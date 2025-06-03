@@ -31,7 +31,7 @@ from .types import (
 # RDF IRIs
 IRIS = {
     "RDF": rdflib.URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
-    "RDFS": rdflib.URIRef("ttp://www.w3.org/2000/01/rdf-schema#"),
+    "RDFS": rdflib.URIRef("http://www.w3.org/2000/01/rdf-schema#"),
     "MF": rdflib.URIRef("http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#"),
     "QT": rdflib.URIRef("http://www.w3.org/2001/sw/DataAccess/tests/test-query#"),
 }
