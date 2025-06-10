@@ -4,4 +4,4 @@
 
 enum class Model { Quad, RDF };
 
-int RunCLI(Model model, std::chrono::seconds timeout);
+int RunCLI(Model model, std::chrono::seconds timeout, bool graph_output);

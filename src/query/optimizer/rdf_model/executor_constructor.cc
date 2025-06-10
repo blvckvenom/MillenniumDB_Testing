@@ -9,6 +9,7 @@
 #include "query/executor/query_executor/sparql/ask_executor.h"
 #include "query/executor/query_executor/sparql/construct_executor.h"
 #include "query/executor/query_executor/sparql/csv_select_executor.h"
+#include "query/executor/query_executor/sparql/graph_select_executor.h"
 #include "query/executor/query_executor/sparql/describe_executor.h"
 #include "query/executor/query_executor/sparql/json_select_executor.h"
 #include "query/executor/query_executor/sparql/tsv_select_executor.h"
@@ -89,6 +90,13 @@ void ExecutorConstructor::visit(OpSelect& op_select) {
         break;
     case SPARQL::ResponseType::TSV:
         executor = std::make_unique<TSVSelectExecutor>(
+            std::move(iter_root),
+            std::move(projection_vars)
+        );
+        break;
+    case SPARQL::ResponseType::GRAPH:
+    case SPARQL::ResponseType::TURTLE:
+        executor = std::make_unique<GraphSelectExecutor>(
             std::move(iter_root),
             std::move(projection_vars)
         );

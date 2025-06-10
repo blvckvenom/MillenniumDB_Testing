@@ -12,6 +12,7 @@ enum class ResponseType {
     TSV,
     CSV,
     TURTLE,
+    GRAPH,
 };
 
 inline std::string response_type_to_string(ResponseType response_type) {
@@ -21,6 +22,7 @@ inline std::string response_type_to_string(ResponseType response_type) {
         case ResponseType::TSV: return "TSV";
         case ResponseType::CSV: return "CSV";
         case ResponseType::TURTLE: return "TURTLE";
+        case ResponseType::GRAPH: return "GRAPH";
         default:
             throw LogicException("Unmanaged ResposeType in response_type_to_string");
     }

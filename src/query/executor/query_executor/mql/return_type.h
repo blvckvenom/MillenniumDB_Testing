@@ -3,6 +3,7 @@
 namespace MQL {
 enum class ReturnType {
     CSV,
-    TSV
+    TSV,
+    TURTLE
 };
 } // namespace MQL

@@ -75,6 +75,7 @@ INTERNAL_TESTS: List[str] = [
     "schemes",
     "uuid",
     "hex",
+    "graph_select",
     # "service",
 ]
 

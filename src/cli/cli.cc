@@ -332,7 +332,8 @@ enum class ReturnStatus { Ok, Error, Interrupted };
 // Main class that implements the CLI
 class CLI {
 public:
-    CLI(Model model, chrono::seconds timeout) : model(model), timeout(timeout) { }
+    CLI(Model model, chrono::seconds timeout, bool graph_output) :
+        model(model), timeout(timeout), graph_output(graph_output) { }
     ~CLI();
 
     // Initialize Tui, has to be called before MainLoop
@@ -428,6 +429,7 @@ private:
 
     // Differentiates between the different models
     Model model;
+    bool graph_output = false;
 
     // Used for thread that executes queries
     std::atomic<bool> query_is_done = false;
@@ -1047,79 +1049,110 @@ void CLI::HandleSend() {
         return;
     }
 
-    input_data = {L"Generating table...  "};
-    auto status = tabulate(fs_raw, fs_table);
+    if (!graph_output) {
+        input_data = {L"Generating table...  "};
+        auto status = tabulate(fs_raw, fs_table);
 
-    if (status == ReturnStatus::Interrupted) {
+        if (status == ReturnStatus::Interrupted) {
+            AddOutput(L"", LineType::BlankLine);
+            AddOutput(L" User interrupted table generation", LineType::OutputError);
+            AddOutput(L"", LineType::BlankLine);
+            if (query_result_count > 0) {
+                AddOutput(L" " + std::to_wstring(query_result_count)
+                    + L" results in " + std::to_wstring(query_execution_time.count()) + L"ms", LineType::OutputOk);
+                AddOutput(L" Results in TSV format: " + path_raw.wstring(), LineType::OutputOk);
+            } else {
+                AddOutput(L" Partial results in TSV format: " + path_raw.wstring(), LineType::OutputOk);
+            }
+            AddOutput(L" Ctrl+L to open pager (inside pager: Q to exit, H for help)", LineType::OutputOk);
+
+            last_output_tmp_file = path_raw;
+
+            input_data = {L""};
+            while (wget_wch(input_win, &throw_away_input) != ERR);
+            nodelay(input_win, false);
+            return;
+        } else if (status == ReturnStatus::Error) {
+            AddOutput(L"", LineType::BlankLine);
+            AddOutput(L" Error during table generation", LineType::OutputError);
+
+            input_data = {L""};
+            while (wget_wch(input_win, &throw_away_input) != ERR);
+            nodelay(input_win, false);
+            return;
+        }
+
+        while (wget_wch(input_win, &throw_away_input) != ERR);
+        nodelay(input_win, false);
+
+        fs_table.clear();
+        fs_table.flush();
+        fs_table.seekg(0, std::ios_base::beg);
+        if (fs_table.fail()) {
+            AddOutput(L" Could not seek " + path_table.wstring(), LineType::OutputError);
+            input_data = {L""};
+            return;
+        }
+
+        constexpr size_t buffer_size = 1024*1024;
+        char buffer[buffer_size];
+        int line_count = 0;
+
+        std::vector<std::wstring> result;
+
         AddOutput(L"", LineType::BlankLine);
-        AddOutput(L" User interrupted table generation", LineType::OutputError);
+        while (fs_table.getline(buffer, buffer_size)) {
+            line_count++;
+            if (line_count > max_table_lines) {
+                break;
+            }
+            AddOutput(string_to_wstring(buffer), LineType::OutputOk);
+        }
+
+
+        AddOutput(L"", LineType::BlankLine);
+        if (query_result_count > 0) {
+            AddOutput(L" " + std::to_wstring(query_result_count)
+                + L" results in " + std::to_wstring(query_execution_time.count())
+                + L"ms", LineType::OutputOk);
+            AddOutput(L" Results in table format: " + path_table.wstring(), LineType::OutputOk);
+        } else {
+            AddOutput(L" Partial results in table format: " + path_table.wstring(), LineType::OutputOk);
+        }
+        AddOutput(L" Ctrl+L to open pager (inside pager: Q to exit, H for help)", LineType::OutputOk);
+
+        last_output_tmp_file = path_table;
+        input_data = {L""};
+    } else {
+        // Graph output
+        while (wget_wch(input_win, &throw_away_input) != ERR);
+        nodelay(input_win, false);
+
+        constexpr size_t buffer_size = 1024*1024;
+        char buffer[buffer_size];
+        int line_count = 0;
+
+        AddOutput(L"", LineType::BlankLine);
+        while (fs_raw.getline(buffer, buffer_size)) {
+            line_count++;
+            if (line_count > max_table_lines) break;
+            AddOutput(string_to_wstring(buffer), LineType::OutputOk);
+        }
+
         AddOutput(L"", LineType::BlankLine);
         if (query_result_count > 0) {
             AddOutput(L" " + std::to_wstring(query_result_count)
                 + L" results in " + std::to_wstring(query_execution_time.count()) + L"ms", LineType::OutputOk);
-            AddOutput(L" Results in TSV format: " + path_raw.wstring(), LineType::OutputOk);
+            AddOutput(L" Results in graph format: " + path_raw.wstring(), LineType::OutputOk);
         } else {
-            AddOutput(L" Partial results in TSV format: " + path_raw.wstring(), LineType::OutputOk);
+            AddOutput(L" Partial results in graph format: " + path_raw.wstring(), LineType::OutputOk);
         }
         AddOutput(L" Ctrl+L to open pager (inside pager: Q to exit, H for help)", LineType::OutputOk);
 
         last_output_tmp_file = path_raw;
-
         input_data = {L""};
-        while (wget_wch(input_win, &throw_away_input) != ERR);
-        nodelay(input_win, false);
-        return;
-    } else if (status == ReturnStatus::Error) {
-        AddOutput(L"", LineType::BlankLine);
-        AddOutput(L" Error during table generation", LineType::OutputError);
-
-        input_data = {L""};
-        while (wget_wch(input_win, &throw_away_input) != ERR);
-        nodelay(input_win, false);
-        return;
     }
 
-    while (wget_wch(input_win, &throw_away_input) != ERR);
-    nodelay(input_win, false);
-
-    fs_table.clear();
-    fs_table.flush();
-    fs_table.seekg(0, std::ios_base::beg);
-    if (fs_table.fail()) {
-        AddOutput(L" Could not seek " + path_table.wstring(), LineType::OutputError);
-        input_data = {L""};
-        return;
-    }
-
-    constexpr size_t buffer_size = 1024*1024;
-    char buffer[buffer_size];
-    int line_count = 0;
-
-    std::vector<std::wstring> result;
-
-    AddOutput(L"", LineType::BlankLine);
-    while (fs_table.getline(buffer, buffer_size)) {
-        line_count++;
-        if (line_count > max_table_lines) {
-            break;
-        }
-        AddOutput(string_to_wstring(buffer), LineType::OutputOk);
-    }
-
-
-    AddOutput(L"", LineType::BlankLine);
-    if (query_result_count > 0) {
-        AddOutput(L" " + std::to_wstring(query_result_count)
-            + L" results in " + std::to_wstring(query_execution_time.count())
-            + L"ms", LineType::OutputOk);
-        AddOutput(L" Results in table format: " + path_table.wstring(), LineType::OutputOk);
-    } else {
-        AddOutput(L" Partial results in table format: " + path_table.wstring(), LineType::OutputOk);
-    }
-    AddOutput(L" Ctrl+L to open pager (inside pager: Q to exit, H for help)", LineType::OutputOk);
-
-    last_output_tmp_file = path_table;
-    input_data = {L""};
 }
 
 
@@ -1667,7 +1700,8 @@ void CLI::ProcessSPARQLQuery(std::ostream& os, const std::string& query) {
         std::unique_ptr<Op> logical_plan;
         logical_plan = SPARQL::QueryParser::get_query_plan(query);
 
-        auto query_optimizer = SPARQL::ExecutorConstructor(SPARQL::ResponseType::TSV);
+        auto resp_type = graph_output ? SPARQL::ResponseType::TURTLE : SPARQL::ResponseType::TSV;
+        auto query_optimizer = SPARQL::ExecutorConstructor(resp_type);
         logical_plan->accept_visitor(query_optimizer);
         auto physical_plan = std::move(query_optimizer.executor);
 
@@ -1736,7 +1770,8 @@ void CLI::ProcessMQLQuery(std::ostream& os, const std::string& query) {
         std::unique_ptr<Op> logical_plan;
         logical_plan = MQL::QueryParser::get_query_plan(query);
 
-        auto query_optimizer = MQL::ExecutorConstructor(MQL::ReturnType::TSV);
+        auto ret_type = graph_output ? MQL::ReturnType::TURTLE : MQL::ReturnType::TSV;
+        auto query_optimizer = MQL::ExecutorConstructor(ret_type);
         logical_plan->accept_visitor(query_optimizer);
         auto physical_plan = std::move(query_optimizer.executor);
 
@@ -1847,8 +1882,8 @@ int CLI::MainLoop() {
 } // namespace Tui
 
 
-int RunCLI(Model model, chrono::seconds timeout) {
-    auto tui = CLI::CLI(model, timeout);
+int RunCLI(Model model, chrono::seconds timeout, bool graph_output) {
+    auto tui = CLI::CLI(model, timeout, graph_output);
 
     auto ret = tui.Init();
     if (ret != EXIT_SUCCESS) {

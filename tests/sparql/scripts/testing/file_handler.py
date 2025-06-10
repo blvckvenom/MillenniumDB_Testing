@@ -160,8 +160,12 @@ def get_internal_tests() -> TestSuite:
             prefixes = None
 
         for query in test_dir.glob("good_queries/**/*.rq"):
-            if query_has_keywords(query, ["describe", "construct"]):
-                expected = query.with_suffix(".ttl")
+            ttl_expected = query.with_suffix(".ttl")
+            if ttl_expected.is_file():
+                expected = ttl_expected
+                graph_output = True
+            elif query_has_keywords(query, ["describe", "construct"]):
+                expected = ttl_expected
                 if not expected.is_file():
                     print(f"File not found: {expected}")
                     sys.exit(1)

@@ -53,6 +53,7 @@ int main(int argc, char* argv[])
     uint64_t private_pages_buffer = BufferManager::DEFAULT_PRIVATE_PAGES_BUFFER_SIZE;
     uint64_t unversioned_pages_buffer = BufferManager::DEFAULT_UNVERSIONED_PAGES_BUFFER_SIZE;
     uint64_t tensor_store_buffer = TensorStoreManager::DEFAULT_TENSOR_BUFFER_SIZE;
+    bool graph_output = false;
 
     CLI::App app { "MillenniumDB TUI" };
     app.get_formatter()->column_width(34);
@@ -109,6 +110,9 @@ int main(int argc, char* argv[])
         ->transform(CLI::AsSizeValue(false))
         ->check(CLI::Range(1024ULL * 1024, 1024ULL * 1024 * 1024 * 1024));
 
+    app.add_flag("--graph", graph_output)
+        ->description("Output results as graph in Turtle format");
+
     CLI11_PARSE(app, argc, argv);
 
     auto catalog_path = db_directory + "/catalog.dat";
@@ -135,11 +139,11 @@ int main(int argc, char* argv[])
         switch (model_identifier) {
         case QuadCatalog::MODEL_ID: {
             auto model_destroyer = QuadModel::init();
-            return RunCLI(Model::Quad, timeout);
+            return RunCLI(Model::Quad, timeout, graph_output);
         }
         case RdfCatalog::MODEL_ID: {
             auto model_destroyer = RdfModel::init();
-            return RunCLI(Model::RDF, timeout);
+            return RunCLI(Model::RDF, timeout, graph_output);
         }
         default: {
             FATAL_ERROR("Unknow model identifier: ", model_identifier, ". Catalog may be corrupted");
