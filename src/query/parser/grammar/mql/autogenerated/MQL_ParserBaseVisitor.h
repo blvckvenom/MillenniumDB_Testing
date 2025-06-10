@@ -79,6 +79,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitProjectQuery(MQL_Parser::ProjectQueryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitCreateTextIndex(MQL_Parser::CreateTextIndexContext *ctx) override {
     return visitChildren(ctx);
   }

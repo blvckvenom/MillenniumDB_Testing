@@ -12,6 +12,7 @@
 #include "query/parser/op/mql/op_group_by.h"                          // IWYU pragma: export
 #include "query/parser/op/mql/op_order_by.h"                          // IWYU pragma: export
 #include "query/parser/op/mql/op_return.h"                            // IWYU pragma: export
+#include "query/parser/op/mql/op_project.h"                           // IWYU pragma: export
 #include "query/parser/op/mql/op_set.h"                               // IWYU pragma: export
 #include "query/parser/op/mql/op_show.h"                              // IWYU pragma: export
 #include "query/parser/op/mql/op_where.h"                             // IWYU pragma: export
