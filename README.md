@@ -51,6 +51,16 @@ This is explained in more detail [here](doc/sparql/sparql_deviations.md).
 The definition of the graph model and how to create a graph file is explained [here](doc/quad_model/data_model.md).
 The query language is inspired on Cypher and its defined [here](doc/quad_model/query_language.md).
 
+### Projecting a Graph
+Graphs in `.qm` format can be loaded temporarily using the `project` function.
+This stores the graph in memory under the given name so future queries or
+algorithms can reference it directly:
+
+```mql
+project("G1", "graph.qm");
+MATCH (n) WHERE ... ON "G1"
+```
+
 
 
 [Project build](#millenniumdb)

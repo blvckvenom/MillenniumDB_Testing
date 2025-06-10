@@ -88,6 +88,7 @@ set(BUILD_TARGETS
     mdb-server
     mdb-cli
     mdb-import
+    mdb-project
 )
 
 # Build targets
