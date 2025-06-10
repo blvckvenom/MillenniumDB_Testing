@@ -55,6 +55,7 @@ public:
     // possible Logical Plan roots
     void visit(OpDescribe&) override;
     void visit(OpReturn&)   override;
+    void visit(OpProject&)  override;
     void visit(OpSet&)      override;
     void visit(OpShow&) override;
 };

@@ -87,6 +87,7 @@ public:
     void visit(MQL::OpGroupBy&)               override;
     void visit(MQL::OpOrderBy&)               override;
     void visit(MQL::OpReturn&)                override;
+    void visit(MQL::OpProject&)               override;
 
     /* These are processed in BindingIterVisitor */
     void visit(MQL::OpSet&) override

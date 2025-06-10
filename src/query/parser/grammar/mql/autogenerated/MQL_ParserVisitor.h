@@ -51,6 +51,8 @@ public:
 
     virtual std::any visitTextIndexQuery(MQL_Parser::TextIndexQueryContext *context) = 0;
 
+    virtual std::any visitProjectQuery(MQL_Parser::ProjectQueryContext *context) = 0;
+
     virtual std::any visitCreateTextIndex(MQL_Parser::CreateTextIndexContext *context) = 0;
 
     virtual std::any visitNormalizeTextIndex(MQL_Parser::NormalizeTextIndexContext *context) = 0;

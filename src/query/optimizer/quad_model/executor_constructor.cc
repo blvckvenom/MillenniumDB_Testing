@@ -118,6 +118,16 @@ void ExecutorConstructor::visit(OpReturn& op_return) {
     }
 }
 
+void ExecutorConstructor::visit(OpProject& op_project) {
+    BindingIterConstructor visitor(set_vars);
+    op_project.op->accept_visitor(visitor);
+
+    path_manager.begin(std::move(visitor.begin_at_left));
+    // Reuse ReturnExecutor to output bindings; graph handling not implemented
+    executor = std::make_unique<MQL::ReturnExecutor<MQL::ReturnType::CSV>>(
+        std::move(visitor.tmp), std::move(set_vars), std::vector<VarId>{});
+}
+
 void ExecutorConstructor::visit(OpShow& op_show)
 {
     switch (ret) {

@@ -37,7 +37,7 @@ public:
     virtual std::unique_ptr<Op> clone() const override {
         std::vector<std::pair<VarId,std::unique_ptr<Expr>>> projection_clone;
         projection_clone.reserve(projection.size());
-        for (auto&& [var, expr] : projection_clone) {
+        for (auto&& [var, expr] : projection) {
             if (expr != nullptr) {
                 projection_clone.push_back({var, expr->clone()});
             } else {

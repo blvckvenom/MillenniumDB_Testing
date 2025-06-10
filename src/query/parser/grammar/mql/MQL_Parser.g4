@@ -5,7 +5,7 @@ options {
 	tokenVocab = MQL_Lexer;
 }
 
-root: ((setStatement? matchQuery | describeQuery) | insertPatterns | tensorStoreQuery | textIndexQuery | showQuery) EOF;
+root: ((setStatement? matchQuery | describeQuery) | insertPatterns | tensorStoreQuery | textIndexQuery | projectQuery | showQuery) EOF;
 
 matchQuery: matchStatement whereStatement? groupByStatement? orderByStatement? returnStatement;
 
@@ -40,6 +40,8 @@ tensorDistanceReference: conditionalOrExpr;// | tensor;
 metricType: K_ANGULAR | K_EUCLIDEAN | K_MANHATTAN;
 
 textIndexQuery: createTextIndex;
+
+projectQuery: K_PROJECT matchQuery;
 
 createTextIndex:
     K_CREATE K_TEXT K_INDEX STRING K_ON identifier (

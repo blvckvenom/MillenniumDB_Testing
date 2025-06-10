@@ -163,6 +163,8 @@ public:
     virtual std::any visitTensorDistance(MQL_Parser::TensorDistanceContext* ctx) override;
     virtual std::any visitTextSearch(MQL_Parser::TextSearchContext* ctx) override;
 
+    virtual std::any visitProjectQuery(MQL_Parser::ProjectQueryContext* ctx) override;
+
     virtual std::any visitCreateTensorStore(MQL_Parser::CreateTensorStoreContext* ctx) override;
     virtual std::any visitInsertTensors(MQL_Parser::InsertTensorsContext* ctx) override;
     virtual std::any visitDeleteTensors(MQL_Parser::DeleteTensorsContext* ctx) override;
