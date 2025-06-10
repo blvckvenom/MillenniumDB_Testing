@@ -22,6 +22,7 @@ class OpOrderBy;
 class OpPath;
 class OpProperty;
 class OpReturn;
+class OpProject;
 class OpSet;
 class OpShow;
 class OpWhere;
@@ -106,6 +107,7 @@ public:
     virtual void visit(MQL::OpPath&)                  { throw LogicException("visit MQL::OpPath not implemented"); }
     virtual void visit(MQL::OpProperty&)              { throw LogicException("visit MQL::OpProperty not implemented"); }
     virtual void visit(MQL::OpReturn&)                { throw LogicException("visit MQL::OpReturn not implemented"); }
+    virtual void visit(MQL::OpProject&)               { throw LogicException("visit MQL::OpProject not implemented"); }
     virtual void visit(MQL::OpSet&)                   { throw LogicException("visit MQL::OpSet not implemented"); }
     virtual void visit(MQL::OpShow&)                  { throw LogicException("visit MQL::OpShow not implemented"); }
     virtual void visit(MQL::OpWhere&)                 { throw LogicException("visit MQL::OpWhere not implemented"); }

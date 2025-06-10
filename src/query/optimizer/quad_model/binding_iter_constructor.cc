@@ -514,6 +514,11 @@ void BindingIterConstructor::visit(OpReturn& op_return)
     }
 }
 
+void BindingIterConstructor::visit(OpProject& op_project)
+{
+    op_project.op->accept_visitor(*this);
+}
+
 
 Id BindingIterConstructor::replace_setted_var(Id id) const
 {

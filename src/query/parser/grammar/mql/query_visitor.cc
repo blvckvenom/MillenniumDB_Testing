@@ -1779,3 +1779,10 @@ Any QueryVisitor::visitCreateTextIndex(MQL_Parser::CreateTextIndexContext* ctx)
 
     return 0;
 }
+
+Any QueryVisitor::visitProjectQuery(MQL_Parser::ProjectQueryContext* ctx)
+{
+    ctx->matchQuery()->accept(this);
+    current_op = std::make_unique<OpProject>(std::move(current_op));
+    return 0;
+}
