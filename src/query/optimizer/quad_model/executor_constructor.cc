@@ -9,6 +9,7 @@
 #include "query/executor/query_executor/mql/describe_executor.h"
 #include "query/executor/query_executor/mql/return_executor.h"
 #include "query/executor/query_executor/mql/show_executor.h"
+#include "query/executor/query_executor/mql/project_executor.h"
 #include "query/optimizer/quad_model/binding_iter_constructor.h"
 
 using namespace MQL;
@@ -145,4 +146,12 @@ void ExecutorConstructor::visit(OpShow& op_show)
     default:
         throw std::runtime_error("Unhandled SHOW");
     }
+}
+
+void ExecutorConstructor::visit(OpProject& op_project)
+{
+    executor = std::make_unique<MQL::ProjectExecutor>(
+        op_project.name,
+        op_project.node_query,
+        op_project.edge_query);
 }

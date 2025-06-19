@@ -24,6 +24,7 @@ class OpProperty;
 class OpReturn;
 class OpSet;
 class OpShow;
+class OpProject;
 class OpWhere;
 } // namespace MQL
 
@@ -108,6 +109,7 @@ public:
     virtual void visit(MQL::OpReturn&)                { throw LogicException("visit MQL::OpReturn not implemented"); }
     virtual void visit(MQL::OpSet&)                   { throw LogicException("visit MQL::OpSet not implemented"); }
     virtual void visit(MQL::OpShow&)                  { throw LogicException("visit MQL::OpShow not implemented"); }
+    virtual void visit(MQL::OpProject&)               { throw LogicException("visit MQL::OpProject not implemented"); }
     virtual void visit(MQL::OpWhere&)                 { throw LogicException("visit MQL::OpWhere not implemented"); }
 
     // SPARQL
