@@ -5,7 +5,7 @@ options {
 	tokenVocab = MQL_Lexer;
 }
 
-root: ((setStatement? matchQuery | describeQuery) | insertPatterns | tensorStoreQuery | textIndexQuery | showQuery) EOF;
+root: ((setStatement? matchQuery | describeQuery) | insertPatterns | tensorStoreQuery | textIndexQuery | showQuery | projectQuery) EOF;
 
 matchQuery: matchStatement whereStatement? groupByStatement? orderByStatement? returnStatement;
 
@@ -60,6 +60,12 @@ showQuery: K_SHOW (
     K_TENSOR K_STORE
 |   K_TEXT K_INDEX
 );
+
+projectQuery: K_PROJECT STRING nodeProjection relationshipProjection;
+
+nodeProjection: K_LABELS '(' TYPE (',' TYPE)* ')';
+
+relationshipProjection: K_EDGE '(' TYPE (',' TYPE)* ')';
 
 // updateStatements: (insertStatement | deleteStatement | updateSetStatement)+;
 

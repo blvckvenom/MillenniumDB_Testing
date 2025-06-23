@@ -20,4 +20,5 @@
 #include "query/parser/op/mql/update/op_delete_tensors.h"             // IWYU pragma: export
 #include "query/parser/op/mql/update/op_insert.h"                     // IWYU pragma: export
 #include "query/parser/op/mql/update/op_insert_tensors.h"             // IWYU pragma: export
+#include "query/parser/op/mql/op_project.h"                            // IWYU pragma: export
 // #include "query/parser/op/mql/update/op_update.h" // IWYU pragma: export

@@ -24,18 +24,18 @@ public:
     K_OUTGOING = 47, K_PREFIX = 48, K_PROPERTIES = 49, K_PROPERTY = 50, 
     K_NOT = 51, K_NULL = 52, K_SHORTEST = 53, K_SHOW = 54, K_SIMPLE = 55, 
     K_TENSOR_DISTANCE = 56, K_TEXT_SEARCH = 57, K_REGEX = 58, K_RETURN = 59, 
-    K_SET = 60, K_SUM = 61, K_STRING = 62, K_STORE = 63, K_TENSOR = 64, 
-    K_TEXT = 65, K_TRUE = 66, K_TOKENIZE = 67, K_TRAILS = 68, K_VALUES = 69, 
-    K_WALKS = 70, K_WITH = 71, K_WHERE = 72, K_WS_KEEP_PUNCT = 73, K_WS_RM_PUNCT = 74, 
-    K_WS_SPLIT_PUNCT = 75, TRUE_PROP = 76, FALSE_PROP = 77, ANON_ID = 78, 
-    EDGE_ID = 79, KEY = 80, TYPE = 81, TYPE_VAR = 82, VARIABLE = 83, STRING = 84, 
-    UNSIGNED_INTEGER = 85, UNSIGNED_FLOAT = 86, UNSIGNED_SCIENTIFIC_NOTATION = 87, 
-    NAME = 88, LEQ = 89, GEQ = 90, EQ = 91, NEQ = 92, LT = 93, GT = 94, 
-    SINGLE_EQ = 95, PATH_SEQUENCE = 96, PATH_ALTERNATIVE = 97, PATH_NEGATION = 98, 
-    STAR = 99, PERCENT = 100, QUESTION_MARK = 101, PLUS = 102, MINUS = 103, 
-    L_PAR = 104, R_PAR = 105, LCURLY_BRACKET = 106, RCURLY_BRACKET = 107, 
-    LSQUARE_BRACKET = 108, RSQUARE_BRACKET = 109, COMMA = 110, COLON = 111, 
-    WHITE_SPACE = 112, SINGLE_LINE_COMMENT = 113, UNRECOGNIZED = 114
+    K_SET = 60, K_SUM = 61, K_STRING = 62, K_PROJECT = 63, K_STORE = 64, 
+    K_TENSOR = 65, K_TEXT = 66, K_TRUE = 67, K_TOKENIZE = 68, K_TRAILS = 69, 
+    K_VALUES = 70, K_WALKS = 71, K_WITH = 72, K_WHERE = 73, K_WS_KEEP_PUNCT = 74, 
+    K_WS_RM_PUNCT = 75, K_WS_SPLIT_PUNCT = 76, TRUE_PROP = 77, FALSE_PROP = 78, 
+    ANON_ID = 79, EDGE_ID = 80, KEY = 81, TYPE = 82, TYPE_VAR = 83, VARIABLE = 84, 
+    STRING = 85, UNSIGNED_INTEGER = 86, UNSIGNED_FLOAT = 87, UNSIGNED_SCIENTIFIC_NOTATION = 88, 
+    NAME = 89, LEQ = 90, GEQ = 91, EQ = 92, NEQ = 93, LT = 94, GT = 95, 
+    SINGLE_EQ = 96, PATH_SEQUENCE = 97, PATH_ALTERNATIVE = 98, PATH_NEGATION = 99, 
+    STAR = 100, PERCENT = 101, QUESTION_MARK = 102, PLUS = 103, MINUS = 104, 
+    L_PAR = 105, R_PAR = 106, LCURLY_BRACKET = 107, RCURLY_BRACKET = 108, 
+    LSQUARE_BRACKET = 109, RSQUARE_BRACKET = 110, COMMA = 111, COLON = 112, 
+    WHITE_SPACE = 113, SINGLE_LINE_COMMENT = 114, UNRECOGNIZED = 115
   };
 
   enum {
@@ -46,22 +46,23 @@ public:
     RuleTensorDistanceReference = 13, RuleMetricType = 14, RuleTextIndexQuery = 15, 
     RuleCreateTextIndex = 16, RuleNormalizeTextIndex = 17, RuleNormalizeType = 18, 
     RuleTokenizeTextIndex = 19, RuleTokenizeType = 20, RuleShowQuery = 21, 
-    RuleDescribeQuery = 22, RuleDescribeFlag = 23, RuleSetStatement = 24, 
-    RuleMatchStatement = 25, RuleWhereStatement = 26, RuleGroupByStatement = 27, 
-    RuleOrderByStatement = 28, RuleReturnStatement = 29, RuleLimitOffsetClauses = 30, 
-    RuleLimitClause = 31, RuleOffsetClause = 32, RuleSetItem = 33, RuleReturnItem = 34, 
-    RuleAlias = 35, RuleAggregateFunc = 36, RuleOrderByItem = 37, RuleGroupByItem = 38, 
-    RuleGraphPattern = 39, RuleOptionalPattern = 40, RuleBasicPattern = 41, 
-    RuleLinearPattern = 42, RulePath = 43, RulePathAlternatives = 44, RulePathSequence = 45, 
-    RulePathAtom = 46, RulePathSuffix = 47, RulePathType = 48, RuleNode = 49, 
-    RuleFixedNode = 50, RuleFixedNodeInside = 51, RuleEdge = 52, RuleEdgeInside = 53, 
-    RuleVarNode = 54, RuleProperties = 55, RuleProperty = 56, RuleConditionalOrType = 57, 
-    RuleIdentifier = 58, RuleBoolValue = 59, RuleNumericValue = 60, RuleDatatypeValue = 61, 
-    RuleValue = 62, RuleConditionalOrExpr = 63, RuleConditionalAndExpr = 64, 
-    RuleComparisonExpr = 65, RuleAdditiveExpr = 66, RuleMultiplicativeExpr = 67, 
-    RuleUnaryExpr = 68, RuleAtomicExpr = 69, RuleFunction = 70, RuleRegex = 71, 
-    RuleTensorDistance = 72, RuleTextSearch = 73, RuleTextSearchIndexMode = 74, 
-    RuleExprTypename = 75, RuleKeyword = 76
+    RuleProjectQuery = 22, RuleNodeProjection = 23, RuleRelationshipProjection = 24, 
+    RuleDescribeQuery = 25, RuleDescribeFlag = 26, RuleSetStatement = 27, 
+    RuleMatchStatement = 28, RuleWhereStatement = 29, RuleGroupByStatement = 30, 
+    RuleOrderByStatement = 31, RuleReturnStatement = 32, RuleLimitOffsetClauses = 33, 
+    RuleLimitClause = 34, RuleOffsetClause = 35, RuleSetItem = 36, RuleReturnItem = 37, 
+    RuleAlias = 38, RuleAggregateFunc = 39, RuleOrderByItem = 40, RuleGroupByItem = 41, 
+    RuleGraphPattern = 42, RuleOptionalPattern = 43, RuleBasicPattern = 44, 
+    RuleLinearPattern = 45, RulePath = 46, RulePathAlternatives = 47, RulePathSequence = 48, 
+    RulePathAtom = 49, RulePathSuffix = 50, RulePathType = 51, RuleNode = 52, 
+    RuleFixedNode = 53, RuleFixedNodeInside = 54, RuleEdge = 55, RuleEdgeInside = 56, 
+    RuleVarNode = 57, RuleProperties = 58, RuleProperty = 59, RuleConditionalOrType = 60, 
+    RuleIdentifier = 61, RuleBoolValue = 62, RuleNumericValue = 63, RuleDatatypeValue = 64, 
+    RuleValue = 65, RuleConditionalOrExpr = 66, RuleConditionalAndExpr = 67, 
+    RuleComparisonExpr = 68, RuleAdditiveExpr = 69, RuleMultiplicativeExpr = 70, 
+    RuleUnaryExpr = 71, RuleAtomicExpr = 72, RuleFunction = 73, RuleRegex = 74, 
+    RuleTensorDistance = 75, RuleTextSearch = 76, RuleTextSearchIndexMode = 77, 
+    RuleExprTypename = 78, RuleKeyword = 79
   };
 
   explicit MQL_Parser(antlr4::TokenStream *input);
@@ -103,6 +104,9 @@ public:
   class TokenizeTextIndexContext;
   class TokenizeTypeContext;
   class ShowQueryContext;
+  class ProjectQueryContext;
+  class NodeProjectionContext;
+  class RelationshipProjectionContext;
   class DescribeQueryContext;
   class DescribeFlagContext;
   class SetStatementContext;
@@ -168,6 +172,7 @@ public:
     TensorStoreQueryContext *tensorStoreQuery();
     TextIndexQueryContext *textIndexQuery();
     ShowQueryContext *showQuery();
+    ProjectQueryContext *projectQuery();
     MatchQueryContext *matchQuery();
     DescribeQueryContext *describeQuery();
     SetStatementContext *setStatement();
@@ -530,6 +535,60 @@ public:
   };
 
   ShowQueryContext* showQuery();
+
+  class  ProjectQueryContext : public antlr4::ParserRuleContext {
+  public:
+    ProjectQueryContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *K_PROJECT();
+    antlr4::tree::TerminalNode *STRING();
+    NodeProjectionContext *nodeProjection();
+    RelationshipProjectionContext *relationshipProjection();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  ProjectQueryContext* projectQuery();
+
+  class  NodeProjectionContext : public antlr4::ParserRuleContext {
+  public:
+    NodeProjectionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *K_LABELS();
+    antlr4::tree::TerminalNode *L_PAR();
+    std::vector<antlr4::tree::TerminalNode *> TYPE();
+    antlr4::tree::TerminalNode* TYPE(size_t i);
+    antlr4::tree::TerminalNode *R_PAR();
+    std::vector<antlr4::tree::TerminalNode *> COMMA();
+    antlr4::tree::TerminalNode* COMMA(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  NodeProjectionContext* nodeProjection();
+
+  class  RelationshipProjectionContext : public antlr4::ParserRuleContext {
+  public:
+    RelationshipProjectionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *K_EDGE();
+    antlr4::tree::TerminalNode *L_PAR();
+    std::vector<antlr4::tree::TerminalNode *> TYPE();
+    antlr4::tree::TerminalNode* TYPE(size_t i);
+    antlr4::tree::TerminalNode *R_PAR();
+    std::vector<antlr4::tree::TerminalNode *> COMMA();
+    antlr4::tree::TerminalNode* COMMA(size_t i);
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  RelationshipProjectionContext* relationshipProjection();
 
   class  DescribeQueryContext : public antlr4::ParserRuleContext {
   public:
@@ -1482,10 +1541,10 @@ public:
 
   class  AdditiveExprContext : public antlr4::ParserRuleContext {
   public:
-    antlr4::Token *s102 = nullptr;
-    std::vector<antlr4::Token *> op;
     antlr4::Token *s103 = nullptr;
-    antlr4::Token *_tset1498 = nullptr;
+    std::vector<antlr4::Token *> op;
+    antlr4::Token *s104 = nullptr;
+    antlr4::Token *_tset1552 = nullptr;
     AdditiveExprContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     std::vector<MultiplicativeExprContext *> multiplicativeExpr();
@@ -1504,11 +1563,11 @@ public:
 
   class  MultiplicativeExprContext : public antlr4::ParserRuleContext {
   public:
-    antlr4::Token *s99 = nullptr;
-    std::vector<antlr4::Token *> op;
-    antlr4::Token *s96 = nullptr;
     antlr4::Token *s100 = nullptr;
-    antlr4::Token *_tset1517 = nullptr;
+    std::vector<antlr4::Token *> op;
+    antlr4::Token *s97 = nullptr;
+    antlr4::Token *s101 = nullptr;
+    antlr4::Token *_tset1571 = nullptr;
     MultiplicativeExprContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     std::vector<UnaryExprContext *> unaryExpr();

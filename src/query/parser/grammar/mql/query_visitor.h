@@ -169,5 +169,6 @@ public:
     virtual std::any visitTensor(MQL_Parser::TensorContext* ctx) override;
 
     virtual std::any visitCreateTextIndex(MQL_Parser::CreateTextIndexContext* ctx) override;
+    virtual std::any visitProjectQuery(MQL_Parser::ProjectQueryContext* ctx) override;
 };
 } // namespace MQL

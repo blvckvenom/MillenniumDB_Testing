@@ -1779,3 +1779,31 @@ Any QueryVisitor::visitCreateTextIndex(MQL_Parser::CreateTextIndexContext* ctx)
 
     return 0;
 }
+
+Any QueryVisitor::visitProjectQuery(MQL_Parser::ProjectQueryContext* ctx)
+{
+    std::string graph_name = ctx->STRING()->getText();
+    graph_name = graph_name.substr(1, graph_name.size() - 2);
+
+    std::vector<ObjectId> node_labels;
+    for (auto type : ctx->nodeProjection()->TYPE()) {
+        auto label = type->getText();
+        label.erase(0, 1);
+        node_labels.push_back(QuadObjectId::get_string(label));
+    }
+
+    std::vector<ObjectId> edge_types;
+    for (auto type : ctx->relationshipProjection()->TYPE()) {
+        auto t = type->getText();
+        t.erase(0, 1);
+        edge_types.push_back(QuadObjectId::get_string(t));
+    }
+
+    current_op = std::make_unique<OpProject>(
+        std::move(graph_name),
+        std::move(node_labels),
+        std::move(edge_types)
+    );
+
+    return 0;
+}

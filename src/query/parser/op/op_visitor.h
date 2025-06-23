@@ -14,6 +14,7 @@ class OpEdge;
 class OpGroupBy;
 class OpInsert;
 class OpInsertTensors;
+class OpProject;
 class OpDisjointTerm;
 class OpDisjointVar;
 class OpLabel;
@@ -98,6 +99,7 @@ public:
     virtual void visit(MQL::OpGroupBy&)               { throw LogicException("visit MQL::OpGroupBy not implemented"); }
     virtual void visit(MQL::OpInsert&)                { throw LogicException("visit MQL::OpInsert not implemented"); }
     virtual void visit(MQL::OpInsertTensors&)         { throw LogicException("visit MQL::OpInsertTensors not implemented"); }
+    virtual void visit(MQL::OpProject&)               { throw LogicException("visit MQL::OpProject not implemented"); }
     virtual void visit(MQL::OpDisjointTerm&)          { throw LogicException("visit MQL::OpDisjointTerm not implemented"); }
     virtual void visit(MQL::OpDisjointVar&)           { throw LogicException("visit MQL::OpDisjointVar not implemented"); }
     virtual void visit(MQL::OpLabel&)                 { throw LogicException("visit MQL::OpLabel not implemented"); }

@@ -63,6 +63,12 @@ public:
 
     virtual std::any visitShowQuery(MQL_Parser::ShowQueryContext *context) = 0;
 
+    virtual std::any visitProjectQuery(MQL_Parser::ProjectQueryContext *context) = 0;
+
+    virtual std::any visitNodeProjection(MQL_Parser::NodeProjectionContext *context) = 0;
+
+    virtual std::any visitRelationshipProjection(MQL_Parser::RelationshipProjectionContext *context) = 0;
+
     virtual std::any visitDescribeQuery(MQL_Parser::DescribeQueryContext *context) = 0;
 
     virtual std::any visitDescribeFlag(MQL_Parser::DescribeFlagContext *context) = 0;
