@@ -7,6 +7,7 @@
 #include "query/parser/op/op.h"
 #include "storage/index/tensor_store/tensor_store_update_data.h"
 #include "storage/index/text_search/text_search_index_update_data.h"
+#include "query/parser/op/mql/op_project.h"
 
 namespace MQL {
 
@@ -44,6 +45,7 @@ public:
     void visit(OpDeleteTensors&) override;
     void visit(OpCreateTensorStore&) override;
     void visit(OpCreateTextSearchIndex&) override;
+    void visit(OpProject&) override;
 
     void execute(Op& op);
     void print_stats(std::ostream& os);

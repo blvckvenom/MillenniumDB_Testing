@@ -103,6 +103,18 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitProjectQuery(MQL_Parser::ProjectQueryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitNodeProjection(MQL_Parser::NodeProjectionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitRelationshipProjection(MQL_Parser::RelationshipProjectionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitDescribeQuery(MQL_Parser::DescribeQueryContext *ctx) override {
     return visitChildren(ctx);
   }

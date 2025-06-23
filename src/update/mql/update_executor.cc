@@ -1,6 +1,8 @@
 #include "update_executor.h"
 
 #include <cassert>
+#include <fstream>
+#include <unordered_set>
 
 #include "graph_models/quad_model/conversions.h"
 #include "graph_models/quad_model/quad_model.h"
@@ -401,6 +403,77 @@ void UpdateExecutor::visit(OpCreateTextSearchIndex& op)
     } catch (const std::exception& e) {
         // Rethrow any exception wrapped by a QueryExecutionException
         throw QueryExecutionException(e.what());
+    }
+}
+
+void UpdateExecutor::visit(OpProject& op)
+{
+    bool interruption_requested = false;
+    std::fstream fs(op.graph_name, std::ios::out | std::ios::trunc);
+
+    std::unordered_set<uint64_t> nodes_set;
+    if (op.node_labels.empty()) {
+        auto it = quad_model.nodes->get_range(&interruption_requested, {0}, {UINT64_MAX});
+        if (!it.is_end()) {
+            auto rec = it.next();
+            while (rec) {
+                nodes_set.insert((*rec)[0]);
+                rec = it.next();
+            }
+        }
+    } else {
+        for (const auto& label : op.node_labels) {
+            auto it = quad_model.label_node->get_range(&interruption_requested, {label.id, 0}, {label.id, UINT64_MAX});
+            auto rec = it.next();
+            while (rec) {
+                nodes_set.insert((*rec)[1]);
+                rec = it.next();
+            }
+        }
+    }
+
+    for (auto node_id : nodes_set) {
+        fs << MQL::Conversions::to_lexical_str(ObjectId(node_id));
+        auto node_label_it = quad_model.node_label->get_range(&interruption_requested, {node_id, 0}, {node_id, UINT64_MAX});
+        auto nl = node_label_it.next();
+        while (nl) {
+            auto label_name = MQL::Conversions::to_lexical_str(ObjectId((*nl)[1]));
+            label_name = label_name.substr(1, label_name.size() - 2);
+            fs << " :" << label_name;
+            nl = node_label_it.next();
+        }
+        auto prop_it = quad_model.object_key_value->get_range(&interruption_requested, {node_id, 0, 0}, {node_id, UINT64_MAX, UINT64_MAX});
+        auto prop = prop_it.next();
+        while (prop) {
+            auto key_name = MQL::Conversions::to_lexical_str(ObjectId((*prop)[1]));
+            key_name = key_name.substr(1, key_name.size() - 2);
+            fs << " " << key_name << ":" << MQL::Conversions::to_lexical_str(ObjectId((*prop)[2]));
+            prop = prop_it.next();
+        }
+        fs << "\n";
+    }
+
+    for (const auto& type : op.edge_types) {
+        auto it = quad_model.type_from_to_edge->get_range(&interruption_requested, {type.id, 0, 0, 0}, {type.id, UINT64_MAX, UINT64_MAX, UINT64_MAX});
+        auto rec = it.next();
+        while (rec) {
+            if (nodes_set.count((*rec)[1]) && nodes_set.count((*rec)[2])) {
+                fs << MQL::Conversions::to_lexical_str(ObjectId((*rec)[1])) << "->"
+                   << MQL::Conversions::to_lexical_str(ObjectId((*rec)[2])) << " :"
+                   << MQL::Conversions::to_lexical_str(ObjectId((*rec)[0]));
+
+                auto prop_it = quad_model.object_key_value->get_range(&interruption_requested, {(*rec)[3], 0, 0}, {(*rec)[3], UINT64_MAX, UINT64_MAX});
+                auto prop = prop_it.next();
+                while (prop) {
+                    auto key_name = MQL::Conversions::to_lexical_str(ObjectId((*prop)[1]));
+                    key_name = key_name.substr(1, key_name.size() - 2);
+                    fs << " " << key_name << ":" << MQL::Conversions::to_lexical_str(ObjectId((*prop)[2]));
+                    prop = prop_it.next();
+                }
+                fs << "\n";
+            }
+            rec = it.next();
+        }
     }
 }
 
