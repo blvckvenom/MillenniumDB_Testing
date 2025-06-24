@@ -21,6 +21,9 @@
 #include "query/executor/binding_iter/scan_ranges/scan_range.h"
 #include "query/executor/binding_iter/single_result_binding_iter.h"
 #include "query/executor/binding_iter/text_search_index_scan.h"
+#include "query/executor/binding_iter/virtual_graph/node_scan.h"
+#include "query/executor/binding_iter/virtual_graph/edge_scan.h"
+#include "virtual_graph/virtual_graph_factory.h"
 #include "query/executor/binding_iters.h"
 #include "query/optimizer/plan/join_order/greedy_optimizer.h"
 #include "query/optimizer/plan/join_order/leapfrog_optimizer.h"
@@ -70,6 +73,23 @@ BindingIterConstructor::BindingIterConstructor(std::map<VarId, ObjectId>& setted
 
 void BindingIterConstructor::visit(OpBasicGraphPattern& op_basic_graph_pattern)
 {
+    if (!op_basic_graph_pattern.in_graph.empty()) {
+        auto g = VirtualGraphFactory::get(op_basic_graph_pattern.in_graph);
+        if (op_basic_graph_pattern.edges.size() == 1) {
+            auto edge = *op_basic_graph_pattern.edges.begin();
+            tmp = std::make_unique<VirtualGraphEdgeScan>(
+                g,
+                edge.from.get_var(),
+                edge.to.get_var(),
+                edge.edge.get_var());
+        } else if (!op_basic_graph_pattern.disjoint_vars.empty()) {
+            auto var = op_basic_graph_pattern.disjoint_vars.begin()->var;
+            tmp = std::make_unique<VirtualGraphNodeScan>(g, var);
+        } else {
+            tmp = std::make_unique<EmptyBindingIter>();
+        }
+        return;
+    }
     // Handle Text Searches
     std::vector<std::unique_ptr<TextSearchIndexScan>> text_search_binding_iters;
     if (op_basic_graph_pattern.expr_text_searches.size() > 1) {

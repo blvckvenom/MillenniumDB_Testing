@@ -62,6 +62,9 @@ public:
     std::set<OpDisjointTerm> disjoint_terms;
     std::set<ExprTextSearch> expr_text_searches;
 
+    // name of a projected graph to execute this pattern against
+    std::string in_graph;
+
     std::set<VarId> vars; // contains declared variables and anonymous (auto-generated in the constructor)
     std::vector<OpProperty> optional_properties;
 
@@ -173,7 +176,11 @@ public:
     std::ostream& print_to_ostream(std::ostream& os, int indent = 0) const override
     {
         os << std::string(indent, ' ');
-        os << "OpBasicGraphPattern()\n";
+        os << "OpBasicGraphPattern(";
+        if (!in_graph.empty()) {
+            os << "graph=\"" << in_graph << "\"";
+        }
+        os << ")\n";
 
         for (auto& op_property : optional_properties) {
             op_property.print_to_ostream(os, indent);

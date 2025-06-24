@@ -147,3 +147,8 @@ void StreamingExecutorConstructor::visit(OpShow& op_show)
         throw NotSupportedException("MQL::StreamingExecutorConstructor::visit(OpShow&): Unhandled SHOW");
     }
 }
+
+void StreamingExecutorConstructor::visit(OpProject&)
+{
+    throw NotSupportedException("MQL::StreamingExecutorConstructor::visit(OpProject&) not implemented");
+}

@@ -14,6 +14,7 @@
 #include "query/parser/op/mql/op_return.h"                            // IWYU pragma: export
 #include "query/parser/op/mql/op_set.h"                               // IWYU pragma: export
 #include "query/parser/op/mql/op_show.h"                              // IWYU pragma: export
+#include "query/parser/op/mql/op_project.h"                           // IWYU pragma: export
 #include "query/parser/op/mql/op_where.h"                             // IWYU pragma: export
 #include "query/parser/op/mql/update/op_create_tensor_store.h"        // IWYU pragma: export
 #include "query/parser/op/mql/update/op_create_text_search_index.h"   // IWYU pragma: export

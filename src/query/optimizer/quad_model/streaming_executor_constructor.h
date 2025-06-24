@@ -24,5 +24,6 @@ public:
     void visit(OpReturn&) override;
     void visit(OpSet&) override;
     void visit(OpShow&) override;
+    void visit(OpProject&) override;
 };
 } // namespace MQL
