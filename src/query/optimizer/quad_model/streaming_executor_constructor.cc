@@ -10,6 +10,7 @@
 #include "query/executor/query_executor/mql/edge_describe_streaming_executor.h"
 #include "query/executor/query_executor/mql/return_streaming_executor.h"
 #include "query/executor/query_executor/mql/show_streaming_executor.h"
+#include "query/executor/query_executor/mql/project_streaming_executor.h"
 #include "query/optimizer/quad_model/binding_iter_constructor.h"
 #include "query/parser/op/mql/ops.h"
 #include "system/path_manager.h"
@@ -148,7 +149,10 @@ void StreamingExecutorConstructor::visit(OpShow& op_show)
     }
 }
 
-void StreamingExecutorConstructor::visit(OpProject&)
+void StreamingExecutorConstructor::visit(OpProject& op_project)
 {
-    throw NotSupportedException("MQL::StreamingExecutorConstructor::visit(OpProject&) not implemented");
+    executor = std::make_unique<MQL::ProjectStreamingExecutor>(
+        op_project.name,
+        op_project.node_query,
+        op_project.edge_query);
 }
