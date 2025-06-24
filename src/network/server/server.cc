@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <csignal>
+#include <filesystem>
 #include <thread>
 #include <vector>
 
@@ -174,11 +175,13 @@ void MDBServer::Server::browser_session(tcp::socket&& socket) {
             return;
         }
 
-        // if ENV MDB_BROWSER is set use that
-        char* env_browser = std::getenv("MDB_BROWSER");
-
-        std::string path = env_browser == nullptr ? MDBServer::Protocol::DEFAULT_BROWSER_PATH : env_browser;
-        path = path_cat(path, req.target());
+        // if ENV MDB_BROWSER is set use that, otherwise try default paths
+        char*       env_browser = std::getenv("MDB_BROWSER");
+        std::string base_path   = env_browser == nullptr ? std::string(MDBServer::Protocol::DEFAULT_BROWSER_PATH) : std::string(env_browser);
+        if (!std::filesystem::exists(base_path) && std::filesystem::exists("../browser")) {
+            base_path = "../browser";
+        }
+        std::string path = path_cat(base_path, req.target());
         if (req.target().back() == '/')
             path.append("index.html");
 
@@ -189,7 +192,15 @@ void MDBServer::Server::browser_session(tcp::socket&& socket) {
 
         // Handle the case where the file doesn't exist
         if (ec == boost::beast::errc::no_such_file_or_directory) {
-            write(stream, not_found(req.target()), ec);
+            if (req.target() == "/") {
+                boost::beast::http::response<boost::beast::http::string_body> res{
+                    boost::beast::http::status::found, req.version()};
+                res.set(boost::beast::http::field::location, "/browser/index.html");
+                res.prepare_payload();
+                write(stream, std::move(res), ec);
+            } else {
+                write(stream, not_found(req.target()), ec);
+            }
             return;
         }
 

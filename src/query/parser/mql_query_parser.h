@@ -7,6 +7,7 @@
 #include "query/parser/grammar/mql/query_visitor.h"
 #include "query/parser/op/mql/op_project.h"
 #include "query/parser/op/op.h"
+#include "query/exceptions.h"
 #include <regex>
 #include "query/rewriter/mql/op/check_var_names.h"
 #include "query/rewriter/mql/op/check_well_designed.h"
@@ -17,6 +18,56 @@ namespace MQL {
 
 class QueryParser {
 public:
+    static std::unique_ptr<Op> parse_call(const std::string& query)
+    {
+        // Trim trailing semicolon and spaces
+        auto trimmed = query;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r"));
+        trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+        if (!trimmed.empty() && trimmed.back() == ';') {
+            trimmed.pop_back();
+            trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
+        }
+
+        if (trimmed.rfind("CALL", 0) != 0)
+            throw QueryParsingException("Expected CALL statement", 0, 0);
+
+        auto body = trimmed.substr(4); // after CALL
+        body.erase(0, body.find_first_not_of(" \t"));
+
+        if (body.rfind("project", 0) != 0)
+            throw QueryParsingException("Only project procedure supported", 0, 0);
+
+        auto open  = body.find('(');
+        auto close = body.rfind(')');
+        if (open == std::string::npos || close == std::string::npos || close <= open)
+            throw QueryParsingException("Malformed CALL syntax", 0, 0);
+
+        auto inside = body.substr(open + 1, close - open - 1);
+        std::vector<std::string> parts;
+        bool        in_str = false;
+        std::string cur;
+        char        prev = 0;
+        for (char c : inside) {
+            if (in_str) {
+                if (c == '"' && prev != '\\') {
+                    parts.push_back(cur);
+                    cur.clear();
+                    in_str = false;
+                } else {
+                    cur += c;
+                }
+            } else if (c == '"') {
+                in_str = true;
+            }
+            prev = c;
+        }
+        if (parts.size() != 3)
+            throw QueryParsingException("CALL project expects three string arguments", 0, 0);
+
+        return std::make_unique<OpProject>(parts[0], parts[1], parts[2]);
+    }
+
     static std::unique_ptr<Op> get_query_plan(const std::string& query)
     {
         auto trimmed = query;
@@ -27,33 +78,10 @@ public:
             trimmed.erase(trimmed.find_last_not_of(" \t\n\r") + 1);
         }
 
-        if (trimmed.rfind("CALL project", 0) == 0) {
-            auto open = trimmed.find('(');
-            auto close = trimmed.rfind(')');
-            if (open != std::string::npos && close != std::string::npos && close > open) {
-                auto inside = trimmed.substr(open + 1, close - open - 1);
-                std::vector<std::string> parts;
-                bool in_str = false; std::string cur; char prev = 0;
-                for (char c : inside) {
-                    if (in_str) {
-                        if (c == '"' && prev != '\\') {
-                            parts.push_back(cur);
-                            cur.clear();
-                            in_str = false;
-                        } else {
-                            cur += c;
-                        }
-                    } else if (c == '"') {
-                        in_str = true;
-                    }
-                    prev = c;
-                }
-                if (parts.size() == 3) {
-                    auto op = std::make_unique<OpProject>(parts[0], parts[1], parts[2]);
-                    logger(Category::LogicalPlan) << "Initial logical plan:\n" << *op;
-                    return op;
-                }
-            }
+        if (trimmed.rfind("CALL", 0) == 0) {
+            auto op = parse_call(trimmed);
+            logger(Category::LogicalPlan) << "Initial logical plan:\n" << *op;
+            return op;
         }
 
         std::string graph_name;
