@@ -3,6 +3,7 @@
 #include <chrono>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "query/optimizer/quad_model/executor_constructor.h"
 #include "query/parser/mql_query_parser.h"
@@ -47,74 +48,93 @@ std::vector<std::vector<std::string>> parse_tsv(const std::string& data) {
 std::unordered_map<std::string, std::shared_ptr<VirtualGraph>> graphs;
 
 static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
-                                                 const std::string& edge_query) {
+                                                 const std::string& edge_query)
+{
     auto vg = std::make_shared<VirtualGraph>();
 
-    // Nodes
-    auto node_exec = compile_query(node_query);
-    std::stringstream node_ss;
-    node_exec->execute(node_ss);
-    auto node_rows = parse_tsv(node_ss.str());
-    if (!node_rows.empty()) {
-        const auto& header = node_rows.front();
-        int id_idx = 0;
-        for (size_t i = 0; i < header.size(); ++i) {
-            if (header[i] == "id" || header[i] == "node") {
-                id_idx = i;
-                break;
+    // evaluate edges first to know the set of valid nodes
+    std::unordered_set<std::string> valid_nodes;
+    {
+        auto edge_exec = compile_query(edge_query);
+        std::stringstream edge_ss;
+        edge_exec->execute(edge_ss);
+        auto edge_rows = parse_tsv(edge_ss.str());
+        if (!edge_rows.empty()) {
+            const auto& header = edge_rows.front();
+            int from_idx = 0;
+            int to_idx = 1;
+            for (size_t i = 0; i < header.size(); ++i) {
+                if (header[i] == "from" || header[i] == "source")
+                    from_idx = i;
+                if (header[i] == "to" || header[i] == "target")
+                    to_idx = i;
             }
-        }
-        for (size_t i = 1; i < node_rows.size(); ++i) {
-            const auto& row = node_rows[i];
-            if (row.size() <= static_cast<size_t>(id_idx))
-                continue;
-            const std::string& node_id = row[id_idx];
-            auto it = vg->node_index.find(node_id);
-            if (it == vg->node_index.end()) {
-                size_t idx = vg->nodes.size();
-                vg->node_index.insert({ node_id, idx });
-                vg->nodes.push_back({ node_id, {} });
-                it = vg->node_index.find(node_id);
-            }
-            auto& props = vg->nodes[it->second].properties;
-            for (size_t j = 0; j < row.size(); ++j) {
-                if (j == static_cast<size_t>(id_idx))
+            for (size_t i = 1; i < edge_rows.size(); ++i) {
+                const auto& row = edge_rows[i];
+                if (row.size() <= static_cast<size_t>(std::max(from_idx, to_idx)))
                     continue;
-                if (j < header.size())
-                    props[header[j]] = row[j];
+                VirtualGraph::Edge e;
+                e.from = row[from_idx];
+                e.to = row[to_idx];
+                valid_nodes.insert(e.from);
+                valid_nodes.insert(e.to);
+                for (size_t j = 0; j < row.size(); ++j) {
+                    if (j == static_cast<size_t>(from_idx) || j == static_cast<size_t>(to_idx))
+                        continue;
+                    if (j < header.size())
+                        e.properties[header[j]] = row[j];
+                }
+                vg->edges.push_back(std::move(e));
             }
         }
     }
 
-    // Edges
-    auto edge_exec = compile_query(edge_query);
-    std::stringstream edge_ss;
-    edge_exec->execute(edge_ss);
-    auto edge_rows = parse_tsv(edge_ss.str());
-    if (!edge_rows.empty()) {
-        const auto& header = edge_rows.front();
-        int from_idx = 0;
-        int to_idx = 1;
-        for (size_t i = 0; i < header.size(); ++i) {
-            if (header[i] == "from" || header[i] == "source")
-                from_idx = i;
-            if (header[i] == "to" || header[i] == "target")
-                to_idx = i;
-        }
-        for (size_t i = 1; i < edge_rows.size(); ++i) {
-            const auto& row = edge_rows[i];
-            if (row.size() <= static_cast<size_t>(std::max(from_idx, to_idx)))
-                continue;
-            VirtualGraph::Edge e;
-            e.from = row[from_idx];
-            e.to = row[to_idx];
-            for (size_t j = 0; j < row.size(); ++j) {
-                if (j == static_cast<size_t>(from_idx) || j == static_cast<size_t>(to_idx))
-                    continue;
-                if (j < header.size())
-                    e.properties[header[j]] = row[j];
+    // parse nodes keeping only those referenced by edges
+    {
+        auto node_exec = compile_query(node_query);
+        std::stringstream node_ss;
+        node_exec->execute(node_ss);
+        auto node_rows = parse_tsv(node_ss.str());
+        if (!node_rows.empty()) {
+            const auto& header = node_rows.front();
+            int id_idx = 0;
+            for (size_t i = 0; i < header.size(); ++i) {
+                if (header[i] == "id" || header[i] == "node") {
+                    id_idx = i;
+                    break;
+                }
             }
-            vg->edges.push_back(std::move(e));
+            for (size_t i = 1; i < node_rows.size(); ++i) {
+                const auto& row = node_rows[i];
+                if (row.size() <= static_cast<size_t>(id_idx))
+                    continue;
+                const std::string& node_id = row[id_idx];
+                if (!valid_nodes.empty() && !valid_nodes.count(node_id))
+                    continue;
+                auto it = vg->node_index.find(node_id);
+                if (it == vg->node_index.end()) {
+                    size_t idx = vg->nodes.size();
+                    vg->node_index.insert({ node_id, idx });
+                    vg->nodes.push_back({ node_id, {} });
+                    it = vg->node_index.find(node_id);
+                }
+                auto& props = vg->nodes[it->second].properties;
+                for (size_t j = 0; j < row.size(); ++j) {
+                    if (j == static_cast<size_t>(id_idx))
+                        continue;
+                    if (j < header.size())
+                        props[header[j]] = row[j];
+                }
+            }
+        }
+    }
+
+    // ensure nodes referenced by edges exist even if not in node query
+    for (const auto& id : valid_nodes) {
+        if (vg->node_index.find(id) == vg->node_index.end()) {
+            size_t idx = vg->nodes.size();
+            vg->node_index.insert({ id, idx });
+            vg->nodes.push_back({ id, {} });
         }
     }
 
