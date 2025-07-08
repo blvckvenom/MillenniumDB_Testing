@@ -83,6 +83,12 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
                 VirtualGraph::Edge e;
                 e.from = row[from_idx];
                 e.to = row[to_idx];
+
+                // skip edges that reference internal edge identifiers
+                if ((e.from.size() > 1 && e.from[0] == '_' && e.from[1] == 'e') ||
+                    (e.to.size() > 1 && e.to[0] == '_' && e.to[1] == 'e'))
+                    continue;
+
                 valid_nodes.insert(e.from);
                 valid_nodes.insert(e.to);
 
@@ -120,6 +126,8 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
                 const std::string& node_id = row[id_idx];
                 if (!valid_nodes.empty() && !valid_nodes.count(node_id))
                     continue;
+                if (node_id.size() > 1 && node_id[0] == '_' && node_id[1] == 'e')
+                    continue; // skip internal edge identifiers
                 auto it = vg->node_index.find(node_id);
                 if (it == vg->node_index.end()) {
                     size_t idx = vg->nodes.size();
@@ -140,6 +148,8 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
 
     // ensure nodes referenced by edges exist even if not in node query
     for (const auto& id : valid_nodes) {
+        if (id.size() > 1 && id[0] == '_' && id[1] == 'e')
+            continue; // do not create nodes for internal edge ids
         if (vg->node_index.find(id) == vg->node_index.end()) {
             size_t idx = vg->nodes.size();
             vg->node_index.insert({ id, idx });
