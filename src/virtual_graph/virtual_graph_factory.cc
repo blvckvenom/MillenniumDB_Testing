@@ -61,29 +61,38 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
         auto edge_rows = parse_tsv(edge_ss.str());
         if (!edge_rows.empty()) {
             const auto& header = edge_rows.front();
-            int from_idx = 0;
-            int to_idx = 1;
+            // heuristically assume the first column is the source node and the
+            // last column is the target node. This matches the default RETURN
+            // order used by CALL project examples.
+            size_t from_idx = 0;
+            size_t to_idx = header.size() >= 3 ? 2 : 1;
+
+            // try to detect explicit column names
             for (size_t i = 0; i < header.size(); ++i) {
                 if (header[i] == "from" || header[i] == "source")
                     from_idx = i;
                 if (header[i] == "to" || header[i] == "target")
                     to_idx = i;
             }
+
             for (size_t i = 1; i < edge_rows.size(); ++i) {
                 const auto& row = edge_rows[i];
-                if (row.size() <= static_cast<size_t>(std::max(from_idx, to_idx)))
+                if (row.size() <= std::max(from_idx, to_idx))
                     continue;
+
                 VirtualGraph::Edge e;
                 e.from = row[from_idx];
                 e.to = row[to_idx];
                 valid_nodes.insert(e.from);
                 valid_nodes.insert(e.to);
+
                 for (size_t j = 0; j < row.size(); ++j) {
-                    if (j == static_cast<size_t>(from_idx) || j == static_cast<size_t>(to_idx))
+                    if (j == from_idx || j == to_idx)
                         continue;
                     if (j < header.size())
                         e.properties[header[j]] = row[j];
                 }
+
                 vg->edges.push_back(std::move(e));
             }
         }
