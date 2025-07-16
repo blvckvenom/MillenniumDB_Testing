@@ -947,7 +947,7 @@ Any QueryVisitor::visitProperty4(MQL_Parser::Property4Context* property)
     std::tuple<VarId, ObjectId, ObjectId, ObjectId>
         property_operation_tuple(saved_property_obj.get_var(), key_id, oid, QuadObjectId::get_value(op));
 
-    if (op == "==") {
+    if (op == "==" || op == "=") {
         property_expr.push_back(
             std::make_unique<ExprEquals>(std::move(expr_var_property), std::move(value_constant))
         );
@@ -1404,7 +1404,7 @@ Any QueryVisitor::visitComparisonExprOp(MQL_Parser::ComparisonExprOpContext* ctx
         auto saved_lhs = std::move(current_expr);
         ctx->additiveExpr()[1]->accept(this);
         auto op = ctx->op->getText();
-        if (op == "==") {
+        if (op == "==" || op == "=") {
             current_expr = std::make_unique<ExprEquals>(std::move(saved_lhs), std::move(current_expr));
         } else if (op == "!=") {
             current_expr = std::make_unique<ExprNotEquals>(std::move(saved_lhs), std::move(current_expr));
@@ -1462,6 +1462,39 @@ Any QueryVisitor::visitComparisonExprIs(MQL_Parser::ComparisonExprIsContext* ctx
         type,
         propertyTypeBitmap
     );
+
+    return 0;
+}
+
+Any QueryVisitor::visitComparisonExprIn(MQL_Parser::ComparisonExprInContext* ctx)
+{
+    ctx->additiveExpr()->accept(this);
+    auto lhs = std::move(current_expr);
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    for (auto fixed : ctx->nodeList()->fixedNodeInside()) {
+        auto oid = QuadObjectId::get_fixed_node_inside(fixed->getText());
+        exprs.push_back(std::make_unique<ExprConstant>(oid));
+    }
+
+    current_expr = std::make_unique<ExprIn>(std::move(lhs), std::move(exprs));
+
+    return 0;
+}
+
+Any QueryVisitor::visitComparisonExprNotIn(MQL_Parser::ComparisonExprNotInContext* ctx)
+{
+    ctx->additiveExpr()->accept(this);
+    auto lhs = std::move(current_expr);
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    for (auto fixed : ctx->nodeList()->fixedNodeInside()) {
+        auto oid = QuadObjectId::get_fixed_node_inside(fixed->getText());
+        exprs.push_back(std::make_unique<ExprConstant>(oid));
+    }
+
+    current_expr = std::make_unique<ExprIn>(std::move(lhs), std::move(exprs));
+    current_expr = std::make_unique<ExprNot>(std::move(current_expr));
 
     return 0;
 }

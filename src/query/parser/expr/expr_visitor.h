@@ -20,6 +20,7 @@ class ExprIs;
 class ExprLessOrEquals;
 class ExprLess;
 class ExprNotEquals;
+class ExprIn;
 class ExprAnd;
 class ExprNot;
 class ExprOr;
@@ -151,6 +152,7 @@ class ExprGreater;
 class ExprIs;
 class ExprLessOrEquals;
 class ExprNotEquals;
+class ExprIn;
 class ExprLess;
 class ExprLess;
 class ExprXor;
@@ -227,6 +229,7 @@ public:
     virtual void visit(MQL::ExprLessOrEquals&)    { throw LogicException("visit MQL::ExprLessOrEquals not implemented"); }
     virtual void visit(MQL::ExprLess&)            { throw LogicException("visit MQL::ExprLess not implemented"); }
     virtual void visit(MQL::ExprNotEquals&)       { throw LogicException("visit MQL::ExprNotEquals not implemented"); }
+    virtual void visit(MQL::ExprIn&)             { throw LogicException("visit MQL::ExprIn not implemented"); }
     virtual void visit(MQL::ExprAnd&)             { throw LogicException("visit MQL::ExprAnd not implemented"); }
     virtual void visit(MQL::ExprNot&)             { throw LogicException("visit MQL::ExprNot not implemented"); }
     virtual void visit(MQL::ExprOr&)              { throw LogicException("visit MQL::ExprOr not implemented"); }

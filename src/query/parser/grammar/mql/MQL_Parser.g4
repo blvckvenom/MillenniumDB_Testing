@@ -232,8 +232,10 @@ conditionalOrExpr: conditionalAndExpr (K_OR conditionalAndExpr)*;
 
 conditionalAndExpr: comparisonExpr (K_AND comparisonExpr)*;
 
-comparisonExpr: additiveExpr (op=('=='|'!='|'<'|'>'|'<='|'>=') additiveExpr)? # comparisonExprOp
+comparisonExpr: additiveExpr (op=('=='|'='|'!='|'<'|'>'|'<='|'>=') additiveExpr)? # comparisonExprOp
 |               additiveExpr K_IS K_NOT? exprTypename # comparisonExprIs
+|               additiveExpr K_IN nodeList           # comparisonExprIn
+|               additiveExpr K_NOT K_IN nodeList     # comparisonExprNotIn
 ;
 
 additiveExpr: multiplicativeExpr (op+=('+'|'-') multiplicativeExpr)*;
@@ -264,6 +266,8 @@ tensorDistance: K_TENSOR_DISTANCE '(' STRING ',' tensorDistanceReference ',' ten
 textSearch: K_TEXT_SEARCH '(' STRING ',' STRING ',' textSearchIndexMode ',' VARIABLE (',' VARIABLE)? ')';
 
 textSearchIndexMode: K_PREFIX | K_MATCH;
+
+nodeList: LSQUARE_BRACKET fixedNodeInside (COMMA fixedNodeInside)* RSQUARE_BRACKET;
 
 exprTypename: K_NULL
 |             K_STRING
@@ -296,6 +300,7 @@ K_ACYCLIC
 | K_FROM
 | K_INCOMING
 | K_INDEX
+| K_IN
 | K_INSERT
 | K_INTEGER
 | K_INTO

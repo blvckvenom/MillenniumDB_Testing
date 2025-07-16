@@ -24,6 +24,7 @@
 #include "query/parser/expr/mql/bool_expr/expr_comaprision/expr_less.h"              // IWYU pragma: export
 #include "query/parser/expr/mql/bool_expr/expr_comaprision/expr_less_or_equals.h"    // IWYU pragma: export
 #include "query/parser/expr/mql/bool_expr/expr_comaprision/expr_not_equals.h"        // IWYU pragma: export
+#include "query/parser/expr/mql/bool_expr/expr_comaprision/expr_in.h"               // IWYU pragma: export
 #include "query/parser/expr/mql/bool_expr/expr_not.h"                                // IWYU pragma: export
 #include "query/parser/expr/mql/bool_expr/expr_or.h"                                 // IWYU pragma: export
 #include "query/parser/expr/mql/function/expr_regex.h"                               // IWYU pragma: export

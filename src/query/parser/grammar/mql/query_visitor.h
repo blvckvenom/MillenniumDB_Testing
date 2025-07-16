@@ -154,6 +154,8 @@ public:
     virtual std::any visitConditionalAndExpr(MQL_Parser::ConditionalAndExprContext* ctx) override;
     virtual std::any visitComparisonExprOp(MQL_Parser::ComparisonExprOpContext* ctx) override;
     virtual std::any visitComparisonExprIs(MQL_Parser::ComparisonExprIsContext* ctx) override;
+    virtual std::any visitComparisonExprIn(MQL_Parser::ComparisonExprInContext* ctx) override;
+    virtual std::any visitComparisonExprNotIn(MQL_Parser::ComparisonExprNotInContext* ctx) override;
     virtual std::any visitAdditiveExpr(MQL_Parser::AdditiveExprContext* ctx) override;
     virtual std::any visitMultiplicativeExpr(MQL_Parser::MultiplicativeExprContext* ctx) override;
     virtual std::any visitUnaryExpr(MQL_Parser::UnaryExprContext* ctx) override;
