@@ -93,6 +93,20 @@ void BindingExprPrinter::visit(BindingExprNotEquals& expr) {
     os << ')';
 }
 
+void BindingExprPrinter::visit(BindingExprIn& expr) {
+    os << '(';
+    expr.lhs->accept_visitor(*this);
+    os << " IN [";
+    auto first = true;
+    for (auto& e : expr.rhs) {
+        if (!first) os << ", ";
+        first = false;
+        e->accept_visitor(*this);
+    }
+    os << "]";
+    os << ')';
+}
+
 
 void BindingExprPrinter::visit(BindingExprNot& expr) {
     os << "!";

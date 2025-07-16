@@ -27,6 +27,7 @@ public:
     void visit(BindingExprModulo&)         override;
     void visit(BindingExprMultiplication&) override;
     void visit(BindingExprNotEquals&)      override;
+    void visit(BindingExprIn&)             override;
     void visit(BindingExprNot&)            override;
     void visit(BindingExprOr&)             override;
     void visit(BindingExprSubtraction&)    override;
@@ -35,4 +36,4 @@ public:
     void visit(BindingExprRegex&)          override;
     void visit(BindingExprTensorDistance&) override;
 };
-} // namespace MQL
+} // namespace MQ

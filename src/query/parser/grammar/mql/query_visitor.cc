@@ -947,7 +947,7 @@ Any QueryVisitor::visitProperty4(MQL_Parser::Property4Context* property)
     std::tuple<VarId, ObjectId, ObjectId, ObjectId>
         property_operation_tuple(saved_property_obj.get_var(), key_id, oid, QuadObjectId::get_value(op));
 
-    if (op == "==") {
+    if (op == "==" || op == "=") {
         property_expr.push_back(
             std::make_unique<ExprEquals>(std::move(expr_var_property), std::move(value_constant))
         );
@@ -1404,7 +1404,7 @@ Any QueryVisitor::visitComparisonExprOp(MQL_Parser::ComparisonExprOpContext* ctx
         auto saved_lhs = std::move(current_expr);
         ctx->additiveExpr()[1]->accept(this);
         auto op = ctx->op->getText();
-        if (op == "==") {
+        if (op == "==" || op == "=") {
             current_expr = std::make_unique<ExprEquals>(std::move(saved_lhs), std::move(current_expr));
         } else if (op == "!=") {
             current_expr = std::make_unique<ExprNotEquals>(std::move(saved_lhs), std::move(current_expr));
