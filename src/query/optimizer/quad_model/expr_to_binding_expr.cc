@@ -26,6 +26,7 @@
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_multiplication.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_equals.h"
+#include "query/executor/binding_iter/binding_expr/mql/binding_expr_in.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_or.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_regex.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_subtraction.h"
@@ -232,6 +233,21 @@ void ExprToBindingExpr::visit(ExprNotEquals& expr)
     auto rhs_binding_expr = std::move(tmp);
 
     tmp = std::make_unique<BindingExprNotEquals>(std::move(lhs_binding_expr), std::move(rhs_binding_expr));
+}
+
+void ExprToBindingExpr::visit(ExprIn& expr)
+{
+    std::vector<std::unique_ptr<BindingExpr>> exprs;
+    exprs.reserve(expr.rhs.size());
+    for (auto& e : expr.rhs) {
+        e->accept_visitor(*this);
+        exprs.push_back(std::move(tmp));
+    }
+
+    expr.lhs->accept_visitor(*this);
+    auto lhs_binding_expr = std::move(tmp);
+
+    tmp = std::make_unique<BindingExprIn>(std::move(lhs_binding_expr), std::move(exprs));
 }
 
 void ExprToBindingExpr::visit(ExprAnd& expr)

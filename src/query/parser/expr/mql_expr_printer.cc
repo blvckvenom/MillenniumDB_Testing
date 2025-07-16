@@ -137,6 +137,18 @@ void ExprPrinter::visit(ExprNotEquals& expr) {
     os << ')' ;
 }
 
+void ExprPrinter::visit(ExprIn& expr) {
+    os << '(';
+    expr.lhs->accept_visitor(*this);
+    os << " IN [";
+    for (size_t i = 0; i < expr.rhs.size(); i++) {
+        if (i > 0) os << ", ";
+        expr.rhs[i]->accept_visitor(*this);
+    }
+    os << "]";
+    os << ')';
+}
+
 
 void ExprPrinter::visit(ExprAnd& expr) {
     os << '(';

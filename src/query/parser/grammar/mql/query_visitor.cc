@@ -1466,6 +1466,39 @@ Any QueryVisitor::visitComparisonExprIs(MQL_Parser::ComparisonExprIsContext* ctx
     return 0;
 }
 
+Any QueryVisitor::visitComparisonExprIn(MQL_Parser::ComparisonExprInContext* ctx)
+{
+    ctx->additiveExpr()->accept(this);
+    auto lhs = std::move(current_expr);
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    for (auto fixed : ctx->nodeList()->fixedNodeInside()) {
+        auto oid = QuadObjectId::get_fixed_node_inside(fixed->getText());
+        exprs.push_back(std::make_unique<ExprConstant>(oid));
+    }
+
+    current_expr = std::make_unique<ExprIn>(std::move(lhs), std::move(exprs));
+
+    return 0;
+}
+
+Any QueryVisitor::visitComparisonExprNotIn(MQL_Parser::ComparisonExprNotInContext* ctx)
+{
+    ctx->additiveExpr()->accept(this);
+    auto lhs = std::move(current_expr);
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    for (auto fixed : ctx->nodeList()->fixedNodeInside()) {
+        auto oid = QuadObjectId::get_fixed_node_inside(fixed->getText());
+        exprs.push_back(std::make_unique<ExprConstant>(oid));
+    }
+
+    current_expr = std::make_unique<ExprIn>(std::move(lhs), std::move(exprs));
+    current_expr = std::make_unique<ExprNot>(std::move(current_expr));
+
+    return 0;
+}
+
 Any QueryVisitor::visitAdditiveExpr(MQL_Parser::AdditiveExprContext* ctx)
 {
     auto multiplicativeExprs = ctx->multiplicativeExpr();

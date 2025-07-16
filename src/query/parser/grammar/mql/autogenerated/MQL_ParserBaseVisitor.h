@@ -327,6 +327,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitComparisonExprIn(MQL_Parser::ComparisonExprInContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitComparisonExprNotIn(MQL_Parser::ComparisonExprNotInContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitAdditiveExpr(MQL_Parser::AdditiveExprContext *ctx) override {
     return visitChildren(ctx);
   }
@@ -376,6 +384,10 @@ public:
   }
 
   virtual std::any visitTextSearchIndexMode(MQL_Parser::TextSearchIndexModeContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitNodeList(MQL_Parser::NodeListContext *ctx) override {
     return visitChildren(ctx);
   }
 

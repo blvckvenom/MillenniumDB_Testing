@@ -175,6 +175,10 @@ public:
 
     virtual std::any visitComparisonExprIs(MQL_Parser::ComparisonExprIsContext *context) = 0;
 
+    virtual std::any visitComparisonExprIn(MQL_Parser::ComparisonExprInContext *context) = 0;
+
+    virtual std::any visitComparisonExprNotIn(MQL_Parser::ComparisonExprNotInContext *context) = 0;
+
     virtual std::any visitAdditiveExpr(MQL_Parser::AdditiveExprContext *context) = 0;
 
     virtual std::any visitMultiplicativeExpr(MQL_Parser::MultiplicativeExprContext *context) = 0;
@@ -200,6 +204,8 @@ public:
     virtual std::any visitTextSearch(MQL_Parser::TextSearchContext *context) = 0;
 
     virtual std::any visitTextSearchIndexMode(MQL_Parser::TextSearchIndexModeContext *context) = 0;
+
+    virtual std::any visitNodeList(MQL_Parser::NodeListContext *context) = 0;
 
     virtual std::any visitExprTypename(MQL_Parser::ExprTypenameContext *context) = 0;
 
