@@ -79,3 +79,5 @@
 #include "query/executor/binding_iter/paths/experimental/dijkstra_check.h" // IWYU pragma: keep
 #include "query/executor/binding_iter/paths/experimental/dijkstra_enum.h"  // IWYU pragma: keep
 #include "query/executor/binding_iter/paths/unfixed_composite.h"           // IWYU pragma: keep
+#include "query/executor/binding_iter/virtual_graph/node_scan.h" // IWYU pragma: keep
+#include "query/executor/binding_iter/virtual_graph/edge_scan.h" // IWYU pragma: keep

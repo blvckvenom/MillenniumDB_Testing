@@ -210,7 +210,15 @@ build/Release/bin/mdb-server data/example-rdf-database
 
 Execute a Query
 --------------------------------------------------------------------------------
-Go to http://localhost:4321/
+Open http://localhost:4321/browser/ to access the web console.
+```
+CALL project("demo", "MATCH (n) RETURN n", "MATCH (a)-[r]->(b) RETURN a, r, b")
+```
+The same command is available via the CLI:
+```
+build/Release/bin/mdb-cli data/example-rdf-database
+```
+and then type the query when prompted.
 
 Remove the Database
 --------------------------------------------------------------------------------
