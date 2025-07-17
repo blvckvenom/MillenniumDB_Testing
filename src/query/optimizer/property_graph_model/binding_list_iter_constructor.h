@@ -25,6 +25,7 @@ public:
     void visit(OpQueryStatements& op) override;
     void visit(OpFilterStatement& op) override;
     void visit(OpLet& op) override;
+    void visit(OpCallSubquery& op) override;
     void visit(OpOrderBy&) override;
     void visit(OpOrderByStatement&) override;
 

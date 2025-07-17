@@ -14,6 +14,8 @@
 #include "query/executor/binding_iter/gql/repetition.h"
 #include "query/executor/binding_iter/gql/union_path.h"
 #include "query/executor/binding_iter/index_nested_loop_join.h"
+#include "query/executor/binding_iter/index_left_outer_join.h"
+#include "query/executor/binding_iter/subquery_call.h"
 #include "query/executor/binding_iter/object_enum.h"
 #include "query/executor/binding_iter/order_by.h"
 #include "query/executor/binding_iter/set_variable_value.h"
@@ -233,6 +235,47 @@ void PathBindingIterConstructor::visit(OpLet& op_let)
         );
     } else {
         tmp_iter = std::make_unique<SetVariableValues>(std::move(binding_exprs));
+    }
+}
+
+void PathBindingIterConstructor::visit(OpCallSubquery& op_call)
+{
+    PathBindingIterConstructor sub_visitor;
+    op_call.subquery->accept_visitor(sub_visitor);
+    auto sub_iter = std::move(sub_visitor.tmp_iter);
+
+    std::vector<VarId> projection_vars;
+    if (auto qs = dynamic_cast<OpQueryStatements*>(op_call.subquery.get())) {
+        for (auto& o : qs->ops) {
+            if (auto ret = dynamic_cast<OpReturn*>(o.get())) {
+                auto vars = ret->get_expr_vars();
+                projection_vars.insert(projection_vars.end(), vars.begin(), vars.end());
+            }
+        }
+    }
+
+    auto rhs_vars = projection_vars;
+    auto call_iter = std::make_unique<SubqueryCall>(
+        std::move(sub_iter),
+        std::move(projection_vars),
+        op_call.imported_vars
+    );
+
+    if (tmp_iter != nullptr) {
+        if (op_call.optional) {
+            tmp_iter = std::make_unique<IndexLeftOuterJoin>(
+                std::move(tmp_iter),
+                std::move(call_iter),
+                std::move(rhs_vars)
+            );
+        } else {
+            tmp_iter = std::make_unique<IndexNestedLoopJoin>(
+                std::move(tmp_iter),
+                std::move(call_iter)
+            );
+        }
+    } else {
+        tmp_iter = std::move(call_iter);
     }
 }
 

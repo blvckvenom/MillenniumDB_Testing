@@ -10,6 +10,7 @@ The main objective of this project is to create a fully functional and easy-to-e
   - Property Graphs with a single edge label and directed edges only, with a custom Cypher-like language (we call this Quad Model or QM in the docs).
 
   - Property Graphs specified by the GQL Standard (undirected edges, 0-N edge labels), with an early implementation of GQL, still missing a lot of functionality and optimizations.
+  - Support for executing subqueries via `CALL { ... }` with optional variable import and `OPTIONAL CALL` semantics.
 
 This project is still in active development and is not production ready yet, some functionality is missing and there may be bugs.
 

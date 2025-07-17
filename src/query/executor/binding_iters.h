@@ -81,5 +81,6 @@
 #include "query/executor/binding_iter/slice.h" // IWYU pragma: keep
 #include "query/executor/binding_iter/sparql_service.h" // IWYU pragma: keep
 #include "query/executor/binding_iter/sub_select.h" // IWYU pragma: keep
+#include "query/executor/binding_iter/subquery_call.h" // IWYU pragma: keep
 #include "query/executor/binding_iter/union.h" // IWYU pragma: keep
 #include "query/executor/binding_iter/values.h" // IWYU pragma: keep
