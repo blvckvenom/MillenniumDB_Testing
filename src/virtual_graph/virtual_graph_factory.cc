@@ -109,7 +109,8 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, 
             // last column is the target node. This matches the default RETURN
             // order used by CALL project examples.
             size_t from_idx = 0;
-            size_t to_idx = header.size() >= 3 ? 2 : 1;
+            size_t to_idx   = header.size() >= 3 ? 2 : 1;
+            size_t type_idx = 1;
 
             // try to detect explicit column names
             for (size_t i = 0; i < header.size(); ++i) {
@@ -117,6 +118,8 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, 
                     from_idx = i;
                 if (header[i] == "to" || header[i] == "target")
                     to_idx = i;
+                if (header[i] == "type" || header[i] == "label")
+                    type_idx = i;
             }
 
             for (size_t i = 1; i < edge_rows.size(); ++i) {
@@ -126,7 +129,9 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, 
 
                 VirtualGraph::Edge e;
                 e.from = row[from_idx];
-                e.to = row[to_idx];
+                e.to   = row[to_idx];
+                if (row.size() > type_idx)
+                    e.type = row[type_idx];
 
                 // skip edges that reference internal edge identifiers
                 if ((e.from.size() > 1 && e.from[0] == '_' && e.from[1] == 'e')

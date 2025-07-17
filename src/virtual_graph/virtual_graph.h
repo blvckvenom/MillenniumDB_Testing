@@ -13,6 +13,7 @@ struct VirtualGraph {
     struct Edge {
         std::string from;
         std::string to;
+        std::string type;
         std::unordered_map<std::string, std::string> properties;
     };
 
