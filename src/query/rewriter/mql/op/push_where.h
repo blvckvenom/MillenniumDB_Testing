@@ -72,6 +72,7 @@ public:
     void visit(ExprDivision&) override;
     void visit(ExprModulo&) override;
     void visit(ExprMultiplication&) override;
+    void visit(ExprIn&) override;
     void visit(ExprSubtraction&) override;
     void visit(ExprUnaryMinus&) override;
     void visit(ExprUnaryPlus&) override;

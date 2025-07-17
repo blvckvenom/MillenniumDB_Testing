@@ -83,6 +83,7 @@ public:
     void visit(ExprLessOrEquals&) override;
     void visit(ExprLess&) override;
     void visit(ExprNotEquals&) override;
+    void visit(ExprIn&) override;
     void visit(ExprAnd&) override;
     void visit(ExprNot&) override;
     void visit(ExprOr&) override;

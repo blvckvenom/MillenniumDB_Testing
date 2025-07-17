@@ -281,6 +281,14 @@ void CheckVarNamesExpr::visit(ExprNotEquals& expr)
     expr.rhs->accept_visitor(*this);
 }
 
+void CheckVarNamesExpr::visit(ExprIn& expr)
+{
+    expr.lhs->accept_visitor(*this);
+    for (auto& e : expr.rhs) {
+        e->accept_visitor(*this);
+    }
+}
+
 void CheckVarNamesExpr::visit(ExprUnaryMinus& expr)
 {
     expr.expr->accept_visitor(*this);

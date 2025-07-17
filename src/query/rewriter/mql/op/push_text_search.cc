@@ -135,6 +135,11 @@ void PushTextSearchExpr::visit(ExprMultiplication&)
 {
     can_remove = false;
 }
+
+void PushTextSearchExpr::visit(ExprIn&)
+{
+    can_remove = false;
+}
 void PushTextSearchExpr::visit(ExprNot&)
 {
     can_remove = false;

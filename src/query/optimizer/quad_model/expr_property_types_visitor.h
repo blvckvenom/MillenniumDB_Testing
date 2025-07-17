@@ -43,6 +43,7 @@ public:
     virtual void visit(MQL::ExprLessOrEquals&) override { }
     virtual void visit(MQL::ExprLess&) override { }
     virtual void visit(MQL::ExprNotEquals&) override { }
+    virtual void visit(MQL::ExprIn&) override { }
     virtual void visit(MQL::ExprNot&) override { }
 
     virtual void visit(MQL::ExprAggAvg&) override { }

@@ -76,6 +76,7 @@ public:
     void visit(ExprLessOrEquals&) override;
     void visit(ExprModulo&) override;
     void visit(ExprMultiplication&) override;
+    void visit(ExprIn&) override;
     void visit(ExprNot&) override;
     void visit(ExprNotEquals&) override;
     void visit(ExprOr&) override;
