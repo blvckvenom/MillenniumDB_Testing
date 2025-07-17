@@ -54,6 +54,7 @@ TEST_SUITES: list[str] = [
     "order_by_statement",
     "datetime",
     "path_binding",
+    "call_subquery",
 ]
 
 # Tests with the following query files fill be ignored

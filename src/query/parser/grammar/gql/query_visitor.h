@@ -93,6 +93,7 @@ public:
     std::unique_ptr<Expr> current_expr;
 
     std::vector<std::unique_ptr<Expr>> current_expr_list;
+    std::vector<VarId> current_var_list;
 
     std::any visitPrimitiveQueryStatement(GQLParser::PrimitiveQueryStatementContext* ctx) override;
     std::any visitSimpleLinearDataAccessingStatement(GQLParser::SimpleLinearDataAccessingStatementContext* ctx
@@ -213,6 +214,15 @@ public:
     std::any visitGqlCountAllFunction(GQLParser::GqlCountAllFunctionContext*) override;
     std::any visitGqlGeneralSetFunction(GQLParser::GqlGeneralSetFunctionContext* ctx) override;
     std::any visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunctionContext* ctx) override;
+
+    // Subquery CALL
+    std::any visitCallProcedureStatement(GQLParser::CallProcedureStatementContext* ctx) override;
+    std::any visitProcedureCall(GQLParser::ProcedureCallContext* ctx) override;
+    std::any visitInlineProcedureCall(GQLParser::InlineProcedureCallContext* ctx) override;
+    std::any visitVariableScopeClause(GQLParser::VariableScopeClauseContext* ctx) override;
+    std::any visitBindingVariableReferenceList(GQLParser::BindingVariableReferenceListContext* ctx) override;
+    std::any visitNestedProcedureSpecification(GQLParser::NestedProcedureSpecificationContext* ctx) override;
+    std::any visitProcedureSpecification(GQLParser::ProcedureSpecificationContext* ctx) override;
 
     std::any visitFilterStatement(GQLParser::FilterStatementContext* ctx) override;
 };

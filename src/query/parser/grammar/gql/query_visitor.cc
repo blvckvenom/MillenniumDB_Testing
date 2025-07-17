@@ -1490,6 +1490,84 @@ std::any QueryVisitor::visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunction
     return 0;
 }
 
+std::any QueryVisitor::visitCallProcedureStatement(GQLParser::CallProcedureStatementContext* ctx)
+{
+    LOG_VISITOR
+    bool is_optional = ctx->OPTIONAL() != nullptr;
+    visit(ctx->procedureCall());
+    auto op = dynamic_cast<OpCallSubquery*>(current_op.get());
+    if (op) {
+        op->optional = is_optional;
+    }
+    return 0;
+}
+
+std::any QueryVisitor::visitProcedureCall(GQLParser::ProcedureCallContext* ctx)
+{
+    LOG_VISITOR
+    if (ctx->inlineProcedureCall()) {
+        visit(ctx->inlineProcedureCall());
+    } else {
+        throw NotSupportedException("Named procedure calls are not supported");
+    }
+    return 0;
+}
+
+std::any QueryVisitor::visitInlineProcedureCall(GQLParser::InlineProcedureCallContext* ctx)
+{
+    LOG_VISITOR
+    std::vector<VarId> imported;
+    if (ctx->variableScopeClause()) {
+        visit(ctx->variableScopeClause());
+        imported = std::move(current_var_list);
+    }
+
+    QueryVisitor visitor;
+    visitor.visit(ctx->nestedProcedureSpecification());
+    current_op = std::make_unique<OpCallSubquery>(
+        std::move(visitor.current_op),
+        std::move(imported),
+        false
+    );
+    return 0;
+}
+
+std::any QueryVisitor::visitVariableScopeClause(GQLParser::VariableScopeClauseContext* ctx)
+{
+    LOG_VISITOR
+    current_var_list.clear();
+    if (ctx->bindingVariableReferenceList()) {
+        visit(ctx->bindingVariableReferenceList());
+    }
+    return 0;
+}
+
+std::any QueryVisitor::visitBindingVariableReferenceList(GQLParser::BindingVariableReferenceListContext* ctx)
+{
+    LOG_VISITOR
+    for (auto var_ctx : ctx->bindingVariableReference()) {
+        std::string name = var_ctx->getText();
+        current_var_list.push_back(get_query_ctx().get_or_create_var(name));
+    }
+    return 0;
+}
+
+std::any QueryVisitor::visitNestedProcedureSpecification(GQLParser::NestedProcedureSpecificationContext* ctx)
+{
+    LOG_VISITOR
+    QueryVisitor visitor;
+    visitor.visit(ctx->procedureSpecification());
+    current_op = std::move(visitor.current_op);
+    return 0;
+}
+
+std::any QueryVisitor::visitProcedureSpecification(GQLParser::ProcedureSpecificationContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->procedureBody());
+    return 0;
+}
+
 std::any QueryVisitor::visitPropertyReference(GQLParser::PropertyReferenceContext* ctx)
 {
     LOG_VISITOR

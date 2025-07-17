@@ -23,6 +23,7 @@ class OpFilterStatement;
 class OpLet;
 class OpOrderByStatement;
 class OpQueryStatements;
+class OpCallSubquery;
 
 class OpVisitor {
 public:
@@ -107,6 +108,10 @@ public:
     virtual void visit(OpQueryStatements&)
     {
         throw LogicException("visit GQL::OpQueryStatements not implemented");
+    }
+    virtual void visit(OpCallSubquery&)
+    {
+        throw LogicException("visit GQL::OpCallSubquery not implemented");
     }
 };
 } // namespace GQL
