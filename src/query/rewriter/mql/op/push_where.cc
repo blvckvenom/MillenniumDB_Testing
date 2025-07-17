@@ -119,6 +119,7 @@ void PushWhereExpr::visit(ExprAddition&)        { can_remove = false; }
 void PushWhereExpr::visit(ExprDivision&)        { can_remove = false; }
 void PushWhereExpr::visit(ExprModulo&)          { can_remove = false; }
 void PushWhereExpr::visit(ExprMultiplication&)  { can_remove = false; }
+void PushWhereExpr::visit(ExprIn&)             { can_remove = false; }
 void PushWhereExpr::visit(ExprSubtraction&)     { can_remove = false; }
 void PushWhereExpr::visit(ExprUnaryMinus&)      { can_remove = false; }
 void PushWhereExpr::visit(ExprUnaryPlus&)       { can_remove = false; }

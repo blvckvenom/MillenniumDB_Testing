@@ -12,7 +12,8 @@
 
 namespace {
 
-std::unique_ptr<QueryExecutor> compile_query(const std::string& query) {
+std::unique_ptr<QueryExecutor> compile_query(const std::string& query)
+{
     auto version_scope = buffer_manager.init_version_readonly();
 
     static thread_local QueryContext qc;
@@ -25,7 +26,8 @@ std::unique_ptr<QueryExecutor> compile_query(const std::string& query) {
     return std::move(ctor.executor);
 }
 
-std::vector<std::vector<std::string>> parse_tsv(const std::string& data) {
+std::vector<std::vector<std::string>> parse_tsv(const std::string& data)
+{
     std::vector<std::vector<std::string>> rows;
     std::stringstream ss(data);
     std::string line;
@@ -47,13 +49,55 @@ std::vector<std::vector<std::string>> parse_tsv(const std::string& data) {
 
 std::unordered_map<std::string, std::shared_ptr<VirtualGraph>> graphs;
 
-static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
-                                                 const std::string& edge_query)
+static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, const std::string& edge_query)
 {
     auto vg = std::make_shared<VirtualGraph>();
 
-    // evaluate edges first to know the set of valid nodes
-    std::unordered_set<std::string> valid_nodes;
+    // first evaluate node query to know allowed nodes
+    std::unordered_set<std::string> allowed_nodes;
+    {
+        auto node_exec = compile_query(node_query);
+        std::stringstream node_ss;
+        node_exec->execute(node_ss);
+        auto node_rows = parse_tsv(node_ss.str());
+        if (!node_rows.empty()) {
+            const auto& header = node_rows.front();
+            int id_idx = 0;
+            for (size_t i = 0; i < header.size(); ++i) {
+                if (header[i] == "id" || header[i] == "node") {
+                    id_idx = i;
+                    break;
+                }
+            }
+            for (size_t i = 1; i < node_rows.size(); ++i) {
+                const auto& row = node_rows[i];
+                if (row.size() <= static_cast<size_t>(id_idx))
+                    continue;
+                const std::string& node_id = row[id_idx];
+                if (node_id.size() > 1 && node_id[0] == '_' && node_id[1] == 'e')
+                    continue; // skip internal edge identifiers
+
+                allowed_nodes.insert(node_id);
+
+                auto it = vg->node_index.find(node_id);
+                if (it == vg->node_index.end()) {
+                    size_t idx = vg->nodes.size();
+                    vg->node_index.insert({ node_id, idx });
+                    vg->nodes.push_back({ node_id, {} });
+                    it = vg->node_index.find(node_id);
+                }
+                auto& props = vg->nodes[it->second].properties;
+                for (size_t j = 0; j < row.size(); ++j) {
+                    if (j == static_cast<size_t>(id_idx))
+                        continue;
+                    if (j < header.size())
+                        props[header[j]] = row[j];
+                }
+            }
+        }
+    }
+
+    // evaluate edges keeping only those within allowed nodes
     {
         auto edge_exec = compile_query(edge_query);
         std::stringstream edge_ss;
@@ -85,12 +129,14 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
                 e.to = row[to_idx];
 
                 // skip edges that reference internal edge identifiers
-                if ((e.from.size() > 1 && e.from[0] == '_' && e.from[1] == 'e') ||
-                    (e.to.size() > 1 && e.to[0] == '_' && e.to[1] == 'e'))
+                if ((e.from.size() > 1 && e.from[0] == '_' && e.from[1] == 'e')
+                    || (e.to.size() > 1 && e.to[0] == '_' && e.to[1] == 'e'))
                     continue;
 
-                valid_nodes.insert(e.from);
-                valid_nodes.insert(e.to);
+                if (!allowed_nodes.empty()) {
+                    if (!allowed_nodes.count(e.from) || !allowed_nodes.count(e.to))
+                        continue; // skip edges that go outside allowed nodes
+                }
 
                 for (size_t j = 0; j < row.size(); ++j) {
                     if (j == from_idx || j == to_idx)
@@ -104,77 +150,25 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query,
         }
     }
 
-    // parse nodes keeping only those referenced by edges
-    {
-        auto node_exec = compile_query(node_query);
-        std::stringstream node_ss;
-        node_exec->execute(node_ss);
-        auto node_rows = parse_tsv(node_ss.str());
-        if (!node_rows.empty()) {
-            const auto& header = node_rows.front();
-            int id_idx = 0;
-            for (size_t i = 0; i < header.size(); ++i) {
-                if (header[i] == "id" || header[i] == "node") {
-                    id_idx = i;
-                    break;
-                }
-            }
-            for (size_t i = 1; i < node_rows.size(); ++i) {
-                const auto& row = node_rows[i];
-                if (row.size() <= static_cast<size_t>(id_idx))
-                    continue;
-                const std::string& node_id = row[id_idx];
-                if (!valid_nodes.empty() && !valid_nodes.count(node_id))
-                    continue;
-                if (node_id.size() > 1 && node_id[0] == '_' && node_id[1] == 'e')
-                    continue; // skip internal edge identifiers
-                auto it = vg->node_index.find(node_id);
-                if (it == vg->node_index.end()) {
-                    size_t idx = vg->nodes.size();
-                    vg->node_index.insert({ node_id, idx });
-                    vg->nodes.push_back({ node_id, {} });
-                    it = vg->node_index.find(node_id);
-                }
-                auto& props = vg->nodes[it->second].properties;
-                for (size_t j = 0; j < row.size(); ++j) {
-                    if (j == static_cast<size_t>(id_idx))
-                        continue;
-                    if (j < header.size())
-                        props[header[j]] = row[j];
-                }
-            }
-        }
-    }
-
-    // ensure nodes referenced by edges exist even if not in node query
-    for (const auto& id : valid_nodes) {
-        if (id.size() > 1 && id[0] == '_' && id[1] == 'e')
-            continue; // do not create nodes for internal edge ids
-        if (vg->node_index.find(id) == vg->node_index.end()) {
-            size_t idx = vg->nodes.size();
-            vg->node_index.insert({ id, idx });
-            vg->nodes.push_back({ id, {} });
-        }
-    }
-
     return vg;
 }
 
 std::shared_ptr<VirtualGraph> VirtualGraphFactory::project(
     const std::string& name,
     const std::string& node_query,
-    const std::string& edge_query) {
+    const std::string& edge_query
+)
+{
     auto g = run_project(node_query, edge_query);
     graphs[name] = g;
     return g;
 }
 
-std::shared_ptr<VirtualGraph> VirtualGraphFactory::get(const std::string& name) {
+std::shared_ptr<VirtualGraph> VirtualGraphFactory::get(const std::string& name)
+{
     auto it = graphs.find(name);
     if (it != graphs.end()) {
         return it->second;
     }
     return nullptr;
 }
-
-
