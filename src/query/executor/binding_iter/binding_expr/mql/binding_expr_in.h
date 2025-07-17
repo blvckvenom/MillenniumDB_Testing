@@ -19,23 +19,23 @@ public:
     ObjectId eval(const Binding& binding) override
     {
         auto lhs_oid = lhs->eval(binding);
-        auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
 
-        if (lhs_generic == ObjectId::MASK_EDGE || lhs_type == ObjectId::MASK_EDGE_LABEL)
+        // skip bindings that are not real nodes
+        if (lhs_type != ObjectId::MASK_NODE)
             return ObjectId::get_null();
 
         bool compatible = false;
         for (auto& expr : rhs) {
             auto rhs_oid = expr->eval(binding);
-            auto rhs_generic = rhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
             auto rhs_type = rhs_oid.id & ObjectId::TYPE_MASK;
 
-            if (rhs_generic == lhs_generic && rhs_type == lhs_type) {
-                compatible = true;
-                if (lhs_oid == rhs_oid) {
-                    return ObjectId(ObjectId::BOOL_TRUE);
-                }
+            if (rhs_type != ObjectId::MASK_NODE)
+                continue;
+
+            compatible = true;
+            if (lhs_oid == rhs_oid) {
+                return ObjectId(ObjectId::BOOL_TRUE);
             }
         }
 
