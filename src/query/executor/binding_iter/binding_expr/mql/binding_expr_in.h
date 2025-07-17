@@ -11,21 +11,35 @@ public:
     std::unique_ptr<BindingExpr> lhs;
     std::vector<std::unique_ptr<BindingExpr>> rhs;
 
-    BindingExprIn(std::unique_ptr<BindingExpr> lhs,
-                  std::vector<std::unique_ptr<BindingExpr>> rhs) :
-        lhs(std::move(lhs)), rhs(std::move(rhs)) { }
+    BindingExprIn(std::unique_ptr<BindingExpr> lhs, std::vector<std::unique_ptr<BindingExpr>> rhs) :
+        lhs(std::move(lhs)),
+        rhs(std::move(rhs))
+    { }
 
-    ObjectId eval(const Binding& binding) override {
+    ObjectId eval(const Binding& binding) override
+    {
         auto lhs_oid = lhs->eval(binding);
+        auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
+
+        bool compatible = false;
         for (auto& expr : rhs) {
-            if (lhs_oid == expr->eval(binding)) {
-                return ObjectId(ObjectId::BOOL_TRUE);
+            auto rhs_oid = expr->eval(binding);
+            if ((rhs_oid.id & ObjectId::GENERIC_TYPE_MASK) == lhs_generic) {
+                compatible = true;
+                if (lhs_oid == rhs_oid) {
+                    return ObjectId(ObjectId::BOOL_TRUE);
+                }
             }
+        }
+
+        if (!compatible) {
+            return ObjectId::get_null();
         }
         return ObjectId(ObjectId::BOOL_FALSE);
     }
 
-    void accept_visitor(BindingExprVisitor& visitor) override {
+    void accept_visitor(BindingExprVisitor& visitor) override
+    {
         visitor.visit(*this);
     }
 };
