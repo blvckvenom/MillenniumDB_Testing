@@ -28,6 +28,7 @@ public:
     void visit(BindingExprMultiplication&) override;
     void visit(BindingExprNotEquals&)      override;
     void visit(BindingExprIn&)             override;
+    void visit(BindingExprNotIn&)          override;
     void visit(BindingExprNot&)            override;
     void visit(BindingExprOr&)             override;
     void visit(BindingExprSubtraction&)    override;

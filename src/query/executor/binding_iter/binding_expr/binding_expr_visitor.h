@@ -17,6 +17,7 @@ class BindingExprModulo;
 class BindingExprMultiplication;
 class BindingExprNotEquals;
 class BindingExprIn;
+class BindingExprNotIn;
 class BindingExprNot;
 class BindingExprOr;
 class BindingExprSubtraction;
@@ -173,6 +174,7 @@ public:
     virtual void visit(MQL::BindingExprMultiplication&) { throw LogicException("visits MQL::BindingExprMultiplication not implemented"); }
     virtual void visit(MQL::BindingExprNotEquals&)      { throw LogicException("visits MQL::BindingExprNotEquals not implemented"); }
     virtual void visit(MQL::BindingExprIn&)             { throw LogicException("visits MQL::BindingExprIn not implemented"); }
+    virtual void visit(MQL::BindingExprNotIn&)          { throw LogicException("visits MQL::BindingExprNotIn not implemented"); }
     virtual void visit(MQL::BindingExprNot&)            { throw LogicException("visits MQL::BindingExprNot not implemented"); }
     virtual void visit(MQL::BindingExprOr&)             { throw LogicException("visits MQL::BindingExprOr not implemented"); }
     virtual void visit(MQL::BindingExprSubtraction&)    { throw LogicException("visits MQL::BindingExprSubtraction not implemented"); }
