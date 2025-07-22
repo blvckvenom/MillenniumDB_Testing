@@ -27,6 +27,7 @@
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_equals.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_in.h"
+#include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_in.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_or.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_regex.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_subtraction.h"
@@ -34,6 +35,7 @@
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_unary_minus.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_unary_plus.h"
 #include "query/parser/expr/mql_exprs.h"
+#include "query/parser/expr/sparql_exprs.h"
 
 using namespace MQL;
 
@@ -287,6 +289,30 @@ void ExprToBindingExpr::visit(ExprAnd& expr)
 
 void ExprToBindingExpr::visit(ExprNot& expr)
 {
+    if (auto* in_expr = dynamic_cast<ExprIn*>(expr.expr.get())) {
+        std::vector<std::unique_ptr<BindingExpr>> exprs;
+        exprs.reserve(in_expr->rhs.size());
+        for (auto& e : in_expr->rhs) {
+            e->accept_visitor(*this);
+            exprs.push_back(std::move(tmp));
+        }
+        in_expr->lhs->accept_visitor(*this);
+        auto lhs_binding_expr = std::move(tmp);
+        tmp = std::make_unique<BindingExprNotIn>(std::move(lhs_binding_expr), std::move(exprs));
+        return;
+    } else if (auto* in_expr = dynamic_cast<SPARQL::ExprIn*>(expr.expr.get())) {
+        std::vector<std::unique_ptr<BindingExpr>> exprs;
+        exprs.reserve(in_expr->exprs.size());
+        for (auto& e : in_expr->exprs) {
+            e->accept_visitor(*this);
+            exprs.push_back(std::move(tmp));
+        }
+        in_expr->lhs_expr->accept_visitor(*this);
+        auto lhs_binding_expr = std::move(tmp);
+        tmp = std::make_unique<BindingExprNotIn>(std::move(lhs_binding_expr), std::move(exprs));
+        return;
+    }
+
     expr.expr->accept_visitor(*this);
     auto potential_expr_term = dynamic_cast<BindingExprTerm*>(tmp.get());
 

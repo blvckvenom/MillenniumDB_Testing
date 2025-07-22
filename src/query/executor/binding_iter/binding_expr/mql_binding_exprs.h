@@ -10,6 +10,7 @@
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not.h"            // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_equals.h"     // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_in.h"            // IWYU pragma: export
+#include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_in.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_or.h"             // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_regex.h"          // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_subtraction.h"    // IWYU pragma: export
