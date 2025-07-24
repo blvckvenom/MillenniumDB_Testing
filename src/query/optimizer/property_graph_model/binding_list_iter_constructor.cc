@@ -7,6 +7,7 @@
 #include "query/executor/binding_iter/distinct_hash.h"
 #include "query/executor/binding_iter/expr_evaluator.h"
 #include "query/executor/binding_iter/filter.h"
+#include "query/executor/binding_iter/gql/call_binding_iter.h"
 #include "query/executor/binding_iter/gql/check_repeated_variable.h"
 #include "query/executor/binding_iter/gql/extend_right.h"
 #include "query/executor/binding_iter/gql/linear_pattern_path.h"
@@ -506,4 +507,48 @@ void PathBindingIterConstructor::visit(OpProperty& op_property)
             op_property.property.value
         ));
     }
+}
+
+// CALL statement implementations
+
+void PathBindingIterConstructor::visit(OpCallNamed& op_call_named)
+{
+    // Prepare arguments as vector of unique_ptr<Expr>
+    std::vector<std::unique_ptr<Expr>> arguments;
+    for (const auto& arg : op_call_named.get_arguments()) {
+        // Si arg es unique_ptr<Expr>, clónalo o muévelo
+        arguments.push_back(arg->clone());
+    }
+    
+    // Extract yield variable IDs
+    std::vector<VarId> yield_vars;
+    for (const auto& yield_item : op_call_named.get_yield_items()) {
+        yield_vars.push_back(yield_item.var_id);
+    }
+    
+    // Create the CallNamedBindingIter
+    tmp_iter = std::make_unique<CallNamedBindingIter>(
+        op_call_named.get_procedure_name(),
+        std::move(arguments),
+        std::move(yield_vars)
+    );
+}
+
+void PathBindingIterConstructor::visit(OpCallInline& op_call_inline)
+{
+    // First, create a binding iterator for the subquery
+    PathBindingIterConstructor subquery_constructor;
+    op_call_inline.get_subquery()->accept_visitor(subquery_constructor);
+    
+    // Extract yield variable IDs
+    std::vector<VarId> yield_vars;
+    for (const auto& yield_item : op_call_inline.get_yield_items()) {
+        yield_vars.push_back(yield_item.var_id);
+    }
+    
+    // Create the CallInlineBindingIter
+    tmp_iter = std::make_unique<CallInlineBindingIter>(
+        std::move(subquery_constructor.tmp_iter),
+        std::move(yield_vars)
+    );
 }

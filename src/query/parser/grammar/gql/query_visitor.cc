@@ -10,7 +10,7 @@
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
 
-// #define DEBUG_GQL_QUERY_VISITOR
+#define DEBUG_GQL_QUERY_VISITOR
 
 #ifdef DEBUG_GQL_QUERY_VISITOR
 
@@ -1998,4 +1998,173 @@ uint64_t QueryVisitor::get_unsigned_integer(std::string& integer_str)
         }
     }
     return std::stoull(integer_str);
+}
+
+// CALL statement implementations
+
+std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx)
+{
+    LOG_VISITOR
+    return visit(ctx->callProcedureStatement());
+}
+
+std::any QueryVisitor::visitCallProcedureStatement(GQLParser::CallProcedureStatementContext* ctx)
+{
+    LOG_VISITOR
+    bool is_optional = ctx->OPTIONAL() != nullptr;
+    
+    auto result = visit(ctx->procedureCall());
+    
+    // The result should be either OpCallNamed or OpCallInline
+    // We need to set the optional flag
+    if (result.type() == typeid(std::shared_ptr<OpCallNamed>)) {
+        auto original = std::any_cast<std::shared_ptr<OpCallNamed>>(result);
+        current_op = std::make_unique<OpCallNamed>(
+            original->get_procedure_name(),
+            std::move(original->arguments),
+            std::move(original->yield_items),
+            is_optional
+        );
+    } else if (result.type() == typeid(std::shared_ptr<OpCallInline>)) {
+        auto original = std::any_cast<std::shared_ptr<OpCallInline>>(result);
+        current_op = std::make_unique<OpCallInline>(
+            std::move(original->subquery),
+            std::move(original->yield_items),
+            std::move(original->scope_vars),
+            is_optional
+        );
+    }
+    
+    return 0;
+}
+
+std::any QueryVisitor::visitProcedureCall(GQLParser::ProcedureCallContext* ctx)
+{
+    LOG_VISITOR
+    if (ctx->namedProcedureCall()) {
+        return visit(ctx->namedProcedureCall());
+    } else if (ctx->inlineProcedureCall()) {
+        return visit(ctx->inlineProcedureCall());
+    }
+    return 0;
+}
+
+std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallContext* ctx)
+{
+    LOG_VISITOR
+    
+    // Extract procedure name
+    std::string procedure_name;
+    if (ctx->procedureReference()) {
+        // For now, we'll extract the text representation
+        // TODO: Properly parse catalogProcedureParentAndName
+        procedure_name = ctx->procedureReference()->getText();
+    }
+    
+    // Extract arguments
+    std::vector<std::unique_ptr<Expr>> arguments;
+    if (ctx->procedureArgumentList()) {
+        for (auto* arg_ctx : ctx->procedureArgumentList()->procedureArgument()) {
+            visit(arg_ctx->expression());
+            arguments.push_back(std::move(current_expr));
+        }
+    }
+    
+    // Extract yield items
+    std::vector<OpCall::YieldItem> yield_items;
+    if (ctx->yieldClause()) {
+        auto result = visit(ctx->yieldClause());
+        if (result.has_value()) {
+            yield_items = std::any_cast<std::vector<OpCall::YieldItem>>(result);
+        }
+    }
+    
+    auto call_op = std::make_shared<OpCallNamed>(
+        std::move(procedure_name),
+        std::move(arguments),
+        std::move(yield_items),
+        false  // Optional flag will be set in visitCallProcedureStatement
+    );
+    return std::any(call_op);
+}
+
+std::any QueryVisitor::visitInlineProcedureCall(GQLParser::InlineProcedureCallContext* ctx)
+{
+    LOG_VISITOR
+    
+    // Extract scope variables if present
+    std::vector<VarId> scope_vars;
+    if (ctx->variableScopeClause()) {
+        auto result = visit(ctx->variableScopeClause());
+        if (result.has_value()) {
+            scope_vars = std::any_cast<std::vector<VarId>>(result);
+        }
+    }
+    
+    // Extract subquery from nestedProcedureSpecification
+    std::unique_ptr<Op> subquery;
+    if (ctx->nestedProcedureSpecification()) {
+        // Visit the procedure specification inside the braces
+        visit(ctx->nestedProcedureSpecification()->procedureSpecification());
+        subquery = std::move(current_op);
+    }
+    
+    auto call_op = std::make_shared<OpCallInline>(
+        std::move(subquery),
+        std::vector<OpCall::YieldItem>{}, // yield_items handled in parent
+        std::move(scope_vars),
+        false  // Optional flag will be set in visitCallProcedureStatement
+    );
+    return std::any(call_op);
+}
+
+std::any QueryVisitor::visitYieldClause(GQLParser::YieldClauseContext* ctx)
+{
+    LOG_VISITOR
+    
+    std::vector<OpCall::YieldItem> yield_items;
+    
+    if (ctx->yieldItemList()) {
+        for (auto* item_ctx : ctx->yieldItemList()->yieldItem()) {
+            std::string field_name;
+            
+            // Extract field name
+            if (item_ctx->yieldItemName() && item_ctx->yieldItemName()->fieldName()) {
+                field_name = item_ctx->yieldItemName()->fieldName()->getText();
+            }
+            
+            // Extract alias if present, otherwise use field name as variable name
+            VarId var_id(0); // Initialize with 0, will be overwritten
+            if (item_ctx->yieldItemAlias()) {
+                std::string alias = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                bool found;
+                var_id = get_query_ctx().get_var(alias, &found);
+            } else {
+                bool found;
+                var_id = get_query_ctx().get_var(field_name, &found);
+            }
+            
+            yield_items.emplace_back(std::move(field_name), var_id);
+        }
+    }
+    
+    return yield_items;
+}
+
+std::any QueryVisitor::visitVariableScopeClause(GQLParser::VariableScopeClauseContext* ctx)
+{
+    LOG_VISITOR
+    
+    std::vector<VarId> scope_vars;
+    if (ctx->bindingVariableReferenceList()) {
+        for (auto* ref_ctx : ctx->bindingVariableReferenceList()->bindingVariableReference()) {
+            // Extract variable name and get VarId
+            std::string var_name = ref_ctx->getText();
+            bool found;
+            VarId var_id = get_query_ctx().get_var(var_name, &found);
+            scope_vars.push_back(var_id);
+        }
+    }
+    
+    return scope_vars;
 }

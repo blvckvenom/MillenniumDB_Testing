@@ -1,0 +1,8 @@
+[  1%] Building CXX object CMakeFiles/millenniumdb.dir/src/query/executor/binding_iter/gql/call_binding_iter.cc.o
+/mnt/c/Users/benit/Desktop/MilleniumDB Practica/MillenniumDB_Testing/src/query/executor/binding_iter/gql/call_binding_iter.cc:5:10: fatal error: storage/index/hash/object_file_hash.h: No such file or directory
+    5 | #include "storage/index/hash/object_file_hash.h"
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+compilation terminated.
+gmake[2]: *** [CMakeFiles/millenniumdb.dir/build.make:958: CMakeFiles/millenniumdb.dir/src/query/executor/binding_iter/gql/call_binding_iter.cc.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:116: CMakeFiles/millenniumdb.dir/all] Error 2
+gmake: *** [Makefile:146: all] Error 2

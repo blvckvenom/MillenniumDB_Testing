@@ -650,8 +650,8 @@ int CLI::Init() {
         cat.second.enabled = false;
     }
 
-    setlocale(LC_ALL, "en_US.UTF-8");
-    std::locale::global(std::locale("en_US.UTF-8"));
+    setlocale(LC_ALL, "");
+    std::locale::global(std::locale(""));
 
     if (initscr() == nullptr) {
         std::cerr << "Curses initscr() failed";

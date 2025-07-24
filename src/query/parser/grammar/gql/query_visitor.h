@@ -9,6 +9,7 @@
 #include "query/parser/op/gql/graph_pattern/op_repetition.h"
 #include "query/parser/op/gql/graph_pattern/path_mode.h"
 #include "query/parser/op/gql/op.h"
+#include "query/parser/op/gql/op_call.h"
 #include "query/parser/op/gql/op_let.h"
 #include "query/parser/op/gql/op_return.h"
 #include "query/var_id.h"
@@ -215,5 +216,14 @@ public:
     std::any visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunctionContext* ctx) override;
 
     std::any visitFilterStatement(GQLParser::FilterStatementContext* ctx) override;
+    
+    // CALL statement visitors
+    std::any visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx) override;
+    std::any visitCallProcedureStatement(GQLParser::CallProcedureStatementContext* ctx) override;
+    std::any visitProcedureCall(GQLParser::ProcedureCallContext* ctx) override;
+    std::any visitNamedProcedureCall(GQLParser::NamedProcedureCallContext* ctx) override;
+    std::any visitInlineProcedureCall(GQLParser::InlineProcedureCallContext* ctx) override;
+    std::any visitYieldClause(GQLParser::YieldClauseContext* ctx) override;
+    std::any visitVariableScopeClause(GQLParser::VariableScopeClauseContext* ctx) override;
 };
 } // namespace GQL

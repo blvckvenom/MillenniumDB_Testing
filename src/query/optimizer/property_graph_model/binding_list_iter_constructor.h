@@ -5,9 +5,11 @@
 #include "query/executor/binding_iter.h"
 #include "query/executor/binding_iter/aggregation/agg.h"
 #include "query/executor/binding_iter/gql/path_binding_iter.h"
+#include "query/executor/binding_iter/gql/call_binding_iter.h"
 #include "query/optimizer/plan/plan.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/op/gql/graph_pattern/op_optional_properties.h"
+#include "query/parser/op/gql/op_call.h"
 #include "query/parser/op/gql/op_visitor.h"
 
 namespace GQL {
@@ -44,6 +46,10 @@ public:
     void visit(OpEdgeLabel&) override;
     void visit(OpEdge&) override;
     void visit(OpProperty&) override;
+    
+    // CALL statement visitors
+    void visit(OpCallNamed&) override;
+    void visit(OpCallInline&) override;
 
     std::unique_ptr<BindingIter> tmp_iter;
 
