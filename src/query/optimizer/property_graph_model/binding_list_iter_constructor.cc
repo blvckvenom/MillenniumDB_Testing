@@ -533,7 +533,8 @@ void PathBindingIterConstructor::visit(OpCallNamed& op_call_named)
         op_call_named.get_procedure_name(),
         std::move(arguments),
         std::move(yield_vars),
-        std::move(yield_fields)
+        std::move(yield_fields),
+        op_call_named.get_is_optional()
     );
 }
 
@@ -552,6 +553,7 @@ void PathBindingIterConstructor::visit(OpCallInline& op_call_inline)
     // Create the CallInlineBindingIter
     tmp_iter = std::make_unique<CallInlineBindingIter>(
         std::move(subquery_constructor.tmp_iter),
-        std::move(yield_vars)
+        std::move(yield_vars),
+        op_call_inline.get_is_optional()
     );
 }

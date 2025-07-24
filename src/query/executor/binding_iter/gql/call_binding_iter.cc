@@ -9,16 +9,19 @@ CallNamedBindingIter::CallNamedBindingIter(
     const std::string& procedure_name,
     const std::vector<std::unique_ptr<Expr>>& arguments,
     const std::vector<VarId>& yield_vars,
-    const std::vector<std::string>& yield_fields
+    const std::vector<std::string>& yield_fields,
+    bool is_optional
 ) :
     procedure_name(procedure_name)
 {
     this->yield_vars = yield_vars;
     this->yield_fields = yield_fields;
+    this->is_optional = is_optional;
     // Clone arguments
     for (const auto& arg : arguments) {
         this->arguments.push_back(arg->clone());
     }
+    returned_null_row = false;
 }
 
 void CallNamedBindingIter::print(std::ostream& os, int indent, bool stats) const
@@ -38,6 +41,8 @@ void CallNamedBindingIter::_begin(Binding& parent_binding)
     result_count = 0;
     exhausted = false;
     procedure_results.clear();
+    executed = false;
+    returned_null_row = false;
 }
 
 bool CallNamedBindingIter::_next()
@@ -46,7 +51,8 @@ bool CallNamedBindingIter::_next()
         return false;
     }
 
-    if (current_result_index == 0) {
+    if (!executed) {
+        executed = true;
         // First call - execute the procedure
         if (procedure_name == "db.labels") {
             execute_db_labels();
@@ -56,6 +62,20 @@ bool CallNamedBindingIter::_next()
             execute_db_relationship_types();
         } else {
             // Unknown procedure
+            exhausted = true;
+            return false;
+        }
+
+        if (procedure_results.empty() && is_optional) {
+            if (!returned_null_row) {
+                for (auto var : yield_vars) {
+                    parent_binding->add(var, ObjectId::get_null());
+                }
+                returned_null_row = true;
+                exhausted = true;
+                result_count++;
+                return true;
+            }
             exhausted = true;
             return false;
         }
@@ -80,6 +100,16 @@ bool CallNamedBindingIter::_next()
         return true;
     }
 
+    if (is_optional && !returned_null_row && result_count == 0) {
+        for (auto var : yield_vars) {
+            parent_binding->add(var, ObjectId::get_null());
+        }
+        returned_null_row = true;
+        exhausted = true;
+        result_count++;
+        return true;
+    }
+
     exhausted = true;
     return false;
 }
@@ -97,6 +127,8 @@ void CallNamedBindingIter::_reset()
     result_count = 0;
     exhausted = false;
     procedure_results.clear();
+    executed = false;
+    returned_null_row = false;
 }
 
 void CallNamedBindingIter::execute_db_labels()
@@ -125,11 +157,14 @@ void CallNamedBindingIter::execute_db_relationship_types()
 
 CallInlineBindingIter::CallInlineBindingIter(
     std::unique_ptr<BindingIter> subquery_iter,
-    const std::vector<VarId>& yield_vars
+    const std::vector<VarId>& yield_vars,
+    bool is_optional
 ) :
     subquery_iter(std::move(subquery_iter))
 {
     this->yield_vars = yield_vars;
+    this->is_optional = is_optional;
+    returned_null_row = false;
 }
 
 void CallInlineBindingIter::print(std::ostream& os, int indent, bool stats) const
@@ -148,6 +183,7 @@ void CallInlineBindingIter::_begin(Binding& parent_binding)
     this->parent_binding = &parent_binding;
     result_count = 0;
     exhausted = false;
+    returned_null_row = false;
     if (subquery_iter) {
         subquery_iter->begin(parent_binding);
     }
@@ -160,6 +196,19 @@ bool CallInlineBindingIter::_next()
     }
 
     if (subquery_iter && subquery_iter->next()) {
+        result_count++;
+        return true;
+    }
+
+    if (is_optional && !returned_null_row && result_count == 0) {
+        for (auto var : yield_vars) {
+            parent_binding->add(var, ObjectId::get_null());
+        }
+        if (subquery_iter) {
+            subquery_iter->assign_nulls();
+        }
+        returned_null_row = true;
+        exhausted = true;
         result_count++;
         return true;
     }
@@ -182,6 +231,7 @@ void CallInlineBindingIter::_reset()
 {
     result_count = 0;
     exhausted = false;
+    returned_null_row = false;
     if (subquery_iter) {
         subquery_iter->reset();
     }
