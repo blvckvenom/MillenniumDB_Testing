@@ -53,13 +53,11 @@ private:
     std::string procedure_name;
     std::vector<std::unique_ptr<Expr>> arguments;
     std::vector<std::string> yield_fields;
-    std::vector<std::unordered_map<std::string, std::string>> procedure_results;
+    using ResultRow = std::unordered_map<std::string, ObjectId>;
+    std::vector<ResultRow> procedure_results;
     size_t current_result_index = 0;
     bool executed = false;
 
-    void execute_db_labels();
-    void execute_db_property_keys();
-    void execute_db_relationship_types();
 };
 
 class CallInlineBindingIter : public CallBindingIter {

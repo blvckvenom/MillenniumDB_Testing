@@ -3,6 +3,66 @@
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
 
+#include <algorithm>
+#include <functional>
+#include <unordered_set>
+
+namespace {
+
+using ResultRow = std::unordered_map<std::string, ObjectId>;
+using ResultSet = std::vector<ResultRow>;
+
+ResultSet proc_db_labels()
+{
+    ResultSet results;
+    results.reserve(gql_model.catalog.node_labels_str.size());
+    for (const auto& lbl : gql_model.catalog.node_labels_str) {
+        results.push_back({{"label", GQL::Conversions::pack_string_simple(lbl)}});
+    }
+    return results;
+}
+
+ResultSet proc_db_property_keys()
+{
+    std::unordered_set<std::string> keys;
+    keys.insert(gql_model.catalog.node_keys_str.begin(), gql_model.catalog.node_keys_str.end());
+    keys.insert(gql_model.catalog.edge_keys_str.begin(), gql_model.catalog.edge_keys_str.end());
+
+    ResultSet results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back({{"propertyKey", GQL::Conversions::pack_string_simple(key)}});
+    }
+    return results;
+}
+
+ResultSet proc_db_relationship_types()
+{
+    ResultSet results;
+    results.reserve(gql_model.catalog.edge_labels_str.size());
+    for (const auto& lbl : gql_model.catalog.edge_labels_str) {
+        results.push_back({{"relationshipType", GQL::Conversions::pack_string_simple(lbl)}});
+    }
+    return results;
+}
+
+struct ProcedureInfo {
+    std::vector<std::string> fields;
+    std::function<ResultSet()> impl;
+};
+
+const std::unordered_map<std::string, ProcedureInfo>& get_procedure_registry()
+{
+    static const std::unordered_map<std::string, ProcedureInfo> registry = {
+        {"db.labels", {{"label"}, proc_db_labels}},
+        {"db.propertyKeys", {{"propertyKey"}, proc_db_property_keys}},
+        {"db.relationshipTypes", {{"relationshipType"}, proc_db_relationship_types}}
+    };
+    return registry;
+}
+
+} // namespace
+
 namespace GQL {
 
 CallNamedBindingIter::CallNamedBindingIter(
@@ -53,18 +113,24 @@ bool CallNamedBindingIter::_next()
 
     if (!executed) {
         executed = true;
-        // First call - execute the procedure
-        if (procedure_name == "db.labels") {
-            execute_db_labels();
-        } else if (procedure_name == "db.propertyKeys") {
-            execute_db_property_keys();
-        } else if (procedure_name == "db.relationshipTypes") {
-            execute_db_relationship_types();
-        } else {
-            // Unknown procedure
+
+        auto& registry = get_procedure_registry();
+        auto it = registry.find(procedure_name);
+        if (it == registry.end()) {
             exhausted = true;
             return false;
         }
+
+        const auto& info = it->second;
+
+        for (const auto& field : yield_fields) {
+            if (std::find(info.fields.begin(), info.fields.end(), field) == info.fields.end()) {
+                throw QueryExecutionException(
+                    "Procedure `" + procedure_name + "` does not yield field `" + field + "`");
+            }
+        }
+
+        procedure_results = info.impl();
 
         if (procedure_results.empty() && is_optional) {
             if (!returned_null_row) {
@@ -88,10 +154,10 @@ bool CallNamedBindingIter::_next()
             if (i < yield_fields.size()) {
                 auto it = result.find(yield_fields[i]);
                 if (it != result.end()) {
-                    value = Conversions::pack_string_simple(it->second);
+                    value = it->second;
                 }
             } else if (result.size() == 1) {
-                value = Conversions::pack_string_simple(result.begin()->second);
+                value = result.begin()->second;
             }
             parent_binding->add(yield_vars[i], value);
         }
@@ -129,30 +195,6 @@ void CallNamedBindingIter::_reset()
     procedure_results.clear();
     executed = false;
     returned_null_row = false;
-}
-
-void CallNamedBindingIter::execute_db_labels()
-{
-    // Simple implementation - return some common labels
-    procedure_results.push_back({{"label", "Person"}});
-    procedure_results.push_back({{"label", "Company"}});
-    procedure_results.push_back({{"label", "Product"}});
-}
-
-void CallNamedBindingIter::execute_db_property_keys()
-{
-    // Simple implementation - return some common property keys
-    procedure_results.push_back({{"propertyKey", "name"}});
-    procedure_results.push_back({{"propertyKey", "age"}});
-    procedure_results.push_back({{"propertyKey", "id"}});
-}
-
-void CallNamedBindingIter::execute_db_relationship_types()
-{
-    // Simple implementation - return some common relationship types
-    procedure_results.push_back({{"relationshipType", "KNOWS"}});
-    procedure_results.push_back({{"relationshipType", "WORKS_FOR"}});
-    procedure_results.push_back({{"relationshipType", "BOUGHT"}});
 }
 
 CallInlineBindingIter::CallInlineBindingIter(
