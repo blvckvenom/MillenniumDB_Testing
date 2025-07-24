@@ -1,25 +1,28 @@
 #include "call_binding_iter.h"
 
-#include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/conversions.h"
+#include "graph_models/gql/gql_model.h"
 
 namespace GQL {
 
 CallNamedBindingIter::CallNamedBindingIter(
     const std::string& procedure_name,
     const std::vector<std::unique_ptr<Expr>>& arguments,
-    const std::vector<VarId>& yield_vars
+    const std::vector<VarId>& yield_vars,
+    const std::vector<std::string>& yield_fields
 ) :
     procedure_name(procedure_name)
 {
     this->yield_vars = yield_vars;
+    this->yield_fields = yield_fields;
     // Clone arguments
     for (const auto& arg : arguments) {
         this->arguments.push_back(arg->clone());
     }
 }
 
-void CallNamedBindingIter::print(std::ostream& os, int indent, bool stats) const {
+void CallNamedBindingIter::print(std::ostream& os, int indent, bool stats) const
+{
     os << std::string(indent, ' ') << "CallNamed(procedure: " << procedure_name;
     os << ", args: " << arguments.size();
     os << ", yields: " << yield_vars.size() << ")";
@@ -28,7 +31,8 @@ void CallNamedBindingIter::print(std::ostream& os, int indent, bool stats) const
     }
 }
 
-void CallNamedBindingIter::_begin(Binding& parent_binding) {
+void CallNamedBindingIter::_begin(Binding& parent_binding)
+{
     this->parent_binding = &parent_binding;
     current_result_index = 0;
     result_count = 0;
@@ -36,7 +40,8 @@ void CallNamedBindingIter::_begin(Binding& parent_binding) {
     procedure_results.clear();
 }
 
-bool CallNamedBindingIter::_next() {
+bool CallNamedBindingIter::_next()
+{
     if (exhausted) {
         return false;
     }
@@ -57,10 +62,18 @@ bool CallNamedBindingIter::_next() {
     }
 
     if (current_result_index < procedure_results.size()) {
-        // Assign result to yield variable
-        if (!yield_vars.empty()) {
-            ObjectId result_oid = Conversions::pack_string_simple(procedure_results[current_result_index]);
-            parent_binding->add(yield_vars[0], result_oid);
+        const auto& result = procedure_results[current_result_index];
+        for (size_t i = 0; i < yield_vars.size(); ++i) {
+            ObjectId value = ObjectId::get_null();
+            if (i < yield_fields.size()) {
+                auto it = result.find(yield_fields[i]);
+                if (it != result.end()) {
+                    value = Conversions::pack_string_simple(it->second);
+                }
+            } else if (result.size() == 1) {
+                value = Conversions::pack_string_simple(result.begin()->second);
+            }
+            parent_binding->add(yield_vars[i], value);
         }
         current_result_index++;
         result_count++;
@@ -71,38 +84,43 @@ bool CallNamedBindingIter::_next() {
     return false;
 }
 
-void CallNamedBindingIter::assign_nulls() {
+void CallNamedBindingIter::assign_nulls()
+{
     for (auto var : yield_vars) {
         parent_binding->add(var, ObjectId::get_null());
     }
 }
 
-void CallNamedBindingIter::_reset() {
+void CallNamedBindingIter::_reset()
+{
     current_result_index = 0;
     result_count = 0;
     exhausted = false;
     procedure_results.clear();
 }
 
-void CallNamedBindingIter::execute_db_labels() {
+void CallNamedBindingIter::execute_db_labels()
+{
     // Simple implementation - return some common labels
-    procedure_results.push_back("Person");
-    procedure_results.push_back("Company");
-    procedure_results.push_back("Product");
+    procedure_results.push_back({{"label", "Person"}});
+    procedure_results.push_back({{"label", "Company"}});
+    procedure_results.push_back({{"label", "Product"}});
 }
 
-void CallNamedBindingIter::execute_db_property_keys() {
+void CallNamedBindingIter::execute_db_property_keys()
+{
     // Simple implementation - return some common property keys
-    procedure_results.push_back("name");
-    procedure_results.push_back("age");
-    procedure_results.push_back("id");
+    procedure_results.push_back({{"propertyKey", "name"}});
+    procedure_results.push_back({{"propertyKey", "age"}});
+    procedure_results.push_back({{"propertyKey", "id"}});
 }
 
-void CallNamedBindingIter::execute_db_relationship_types() {
+void CallNamedBindingIter::execute_db_relationship_types()
+{
     // Simple implementation - return some common relationship types
-    procedure_results.push_back("KNOWS");
-    procedure_results.push_back("WORKS_FOR");
-    procedure_results.push_back("BOUGHT");
+    procedure_results.push_back({{"relationshipType", "KNOWS"}});
+    procedure_results.push_back({{"relationshipType", "WORKS_FOR"}});
+    procedure_results.push_back({{"relationshipType", "BOUGHT"}});
 }
 
 CallInlineBindingIter::CallInlineBindingIter(
@@ -114,7 +132,8 @@ CallInlineBindingIter::CallInlineBindingIter(
     this->yield_vars = yield_vars;
 }
 
-void CallInlineBindingIter::print(std::ostream& os, int indent, bool stats) const {
+void CallInlineBindingIter::print(std::ostream& os, int indent, bool stats) const
+{
     os << std::string(indent, ' ') << "CallInline(yields: " << yield_vars.size() << ")";
     if (stats) {
         print_generic_stats(os, indent + 2);
@@ -124,7 +143,8 @@ void CallInlineBindingIter::print(std::ostream& os, int indent, bool stats) cons
     }
 }
 
-void CallInlineBindingIter::_begin(Binding& parent_binding) {
+void CallInlineBindingIter::_begin(Binding& parent_binding)
+{
     this->parent_binding = &parent_binding;
     result_count = 0;
     exhausted = false;
@@ -133,7 +153,8 @@ void CallInlineBindingIter::_begin(Binding& parent_binding) {
     }
 }
 
-bool CallInlineBindingIter::_next() {
+bool CallInlineBindingIter::_next()
+{
     if (exhausted) {
         return false;
     }
@@ -147,7 +168,8 @@ bool CallInlineBindingIter::_next() {
     return false;
 }
 
-void CallInlineBindingIter::assign_nulls() {
+void CallInlineBindingIter::assign_nulls()
+{
     for (auto var : yield_vars) {
         parent_binding->add(var, ObjectId::get_null());
     }
@@ -156,7 +178,8 @@ void CallInlineBindingIter::assign_nulls() {
     }
 }
 
-void CallInlineBindingIter::_reset() {
+void CallInlineBindingIter::_reset()
+{
     result_count = 0;
     exhausted = false;
     if (subquery_iter) {

@@ -520,17 +520,20 @@ void PathBindingIterConstructor::visit(OpCallNamed& op_call_named)
         arguments.push_back(arg->clone());
     }
     
-    // Extract yield variable IDs
+    // Extract yield variable IDs and field names
     std::vector<VarId> yield_vars;
+    std::vector<std::string> yield_fields;
     for (const auto& yield_item : op_call_named.get_yield_items()) {
         yield_vars.push_back(yield_item.var_id);
+        yield_fields.push_back(yield_item.field_name);
     }
     
     // Create the CallNamedBindingIter
     tmp_iter = std::make_unique<CallNamedBindingIter>(
         op_call_named.get_procedure_name(),
         std::move(arguments),
-        std::move(yield_vars)
+        std::move(yield_vars),
+        std::move(yield_fields)
     );
 }
 
