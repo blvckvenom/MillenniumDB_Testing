@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "query/executor/binding_iter.h"
 #include "query/parser/op/gql/op_call.h"
@@ -33,7 +34,8 @@ public:
     CallNamedBindingIter(
         const std::string& procedure_name,
         const std::vector<std::unique_ptr<Expr>>& arguments,
-        const std::vector<VarId>& yield_vars
+        const std::vector<VarId>& yield_vars,
+        const std::vector<std::string>& yield_fields
     );
 
     void print(std::ostream& os, int indent, bool stats) const override;
@@ -47,7 +49,8 @@ protected:
 private:
     std::string procedure_name;
     std::vector<std::unique_ptr<Expr>> arguments;
-    std::vector<std::string> procedure_results;
+    std::vector<std::string> yield_fields;
+    std::vector<std::unordered_map<std::string, std::string>> procedure_results;
     size_t current_result_index = 0;
 
     void execute_db_labels();
