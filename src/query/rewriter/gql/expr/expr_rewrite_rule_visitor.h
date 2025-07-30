@@ -354,7 +354,19 @@ public:
 
     void visit(GQL::ExprSubStr& expr) override
     {
-        visit_expr_with_expr<ExprSubStr>(expr);
+        for (auto& rule : rules) {
+            if (rule->is_possible_to_regroup(expr.expr)) {
+                expr.expr = rule->regroup(std::move(expr.expr));
+                has_rewritten = true;
+            }
+            if (rule->is_possible_to_regroup(expr.str_len)) {
+                expr.str_len = rule->regroup(std::move(expr.str_len));
+                has_rewritten = true;
+            }
+        }
+
+        expr.expr->accept_visitor(*this);
+        expr.str_len->accept_visitor(*this);
     }
 
     void visit(GQL::ExprSubtraction& expr) override
@@ -372,57 +384,57 @@ public:
         visit_expr_with_expr<ExprTanh>(expr);
     }
 
-    virtual void visit(GQL::ExprAggCount& expr) override
+    void visit(GQL::ExprAggCount& expr) override
     {
         visit_expr_with_expr<ExprAggCount>(expr);
     }
 
-    virtual void visit(GQL::ExprAggAvg& expr) override
+    void visit(GQL::ExprAggAvg& expr) override
     {
         visit_expr_with_expr<ExprAggAvg>(expr);
     }
 
-    virtual void visit(GQL::ExprAggMax& expr) override
+    void visit(GQL::ExprAggMax& expr) override
     {
         visit_expr_with_expr<ExprAggMax>(expr);
     }
 
-    virtual void visit(GQL::ExprAggMin& expr) override
+    void visit(GQL::ExprAggMin& expr) override
     {
         visit_expr_with_expr<ExprAggMin>(expr);
     }
 
-    virtual void visit(GQL::ExprAggSum& expr) override
+    void visit(GQL::ExprAggSum& expr) override
     {
         visit_expr_with_expr<ExprAggSum>(expr);
     }
 
-    virtual void visit(GQL::ExprAggStddevPop& expr) override
+    void visit(GQL::ExprAggStddevPop& expr) override
     {
         visit_expr_with_expr<ExprAggStddevPop>(expr);
     }
 
-    virtual void visit(GQL::ExprAggStddevSamp& expr) override
+    void visit(GQL::ExprAggStddevSamp& expr) override
     {
         visit_expr_with_expr<ExprAggStddevSamp>(expr);
     }
 
-    virtual void visit(GQL::ExprAggCollect& expr) override
+    void visit(GQL::ExprAggCollect& expr) override
     {
         visit_expr_with_expr<ExprAggCollect>(expr);
     }
 
-    virtual void visit(GQL::ExprAggPercentileCont& expr) override
+    void visit(GQL::ExprAggPercentileCont& expr) override
     {
         visit_expr_with_expr<ExprAggPercentileCont>(expr);
     }
 
-    virtual void visit(GQL::ExprAggPercentileDisc& expr) override
+    void visit(GQL::ExprAggPercentileDisc& expr) override
     {
         visit_expr_with_expr<ExprAggPercentileDisc>(expr);
     }
 
-    virtual void visit(GQL::ExprAggCountAll&) override { }
+    void visit(GQL::ExprAggCountAll&) override { }
     void visit(GQL::ExprTerm&) override { }
     void visit(GQL::ExprHasNodeLabel&) override { }
     void visit(GQL::ExprHasEdgeLabel&) override { }

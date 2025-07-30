@@ -17,5 +17,6 @@ public:
     void visit(OpLet&) override;
     void visit(OpOrderBy&) override;
     void visit(OpOrderByStatement&) override;
+    void visit(OpGroupBy&) override;
 };
 } // namespace GQL

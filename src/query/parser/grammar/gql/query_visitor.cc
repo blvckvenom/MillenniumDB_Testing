@@ -191,6 +191,11 @@ std::any QueryVisitor::visitReturnStatementBody(GQLParser::ReturnStatementBodyCo
     }
 
     if (ctx->ASTERISK()) {
+        if (ctx->groupByClause()) {
+            throw QuerySemanticException("A query that contains an asterisk (*) in the RETURN statement "
+                                         "cannot contain the GROUP BY clause");
+        }
+
         auto vars = current_op->get_all_vars();
         for (auto& var : vars) {
             std::string var_name = get_query_ctx().get_var_name(var);
@@ -202,6 +207,13 @@ std::any QueryVisitor::visitReturnStatementBody(GQLParser::ReturnStatementBodyCo
         }
     } else if (ctx->returnItemList()) {
         visit(ctx->returnItemList());
+    }
+
+    if (ctx->groupByClause()) {
+        visit(ctx->groupByClause()->groupingElementList());
+        if (!current_expr_list.empty()) {
+            current_op = std::make_unique<OpGroupBy>(std::move(current_op), std::move(current_expr_list));
+        }
     }
 
     current_op = std::make_unique<OpReturn>(std::move(current_op), std::move(return_items), distinct);
@@ -224,6 +236,17 @@ std::any QueryVisitor::visitReturnItemList(GQLParser::ReturnItemListContext* ctx
             alias = get_query_ctx().get_or_create_var(alias_str);
         }
         return_items.emplace_back(std::move(current_expr), alias);
+    }
+    return 0;
+}
+
+std::any QueryVisitor::visitGroupingElementList(GQLParser::GroupingElementListContext* ctx)
+{
+    LOG_VISITOR
+    current_expr_list.clear();
+    for (auto& elem : ctx->groupingElement()) {
+        VarId group_var = get_query_ctx().get_or_create_var(elem->getText());
+        current_expr_list.push_back(std::make_unique<ExprVar>(group_var));
     }
     return 0;
 }
@@ -1428,7 +1451,7 @@ std::any QueryVisitor::visitCastFunction(GQLParser::CastFunctionContext* ctx)
 std::any QueryVisitor::visitGqlCountAllFunction(GQLParser::GqlCountAllFunctionContext*)
 {
     LOG_VISITOR
-    current_expr = std::make_unique<ExprAggCountAll>();
+    current_expr = std::make_unique<ExprAggCountAll>(get_query_ctx().get_internal_var());
     return 0;
 }
 
@@ -1443,22 +1466,24 @@ std::any QueryVisitor::visitGqlGeneralSetFunction(GQLParser::GqlGeneralSetFuncti
         }
     }
 
+    VarId agg_var = get_query_ctx().get_internal_var();
+
     if (ctx->generalSetFunctionType()->COUNT()) {
-        current_expr = std::make_unique<ExprAggCount>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggCount>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->AVG()) {
-        current_expr = std::make_unique<ExprAggAvg>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggAvg>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->MAX()) {
-        current_expr = std::make_unique<ExprAggMax>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggMax>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->MIN()) {
-        current_expr = std::make_unique<ExprAggMin>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggMin>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->SUM()) {
-        current_expr = std::make_unique<ExprAggSum>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggSum>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->STDDEV_POP()) {
-        current_expr = std::make_unique<ExprAggStddevPop>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggStddevPop>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->STDDEV_SAMP()) {
-        current_expr = std::make_unique<ExprAggStddevSamp>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggStddevSamp>(std::move(current_expr), distinct, agg_var);
     } else if (ctx->generalSetFunctionType()->COLLECT()) {
-        current_expr = std::make_unique<ExprAggCollect>(std::move(current_expr), distinct);
+        current_expr = std::make_unique<ExprAggCollect>(std::move(current_expr), distinct, agg_var);
     }
     return 0;
 }
@@ -1478,17 +1503,21 @@ std::any QueryVisitor::visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunction
         }
     }
 
+    VarId agg_var = get_query_ctx().get_internal_var();
+
     if (ctx->binarySetFunctionType()->PERCENTILE_CONT()) {
         current_expr = std::make_unique<ExprAggPercentileCont>(
             std::move(expr),
             std::move(percentile),
-            distinct
+            distinct,
+            agg_var
         );
     } else if (ctx->binarySetFunctionType()->PERCENTILE_DISC()) {
         current_expr = std::make_unique<ExprAggPercentileDisc>(
             std::move(expr),
             std::move(percentile),
-            distinct
+            distinct,
+            agg_var
         );
     }
     return 0;

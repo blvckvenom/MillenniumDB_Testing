@@ -3,6 +3,7 @@
 #include "query/executor/binding_iter/aggregation/gql/aggs.h"
 #include "query/executor/binding_iter/binding_expr/gql_binding_exprs.h"
 #include "query/optimizer/property_graph_model/binding_list_iter_constructor.h"
+#include "query/parser/expr/gql/expr_printer.h"
 #include "query/parser/expr/gql/exprs.h"
 
 using namespace GQL;
@@ -10,6 +11,10 @@ using namespace GQL;
 void ExprToBindingExpr::visit(ExprVar& expr_var)
 {
     tmp = std::make_unique<BindingExprVar>(expr_var.id);
+
+    if (after_group) {
+        bic->group_saved_vars.insert(expr_var.id);
+    }
 }
 
 void ExprToBindingExpr::visit(ExprTerm& expr_term)
@@ -83,10 +88,14 @@ void ExprToBindingExpr::visit(ExprEquals& expr)
 
 void ExprToBindingExpr::visit(ExprProperty& expr)
 {
-    if (expr.type == VarType::Node) {
-        tmp = std::make_unique<BindingExprNodeProperty>(expr.object, expr.key, expr.value);
-    } else {
-        tmp = std::make_unique<BindingExprEdgeProperty>(expr.object, expr.key, expr.value);
+    tmp = std::make_unique<BindingExprVar>(expr.value);
+
+    if (bic != nullptr) {
+        bic->used_properties.emplace(expr, false);
+    }
+
+    if (after_group) {
+        bic->group_saved_vars.insert(expr.value);
     }
 }
 
@@ -514,72 +523,72 @@ void ExprToBindingExpr::visit(ExprCast& expr)
     tmp = std::make_unique<BindingExprCast>(std::move(tmp), std::move(expr.targetType));
 }
 
-void ExprToBindingExpr::visit(ExprAggCountAll&)
+void ExprToBindingExpr::visit(ExprAggCountAll& expr)
 {
-    check_and_make_aggregate<AggCountAll>(nullptr);
+    check_and_make_aggregate<AggCountAll>(nullptr, expr.var);
 }
 
 void ExprToBindingExpr::visit(ExprAggCount& expr)
 {
     if (expr.distinct) {
-        check_and_make_aggregate<AggCountDistinct>(expr.expr.get());
+        check_and_make_aggregate<AggCountDistinct>(expr.expr.get(), expr.var);
     } else {
-        check_and_make_aggregate<AggCount>(expr.expr.get());
+        check_and_make_aggregate<AggCount>(expr.expr.get(), expr.var);
     }
 }
 
 void ExprToBindingExpr::visit(ExprAggAvg& expr)
 {
     if (expr.distinct) {
-        check_and_make_aggregate<AggAvgDistinct>(expr.expr.get());
+        check_and_make_aggregate<AggAvgDistinct>(expr.expr.get(), expr.var);
     } else {
-        check_and_make_aggregate<AggAvg>(expr.expr.get());
+        check_and_make_aggregate<AggAvg>(expr.expr.get(), expr.var);
     }
 }
 
 void ExprToBindingExpr::visit(ExprAggMin& expr)
 {
-    check_and_make_aggregate<AggMin>(expr.expr.get());
+    check_and_make_aggregate<AggMin>(expr.expr.get(), expr.var);
 }
 
 void ExprToBindingExpr::visit(ExprAggMax& expr)
 {
-    check_and_make_aggregate<AggMax>(expr.expr.get());
+    check_and_make_aggregate<AggMax>(expr.expr.get(), expr.var);
 }
 
 void ExprToBindingExpr::visit(ExprAggSum& expr)
 {
     if (expr.distinct) {
-        check_and_make_aggregate<AggSumDistinct>(expr.expr.get());
+        check_and_make_aggregate<AggSumDistinct>(expr.expr.get(), expr.var);
     } else {
-        check_and_make_aggregate<AggSum>(expr.expr.get());
+        check_and_make_aggregate<AggSum>(expr.expr.get(), expr.var);
     }
 }
 
 void ExprToBindingExpr::visit(ExprAggStddevPop& expr)
 {
     if (expr.distinct) {
-        check_and_make_aggregate<AggStddevPopDistinct>(expr.expr.get());
+        check_and_make_aggregate<AggStddevPopDistinct>(expr.expr.get(), expr.var);
     } else {
-        check_and_make_aggregate<AggStddevPop>(expr.expr.get());
+        check_and_make_aggregate<AggStddevPop>(expr.expr.get(), expr.var);
     }
 }
 
 void ExprToBindingExpr::visit(ExprAggStddevSamp& expr)
 {
     if (expr.distinct) {
-        check_and_make_aggregate<AggStddevSampDistinct>(expr.expr.get());
+        check_and_make_aggregate<AggStddevSampDistinct>(expr.expr.get(), expr.var);
     } else {
-        check_and_make_aggregate<AggStddevSamp>(expr.expr.get());
+        check_and_make_aggregate<AggStddevSamp>(expr.expr.get(), expr.var);
     }
 }
 
 void ExprToBindingExpr::visit(ExprAggCollect& expr)
 {
     if (expr.distinct) {
-        check_and_make_aggregate<AggCollectDistinct>(expr.expr.get());
+        check_and_make_aggregate<AggCollectDistinct>(expr.expr.get(), expr.var);
     } else {
-        check_and_make_aggregate<AggCollect>(expr.expr.get());
+        check_and_make_aggregate<AggCollect>(expr.expr.get(), expr.var);
     }
 }
 
@@ -588,9 +597,13 @@ void ExprToBindingExpr::visit(ExprAggPercentileCont& expr)
     expr.percentile->accept_visitor(*this);
     auto percentile_expr = std::move(tmp);
     if (expr.distinct) {
-        check_and_make_aggregate<AggPercentileContDistinct>(expr.expr.get(), std::move(percentile_expr));
+        check_and_make_aggregate<AggPercentileContDistinct>(
+            expr.expr.get(),
+            expr.var,
+            std::move(percentile_expr)
+        );
     } else {
-        check_and_make_aggregate<AggPercentileCont>(expr.expr.get(), std::move(percentile_expr));
+        check_and_make_aggregate<AggPercentileCont>(expr.expr.get(), expr.var, std::move(percentile_expr));
     }
 }
 
@@ -599,14 +612,18 @@ void ExprToBindingExpr::visit(ExprAggPercentileDisc& expr)
     expr.percentile->accept_visitor(*this);
     auto percentile_expr = std::move(tmp);
     if (expr.distinct) {
-        check_and_make_aggregate<AggPercentileDiscDistinct>(expr.expr.get(), std::move(percentile_expr));
+        check_and_make_aggregate<AggPercentileDiscDistinct>(
+            expr.expr.get(),
+            expr.var,
+            std::move(percentile_expr)
+        );
     } else {
-        check_and_make_aggregate<AggPercentileDisc>(expr.expr.get(), std::move(percentile_expr));
+        check_and_make_aggregate<AggPercentileDisc>(expr.expr.get(), expr.var, std::move(percentile_expr));
     }
 }
 
 template<typename AggType, class... Args>
-void ExprToBindingExpr::check_and_make_aggregate(Expr* expr, Args&&... args)
+void ExprToBindingExpr::check_and_make_aggregate(Expr* expr, VarId var, Args&&... args)
 {
     if (bic == nullptr) {
         throw QuerySemanticException("Aggregation where it is not allowed");
@@ -618,17 +635,6 @@ void ExprToBindingExpr::check_and_make_aggregate(Expr* expr, Args&&... args)
         throw QuerySemanticException("Nested aggregations are not allowed");
     }
 
-    VarId var(0);
-    if (at_root && as_var.has_value()) {
-        // If we are at the root of the expression, and the expressions is associated with a variable
-        // (<expr> AS <var>), then we can avoid creating an unnecessary internal variable.
-        var = as_var.value();
-    } else {
-        // Otherwise we have to create an internal variable to associated with the aggregation.
-        var = get_query_ctx().get_internal_var();
-    }
-
-    at_root = false;
     inside_aggregation = true;
 
     std::unique_ptr<AggType> agg;

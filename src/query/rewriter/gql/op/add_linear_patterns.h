@@ -28,6 +28,7 @@ public:
     void visit(OpReturn&) override;
     void visit(OpLet&) override;
 
+    void visit(OpGroupBy&) override;
     void visit(OpOrderBy&) override;
     void visit(OpOrderByStatement&) override;
     void visit(OpFilter&) override;
