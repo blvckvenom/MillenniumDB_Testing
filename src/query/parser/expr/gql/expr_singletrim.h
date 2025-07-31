@@ -1,11 +1,14 @@
 #pragma once
 
+#include <string>
+
 #include "query/parser/expr/gql/expr.h"
 
 namespace GQL {
 class ExprSingleTrim : public Expr {
 public:
     std::unique_ptr<Expr> str;
+    // single_char may be nullptr
     std::unique_ptr<Expr> single_char;
     std::string specification;
 

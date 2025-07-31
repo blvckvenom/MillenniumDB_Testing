@@ -2,8 +2,7 @@
 
 #include "query/parser/op/gql/ops.h"
 
-using namespace GQL;
-
+namespace GQL {
 class AddLinearPatterns : public OpVisitor {
 public:
     enum LinearType {
@@ -29,6 +28,7 @@ public:
     void visit(OpReturn&) override;
     void visit(OpLet&) override;
 
+    void visit(OpGroupBy&) override;
     void visit(OpOrderBy&) override;
     void visit(OpOrderByStatement&) override;
     void visit(OpFilter&) override;
@@ -40,3 +40,4 @@ public:
     void visit(OpNodeLabel&) override;
     void visit(OpEdgeLabel&) override;
 };
+} // namespace GQL
