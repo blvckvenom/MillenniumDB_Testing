@@ -1,13 +1,16 @@
 #pragma once
 
 #include "query/executor/binding_iter.h"
-
-using namespace GQL;
+#include "query/executor/binding_iter/binding_expr/binding_expr.h"
 
 class SetVariableValues : public BindingIter {
 public:
-    SetVariableValues(std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> items) :
-        items(std::move(items))
+    SetVariableValues(
+        std::unique_ptr<BindingIter> child,
+        std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> items
+    ) :
+        items(std::move(items)),
+        child(std::move(child))
     { }
 
     void print(std::ostream& os, int indent, bool stats) const override;
@@ -19,6 +22,6 @@ public:
     std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> items;
 
 private:
-    bool returned = false;
     Binding* parent_binding;
+    std::unique_ptr<BindingIter> child;
 };

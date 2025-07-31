@@ -19,8 +19,6 @@
 #include "system/string_manager.h"
 #include "system/tmp_manager.h"
 
-class BindingExprPrinter;
-
 struct ThreadInfo {
     bool interruption_requested = false;
 
@@ -54,9 +52,6 @@ public:
 
     // Debug prints ObjectIds
     static inline std::ostream& (*_debug_print)(std::ostream&, ObjectId);
-
-    // Creates a BindingExprPrinter used to debug print BindingExprs of the physical plan
-    static inline std::unique_ptr<BindingExprPrinter> (*create_binding_expr_printer)(std::ostream&);
 
     static constexpr uint64_t buffer_size = 64 * 1024;
 
@@ -133,6 +128,9 @@ public:
         return distribution(rand_generator);
     }
 
+    void define_alias(VarId var_id, const std::string& alias) {
+        var_ctx.var_map.insert({ alias, var_id.id });
+    }
 
     VarId get_or_create_var(const std::string& var_name) {
         auto found = var_ctx.var_map.find(var_name);

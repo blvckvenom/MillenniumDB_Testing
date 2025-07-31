@@ -25,7 +25,8 @@ public:
     // and be false otherwise
     bool inside_aggregation = false;
 
-    bool at_root = true; // The visitor is currently at the root node
+    // true if expression is from order by or return
+    bool after_group = false;
 
     // This constructor is used to visit expressions that must not have aggregations or group variables.
     ExprToBindingExpr() :
@@ -33,13 +34,14 @@ public:
     { }
 
     // This constructor is used to visit expressions that can have aggregations or group variables.
-    ExprToBindingExpr(PathBindingIterConstructor* bic, std::optional<VarId> as_var) :
+    ExprToBindingExpr(PathBindingIterConstructor* bic, std::optional<VarId> as_var, bool after_group) :
         bic(bic),
-        as_var(as_var)
+        as_var(as_var),
+        after_group(after_group)
     { }
 
     template<typename AggType, class... Args>
-    void check_and_make_aggregate(Expr*, Args&&... args);
+    void check_and_make_aggregate(Expr* expr, VarId var, Args&&... args);
 
     void visit(ExprOr&) override;
     void visit(ExprAnd&) override;

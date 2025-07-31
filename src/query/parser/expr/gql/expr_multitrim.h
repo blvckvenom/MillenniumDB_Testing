@@ -1,11 +1,14 @@
 #pragma once
 
+#include <string>
+
 #include "query/parser/expr/gql/expr.h"
 
 namespace GQL {
 class ExprMultiTrim : public Expr {
 public:
     std::unique_ptr<Expr> trim_src;
+    // delim_str may be nullptr
     std::unique_ptr<Expr> delim_str;
     std::string specification;
 
