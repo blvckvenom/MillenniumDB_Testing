@@ -23,9 +23,9 @@ public:
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
 
         // ignore relations, labels and internal edge identifiers (_eX)
-        if (lhs_generic == ObjectId::MASK_EDGE || lhs_type == ObjectId::MASK_EDGE_LABEL
-            || lhs_type == ObjectId::MASK_NODE_LABEL || lhs_type == ObjectId::MASK_EDGE_KEY
-            || lhs_type == ObjectId::MASK_NODE_KEY)
+        if (lhs_type == ObjectId::MASK_DIRECTED_EDGE || lhs_type == ObjectId::MASK_UNDIRECTED_EDGE
+            || lhs_type == ObjectId::MASK_EDGE_LABEL || lhs_type == ObjectId::MASK_NODE_LABEL
+            || lhs_type == ObjectId::MASK_EDGE_KEY || lhs_type == ObjectId::MASK_NODE_KEY)
         {
             return ObjectId::get_null();
         }
