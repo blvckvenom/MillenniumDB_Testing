@@ -22,20 +22,30 @@ public:
         auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
 
-        // ignore relations and internal edge identifiers (_eX)
-        if (lhs_generic == ObjectId::MASK_EDGE || lhs_type == ObjectId::MASK_EDGE_LABEL)
-            return ObjectId(ObjectId::BOOL_TRUE);
+        // ignore relations, labels and internal edge identifiers (_eX)
+        if (lhs_type == ObjectId::MASK_DIRECTED_EDGE || lhs_type == ObjectId::MASK_UNDIRECTED_EDGE
+            || lhs_type == ObjectId::MASK_EDGE_LABEL || lhs_type == ObjectId::MASK_NODE_LABEL
+            || lhs_type == ObjectId::MASK_EDGE_KEY || lhs_type == ObjectId::MASK_NODE_KEY)
+        {
+            return ObjectId::get_null();
+        }
 
+        bool compatible = false;
         for (auto& expr : rhs) {
             auto rhs_oid = expr->eval(binding);
             auto rhs_generic = rhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
             auto rhs_type = rhs_oid.id & ObjectId::TYPE_MASK;
 
             if (rhs_generic == lhs_generic && rhs_type == lhs_type) {
+                compatible = true;
                 if (lhs_oid == rhs_oid) {
                     return ObjectId(ObjectId::BOOL_FALSE);
                 }
             }
+        }
+
+        if (!compatible) {
+            return ObjectId::get_null();
         }
 
         return ObjectId(ObjectId::BOOL_TRUE);
