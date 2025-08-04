@@ -127,15 +127,12 @@ void ExtractExprs::visit(OpRepetition& op_repetition)
     tmp = std::make_unique<OpRepetition>(std::move(tmp), op_repetition.lower, op_repetition.upper);
 }
 
-void ExtractExprs::visit(OpOptProperties& op_opt_properties)
-{
-    op_opt_properties.op->accept_visitor(*this);
-    tmp = std::make_unique<OpOptProperties>(std::move(tmp), op_opt_properties.properties);
-}
-
 void ExtractExprs::visit(OpLinearPattern& op)
 {
-    tmp = std::make_unique<OpLinearPattern>(std::move(op.patterns), std::move(op.start), std::move(op.end));
+    auto new_op = std::make_unique<OpLinearPattern>(std::move(op.patterns));
+    new_op->labels = op.labels;
+    new_op->properties = op.properties;
+    tmp = std::move(new_op);
 }
 
 void ExtractExprs::visit(OpNode& op)
@@ -151,21 +148,6 @@ void ExtractExprs::visit(OpEdge& op)
 void ExtractExprs::visit(OpLet& op_let)
 {
     tmp = std::make_unique<OpLet>(std::move(op_let.items));
-}
-
-void ExtractExprs::visit(OpProperty& op)
-{
-    tmp = std::make_unique<OpProperty>(op);
-}
-
-void ExtractExprs::visit(OpNodeLabel& op)
-{
-    tmp = std::make_unique<OpNodeLabel>(op);
-}
-
-void ExtractExprs::visit(OpEdgeLabel& op)
-{
-    tmp = std::make_unique<OpEdgeLabel>(op);
 }
 
 void ExtractExprs::visit(OpFilterStatement& op)

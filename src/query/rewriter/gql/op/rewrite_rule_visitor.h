@@ -58,12 +58,8 @@ public:
     void visit(OpFilterStatement&) override { }
     void visit(OpOrderByStatement&) override { }
     void visit(OpFilter&) override;
-    void visit(OpOptProperties&) override;
     void visit(OpPathUnion&) override;
     void visit(OpNode&) override { }
     void visit(OpEdge&) override { }
-    void visit(OpNodeLabel&) override { }
-    void visit(OpEdgeLabel&) override { }
-    void visit(OpProperty&) override { }
 };
 } // namespace GQL

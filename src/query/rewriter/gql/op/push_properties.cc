@@ -110,12 +110,6 @@ void PushProperties::visit(OpFilter& op_filter)
     }
 }
 
-void PushProperties::visit(OpOptProperties& op_property)
-{
-    op_property.op->accept_visitor(*this);
-    tmp = std::make_unique<OpOptProperties>(std::move(tmp), op_property.properties);
-}
-
 void PushProperties::visit(OpPathUnion& op_path_union)
 {
     std::vector<std::unique_ptr<Op>> patterns;
@@ -150,17 +144,16 @@ void PushProperties::visit(OpLinearPattern& op_linear_pattern)
         patterns.push_back(std::move(tmp));
     }
 
+    auto new_op = std::make_unique<OpLinearPattern>(std::move(patterns));
+    new_op->labels = op_linear_pattern.labels;
+
     for (auto& property : properties) {
         if (vars_in_linear_pattern.count(property.object)) {
-            patterns.push_back(std::make_unique<OpProperty>(property));
+            new_op->add_property(property);
         }
     }
 
-    tmp = std::make_unique<OpLinearPattern>(
-        std::move(patterns),
-        std::move(op_linear_pattern.start),
-        std::move(op_linear_pattern.end)
-    );
+    tmp = std::move(new_op);
 }
 
 void PushProperties::visit(OpLet& op)
@@ -177,16 +170,6 @@ void PushProperties::visit(OpNode& op)
 void PushProperties::visit(OpEdge& op)
 {
     vars_in_linear_pattern.insert(op.id);
-    tmp = op.clone();
-}
-
-void PushProperties::visit(OpNodeLabel& op)
-{
-    tmp = op.clone();
-}
-
-void PushProperties::visit(OpEdgeLabel& op)
-{
     tmp = op.clone();
 }
 

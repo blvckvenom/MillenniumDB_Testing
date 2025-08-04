@@ -11,7 +11,7 @@ namespace GQL {
 class PushLabels : public OpVisitor {
 private:
     ExtractLabelsFromExpr visitor;
-    std::vector<LabelOpId> labels_to_push;
+    std::vector<Label> labels_to_push;
     std::set<VarId> vars_in_linear_pattern;
 
 public:
@@ -32,7 +32,6 @@ public:
     void visit(OpOrderBy& op) override;
     void visit(OpOrderByStatement& op) override;
     void visit(OpFilter& op_filter) override;
-    void visit(OpOptProperties&) override;
     void visit(OpPathUnion& op) override;
     void visit(OpLinearPattern& op) override;
     void visit(OpLet& op) override;
@@ -40,8 +39,5 @@ public:
 
     void visit(OpNode&) override;
     void visit(OpEdge&) override;
-    void visit(OpNodeLabel&) override;
-    void visit(OpEdgeLabel&) override;
-    void visit(OpProperty&) override;
 };
 } // namespace GQL

@@ -300,11 +300,6 @@ void PathBindingIterConstructor::visit(OpGroupBy& op_group_by)
     }
 }
 
-void PathBindingIterConstructor::visit(OpOptProperties& op_opt_properties)
-{
-    op_opt_properties.op->accept_visitor(*this);
-}
-
 void PathBindingIterConstructor::visit(OpLet& op_let)
 {
     std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> binding_exprs;
@@ -411,8 +406,6 @@ void PathBindingIterConstructor::visit(OpFilter& op_filter)
     );
 }
 
-void PathBindingIterConstructor::visit(OpOptLabels&) { }
-
 void PathBindingIterConstructor::visit(OpRepetition& op_repetition)
 {
     if (is_first_iter) {
@@ -471,6 +464,30 @@ void PathBindingIterConstructor::visit(OpLinearPattern& op_linear_pattern)
 
     for (auto& pattern : op_linear_pattern.patterns) {
         pattern->accept_visitor(*this);
+    }
+
+    for (auto& property : op_linear_pattern.properties) {
+        setted_vars.insert({ property.var_with_property, property.value });
+
+        if (property.type == VarType::Node) {
+            seen_nodes.insert(property.object);
+            base_plans.push_back(
+                std::make_unique<NodePropertyPlan>(property.object, property.key, property.value)
+            );
+        } else {
+            base_plans.push_back(
+                std::make_unique<EdgePropertyPlan>(property.object, property.key, property.value)
+            );
+        }
+    }
+
+    for (auto& label : op_linear_pattern.labels) {
+        if (label.type == VarType::Node) {
+            seen_nodes.insert(label.object);
+            base_plans.push_back(std::make_unique<NodeLabelPlan>(label.object, label.label_id));
+        } else {
+            base_plans.push_back(std::make_unique<EdgeLabelPlan>(label.object, label.label_id));
+        }
     }
 
     for (auto& node_id : possible_disjoint_nodes) {
@@ -565,37 +582,6 @@ void PathBindingIterConstructor::visit(OpEdge& op_edge)
             op_edge.direction_var
         ));
         break;
-    }
-}
-
-void PathBindingIterConstructor::visit(OpNodeLabel& op_node_label)
-{
-    seen_nodes.insert(op_node_label.node_id);
-    base_plans.push_back(std::make_unique<NodeLabelPlan>(op_node_label.node_id, op_node_label.label_id));
-}
-
-void PathBindingIterConstructor::visit(OpEdgeLabel& op_edge_label)
-{
-    base_plans.push_back(std::make_unique<EdgeLabelPlan>(op_edge_label.edge_id, op_edge_label.label_id));
-}
-
-void PathBindingIterConstructor::visit(OpProperty& op_property)
-{
-    seen_nodes.insert(op_property.property.object);
-    setted_vars.insert({ op_property.property.var_with_property, op_property.property.value });
-
-    if (op_property.property.type == VarType::Node) {
-        base_plans.push_back(std::make_unique<NodePropertyPlan>(
-            op_property.property.object,
-            op_property.property.key,
-            op_property.property.value
-        ));
-    } else {
-        base_plans.push_back(std::make_unique<EdgePropertyPlan>(
-            op_property.property.object,
-            op_property.property.key,
-            op_property.property.value
-        ));
     }
 }
 

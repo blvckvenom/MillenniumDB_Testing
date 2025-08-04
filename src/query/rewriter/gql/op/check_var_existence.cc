@@ -201,16 +201,6 @@ void CheckVarExistence::visit(GQL::OpFilter& op_filter)
     check_expr_variables(expr_variables);
 }
 
-void CheckVarExistence::visit(GQL::OpOptProperties& op_property)
-{
-    op_property.op->accept_visitor(*this);
-
-    for (auto& property : op_property.properties) {
-        variables.insert(property.object);
-        variables.insert(property.value);
-    }
-}
-
 void CheckVarExistence::visit(GQL::OpBasicGraphPattern& op_basic_graph_pattern)
 {
     std::set<VarId> subvariables;
@@ -222,11 +212,6 @@ void CheckVarExistence::visit(GQL::OpBasicGraphPattern& op_basic_graph_pattern)
     }
 
     variables = std::move(subvariables);
-}
-
-void CheckVarExistence::visit(GQL::OpProperty& op_property)
-{
-    variables.insert(op_property.property.object);
 }
 
 void CheckVarExistence::visit(OpNode& op_node)
@@ -249,6 +234,13 @@ void CheckVarExistence::visit(OpEdge& op_edge)
         );
     }
     variables.insert(op_edge.id);
+}
+
+void CheckVarExistence::visit(OpLinearPattern& op_linear_pattern)
+{
+    for (auto& op : op_linear_pattern.patterns) {
+        op->accept_visitor(*this);
+    }
 }
 
 } // namespace GQL

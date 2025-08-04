@@ -58,17 +58,16 @@ void PushLabels::visit(OpLinearPattern& op_linear_pattern)
         patterns.push_back(std::move(tmp));
     }
 
+    auto new_op = std::make_unique<OpLinearPattern>(std::move(patterns));
+    new_op->properties = op_linear_pattern.properties;
+
     for (auto& label : labels_to_push) {
-        if (vars_in_linear_pattern.count(label.id)) {
-            patterns.push_back(label.op->clone());
+        if (vars_in_linear_pattern.count(label.object)) {
+            new_op->add_label(label);
         }
     }
 
-    tmp = std::make_unique<OpLinearPattern>(
-        std::move(patterns),
-        std::move(op_linear_pattern.start),
-        std::move(op_linear_pattern.end)
-    );
+    tmp = std::move(new_op);
 }
 
 void PushLabels::visit(OpRepetition& op)
@@ -139,7 +138,7 @@ void PushLabels::visit(OpFilter& op_filter)
     size_t num_of_new_labels = visitor.labels.size();
 
     for (auto& label : visitor.labels) {
-        labels_to_push.emplace_back(label.op->clone(), label.id, label.label_id);
+        labels_to_push.push_back(label);
     }
 
     op_filter.op->accept_visitor(*this);
@@ -149,12 +148,6 @@ void PushLabels::visit(OpFilter& op_filter)
     if (exprs.size() > 0) {
         tmp = std::make_unique<OpFilter>(std::move(tmp), std::move(exprs));
     }
-}
-
-void PushLabels::visit(OpOptProperties& op_property)
-{
-    op_property.op->accept_visitor(*this);
-    tmp = std::make_unique<OpOptProperties>(std::move(tmp), op_property.properties);
 }
 
 void PushLabels::visit(OpPathUnion& op)
@@ -177,21 +170,6 @@ void PushLabels::visit(OpNode& op)
 void PushLabels::visit(OpEdge& op)
 {
     vars_in_linear_pattern.insert(op.id);
-    tmp = op.clone();
-}
-
-void PushLabels::visit(OpNodeLabel& op)
-{
-    tmp = op.clone();
-}
-
-void PushLabels::visit(OpEdgeLabel& op)
-{
-    tmp = op.clone();
-}
-
-void PushLabels::visit(OpProperty& op)
-{
     tmp = op.clone();
 }
 
