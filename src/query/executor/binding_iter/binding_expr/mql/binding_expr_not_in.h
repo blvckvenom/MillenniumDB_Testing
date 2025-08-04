@@ -22,8 +22,11 @@ public:
         auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
 
-        // ignore relations and internal edge identifiers (_eX)
-        if (lhs_generic == ObjectId::MASK_EDGE || lhs_type == ObjectId::MASK_EDGE_LABEL) {
+        // ignore relations, labels and internal edge identifiers (_eX)
+        if (lhs_generic == ObjectId::MASK_EDGE || lhs_type == ObjectId::MASK_EDGE_LABEL
+            || lhs_type == ObjectId::MASK_NODE_LABEL || lhs_type == ObjectId::MASK_EDGE_KEY
+            || lhs_type == ObjectId::MASK_NODE_KEY)
+        {
             return ObjectId::get_null();
         }
 
