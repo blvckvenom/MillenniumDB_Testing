@@ -60,17 +60,7 @@ void CheckUnboundedRepetition::visit(OpQueryStatements& op)
     }
 }
 
-void CheckUnboundedRepetition::visit(OpOrderBy& op)
-{
-    op.op->accept_visitor(*this);
-}
-
-void CheckUnboundedRepetition::visit(OpFilter& op)
-{
-    op.op->accept_visitor(*this);
-}
-
-void CheckUnboundedRepetition::visit(OpOptProperties& op)
+void CheckUnboundedRepetition::visit(OpWhere& op)
 {
     op.op->accept_visitor(*this);
 }
@@ -82,18 +72,14 @@ void CheckUnboundedRepetition::visit(OpPathUnion& op)
     }
 }
 
-void CheckUnboundedRepetition::visit(OpOrderByStatement&) { }
+void CheckUnboundedRepetition::visit(OpLinearPattern&) { }
 
-void CheckUnboundedRepetition::visit(OpFilterStatement&) { }
+void CheckUnboundedRepetition::visit(OpOrderBy&) { }
+
+void CheckUnboundedRepetition::visit(OpFilter&) { }
 
 void CheckUnboundedRepetition::visit(OpLet&) { }
-
-void CheckUnboundedRepetition::visit(OpProperty&) { }
 
 void CheckUnboundedRepetition::visit(OpNode&) { }
 
 void CheckUnboundedRepetition::visit(OpEdge&) { }
-
-void CheckUnboundedRepetition::visit(OpNodeLabel&) { }
-
-void CheckUnboundedRepetition::visit(OpEdgeLabel&) { }

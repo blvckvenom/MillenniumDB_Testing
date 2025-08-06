@@ -12,12 +12,12 @@ class PushProperties : public OpVisitor {
 public:
     ExtractPropertiesFromExpr visitor;
     std::unique_ptr<Op> tmp;
-    std::vector<PropertyValue> properties;
+    std::vector<Property> properties;
     std::set<VarId> vars_in_linear_pattern;
 
     void visit(OpQueryStatements&) override;
-    void visit(OpFilterStatement&) override;
-    void visit(OpOrderByStatement&) override;
+    void visit(OpFilter&) override;
+    void visit(OpOrderBy&) override;
     void visit(OpGraphPattern&) override;
     void visit(OpGraphPatternList&) override;
     void visit(OpBasicGraphPattern&) override;
@@ -27,13 +27,9 @@ public:
     void visit(OpLet&) override;
     void visit(OpGroupBy&) override;
 
-    void visit(OpOrderBy&) override;
-    void visit(OpFilter&) override;
-    void visit(OpOptProperties&) override;
+    void visit(OpWhere&) override;
     void visit(OpPathUnion&) override;
     void visit(OpNode&) override;
     void visit(OpEdge&) override;
-    void visit(OpNodeLabel&) override;
-    void visit(OpEdgeLabel&) override;
 };
 } // namespace GQL

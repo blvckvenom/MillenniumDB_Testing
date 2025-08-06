@@ -21,7 +21,7 @@ void AddStartingEnum::visit(OpQueryStatements& op)
     }
 }
 
-void AddStartingEnum::visit(OpFilter& op)
+void AddStartingEnum::visit(OpWhere& op)
 {
     op.op->accept_visitor(*this);
 }
@@ -51,11 +51,7 @@ void AddStartingEnum::visit(OpBasicGraphPattern& op)
     auto node = std::make_unique<OpNode>(node_id);
     std::vector<std::unique_ptr<Op>> vec;
     vec.push_back(std::move(node));
-    auto linear_pattern = std::make_unique<OpLinearPattern>(
-        std::move(vec),
-        std::make_unique<VarId>(node_id),
-        std::make_unique<VarId>(node_id)
-    );
+    auto linear_pattern = std::make_unique<OpLinearPattern>(std::move(vec));
 
     op.patterns.insert(op.patterns.begin(), std::move(linear_pattern));
 }
@@ -71,11 +67,6 @@ void AddStartingEnum::visit(OpLinearPattern& op)
     op.patterns[0]->accept_visitor(*this);
 }
 
-void AddStartingEnum::visit(OpOptProperties& op)
-{
-    op.op->accept_visitor(*this);
-}
-
 void AddStartingEnum::visit(OpPathUnion& op)
 {
     for (auto& pattern : op.op_list) {
@@ -83,23 +74,12 @@ void AddStartingEnum::visit(OpPathUnion& op)
     }
 }
 
-void AddStartingEnum::visit(OpOrderBy& op)
-{
-    op.op->accept_visitor(*this);
-}
+void AddStartingEnum::visit(OpFilter&) { }
 
-void AddStartingEnum::visit(OpFilterStatement&) { }
-
-void AddStartingEnum::visit(OpOrderByStatement&) { }
+void AddStartingEnum::visit(OpOrderBy&) { }
 
 void AddStartingEnum::visit(OpLet&) { }
 
 void AddStartingEnum::visit(OpNode&) { }
 
 void AddStartingEnum::visit(OpEdge&) { }
-
-void AddStartingEnum::visit(OpNodeLabel&) { }
-
-void AddStartingEnum::visit(OpEdgeLabel&) { }
-
-void AddStartingEnum::visit(OpProperty&) { }

@@ -32,6 +32,27 @@ void ExecutorConstructor::visit(OpGraphPattern&) { }
 
 void ExecutorConstructor::visit(OpGraphPatternList&) { }
 
-void ExecutorConstructor::visit(OpFilter&) { }
+void ExecutorConstructor::visit(OpWhere&) { }
 
 void ExecutorConstructor::visit(OpBasicGraphPattern&) { }
+
+void ExecutorConstructor::visit(OpNode&) { }
+
+void ExecutorConstructor::visit(OpEdge&) { }
+
+void ExecutorConstructor::visit(OpPathUnion&) { }
+
+void ExecutorConstructor::visit(OpRepetition&) { }
+
+void ExecutorConstructor::visit(OpLinearPattern&) { }
+
+void ExecutorConstructor::visit(OpFilter&) { }
+
+void ExecutorConstructor::visit(OpLet&) { }
+
+void ExecutorConstructor::visit(OpOrderBy&) { }
+
+void ExecutorConstructor::visit(OpQueryStatements&) { }
+
+void ExecutorConstructor::visit(OpGroupBy&) { }
+
