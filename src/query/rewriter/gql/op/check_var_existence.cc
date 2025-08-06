@@ -42,7 +42,7 @@ void CheckVarExistence::visit(OpQueryStatements& op_statements)
     }
 }
 
-void CheckVarExistence::visit(OpFilterStatement& op_filter)
+void CheckVarExistence::visit(OpFilter& op_filter)
 {
     std::set<VarId> expr_variables;
     for (auto& expr : op_filter.exprs) {
@@ -131,23 +131,10 @@ void CheckVarExistence::visit(GQL::OpLet& op_let)
     }
 }
 
-void CheckVarExistence::visit(GQL::OpOrderByStatement& op_order_by)
-{
-    std::set<VarId> expr_variables;
-
-    for (auto& expr : op_order_by.items) {
-        for (auto var : expr->get_all_vars()) {
-            expr_variables.insert(var);
-        }
-    }
-    check_expr_variables(expr_variables);
-}
-
 void CheckVarExistence::visit(GQL::OpOrderBy& op_order_by)
 {
-    op_order_by.op->accept_visitor(*this);
-
     std::set<VarId> expr_variables;
+
     for (auto& expr : op_order_by.items) {
         for (auto var : expr->get_all_vars()) {
             expr_variables.insert(var);
@@ -187,7 +174,7 @@ void CheckVarExistence::visit(GQL::OpRepetition& op_repetition)
     op_repetition.op->accept_visitor(*this);
 }
 
-void CheckVarExistence::visit(GQL::OpFilter& op_filter)
+void CheckVarExistence::visit(GQL::OpWhere& op_filter)
 {
     op_filter.op->accept_visitor(*this);
 
@@ -201,16 +188,6 @@ void CheckVarExistence::visit(GQL::OpFilter& op_filter)
     check_expr_variables(expr_variables);
 }
 
-void CheckVarExistence::visit(GQL::OpOptProperties& op_property)
-{
-    op_property.op->accept_visitor(*this);
-
-    for (auto& property : op_property.properties) {
-        variables.insert(property.object);
-        variables.insert(property.value);
-    }
-}
-
 void CheckVarExistence::visit(GQL::OpBasicGraphPattern& op_basic_graph_pattern)
 {
     std::set<VarId> subvariables;
@@ -222,11 +199,6 @@ void CheckVarExistence::visit(GQL::OpBasicGraphPattern& op_basic_graph_pattern)
     }
 
     variables = std::move(subvariables);
-}
-
-void CheckVarExistence::visit(GQL::OpProperty& op_property)
-{
-    variables.insert(op_property.property.object);
 }
 
 void CheckVarExistence::visit(OpNode& op_node)
@@ -249,6 +221,13 @@ void CheckVarExistence::visit(OpEdge& op_edge)
         );
     }
     variables.insert(op_edge.id);
+}
+
+void CheckVarExistence::visit(OpLinearPattern& op_linear_pattern)
+{
+    for (auto& op : op_linear_pattern.patterns) {
+        op->accept_visitor(*this);
+    }
 }
 
 } // namespace GQL

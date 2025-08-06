@@ -8,7 +8,6 @@
 #include "query/optimizer/plan/plan.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_property.h"
-#include "query/parser/op/gql/graph_pattern/op_optional_properties.h"
 #include "query/parser/op/gql/op_visitor.h"
 
 namespace GQL {
@@ -24,28 +23,22 @@ public:
     );
 
     void visit(OpQueryStatements& op) override;
-    void visit(OpFilterStatement& op) override;
+    void visit(OpFilter& op) override;
     void visit(OpLet& op) override;
     void visit(OpOrderBy&) override;
-    void visit(OpOrderByStatement&) override;
     void visit(OpGroupBy&) override;
 
     void visit(OpReturn&) override;
     void visit(OpGraphPattern&) override;
     void visit(OpBasicGraphPattern&) override;
     void visit(OpGraphPatternList&) override;
-    void visit(OpFilter&) override;
+    void visit(OpWhere&) override;
     void visit(OpPathUnion&) override;
     void visit(OpRepetition&) override;
-    void visit(OpOptProperties&) override;
-    void visit(OpOptLabels& op) override;
     void visit(OpLinearPattern& op) override;
 
     void visit(OpNode&) override;
-    void visit(OpNodeLabel&) override;
-    void visit(OpEdgeLabel&) override;
     void visit(OpEdge&) override;
-    void visit(OpProperty&) override;
 
     std::unique_ptr<BindingIter> tmp_iter;
 

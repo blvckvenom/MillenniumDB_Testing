@@ -34,20 +34,7 @@ void PushProperties::visit(OpGroupBy& op_group_by)
 
 void PushProperties::visit(OpOrderBy& op_order_by)
 {
-    op_order_by.op->accept_visitor(*this);
     tmp = std::make_unique<OpOrderBy>(
-        std::move(tmp),
-        std::move(op_order_by.items),
-        std::move(op_order_by.ascending_order),
-        std::move(op_order_by.null_order),
-        op_order_by.offset,
-        op_order_by.limit
-    );
-}
-
-void PushProperties::visit(OpOrderByStatement& op_order_by)
-{
-    tmp = std::make_unique<OpOrderByStatement>(
         std::move(op_order_by.items),
         std::move(op_order_by.ascending_order),
         std::move(op_order_by.null_order),
@@ -85,7 +72,7 @@ void PushProperties::visit(OpRepetition& op_repetition)
     tmp = std::make_unique<OpRepetition>(std::move(tmp), op_repetition.lower, op_repetition.upper);
 }
 
-void PushProperties::visit(OpFilter& op_filter)
+void PushProperties::visit(OpWhere& op_filter)
 {
     std::vector<std::unique_ptr<Expr>> exprs;
 
@@ -106,14 +93,8 @@ void PushProperties::visit(OpFilter& op_filter)
     properties.erase(properties.end() - num_of_new_properties, properties.end());
 
     if (exprs.size() > 0) {
-        tmp = std::make_unique<OpFilter>(std::move(tmp), std::move(exprs));
+        tmp = std::make_unique<OpWhere>(std::move(tmp), std::move(exprs));
     }
-}
-
-void PushProperties::visit(OpOptProperties& op_property)
-{
-    op_property.op->accept_visitor(*this);
-    tmp = std::make_unique<OpOptProperties>(std::move(tmp), op_property.properties);
 }
 
 void PushProperties::visit(OpPathUnion& op_path_union)
@@ -150,17 +131,16 @@ void PushProperties::visit(OpLinearPattern& op_linear_pattern)
         patterns.push_back(std::move(tmp));
     }
 
+    auto new_op = std::make_unique<OpLinearPattern>(std::move(patterns));
+    new_op->labels = op_linear_pattern.labels;
+
     for (auto& property : properties) {
         if (vars_in_linear_pattern.count(property.object)) {
-            patterns.push_back(std::make_unique<OpProperty>(property));
+            new_op->add_property(property);
         }
     }
 
-    tmp = std::make_unique<OpLinearPattern>(
-        std::move(patterns),
-        std::move(op_linear_pattern.start),
-        std::move(op_linear_pattern.end)
-    );
+    tmp = std::move(new_op);
 }
 
 void PushProperties::visit(OpLet& op)
@@ -180,17 +160,7 @@ void PushProperties::visit(OpEdge& op)
     tmp = op.clone();
 }
 
-void PushProperties::visit(OpNodeLabel& op)
-{
-    tmp = op.clone();
-}
-
-void PushProperties::visit(OpEdgeLabel& op)
-{
-    tmp = op.clone();
-}
-
-void PushProperties::visit(OpFilterStatement& op)
+void PushProperties::visit(OpFilter& op)
 {
     tmp = op.clone();
 }

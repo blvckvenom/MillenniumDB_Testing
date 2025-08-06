@@ -14,13 +14,10 @@ public:
     LinearType linear_pattern = None;
     bool consecutive_nodes_found = false;
 
-    std::unique_ptr<VarId> start;
-    std::unique_ptr<VarId> end;
-
     std::unique_ptr<Op> tmp;
 
     void visit(OpQueryStatements&) override;
-    void visit(OpFilterStatement&) override;
+    void visit(OpFilter&) override;
     void visit(OpGraphPattern&) override;
     void visit(OpGraphPatternList&) override;
     void visit(OpBasicGraphPattern&) override;
@@ -30,14 +27,10 @@ public:
 
     void visit(OpGroupBy&) override;
     void visit(OpOrderBy&) override;
-    void visit(OpOrderByStatement&) override;
-    void visit(OpFilter&) override;
-    void visit(OpOptProperties&) override;
-    void visit(OpProperty&) override;
+    void visit(OpWhere&) override;
     void visit(OpPathUnion&) override;
     void visit(OpNode&) override;
     void visit(OpEdge&) override;
-    void visit(OpNodeLabel&) override;
-    void visit(OpEdgeLabel&) override;
+    void visit(OpLinearPattern&) override;
 };
 } // namespace GQL
