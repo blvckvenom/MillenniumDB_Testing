@@ -19,6 +19,11 @@ public:
     ObjectId eval(const Binding& binding) override
     {
         auto lhs_oid = lhs->eval(binding);
+
+        if (lhs_oid.is_null()) {
+            return ObjectId::get_null();
+        }
+
         auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
 
@@ -27,7 +32,7 @@ public:
             || lhs_type == ObjectId::MASK_EDGE_LABEL || lhs_type == ObjectId::MASK_NODE_LABEL
             || lhs_type == ObjectId::MASK_EDGE_KEY || lhs_type == ObjectId::MASK_NODE_KEY)
         {
-            return ObjectId::get_null();
+            return ObjectId(ObjectId::BOOL_FALSE);
         }
 
         bool compatible = false;
