@@ -20,19 +20,26 @@ public:
     {
         auto lhs_oid = lhs->eval(binding);
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
+        auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
 
-        // Only real nodes should be considered. Any other value (relations,
-        // labels, internal edge identifiers, strings, etc.) must be ignored and
-        // therefore filtered out from the result set.
-        if (lhs_type != ObjectId::MASK_NODE) {
+        // Only evaluate NOT IN for real node identifiers. Any other value
+        // (relations, labels, internal edge identifiers, strings, etc.) is
+        // ignored by returning FALSE so that the binding is filtered out.
+        if (lhs_type != ObjectId::MASK_NODE && lhs_generic != ObjectId::MASK_NAMED_NODE
+            && lhs_generic != ObjectId::MASK_ANON)
+        {
             return ObjectId(ObjectId::BOOL_FALSE);
         }
 
         for (auto& expr : rhs) {
             auto rhs_oid = expr->eval(binding);
             auto rhs_type = rhs_oid.id & ObjectId::TYPE_MASK;
+            auto rhs_generic = rhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
 
-            if (rhs_type == ObjectId::MASK_NODE && lhs_oid == rhs_oid) {
+            if ((rhs_type == ObjectId::MASK_NODE || rhs_generic == ObjectId::MASK_NAMED_NODE
+                 || rhs_generic == ObjectId::MASK_ANON)
+                && lhs_oid == rhs_oid)
+            {
                 return ObjectId(ObjectId::BOOL_FALSE);
             }
         }
