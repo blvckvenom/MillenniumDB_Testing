@@ -19,15 +19,19 @@ public:
     ObjectId eval(const Binding& binding) override
     {
         auto lhs_oid = lhs->eval(binding);
+
+        if (lhs_oid.is_null()) {
+            return ObjectId::get_null();
+        }
+
         auto lhs_generic = lhs_oid.id & ObjectId::GENERIC_TYPE_MASK;
         auto lhs_type = lhs_oid.id & ObjectId::TYPE_MASK;
 
-        // ignore relations, labels and internal edge identifiers (_eX)
-        if (lhs_type == ObjectId::MASK_DIRECTED_EDGE || lhs_type == ObjectId::MASK_UNDIRECTED_EDGE
-            || lhs_type == ObjectId::MASK_EDGE_LABEL || lhs_type == ObjectId::MASK_NODE_LABEL
-            || lhs_type == ObjectId::MASK_EDGE_KEY || lhs_type == ObjectId::MASK_NODE_KEY)
-        {
-            return ObjectId::get_null();
+        // Only evaluate real nodes. Any other value (relations, labels, internal
+        // edge identifiers, etc.) is ignored by returning false so the binding
+        // does not pass the filter.
+        if (lhs_type != ObjectId::MASK_NODE) {
+            return ObjectId(ObjectId::BOOL_FALSE);
         }
 
         bool compatible = false;

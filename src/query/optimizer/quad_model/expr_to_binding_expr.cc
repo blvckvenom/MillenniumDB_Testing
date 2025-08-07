@@ -19,6 +19,7 @@
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_and.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_division.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_equals.h"
+#include "query/executor/binding_iter/binding_expr/mql/binding_expr_in.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_is.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_less.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_less_or_equals.h"
@@ -26,7 +27,6 @@
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_multiplication.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_equals.h"
-#include "query/executor/binding_iter/binding_expr/mql/binding_expr_in.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_not_in.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_or.h"
 #include "query/executor/binding_iter/binding_expr/mql/binding_expr_regex.h"
@@ -132,8 +132,10 @@ void ExprToBindingExpr::visit(ExprMultiplication& expr)
     expr.rhs->accept_visitor(*this);
     auto rhs_binding_expr = std::move(tmp);
 
-    tmp =
-        std::make_unique<BindingExprMultiplication>(std::move(lhs_binding_expr), std::move(rhs_binding_expr));
+    tmp = std::make_unique<BindingExprMultiplication>(
+        std::move(lhs_binding_expr),
+        std::move(rhs_binding_expr)
+    );
 }
 
 void ExprToBindingExpr::visit(ExprSubtraction& expr)
@@ -188,7 +190,6 @@ void ExprToBindingExpr::visit(ExprGreater& expr)
     tmp = std::make_unique<BindingExprLess>(std::move(rhs_binding_expr), std::move(lhs_binding_expr));
 }
 
-
 void ExprToBindingExpr::visit(ExprIs& expr)
 {
     expr.expr->accept_visitor(*this);
@@ -205,7 +206,6 @@ void ExprToBindingExpr::visit(ExprIs& expr)
     }
     tmp = std::make_unique<BindingExprIs>(std::move(tmp), expr.negation, expr.type);
 }
-
 
 void ExprToBindingExpr::visit(ExprLessOrEquals& expr)
 {
@@ -289,6 +289,10 @@ void ExprToBindingExpr::visit(ExprAnd& expr)
 
 void ExprToBindingExpr::visit(ExprNot& expr)
 {
+    // Optimize NOT (A IN [...]) into a dedicated BindingExprNotIn instead of
+    // building a generic negation over BindingExprIn. This avoids evaluating
+    // the IN expression first (which may yield null for relations) and then
+    // applying NOT, which would incorrectly turn null into true.
     if (auto* in_expr = dynamic_cast<ExprIn*>(expr.expr.get())) {
         std::vector<std::unique_ptr<BindingExpr>> exprs;
         exprs.reserve(in_expr->rhs.size());
@@ -369,7 +373,6 @@ void ExprToBindingExpr::visit(MQL::ExprAggCountAll& expr)
     } else {
         check_and_make_aggregate<AggCountAll>(nullptr);
     }
-
 }
 
 void ExprToBindingExpr::visit(MQL::ExprAggCount& expr)
