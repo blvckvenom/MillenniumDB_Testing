@@ -1,16 +1,16 @@
 cmake_minimum_required(VERSION 3.12)
 
-# Set project name and version
+#Set project name and version
 project(MillenniumDB VERSION 1.0.0)
 
-# Specify the C++ standard
+#Specify the C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-# Enable export of compile commands output
+#Enable export of compile commands output
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Use all cores but one for compilation
+#Use all cores but one for compilation
 include(ProcessorCount)
 ProcessorCount(NUM_CORES)
 if(NUM_CORES GREATER 1)
@@ -18,13 +18,13 @@ if(NUM_CORES GREATER 1)
     set(CMAKE_BUILD_PARALLEL_LEVEL ${PARALLEL_LEVEL})
 endif()
 
-# Set output directories
+#Set output directories
 set(EXECUTABLE_OUTPUT_PATH bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY lib)
 
-# Uncomment to disable CLI
-# add_definitions(-DNO_MDB_CLI)
+#Uncomment to disable CLI
+#add_definitions(-DNO_MDB_CLI)
 
 if(APPLE)
     message("https://cmake.org/cmake/help/latest/variable/APPLE.html?highlight=apple")
@@ -48,11 +48,11 @@ else()
     set(NCURSES ncursesw)
     set(FS "stdc++fs")
 
-    # Find ICU and its required components
+#Find ICU and its required components
     find_package(ICU COMPONENTS uc i18n REQUIRED)
 endif(APPLE)
 
-# Define the compiler flags
+#Define the compiler flags
 set(CMAKE_CXX_FLAGS "-Wall -Wextra -pedantic -Wno-deprecated -pthread -march=native -funroll-loops -fno-operator-names")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g3 -fsanitize=undefined,address -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -g0")
@@ -61,13 +61,12 @@ if(PROFILE)
     add_definitions(-DBOOST_STACKTRACE_USE_ADDR2LINE)
 endif(PROFILE)
 
-
-# When compiling with Clang generate debug info specifically for lldb
+#When compiling with Clang generate debug info specifically for lldb
 if(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -glldb -fstandalone-debug")
 endif()
 
-# Enable interprocedural optimization if supported and BUILD_TYPE is RELEASE
+#Enable interprocedural optimization if supported and BUILD_TYPE is RELEASE
 string(TOUPPER "${CMAKE_BUILD_TYPE}" BUILD_TYPE)
 if(BUILD_TYPE STREQUAL "RELEASE")
     include(CheckIPOSupported)
@@ -79,10 +78,10 @@ if(BUILD_TYPE STREQUAL "RELEASE")
     endif(ipo_result)
 endif(BUILD_TYPE STREQUAL "RELEASE")
 
-# Add include directories
+#Add include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
-# Define sources
+#Define sources
 file(GLOB_RECURSE SRCS src/*.cc)
 file(GLOB_RECURSE BIN_SRCS src/bin/*.cc)
 file(GLOB_RECURSE TEST_SRCS src/tests/*.cc)
@@ -113,6 +112,7 @@ set(TEST_TARGETS
     scsu-test
     variable_set
     tensor_operations
+    gds_graph_list
 )
 # Build targets
 foreach(target ${BUILD_TARGETS})
