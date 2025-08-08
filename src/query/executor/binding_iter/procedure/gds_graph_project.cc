@@ -21,11 +21,99 @@
 
 #include <memory>
 #include <vector>
+#include <stdexcept>
+
 #include "graph_models/gql/gql_graph_catalog.h"
+#include "graph_models/gql/gql_value.h"
+#include "graph_models/gql/conversions.h"
+#include "graph_models/common/conversions.h"
 #include "graph_models/object_id.h"
 #include "query/executor/binding.h"
 #include "query/parser/expr/gql/expr.h"
+#include "query/parser/expr/gql/expr_term.h"
 #include "query/var_id.h"
+
+namespace {
+
+// Convert an ObjectId representing a literal into a GQL::Value. This handles
+// strings, booleans, numbers, lists and maps (encoded as lists of key/value
+// pairs).
+GQL::Value object_id_to_value(ObjectId oid)
+{
+    const auto gen_t = oid.id & ObjectId::GENERIC_TYPE_MASK;
+
+    if (gen_t == ObjectId::MASK_STRING) {
+        return GQL::Value(GQL::Conversions::unpack_string(oid));
+    }
+
+    if (gen_t == ObjectId::MASK_BOOL) {
+        return GQL::Value(oid.is_true());
+    }
+
+    if (gen_t == ObjectId::MASK_LIST) {
+        std::vector<ObjectId> elements;
+        GQL::Conversions::unpack_list(oid, elements);
+
+        // Determine if this list encodes a map
+        bool is_map = true;
+        for (const auto& el : elements) {
+            if ((el.id & ObjectId::GENERIC_TYPE_MASK) != ObjectId::MASK_LIST) {
+                is_map = false;
+                break;
+            }
+            std::vector<ObjectId> pair;
+            GQL::Conversions::unpack_list(el, pair);
+            if (pair.size() != 2 || (pair[0].id & ObjectId::GENERIC_TYPE_MASK) != ObjectId::MASK_STRING) {
+                is_map = false;
+                break;
+            }
+        }
+
+        if (is_map) {
+            GQL::Value::ValueMap m;
+            for (const auto& el : elements) {
+                std::vector<ObjectId> pair;
+                GQL::Conversions::unpack_list(el, pair);
+                std::string key = GQL::Conversions::unpack_string(pair[0]);
+                m.emplace(key, object_id_to_value(pair[1]));
+            }
+            return GQL::Value(m);
+        }
+
+        GQL::Value::ValueList list;
+        list.reserve(elements.size());
+        for (const auto& el : elements) {
+            list.emplace_back(object_id_to_value(el));
+        }
+        return GQL::Value(list);
+    }
+
+    if (gen_t == ObjectId::MASK_NUMERIC || gen_t == ObjectId::MASK_INT
+        || gen_t == ObjectId::MASK_DECIMAL || gen_t == ObjectId::MASK_FLOAT
+        || gen_t == ObjectId::MASK_DOUBLE)
+    {
+        // Try integer first, fall back to double
+        try {
+            return GQL::Value(Common::Conversions::unpack_int(oid));
+        } catch (...) {
+            return GQL::Value(Common::Conversions::to_double(oid));
+        }
+    }
+
+    // Fallback to lexical string representation for unsupported types
+    return GQL::Value(GQL::Conversions::to_lexical_str(oid));
+}
+
+// Evaluate a GQL::Expr expected to be a literal and return its value.
+GQL::Value evaluate_expr_to_value(const GQL::Expr* expr)
+{
+    if (const auto* term = dynamic_cast<const GQL::ExprTerm*>(expr)) {
+        return object_id_to_value(term->term);
+    }
+    return GQL::Value();
+}
+
+} // namespace
 
 // Force symbol visibility
 #ifdef __GNUC__
@@ -77,33 +165,50 @@ bool GdsGraphProject::_next()
     if (executed_) {
         return false;
     }
-    
+
     executed_ = true;
-    
-    // TODO: Evaluate argument expressions to get actual values
-    // For now, we create a placeholder projection
-    
-    // Extract graph name from first argument
-    // auto graph_name_expr = argument_exprs_[0].get();
-    // auto graph_name = evaluate_expression_to_string(graph_name_expr);
-    
-    // For demonstration, use a hardcoded graph name
-    std::string graph_name = "demo_graph";
-    
-    // Create placeholder Value and Map objects
-    // TODO: Implement proper expression evaluation
-    // GQL::Value node_projection = ...;
-    // GQL::Value rel_projection = ...;
-    // GQL::Map configuration = ...;
-    
-    // For now, create an empty projection
-    // auto result = catalog_.project(graph_name, node_projection, rel_projection, configuration);
-    
-    // TODO: Set the yield variables with the result values
-    // parent_binding->add(yield_vars_[0], ObjectId::get_string(result.graphName));
-    // etc.
-    
-    return true;
+
+    try {
+        // Evaluate arguments
+        auto graph_name_val = evaluate_expr_to_value(argument_exprs_[0].get());
+        if (!graph_name_val.is_string()) {
+            assign_nulls();
+            return false;
+        }
+
+        auto node_proj_val = evaluate_expr_to_value(argument_exprs_[1].get());
+        auto rel_proj_val  = evaluate_expr_to_value(argument_exprs_[2].get());
+        auto config_val    = evaluate_expr_to_value(argument_exprs_[3].get());
+
+        GQL::Map configuration;
+        if (config_val.is_map()) {
+            configuration = GQL::Map(config_val.as_map());
+        }
+
+        // Invoke catalog
+        auto result = catalog_.project(
+            graph_name_val.get_string(),
+            node_proj_val,
+            rel_proj_val,
+            configuration);
+
+        // Assign results to yield variables following the predefined order
+        parent_binding->add(yield_vars_[0], GQL::Conversions::pack_string_simple(result.graphName));
+        parent_binding->add(yield_vars_[1], GQL::Conversions::pack_string_simple(result.nodeProjection));
+        parent_binding->add(yield_vars_[2], Common::Conversions::pack_int(result.nodeCount));
+        parent_binding->add(yield_vars_[3], GQL::Conversions::pack_string_simple(result.relationshipProjection));
+        parent_binding->add(yield_vars_[4], Common::Conversions::pack_int(result.relationshipCount));
+        parent_binding->add(yield_vars_[5], Common::Conversions::pack_int(result.projectMillis));
+        // query field not supported yet
+        parent_binding->add(yield_vars_[6], ObjectId::get_null());
+        parent_binding->add(yield_vars_[7], GQL::Conversions::pack_string_simple(result.configuration));
+
+        return true;
+
+    } catch (const std::exception&) {
+        assign_nulls();
+        return false;
+    }
 }
 
 void GdsGraphProject::_reset()
