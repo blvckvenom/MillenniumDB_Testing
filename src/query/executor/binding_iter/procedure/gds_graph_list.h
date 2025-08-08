@@ -28,9 +28,10 @@
 #include "graph_models/gql/gql_graph_catalog.h"
 
 /**
- * BindingIter implementation for the GdsGraphList procedure.
- * This iterator lists graph projections in the catalog and yields
- * each graph's metadata as a result row.
+ * BindingIter implementation for the gds.graph.list procedure.
+ * Usage: `CALL gds.graph.list()` with an optional YIELD clause to
+ * specify the returned columns. This iterator lists graph projections
+ * in the catalog and yields each graph's metadata as a result row.
  */
 class GdsGraphList : public BindingIter {
 public:
