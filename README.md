@@ -11,6 +11,10 @@ The main objective of this project is to create a fully functional and easy-to-e
 
   - Property Graphs specified by the GQL Standard (undirected edges, 0-N edge labels), with an early implementation of GQL, still missing a lot of functionality and optimizations.
 
+    The engine also supports a subset of Neo4j's Graph Data Science procedures
+    via the `CALL` clause, for example `CALL gds.graph.list()` to inspect the
+    catalog of projected graphs.
+
 This project is still in active development and is not production ready yet, some functionality is missing and there may be bugs.
 
 To learn more about MillenniumDB and how to use it, see our [Wiki](https://github.com/MillenniumDB/MillenniumDB/wiki).

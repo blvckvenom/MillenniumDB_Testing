@@ -2038,27 +2038,35 @@ std::any QueryVisitor::visitCallProcedureStatement(GQLParser::CallProcedureState
 std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallContext* ctx)
 {
     LOG_VISITOR
-    // Extract procedure name and convert to lower case for case‑insensitive matching
+    // Extract procedure name, strip dots and convert to lower case for
+    // case-insensitive matching. This allows CALL gds.graph.list() style
+    // invocations where dots are used to qualify the procedure name.
     std::string procedure_name = ctx->procedureReference()->getText();
-    
+
     // Remove backticks if present (accent-quoted identifiers)
     if (procedure_name.front() == '`' && procedure_name.back() == '`') {
         procedure_name = procedure_name.substr(1, procedure_name.length() - 2);
     }
-    
-    std::string lower_procedure_name;
-    lower_procedure_name.reserve(procedure_name.size());
+
+    std::string normalized_procedure_name;
+    normalized_procedure_name.reserve(procedure_name.size());
     for (char c : procedure_name) {
-        lower_procedure_name.push_back(static_cast<char>(std::tolower(c)));
+        if (c != '.') {
+            normalized_procedure_name.push_back(static_cast<char>(std::tolower(c)));
+        }
     }
 
     OpProcedure::ProcedureType procedure_type;
-    if (lower_procedure_name == "gdsgraphproject") {
+    if (normalized_procedure_name == "gdsgraphproject") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_PROJECT;
-    } else if (lower_procedure_name == "gdsgraphlist") {
+    } else if (normalized_procedure_name == "gdsgraphlist") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_LIST;
-    } else if (lower_procedure_name == "gdsgraphdrop") {
+    } else if (normalized_procedure_name == "gdsgraphdrop") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_DROP;
+    } else if (normalized_procedure_name == "gdsgraphexport") {
+        procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_EXPORT;
+    } else if (normalized_procedure_name == "gdsgraphfilter") {
+        procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_FILTER;
     } else {
         throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
     }
