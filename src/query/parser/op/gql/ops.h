@@ -20,5 +20,6 @@
 #include "query/parser/op/gql/op_let.h" // IWYU pragma: export
 #include "query/parser/op/gql/op_order_by.h" // IWYU pragma: export
 #include "query/parser/op/gql/op_order_by_statement.h" // IWYU pragma: export
+#include "query/parser/op/gql/op_procedure.h" // IWYU pragma: export
 #include "query/parser/op/gql/op_query_statements.h" // IWYU pragma: export
 #include "query/parser/op/gql/op_return.h" // IWYU pragma: export

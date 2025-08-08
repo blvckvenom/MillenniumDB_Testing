@@ -13,5 +13,6 @@ public:
     std::unique_ptr<StreamingQueryExecutor> executor;
 
     void visit(OpReturn&) override;
+    void visit(OpProcedure&) override;
 };
 } // namespace GQL

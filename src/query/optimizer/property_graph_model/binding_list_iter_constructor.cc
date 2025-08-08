@@ -18,6 +18,9 @@
 #include "query/executor/binding_iter/index_nested_loop_join.h"
 #include "query/executor/binding_iter/object_enum.h"
 #include "query/executor/binding_iter/order_by.h"
+#include "query/executor/binding_iter/procedure/gds_graph_project.h"
+#include "query/executor/binding_iter/procedure/gds_graph_list.h"
+#include "query/executor/binding_iter/procedure/gds_graph_drop.h"
 #include "query/executor/binding_iter/set_variable_value.h"
 #include "query/executor/binding_iter/single_result_binding_iter.h"
 #include "query/executor/binding_iter/slice.h"
@@ -596,6 +599,45 @@ void PathBindingIterConstructor::visit(OpProperty& op_property)
             op_property.property.key,
             op_property.property.value
         ));
+    }
+}
+
+void PathBindingIterConstructor::visit(OpProcedure& op_procedure)
+{
+    // For procedure calls, we need to create the appropriate iterator based on the procedure type
+    // Use the global gql_model to access the graph catalog
+    auto& catalog = gql_model.get_graph_catalog();
+    
+    switch (op_procedure.procedure_type) {
+    case OpProcedure::ProcedureType::GDS_GRAPH_PROJECT:
+        tmp_iter = std::make_unique<GdsGraphProject>(
+            catalog,
+            std::move(op_procedure.argument_exprs),
+            std::move(op_procedure.yield_vars)
+        );
+        break;
+    case OpProcedure::ProcedureType::GDS_GRAPH_LIST:
+        tmp_iter = std::make_unique<GdsGraphList>(
+            catalog,
+            std::move(op_procedure.argument_exprs),
+            std::move(op_procedure.yield_vars)
+        );
+        break;
+    case OpProcedure::ProcedureType::GDS_GRAPH_DROP:
+        tmp_iter = std::make_unique<GdsGraphDrop>(
+            catalog,
+            std::move(op_procedure.argument_exprs),
+            std::move(op_procedure.yield_vars)
+        );
+        break;
+    case OpProcedure::ProcedureType::GDS_GRAPH_EXPORT:
+        // TODO: Create GdsGraphExport iterator
+        break;
+    case OpProcedure::ProcedureType::GDS_GRAPH_FILTER:
+        // TODO: Create GdsGraphFilter iterator
+        break;
+    default:
+        throw std::runtime_error("Unsupported procedure type in PathBindingIterConstructor::visit(OpProcedure&)");
     }
 }
 

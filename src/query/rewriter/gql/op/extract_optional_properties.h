@@ -30,6 +30,7 @@ public:
     void visit(OpEdgeLabel&) override;
     void visit(OpProperty&) override;
     void visit(OpLet&) override;
+    void visit(OpProcedure&) override { }
 };
 
 } // namespace GQL

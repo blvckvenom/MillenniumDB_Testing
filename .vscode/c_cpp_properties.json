@@ -1,6 +1,25 @@
 {
     "configurations": [
         {
+            "name": "Win32",
+            "compilerPath": "",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64",
+            "includePath": [
+                "${workspaceFolder}/src/",
+                "${workspaceFolder}/third_party/antlr4-runtime-4.13.1/src",
+                "${workspaceFolder}/third_party/boost_1_82/include"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "windowsSdkVersion": "10.0.19041.0",
+            "compileCommands": "${workspaceFolder}/build/Debug/compile_commands.json"
+        },
+        {
             "name": "Linux",
             "compilerPath": "/usr/bin/g++",
             "cStandard": "c11",

@@ -36,6 +36,7 @@ public:
 
     void visit(GQL::OpEdgeLabel&) override { }
     void visit(GQL::OpNodeLabel&) override { }
+    void visit(GQL::OpProcedure&) override { }
 };
 
 } // namespace GQL

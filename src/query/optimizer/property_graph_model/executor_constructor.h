@@ -21,6 +21,7 @@ public:
     void visit(GQL::OpBasicGraphPattern&) override;
     void visit(GQL::OpGraphPatternList&) override;
     void visit(GQL::OpFilter&) override;
+    void visit(GQL::OpProcedure&) override { }
 
 private:
     ReturnType return_type;

@@ -46,6 +46,7 @@ public:
     void visit(OpEdgeLabel&) override;
     void visit(OpEdge&) override;
     void visit(OpProperty&) override;
+    void visit(OpProcedure&) override;
 
     std::unique_ptr<BindingIter> tmp_iter;
 

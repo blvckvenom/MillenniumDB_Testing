@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graph_models/gql/gql_catalog.h"
+#include "graph_models/gql/gql_graph_catalog.h"
 #include "graph_models/model_destroyer.h"
 
 template<std::size_t N>
@@ -43,9 +44,15 @@ public:
     std::unique_ptr<BPlusTree<2>> equal_d_edge;
 
     GQLCatalog catalog;
+    
+    // Graph catalog for managing projected graphs
+    mutable GQL::GqlGraphCatalog graph_catalog;
 
     // necessary to be called before first usage
     static std::unique_ptr<ModelDestroyer> init();
+    
+    // Get the graph catalog for procedure operations
+    GQL::GqlGraphCatalog& get_graph_catalog() const { return graph_catalog; };
 
 private:
     GQLModel();

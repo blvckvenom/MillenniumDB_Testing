@@ -1,0 +1,201 @@
+===========================================
+MAPEO COMPLETO DEL PROYECTO MILLENNIUMDB
+===========================================
+Fecha de generación: Agosto 3, 2025
+Propósito: Revisión completa de estructura de carpetas y archivos
+
+===========================================
+ESTRUCTURA PRINCIPAL
+===========================================
+
+📁 RAIZ DEL PROYECTO:
+  📄 .clang-format                    - Configuración de formato de código C++
+  📄 .clangd                         - Configuración del servidor de lenguaje
+  📄 .dockerignore                   - Archivos ignorados por Docker
+  📄 .gitignore                      - Archivos ignorados por Git
+  📄 CMakeLists.txt                  - Configuración de compilación CMake
+  📄 Contributors.md                 - Lista de contribuidores
+  📄 Dockerfile                      - Configuración de contenedor Docker
+  📄 LICENSE                         - Licencia del proyecto (AGPL v3)
+  📄 README.md                       - Documentación principal
+
+===========================================
+CARPETAS PRINCIPALES
+===========================================
+
+📁 browser/                          - Interfaz web del navegador de consultas
+📁 data/                            - Datos de ejemplo y esquemas
+📁 deb-package/                     - Configuración de paquetes Debian
+📁 scripts/                         - Scripts de utilidad
+📁 src/                             - CÓDIGO FUENTE PRINCIPAL
+📁 tests/                           - Casos de prueba
+📁 third_party/                     - Bibliotecas de terceros
+
+===========================================
+CARPETA: browser/
+===========================================
+📄 favicon.ico                      - Icono de la aplicación web
+📄 index.html                       - Página principal del navegador web
+
+📁 assets/                          - Recursos estáticos de la interfaz web
+  📄 codicon-DWH9l-dS.ttf           - Fuente de iconos
+  📄 editor.worker-GzTmaUIK.js      - Worker del editor de código
+  📄 index-CCXrhw51.css             - Estilos CSS principales
+  📄 index-DdJzsecl.js              - JavaScript principal
+  📄 millenniumdb.worker-MjK9WE7R.js - Worker específico de MillenniumDB
+  📄 roboto-* (múltiples archivos)  - Fuentes Roboto en varios idiomas
+
+===========================================
+CARPETA: data/
+===========================================
+📁 dbs/                             - Bases de datos de ejemplo
+  📁 gql/                           - Ejemplos de Graph Query Language
+  📁 qm/                            - Ejemplos de Query Model
+  📁 rdf/                           - Ejemplos de RDF/SPARQL
+
+📁 example/                         - Datos de ejemplo para pruebas
+
+===========================================
+CARPETA: src/ (CÓDIGO FUENTE PRINCIPAL)
+===========================================
+
+📁 bin/                             - Ejecutables principales
+📁 cli/                             - Interfaz de línea de comandos
+📁 graph_models/                    - MODELOS DE GRAFOS (núcleo del sistema)
+📁 import/                          - Importación de datos
+📁 macros/                          - Macros de C++
+📁 misc/                            - Utilidades varias
+📁 network/                         - Comunicación de red
+📁 query/                           - MOTOR DE CONSULTAS (núcleo del sistema)
+📁 storage/                         - SISTEMA DE ALMACENAMIENTO
+📁 system/                          - Componentes del sistema
+📁 tests/                           - Pruebas unitarias
+📁 third_party/                     - Bibliotecas integradas
+📁 update/                          - Actualizaciones de datos
+
+===========================================
+CARPETA: src/graph_models/
+===========================================
+📄 model_destroyer.h               - Destructor de modelos
+📄 object_id.h/cc                  - Identificadores de objetos
+
+📁 gql/                             - GRAPH QUERY LANGUAGE (GQL)
+  📄 comparisons.h/cc               - Comparaciones en GQL
+  📄 conversions.h/cc               - Conversiones de tipos
+  📄 gql_catalog.h/cc               - Catálogo principal de GQL
+  📄 gql_graph_catalog.h/cc         - ⭐ CATÁLOGO DE GRAFOS PROYECTADOS (implementado)
+  📄 gql_model.h/cc                 - Modelo principal de GQL
+
+📁 quad_model/                      - Modelo de cuádruplas
+📁 rdf_model/                       - Modelo RDF/SPARQL
+
+===========================================
+CARPETA: src/query/
+===========================================
+
+📁 executor/                        - EJECUTOR DE CONSULTAS
+  📄 binding_iter.h                 - Iterador base de enlaces
+  📁 binding_iter/                  - Iteradores específicos
+    📁 procedure/                   - ⭐ PROCEDIMIENTOS GQL (implementado)
+      📄 gds_graph_project.h/cc     - ⭐ Procedimiento de proyección de grafos
+      📄 gds_graph_list.h/cc        - ⭐ Procedimiento de listado de grafos
+      📄 gds_graph_drop.h/cc        - ⭐ Procedimiento de eliminación de grafos
+
+📁 optimizer/                       - OPTIMIZADOR DE CONSULTAS
+  📁 property_graph_model/          - Optimizador para grafos de propiedades
+    📄 binding_list_iter_constructor.h/cc - ⭐ Constructor de iteradores (modificado)
+
+📁 parser/                          - PARSER DE CONSULTAS
+  📁 op/gql/                        - Operadores GQL
+    📄 op_visitor.h                 - ⭐ Visitante de operadores (modificado)
+    📄 ops.h                        - ⭐ Definiciones de operadores (modificado)
+
+===========================================
+ARCHIVOS CLAVE IMPLEMENTADOS/MODIFICADOS
+===========================================
+
+⭐ NUEVOS ARCHIVOS IMPLEMENTADOS:
+📄 src/graph_models/gql/gql_graph_catalog.h/cc
+   - Sistema completo de catálogo de grafos proyectados
+   - Persistencia JSON con fallback a boost::property_tree
+   - Operaciones: project(), list(), drop()
+
+📄 src/query/executor/binding_iter/procedure/gds_graph_project.h/cc
+   - Iterador para procedimiento gds.graph.project
+   - Hereda de BindingIter
+   - Implementa _begin(), _next(), _reset()
+
+📄 src/query/executor/binding_iter/procedure/gds_graph_list.h/cc
+   - Iterador para procedimiento gds.graph.list
+   - Lista grafos proyectados existentes
+
+📄 src/query/executor/binding_iter/procedure/gds_graph_drop.h/cc
+   - Iterador para procedimiento gds.graph.drop
+   - Elimina grafos proyectados
+
+⭐ ARCHIVOS MODIFICADOS:
+📄 src/graph_models/gql/gql_model.h/cc
+   - Agregado: GqlGraphCatalog graph_catalog
+   - Agregado: get_graph_catalog() método
+
+📄 src/query/parser/op/gql/op_visitor.h
+   - Agregado: visit(OpProcedure&) método
+   - Agregado: forward declaration de OpProcedure
+
+📄 src/query/parser/op/gql/ops.h
+   - Agregado: #include "op_procedure.h"
+
+📄 src/query/optimizer/property_graph_model/binding_list_iter_constructor.h/cc
+   - Agregado: visit(OpProcedure&) implementación
+   - Agregado: includes para procedimientos
+
+===========================================
+FUNCIONALIDAD IMPLEMENTADA
+===========================================
+
+✅ Sistema completo de catálogo de grafos GQL
+✅ Procedimientos gds.graph.project, list, drop
+✅ Integración con el motor de consultas
+✅ Persistencia JSON con fallback
+✅ Iteradores de binding para procedimientos
+✅ Integración con el visitante de operadores
+
+===========================================
+USO ESPERADO
+===========================================
+
+Los usuarios pueden ejecutar consultas como:
+
+CALL gds.graph.project('myGraph', nodeProjection, relProjection, config)
+YIELD graphName, nodeCount, relationshipCount, projectMillis
+
+CALL gds.graph.list()
+YIELD graphName, nodeCount, relationshipCount
+
+CALL gds.graph.drop('myGraph', true)
+YIELD graphName, dropped
+
+===========================================
+ESTADO DEL PROYECTO
+===========================================
+
+🟢 COMPLETADO: Implementación de catálogo de grafos GQL
+🟢 COMPLETADO: Procedimientos de gestión de grafos
+🟢 COMPLETADO: Integración con motor de consultas
+🟡 PENDIENTE: Pruebas exhaustivas
+🟡 PENDIENTE: Documentación detallada
+🟡 PENDIENTE: Optimizaciones de rendimiento
+
+===========================================
+RESUMEN DE TAMAÑOS DE ARCHIVOS IMPORTANTES
+===========================================
+
+CMakeLists.txt: Sistema de compilación principal
+src/: Contiene ~700+ archivos fuente
+tests/: Contiene casos de prueba comprehensivos
+browser/: Interfaz web completa
+data/: Ejemplos y datos de prueba
+
+===========================================
+FIN DEL MAPEO
+===========================================

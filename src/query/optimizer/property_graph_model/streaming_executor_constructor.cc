@@ -3,6 +3,7 @@
 #include "query/executor/query_executor/gql/return_streaming_executor.h"
 #include "query/optimizer/property_graph_model/binding_list_iter_constructor.h"
 #include "query/parser/op/gql/op_return.h"
+#include "query/parser/op/gql/op_procedure.h"
 #include "system/path_manager.h"
 
 using namespace GQL;
@@ -21,6 +22,22 @@ void GQL::StreamingExecutorConstructor::visit(OpReturn& op_return)
     }
 
     // path_manager.begin(std::move(visitor.begin_at_left));
+
+    executor = std::make_unique<ReturnStreamingExecutor>(std::move(binding_iter), std::move(projection_vars));
+}
+
+void StreamingExecutorConstructor::visit(OpProcedure& op_procedure)
+{
+    PathBindingIterConstructor visitor;
+    op_procedure.accept_visitor(visitor);
+
+    std::unique_ptr<BindingIter> binding_iter = std::move(visitor.tmp_iter);
+
+    std::vector<VarId> projection_vars;
+
+    for (auto& var : op_procedure.yield_vars) {
+        projection_vars.push_back(var);
+    }
 
     executor = std::make_unique<ReturnStreamingExecutor>(std::move(binding_iter), std::move(projection_vars));
 }

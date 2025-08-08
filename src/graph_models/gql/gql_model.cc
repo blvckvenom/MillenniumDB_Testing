@@ -20,7 +20,8 @@ std::unique_ptr<ModelDestroyer> GQLModel::init()
 }
 
 GQLModel::GQLModel() :
-    catalog("catalog.dat")
+    catalog("catalog.dat"),
+    graph_catalog("graph_catalog.json")
 {
     QueryContext::_debug_print = GQL::Conversions::debug_print;
 

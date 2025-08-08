@@ -11,6 +11,7 @@
 #include "query/parser/op/gql/op.h"
 #include "query/parser/op/gql/op_let.h"
 #include "query/parser/op/gql/op_return.h"
+#include <map>
 #include "query/var_id.h"
 
 namespace GQL {
@@ -93,6 +94,9 @@ public:
     std::unique_ptr<Expr> current_expr;
 
     std::vector<std::unique_ptr<Expr>> current_expr_list;
+
+    std::vector<std::unique_ptr<Expr>> current_procedure_argument_exprs;
+    std::map<std::string, VarId> current_procedure_yield_var2alias;
 
     std::any visitPrimitiveQueryStatement(GQLParser::PrimitiveQueryStatementContext* ctx) override;
     std::any visitSimpleLinearDataAccessingStatement(GQLParser::SimpleLinearDataAccessingStatementContext* ctx
@@ -216,5 +220,18 @@ public:
     std::any visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunctionContext* ctx) override;
 
     std::any visitFilterStatement(GQLParser::FilterStatementContext* ctx) override;
+
+    // Procedure call support
+    // visitCallProcedureStatement handles the CALL clause at the statement level.
+    std::any visitCallProcedureStatement(GQLParser::CallProcedureStatementContext* ctx) override;
+    // visitNamedProcedureCall handles procedure names (e.g., GdsGraphProject) with
+    // arguments and an optional YIELD clause. It constructs an OpProcedure and assigns
+    // it to current_op.
+    std::any visitNamedProcedureCall(GQLParser::NamedProcedureCallContext* ctx) override;
+    // visitYieldClause parses the list of yielded variables and stores them in
+    // current_procedure_yield_var2alias. It validates duplicate declarations but does not
+    // construct the final yield order.
+    std::any visitYieldClause(GQLParser::YieldClauseContext* ctx) override;
+
 };
 } // namespace GQL

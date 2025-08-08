@@ -9,6 +9,12 @@
 #include "graph_models/rdf_model/conversions.h"
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
+#include "query/parser/op/gql/op_procedure.h"
+#include "query/query_context.h"
+#include "query/exceptions.h"
+#include <algorithm>
+#include <cctype>
+
 
 // #define DEBUG_GQL_QUERY_VISITOR
 
@@ -2011,6 +2017,147 @@ std::any QueryVisitor::visitFilterStatement(GQLParser::FilterStatementContext* c
         visit(ctx->expression());
         filter_items.emplace_back(std::move(current_expr));
     }
+    return 0;
+}
+
+// Recognise CALL … PROCEDURE statements and delegate to the specific procedure
+// call handler. At this stage, OPTIONAL CALL is not supported and will throw.
+std::any QueryVisitor::visitCallProcedureStatement(GQLParser::CallProcedureStatementContext* ctx)
+{
+    LOG_VISITOR
+    // OPTIONAL keyword indicates an optional call; not implemented yet.
+    if (ctx->OPTIONAL() != nullptr) {
+        throw QueryException("OPTIONAL CALL is not supported");
+    }
+    // Delegate to the concrete procedure call (named or inline). The accept
+    // method will populate current_op.
+    ctx->procedureCall()->accept(this);
+    return 0;
+}
+
+std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallContext* ctx)
+{
+    LOG_VISITOR
+    // Extract procedure name and convert to lower case for case‑insensitive matching
+    std::string procedure_name = ctx->procedureReference()->getText();
+    
+    // Remove backticks if present (accent-quoted identifiers)
+    if (procedure_name.front() == '`' && procedure_name.back() == '`') {
+        procedure_name = procedure_name.substr(1, procedure_name.length() - 2);
+    }
+    
+    std::string lower_procedure_name;
+    lower_procedure_name.reserve(procedure_name.size());
+    for (char c : procedure_name) {
+        lower_procedure_name.push_back(static_cast<char>(std::tolower(c)));
+    }
+
+    OpProcedure::ProcedureType procedure_type;
+    if (lower_procedure_name == "gdsgraphproject") {
+        procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_PROJECT;
+    } else if (lower_procedure_name == "gdsgraphlist") {
+        procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_LIST;
+    } else if (lower_procedure_name == "gdsgraphdrop") {
+        procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_DROP;
+    } else {
+        throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
+    }
+
+    // Clear temporary storages before populating them
+    current_procedure_argument_exprs.clear();
+    current_procedure_yield_var2alias.clear();
+
+    // Parse arguments if present
+    if (ctx->procedureArgumentList() != nullptr) {
+        auto proc_args = ctx->procedureArgumentList()->procedureArgument();
+        current_procedure_argument_exprs.reserve(proc_args.size());
+        for (auto argCtx : proc_args) {
+            // procedureArgument is a wrapper around an expression
+            visit(argCtx->expression());
+            current_procedure_argument_exprs.emplace_back(std::move(current_expr));
+        }
+    }
+
+    // Determine available yield column names for the procedure
+    auto available_yield_names = OpProcedure::get_procedure_available_yield_variable_names(procedure_type);
+
+    std::vector<VarId> yield_vars;
+    if (ctx->yieldClause() != nullptr) {
+        // Populate current_procedure_yield_var2alias by visiting the yield clause
+        ctx->yieldClause()->accept(this);
+        // Validate each requested yield variable
+        for (const auto& [yield_name, var_id] : current_procedure_yield_var2alias) {
+            if (std::find(available_yield_names.begin(), available_yield_names.end(), yield_name)
+                == available_yield_names.end())
+            {
+                std::string var_names_str = "{ ";
+                var_names_str += available_yield_names[0];
+                for (std::size_t i = 1; i < available_yield_names.size(); ++i) {
+                    var_names_str += ", " + available_yield_names[i];
+                }
+                var_names_str += " }";
+                throw QueryException(
+                    OpProcedure::get_procedure_string(procedure_type) + " has an unexpected yield variable: \""
+                    + yield_name + "\". The valid yield variables are the following: " + var_names_str
+                );
+            }
+        }
+        // Build the ordered list of yield variables: user‑specified aliases first, then
+        // internal vars for unrequested fields
+        yield_vars.reserve(available_yield_names.size());
+        for (const auto& avail_name : available_yield_names) {
+            auto it = current_procedure_yield_var2alias.find(avail_name);
+            if (it != current_procedure_yield_var2alias.end()) {
+                yield_vars.emplace_back(it->second);
+            } else {
+                yield_vars.emplace_back(get_query_ctx().get_internal_var());
+            }
+        }
+    } else {
+        // No yield clause: create all variables implicitly using their names
+        yield_vars.reserve(available_yield_names.size());
+        for (const auto& avail_name : available_yield_names) {
+            yield_vars.emplace_back(get_query_ctx().get_or_create_var(avail_name));
+        }
+    }
+
+    // Create the procedure operator and store it in current_op
+    current_op = std::make_unique<OpProcedure>(
+        procedure_type,
+        std::move(current_procedure_argument_exprs),
+        std::move(yield_vars)
+    );
+    return 0;
+}
+
+ // Process the YIELD clause associated with a procedure call. This method builds
+ // a mapping from procedure output column names to the VarId used for binding,
+ // taking into account aliases specified via the AS keyword.
+ std::any QueryVisitor::visitYieldClause(GQLParser::YieldClauseContext* ctx)
+ {
+     LOG_VISITOR
+     // The grammar ensures yieldClause has at least one item
+     auto items = ctx->yieldItemList()->yieldItem();
+     std::map<std::string, VarId> yield_var2alias;
+     for (auto item : items) {
+         // yieldItemName is a fieldName; use its text as the procedure column name
+         std::string yield_name = item->yieldItemName()->getText();
+         if (item->yieldItemAlias() != nullptr) {
+             // User provided an alias: AS bindingVariable
+             std::string alias = item->yieldItemAlias()->bindingVariable()->getText();
+             VarId alias_var = get_query_ctx().get_or_create_var(alias);
+            if (!yield_var2alias.insert({ yield_name, alias_var }).second) {
+                throw QueryException("Duplicate procedure variable: \"" + yield_name + "\"");
+            }
+        } else {
+            // No alias: bind to a variable of the same name
+            VarId var = get_query_ctx().get_or_create_var(yield_name);
+            if (!yield_var2alias.insert({ yield_name, var }).second) {
+                throw QueryException("Duplicate procedure variable: \"" + yield_name + "\"");
+            }
+        }
+    }
+    current_procedure_yield_var2alias = std::move(yield_var2alias);
     return 0;
 }
 
