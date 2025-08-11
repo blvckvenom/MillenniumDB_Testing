@@ -26,6 +26,8 @@
 #include "query/parser/expr/gql/expr_var.h"
 #include "query/query_context.h"
 #include <chrono>
+#include <unordered_map>
+#include "query/parser/op/gql/op_procedure.h"
 
 GdsGraphList::GdsGraphList(
     GQL::GqlGraphCatalog& catalog,
@@ -78,46 +80,49 @@ bool GdsGraphList::_next()
 
     const auto& entry = entries_[current_index_];
 
-    for (auto var : yield_vars_) {
-        const auto& name = get_query_ctx().get_var_name(var);
-        if (name == "graphName") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.graphName));
-        } else if (name == "database") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.database));
-        } else if (name == "databaseLocation") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.databaseLocation));
-        } else if (name == "configuration") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.configuration));
-        } else if (name == "schema") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.schema));
-        } else if (name == "schemaWithOrientation") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.schemaWithOrientation));
-        } else if (name == "degreeDistribution") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.degreeDistribution));
-        } else if (name == "memoryUsage") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.memoryUsage));
-        } else if (name == "nodeCount") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.nodeCount));
-        } else if (name == "relationshipCount") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.relationshipCount));
-        } else if (name == "density") {
-            parent_binding->add(var, Common::Conversions::pack_double(entry.density));
-        } else if (name == "creationTime") {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          entry.creationTime.time_since_epoch()
-            )
-                          .count();
-            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(ms)));
-        } else if (name == "modificationTime") {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          entry.modificationTime.time_since_epoch()
-            )
-                          .count();
-            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(ms)));
-        } else if (name == "sizeInBytes") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.sizeInBytes));
-        } else {
-            parent_binding->add(var, ObjectId::get_null());
+    std::unordered_map<std::string, ObjectId> row{
+        { "graphName", GQL::Conversions::pack_string_simple(entry.graphName) },
+        { "database", GQL::Conversions::pack_string_simple(entry.database) },
+        { "databaseLocation", GQL::Conversions::pack_string_simple(entry.databaseLocation) },
+        { "configuration", GQL::Conversions::pack_string_simple(entry.configuration) },
+        { "schema", GQL::Conversions::pack_string_simple(entry.schema) },
+        { "schemaWithOrientation", GQL::Conversions::pack_string_simple(entry.schemaWithOrientation) },
+        { "degreeDistribution", GQL::Conversions::pack_string_simple(entry.degreeDistribution) },
+        { "memoryUsage", GQL::Conversions::pack_string_simple(entry.memoryUsage) },
+        { "nodeCount", Common::Conversions::pack_int(static_cast<int64_t>(entry.nodeCount)) },
+        { "relationshipCount", Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount)) },
+        { "density", Common::Conversions::pack_double(entry.density) },
+        { "creationTime", Common::Conversions::pack_int(static_cast<int64_t>(
+                              std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  entry.creationTime.time_since_epoch()).count())) },
+        { "modificationTime", Common::Conversions::pack_int(static_cast<int64_t>(
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     entry.modificationTime.time_since_epoch()).count())) },
+        { "sizeInBytes", Common::Conversions::pack_int(static_cast<int64_t>(entry.sizeInBytes)) }
+    };
+
+    auto available_names = GQL::OpProcedure::get_procedure_available_yield_variable_names(
+        GQL::OpProcedure::ProcedureType::GDS_GRAPH_LIST);
+
+    if (yield_vars_.size() == available_names.size()) {
+        for (size_t i = 0; i < yield_vars_.size(); ++i) {
+            const auto& col = available_names[i];
+            auto it = row.find(col);
+            if (it != row.end()) {
+                parent_binding->add(yield_vars_[i], it->second);
+            } else {
+                parent_binding->add(yield_vars_[i], ObjectId::get_null());
+            }
+        }
+    } else {
+        for (auto var : yield_vars_) {
+            const auto& name = get_query_ctx().get_var_name(var);
+            auto it = row.find(name);
+            if (it != row.end()) {
+                parent_binding->add(var, it->second);
+            } else {
+                parent_binding->add(var, ObjectId::get_null());
+            }
         }
     }
 

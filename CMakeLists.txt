@@ -113,6 +113,7 @@ set(TEST_TARGETS
     variable_set
     tensor_operations
     gds_graph_list
+    gds_graph_drop
 )
 # Build targets
 foreach(target ${BUILD_TARGETS})

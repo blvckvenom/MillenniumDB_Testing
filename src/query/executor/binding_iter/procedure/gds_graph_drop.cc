@@ -21,12 +21,14 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_graph_catalog.h"
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/parser/expr/gql/expr_var.h"
+#include "query/parser/op/gql/op_procedure.h"
 #include "query/query_context.h"
 
 GdsGraphDrop::GdsGraphDrop(
@@ -86,45 +88,50 @@ bool GdsGraphDrop::_next()
         if (result.droppedGraph.has_value()) {
             const auto& entry = result.droppedGraph.value();
 
-            for (auto var : yield_vars_) {
-                const std::string& var_name = get_query_ctx().get_var_name(var);
-                ObjectId value = ObjectId::get_null();
+            std::unordered_map<std::string, ObjectId> row{
+                { "graphName", GQL::Conversions::pack_string_simple(entry.graphName) },
+                { "database", GQL::Conversions::pack_string_simple(entry.database) },
+                { "databaseLocation", GQL::Conversions::pack_string_simple(entry.databaseLocation) },
+                { "configuration", GQL::Conversions::pack_string_simple(entry.configuration) },
+                { "nodeCount", Common::Conversions::pack_int(static_cast<int64_t>(entry.nodeCount)) },
+                { "relationshipCount", Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount)) },
+                { "schema", GQL::Conversions::pack_string_simple(entry.schema) },
+                { "schemaWithOrientation", GQL::Conversions::pack_string_simple(entry.schemaWithOrientation) },
+                { "degreeDistribution", GQL::Conversions::pack_string_simple(entry.degreeDistribution) },
+                { "density", Common::Conversions::pack_double(entry.density) },
+                { "creationTime", Common::Conversions::pack_int(static_cast<int64_t>(
+                                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         entry.creationTime.time_since_epoch()).count())) },
+                { "modificationTime", Common::Conversions::pack_int(static_cast<int64_t>(
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            entry.modificationTime.time_since_epoch()).count())) },
+                { "sizeInBytes", Common::Conversions::pack_int(static_cast<int64_t>(entry.sizeInBytes)) },
+                { "memoryUsage", GQL::Conversions::pack_string_simple(entry.memoryUsage) }
+            };
 
-                if (var_name == "graphName") {
-                    value = GQL::Conversions::pack_string_simple(entry.graphName);
-                } else if (var_name == "database") {
-                    value = GQL::Conversions::pack_string_simple(entry.database);
-                } else if (var_name == "databaseLocation") {
-                    value = GQL::Conversions::pack_string_simple(entry.databaseLocation);
-                } else if (var_name == "configuration") {
-                    value = GQL::Conversions::pack_string_simple(entry.configuration);
-                } else if (var_name == "nodeCount") {
-                    value = Common::Conversions::pack_int(static_cast<int64_t>(entry.nodeCount));
-                } else if (var_name == "relationshipCount") {
-                    value = Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount));
-                } else if (var_name == "schema") {
-                    value = GQL::Conversions::pack_string_simple(entry.schema);
-                } else if (var_name == "schemaWithOrientation") {
-                    value = GQL::Conversions::pack_string_simple(entry.schemaWithOrientation);
-                } else if (var_name == "degreeDistribution") {
-                    value = GQL::Conversions::pack_string_simple(entry.degreeDistribution);
-                } else if (var_name == "density") {
-                    value = Common::Conversions::pack_double(entry.density);
-                } else if (var_name == "creationTime") {
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        entry.creationTime.time_since_epoch()).count();
-                    value = Common::Conversions::pack_int(ms);
-                } else if (var_name == "modificationTime") {
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        entry.modificationTime.time_since_epoch()).count();
-                    value = Common::Conversions::pack_int(ms);
-                } else if (var_name == "sizeInBytes") {
-                    value = Common::Conversions::pack_int(static_cast<int64_t>(entry.sizeInBytes));
-                } else if (var_name == "memoryUsage") {
-                    value = GQL::Conversions::pack_string_simple(entry.memoryUsage);
+            auto available_names = GQL::OpProcedure::get_procedure_available_yield_variable_names(
+                GQL::OpProcedure::ProcedureType::GDS_GRAPH_DROP);
+
+            if (yield_vars_.size() == available_names.size()) {
+                for (size_t i = 0; i < yield_vars_.size(); ++i) {
+                    const auto& col = available_names[i];
+                    auto it = row.find(col);
+                    if (it != row.end()) {
+                        parent_binding->add(yield_vars_[i], it->second);
+                    } else {
+                        parent_binding->add(yield_vars_[i], ObjectId::get_null());
+                    }
                 }
-
-                parent_binding->add(var, value);
+            } else {
+                for (auto var : yield_vars_) {
+                    const auto& name = get_query_ctx().get_var_name(var);
+                    auto it = row.find(name);
+                    if (it != row.end()) {
+                        parent_binding->add(var, it->second);
+                    } else {
+                        parent_binding->add(var, ObjectId::get_null());
+                    }
+                }
             }
 
             return true;
