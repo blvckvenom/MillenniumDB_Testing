@@ -22,6 +22,7 @@
 #include <memory>
 #include <vector>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "graph_models/gql/gql_graph_catalog.h"
 #include "graph_models/gql/gql_value.h"
@@ -32,6 +33,7 @@
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/var_id.h"
+#include "query/query_context.h"
 
 namespace {
 
@@ -192,16 +194,28 @@ bool GdsGraphProject::_next()
             rel_proj_val,
             configuration);
 
-        // Assign results to yield variables following the predefined order
-        parent_binding->add(yield_vars_[0], GQL::Conversions::pack_string_simple(result.graphName));
-        parent_binding->add(yield_vars_[1], GQL::Conversions::pack_string_simple(result.nodeProjection));
-        parent_binding->add(yield_vars_[2], Common::Conversions::pack_int(result.nodeCount));
-        parent_binding->add(yield_vars_[3], GQL::Conversions::pack_string_simple(result.relationshipProjection));
-        parent_binding->add(yield_vars_[4], Common::Conversions::pack_int(result.relationshipCount));
-        parent_binding->add(yield_vars_[5], Common::Conversions::pack_int(result.projectMillis));
-        // query field not supported yet
-        parent_binding->add(yield_vars_[6], ObjectId::get_null());
-        parent_binding->add(yield_vars_[7], GQL::Conversions::pack_string_simple(result.configuration));
+        // Map column names to values
+        std::unordered_map<std::string, ObjectId> values {
+            {"graphName", GQL::Conversions::pack_string_simple(result.graphName)},
+            {"nodeProjection", GQL::Conversions::pack_string_simple(result.nodeProjection)},
+            {"nodeCount", Common::Conversions::pack_int(result.nodeCount)},
+            {"relationshipProjection", GQL::Conversions::pack_string_simple(result.relationshipProjection)},
+            {"relationshipCount", Common::Conversions::pack_int(result.relationshipCount)},
+            {"projectMillis", Common::Conversions::pack_int(result.projectMillis)},
+            {"query", ObjectId::get_null()},
+            {"configuration", GQL::Conversions::pack_string_simple(result.configuration)}
+        };
+
+        // Assign only requested yield variables
+        for (auto var : yield_vars_) {
+            const auto& name = get_query_ctx().get_var_name(var);
+            auto it = values.find(name);
+            if (it != values.end()) {
+                parent_binding->add(var, it->second);
+            } else {
+                parent_binding->add(var, ObjectId::get_null());
+            }
+        }
 
         return true;
 
