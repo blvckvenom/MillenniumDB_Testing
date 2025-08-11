@@ -11,6 +11,7 @@ struct VirtualGraph {
     };
 
     struct Edge {
+        std::string id;
         std::string from;
         std::string to;
         std::string type;
@@ -21,4 +22,3 @@ struct VirtualGraph {
     std::vector<Edge> edges;
     std::unordered_map<std::string, std::size_t> node_index;
 };
-

@@ -1,33 +1,14 @@
-#include "virtual_graph_factory.h"
-
+#include "virtual_graph/virtual_graph.h"
 #include <algorithm>
-#include <chrono>
+#include <cassert>
+#include <iostream>
+#include <memory>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
-#include "query/optimizer/quad_model/executor_constructor.h"
-#include "query/parser/mql_query_parser.h"
-#include "query/query_context.h"
-#include "system/buffer_manager.h"
-
-namespace {
-
-std::unique_ptr<QueryExecutor> compile_query(const std::string& query)
-{
-    auto version_scope = buffer_manager.init_version_readonly();
-
-    static thread_local QueryContext qc;
-    QueryContext::set_query_ctx(&qc);
-    qc.prepare(*version_scope, std::chrono::seconds(60));
-
-    auto logical_plan = MQL::QueryParser::get_query_plan(query);
-    MQL::ExecutorConstructor ctor(MQL::ReturnType::TSV);
-    logical_plan->accept_visitor(ctor);
-    return std::move(ctor.executor);
-}
-
-std::vector<std::vector<std::string>> parse_tsv(const std::string& data)
+static std::vector<std::vector<std::string>> parse_tsv(const std::string& data)
 {
     std::vector<std::vector<std::string>> rows;
     std::stringstream ss(data);
@@ -46,11 +27,11 @@ std::vector<std::vector<std::string>> parse_tsv(const std::string& data)
     return rows;
 }
 
-std::shared_ptr<VirtualGraph> build_graph_from_rows(
-    const std::vector<std::vector<std::string>>& node_rows,
-    const std::vector<std::vector<std::string>>& edge_rows
-)
+std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const std::string& edge_tsv)
 {
+    auto node_rows = parse_tsv(node_tsv);
+    auto edge_rows = parse_tsv(edge_tsv);
+
     auto vg = std::make_shared<VirtualGraph>();
 
     std::unordered_set<std::string> allowed_nodes;
@@ -67,10 +48,9 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
             const auto& row = node_rows[i];
             if (row.size() <= static_cast<size_t>(id_idx))
                 continue;
-            const std::string& node_id = row[id_idx];
+            const auto& node_id = row[id_idx];
             if (node_id.size() > 1 && node_id[0] == '_' && node_id[1] == 'e')
                 continue;
-
             allowed_nodes.insert(node_id);
 
             auto it = vg->node_index.find(node_id);
@@ -96,7 +76,6 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
         size_t to_idx = header.size() >= 3 ? 2 : 1;
         size_t type_idx = 1;
         size_t id_idx = header.size();
-
         for (size_t i = 0; i < header.size(); ++i) {
             if (header[i] == "src_id" || header[i] == "from" || header[i] == "source")
                 from_idx = i;
@@ -152,12 +131,11 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
                     continue;
             }
 
-            auto ensure_node = [&](const std::string& node_id) {
-                auto it = vg->node_index.find(node_id);
-                if (it == vg->node_index.end()) {
+            auto ensure_node = [&](const std::string& n) {
+                if (!vg->node_index.count(n)) {
                     size_t idx = vg->nodes.size();
-                    vg->node_index.insert({ node_id, idx });
-                    vg->nodes.push_back({ node_id, {} });
+                    vg->node_index[n] = idx;
+                    vg->nodes.push_back({ n, {} });
                 }
             };
 
@@ -171,49 +149,28 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
     return vg;
 }
 
-} // namespace
-
-std::unordered_map<std::string, std::shared_ptr<VirtualGraph>> graphs;
-
-static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, const std::string& edge_query)
+int main()
 {
-    auto node_exec = compile_query(node_query);
-    std::stringstream node_ss;
-    node_exec->execute(node_ss);
-    auto node_rows = parse_tsv(node_ss.str());
+    const std::string node_tsv = "id\tlabel\n1\tPerson\n2\tCountry\n3\tCompany\n";
+    const std::string edge_tsv = "src_id\tdst_id\trel_type\trel_id\n1\t2\tLivesIn\t10\n1\t3\tWorksAt\t11\n";
+    auto g = load_from_tsv(node_tsv, edge_tsv);
+    assert(g->edges.size() == 2);
+    assert(g->edges[0].type == "LivesIn");
+    assert(g->edges[1].type == "WorksAt");
 
-    auto edge_exec = compile_query(edge_query);
-    std::stringstream edge_ss;
-    edge_exec->execute(edge_ss);
-    auto edge_rows = parse_tsv(edge_ss.str());
+    const std::string
+        edge_tsv_label = "src_id\tdst_id\tlabel\trel_id\n1\t2\tLivesIn\t20\n1\t3\tWorksAt\t21\n";
+    auto g2 = load_from_tsv(node_tsv, edge_tsv_label);
+    assert(g2->edges.size() == 2);
+    assert(g2->edges[0].type == "LivesIn");
+    assert(g2->edges[1].type == "WorksAt");
 
-    return build_graph_from_rows(node_rows, edge_rows);
-}
+    const std::string
+        edge_tsv_dup = "src_id\tdst_id\trel_type\trel_id\n1\t2\tLivesIn\t100\n1\t2\tLivesIn\t100\n";
+    auto g3 = load_from_tsv(node_tsv, edge_tsv_dup);
+    assert(g3->edges.size() == 1);
+    assert(g3->edges[0].type == "LivesIn");
 
-std::shared_ptr<VirtualGraph>
-    VirtualGraphFactory::project_from_tsv(const std::string& node_tsv, const std::string& edge_tsv)
-{
-    auto node_rows = parse_tsv(node_tsv);
-    auto edge_rows = parse_tsv(edge_tsv);
-    return build_graph_from_rows(node_rows, edge_rows);
-}
-
-std::shared_ptr<VirtualGraph> VirtualGraphFactory::project(
-    const std::string& name,
-    const std::string& node_query,
-    const std::string& edge_query
-)
-{
-    auto g = run_project(node_query, edge_query);
-    graphs[name] = g;
-    return g;
-}
-
-std::shared_ptr<VirtualGraph> VirtualGraphFactory::get(const std::string& name)
-{
-    auto it = graphs.find(name);
-    if (it != graphs.end()) {
-        return it->second;
-    }
-    return nullptr;
+    std::cout << "All tests passed\n";
+    return 0;
 }
