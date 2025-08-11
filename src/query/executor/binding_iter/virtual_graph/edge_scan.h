@@ -32,8 +32,8 @@ public:
         if (!graph || idx >= graph->edges.size())
             return false;
         const auto& e = graph->edges[idx];
-        parent_binding->add(from_var, QuadObjectId::get_fixed_node_inside(e.from));
-        parent_binding->add(to_var, QuadObjectId::get_fixed_node_inside(e.to));
+        parent_binding->add(from_var, get_node_oid(e.from));
+        parent_binding->add(to_var, get_node_oid(e.to));
 
         if (!e.var.empty()) {
             parent_binding->add(edge_var, QuadObjectId::get_edge(e.var));
@@ -67,7 +67,7 @@ public:
         }
     }
 
-    void accept_visitor(BindingIterVisitor&) override;
+    void accept_visitor(BindingIterVisitor&) override { }
 
 private:
     std::shared_ptr<VirtualGraph> graph;
@@ -78,4 +78,38 @@ private:
     bool type_assigned;
     size_t idx = 0;
     Binding* parent_binding;
+
+    ObjectId get_node_oid(const std::string& id)
+    {
+        auto it = graph->node_index.find(id);
+        if (it != graph->node_index.end()) {
+            const auto& n = graph->nodes[it->second];
+            if (n.is_literal) {
+                switch (n.lit_type) {
+                case VirtualGraph::Node::LitType::STRING:
+                    return QuadObjectId::get_string(n.lit_string);
+                case VirtualGraph::Node::LitType::INT: {
+                    uint64_t oid = ObjectId::MASK_POSITIVE_INT;
+                    int64_t v = n.lit_int;
+                    if (v < 0) {
+                        oid = ObjectId::MASK_NEGATIVE_INT;
+                        v = -v;
+                        oid |= (~static_cast<uint64_t>(v)) & ObjectId::VALUE_MASK;
+                        return ObjectId(oid);
+                    }
+                    return ObjectId(oid | static_cast<uint64_t>(v));
+                }
+                case VirtualGraph::Node::LitType::DOUBLE:
+                    return QuadObjectId::get_string(std::to_string(n.lit_double));
+                case VirtualGraph::Node::LitType::BOOL:
+                    return ObjectId(ObjectId::MASK_BOOL | (n.lit_bool ? 1ULL : 0ULL));
+                case VirtualGraph::Node::LitType::DATE:
+                    return QuadObjectId::get_string(n.lit_string);
+                default:
+                    return QuadObjectId::get_string(n.lit_string);
+                }
+            }
+        }
+        return QuadObjectId::get_fixed_node_inside(id);
+    }
 };

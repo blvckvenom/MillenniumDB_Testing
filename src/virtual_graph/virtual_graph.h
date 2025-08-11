@@ -4,11 +4,17 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cstdint>
 
 struct VirtualGraph {
     struct Node {
         std::string id;
-        std::unordered_map<std::string, std::string> properties;
+        bool is_literal = false;
+        enum class LitType { NONE, STRING, INT, DOUBLE, BOOL, DATE } lit_type = LitType::NONE;
+        std::string lit_string;
+        int64_t lit_int = 0;
+        double lit_double = 0.0;
+        bool lit_bool = false;
     };
 
     struct Edge {

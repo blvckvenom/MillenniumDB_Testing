@@ -5,6 +5,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <cctype>
 
 #include "query/optimizer/quad_model/executor_constructor.h"
 #include "query/parser/mql_query_parser.h"
@@ -58,6 +59,74 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
     auto vg = std::make_shared<VirtualGraph>();
 
     std::unordered_set<std::string> allowed_nodes;
+    std::vector<VirtualGraph::Edge> prop_edges;
+
+    auto create_literal_node = [&](VirtualGraph& graph, const std::string& val) -> std::string {
+        if (val.empty()) return std::string();
+        VirtualGraph::Node lit;
+        lit.is_literal = true;
+        std::string sanitized = val;
+        for (auto& c : sanitized) { if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') c = '_'; }
+        bool parsed = false;
+        try {
+            size_t pos; long long i = std::stoll(val, &pos); if (pos == val.size()) { lit.lit_type = VirtualGraph::Node::LitType::INT; lit.lit_int = i; lit.id = "__lit_int__" + sanitized; parsed = true; }
+        } catch (...) {}
+        if (!parsed) {
+            if (val == "true" || val == "false") { lit.lit_type = VirtualGraph::Node::LitType::BOOL; lit.lit_bool = (val == "true"); lit.id = "__lit_bool__" + sanitized; parsed = true; }
+        }
+        if (!parsed) {
+            try { size_t pos; double d = std::stod(val, &pos); if (pos == val.size()) { lit.lit_type = VirtualGraph::Node::LitType::DOUBLE; lit.lit_double = d; lit.id = "__lit_dbl__" + sanitized; parsed = true; } } catch (...) {}
+        }
+        if (!parsed) { lit.lit_type = VirtualGraph::Node::LitType::STRING; lit.lit_string = val; lit.id = "__lit_str__" + sanitized; }
+        auto it = graph.node_index.find(lit.id);
+        if (it == graph.node_index.end()) {
+            size_t idx = graph.nodes.size();
+            graph.node_index[lit.id] = idx;
+            graph.nodes.push_back(lit);
+        }
+        return lit.id;
+    };
+
+    auto create_literal_from_oid = [&](VirtualGraph& graph, ObjectId oid) -> std::string {
+        VirtualGraph::Node lit;
+        lit.is_literal = true;
+        uint64_t gen = oid.id & ObjectId::GENERIC_TYPE_MASK;
+        if (gen == ObjectId::MASK_STRING) {
+            lit.lit_type = VirtualGraph::Node::LitType::STRING;
+            lit.lit_string = MQL::Conversions::unpack_string(oid);
+            lit.id = "__lit_str__" + std::to_string(oid.id);
+        } else if (gen == ObjectId::MASK_NUMERIC) {
+            if (oid.get_type() == ObjectId::MASK_NEGATIVE_INT || oid.get_type() == ObjectId::MASK_POSITIVE_INT) {
+                lit.lit_type = VirtualGraph::Node::LitType::INT;
+                lit.lit_int = MQL::Conversions::unpack_int(oid);
+                lit.id = "__lit_int__" + std::to_string(oid.id);
+            } else {
+                lit.lit_type = VirtualGraph::Node::LitType::DOUBLE;
+                lit.lit_double = MQL::Conversions::unpack_double(oid);
+                lit.id = "__lit_dbl__" + std::to_string(oid.id);
+            }
+        } else if (gen == ObjectId::MASK_BOOL) {
+            lit.lit_type = VirtualGraph::Node::LitType::BOOL;
+            lit.lit_bool = MQL::Conversions::unpack_bool(oid);
+            lit.id = "__lit_bool__" + std::to_string(oid.id);
+        } else if (gen == ObjectId::MASK_DT) {
+            lit.lit_type = VirtualGraph::Node::LitType::DATE;
+            lit.lit_string = MQL::Conversions::to_lexical_str(oid);
+            lit.id = "__lit_date__" + std::to_string(oid.id);
+        } else {
+            lit.lit_type = VirtualGraph::Node::LitType::STRING;
+            lit.lit_string = MQL::Conversions::to_lexical_str(oid);
+            lit.id = "__lit_str__" + std::to_string(oid.id);
+        }
+        auto it = graph.node_index.find(lit.id);
+        if (it == graph.node_index.end()) {
+            size_t idx = graph.nodes.size();
+            graph.node_index[lit.id] = idx;
+            graph.nodes.push_back(lit);
+        }
+        return lit.id;
+    };
+
     if (!node_rows.empty()) {
         const auto& header = node_rows.front();
         int id_idx = 0;
@@ -77,20 +146,48 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
 
             allowed_nodes.insert(node_id);
 
-            auto it = vg->node_index.find(node_id);
-            if (it == vg->node_index.end()) {
+            if (!vg->node_index.count(node_id)) {
                 size_t idx = vg->nodes.size();
-                vg->node_index.insert({ node_id, idx });
-                vg->nodes.push_back({ node_id, {} });
-                it = vg->node_index.find(node_id);
+                vg->node_index[node_id] = idx;
+                vg->nodes.push_back({ node_id });
             }
-            auto& props = vg->nodes[it->second].properties;
+
             for (size_t j = 0; j < row.size(); ++j) {
-                if (j == static_cast<size_t>(id_idx))
+                if (j == static_cast<size_t>(id_idx) || (j < header.size() && header[j] == "label"))
                     continue;
-                if (j < header.size())
-                    props[header[j]] = row[j];
+                if (j < header.size()) {
+                    const auto& key = header[j];
+                    const auto& val = row[j];
+                    auto lit_id = create_literal_node(*vg, val);
+                    if (!lit_id.empty()) {
+                        prop_edges.push_back({ "", "", node_id, lit_id, key, {} });
+                    }
+                }
             }
+        }
+    }
+
+    // Fetch properties for nodes from the quad model
+    bool interruption = false;
+    for (const auto& [nid, idx] : vg->node_index) {
+        const auto& n = vg->nodes[idx];
+        if (n.is_literal)
+            continue;
+        ObjectId oid;
+        try {
+            oid = QuadObjectId::get_fixed_node_inside(nid);
+        } catch (...) {
+            continue;
+        }
+        auto it = quad_model.object_key_value->get_range(&interruption,
+                                                         { oid.id, 0, 0 },
+                                                         { oid.id, UINT64_MAX, UINT64_MAX });
+        for (auto rec = it.next(); rec != nullptr; rec = it.next()) {
+            ObjectId key_oid((*rec)[1]);
+            ObjectId val_oid((*rec)[2]);
+            std::string key = MQL::Conversions::to_lexical_str(key_oid);
+            auto lit_id = create_literal_from_oid(*vg, val_oid);
+            prop_edges.push_back({ "", "", nid, lit_id, key, {} });
         }
     }
 
@@ -176,11 +273,10 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
             }
 
             auto ensure_node = [&](const std::string& node_id) {
-                auto it = vg->node_index.find(node_id);
-                if (it == vg->node_index.end()) {
+                if (!vg->node_index.count(node_id)) {
                     size_t idx = vg->nodes.size();
-                    vg->node_index.insert({ node_id, idx });
-                    vg->nodes.push_back({ node_id, {} });
+                    vg->node_index[node_id] = idx;
+                    vg->nodes.push_back({ node_id });
                 }
             };
 
@@ -190,6 +286,8 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
             vg->edges.push_back(std::move(e));
         }
     }
+
+    vg->edges.insert(vg->edges.end(), prop_edges.begin(), prop_edges.end());
 
     return vg;
 }

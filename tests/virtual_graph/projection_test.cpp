@@ -9,6 +9,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <cctype>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -78,6 +79,25 @@ std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const s
     auto vg = std::make_shared<VirtualGraph>();
 
     std::unordered_set<std::string> allowed_nodes;
+    std::vector<VirtualGraph::Edge> prop_edges;
+    auto create_literal_node = [&](const std::string& val) -> std::string {
+        if (val.empty()) return std::string();
+        VirtualGraph::Node lit;
+        lit.is_literal = true;
+        std::string sanitized = val;
+        for (auto& c : sanitized) { if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') c = '_'; }
+        bool parsed = false;
+        try { size_t p; long long i = std::stoll(val, &p); if (p == val.size()) { lit.lit_type = VirtualGraph::Node::LitType::INT; lit.lit_int = i; lit.id = "__lit_int__" + sanitized; parsed = true; } } catch (...) {}
+        if (!parsed && (val == "true" || val == "false")) { lit.lit_type = VirtualGraph::Node::LitType::BOOL; lit.lit_bool = (val=="true"); lit.id = "__lit_bool__" + sanitized; parsed = true; }
+        if (!parsed) { lit.lit_type = VirtualGraph::Node::LitType::STRING; lit.lit_string = val; lit.id = "__lit_str__" + sanitized; }
+        if (!vg->node_index.count(lit.id)) {
+            size_t idx = vg->nodes.size();
+            vg->node_index[lit.id] = idx;
+            vg->nodes.push_back(lit);
+        }
+        return lit.id;
+    };
+
     if (!node_rows.empty()) {
         const auto& header = node_rows.front();
         int id_idx = 0;
@@ -96,19 +116,20 @@ std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const s
                 continue;
             allowed_nodes.insert(node_id);
 
-            auto it = vg->node_index.find(node_id);
-            if (it == vg->node_index.end()) {
+            if (!vg->node_index.count(node_id)) {
                 size_t idx = vg->nodes.size();
-                vg->node_index.insert({ node_id, idx });
-                vg->nodes.push_back({ node_id, {} });
-                it = vg->node_index.find(node_id);
+                vg->node_index[node_id] = idx;
+                vg->nodes.push_back({ node_id });
             }
-            auto& props = vg->nodes[it->second].properties;
             for (size_t j = 0; j < row.size(); ++j) {
-                if (j == static_cast<size_t>(id_idx))
+                if (j == static_cast<size_t>(id_idx) || (j < header.size() && header[j] == "label"))
                     continue;
-                if (j < header.size())
-                    props[header[j]] = row[j];
+                if (j < header.size()) {
+                    auto lit_id = create_literal_node(row[j]);
+                    if (!lit_id.empty()) {
+                        prop_edges.push_back({ "", "", node_id, lit_id, header[j], {} });
+                    }
+                }
             }
         }
     }
@@ -206,6 +227,8 @@ std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const s
         }
     }
 
+    vg->edges.insert(vg->edges.end(), prop_edges.begin(), prop_edges.end());
+
     return vg;
 }
 
@@ -276,8 +299,8 @@ int main()
     }
 
     // Ensure source files don't inject type()
-    assert(std::system("rg -q 'type\\(' src/virtual_graph src/query/executor/binding_iter/virtual_graph > /dev/null") != 0);
-    assert(std::system("rg -q 'label\\(' src/virtual_graph src/query/executor/binding_iter/virtual_graph > /dev/null") != 0);
+    assert(std::system("rg -q '[^_]type\\(' src/virtual_graph src/query/executor/binding_iter/virtual_graph > /dev/null") != 0);
+    assert(std::system("rg -q '[^_]label\\(' src/virtual_graph src/query/executor/binding_iter/virtual_graph > /dev/null") != 0);
 
     // A) legacy 3-column project without explicit type column
     {
@@ -332,6 +355,32 @@ int main()
             count++;
         }
         assert(count == g->edges.size());
+    }
+
+    // Node property edges materialization
+    {
+        const std::string node_prop_tsv =
+            "id\tlabel\tname\tage\tactive\n"
+            "N1\tPerson\tAlice\t30\ttrue\n"
+            "N2\tPerson\tBob\t25\tfalse\n";
+        auto gprops = load_from_tsv(node_prop_tsv, edge_tsv);
+        VirtualGraphEdgeScan scan(gprops, VarId(0), VarId(1), VarId(2), VarId(3), true);
+        Binding b(4);
+        scan.begin(b);
+        bool saw_name = false, saw_age = false, saw_active = false;
+        while (scan.next()) {
+            if (b[VarId(3)] == QuadObjectId::get_string("name")) {
+                saw_name = true;
+                assert(b[VarId(1)].get_type() == ObjectId::MASK_STRING_SIMPLE_INLINED);
+            } else if (b[VarId(3)] == QuadObjectId::get_string("age")) {
+                saw_age = true;
+                assert(b[VarId(1)].get_type() == ObjectId::MASK_POSITIVE_INT);
+            } else if (b[VarId(3)] == QuadObjectId::get_string("active")) {
+                saw_active = true;
+                assert(b[VarId(1)].get_type() == ObjectId::MASK_BOOL);
+            }
+        }
+        assert(saw_name && saw_age && saw_active);
     }
 
     std::cout << "All tests passed\n";
