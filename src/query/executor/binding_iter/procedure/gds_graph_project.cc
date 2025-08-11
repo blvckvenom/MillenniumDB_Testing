@@ -31,6 +31,7 @@
 #include "query/executor/binding.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_term.h"
+#include "query/parser/expr/gql/expr_var.h"
 #include "query/var_id.h"
 
 namespace {
@@ -104,11 +105,21 @@ GQL::Value object_id_to_value(ObjectId oid)
     return GQL::Value(GQL::Conversions::to_lexical_str(oid));
 }
 
-// Evaluate a GQL::Expr expected to be a literal and return its value.
-GQL::Value evaluate_expr_to_value(const GQL::Expr* expr)
+// Evaluate a GQL::Expr and return its value. Supports literals and variables.
+GQL::Value evaluate_expr_to_value(const GQL::Expr* expr, Binding* binding)
 {
     if (const auto* term = dynamic_cast<const GQL::ExprTerm*>(expr)) {
         return object_id_to_value(term->term);
+    }
+    if (const auto* var = dynamic_cast<const GQL::ExprVar*>(expr)) {
+        if (binding == nullptr) {
+            return GQL::Value();
+        }
+        auto oid = (*binding)[var->id];
+        if (oid.is_null()) {
+            return GQL::Value();
+        }
+        return object_id_to_value(oid);
     }
     return GQL::Value();
 }
@@ -169,19 +180,36 @@ bool GdsGraphProject::_next()
     executed_ = true;
 
     try {
-        // Evaluate arguments
-        auto graph_name_val = evaluate_expr_to_value(argument_exprs_[0].get());
-        if (!graph_name_val.is_string()) {
-            assign_nulls();
-            return false;
+        // Validate argument count
+        if (argument_exprs_.size() < 3) {
+            throw std::runtime_error("gds.graph.project requires graphName, nodeProjection and relationshipProjection arguments");
+        }
+        if (argument_exprs_.size() > 4) {
+            throw std::runtime_error("gds.graph.project accepts at most four arguments");
         }
 
-        auto node_proj_val = evaluate_expr_to_value(argument_exprs_[1].get());
-        auto rel_proj_val  = evaluate_expr_to_value(argument_exprs_[2].get());
-        auto config_val    = evaluate_expr_to_value(argument_exprs_[3].get());
+        // Evaluate arguments
+        auto graph_name_val = evaluate_expr_to_value(argument_exprs_[0].get(), parent_binding);
+        if (!graph_name_val.is_string()) {
+            throw std::runtime_error("graphName argument must be a string");
+        }
+
+        auto node_proj_val = evaluate_expr_to_value(argument_exprs_[1].get(), parent_binding);
+        if (!(node_proj_val.is_string() || node_proj_val.is_list() || node_proj_val.is_map())) {
+            throw std::runtime_error("nodeProjection argument must be a string, list or map");
+        }
+
+        auto rel_proj_val = evaluate_expr_to_value(argument_exprs_[2].get(), parent_binding);
+        if (!(rel_proj_val.is_string() || rel_proj_val.is_list() || rel_proj_val.is_map())) {
+            throw std::runtime_error("relationshipProjection argument must be a string, list or map");
+        }
 
         GQL::Map configuration;
-        if (config_val.is_map()) {
+        if (argument_exprs_.size() == 4) {
+            auto config_val = evaluate_expr_to_value(argument_exprs_[3].get(), parent_binding);
+            if (!config_val.is_map()) {
+                throw std::runtime_error("configuration argument must be a map");
+            }
             configuration = GQL::Map(config_val.as_map());
         }
 
@@ -205,9 +233,9 @@ bool GdsGraphProject::_next()
 
         return true;
 
-    } catch (const std::exception&) {
+    } catch (...) {
         assign_nulls();
-        return false;
+        throw;
     }
 }
 
