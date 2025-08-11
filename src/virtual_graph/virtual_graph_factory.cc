@@ -10,6 +10,10 @@
 #include "query/parser/mql_query_parser.h"
 #include "query/query_context.h"
 #include "system/buffer_manager.h"
+#include "graph_models/quad_model/quad_model.h"
+#include "graph_models/quad_model/conversions.h"
+#include "graph_models/quad_model/quad_object_id.h"
+#include "storage/index/random_access_table/random_access_table.h"
 
 namespace {
 
@@ -106,7 +110,7 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
                 to_idx = i;
             if (col == "edge_var" || col == "edge" || col == "r")
                 var_idx = i;
-            if (col == "rel_type" || col == "type" || col == "label" || col == "t" || col == "__rel_type")
+            if (col == "rel_type" || col == "type" || col == "label" || col == "t")
                 type_idx = i;
             if (col == "rel_id" || col == "id" || col == "edge_id")
                 id_idx = i;
@@ -127,6 +131,19 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
                 e.var = row[var_idx];
             if (row.size() > type_idx)
                 e.type = row[type_idx];
+
+            if (e.type.empty() && !e.var.empty()) {
+                try {
+                    auto edge_oid = QuadObjectId::get_edge(e.var);
+                    auto rec = (*quad_model.edge_table)[edge_oid.get_value()];
+                    if (rec) {
+                        ObjectId type_oid((*rec)[2]);
+                        e.type = MQL::Conversions::to_lexical_str(type_oid);
+                    }
+                } catch (...) {
+                    // ignore errors, leave type empty
+                }
+            }
             if (row.size() > id_idx)
                 e.id = row[id_idx];
 
@@ -192,26 +209,6 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, 
     std::stringstream edge_ss;
     edge_exec->execute(edge_ss);
     auto edge_rows = parse_tsv(edge_ss.str());
-
-    bool has_type = false;
-    if (!edge_rows.empty()) {
-        const auto& header = edge_rows.front();
-        for (const auto& col : header) {
-            if (col == "rel_type" || col == "type" || col == "label" || col == "t" || col == "__rel_type") {
-                has_type = true;
-                break;
-            }
-        }
-        if (!has_type && header.size() >= 2) {
-            std::string edge_var = header[1];
-            std::string augmented = edge_query + ", type(" + edge_var + ") AS __rel_type";
-            edge_exec = compile_query(augmented);
-            edge_ss.str("");
-            edge_ss.clear();
-            edge_exec->execute(edge_ss);
-            edge_rows = parse_tsv(edge_ss.str());
-        }
-    }
 
     return build_graph_from_rows(node_rows, edge_rows);
 }

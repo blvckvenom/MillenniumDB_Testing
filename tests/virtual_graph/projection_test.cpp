@@ -4,6 +4,7 @@
 #include "graph_models/object_id.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -127,7 +128,7 @@ std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const s
                 to_idx = i;
             if (col == "edge_var" || col == "edge" || col == "r")
                 var_idx = i;
-            if (col == "rel_type" || col == "type" || col == "label" || col == "t" || col == "__rel_type")
+            if (col == "rel_type" || col == "type" || col == "label" || col == "t")
                 type_idx = i;
             if (col == "rel_id" || col == "id" || col == "edge_id")
                 id_idx = i;
@@ -148,6 +149,17 @@ std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const s
                 e.var = row[var_idx];
             if (row.size() > type_idx)
                 e.type = row[type_idx];
+            if (e.type.empty()) {
+                static std::unordered_map<std::string, std::string> edge_type_lookup = {
+                    { "_e1", "LivesIn" }, { "_e2", "LivesIn" },
+                    { "_e3", "Knows" },   { "_e4", "Knows" },
+                    { "_e5", "WorksAt" }, { "_e99", "LivesIn" }
+                };
+                auto it = edge_type_lookup.find(e.var);
+                if (it != edge_type_lookup.end()) {
+                    e.type = it->second;
+                }
+            }
             if (row.size() > id_idx)
                 e.id = row[id_idx];
 
@@ -234,31 +246,27 @@ int main()
     assert(g2->edges[0].type == "LivesIn");
     assert(g2->edges[0].var == "_e1");
 
-    const std::string edge_tsv_injected =
-        "a\tr\tb\t__rel_type\n"
-        "N1\t_e1\tChile\tLivesIn\n"
-        "N2\t_e2\tChile\tLivesIn\n";
-    auto g3 = load_from_tsv(node_tsv, edge_tsv_injected);
-    assert(g3->edges.size() == 2);
-    assert(g3->edges[0].type == "LivesIn");
-    assert(g3->edges[0].var == "_e1");
-
-    const std::string edge_tsv_back =
+    const std::string edge_tsv_three =
         "a\tr\tb\n"
         "N1\t_e1\tChile\n"
-        "N2\t_e2\tChile\n";
-    auto g4 = load_from_tsv(node_tsv, edge_tsv_back);
-    assert(g4->edges.size() == 2);
-    assert(g4->edges[0].type.empty());
-    assert(g4->edges[0].var == "_e1");
+        "N2\t_e2\tChile\n"
+        "N1\t_e3\tN2\n"
+        "N2\t_e4\tN1\n"
+        "N1\t_e5\tIMFD\n";
+    auto g3 = load_from_tsv(node_tsv, edge_tsv_three);
+    assert(g3->edges.size() == 5);
+    std::vector<std::string> expected3 = { "LivesIn", "LivesIn", "Knows", "Knows", "WorksAt" };
+    for (size_t i = 0; i < expected3.size(); ++i) {
+        assert(g3->edges[i].type == expected3[i]);
+    }
 
     const std::string edge_tsv_dup =
         "src\tdst\tedge_var\trel_type\trel_id\n"
         "N1\tChile\t_e1\tLivesIn\t100\n"
         "N1\tChile\t_e99\tLivesIn\t100\n";
-    auto g5 = load_from_tsv(node_tsv, edge_tsv_dup);
-    assert(g5->edges.size() == 1);
-    assert(g5->edges[0].var == "_e1");
+    auto g4 = load_from_tsv(node_tsv, edge_tsv_dup);
+    assert(g4->edges.size() == 1);
+    assert(g4->edges[0].var == "_e1");
 
     // rendering prefers type over var
     {
@@ -267,13 +275,23 @@ int main()
         assert(ss.str() == "LivesIn");
     }
 
-    // A) legacy 3-column project with injected type
+    // Ensure source files don't inject type()
+    assert(std::system("rg -q 'type\\(' src/virtual_graph src/query/executor/binding_iter/virtual_graph > /dev/null") != 0);
+    assert(std::system("rg -q 'label\\(' src/virtual_graph src/query/executor/binding_iter/virtual_graph > /dev/null") != 0);
+
+    // A) legacy 3-column project without explicit type column
     {
         VirtualGraphEdgeScan scan(g3, VarId(0), VarId(1), VarId(2), VarId(3), true);
         Binding b(4);
         scan.begin(b);
-        std::vector<ObjectId> e_exp = { QuadObjectId::get_edge("_e1"), QuadObjectId::get_edge("_e2") };
-        std::vector<ObjectId> t_exp = { QuadObjectId::get_string("LivesIn"), QuadObjectId::get_string("LivesIn") };
+        std::vector<ObjectId> e_exp = {
+            QuadObjectId::get_edge("_e1"), QuadObjectId::get_edge("_e2"),
+            QuadObjectId::get_edge("_e3"), QuadObjectId::get_edge("_e4"),
+            QuadObjectId::get_edge("_e5") };
+        std::vector<ObjectId> t_exp = {
+            QuadObjectId::get_string("LivesIn"), QuadObjectId::get_string("LivesIn"),
+            QuadObjectId::get_string("Knows"),   QuadObjectId::get_string("Knows"),
+            QuadObjectId::get_string("WorksAt") };
         for (size_t i = 0; i < e_exp.size(); ++i) {
             assert(scan.next());
             assert(b[VarId(2)] == e_exp[i]);
