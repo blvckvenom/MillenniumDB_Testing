@@ -1,0 +1,3 @@
+CALL gds.graph.project("bigGraph", [], [])
+CALL gds.graph.list() YIELD nodeCount AS cnt
+RETURN cnt + 9223372036854775807 AS bigNumber
