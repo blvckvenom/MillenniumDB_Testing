@@ -97,9 +97,9 @@ bool GdsGraphList::_next()
         } else if (name == "memoryUsage") {
             parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.memoryUsage));
         } else if (name == "nodeCount") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.nodeCount));
+            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(entry.nodeCount)));
         } else if (name == "relationshipCount") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.relationshipCount));
+            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount)));
         } else if (name == "density") {
             parent_binding->add(var, Common::Conversions::pack_double(entry.density));
         } else if (name == "creationTime") {
@@ -115,7 +115,7 @@ bool GdsGraphList::_next()
                           .count();
             parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(ms)));
         } else if (name == "sizeInBytes") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.sizeInBytes));
+            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(entry.sizeInBytes)));
         } else {
             parent_binding->add(var, ObjectId::get_null());
         }
