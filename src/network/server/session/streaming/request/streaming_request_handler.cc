@@ -129,6 +129,7 @@ void StreamingRequestHandler::handle_run(const std::string& query)
         logger(Category::Error) << msg;
         response_writer->write_error(msg);
         response_writer->flush();
+        throw;
     }
 }
 

@@ -85,6 +85,7 @@ void StreamingWebSocketSession::run(std::unique_ptr<StreamingWebSocketSession> o
                     logger(Category::Error) << "Uncaught exception: " << e.what();
                 } catch (...) {
                     logger(Category::Error) << "Unexpected exception!";
+                    throw;
                 }
 
                 StreamingWebSocketSession::run(std::move(obj));

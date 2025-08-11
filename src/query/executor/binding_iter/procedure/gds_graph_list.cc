@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "gds_graph_list.h"
+#include <iostream>
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
@@ -62,7 +63,8 @@ bool GdsGraphList::_next()
             if (!oid.is_null()) {
                 try {
                     graph_name_filter = GQL::Conversions::unpack_string(oid);
-                } catch (...) {
+                } catch (const std::exception& e) {
+                    std::cerr << "Failed to unpack graph name: " << e.what() << '\n';
                     graph_name_filter = std::nullopt;
                 }
             }

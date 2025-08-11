@@ -38,8 +38,6 @@ void HNSWIndexManager::load_hnsw_index(const std::string& name, const HNSWIndexM
         predicate2names[metadata.predicate].emplace_back(name);
     } catch (const std::exception& e) {
         logger(Category::Error) << "Failed to load HnswIndex \"" + name + "\": " + e.what();
-    } catch (...) {
-        logger(Category::Error) << "Failed to load HnswIndex \"" + name + "\": Unknown error";
     }
 }
 
@@ -159,9 +157,8 @@ std::tuple<uint_fast32_t> HNSWIndexManager::create_hnsw_index(
         has_changes_ = true;
         return { total_inserted_elements };
     } catch (const std::exception& e) {
+        logger(Category::Error) << "Failed to create HNSW index \"" + name + "\": " + e.what();
         throw std::runtime_error("Failed to create HNSW index \"" + name + "\": " + e.what());
-    } catch (...) {
-        throw std::runtime_error("Failed to create HNSW index \"" + name + "\": Unknown error");
     }
 }
 

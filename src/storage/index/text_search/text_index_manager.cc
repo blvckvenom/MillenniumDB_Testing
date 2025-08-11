@@ -45,8 +45,6 @@ void TextIndexManager::load_text_index(
         predicate2names[metadata.predicate].emplace_back(name);
     } catch (const std::exception& e) {
         logger(Category::Error) << "Failed to load TextSearchIndex \"" + name + "\": " + e.what();
-    } catch (...) {
-        logger(Category::Error) << "Failed to load TextSearchIndex \"" + name + "\": Unknown error";
     }
 }
 
@@ -89,8 +87,7 @@ std::tuple<uint_fast32_t, uint_fast32_t> TextIndexManager::create_text_search_in
         has_changes_ = true;
         return { total_inserted_elements, total_inserted_tokens };
     } catch (const std::exception& e) {
+        logger(Category::Error) << "Failed to create TEXT index \"" + name + "\": " + e.what();
         throw std::runtime_error("Failed to create TEXT index \"" + name + "\": " + e.what());
-    } catch (...) {
-        throw std::runtime_error("Failed to create TEXT index \"" + name + "\": Unknown error");
     }
 }

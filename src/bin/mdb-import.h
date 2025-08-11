@@ -80,12 +80,13 @@ inline ImportConfig parse_import_config(const std::vector<std::string>& args)
 
     opt.insert({ "--btree-permutations", [](ImportConfig& config, const std::string& value) {
                     try {
-                        auto perms = std::stoi(value);
+                        auto perms = std::stoi(value); // may throw std::invalid_argument or std::out_of_range
                         if (perms == 3 || perms == 4 || perms == 6) {
                             config.btree_permutations = perms;
                             return "";
                         }
-                    } catch (...) {
+                    } catch (const std::exception& e) {
+                        WARN("Invalid btree-permutations value: ", e.what());
                     }
                     return "Invalid value for option \"btree-permutations\". Expected 3, 4 or 6";
                 } });

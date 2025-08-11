@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -49,7 +50,8 @@ public:
                 size_t idx;
                 try {
                     flt = std::stof(str, &idx);
-                } catch (...) {
+                } catch (const std::exception& e) {
+                    std::cerr << "Float cast failed: " << e.what() << '\n';
                     return ObjectId::get_null();
                 }
                 if (idx != str.size()) {
@@ -63,7 +65,8 @@ public:
                 size_t idx;
                 try {
                     dbl = std::stod(str, &idx);
-                } catch (...) {
+                } catch (const std::exception& e) {
+                    std::cerr << "Double cast failed: " << e.what() << '\n';
                     return ObjectId::get_null();
                 }
                 if (idx != str.size()) {

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <string>
+#include "misc/fatal_error.h"
 
 namespace MdbBin {
 
@@ -14,6 +15,11 @@ inline std::string to_lower(const std::string& str)
     return res;
 }
 
+/**
+ * Parses a human-readable byte string (e.g. "10MB") into its numeric value.
+ * Conversion errors from std::stoll (std::invalid_argument, std::out_of_range)
+ * are logged and cause the function to return -1.
+ */
 inline int64_t parse_bytes(const std::string& value)
 {
     size_t chars_read;
@@ -39,7 +45,8 @@ inline int64_t parse_bytes(const std::string& value)
             }
             return multiplier * number;
         }
-    } catch (...) {
+    } catch (const std::exception& e) {
+        WARN("Failed to parse bytes: ", e.what());
     }
     return -1;
 }

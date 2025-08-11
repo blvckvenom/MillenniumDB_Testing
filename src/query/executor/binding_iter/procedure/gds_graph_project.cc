@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "gds_graph_project.h"
+#include <iostream>
 
 #include <memory>
 #include <vector>
@@ -95,7 +96,8 @@ GQL::Value object_id_to_value(ObjectId oid)
         // Try integer first, fall back to double
         try {
             return GQL::Value(Common::Conversions::unpack_int(oid));
-        } catch (...) {
+        } catch (const std::exception& e) {
+            std::cerr << "Numeric conversion failed: " << e.what() << '\n';
             return GQL::Value(Common::Conversions::to_double(oid));
         }
     }
