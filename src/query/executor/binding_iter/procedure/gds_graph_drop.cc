@@ -131,8 +131,7 @@ bool GdsGraphDrop::_next()
         }
 
         // Graph was not found and failIfMissing was false
-        assign_nulls();
-        return true;
+        return false;
     } catch (...) {
         assign_nulls();
         throw;
