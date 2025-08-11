@@ -29,9 +29,17 @@
 
 /**
  * BindingIter implementation for the gds.graph.list procedure.
- * Usage: `CALL gds.graph.list()` with an optional YIELD clause to
- * specify the returned columns. This iterator lists graph projections
- * in the catalog and yields each graph's metadata as a result row.
+ *
+ * Usage: `CALL gds.graph.list([graphName]) YIELD ...` where the optional
+ *  argument may be provided as a literal or as a variable bound in the
+ *  incoming row. When specified, only the matching graph is listed.
+ *
+ * Yield columns correspond to fields of @ref GQL::GqlGraphCatalog::GraphListEntry:
+ * graphName, database, databaseLocation, configuration, nodeCount,
+ * relationshipCount, schema, schemaWithOrientation, degreeDistribution,
+ * density, creationTime, modificationTime, sizeInBytes and memoryUsage.
+ * Columns not requested in the YIELD clause are ignored; requested columns
+ * without a corresponding catalog value are returned as NULL.
  */
 class GdsGraphList : public BindingIter {
 public:
