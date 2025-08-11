@@ -34,19 +34,19 @@ public:
         const auto& e = graph->edges[idx];
         parent_binding->add(from_var, QuadObjectId::get_fixed_node_inside(e.from));
         parent_binding->add(to_var, QuadObjectId::get_fixed_node_inside(e.to));
-        if (type_assigned) {
-            if (!e.type.empty()) {
-                parent_binding->add(type_var, QuadObjectId::get_named_node(e.type));
-            } else {
-                parent_binding->add(type_var, ObjectId::get_null());
-            }
-        }
-        if (!e.type.empty()) {
-            parent_binding->add(edge_var, QuadObjectId::get_edge(e.type));
-        } else if (!e.var.empty()) {
+
+        if (!e.var.empty()) {
             parent_binding->add(edge_var, QuadObjectId::get_edge(e.var));
         } else {
             parent_binding->add(edge_var, QuadObjectId::get_edge("_e" + std::to_string(idx)));
+        }
+
+        if (type_assigned) {
+            if (!e.type.empty()) {
+                parent_binding->add(type_var, QuadObjectId::get_string(e.type));
+            } else {
+                parent_binding->add(type_var, ObjectId::get_null());
+            }
         }
         idx++;
         return true;

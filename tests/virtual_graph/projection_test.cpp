@@ -1,4 +1,7 @@
 #include "virtual_graph/virtual_graph.h"
+#include "query/executor/binding_iter/virtual_graph/edge_scan.h"
+#include "query/executor/binding.h"
+#include "graph_models/object_id.h"
 #include <algorithm>
 #include <cassert>
 #include <iostream>
@@ -7,6 +10,45 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+
+namespace QuadObjectId {
+ObjectId get_edge(const std::string& str)
+{
+    std::string tmp = (str.size() > 2 && str[0] == '_' && str[1] == 'e') ? str.substr(2) : str;
+    int number = std::stoi(tmp);
+    return ObjectId(static_cast<uint64_t>(number) | ObjectId::MASK_EDGE);
+}
+
+ObjectId get_string(const std::string& str)
+{
+    uint64_t res = 0;
+    int shift_size = 8 * (ObjectId::STR_INLINE_BYTES - 1);
+    for (uint8_t byte : str) {
+        uint64_t byte64 = static_cast<uint64_t>(byte);
+        res |= byte64 << shift_size;
+        shift_size -= 8;
+    }
+    return ObjectId(res | ObjectId::MASK_STRING_SIMPLE_INLINED);
+}
+
+ObjectId get_named_node(const std::string& str)
+{
+    return get_string(str);
+}
+
+ObjectId get_fixed_node_inside(const std::string& str)
+{
+    if (str.size() > 1 && str[0] == '_' && str[1] == 'e') {
+        return get_edge(str);
+    }
+    if (str.size() > 1 && str[0] == '_' && str[1] == 'a') {
+        std::string tmp = str.substr(2);
+        int number = std::stoi(tmp);
+        return ObjectId(static_cast<uint64_t>(number) | ObjectId::MASK_ANON_INLINED);
+    }
+    return get_string(str);
+}
+} // namespace QuadObjectId
 
 static std::vector<std::vector<std::string>> parse_tsv(const std::string& data)
 {
@@ -217,6 +259,62 @@ int main()
     auto g5 = load_from_tsv(node_tsv, edge_tsv_dup);
     assert(g5->edges.size() == 1);
     assert(g5->edges[0].var == "_e1");
+
+    // rendering prefers type over var
+    {
+        std::stringstream ss;
+        ss << g->edges[0];
+        assert(ss.str() == "LivesIn");
+    }
+
+    // A) legacy 3-column project with injected type
+    {
+        VirtualGraphEdgeScan scan(g3, VarId(0), VarId(1), VarId(2), VarId(3), true);
+        Binding b(4);
+        scan.begin(b);
+        std::vector<ObjectId> e_exp = { QuadObjectId::get_edge("_e1"), QuadObjectId::get_edge("_e2") };
+        std::vector<ObjectId> t_exp = { QuadObjectId::get_string("LivesIn"), QuadObjectId::get_string("LivesIn") };
+        for (size_t i = 0; i < e_exp.size(); ++i) {
+            assert(scan.next());
+            assert(b[VarId(2)] == e_exp[i]);
+            assert(b[VarId(3)] == t_exp[i]);
+        }
+        assert(!scan.next());
+    }
+
+    // B) explicit rel_type column with multiple types
+    {
+        VirtualGraphEdgeScan scan(g, VarId(0), VarId(1), VarId(2), VarId(3), true);
+        Binding b(4);
+        scan.begin(b);
+        std::vector<ObjectId> e_exp = {
+            QuadObjectId::get_edge("_e1"), QuadObjectId::get_edge("_e2"),
+            QuadObjectId::get_edge("_e3"), QuadObjectId::get_edge("_e4"),
+            QuadObjectId::get_edge("_e5") };
+        std::vector<ObjectId> t_exp = {
+            QuadObjectId::get_string("LivesIn"), QuadObjectId::get_string("LivesIn"),
+            QuadObjectId::get_string("Knows"),   QuadObjectId::get_string("Knows"),
+            QuadObjectId::get_string("WorksAt") };
+        for (size_t i = 0; i < e_exp.size(); ++i) {
+            assert(scan.next());
+            assert(b[VarId(2)] == e_exp[i]);
+            assert(b[VarId(3)] == t_exp[i]);
+        }
+        assert(!scan.next());
+    }
+
+    // C) edge pattern without type variable
+    {
+        VirtualGraphEdgeScan scan(g, VarId(0), VarId(1), VarId(2));
+        Binding b(3);
+        scan.begin(b);
+        size_t count = 0;
+        while (scan.next()) {
+            assert(b[VarId(2)].get_type() == ObjectId::MASK_EDGE);
+            count++;
+        }
+        assert(count == g->edges.size());
+    }
 
     std::cout << "All tests passed\n";
     return 0;

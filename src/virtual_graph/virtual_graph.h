@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,3 +24,15 @@ struct VirtualGraph {
     std::vector<Edge> edges;
     std::unordered_map<std::string, std::size_t> node_index;
 };
+
+inline std::ostream& operator<<(std::ostream& os, const VirtualGraph::Edge& e)
+{
+    if (!e.type.empty()) {
+        os << e.type;
+    } else if (!e.var.empty()) {
+        os << e.var;
+    } else {
+        os << e.id;
+    }
+    return os;
+}
