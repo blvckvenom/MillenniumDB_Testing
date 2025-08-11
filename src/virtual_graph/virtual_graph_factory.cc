@@ -94,17 +94,21 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
         const auto& header = edge_rows.front();
         size_t from_idx = 0;
         size_t to_idx = header.size() >= 3 ? 2 : 1;
-        size_t type_idx = 1;
+        size_t var_idx = 1;
+        size_t type_idx = header.size();
         size_t id_idx = header.size();
 
         for (size_t i = 0; i < header.size(); ++i) {
-            if (header[i] == "src_id" || header[i] == "from" || header[i] == "source")
+            const auto& col = header[i];
+            if (col == "src_id" || col == "src" || col == "from" || col == "source")
                 from_idx = i;
-            if (header[i] == "dst_id" || header[i] == "to" || header[i] == "target")
+            if (col == "dst_id" || col == "dst" || col == "to" || col == "target")
                 to_idx = i;
-            if (header[i] == "rel_type" || header[i] == "type" || header[i] == "label")
+            if (col == "edge_var" || col == "edge" || col == "r")
+                var_idx = i;
+            if (col == "rel_type" || col == "type" || col == "label" || col == "t")
                 type_idx = i;
-            if (header[i] == "rel_id" || header[i] == "id")
+            if (col == "rel_id" || col == "id" || col == "edge_id")
                 id_idx = i;
         }
 
@@ -119,6 +123,8 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
             VirtualGraph::Edge e;
             e.from = row[from_idx];
             e.to = row[to_idx];
+            if (row.size() > var_idx)
+                e.var = row[var_idx];
             if (row.size() > type_idx)
                 e.type = row[type_idx];
             if (row.size() > id_idx)
@@ -134,7 +140,7 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
             }
 
             for (size_t j = 0; j < row.size(); ++j) {
-                if (j == from_idx || j == to_idx || j == type_idx || j == id_idx)
+                if (j == from_idx || j == to_idx || j == var_idx || j == type_idx || j == id_idx)
                     continue;
                 if (j < header.size())
                     e.properties[header[j]] = row[j];

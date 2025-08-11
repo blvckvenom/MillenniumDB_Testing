@@ -29,6 +29,8 @@ public:
         parent_binding->add(to_var, QuadObjectId::get_fixed_node_inside(e.to));
         if (!e.type.empty()) {
             parent_binding->add(edge_var, QuadObjectId::get_edge(e.type));
+        } else if (!e.var.empty()) {
+            parent_binding->add(edge_var, QuadObjectId::get_edge(e.var));
         } else {
             parent_binding->add(edge_var, QuadObjectId::get_edge("_e" + std::to_string(idx)));
         }

@@ -12,6 +12,7 @@ struct VirtualGraph {
 
     struct Edge {
         std::string id;
+        std::string var;
         std::string from;
         std::string to;
         std::string type;
