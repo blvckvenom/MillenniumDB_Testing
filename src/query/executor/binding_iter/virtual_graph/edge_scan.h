@@ -7,11 +7,18 @@
 
 class VirtualGraphEdgeScan : public BindingIter {
 public:
-    VirtualGraphEdgeScan(std::shared_ptr<VirtualGraph> g, VarId from, VarId to, VarId edge) :
+    VirtualGraphEdgeScan(std::shared_ptr<VirtualGraph> g,
+                         VarId from,
+                         VarId to,
+                         VarId edge,
+                         VarId type = VarId(0),
+                         bool has_type = false) :
         graph(std::move(g)),
         from_var(from),
         to_var(to),
-        edge_var(edge)
+        edge_var(edge),
+        type_var(type),
+        type_assigned(has_type)
     { }
 
     void _begin(Binding& parent) override
@@ -27,6 +34,13 @@ public:
         const auto& e = graph->edges[idx];
         parent_binding->add(from_var, QuadObjectId::get_fixed_node_inside(e.from));
         parent_binding->add(to_var, QuadObjectId::get_fixed_node_inside(e.to));
+        if (type_assigned) {
+            if (!e.type.empty()) {
+                parent_binding->add(type_var, QuadObjectId::get_named_node(e.type));
+            } else {
+                parent_binding->add(type_var, ObjectId::get_null());
+            }
+        }
         if (!e.type.empty()) {
             parent_binding->add(edge_var, QuadObjectId::get_edge(e.type));
         } else if (!e.var.empty()) {
@@ -48,6 +62,9 @@ public:
         parent_binding->add(from_var, ObjectId::get_null());
         parent_binding->add(to_var, ObjectId::get_null());
         parent_binding->add(edge_var, ObjectId::get_null());
+        if (type_assigned) {
+            parent_binding->add(type_var, ObjectId::get_null());
+        }
     }
 
     void accept_visitor(BindingIterVisitor&) override;
@@ -57,6 +74,8 @@ private:
     VarId from_var;
     VarId to_var;
     VarId edge_var;
+    VarId type_var;
+    bool type_assigned;
     size_t idx = 0;
     Binding* parent_binding;
 };

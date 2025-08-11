@@ -85,7 +85,7 @@ std::shared_ptr<VirtualGraph> load_from_tsv(const std::string& node_tsv, const s
                 to_idx = i;
             if (col == "edge_var" || col == "edge" || col == "r")
                 var_idx = i;
-            if (col == "rel_type" || col == "type" || col == "label" || col == "t")
+            if (col == "rel_type" || col == "type" || col == "label" || col == "t" || col == "__rel_type")
                 type_idx = i;
             if (col == "rel_id" || col == "id" || col == "edge_id")
                 id_idx = i;
@@ -192,22 +192,31 @@ int main()
     assert(g2->edges[0].type == "LivesIn");
     assert(g2->edges[0].var == "_e1");
 
+    const std::string edge_tsv_injected =
+        "a\tr\tb\t__rel_type\n"
+        "N1\t_e1\tChile\tLivesIn\n"
+        "N2\t_e2\tChile\tLivesIn\n";
+    auto g3 = load_from_tsv(node_tsv, edge_tsv_injected);
+    assert(g3->edges.size() == 2);
+    assert(g3->edges[0].type == "LivesIn");
+    assert(g3->edges[0].var == "_e1");
+
     const std::string edge_tsv_back =
         "a\tr\tb\n"
         "N1\t_e1\tChile\n"
         "N2\t_e2\tChile\n";
-    auto g3 = load_from_tsv(node_tsv, edge_tsv_back);
-    assert(g3->edges.size() == 2);
-    assert(g3->edges[0].type.empty());
-    assert(g3->edges[0].var == "_e1");
+    auto g4 = load_from_tsv(node_tsv, edge_tsv_back);
+    assert(g4->edges.size() == 2);
+    assert(g4->edges[0].type.empty());
+    assert(g4->edges[0].var == "_e1");
 
     const std::string edge_tsv_dup =
         "src\tdst\tedge_var\trel_type\trel_id\n"
         "N1\tChile\t_e1\tLivesIn\t100\n"
         "N1\tChile\t_e99\tLivesIn\t100\n";
-    auto g4 = load_from_tsv(node_tsv, edge_tsv_dup);
-    assert(g4->edges.size() == 1);
-    assert(g4->edges[0].var == "_e1");
+    auto g5 = load_from_tsv(node_tsv, edge_tsv_dup);
+    assert(g5->edges.size() == 1);
+    assert(g5->edges[0].var == "_e1");
 
     std::cout << "All tests passed\n";
     return 0;

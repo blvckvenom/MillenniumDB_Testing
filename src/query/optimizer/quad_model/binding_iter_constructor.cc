@@ -77,11 +77,14 @@ void BindingIterConstructor::visit(OpBasicGraphPattern& op_basic_graph_pattern)
         auto g = VirtualGraphFactory::get(op_basic_graph_pattern.in_graph);
         if (op_basic_graph_pattern.edges.size() == 1) {
             auto edge = *op_basic_graph_pattern.edges.begin();
+            bool type_is_var = edge.type.is_var();
             tmp = std::make_unique<VirtualGraphEdgeScan>(
                 g,
                 edge.from.get_var(),
                 edge.to.get_var(),
-                edge.edge.get_var());
+                edge.edge.get_var(),
+                type_is_var ? edge.type.get_var() : VarId(0),
+                type_is_var);
         } else if (!op_basic_graph_pattern.disjoint_vars.empty()) {
             auto var = op_basic_graph_pattern.disjoint_vars.begin()->var;
             tmp = std::make_unique<VirtualGraphNodeScan>(g, var);

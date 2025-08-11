@@ -106,7 +106,7 @@ std::shared_ptr<VirtualGraph> build_graph_from_rows(
                 to_idx = i;
             if (col == "edge_var" || col == "edge" || col == "r")
                 var_idx = i;
-            if (col == "rel_type" || col == "type" || col == "label" || col == "t")
+            if (col == "rel_type" || col == "type" || col == "label" || col == "t" || col == "__rel_type")
                 type_idx = i;
             if (col == "rel_id" || col == "id" || col == "edge_id")
                 id_idx = i;
@@ -192,6 +192,26 @@ static std::shared_ptr<VirtualGraph> run_project(const std::string& node_query, 
     std::stringstream edge_ss;
     edge_exec->execute(edge_ss);
     auto edge_rows = parse_tsv(edge_ss.str());
+
+    bool has_type = false;
+    if (!edge_rows.empty()) {
+        const auto& header = edge_rows.front();
+        for (const auto& col : header) {
+            if (col == "rel_type" || col == "type" || col == "label" || col == "t" || col == "__rel_type") {
+                has_type = true;
+                break;
+            }
+        }
+        if (!has_type && header.size() >= 2) {
+            std::string edge_var = header[1];
+            std::string augmented = edge_query + ", type(" + edge_var + ") AS __rel_type";
+            edge_exec = compile_query(augmented);
+            edge_ss.str("");
+            edge_ss.clear();
+            edge_exec->execute(edge_ss);
+            edge_rows = parse_tsv(edge_ss.str());
+        }
+    }
 
     return build_graph_from_rows(node_rows, edge_rows);
 }
