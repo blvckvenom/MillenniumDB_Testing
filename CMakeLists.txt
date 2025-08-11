@@ -114,6 +114,7 @@ set(TEST_TARGETS
     tensor_operations
     gds_graph_list
     gds_graph_drop
+    gds_catalog_utils
 )
 # Build targets
 foreach(target ${BUILD_TARGETS})
@@ -132,7 +133,11 @@ endforeach(target)
 # Test targets
 enable_testing()
 foreach(target ${TEST_TARGETS})
-    add_executable(${target} ${CMAKE_SOURCE_DIR}/src/tests/${target}.cc)
+    if(target STREQUAL "gds_catalog_utils")
+        add_executable(${target} ${CMAKE_SOURCE_DIR}/tests/gds_catalog_utils.test.cc)
+    else()
+        add_executable(${target} ${CMAKE_SOURCE_DIR}/src/tests/${target}.cc)
+    endif()
     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
     target_link_libraries(${target}
         millenniumdb
