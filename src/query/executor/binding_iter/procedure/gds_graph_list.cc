@@ -25,7 +25,7 @@
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/parser/expr/gql/expr_var.h"
 #include "query/query_context.h"
-#include <chrono>
+#include "query/executor/binding_iter/procedure/gds_catalog_utils.h"
 
 GdsGraphList::GdsGraphList(
     GQL::GqlGraphCatalog& catalog,
@@ -80,45 +80,7 @@ bool GdsGraphList::_next()
 
     for (auto var : yield_vars_) {
         const auto& name = get_query_ctx().get_var_name(var);
-        if (name == "graphName") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.graphName));
-        } else if (name == "database") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.database));
-        } else if (name == "databaseLocation") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.databaseLocation));
-        } else if (name == "configuration") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.configuration));
-        } else if (name == "schema") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.schema));
-        } else if (name == "schemaWithOrientation") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.schemaWithOrientation));
-        } else if (name == "degreeDistribution") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.degreeDistribution));
-        } else if (name == "memoryUsage") {
-            parent_binding->add(var, GQL::Conversions::pack_string_simple(entry.memoryUsage));
-        } else if (name == "nodeCount") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.nodeCount));
-        } else if (name == "relationshipCount") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.relationshipCount));
-        } else if (name == "density") {
-            parent_binding->add(var, Common::Conversions::pack_double(entry.density));
-        } else if (name == "creationTime") {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          entry.creationTime.time_since_epoch()
-            )
-                          .count();
-            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(ms)));
-        } else if (name == "modificationTime") {
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          entry.modificationTime.time_since_epoch()
-            )
-                          .count();
-            parent_binding->add(var, Common::Conversions::pack_int(static_cast<int64_t>(ms)));
-        } else if (name == "sizeInBytes") {
-            parent_binding->add(var, Common::Conversions::pack_int(entry.sizeInBytes));
-        } else {
-            parent_binding->add(var, ObjectId::get_null());
-        }
+        parent_binding->add(var, assign_catalog_field(entry, name));
     }
 
     ++current_index_;

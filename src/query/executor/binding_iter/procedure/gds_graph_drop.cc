@@ -19,7 +19,6 @@
 
 #include "gds_graph_drop.h"
 
-#include <chrono>
 #include <stdexcept>
 
 #include "graph_models/common/conversions.h"
@@ -28,6 +27,7 @@
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/parser/expr/gql/expr_var.h"
 #include "query/query_context.h"
+#include "query/executor/binding_iter/procedure/gds_catalog_utils.h"
 
 GdsGraphDrop::GdsGraphDrop(
     GQL::GqlGraphCatalog& catalog,
@@ -88,43 +88,7 @@ bool GdsGraphDrop::_next()
 
             for (auto var : yield_vars_) {
                 const std::string& var_name = get_query_ctx().get_var_name(var);
-                ObjectId value = ObjectId::get_null();
-
-                if (var_name == "graphName") {
-                    value = GQL::Conversions::pack_string_simple(entry.graphName);
-                } else if (var_name == "database") {
-                    value = GQL::Conversions::pack_string_simple(entry.database);
-                } else if (var_name == "databaseLocation") {
-                    value = GQL::Conversions::pack_string_simple(entry.databaseLocation);
-                } else if (var_name == "configuration") {
-                    value = GQL::Conversions::pack_string_simple(entry.configuration);
-                } else if (var_name == "nodeCount") {
-                    value = Common::Conversions::pack_int(static_cast<int64_t>(entry.nodeCount));
-                } else if (var_name == "relationshipCount") {
-                    value = Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount));
-                } else if (var_name == "schema") {
-                    value = GQL::Conversions::pack_string_simple(entry.schema);
-                } else if (var_name == "schemaWithOrientation") {
-                    value = GQL::Conversions::pack_string_simple(entry.schemaWithOrientation);
-                } else if (var_name == "degreeDistribution") {
-                    value = GQL::Conversions::pack_string_simple(entry.degreeDistribution);
-                } else if (var_name == "density") {
-                    value = Common::Conversions::pack_double(entry.density);
-                } else if (var_name == "creationTime") {
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        entry.creationTime.time_since_epoch()).count();
-                    value = Common::Conversions::pack_int(ms);
-                } else if (var_name == "modificationTime") {
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        entry.modificationTime.time_since_epoch()).count();
-                    value = Common::Conversions::pack_int(ms);
-                } else if (var_name == "sizeInBytes") {
-                    value = Common::Conversions::pack_int(static_cast<int64_t>(entry.sizeInBytes));
-                } else if (var_name == "memoryUsage") {
-                    value = GQL::Conversions::pack_string_simple(entry.memoryUsage);
-                }
-
-                parent_binding->add(var, value);
+                parent_binding->add(var, assign_catalog_field(entry, var_name));
             }
 
             return true;
