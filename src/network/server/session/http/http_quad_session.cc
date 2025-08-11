@@ -235,6 +235,7 @@ void HttpQuadSession::execute_readonly_query_plan(
         logger(Category::Error) << "Unexpected Exception: " << e.what();
     } catch (...) {
         logger(Category::Error) << "Unknown exception";
+        throw;
     }
 }
 

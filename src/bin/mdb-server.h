@@ -148,12 +148,13 @@ inline std::map<std::string, std::function<std::string(SystemOptions&, const std
                     } });
         opt.insert({ "port", [](SystemOptions& config, const std::string& value) {
                         try {
-                            auto port = std::stoi(value);
+                            auto port = std::stoi(value); // may throw std::invalid_argument or std::out_of_range
                             if (port >= 1024 && port <= 65535) {
                                 config.port = port;
                                 return "";
                             }
-                        } catch (...) {
+                        } catch (const std::exception& e) {
+                            WARN("Invalid port value: ", e.what());
                         }
                         return "invalid port, expected to be a integer in range 1024 to 65535";
                     } });
@@ -169,23 +170,25 @@ inline std::map<std::string, std::function<std::string(SystemOptions&, const std
                     } });
         opt.insert({ "browser-port", [](SystemOptions& config, const std::string& value) {
                         try {
-                            auto port = std::stoi(value);
+                            auto port = std::stoi(value); // may throw std::invalid_argument or std::out_of_range
                             if (port >= 1024 && port <= 65535) {
                                 config.browser_port = port;
                                 return "";
                             }
-                        } catch (...) {
+                        } catch (const std::exception& e) {
+                            WARN("Invalid browser port value: ", e.what());
                         }
                         return "invalid browser port, expected to be a integer in range 1024 to 65535";
                     } });
         opt.insert({ "threads", [](SystemOptions& config, const std::string& value) {
                         try {
-                            auto threads = std::stoi(value);
+                            auto threads = std::stoi(value); // may throw std::invalid_argument or std::out_of_range
                             if (threads > 0) {
                                 config.workers = threads;
                                 return "";
                             }
-                        } catch (...) {
+                        } catch (const std::exception& e) {
+                            WARN("Invalid worker threads value: ", e.what());
                         }
                         return "invalid worker threads, expected to be a positive integer";
                     } });
@@ -193,12 +196,13 @@ inline std::map<std::string, std::function<std::string(SystemOptions&, const std
 
     opt.insert({ "timeout", [](SystemOptions& config, const std::string& value) {
                     try {
-                        auto seconds = std::stoi(value);
+                        auto seconds = std::stoi(value); // may throw std::invalid_argument or std::out_of_range
                         if (seconds > 0) {
                             config.query_timeout = std::chrono::seconds(seconds);
                             return "";
                         }
-                    } catch (...) {
+                    } catch (const std::exception& e) {
+                        WARN("Invalid timeout value: ", e.what());
                     }
                     return "invalid timeout, expected to be a positive integer";
                 } });

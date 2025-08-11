@@ -110,6 +110,7 @@ void StreamingTCPSession::read_request(uint32_t request_size)
                 logger(Category::Error) << "Uncaught exception: " << e.what();
             } catch (...) {
                 logger(Category::Error) << "Unexpected exception!";
+                throw;
             }
 
             self->request_buffer.consume(bytes_transferred);

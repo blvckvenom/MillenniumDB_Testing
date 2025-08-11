@@ -2,6 +2,7 @@
 
 #include "graph_models/gql/conversions.h"
 #include "query/executor/binding_iter/binding_expr/binding_expr.h"
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -58,7 +59,8 @@ public:
                 std::string str = GQL::Conversions::to_lexical_str(operand_oid);
                 try {
                     return GQL::Conversions::pack_int(std::stod(str));
-                } catch (...) {
+                } catch (const std::exception& e) {
+                    std::cerr << "Numeric cast failed: " << e.what() << '\n';
                     return ObjectId::get_null();
                 }
             }
@@ -70,7 +72,8 @@ public:
             if (sourceType == GQL_OID::GenericType::STRING) {
                 try {
                     return ObjectId(DateTime::from_dateTime(Conversions::to_lexical_str(operand_oid)));
-                } catch (...) {
+                } catch (const std::exception& e) {
+                    std::cerr << "Date cast failed: " << e.what() << '\n';
                     return ObjectId::get_null();
                 }
             }

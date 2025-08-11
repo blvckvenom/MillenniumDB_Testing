@@ -19,11 +19,15 @@ using namespace MdbBin;
 using DurationMS = std::chrono::duration<float, std::milli>;
 using std::chrono::system_clock;
 
+// Logs the stack trace when the program terminates due to an unhandled exception.
+// Any failure while obtaining the stack trace is logged and rethrown.
 void my_terminate_handler()
 {
     try {
         std::cerr << boost::stacktrace::stacktrace();
-    } catch (...) {
+    } catch (const std::exception& e) {
+        WARN("Stacktrace generation failed: ", e.what());
+        throw;
     }
     std::abort();
 }

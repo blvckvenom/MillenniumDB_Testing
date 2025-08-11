@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include "misc/fatal_error.h"
 
 // For JSON serialization we use nlohmann::json if available. If it is not
 // available in the build environment the JSON related code can be replaced
@@ -310,7 +311,8 @@ GqlGraphCatalog::ListResult GqlGraphCatalog::list(const std::optional<std::strin
         const fs::path file_path = fs::path(catalogDirectory_) / (name + ".json");
         try {
             entry.sizeInBytes = fs::file_size(file_path);
-        } catch (...) {
+        } catch (const fs::filesystem_error& e) {
+            WARN("Unable to read file size for ", file_path.string(), ": ", e.what());
             entry.sizeInBytes = 0;
         }
         // Memory usage is not tracked; return empty string
@@ -368,7 +370,8 @@ GqlGraphCatalog::DropResult GqlGraphCatalog::drop(const std::string& graphName,
     const fs::path file_path = fs::path(catalogDirectory_) / (graphName + ".json");
     try {
         entry.sizeInBytes = fs::file_size(file_path);
-    } catch (...) {
+    } catch (const fs::filesystem_error& e) {
+        WARN("Unable to read file size for ", file_path.string(), ": ", e.what());
         entry.sizeInBytes = 0;
     }
     entry.memoryUsage.clear();
@@ -379,8 +382,8 @@ GqlGraphCatalog::DropResult GqlGraphCatalog::drop(const std::string& graphName,
     // Remove from disk
     try {
         fs::remove(file_path);
-    } catch (...) {
-        // ignore errors deleting the file
+    } catch (const fs::filesystem_error& e) {
+        WARN("Failed to remove ", file_path.string(), ": ", e.what());
     }
     return result;
 }

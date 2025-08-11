@@ -166,6 +166,7 @@ void HttpRdfSession::execute_readonly_query(
         logger(Category::Error) << "Unexpected Exception: " << e.what();
     } catch (...) {
         logger(Category::Error) << "Unknown exception";
+        throw;
     }
 }
 

@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "gds_graph_drop.h"
+#include <iostream>
 
 #include <chrono>
 #include <stdexcept>
@@ -140,8 +141,9 @@ bool GdsGraphDrop::_next()
         // Graph was not found and failIfMissing was false
         assign_nulls();
         return true;
-    } catch (...) {
+    } catch (const std::exception& e) {
         assign_nulls();
+        std::cerr << "Error dropping graph: " << e.what() << '\n';
         throw;
     }
 }

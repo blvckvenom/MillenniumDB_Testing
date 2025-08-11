@@ -193,7 +193,9 @@ public:
                 }
                 i += bytes_read;
                 EXPECT_COMMA = true;
-            } catch (...) {
+            } catch (const std::exception& e) {
+                // std::stof/std::stod may throw std::invalid_argument or std::out_of_range
+                std::cerr << "Invalid tensor value: " << e.what() << '\n';
                 *error = true;
                 return {};
             }
