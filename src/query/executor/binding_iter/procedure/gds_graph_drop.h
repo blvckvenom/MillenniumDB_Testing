@@ -32,8 +32,21 @@ class GqlGraphCatalog;
 
 /**
  * BindingIter implementation for the GdsGraphDrop procedure.
- * This iterator drops a graph projection from the catalog and yields
- * the dropped graph's metadata as a single result row.
+ * This iterator drops a graph projection from the catalog and yields the
+ * dropped graph's metadata as a single result row.
+ *
+ * Arguments:
+ *   - graphName (STRING): name of the graph to drop. May be supplied as a
+ *     literal or via a variable in the incoming binding.
+ *   - failIfMissing (BOOLEAN, optional, default true): controls behaviour
+ *     when the graph does not exist. If true, an exception is thrown. If
+ *     false, a single row with NULL values is returned.
+ *
+ * Yield columns mirror @ref GQL::GqlGraphCatalog::GraphListEntry and may
+ * include graphName, database, databaseLocation, configuration, nodeCount,
+ * relationshipCount, schema, schemaWithOrientation, degreeDistribution,
+ * density, creationTime, modificationTime, sizeInBytes and memoryUsage.
+ * Both arguments accept variables.
  */
 class GdsGraphDrop : public BindingIter {
 public:

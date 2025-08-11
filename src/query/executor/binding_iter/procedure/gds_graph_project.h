@@ -29,17 +29,28 @@
 
 /**
  * Binding iterator for the GdsGraphProject() procedure.
- * 
+ *
  * This iterator executes a graph projection operation that creates a new
  * logical graph from a subset of nodes and relationships in the database.
- * 
- * Expected signature:
- * CALL GdsGraphProject(
- *   graphName: STRING,
- *   nodeProjection: Value,
- *   relationshipProjection: Value,
- *   configuration: MAP
- * ) YIELD graphName, nodeCount, relationshipCount, projectMillis
+ *
+ * Arguments (all must currently be provided as literal expressions; variable
+ *  references are not supported):
+ *   - graphName (STRING): name of the projected graph.
+ *   - nodeProjection (Value): description of nodes to include in the
+ *     projection.
+ *   - relationshipProjection (Value): description of relationships to
+ *     include in the projection.
+ *   - configuration (MAP): additional projection options.
+ *
+ * Yielded columns, in order:
+ *   - graphName (STRING)
+ *   - nodeProjection (STRING representation of the argument)
+ *   - nodeCount (INTEGER)
+ *   - relationshipProjection (STRING representation of the argument)
+ *   - relationshipCount (INTEGER)
+ *   - projectMillis (INTEGER execution time)
+ *   - query (currently always NULL)
+ *   - configuration (STRING representation of the argument)
  */
 class GdsGraphProject : public BindingIter {
 public:
