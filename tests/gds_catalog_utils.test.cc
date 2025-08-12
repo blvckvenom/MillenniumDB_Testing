@@ -41,7 +41,7 @@ bool test_assign_catalog_field() {
     check("schema", GQL::Conversions::pack_string_simple(entry.schema));
     check("schemaWithOrientation", GQL::Conversions::pack_string_simple(entry.schemaWithOrientation));
     check("degreeDistribution", GQL::Conversions::pack_string_simple(entry.degreeDistribution));
-    check("density", Common::Conversions::pack_double(entry.density));
+    check("density", Common::Conversions::pack_float(static_cast<float>(entry.density)));
     check("creationTime", Common::Conversions::pack_int(static_cast<int64_t>(
         duration_cast<milliseconds>(entry.creationTime.time_since_epoch()).count())));
     check("modificationTime", Common::Conversions::pack_int(static_cast<int64_t>(

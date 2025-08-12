@@ -99,7 +99,7 @@ bool GdsGraphDrop::_next()
                 { "schema", GQL::Conversions::pack_string_simple(entry.schema) },
                 { "schemaWithOrientation", GQL::Conversions::pack_string_simple(entry.schemaWithOrientation) },
                 { "degreeDistribution", GQL::Conversions::pack_string_simple(entry.degreeDistribution) },
-                { "density", Common::Conversions::pack_double(entry.density) },
+                { "density", Common::Conversions::pack_float(static_cast<float>(entry.density)) },
                 { "creationTime", Common::Conversions::pack_int(static_cast<int64_t>(
                                      std::chrono::duration_cast<std::chrono::milliseconds>(
                                          entry.creationTime.time_since_epoch()).count())) },
