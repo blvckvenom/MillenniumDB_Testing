@@ -13,7 +13,10 @@ The main objective of this project is to create a fully functional and easy-to-e
 
     The engine also supports a subset of Neo4j's Graph Data Science procedures
     via the `CALL` clause, for example `CALL gds.graph.list()` to inspect the
-    catalog of projected graphs.
+    catalog of projected graphs. Procedures like `gds.graph.project` and
+    `gds.graph.drop` accept variables for their arguments; the latter yields no
+    row when asked to drop a non-existent graph with `failIfMissing` set to
+    `false`.
 
 This project is still in active development and is not production ready yet, some functionality is missing and there may be bugs.
 
