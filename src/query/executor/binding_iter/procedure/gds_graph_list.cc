@@ -93,7 +93,7 @@ bool GdsGraphList::_next()
         { "memoryUsage", GQL::Conversions::pack_string_simple(entry.memoryUsage) },
         { "nodeCount", Common::Conversions::pack_int(static_cast<int64_t>(entry.nodeCount)) },
         { "relationshipCount", Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount)) },
-        { "density", Common::Conversions::pack_double(entry.density) },
+        { "density", Common::Conversions::pack_float(static_cast<float>(entry.density)) },
         { "creationTime", Common::Conversions::pack_int(static_cast<int64_t>(
                               std::chrono::duration_cast<std::chrono::milliseconds>(
                                   entry.creationTime.time_since_epoch()).count())) },

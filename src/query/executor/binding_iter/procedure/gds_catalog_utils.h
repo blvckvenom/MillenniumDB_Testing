@@ -32,7 +32,7 @@ inline ObjectId assign_catalog_field(
     } else if (field_name == "relationshipCount") {
         return Common::Conversions::pack_int(static_cast<int64_t>(entry.relationshipCount));
     } else if (field_name == "density") {
-        return Common::Conversions::pack_double(entry.density);
+        return Common::Conversions::pack_float(static_cast<float>(entry.density));
     } else if (field_name == "creationTime") {
         return Common::Conversions::pack_int(static_cast<int64_t>(
             duration_cast<milliseconds>(entry.creationTime.time_since_epoch()).count()));
