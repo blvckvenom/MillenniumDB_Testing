@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 
+#include "graph_models/quad_model/conversions.h"
 #include "query/executor/binding_iter/binding_expr/binding_expr.h"
 
 namespace MQL {
@@ -17,18 +18,24 @@ public:
 
     ObjectId eval(const Binding& binding) override
     {
-        for (auto& expr : or_list) {
-            auto oid = expr->eval(binding);
+        /* this assumes the following rules:
+         *     | T | F | ? |
+         * | T | T | T | T |
+         * | F | T | F | ? |
+         * | ? | T | ? | ? |
+         */
 
-            if (oid == ObjectId(ObjectId::BOOL_FALSE)) {
-                continue;
-            } else if (oid == ObjectId(ObjectId::BOOL_TRUE)) {
-                return oid;
-            } else {
-                return ObjectId::get_null();
+        bool null_seen = false;
+        for (auto& expr : or_list) {
+            const auto oid = MQL::Conversions::to_boolean(expr->eval(binding));
+
+            if (oid == ObjectId(ObjectId::BOOL_TRUE)) {
+                return ObjectId(ObjectId::BOOL_TRUE);
+            } else if (oid == ObjectId::get_null()) {
+                null_seen = true;
             }
         }
-        return ObjectId(ObjectId::BOOL_FALSE);
+        return null_seen ? ObjectId::get_null() : ObjectId(ObjectId::BOOL_FALSE);
     }
 
     void accept_visitor(BindingExprVisitor& visitor) override
