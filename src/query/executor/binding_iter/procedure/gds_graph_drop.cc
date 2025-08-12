@@ -139,8 +139,7 @@ bool GdsGraphDrop::_next()
         }
 
         // Graph was not found and failIfMissing was false
-        assign_nulls();
-        return true;
+        return false;
     } catch (const std::exception& e) {
         assign_nulls();
         std::cerr << "Error dropping graph: " << e.what() << '\n';

@@ -33,8 +33,7 @@
  * This iterator executes a graph projection operation that creates a new
  * logical graph from a subset of nodes and relationships in the database.
  *
- * Arguments (all must currently be provided as literal expressions; variable
- *  references are not supported):
+ * Arguments (literals or variables are allowed):
  *   - graphName (STRING): name of the projected graph.
  *   - nodeProjection (Value): description of nodes to include in the
  *     projection.
