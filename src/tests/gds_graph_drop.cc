@@ -1,3 +1,4 @@
+#include "graph_models/gql/gql_value.h"
 #include "query/executor/binding_iter/procedure/gds_graph_drop.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
