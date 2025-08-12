@@ -2052,7 +2052,9 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
     normalized_procedure_name.reserve(procedure_name.size());
     for (char c : procedure_name) {
         if (c != '.') {
-            normalized_procedure_name.push_back(static_cast<char>(std::tolower(c)));
+            normalized_procedure_name.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c)))
+            );
         }
     }
 
