@@ -1,3 +1,5 @@
+#include "graph_models/gql/gql_value.h"
+#include "query/parser/expr/gql/expr_term.h"
 #include "query/executor/binding_iter/procedure/gds_graph_list.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
