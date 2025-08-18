@@ -22,15 +22,15 @@
 #include <memory>
 #include <vector>
 
+#include "graph_models/gql/gql_graph_catalog.h"
 #include "query/executor/binding_iter.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/var_id.h"
-#include "graph_models/gql/gql_graph_catalog.h"
 
 /**
- * BindingIter implementation for the list procedure.
+ * BindingIter implementation for the gdsgraphlist procedure.
  *
- * Usage: `CALL list([graphName]) YIELD ...` where the optional
+ * Usage: `CALL gdsgraphlist([graphName]) YIELD ...` where the optional
  *  argument may be provided as a literal or as a variable bound in the
  *  incoming row. When specified, only the matching graph is listed.
  *
@@ -64,22 +64,22 @@ private:
     void _reset() override;
     /// Reference to the graph catalog
     GQL::GqlGraphCatalog& catalog_;
-    
+
     /// The procedure arguments
     std::vector<std::unique_ptr<GQL::Expr>> argument_exprs_;
-    
+
     /// The variables to yield in the result
     std::vector<VarId> yield_vars_;
-    
+
     /// The list result from the catalog
     std::vector<GQL::GqlGraphCatalog::GraphListEntry> entries_;
-    
+
     /// Current position in the entries vector
     std::size_t current_index_ = 0;
-    
+
     /// Whether the catalog has been queried
     bool queried_ = false;
-    
+
     /// Parent binding for writing results
     Binding* parent_binding = nullptr;
 };

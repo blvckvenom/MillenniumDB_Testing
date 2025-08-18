@@ -1,1 +1,1 @@
-CALL drop("missing", true) YIELD graphName
+CALL gdsgraphdrop("missing", true) YIELD graphName

@@ -1,1 +1,1 @@
-CALL project("myGraph")
+CALL gdsgraphproject("myGraph")

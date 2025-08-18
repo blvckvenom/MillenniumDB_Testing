@@ -1,1 +1,1 @@
-CALL list() YIELD graphName, nodeCount
+CALL gdsgraphlist() YIELD graphName, nodeCount

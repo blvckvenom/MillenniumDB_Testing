@@ -21,21 +21,21 @@
 #include <iostream>
 
 #include <memory>
-#include <vector>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
+#include "graph_models/common/conversions.h"
+#include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_graph_catalog.h"
 #include "graph_models/gql/gql_value.h"
-#include "graph_models/gql/conversions.h"
-#include "graph_models/common/conversions.h"
 #include "graph_models/object_id.h"
 #include "query/executor/binding.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/parser/expr/gql/expr_var.h"
-#include "query/var_id.h"
 #include "query/query_context.h"
+#include "query/var_id.h"
 
 namespace {
 
@@ -92,9 +92,8 @@ GQL::Value object_id_to_value(ObjectId oid)
         return GQL::Value(list);
     }
 
-    if (gen_t == ObjectId::MASK_NUMERIC || gen_t == ObjectId::MASK_INT
-        || gen_t == ObjectId::MASK_DECIMAL || gen_t == ObjectId::MASK_FLOAT
-        || gen_t == ObjectId::MASK_DOUBLE)
+    if (gen_t == ObjectId::MASK_NUMERIC || gen_t == ObjectId::MASK_INT || gen_t == ObjectId::MASK_DECIMAL
+        || gen_t == ObjectId::MASK_FLOAT || gen_t == ObjectId::MASK_DOUBLE)
     {
         // Try integer first, fall back to double
         try {
@@ -152,18 +151,19 @@ GdsGraphProject::GdsGraphProject(
 
 // Force instantiation of constructor to ensure symbol is generated
 namespace {
-    [[maybe_unused]] static void force_gds_graph_project_instantiation() {
-        // This function forces the compiler to generate the constructor symbol
-        // It will never be called, but ensures the symbol exists for linking
-        if (false) {
-            GQL::GqlGraphCatalog* dummy_catalog = nullptr;
-            std::vector<std::unique_ptr<GQL::Expr>> dummy_exprs;
-            std::vector<VarId> dummy_vars;
-            GdsGraphProject dummy(*dummy_catalog, std::move(dummy_exprs), std::move(dummy_vars));
-            (void)dummy; // Suppress unused variable warning
-        }
+[[maybe_unused]] static void force_gds_graph_project_instantiation()
+{
+    // This function forces the compiler to generate the constructor symbol
+    // It will never be called, but ensures the symbol exists for linking
+    if (false) {
+        GQL::GqlGraphCatalog* dummy_catalog = nullptr;
+        std::vector<std::unique_ptr<GQL::Expr>> dummy_exprs;
+        std::vector<VarId> dummy_vars;
+        GdsGraphProject dummy(*dummy_catalog, std::move(dummy_exprs), std::move(dummy_vars));
+        (void) dummy; // Suppress unused variable warning
     }
 }
+} // namespace
 
 #ifdef __GNUC__
 #pragma GCC visibility pop
@@ -186,10 +186,12 @@ bool GdsGraphProject::_next()
     try {
         // Validate argument count
         if (argument_exprs_.size() < 3) {
-            throw std::runtime_error("project requires graphName, nodeProjection and relationshipProjection arguments");
+            throw std::runtime_error(
+                "gdsgraphproject requires graphName, nodeProjection and relationshipProjection arguments"
+            );
         }
         if (argument_exprs_.size() > 4) {
-            throw std::runtime_error("project accepts at most four arguments");
+            throw std::runtime_error("gdsgraphproject accepts at most four arguments");
         }
 
         // Evaluate arguments
@@ -218,22 +220,19 @@ bool GdsGraphProject::_next()
         }
 
         // Invoke catalog
-        auto result = catalog_.project(
-            graph_name_val.get_string(),
-            node_proj_val,
-            rel_proj_val,
-            configuration);
+        auto result = catalog_
+                          .project(graph_name_val.get_string(), node_proj_val, rel_proj_val, configuration);
 
         // Map column names to values
         std::unordered_map<std::string, ObjectId> values {
-            {"graphName", GQL::Conversions::pack_string_simple(result.graphName)},
-            {"nodeProjection", GQL::Conversions::pack_string_simple(result.nodeProjection)},
-            {"nodeCount", Common::Conversions::pack_int(result.nodeCount)},
-            {"relationshipProjection", GQL::Conversions::pack_string_simple(result.relationshipProjection)},
-            {"relationshipCount", Common::Conversions::pack_int(result.relationshipCount)},
-            {"projectMillis", Common::Conversions::pack_int(result.projectMillis)},
-            {"query", ObjectId::get_null()},
-            {"configuration", GQL::Conversions::pack_string_simple(result.configuration)}
+            {              "graphName",              GQL::Conversions::pack_string_simple(result.graphName) },
+            {         "nodeProjection",         GQL::Conversions::pack_string_simple(result.nodeProjection) },
+            {              "nodeCount",                     Common::Conversions::pack_int(result.nodeCount) },
+            { "relationshipProjection", GQL::Conversions::pack_string_simple(result.relationshipProjection) },
+            {      "relationshipCount",             Common::Conversions::pack_int(result.relationshipCount) },
+            {          "projectMillis",                 Common::Conversions::pack_int(result.projectMillis) },
+            {                  "query",                                                ObjectId::get_null() },
+            {          "configuration",          GQL::Conversions::pack_string_simple(result.configuration) }
         };
 
         // Assign only requested yield variables
