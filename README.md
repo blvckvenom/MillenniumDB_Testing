@@ -12,9 +12,9 @@ The main objective of this project is to create a fully functional and easy-to-e
   - Property Graphs specified by the GQL Standard (undirected edges, 0-N edge labels), with an early implementation of GQL, still missing a lot of functionality and optimizations.
 
     The engine also supports a subset of Neo4j's Graph Data Science procedures
-    via the `CALL` clause, for example `CALL gds.graph.list()` to inspect the
-    catalog of projected graphs. Procedures like `gds.graph.project` and
-    `gds.graph.drop` accept variables for their arguments; the latter yields no
+    via the `CALL` clause, for example `CALL gdsgraphlist()` to inspect the
+    catalog of projected graphs. Procedures like `gdsgraphproject` and
+    `gdsgraphdrop` accept variables for their arguments; the latter yields no
     row when asked to drop a non-existent graph with `failIfMissing` set to
     `false`.
 

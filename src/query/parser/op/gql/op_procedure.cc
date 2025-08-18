@@ -16,15 +16,15 @@ std::string OpProcedure::get_procedure_string(ProcedureType procedure_type)
 {
     switch (procedure_type) {
     case ProcedureType::GDS_GRAPH_PROJECT:
-        return "GdsGraphProject";
+        return "gdsgraphproject";
     case ProcedureType::GDS_GRAPH_LIST:
-        return "GdsGraphList";
+        return "gdsgraphlist";
     case ProcedureType::GDS_GRAPH_DROP:
-        return "GdsGraphDrop";
+        return "gdsgraphdrop";
     case ProcedureType::GDS_GRAPH_EXPORT:
-        return "gds.graph.export";
+        return "gdsgraphexport";
     case ProcedureType::GDS_GRAPH_FILTER:
-        return "gds.graph.filter";
+        return "gdsgraphfilter";
     default:
         return "UNKNOWN_PROCEDURE";
     }
@@ -36,7 +36,7 @@ std::string OpProcedure::get_procedure_string(ProcedureType procedure_type)
 // expected columns as documented but the execution engine may ignore some of
 // them.  These names are used by the parser to validate YIELD clauses.
 std::vector<std::string>
-OpProcedure::get_procedure_available_yield_variable_names(ProcedureType procedure_type)
+    OpProcedure::get_procedure_available_yield_variable_names(ProcedureType procedure_type)
 {
     switch (procedure_type) {
     case ProcedureType::GDS_GRAPH_PROJECT:
@@ -46,58 +46,27 @@ OpProcedure::get_procedure_available_yield_variable_names(ProcedureType procedur
         // relationshipProjection, relationshipCount, projectMillis, query,
         // configuration.  Both `nodeProjection` and `relationshipProjection`
         // describe the projection specifications used to create the graph.
-        return {
-            "graphName",
-            "nodeProjection",
-            "nodeCount",
-            "relationshipProjection",
-            "relationshipCount",
-            "projectMillis",
-            "query",
-            "configuration"
-        };
+        return { "graphName",         "nodeProjection", "nodeCount", "relationshipProjection",
+                 "relationshipCount", "projectMillis",  "query",     "configuration" };
 
     case ProcedureType::GDS_GRAPH_LIST:
         // GdsGraphList returns statistics about projected graphs stored in the
         // catalog.  The Neo4j manual lists a wide range of metrics【359628130627925†L370-L518】,
         // including schema and degree distribution.  We include the most common
         // fields here; additional fields can be added later as support grows.
-        return {
-            "graphName",
-            "database",
-            "databaseLocation",
-            "configuration",
-            "nodeCount",
-            "relationshipCount",
-            "schema",
-            "schemaWithOrientation",
-            "degreeDistribution",
-            "density",
-            "creationTime",
-            "modificationTime",
-            "sizeInBytes",
-            "memoryUsage"
-        };
+        return { "graphName",          "database",          "databaseLocation", "configuration",
+                 "nodeCount",          "relationshipCount", "schema",           "schemaWithOrientation",
+                 "degreeDistribution", "density",           "creationTime",     "modificationTime",
+                 "sizeInBytes",        "memoryUsage" };
 
     case ProcedureType::GDS_GRAPH_DROP:
-        // gds.graph.drop returns similar statistics to gds.graph.list for the
+        // drop returns similar statistics to list for the
         // graph being removed【977493777151698†L380-L520】.  We mirror the list procedure’s
         // yield columns for consistency.
-        return {
-            "graphName",
-            "database",
-            "databaseLocation",
-            "configuration",
-            "nodeCount",
-            "relationshipCount",
-            "schema",
-            "schemaWithOrientation",
-            "density",
-            "creationTime",
-            "modificationTime",
-            "sizeInBytes",
-            "memoryUsage"
-        };
+        return { "graphName",  "database",          "databaseLocation", "configuration",
+                 "nodeCount",  "relationshipCount", "schema",           "schemaWithOrientation",
+                 "density",    "creationTime",      "modificationTime", "sizeInBytes",
+                 "memoryUsage" };
 
     case ProcedureType::GDS_GRAPH_EXPORT:
         // GdsGraphExport writes a projection to a new database.  The
@@ -105,28 +74,15 @@ OpProcedure::get_procedure_available_yield_variable_names(ProcedureType procedur
         // timing information may be returned.  These names are speculative
         // based on the documentation of Neo4j GDS 2.x and may need
         // adjustment when full support is implemented.
-        return {
-            "graphName",
-            "nodeCount",
-            "relationshipCount",
-            "configuration",
-            "projectMillis",
-            "loadMillis",
-            "totalMillis"
-        };
+        return { "graphName",     "nodeCount",  "relationshipCount", "configuration",
+                 "projectMillis", "loadMillis", "totalMillis" };
 
     case ProcedureType::GDS_GRAPH_FILTER:
         // GdsGraphFilter creates a new graph by filtering nodes and/or
         // relationships from an existing projection.  The yield columns are
         // similar to GdsGraphProject with an additional sourceGraphName.
-        return {
-            "graphName",
-            "sourceGraphName",
-            "nodeCount",
-            "relationshipCount",
-            "filterMillis",
-            "configuration"
-        };
+        return { "graphName",         "sourceGraphName", "nodeCount",
+                 "relationshipCount", "filterMillis",    "configuration" };
 
     default:
         throw NotSupportedException(

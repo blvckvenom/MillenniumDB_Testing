@@ -118,19 +118,19 @@ ARCHIVOS CLAVE IMPLEMENTADOS/MODIFICADOS
 📄 src/graph_models/gql/gql_graph_catalog.h/cc
    - Sistema completo de catálogo de grafos proyectados
    - Persistencia JSON con fallback a boost::property_tree
-   - Operaciones: project(), list(), drop()
+   - Operaciones: gdsgraphproject(), gdsgraphlist(), gdsgraphdrop()
 
 📄 src/query/executor/binding_iter/procedure/gds_graph_project.h/cc
-   - Iterador para procedimiento gds.graph.project
+   - Iterador para procedimiento gdsgraphproject
    - Hereda de BindingIter
    - Implementa _begin(), _next(), _reset()
 
 📄 src/query/executor/binding_iter/procedure/gds_graph_list.h/cc
-   - Iterador para procedimiento gds.graph.list
+   - Iterador para procedimiento gdsgraphlist
    - Lista grafos proyectados existentes
 
 📄 src/query/executor/binding_iter/procedure/gds_graph_drop.h/cc
-   - Iterador para procedimiento gds.graph.drop
+   - Iterador para procedimiento gdsgraphdrop
    - Elimina grafos proyectados
 
 ⭐ ARCHIVOS MODIFICADOS:
@@ -154,7 +154,7 @@ FUNCIONALIDAD IMPLEMENTADA
 ===========================================
 
 ✅ Sistema completo de catálogo de grafos GQL
-✅ Procedimientos gds.graph.project, list, drop
+✅ Procedimientos gdsgraphproject, gdsgraphlist, gdsgraphdrop
 ✅ Integración con el motor de consultas
 ✅ Persistencia JSON con fallback
 ✅ Iteradores de binding para procedimientos
@@ -166,13 +166,13 @@ USO ESPERADO
 
 Los usuarios pueden ejecutar consultas como:
 
-CALL gds.graph.project('myGraph', nodeProjection, relProjection, config)
+CALL gdsgraphproject('myGraph', nodeProjection, relProjection, config)
 YIELD graphName, nodeCount, relationshipCount, projectMillis
 
-CALL gds.graph.list()
+CALL gdsgraphlist()
 YIELD graphName, nodeCount, relationshipCount
 
-CALL gds.graph.drop('myGraph', true)
+CALL gdsgraphdrop('myGraph', true)
 YIELD graphName, dropped
 
 ===========================================

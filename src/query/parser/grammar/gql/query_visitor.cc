@@ -7,14 +7,13 @@
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/rdf_model/conversions.h"
-#include "query/parser/expr/gql/exprs.h"
-#include "query/parser/op/gql/ops.h"
-#include "query/parser/op/gql/op_procedure.h"
-#include "query/query_context.h"
 #include "query/exceptions.h"
+#include "query/parser/expr/gql/exprs.h"
+#include "query/parser/op/gql/op_procedure.h"
+#include "query/parser/op/gql/ops.h"
+#include "query/query_context.h"
 #include <algorithm>
 #include <cctype>
-
 
 // #define DEBUG_GQL_QUERY_VISITOR
 
@@ -198,8 +197,10 @@ std::any QueryVisitor::visitReturnStatementBody(GQLParser::ReturnStatementBodyCo
 
     if (ctx->ASTERISK()) {
         if (ctx->groupByClause()) {
-            throw QuerySemanticException("A query that contains an asterisk (*) in the RETURN statement "
-                                         "cannot contain the GROUP BY clause");
+            throw QuerySemanticException(
+                "A query that contains an asterisk (*) in the RETURN statement "
+                "cannot contain the GROUP BY clause"
+            );
         }
 
         auto vars = current_op->get_all_vars();
@@ -762,7 +763,8 @@ std::any QueryVisitor::visitGraphPatternQuantifier(GQLParser::GraphPatternQuanti
         }
 
         if (upper.has_value() && lower > upper) {
-            throw QuerySemanticException("The lower bound in the quantifier is greater than the upper bound."
+            throw QuerySemanticException(
+                "The lower bound in the quantifier is greater than the upper bound."
             );
         }
 
@@ -1364,8 +1366,9 @@ std::any QueryVisitor::visitGqlSimpleCaseFunction(GQLParser::GqlSimpleCaseFuncti
                 } else if (when_operand->comparisonPredicateCond()->compOp()->LESS_THAN_OR_EQUALS_OPERATOR())
                 {
                     comp_operand = "<=";
-                } else if (when_operand->comparisonPredicateCond()->compOp()->GREATER_THAN_OR_EQUALS_OPERATOR(
-                           ))
+                } else if (when_operand->comparisonPredicateCond()
+                               ->compOp()
+                               ->GREATER_THAN_OR_EQUALS_OPERATOR())
                 {
                     comp_operand = ">=";
                 }
@@ -1665,8 +1668,8 @@ std::any QueryVisitor::visitGqlConcatenationExpression(GQLParser::GqlConcatenati
     return 0;
 }
 
-std::any QueryVisitor::visitSingleQuotedCharacterSequence(GQLParser::SingleQuotedCharacterSequenceContext* ctx
-)
+std::any
+    QueryVisitor::visitSingleQuotedCharacterSequence(GQLParser::SingleQuotedCharacterSequenceContext* ctx)
 {
     LOG_VISITOR
     std::vector<std::unique_ptr<Expr>> str_expressions;
@@ -1693,8 +1696,8 @@ std::any QueryVisitor::visitSingleQuotedCharacterSequence(GQLParser::SingleQuote
     return 0;
 }
 
-std::any QueryVisitor::visitDoubleQuotedCharacterSequence(GQLParser::DoubleQuotedCharacterSequenceContext* ctx
-)
+std::any
+    QueryVisitor::visitDoubleQuotedCharacterSequence(GQLParser::DoubleQuotedCharacterSequenceContext* ctx)
 {
     LOG_VISITOR
     std::vector<std::unique_ptr<Expr>> str_expressions;
@@ -2039,8 +2042,8 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
 {
     LOG_VISITOR
     // Extract procedure name, strip dots and convert to lower case for
-    // case-insensitive matching. This allows CALL gds.graph.list() style
-    // invocations where dots are used to qualify the procedure name.
+    // case-insensitive matching. Dotted forms like gds.graph.project are
+    // normalized to their dotless equivalents such as gdsgraphproject.
     std::string procedure_name = ctx->procedureReference()->getText();
 
     // Remove backticks if present (accent-quoted identifiers)
@@ -2107,8 +2110,9 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
                 }
                 var_names_str += " }";
                 throw QueryException(
-                    OpProcedure::get_procedure_string(procedure_type) + " has an unexpected yield variable: \""
-                    + yield_name + "\". The valid yield variables are the following: " + var_names_str
+                    OpProcedure::get_procedure_string(procedure_type)
+                    + " has an unexpected yield variable: \"" + yield_name
+                    + "\". The valid yield variables are the following: " + var_names_str
                 );
             }
         }
@@ -2140,22 +2144,22 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
     return 0;
 }
 
- // Process the YIELD clause associated with a procedure call. This method builds
- // a mapping from procedure output column names to the VarId used for binding,
- // taking into account aliases specified via the AS keyword.
- std::any QueryVisitor::visitYieldClause(GQLParser::YieldClauseContext* ctx)
- {
-     LOG_VISITOR
-     // The grammar ensures yieldClause has at least one item
-     auto items = ctx->yieldItemList()->yieldItem();
-     std::map<std::string, VarId> yield_var2alias;
-     for (auto item : items) {
-         // yieldItemName is a fieldName; use its text as the procedure column name
-         std::string yield_name = item->yieldItemName()->getText();
-         if (item->yieldItemAlias() != nullptr) {
-             // User provided an alias: AS bindingVariable
-             std::string alias = item->yieldItemAlias()->bindingVariable()->getText();
-             VarId alias_var = get_query_ctx().get_or_create_var(alias);
+// Process the YIELD clause associated with a procedure call. This method builds
+// a mapping from procedure output column names to the VarId used for binding,
+// taking into account aliases specified via the AS keyword.
+std::any QueryVisitor::visitYieldClause(GQLParser::YieldClauseContext* ctx)
+{
+    LOG_VISITOR
+    // The grammar ensures yieldClause has at least one item
+    auto items = ctx->yieldItemList()->yieldItem();
+    std::map<std::string, VarId> yield_var2alias;
+    for (auto item : items) {
+        // yieldItemName is a fieldName; use its text as the procedure column name
+        std::string yield_name = item->yieldItemName()->getText();
+        if (item->yieldItemAlias() != nullptr) {
+            // User provided an alias: AS bindingVariable
+            std::string alias = item->yieldItemAlias()->bindingVariable()->getText();
+            VarId alias_var = get_query_ctx().get_or_create_var(alias);
             if (!yield_var2alias.insert({ yield_name, alias_var }).second) {
                 throw QueryException("Duplicate procedure variable: \"" + yield_name + "\"");
             }
