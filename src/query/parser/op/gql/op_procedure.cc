@@ -16,15 +16,15 @@ std::string OpProcedure::get_procedure_string(ProcedureType procedure_type)
 {
     switch (procedure_type) {
     case ProcedureType::GDS_GRAPH_PROJECT:
-        return "GdsGraphProject";
+        return "project";
     case ProcedureType::GDS_GRAPH_LIST:
-        return "GdsGraphList";
+        return "list";
     case ProcedureType::GDS_GRAPH_DROP:
-        return "GdsGraphDrop";
+        return "drop";
     case ProcedureType::GDS_GRAPH_EXPORT:
-        return "gds.graph.export";
+        return "export";
     case ProcedureType::GDS_GRAPH_FILTER:
-        return "gds.graph.filter";
+        return "filter";
     default:
         return "UNKNOWN_PROCEDURE";
     }
@@ -80,7 +80,7 @@ OpProcedure::get_procedure_available_yield_variable_names(ProcedureType procedur
         };
 
     case ProcedureType::GDS_GRAPH_DROP:
-        // gds.graph.drop returns similar statistics to gds.graph.list for the
+        // drop returns similar statistics to list for the
         // graph being removed【977493777151698†L380-L520】.  We mirror the list procedure’s
         // yield columns for consistency.
         return {

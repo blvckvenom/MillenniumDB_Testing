@@ -1,2 +1,2 @@
 LET g = "myGraph", nodes = [], rels = [], cfg = {}
-CALL gds.graph.project(g, nodes, rels, cfg) YIELD graphName, nodeCount
+CALL project(g, nodes, rels, cfg) YIELD graphName, nodeCount

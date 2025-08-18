@@ -28,9 +28,9 @@
 #include "graph_models/gql/gql_graph_catalog.h"
 
 /**
- * BindingIter implementation for the gds.graph.list procedure.
+ * BindingIter implementation for the list procedure.
  *
- * Usage: `CALL gds.graph.list([graphName]) YIELD ...` where the optional
+ * Usage: `CALL list([graphName]) YIELD ...` where the optional
  *  argument may be provided as a literal or as a variable bound in the
  *  incoming row. When specified, only the matching graph is listed.
  *

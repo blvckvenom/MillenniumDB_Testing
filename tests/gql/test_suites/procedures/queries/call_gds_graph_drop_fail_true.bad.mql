@@ -1,1 +1,1 @@
-CALL gds.graph.drop("missing", true) YIELD graphName
+CALL drop("missing", true) YIELD graphName

@@ -186,10 +186,10 @@ bool GdsGraphProject::_next()
     try {
         // Validate argument count
         if (argument_exprs_.size() < 3) {
-            throw std::runtime_error("gds.graph.project requires graphName, nodeProjection and relationshipProjection arguments");
+            throw std::runtime_error("project requires graphName, nodeProjection and relationshipProjection arguments");
         }
         if (argument_exprs_.size() > 4) {
-            throw std::runtime_error("gds.graph.project accepts at most four arguments");
+            throw std::runtime_error("project accepts at most four arguments");
         }
 
         // Evaluate arguments

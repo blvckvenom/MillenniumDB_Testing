@@ -1,1 +1,1 @@
-CALL gds.graph.project("myGraph")
+CALL project("myGraph")

@@ -2039,8 +2039,8 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
 {
     LOG_VISITOR
     // Extract procedure name, strip dots and convert to lower case for
-    // case-insensitive matching. This allows CALL gds.graph.list() style
-    // invocations where dots are used to qualify the procedure name.
+    // case-insensitive matching. Supports both legacy names such as
+    // gdsgraphlist and short names like list.
     std::string procedure_name = ctx->procedureReference()->getText();
 
     // Remove backticks if present (accent-quoted identifiers)
@@ -2057,17 +2057,21 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
             );
         }
     }
+    if (normalized_procedure_name.size() >= 8 &&
+        normalized_procedure_name.compare(0, 8, "gdsgraph") == 0) {
+        normalized_procedure_name = normalized_procedure_name.substr(8);
+    }
 
     OpProcedure::ProcedureType procedure_type;
-    if (normalized_procedure_name == "gdsgraphproject") {
+    if (normalized_procedure_name == "project") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_PROJECT;
-    } else if (normalized_procedure_name == "gdsgraphlist") {
+    } else if (normalized_procedure_name == "list") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_LIST;
-    } else if (normalized_procedure_name == "gdsgraphdrop") {
+    } else if (normalized_procedure_name == "drop") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_DROP;
-    } else if (normalized_procedure_name == "gdsgraphexport") {
+    } else if (normalized_procedure_name == "export") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_EXPORT;
-    } else if (normalized_procedure_name == "gdsgraphfilter") {
+    } else if (normalized_procedure_name == "filter") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_FILTER;
     } else {
         throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
