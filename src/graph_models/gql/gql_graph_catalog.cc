@@ -197,6 +197,20 @@ GqlGraphCatalog::ProjectResult GqlGraphCatalog::project(const std::string& graph
             graph.relationshipProjection = relProjArg.to_string();
         }
 
+        // Reject empty projections which would otherwise create graphs
+        // without any nodes or relationships and can lead to undefined
+        // behaviour later in the projection pipeline.
+        if (nodeLabels.empty()) {
+            throw std::runtime_error(
+                "nodeProjection must include at least one label or '*'"
+            );
+        }
+        if (relationshipTypes.empty()) {
+            throw std::runtime_error(
+                "relationshipProjection must include at least one type or '*'"
+            );
+        }
+
         // 3. ACCESS BASE GRAPH AND APPLY PROJECTIONS
         // Note: In a real implementation, this would access the actual graph database
         // For now, we simulate the projection process
@@ -226,12 +240,14 @@ GqlGraphCatalog::ProjectResult GqlGraphCatalog::project(const std::string& graph
         }
         
         // Create projected edges (simulated as pairs of node IDs)
-        for (size_t i = 0; i < edgeCount && i < nodeCount - 1; ++i) {
-            StoredGraph::Edge edge;
-            edge.source = i;
-            edge.target = (i + 1) % nodeCount;
-            edge.type = relationshipTypes.empty() ? "DEFAULT" : *relationshipTypes.begin();
-            graph.edges.push_back(edge);
+        if (nodeCount > 0) {
+            for (size_t i = 0; i < edgeCount && i < nodeCount - 1; ++i) {
+                StoredGraph::Edge edge;
+                edge.source = i;
+                edge.target = (i + 1) % nodeCount;
+                edge.type = relationshipTypes.empty() ? "DEFAULT" : *relationshipTypes.begin();
+                graph.edges.push_back(edge);
+            }
         }
 
         // 4. APPLY CONFIGURATION OPTIONS
