@@ -840,6 +840,10 @@ PRECISION
    : 'PRECISION'
    ;
 
+PROJECT
+   : 'PROJECT'
+   ;
+
 PROPERTY
    : 'PROPERTY'
    ;
@@ -1227,7 +1231,6 @@ PRE_RESERVED_WORD
    | 'PARTITION'
    | 'PROCEDURE'
    | 'PRODUCT'
-   | 'PROJECT'
    | 'QUERY'
    | 'RECORDS'
    | 'REFERENCE'

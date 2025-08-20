@@ -2062,18 +2062,22 @@ std::any QueryVisitor::visitNamedProcedureCall(GQLParser::NamedProcedureCallCont
     }
 
     OpProcedure::ProcedureType procedure_type;
-    if (normalized_procedure_name == "gdsgraphproject") {
+    // Support both fully-qualified names (gds.graph.project) and short aliases (project)
+    if (normalized_procedure_name == "gdsgraphproject" || normalized_procedure_name == "project") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_PROJECT;
-    } else if (normalized_procedure_name == "gdsgraphlist") {
+    } else if (normalized_procedure_name == "gdsgraphlist" || normalized_procedure_name == "list") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_LIST;
-    } else if (normalized_procedure_name == "gdsgraphdrop") {
+    } else if (normalized_procedure_name == "gdsgraphdrop" || normalized_procedure_name == "drop") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_DROP;
     } else if (normalized_procedure_name == "gdsgraphexport") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_EXPORT;
     } else if (normalized_procedure_name == "gdsgraphfilter") {
         procedure_type = OpProcedure::ProcedureType::GDS_GRAPH_FILTER;
     } else {
-        throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
+        throw QueryException(
+            "Invalid CALL statement procedure: \"" + procedure_name
+            + "\". Supported procedures: project (gds.graph.project), list (gds.graph.list), drop (gds.graph.drop)"
+        );
     }
 
     // Clear temporary storages before populating them

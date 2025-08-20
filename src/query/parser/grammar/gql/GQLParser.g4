@@ -269,6 +269,7 @@ delimitedIdentifier
 
 objectName
    : identifier
+   | keyword
    ;
 
 objectNameOrBindingVariable
@@ -311,6 +312,7 @@ delimitedBindingTableName
 
 procedureName
    : identifier
+   | keyword
    ;
 
 labelName
@@ -2676,6 +2678,7 @@ keyword
    | PERCENTILE_DISC
    | POWER
    | PRECISION
+   | PROJECT
    | PROPERTY
    | PROPERTY_EXISTS
    | RADIANS

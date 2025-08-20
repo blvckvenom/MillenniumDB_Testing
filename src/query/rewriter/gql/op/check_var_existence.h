@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "query/parser/op/gql/op_visitor.h"
+#include "query/parser/op/gql/op_procedure.h"
 #include "query/var_id.h"
 
 namespace GQL {
@@ -36,7 +37,14 @@ public:
 
     void visit(GQL::OpEdgeLabel&) override { }
     void visit(GQL::OpNodeLabel&) override { }
-    void visit(GQL::OpProcedure&) override { }
+    void visit(GQL::OpProcedure& op) override {
+        // Treat YIELD variables from procedures as defined in the current scope
+        // so they can be referenced by RETURN/ORDER BY without raising
+        // "does not appear in the pattern expression".
+        for (auto var : op.yield_vars) {
+            variables.insert(var);
+        }
+    }
 };
 
 } // namespace GQL

@@ -204,10 +204,56 @@ bool GdsGraphProject::_next()
         if (!(node_proj_val.is_string() || node_proj_val.is_list() || node_proj_val.is_map())) {
             throw std::runtime_error("nodeProjection argument must be a string, list or map");
         }
+        
+        // Reject empty projections early to avoid undefined behavior downstream
+        if (node_proj_val.is_string()) {
+            const auto& s = node_proj_val.get_string();
+            const bool only_ws = std::all_of(s.begin(), s.end(), [](unsigned char c){ return std::isspace(c); });
+            if (s.empty() || only_ws) {
+                throw std::runtime_error(
+                    "nodeProjection cannot be empty; use '*' or provide a label/list/map"
+                );
+            }
+        } else if (node_proj_val.is_list()) {
+            if (node_proj_val.as_list().empty()) {
+                throw std::runtime_error(
+                    "nodeProjection list cannot be empty; include at least one label"
+                );
+            }
+        } else if (node_proj_val.is_map()) {
+            if (node_proj_val.as_map().empty()) {
+                throw std::runtime_error(
+                    "nodeProjection map cannot be empty; include at least one label entry"
+                );
+            }
+        }
 
         auto rel_proj_val = evaluate_expr_to_value(argument_exprs_[2].get(), parent_binding);
         if (!(rel_proj_val.is_string() || rel_proj_val.is_list() || rel_proj_val.is_map())) {
             throw std::runtime_error("relationshipProjection argument must be a string, list or map");
+        }
+        
+        // Same validation for relationship projection
+        if (rel_proj_val.is_string()) {
+            const auto& s = rel_proj_val.get_string();
+            const bool only_ws = std::all_of(s.begin(), s.end(), [](unsigned char c){ return std::isspace(c); });
+            if (s.empty() || only_ws) {
+                throw std::runtime_error(
+                    "relationshipProjection cannot be empty; use '*' or provide a type/list/map"
+                );
+            }
+        } else if (rel_proj_val.is_list()) {
+            if (rel_proj_val.as_list().empty()) {
+                throw std::runtime_error(
+                    "relationshipProjection list cannot be empty; include at least one type"
+                );
+            }
+        } else if (rel_proj_val.is_map()) {
+            if (rel_proj_val.as_map().empty()) {
+                throw std::runtime_error(
+                    "relationshipProjection map cannot be empty; include at least one type entry"
+                );
+            }
         }
 
         GQL::Map configuration;
