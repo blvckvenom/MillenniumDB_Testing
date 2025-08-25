@@ -1,0 +1,6 @@
+C1 :Country name:"Chile"
+P1 :Person name:"Alice"
+P2 :Person name:"Bob"
+P1->C1 :LIVES_IN since:2020
+P2->C1 :LIVES_IN since:2019
+P1->P2 :KNOWS since:2018

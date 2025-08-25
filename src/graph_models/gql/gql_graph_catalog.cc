@@ -214,6 +214,8 @@ GqlGraphCatalog::ProjectResult GqlGraphCatalog::project(const std::string& graph
         // Create projected node IDs (simulated)
         for (size_t i = 0; i < nodeCount; ++i) {
             graph.projectedNodes.push_back(i);
+            graph.nodeLabels.emplace_back();
+            graph.nodeProperties.emplace_back();
         }
 
         // Simulate relationship projection
@@ -284,6 +286,63 @@ GqlGraphCatalog::ProjectResult GqlGraphCatalog::project(const std::string& graph
     result.projectMillis = duration_ms.count();
     result.configuration = graph.configuration;
     
+    return result;
+}
+
+GqlGraphCatalog::ProjectResult GqlGraphCatalog::project(
+    const std::string& graphName,
+    const std::vector<ProjectedNodeInput>& nodes,
+    const std::vector<ProjectedEdgeInput>& edges,
+    const Map& configuration,
+    const std::string& nodeQuery,
+    const std::string& edgeQuery)
+{
+    const auto start_time = std::chrono::steady_clock::now();
+
+    StoredGraph graph;
+    graph.configuration = configuration.to_string();
+    graph.nodeProjection = nodeQuery;
+    graph.relationshipProjection = edgeQuery;
+    const auto now = std::chrono::system_clock::now();
+    graph.creationTime = now;
+    graph.modificationTime = now;
+
+    for (const auto& n : nodes) {
+        std::size_t new_id = graph.projectedNodes.size();
+        graph.projectedNodes.push_back(new_id);
+        graph.nodeLabels.push_back(n.labels);
+        graph.nodeProperties.push_back(n.properties);
+        graph.originalToProjectedId[n.originalId] = new_id;
+    }
+
+    for (const auto& e : edges) {
+        auto it_src = graph.originalToProjectedId.find(e.sourceOriginal);
+        auto it_dst = graph.originalToProjectedId.find(e.targetOriginal);
+        if (it_src == graph.originalToProjectedId.end() || it_dst == graph.originalToProjectedId.end()) {
+            continue;
+        }
+        StoredGraph::Edge edge;
+        edge.source = it_src->second;
+        edge.target = it_dst->second;
+        edge.type = e.type;
+        edge.properties = e.properties;
+        graph.edges.push_back(std::move(edge));
+    }
+
+    graphs_[graphName] = graph;
+    save_graph_to_disk(graphName, graphs_[graphName]);
+
+    const auto end_time = std::chrono::steady_clock::now();
+    const auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+    ProjectResult result;
+    result.graphName = graphName;
+    result.nodeProjection = nodeQuery;
+    result.nodeCount = nodes.size();
+    result.relationshipProjection = edgeQuery;
+    result.relationshipCount = graphs_[graphName].edges.size();
+    result.projectMillis = duration_ms.count();
+    result.configuration = configuration.to_string();
     return result;
 }
 

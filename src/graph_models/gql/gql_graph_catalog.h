@@ -26,6 +26,8 @@
 #include <chrono>
 #include <cstdint>
 
+#include "graph_models/gql/gql_value.h"
+
 // Forward declarations to avoid including heavy graph headers here. The actual
 // Value and Map types should be defined in the query layer (e.g., query/value.h).
 namespace GQL {
@@ -62,6 +64,21 @@ public:
         std::size_t relationshipCount;
         std::int64_t projectMillis;
         std::string configuration;
+    };
+
+    /// Node information used when projecting graphs from subquery results.
+    struct ProjectedNodeInput {
+        std::size_t originalId;                 ///< Original node identifier
+        std::vector<std::string> labels;       ///< Node labels
+        Value::ValueMap properties;            ///< Scalar properties
+    };
+
+    /// Edge information used when projecting graphs from subquery results.
+    struct ProjectedEdgeInput {
+        std::size_t sourceOriginal;            ///< Original source node id
+        std::size_t targetOriginal;            ///< Original target node id
+        std::string type;                      ///< Relationship type
+        Value::ValueMap properties;            ///< Scalar properties
     };
 
     /// Structure representing one entry in the GdsGraphList result. Many
@@ -116,6 +133,17 @@ public:
                           const Value& relProjArg,
                           const Map& configuration);
 
+    /// Project a graph using explicit node and edge data obtained from
+    /// subquery execution. Each node's original identifier is remapped to a
+    /// dense range starting at zero. Only edges whose endpoints exist in the
+    /// provided node set are inserted.
+    ProjectResult project(const std::string& graphName,
+                          const std::vector<ProjectedNodeInput>& nodes,
+                          const std::vector<ProjectedEdgeInput>& edges,
+                          const Map& configuration,
+                          const std::string& nodeQuery,
+                          const std::string& edgeQuery);
+
     /// List one or all projected graphs. If graphName is specified, only the
     /// matching entry will be returned (if it exists). Otherwise all graphs
     /// currently stored in the catalog will be listed. Unimplemented fields
@@ -139,10 +167,13 @@ private:
     struct StoredGraph {
         std::vector<std::size_t> projectedNodes;
         std::unordered_map<std::size_t, std::size_t> originalToProjectedId;
+        std::vector<std::vector<std::string>> nodeLabels;
+        std::vector<Value::ValueMap> nodeProperties;
         struct Edge {
             std::size_t source;
             std::size_t target;
             std::string type;
+            Value::ValueMap properties;
         };
         std::vector<Edge> edges;
         // Metadata
