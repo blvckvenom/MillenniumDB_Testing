@@ -23,19 +23,28 @@
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <set>
+#include <algorithm>
+#include <cctype>
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_graph_catalog.h"
 #include "graph_models/gql/gql_value.h"
 #include "graph_models/object_id.h"
+#include "graph_models/gql/gql_model.h"
+#include "storage/index/bplus_tree/bplus_tree.h"
+#include "query/parser/gql_query_parser.h"
+#include "query/optimizer/property_graph_model/binding_list_iter_constructor.h"
 #include "query/executor/binding.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/parser/expr/gql/expr_var.h"
 #include "query/query_context.h"
 #include "query/var_id.h"
+#include "misc/logger.h"
 
 namespace {
 
@@ -125,6 +134,91 @@ GQL::Value evaluate_expr_to_value(const GQL::Expr* expr, Binding* binding)
         return object_id_to_value(oid);
     }
     return GQL::Value();
+}
+
+// Heuristic to determine if a string looks like a GQL subquery.
+bool looks_like_subquery(std::string_view s)
+{
+    size_t i = 0;
+    while (i < s.size()) {
+        char c = s[i];
+        if (std::isspace(static_cast<unsigned char>(c))) { ++i; continue; }
+        if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') {
+            i += 2; while (i < s.size() && s[i] != '\n') ++i; continue;
+        }
+        if (c == '-' && i + 1 < s.size() && s[i + 1] == '-') {
+            i += 2; while (i < s.size() && s[i] != '\n') ++i; continue;
+        }
+        if (c == '/' && i + 1 < s.size() && s[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) ++i;
+            if (i + 1 < s.size()) i += 2;
+            continue;
+        }
+        break;
+    }
+    std::string token;
+    while (i < s.size() && std::isalpha(static_cast<unsigned char>(s[i]))) {
+        token.push_back(std::toupper(static_cast<unsigned char>(s[i])));
+        ++i;
+    }
+    return token == "MATCH" || token == "WITH" || token == "CALL";
+}
+
+// Retrieve all labels for a node or edge
+std::vector<std::string> get_labels(ObjectId oid, bool is_node)
+{
+    bool interruption = false;
+    std::vector<std::string> labels;
+    BptIter<2> it = is_node ?
+        gql_model.node_label->get_range(&interruption, { oid.id, 0 }, { oid.id, UINT64_MAX }) :
+        gql_model.edge_label->get_range(&interruption, { oid.id, 0 }, { oid.id, UINT64_MAX });
+    auto row = it.next();
+    while (row != nullptr) {
+        ObjectId lbl_oid((*row)[1]);
+        auto unmasked = lbl_oid.id & ObjectId::VALUE_MASK;
+        if (is_node) {
+            labels.push_back(gql_model.catalog.node_labels_str[unmasked]);
+        } else {
+            labels.push_back(gql_model.catalog.edge_labels_str[unmasked]);
+        }
+        row = it.next();
+    }
+    return labels;
+}
+
+// Retrieve properties for a node or edge
+GQL::Value::ValueMap get_properties(ObjectId oid, bool is_node)
+{
+    bool interruption = false;
+    GQL::Value::ValueMap props;
+    BptIter<3> it = is_node ?
+        gql_model.node_key_value->get_range(&interruption, { oid.id, 0, 0 }, { oid.id, UINT64_MAX, UINT64_MAX }) :
+        gql_model.edge_key_value->get_range(&interruption, { oid.id, 0, 0 }, { oid.id, UINT64_MAX, UINT64_MAX });
+    auto row = it.next();
+    while (row != nullptr) {
+        ObjectId key_oid((*row)[1]);
+        ObjectId val_oid((*row)[2]);
+        auto unmasked = key_oid.id & ObjectId::VALUE_MASK;
+        std::string key = is_node ?
+            gql_model.catalog.node_keys_str[unmasked] :
+            gql_model.catalog.edge_keys_str[unmasked];
+        props.emplace(key, object_id_to_value(val_oid));
+        row = it.next();
+    }
+    return props;
+}
+
+// Filter to keep only scalar properties (string, int, double, bool)
+GQL::Value::ValueMap filter_scalars(const GQL::Value::ValueMap& in)
+{
+    GQL::Value::ValueMap out;
+    for (const auto& [k, v] : in) {
+        if (v.is_string() || v.is_int() || v.is_double() || v.is_bool()) {
+            out.emplace(k, v);
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -265,9 +359,110 @@ bool GdsGraphProject::_next()
             configuration = GQL::Map(config_val.as_map());
         }
 
-        // Invoke catalog
-        auto result = catalog_
-                          .project(graph_name_val.get_string(), node_proj_val, rel_proj_val, configuration);
+        bool node_is_subq = node_proj_val.is_string() && looks_like_subquery(node_proj_val.get_string());
+        bool edge_is_subq = rel_proj_val.is_string() && looks_like_subquery(rel_proj_val.get_string());
+
+        GQL::GqlGraphCatalog::ProjectResult result;
+
+        if (node_is_subq && edge_is_subq) {
+            // --- Subquery mode ---
+            using NodeIn = GQL::GqlGraphCatalog::ProjectedNodeInput;
+            using EdgeIn = GQL::GqlGraphCatalog::ProjectedEdgeInput;
+
+            std::unordered_map<std::size_t, NodeIn> node_map;
+
+            // Compile and execute nodeQuery
+            {
+                auto plan = GQL::QueryParser::get_query_plan(node_proj_val.get_string());
+                auto types = plan->get_var_types();
+                bool found = false;
+                VarId n_var = get_query_ctx().get_var("n", &found);
+                if (!found || types[n_var].type != GQL::VarType::Node) {
+                    throw std::runtime_error("nodeQuery debe retornar la variable 'n' de tipo nodo");
+                }
+                GQL::PathBindingIterConstructor ctor;
+                plan->accept_visitor(ctor);
+                auto iter = std::move(ctor.tmp_iter);
+                Binding b(get_query_ctx().get_var_size());
+                iter->begin(b);
+                while (iter->next()) {
+                    ObjectId oid = b[n_var];
+                    auto id = static_cast<std::size_t>(oid.id);
+                    if (node_map.count(id) == 0) {
+                        NodeIn ni;
+                        ni.originalId = id;
+                        ni.labels = get_labels(oid, true);
+                        ni.properties = filter_scalars(get_properties(oid, true));
+                        node_map.emplace(id, std::move(ni));
+                    }
+                }
+                logger(Category::Info) << "gdsgraphproject nodes: " << node_map.size();
+            }
+
+            std::vector<EdgeIn> edges;
+            {
+                auto plan = GQL::QueryParser::get_query_plan(rel_proj_val.get_string());
+                auto types = plan->get_var_types();
+                bool fa=false, fr=false, fb=false;
+                VarId a_var = get_query_ctx().get_var("a", &fa);
+                VarId r_var = get_query_ctx().get_var("r", &fr);
+                VarId b_var = get_query_ctx().get_var("b", &fb);
+                if (!fa || types[a_var].type != GQL::VarType::Node ||
+                    !fr || types[r_var].type != GQL::VarType::Edge ||
+                    !fb || types[b_var].type != GQL::VarType::Node) {
+                    throw std::runtime_error("edgeQuery debe retornar 'a' (nodo), 'r' (relación) y 'b' (nodo) con esos nombres");
+                }
+                GQL::PathBindingIterConstructor ctor;
+                plan->accept_visitor(ctor);
+                auto iter = std::move(ctor.tmp_iter);
+                Binding b(get_query_ctx().get_var_size());
+                iter->begin(b);
+                std::unordered_set<std::size_t> seen_edges;
+                while (iter->next()) {
+                    ObjectId a_oid = b[a_var];
+                    ObjectId r_oid = b[r_var];
+                    ObjectId b_oid = b[b_var];
+                    auto a_id = static_cast<std::size_t>(a_oid.id);
+                    auto b_id = static_cast<std::size_t>(b_oid.id);
+                    if (node_map.count(a_id) == 0 || node_map.count(b_id) == 0) {
+                        continue;
+                    }
+                    auto r_id = static_cast<std::size_t>(r_oid.id);
+                    if (!seen_edges.insert(r_id).second) {
+                        continue;
+                    }
+                    EdgeIn ei;
+                    ei.sourceOriginal = a_id;
+                    ei.targetOriginal = b_id;
+                    auto lbls = get_labels(r_oid, false);
+                    ei.type = lbls.empty() ? std::string() : lbls.front();
+                    ei.properties = filter_scalars(get_properties(r_oid, false));
+                    edges.push_back(std::move(ei));
+                }
+                logger(Category::Info) << "gdsgraphproject edges: " << edges.size();
+            }
+
+            std::vector<NodeIn> nodes;
+            nodes.reserve(node_map.size());
+            for (auto& [id, node] : node_map) {
+                nodes.push_back(std::move(node));
+            }
+
+            result = catalog_.project(
+                graph_name_val.get_string(),
+                nodes,
+                edges,
+                configuration,
+                node_proj_val.get_string(),
+                rel_proj_val.get_string());
+        } else {
+            // --- Legacy mode ---
+            result = catalog_.project(
+                graph_name_val.get_string(),
+                node_proj_val,
+                rel_proj_val,
+                configuration);
+        }
 
         // Map column names to values
         std::unordered_map<std::string, ObjectId> values {

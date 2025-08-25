@@ -30,15 +30,21 @@
 /**
  * Binding iterator for the GdsGraphProject() procedure.
  *
- * This iterator executes a graph projection operation that creates a new
- * logical graph from a subset of nodes and relationships in the database.
+ * The iterator operates in two modes:
+ *  - Legacy mode: the node and relationship projections are simple
+ *    descriptors (e.g., "*", lists or maps) and the catalog generates a
+ *    synthetic projection.
+ *  - Subquery mode: when both projections are strings that look like GQL
+ *    subqueries starting with MATCH/WITH/CALL. The strings are compiled and
+ *    executed, expecting the node query to yield a single column `n` (node)
+ *    and the edge query to yield `a` (node), `r` (relationship) and `b`
+    (node). The resulting bindings are materialized into the catalog.
  *
  * Arguments (literals or variables are allowed):
  *   - graphName (STRING): name of the projected graph.
- *   - nodeProjection (Value): description of nodes to include in the
- *     projection.
- *   - relationshipProjection (Value): description of relationships to
- *     include in the projection.
+ *   - nodeProjection (Value): description or subquery for nodes.
+ *   - relationshipProjection (Value): description or subquery for
+ *     relationships.
  *   - configuration (MAP): additional projection options.
  *
  * Yielded columns, in order:

@@ -1,0 +1,7 @@
+CALL gdsgraphproject("gtest",
+       "MATCH (n) RETURN n",
+       "MATCH (a)-[r]->(b) RETURN a,r,b")
+YIELD graphName, nodeCount, relationshipCount;
+
+CALL gdsgraphproject("glegacy", "*", "*")
+YIELD graphName, nodeCount, relationshipCount;
