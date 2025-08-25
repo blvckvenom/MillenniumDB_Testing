@@ -97,198 +97,188 @@ public:
   };
 
   enum {
-    RuleRoot = 0, RuleGqlProgram = 1, RuleProgramActivity = 2, RuleSessionActivity = 3, 
-    RuleSessionActivityCommand = 4, RuleTransactionActivity = 5, RuleEndTransactionCommand = 6, 
-    RuleSessionSetCommand = 7, RuleSessionSetSchemaClause = 8, RuleSessionSetGraphClause = 9, 
-    RuleSessionSetTimeZoneClause = 10, RuleSetTimeZoneValue = 11, RuleSessionSetParameterClause = 12, 
-    RuleSessionSetGraphParameterClause = 13, RuleSessionSetBindingTableParameterClause = 14, 
-    RuleSessionSetValueParameterClause = 15, RuleSessionSetParameterName = 16, 
-    RuleSessionResetCommand = 17, RuleSessionResetArguments = 18, RuleSessionCloseCommand = 19, 
-    RuleStartTransactionCommand = 20, RuleTransactionCharacteristics = 21, 
-    RuleTransactionMode = 22, RuleTransactionAccessMode = 23, RuleImplementationDefinedAccessMode = 24, 
-    RuleRollbackCommand = 25, RuleCommitCommand = 26, RuleNestedProcedureSpecification = 27, 
-    RuleProcedureSpecification = 28, RuleCatalogModifyingProcedureSpecification = 29, 
-    RuleNestedDataModifyingProcedureSpecification = 30, RuleDataModifyingProcedureSpecification = 31, 
-    RuleNestedQuerySpecification = 32, RuleQuerySpecification = 33, RuleUnsignedNumericLiteral = 34, 
-    RuleIntegerLiteral = 35, RuleFloatLiteral = 36, RuleUnbrokenSingleQuotedCharacterSequence = 37, 
-    RuleUnbrokenDoubleQuotedCharacterSequence = 38, RuleUnbrokenAccentQuotedCharacterSequence = 39, 
-    RuleSingleQuotedCharacterSequence = 40, RuleDoubleQuotedCharacterSequence = 41, 
-    RuleAccentQuotedCharacterSequence = 42, RuleUnbrokenCharacterStringLiteral = 43, 
-    RuleNullLiteral = 44, RuleTemporalLiteral = 45, RuleSqlDatetimeLiteral = 46, 
-    RuleDateLiteral = 47, RuleTimeLiteral = 48, RuleDatetimeLiteral = 49, 
-    RuleDurationLiteral = 50, RuleSqlIntervalLiteral = 51, RuleSqlIntervalType = 52, 
-    RuleIdentifier = 53, RuleDelimitedIdentifier = 54, RuleObjectName = 55, 
-    RuleObjectNameOrBindingVariable = 56, RuleDirectoryName = 57, RuleSchemaName = 58, 
-    RuleGraphName = 59, RuleDelimitedGraphName = 60, RuleGraphTypeName = 61, 
-    RuleElementTypeName = 62, RuleBindingTableName = 63, RuleDelimitedBindingTableName = 64, 
-    RuleProcedureName = 65, RuleLabelName = 66, RuleFunctionName = 67, RulePropertyName = 68, 
-    RuleFieldName = 69, RuleParameterName = 70, RuleVariable = 71, RuleGraphVariable = 72, 
-    RuleGraphPatternVariable = 73, RulePathOrSubpathVariable = 74, RuleElementVariable = 75, 
-    RulePathVariable = 76, RuleSubpathVariable = 77, RuleBindingTableVariable = 78, 
-    RuleValueVariable = 79, RuleBindingVariable = 80, RulePredefinedTypeLiteral = 81, 
-    RuleBooleanLiteral = 82, RuleCharacterStringLiteral = 83, RuleByteStringLiteral = 84, 
-    RuleProcedureBody = 85, RuleBindingVariableDefinitionBlock = 86, RuleBindingVariableDefinition = 87, 
-    RuleStatementBlock = 88, RuleStatement = 89, RuleNextStatement = 90, 
-    RuleGraphVariableDefinition = 91, RuleOptTypedGraphInitializer = 92, 
-    RuleGraphInitializer = 93, RuleBindingTableVariableDefinition = 94, 
-    RuleOptTypedBindingTableInitializer = 95, RuleBindingTableInitializer = 96, 
-    RuleValueVariableDefinition = 97, RuleOptTypedValueInitializer = 98, 
-    RuleGraphExpression = 99, RuleCurrentGraph = 100, RuleNestedGraphQuerySpecification = 101, 
-    RuleBindingTableExpression = 102, RuleNestedBindingTableQuerySpecification = 103, 
-    RuleObjectExpressionPrimary = 104, RuleLinearCatalogModifyingStatement = 105, 
-    RuleSimpleCatalogModifyingStatement = 106, RulePrimitiveCatalogModifyingStatement = 107, 
-    RuleCreateSchemaStatement = 108, RuleDropSchemaStatement = 109, RuleCreateGraphStatement = 110, 
-    RuleOpenGraphType = 111, RuleOfGraphType = 112, RuleGraphTypeLikeGraph = 113, 
-    RuleGraphSource = 114, RuleDropGraphStatement = 115, RuleCreateGraphTypeStatement = 116, 
-    RuleGraphTypeSource = 117, RuleCopyOfGraphType = 118, RuleDropGraphTypeStatement = 119, 
-    RuleCallCatalogModifyingProcedureStatement = 120, RuleLinearDataModifyingStatement = 121, 
-    RuleFocusedLinearDataModifyingStatement = 122, RuleFocusedLinearDataModifyingStatementBody = 123, 
-    RuleFocusedNestedDataModifyingProcedureSpecification = 124, RuleAmbientLinearDataModifyingStatement = 125, 
-    RuleAmbientLinearDataModifyingStatementBody = 126, RuleSimpleLinearDataAccessingStatement = 127, 
-    RuleSimpleDataAccessingStatement = 128, RuleSimpleDataModifyingStatement = 129, 
-    RulePrimitiveDataModifyingStatement = 130, RuleInsertStatement = 131, 
-    RuleSetStatement = 132, RuleSetItemList = 133, RuleSetItem = 134, RuleSetPropertyItem = 135, 
-    RuleSetAllPropertiesItem = 136, RuleSetLabelItem = 137, RuleLabelSetSpecification = 138, 
-    RuleRemoveStatement = 139, RuleRemoveItemList = 140, RuleRemoveItem = 141, 
-    RuleRemovePropertyItem = 142, RuleRemoveLabelItem = 143, RuleDeleteStatement = 144, 
-    RuleDeleteItemList = 145, RuleDeleteItem = 146, RuleCallDataModifyingProcedureStatement = 147, 
-    RuleCompositeQueryStatement = 148, RuleCompositeQueryExpression = 149, 
-    RuleQueryConjunction = 150, RuleSetOperator = 151, RuleCompositeQueryPrimary = 152, 
-    RuleLinearQueryStatement = 153, RuleFocusedLinearQueryStatement = 154, 
-    RuleFocusedLinearQueryStatementPart = 155, RuleFocusedLinearQueryAndPrimitiveResultStatementPart = 156, 
-    RuleFocusedPrimitiveResultStatement = 157, RuleFocusedNestedQuerySpecification = 158, 
-    RuleAmbientLinearQueryStatement = 159, RuleSimpleLinearQueryStatement = 160, 
-    RuleSimpleQueryStatement = 161, RulePrimitiveQueryStatement = 162, RuleMatchStatement = 163, 
-    RuleSimpleMatchStatement = 164, RuleOptionalMatchStatement = 165, RuleOptionalOperand = 166, 
-    RuleMatchStatementBlock = 167, RuleCallQueryStatement = 168, RuleFilterStatement = 169, 
-    RuleLetStatement = 170, RuleLetVariableDefinitionList = 171, RuleLetVariableDefinition = 172, 
-    RuleForStatement = 173, RuleForItem = 174, RuleForItemAlias = 175, RuleForOrdinalityOrOffset = 176, 
-    RuleOrderByAndPageStatement = 177, RulePrimitiveResultStatement = 178, 
-    RuleReturnStatement = 179, RuleReturnStatementBody = 180, RuleReturnItemList = 181, 
-    RuleReturnItem = 182, RuleReturnItemAlias = 183, RuleSelectStatement = 184, 
-    RuleSelectItemList = 185, RuleSelectItem = 186, RuleSelectItemAlias = 187, 
-    RuleHavingClause = 188, RuleSelectStatementBody = 189, RuleSelectGraphMatchList = 190, 
-    RuleSelectGraphMatch = 191, RuleSelectQuerySpecification = 192, RuleCallProcedureStatement = 193, 
-    RuleProcedureCall = 194, RuleInlineProcedureCall = 195, RuleVariableScopeClause = 196, 
-    RuleBindingVariableReferenceList = 197, RuleNamedProcedureCall = 198, 
-    RuleProcedureArgumentList = 199, RuleProcedureArgument = 200, RuleUseGraphClause = 201, 
-    RuleAtSchemaClause = 202, RuleBindingVariableReference = 203, RuleElementVariableReference = 204, 
-    RulePathVariableReference = 205, RuleParameter = 206, RuleGraphPatternBindingTable = 207, 
-    RuleGraphPatternYieldClause = 208, RuleGraphPatternYieldItemList = 209, 
-    RuleGraphPatternYieldItem = 210, RuleGraphPattern = 211, RuleMatchMode = 212, 
-    RuleRepeatableElementsMatchMode = 213, RuleDifferentEdgesMatchMode = 214, 
-    RuleElementBindingsOrElements = 215, RuleEdgeBindingsOrEdges = 216, 
-    RulePathPatternList = 217, RulePathPattern = 218, RulePathVariableDeclaration = 219, 
-    RuleKeepClause = 220, RuleGraphPatternWhereClause = 221, RulePathPatternPrefix = 222, 
-    RulePathModePrefix = 223, RulePathMode = 224, RulePathSearchPrefix = 225, 
-    RuleAllPathSearch = 226, RulePathOrPaths = 227, RuleAnyPathSearch = 228, 
-    RuleNumberOfPaths = 229, RuleShortestPathSearch = 230, RuleAllShortestPathSearch = 231, 
-    RuleAnyShortestPathSearch = 232, RuleCountedShortestPathSearch = 233, 
-    RuleCountedShortestGroupSearch = 234, RuleNumberOfGroups = 235, RulePathPatternExpression = 236, 
-    RulePathMultisetAlternation = 237, RulePathPatternUnion = 238, RulePathTerm = 239, 
-    RulePathFactor = 240, RuleQuantifiedPathPrimary = 241, RuleQuestionedPathPrimary = 242, 
-    RulePathPrimary = 243, RuleElementPattern = 244, RuleNodePattern = 245, 
-    RuleElementPatternFiller = 246, RuleElementVariableDeclaration = 247, 
-    RuleIsLabelExpression = 248, RuleIsOrColon = 249, RuleElementPatternPredicate = 250, 
-    RuleElementPatternWhereClause = 251, RuleElementPropertySpecification = 252, 
-    RulePropertyKeyValuePairList = 253, RulePropertyKeyValuePair = 254, 
-    RuleEdgePattern = 255, RuleFullEdgePattern = 256, RuleFullEdgePointingLeft = 257, 
-    RuleFullEdgeUndirected = 258, RuleFullEdgePointingRight = 259, RuleFullEdgeLeftOrUndirected = 260, 
-    RuleFullEdgeUndirectedOrRight = 261, RuleFullEdgeLeftOrRight = 262, 
-    RuleFullEdgeAnyDirection = 263, RuleAbbreviatedEdgePattern = 264, RuleParenthesizedPathPatternExpression = 265, 
-    RuleSubpathVariableDeclaration = 266, RuleParenthesizedPathPatternWhereClause = 267, 
-    RuleInsertGraphPattern = 268, RuleInsertPathPatternList = 269, RuleInsertPathPattern = 270, 
-    RuleInsertNodePattern = 271, RuleInsertEdgePattern = 272, RuleInsertEdgePointingLeft = 273, 
-    RuleInsertEdgePointingRight = 274, RuleInsertEdgeUndirected = 275, RuleInsertElementPatternFiller = 276, 
-    RuleLabelAndPropertySetSpecification = 277, RuleLabelExpression = 278, 
-    RuleLabelTerm = 279, RuleLabelFactor = 280, RuleLabelPrimary = 281, 
-    RuleWildcardLabel = 282, RuleParenthesizedLabelExpression = 283, RuleGraphPatternQuantifier = 284, 
-    RuleFixedQuantifier = 285, RuleGeneralQuantifier = 286, RuleLowerBound = 287, 
-    RuleUpperBound = 288, RuleSimplifiedPathPatternExpression = 289, RuleSimplifiedDefaultingLeft = 290, 
-    RuleSimplifiedDefaultingUndirected = 291, RuleSimplifiedDefaultingRight = 292, 
-    RuleSimplifiedDefaultingLeftOrUndirected = 293, RuleSimplifiedDefaultingUndirectedOrRight = 294, 
-    RuleSimplifiedDefaultingLeftOrRight = 295, RuleSimplifiedDefaultingAnyDirection = 296, 
-    RuleSimplifiedContents = 297, RuleSimplifiedPathUnion = 298, RuleSimplifiedMultisetAlternation = 299, 
-    RuleSimplifiedTerm = 300, RuleSimplifiedFactorLow = 301, RuleSimplifiedFactorHigh = 302, 
-    RuleSimplifiedQuantified = 303, RuleSimplifiedQuestioned = 304, RuleSimplifiedTertiary = 305, 
-    RuleSimplifiedDirectionOverride = 306, RuleSimplifiedOverrideLeft = 307, 
-    RuleSimplifiedOverrideUndirected = 308, RuleSimplifiedOverrideRight = 309, 
-    RuleSimplifiedOverrideLeftOrUndirected = 310, RuleSimplifiedOverrideUndirectedOrRight = 311, 
-    RuleSimplifiedOverrideLeftOrRight = 312, RuleSimplifiedOverrideAnyDirection = 313, 
-    RuleSimplifiedSecondary = 314, RuleSimplifiedNegation = 315, RuleSimplifiedPrimary = 316, 
-    RuleWhereClause = 317, RuleYieldClause = 318, RuleYieldItemList = 319, 
-    RuleYieldItem = 320, RuleYieldItemName = 321, RuleYieldItemAlias = 322, 
-    RuleGroupByClause = 323, RuleGroupingElementList = 324, RuleGroupingElement = 325, 
-    RuleEmptyGroupingSet = 326, RuleOrderByClause = 327, RuleAggregateFunction = 328, 
-    RuleGeneralSetFunctionType = 329, RuleSetQuantifier = 330, RuleBinarySetFunctionType = 331, 
-    RuleSortSpecificationList = 332, RuleSortSpecification = 333, RuleSortKey = 334, 
-    RuleOrderingSpecification = 335, RuleNullOrdering = 336, RuleLimitClause = 337, 
-    RuleOffsetClause = 338, RuleOffsetSynonym = 339, RuleNestedGraphTypeSpecification = 340, 
-    RuleGraphTypeSpecificationBody = 341, RuleElementTypeDefinitionList = 342, 
-    RuleElementTypeDefinition = 343, RuleNodeTypeDefinition = 344, RuleNodeTypePattern = 345, 
-    RuleNodeTypePhrase = 346, RuleNodeTypeName = 347, RuleNodeTypeFiller = 348, 
-    RuleNodeTypeLabelSetDefinition = 349, RuleNodeTypePropertyTypeSetDefinition = 350, 
-    RuleEdgeTypeDefinition = 351, RuleEdgeTypePattern = 352, RuleEdgeTypePhrase = 353, 
-    RuleEdgeTypeName = 354, RuleEdgeTypeFiller = 355, RuleEdgeTypeLabelSetDefinition = 356, 
-    RuleEdgeTypePropertyTypeSetDefinition = 357, RuleFullEdgeTypePattern = 358, 
-    RuleFullEdgeTypePatternPointingRight = 359, RuleFullEdgeTypePatternPointingLeft = 360, 
-    RuleFullEdgeTypePatternUndirected = 361, RuleArcTypePointingRight = 362, 
-    RuleArcTypePointingLeft = 363, RuleArcTypeUndirected = 364, RuleArcTypeFiller = 365, 
-    RuleAbbreviatedEdgeTypePattern = 366, RuleAbbreviatedEdgeTypePatternPointingRight = 367, 
-    RuleAbbreviatedEdgeTypePatternPointingLeft = 368, RuleAbbreviatedEdgeTypePatternUndirected = 369, 
-    RuleNodeTypeReference = 370, RuleSourceNodeTypeReference = 371, RuleDestinationNodeTypeReference = 372, 
-    RuleEdgeKind = 373, RuleEndpointDefinition = 374, RuleEndpointPairDefinition = 375, 
-    RuleEndpointPairDefinitionPointingRight = 376, RuleEndpointPairDefinitionPointingLeft = 377, 
-    RuleEndpointPairDefinitionUndirected = 378, RuleConnectorPointingRight = 379, 
-    RuleConnectorUndirected = 380, RuleSourceNodeTypeName = 381, RuleDestinationNodeTypeName = 382, 
-    RuleLabelSetDefinition = 383, RulePropertyTypeSetDefinition = 384, RulePropertyTypeDefinitionList = 385, 
-    RulePropertyTypeDefinition = 386, RulePropertyValueType = 387, RuleBindingTableType = 388, 
-    RuleValueType = 389, RuleTyped = 390, RulePredefinedType = 391, RuleBooleanType = 392, 
-    RuleCharacterStringType = 393, RuleByteStringType = 394, RuleMinLength = 395, 
-    RuleMaxLength = 396, RuleFixedLength = 397, RuleNumericType = 398, RuleExactNumericType = 399, 
-    RuleBinaryExactNumericType = 400, RuleSignedBinaryExactNumericType = 401, 
-    RuleUnsignedBinaryExactNumericType = 402, RuleVerboseBinaryExactNumericType = 403, 
-    RuleDecimalExactNumericType = 404, RulePrecision = 405, RuleScale = 406, 
-    RuleApproximateNumericType = 407, RuleTemporalType = 408, RuleTemporalInstantType = 409, 
-    RuleTemporalDurationType = 410, RuleDatetimeType = 411, RuleLocaldatetimeType = 412, 
-    RuleDateType = 413, RuleTimeType = 414, RuleLocaltimeType = 415, RuleDurationType = 416, 
-    RuleReferenceValueType = 417, RuleGraphReferenceValueType = 418, RuleClosedGraphReferenceValueType = 419, 
-    RuleOpenGraphReferenceValueType = 420, RuleBindingTableReferenceValueType = 421, 
-    RuleNodeReferenceValueType = 422, RuleClosedNodeReferenceValueType = 423, 
-    RuleOpenNodeReferenceValueType = 424, RuleEdgeReferenceValueType = 425, 
-    RuleClosedEdgeReferenceValueType = 426, RuleOpenEdgeReferenceValueType = 427, 
-    RuleListValueTypeName = 428, RuleListValueTypeNameSynonym = 429, RuleFieldTypesSpecification = 430, 
-    RuleFieldTypeList = 431, RulePathValueType = 432, RuleNotNull = 433, 
-    RuleFieldType = 434, RuleSchemaReference = 435, RuleAbsoluteCatalogSchemaReference = 436, 
-    RuleCatalogSchemaParentAndName = 437, RuleRelativeCatalogSchemaReference = 438, 
-    RulePredefinedSchemaReference = 439, RuleAbsoluteDirectoryPath = 440, 
-    RuleRelativeDirectoryPath = 441, RuleSimpleDirectoryPath = 442, RuleGraphReference = 443, 
-    RuleCatalogGraphParentAndName = 444, RuleHomeGraph = 445, RuleGraphTypeReference = 446, 
-    RuleCatalogGraphTypeParentAndName = 447, RuleBindingTableReference = 448, 
-    RuleCatalogBindingTableParentAndName = 449, RuleProcedureReference = 450, 
-    RuleCatalogProcedureParentAndName = 451, RuleCatalogObjectParentReference = 452, 
-    RuleReferenceParameter = 453, RuleExternalObjectReference = 454, RuleComparisonPredicateCond = 455, 
-    RuleCompOp = 456, RuleNullPredicateCond = 457, RuleNormalizedPredicateCond = 458, 
-    RuleDirectedPredicateCond = 459, RuleLabeledPredicateCond = 460, RuleSourceDestinationPredicateCond = 461, 
-    RuleUnsignedValueSpecification = 462, RuleUnsignedIntegerSpecification = 463, 
-    RuleParameterValueSpecification = 464, RulePredefinedParameter = 465, 
-    RuleExpression = 466, RuleExpressionPredicate = 467, RuleExpressionAtom = 468, 
-    RuleTruthValue = 469, RuleUnaryOperator = 470, RuleFunctionCall = 471, 
-    RuleNumericFunction = 472, RuleFunctionParameter = 473, RulePropertyReference = 474, 
-    RuleOneArgNumericFunctionName = 475, RuleTwoArgNumericFunctionName = 476, 
-    RuleStringFunction = 477, RuleListFunction = 478, RuleCaseFunction = 479, 
-    RuleSimpleWhenClause = 480, RuleSearchedWhenClause = 481, RuleElseClause = 482, 
-    RuleWhenOperand = 483, RuleCastFunction = 484, RuleElementIdFunction = 485, 
-    RuleDatetimeValueFunction = 486, RuleDateFunction = 487, RuleTimeFunction = 488, 
-    RuleLocalTimeFunction = 489, RuleDatetimeFunction = 490, RuleLocalDatetimeFunction = 491, 
-    RuleDateFunctionParameters = 492, RuleTimeFunctionParameters = 493, 
-    RuleDatetimeFunctionParameters = 494, RuleDateString = 495, RuleTimeString = 496, 
-    RuleDatetimeString = 497, RuleDurationFunction = 498, RuleDurationFunctionParameters = 499, 
-    RuleDurationString = 500, RuleGeneralFunction = 501, RuleCollectionValueConstructor = 502, 
-    RuleTrimSpecification = 503, RuleNormalForm = 504, RuleListValueConstructor = 505, 
-    RuleRecordValueConstructor = 506, RuleField = 507, RulePathValueConstructor = 508, 
-    RuleUnsignedLiteral = 509, RuleGeneralLiteral = 510, RuleListLiteral = 511, 
-    RuleRecordLiteral = 512, RuleRecordFieldLiteral = 513, RuleKeyword = 514
+    RuleRoot = 0, RuleGqlProgram = 1, RuleSessionActivity = 2, RuleSessionActivityCommand = 3, 
+    RuleTransactionActivity = 4, RuleEndTransactionCommand = 5, RuleSessionSetCommand = 6, 
+    RuleSessionSetSchemaClause = 7, RuleSessionSetGraphClause = 8, RuleSessionSetTimeZoneClause = 9, 
+    RuleSetTimeZoneValue = 10, RuleSessionSetParameterClause = 11, RuleSessionSetGraphParameterClause = 12, 
+    RuleSessionSetBindingTableParameterClause = 13, RuleSessionSetValueParameterClause = 14, 
+    RuleSessionSetParameterName = 15, RuleSessionResetCommand = 16, RuleSessionResetArguments = 17, 
+    RuleSessionCloseCommand = 18, RuleStartTransactionCommand = 19, RuleTransactionMode = 20, 
+    RuleImplementationDefinedAccessMode = 21, RuleRollbackCommand = 22, 
+    RuleCommitCommand = 23, RuleNestedProcedureSpecification = 24, RuleUnsignedNumericLiteral = 25, 
+    RuleIntegerLiteral = 26, RuleFloatLiteral = 27, RuleUnbrokenSingleQuotedCharacterSequence = 28, 
+    RuleUnbrokenDoubleQuotedCharacterSequence = 29, RuleUnbrokenAccentQuotedCharacterSequence = 30, 
+    RuleSingleQuotedCharacterSequence = 31, RuleDoubleQuotedCharacterSequence = 32, 
+    RuleAccentQuotedCharacterSequence = 33, RuleUnbrokenCharacterStringLiteral = 34, 
+    RuleNullLiteral = 35, RuleTemporalLiteral = 36, RuleSqlDatetimeLiteral = 37, 
+    RuleDateLiteral = 38, RuleTimeLiteral = 39, RuleDatetimeLiteral = 40, 
+    RuleDurationLiteral = 41, RuleSqlIntervalLiteral = 42, RuleSqlIntervalType = 43, 
+    RuleIdentifier = 44, RuleDelimitedIdentifier = 45, RuleObjectName = 46, 
+    RuleObjectNameOrBindingVariable = 47, RuleDirectoryName = 48, RuleSchemaName = 49, 
+    RuleGraphName = 50, RuleDelimitedGraphName = 51, RuleGraphTypeName = 52, 
+    RuleElementTypeName = 53, RuleBindingTableName = 54, RuleDelimitedBindingTableName = 55, 
+    RuleProcedureName = 56, RuleLabelName = 57, RuleFunctionName = 58, RulePropertyName = 59, 
+    RuleFieldName = 60, RuleParameterName = 61, RuleVariable = 62, RuleGraphVariable = 63, 
+    RuleGraphPatternVariable = 64, RulePathOrSubpathVariable = 65, RuleElementVariable = 66, 
+    RulePathVariable = 67, RuleSubpathVariable = 68, RuleBindingTableVariable = 69, 
+    RuleValueVariable = 70, RuleBindingVariable = 71, RulePredefinedTypeLiteral = 72, 
+    RuleBooleanLiteral = 73, RuleCharacterStringLiteral = 74, RuleByteStringLiteral = 75, 
+    RuleProcedureBody = 76, RuleBindingVariableDefinitionBlock = 77, RuleBindingVariableDefinition = 78, 
+    RuleStatementBlock = 79, RuleStatement = 80, RuleNextStatement = 81, 
+    RuleGraphVariableDefinition = 82, RuleOptTypedGraphInitializer = 83, 
+    RuleGraphInitializer = 84, RuleBindingTableVariableDefinition = 85, 
+    RuleOptTypedBindingTableInitializer = 86, RuleBindingTableInitializer = 87, 
+    RuleValueVariableDefinition = 88, RuleOptTypedValueInitializer = 89, 
+    RuleGraphExpression = 90, RuleCurrentGraph = 91, RuleBindingTableExpression = 92, 
+    RuleObjectExpressionPrimary = 93, RuleLinearCatalogModifyingStatement = 94, 
+    RuleSimpleCatalogModifyingStatement = 95, RulePrimitiveCatalogModifyingStatement = 96, 
+    RuleCreateSchemaStatement = 97, RuleDropSchemaStatement = 98, RuleCreateGraphStatement = 99, 
+    RuleOpenGraphType = 100, RuleOfGraphType = 101, RuleGraphTypeLikeGraph = 102, 
+    RuleGraphSource = 103, RuleDropGraphStatement = 104, RuleCreateGraphTypeStatement = 105, 
+    RuleGraphTypeSource = 106, RuleCopyOfGraphType = 107, RuleDropGraphTypeStatement = 108, 
+    RuleLinearDataModifyingStatement = 109, RuleLinearDataModifyingStatementBody = 110, 
+    RuleNestedDataModifyingProcedure = 111, RuleSimpleDataAccessingStatement = 112, 
+    RulePrimitiveDataModifyingStatement = 113, RuleInsertStatement = 114, 
+    RuleSetStatement = 115, RuleSetItemList = 116, RuleSetItem = 117, RuleSetPropertyItem = 118, 
+    RuleSetAllPropertiesItem = 119, RuleSetLabelItem = 120, RuleLabelSetSpecification = 121, 
+    RuleRemoveStatement = 122, RuleRemoveItemList = 123, RuleRemoveItem = 124, 
+    RuleRemovePropertyItem = 125, RuleRemoveLabelItem = 126, RuleDeleteStatement = 127, 
+    RuleDeleteItemList = 128, RuleDeleteItem = 129, RuleCallDataModifyingProcedureStatement = 130, 
+    RuleCompositeQueryExpression = 131, RuleQueryConjunction = 132, RuleSetOperator = 133, 
+    RuleCompositeQueryPrimary = 134, RuleLinearQueryStatement = 135, RuleFocusedLinearQueryStatement = 136, 
+    RuleFocusedLinearQueryStatementPart = 137, RuleFocusedLinearQueryAndPrimitiveResultStatementPart = 138, 
+    RuleFocusedPrimitiveResultStatement = 139, RuleFocusedNestedQuerySpecification = 140, 
+    RuleAmbientLinearQueryStatement = 141, RuleSimpleLinearQueryStatement = 142, 
+    RulePrimitiveQueryStatement = 143, RuleMatchStatement = 144, RuleSimpleMatchStatement = 145, 
+    RuleOptionalMatchStatement = 146, RuleOptionalOperand = 147, RuleMatchStatementBlock = 148, 
+    RuleCallQueryStatement = 149, RuleFilterStatement = 150, RuleLetStatement = 151, 
+    RuleLetVariableDefinitionList = 152, RuleLetVariableDefinition = 153, 
+    RuleForStatement = 154, RuleForItem = 155, RuleForItemAlias = 156, RuleForOrdinalityOrOffset = 157, 
+    RuleOrderByAndPageStatement = 158, RulePrimitiveResultStatement = 159, 
+    RuleReturnStatement = 160, RuleReturnStatementBody = 161, RuleReturnItemList = 162, 
+    RuleReturnItem = 163, RuleReturnItemAlias = 164, RuleSelectStatement = 165, 
+    RuleSelectItemList = 166, RuleSelectItem = 167, RuleSelectItemAlias = 168, 
+    RuleHavingClause = 169, RuleSelectStatementBody = 170, RuleSelectGraphMatchList = 171, 
+    RuleSelectGraphMatch = 172, RuleSelectQuerySpecification = 173, RuleCallProcedureStatement = 174, 
+    RuleProcedureCall = 175, RuleInlineProcedureCall = 176, RuleVariableScopeClause = 177, 
+    RuleBindingVariableReferenceList = 178, RuleNamedProcedureCall = 179, 
+    RuleProcedureArgumentList = 180, RuleProcedureArgument = 181, RuleUseGraphClause = 182, 
+    RuleAtSchemaClause = 183, RuleBindingVariableReference = 184, RuleElementVariableReference = 185, 
+    RulePathVariableReference = 186, RuleParameter = 187, RuleGraphPatternYieldClause = 188, 
+    RuleGraphPatternYieldItemList = 189, RuleGraphPatternYieldItem = 190, 
+    RuleGraphPattern = 191, RuleMatchMode = 192, RuleRepeatableElementsMatchMode = 193, 
+    RuleDifferentEdgesMatchMode = 194, RuleElementBindingsOrElements = 195, 
+    RuleEdgeBindingsOrEdges = 196, RulePathPatternList = 197, RulePathPattern = 198, 
+    RulePathVariableDeclaration = 199, RuleKeepClause = 200, RuleGraphPatternWhereClause = 201, 
+    RulePathPatternPrefix = 202, RulePathModePrefix = 203, RulePathMode = 204, 
+    RulePathSearchPrefix = 205, RuleAllPathSearch = 206, RulePathOrPaths = 207, 
+    RuleAnyPathSearch = 208, RuleNumberOfPaths = 209, RuleShortestPathSearch = 210, 
+    RuleAllShortestPathSearch = 211, RuleAnyShortestPathSearch = 212, RuleCountedShortestPathSearch = 213, 
+    RuleCountedShortestGroupSearch = 214, RuleNumberOfGroups = 215, RulePathPatternExpression = 216, 
+    RulePathMultisetAlternation = 217, RulePathPatternUnion = 218, RulePathTerm = 219, 
+    RulePathFactor = 220, RuleQuantifiedPathPrimary = 221, RuleQuestionedPathPrimary = 222, 
+    RulePathPrimary = 223, RuleElementPattern = 224, RuleNodePattern = 225, 
+    RuleElementPatternFiller = 226, RuleElementVariableDeclaration = 227, 
+    RuleIsLabelExpression = 228, RuleIsOrColon = 229, RuleElementPatternPredicate = 230, 
+    RuleElementPatternWhereClause = 231, RuleElementPropertySpecification = 232, 
+    RulePropertyKeyValuePairList = 233, RulePropertyKeyValuePair = 234, 
+    RuleEdgePattern = 235, RuleFullEdgePattern = 236, RuleFullEdgePointingLeft = 237, 
+    RuleFullEdgeUndirected = 238, RuleFullEdgePointingRight = 239, RuleFullEdgeLeftOrUndirected = 240, 
+    RuleFullEdgeUndirectedOrRight = 241, RuleFullEdgeLeftOrRight = 242, 
+    RuleFullEdgeAnyDirection = 243, RuleAbbreviatedEdgePattern = 244, RuleParenthesizedPathPatternExpression = 245, 
+    RuleSubpathVariableDeclaration = 246, RuleParenthesizedPathPatternWhereClause = 247, 
+    RuleInsertGraphPattern = 248, RuleInsertPathPatternList = 249, RuleInsertPathPattern = 250, 
+    RuleInsertNodePattern = 251, RuleInsertEdgePattern = 252, RuleInsertEdgePointingLeft = 253, 
+    RuleInsertEdgePointingRight = 254, RuleInsertEdgeUndirected = 255, RuleInsertElementPatternFiller = 256, 
+    RuleLabelAndPropertySetSpecification = 257, RuleLabelExpression = 258, 
+    RuleLabelTerm = 259, RuleLabelFactor = 260, RuleLabelPrimary = 261, 
+    RuleWildcardLabel = 262, RuleParenthesizedLabelExpression = 263, RuleGraphPatternQuantifier = 264, 
+    RuleFixedQuantifier = 265, RuleGeneralQuantifier = 266, RuleLowerBound = 267, 
+    RuleUpperBound = 268, RuleSimplifiedPathPatternExpression = 269, RuleSimplifiedDefaultingLeft = 270, 
+    RuleSimplifiedDefaultingUndirected = 271, RuleSimplifiedDefaultingRight = 272, 
+    RuleSimplifiedDefaultingLeftOrUndirected = 273, RuleSimplifiedDefaultingUndirectedOrRight = 274, 
+    RuleSimplifiedDefaultingLeftOrRight = 275, RuleSimplifiedDefaultingAnyDirection = 276, 
+    RuleSimplifiedContents = 277, RuleSimplifiedPathUnion = 278, RuleSimplifiedMultisetAlternation = 279, 
+    RuleSimplifiedTerm = 280, RuleSimplifiedFactorLow = 281, RuleSimplifiedFactorHigh = 282, 
+    RuleSimplifiedQuantified = 283, RuleSimplifiedQuestioned = 284, RuleSimplifiedTertiary = 285, 
+    RuleSimplifiedDirectionOverride = 286, RuleSimplifiedOverrideLeft = 287, 
+    RuleSimplifiedOverrideUndirected = 288, RuleSimplifiedOverrideRight = 289, 
+    RuleSimplifiedOverrideLeftOrUndirected = 290, RuleSimplifiedOverrideUndirectedOrRight = 291, 
+    RuleSimplifiedOverrideLeftOrRight = 292, RuleSimplifiedOverrideAnyDirection = 293, 
+    RuleSimplifiedSecondary = 294, RuleSimplifiedNegation = 295, RuleSimplifiedPrimary = 296, 
+    RuleWhereClause = 297, RuleYieldClause = 298, RuleYieldItemList = 299, 
+    RuleYieldItem = 300, RuleYieldItemName = 301, RuleYieldItemAlias = 302, 
+    RuleGroupByClause = 303, RuleGroupingElementList = 304, RuleGroupingElement = 305, 
+    RuleEmptyGroupingSet = 306, RuleOrderByClause = 307, RuleAggregateFunction = 308, 
+    RuleGeneralSetFunctionType = 309, RuleSetQuantifier = 310, RuleBinarySetFunctionType = 311, 
+    RuleSortSpecificationList = 312, RuleSortSpecification = 313, RuleSortKey = 314, 
+    RuleOrderingSpecification = 315, RuleNullOrdering = 316, RuleLimitClause = 317, 
+    RuleOffsetClause = 318, RuleOffsetSynonym = 319, RuleNestedGraphTypeSpecification = 320, 
+    RuleGraphTypeSpecificationBody = 321, RuleElementTypeDefinitionList = 322, 
+    RuleElementTypeDefinition = 323, RuleNodeTypeDefinition = 324, RuleNodeTypePattern = 325, 
+    RuleNodeTypePhrase = 326, RuleNodeTypeName = 327, RuleNodeTypeFiller = 328, 
+    RuleNodeTypeLabelSetDefinition = 329, RuleNodeTypePropertyTypeSetDefinition = 330, 
+    RuleEdgeTypeDefinition = 331, RuleEdgeTypePattern = 332, RuleEdgeTypePhrase = 333, 
+    RuleEdgeTypeName = 334, RuleEdgeTypeFiller = 335, RuleEdgeTypeLabelSetDefinition = 336, 
+    RuleEdgeTypePropertyTypeSetDefinition = 337, RuleFullEdgeTypePattern = 338, 
+    RuleFullEdgeTypePatternPointingRight = 339, RuleFullEdgeTypePatternPointingLeft = 340, 
+    RuleFullEdgeTypePatternUndirected = 341, RuleArcTypePointingRight = 342, 
+    RuleArcTypePointingLeft = 343, RuleArcTypeUndirected = 344, RuleArcTypeFiller = 345, 
+    RuleAbbreviatedEdgeTypePattern = 346, RuleAbbreviatedEdgeTypePatternPointingRight = 347, 
+    RuleAbbreviatedEdgeTypePatternPointingLeft = 348, RuleAbbreviatedEdgeTypePatternUndirected = 349, 
+    RuleNodeTypeReference = 350, RuleSourceNodeTypeReference = 351, RuleDestinationNodeTypeReference = 352, 
+    RuleEdgeKind = 353, RuleEndpointDefinition = 354, RuleEndpointPairDefinition = 355, 
+    RuleEndpointPairDefinitionPointingRight = 356, RuleEndpointPairDefinitionPointingLeft = 357, 
+    RuleEndpointPairDefinitionUndirected = 358, RuleConnectorPointingRight = 359, 
+    RuleConnectorUndirected = 360, RuleSourceNodeTypeName = 361, RuleDestinationNodeTypeName = 362, 
+    RuleLabelSetDefinition = 363, RulePropertyTypeSetDefinition = 364, RulePropertyTypeDefinitionList = 365, 
+    RulePropertyTypeDefinition = 366, RulePropertyValueType = 367, RuleBindingTableType = 368, 
+    RuleValueType = 369, RuleTyped = 370, RulePredefinedType = 371, RuleBooleanType = 372, 
+    RuleCharacterStringType = 373, RuleByteStringType = 374, RuleMinLength = 375, 
+    RuleMaxLength = 376, RuleFixedLength = 377, RuleNumericType = 378, RuleExactNumericType = 379, 
+    RuleBinaryExactNumericType = 380, RuleSignedBinaryExactNumericType = 381, 
+    RuleUnsignedBinaryExactNumericType = 382, RuleVerboseBinaryExactNumericType = 383, 
+    RuleDecimalExactNumericType = 384, RulePrecision = 385, RuleScale = 386, 
+    RuleApproximateNumericType = 387, RuleTemporalType = 388, RuleTemporalInstantType = 389, 
+    RuleTemporalDurationType = 390, RuleDatetimeType = 391, RuleLocaldatetimeType = 392, 
+    RuleDateType = 393, RuleTimeType = 394, RuleLocaltimeType = 395, RuleDurationType = 396, 
+    RuleReferenceValueType = 397, RuleGraphReferenceValueType = 398, RuleClosedGraphReferenceValueType = 399, 
+    RuleOpenGraphReferenceValueType = 400, RuleBindingTableReferenceValueType = 401, 
+    RuleNodeReferenceValueType = 402, RuleClosedNodeReferenceValueType = 403, 
+    RuleOpenNodeReferenceValueType = 404, RuleEdgeReferenceValueType = 405, 
+    RuleClosedEdgeReferenceValueType = 406, RuleOpenEdgeReferenceValueType = 407, 
+    RuleListValueTypeName = 408, RuleListValueTypeNameSynonym = 409, RuleFieldTypesSpecification = 410, 
+    RuleFieldTypeList = 411, RulePathValueType = 412, RuleNotNull = 413, 
+    RuleFieldType = 414, RuleSchemaReference = 415, RuleAbsoluteCatalogSchemaReference = 416, 
+    RuleCatalogSchemaParentAndName = 417, RuleRelativeCatalogSchemaReference = 418, 
+    RulePredefinedSchemaReference = 419, RuleAbsoluteDirectoryPath = 420, 
+    RuleRelativeDirectoryPath = 421, RuleSimpleDirectoryPath = 422, RuleGraphReference = 423, 
+    RuleCatalogGraphParentAndName = 424, RuleHomeGraph = 425, RuleGraphTypeReference = 426, 
+    RuleCatalogGraphTypeParentAndName = 427, RuleBindingTableReference = 428, 
+    RuleCatalogBindingTableParentAndName = 429, RuleProcedureReference = 430, 
+    RuleCatalogProcedureParentAndName = 431, RuleCatalogObjectParentReference = 432, 
+    RuleReferenceParameter = 433, RuleExternalObjectReference = 434, RuleComparisonPredicateCond = 435, 
+    RuleCompOp = 436, RuleNullPredicateCond = 437, RuleNormalizedPredicateCond = 438, 
+    RuleDirectedPredicateCond = 439, RuleLabeledPredicateCond = 440, RuleSourceDestinationPredicateCond = 441, 
+    RuleUnsignedValueSpecification = 442, RuleUnsignedIntegerSpecification = 443, 
+    RuleParameterValueSpecification = 444, RulePredefinedParameter = 445, 
+    RuleExpression = 446, RuleExpressionPredicate = 447, RuleExpressionAtom = 448, 
+    RuleTruthValue = 449, RuleUnaryOperator = 450, RuleFunctionCall = 451, 
+    RuleNumericFunction = 452, RuleFunctionParameter = 453, RulePropertyReference = 454, 
+    RuleOneArgNumericFunctionName = 455, RuleTwoArgNumericFunctionName = 456, 
+    RuleStringFunction = 457, RuleListFunction = 458, RuleCaseFunction = 459, 
+    RuleLabelsFunction = 460, RuleSimpleWhenClause = 461, RuleSearchedWhenClause = 462, 
+    RuleElseClause = 463, RuleWhenOperand = 464, RuleCastFunction = 465, 
+    RuleElementIdFunction = 466, RuleDatetimeValueFunction = 467, RuleDateFunction = 468, 
+    RuleTimeFunction = 469, RuleLocalTimeFunction = 470, RuleDatetimeFunction = 471, 
+    RuleLocalDatetimeFunction = 472, RuleDateFunctionParameters = 473, RuleTimeFunctionParameters = 474, 
+    RuleDatetimeFunctionParameters = 475, RuleDateString = 476, RuleTimeString = 477, 
+    RuleDatetimeString = 478, RuleDurationFunction = 479, RuleDurationFunctionParameters = 480, 
+    RuleDurationString = 481, RuleGeneralFunction = 482, RuleCollectionValueConstructor = 483, 
+    RuleTrimSpecification = 484, RuleNormalForm = 485, RuleListValueConstructor = 486, 
+    RuleRecordValueConstructor = 487, RuleField = 488, RulePathValueConstructor = 489, 
+    RuleUnsignedLiteral = 490, RuleGeneralLiteral = 491, RuleListLiteral = 492, 
+    RuleRecordLiteral = 493, RuleRecordFieldLiteral = 494, RuleKeyword = 495
   };
 
   explicit GQLParser(antlr4::TokenStream *input);
@@ -310,7 +300,6 @@ public:
 
   class RootContext;
   class GqlProgramContext;
-  class ProgramActivityContext;
   class SessionActivityContext;
   class SessionActivityCommandContext;
   class TransactionActivityContext;
@@ -329,19 +318,11 @@ public:
   class SessionResetArgumentsContext;
   class SessionCloseCommandContext;
   class StartTransactionCommandContext;
-  class TransactionCharacteristicsContext;
   class TransactionModeContext;
-  class TransactionAccessModeContext;
   class ImplementationDefinedAccessModeContext;
   class RollbackCommandContext;
   class CommitCommandContext;
   class NestedProcedureSpecificationContext;
-  class ProcedureSpecificationContext;
-  class CatalogModifyingProcedureSpecificationContext;
-  class NestedDataModifyingProcedureSpecificationContext;
-  class DataModifyingProcedureSpecificationContext;
-  class NestedQuerySpecificationContext;
-  class QuerySpecificationContext;
   class UnsignedNumericLiteralContext;
   class IntegerLiteralContext;
   class FloatLiteralContext;
@@ -409,9 +390,7 @@ public:
   class OptTypedValueInitializerContext;
   class GraphExpressionContext;
   class CurrentGraphContext;
-  class NestedGraphQuerySpecificationContext;
   class BindingTableExpressionContext;
-  class NestedBindingTableQuerySpecificationContext;
   class ObjectExpressionPrimaryContext;
   class LinearCatalogModifyingStatementContext;
   class SimpleCatalogModifyingStatementContext;
@@ -428,16 +407,10 @@ public:
   class GraphTypeSourceContext;
   class CopyOfGraphTypeContext;
   class DropGraphTypeStatementContext;
-  class CallCatalogModifyingProcedureStatementContext;
   class LinearDataModifyingStatementContext;
-  class FocusedLinearDataModifyingStatementContext;
-  class FocusedLinearDataModifyingStatementBodyContext;
-  class FocusedNestedDataModifyingProcedureSpecificationContext;
-  class AmbientLinearDataModifyingStatementContext;
-  class AmbientLinearDataModifyingStatementBodyContext;
-  class SimpleLinearDataAccessingStatementContext;
+  class LinearDataModifyingStatementBodyContext;
+  class NestedDataModifyingProcedureContext;
   class SimpleDataAccessingStatementContext;
-  class SimpleDataModifyingStatementContext;
   class PrimitiveDataModifyingStatementContext;
   class InsertStatementContext;
   class SetStatementContext;
@@ -456,7 +429,6 @@ public:
   class DeleteItemListContext;
   class DeleteItemContext;
   class CallDataModifyingProcedureStatementContext;
-  class CompositeQueryStatementContext;
   class CompositeQueryExpressionContext;
   class QueryConjunctionContext;
   class SetOperatorContext;
@@ -469,7 +441,6 @@ public:
   class FocusedNestedQuerySpecificationContext;
   class AmbientLinearQueryStatementContext;
   class SimpleLinearQueryStatementContext;
-  class SimpleQueryStatementContext;
   class PrimitiveQueryStatementContext;
   class MatchStatementContext;
   class SimpleMatchStatementContext;
@@ -515,7 +486,6 @@ public:
   class ElementVariableReferenceContext;
   class PathVariableReferenceContext;
   class ParameterContext;
-  class GraphPatternBindingTableContext;
   class GraphPatternYieldClauseContext;
   class GraphPatternYieldItemListContext;
   class GraphPatternYieldItemContext;
@@ -788,6 +758,7 @@ public:
   class StringFunctionContext;
   class ListFunctionContext;
   class CaseFunctionContext;
+  class LabelsFunctionContext;
   class SimpleWhenClauseContext;
   class SearchedWhenClauseContext;
   class ElseClauseContext;
@@ -843,7 +814,8 @@ public:
   public:
     GqlProgramContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    ProgramActivityContext *programActivity();
+    SessionActivityContext *sessionActivity();
+    TransactionActivityContext *transactionActivity();
     SessionCloseCommandContext *sessionCloseCommand();
 
 
@@ -852,20 +824,6 @@ public:
   };
 
   GqlProgramContext* gqlProgram();
-
-  class  ProgramActivityContext : public antlr4::ParserRuleContext {
-  public:
-    ProgramActivityContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    SessionActivityContext *sessionActivity();
-    TransactionActivityContext *transactionActivity();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  ProgramActivityContext* programActivity();
 
   class  SessionActivityContext : public antlr4::ParserRuleContext {
   public:
@@ -900,7 +858,7 @@ public:
     TransactionActivityContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     StartTransactionCommandContext *startTransactionCommand();
-    ProcedureSpecificationContext *procedureSpecification();
+    ProcedureBodyContext *procedureBody();
     EndTransactionCommandContext *endTransactionCommand();
 
 
@@ -1134,7 +1092,7 @@ public:
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *START();
     antlr4::tree::TerminalNode *TRANSACTION();
-    TransactionCharacteristicsContext *transactionCharacteristics();
+    TransactionModeContext *transactionMode();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -1143,27 +1101,13 @@ public:
 
   StartTransactionCommandContext* startTransactionCommand();
 
-  class  TransactionCharacteristicsContext : public antlr4::ParserRuleContext {
-  public:
-    TransactionCharacteristicsContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    std::vector<TransactionModeContext *> transactionMode();
-    TransactionModeContext* transactionMode(size_t i);
-    std::vector<antlr4::tree::TerminalNode *> COMMA();
-    antlr4::tree::TerminalNode* COMMA(size_t i);
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  TransactionCharacteristicsContext* transactionCharacteristics();
-
   class  TransactionModeContext : public antlr4::ParserRuleContext {
   public:
     TransactionModeContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    TransactionAccessModeContext *transactionAccessMode();
+    antlr4::tree::TerminalNode *READ();
+    antlr4::tree::TerminalNode *ONLY();
+    antlr4::tree::TerminalNode *WRITE();
     ImplementationDefinedAccessModeContext *implementationDefinedAccessMode();
 
 
@@ -1172,21 +1116,6 @@ public:
   };
 
   TransactionModeContext* transactionMode();
-
-  class  TransactionAccessModeContext : public antlr4::ParserRuleContext {
-  public:
-    TransactionAccessModeContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    antlr4::tree::TerminalNode *READ();
-    antlr4::tree::TerminalNode *ONLY();
-    antlr4::tree::TerminalNode *WRITE();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  TransactionAccessModeContext* transactionAccessMode();
 
   class  ImplementationDefinedAccessModeContext : public antlr4::ParserRuleContext {
   public:
@@ -1232,7 +1161,7 @@ public:
     NestedProcedureSpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *LEFT_BRACE();
-    ProcedureSpecificationContext *procedureSpecification();
+    ProcedureBodyContext *procedureBody();
     antlr4::tree::TerminalNode *RIGHT_BRACE();
 
 
@@ -1241,88 +1170,6 @@ public:
   };
 
   NestedProcedureSpecificationContext* nestedProcedureSpecification();
-
-  class  ProcedureSpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    ProcedureSpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    ProcedureBodyContext *procedureBody();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  ProcedureSpecificationContext* procedureSpecification();
-
-  class  CatalogModifyingProcedureSpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    CatalogModifyingProcedureSpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    ProcedureBodyContext *procedureBody();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  CatalogModifyingProcedureSpecificationContext* catalogModifyingProcedureSpecification();
-
-  class  NestedDataModifyingProcedureSpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    NestedDataModifyingProcedureSpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    antlr4::tree::TerminalNode *LEFT_BRACE();
-    DataModifyingProcedureSpecificationContext *dataModifyingProcedureSpecification();
-    antlr4::tree::TerminalNode *RIGHT_BRACE();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  NestedDataModifyingProcedureSpecificationContext* nestedDataModifyingProcedureSpecification();
-
-  class  DataModifyingProcedureSpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    DataModifyingProcedureSpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    ProcedureBodyContext *procedureBody();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  DataModifyingProcedureSpecificationContext* dataModifyingProcedureSpecification();
-
-  class  NestedQuerySpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    NestedQuerySpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    antlr4::tree::TerminalNode *LEFT_BRACE();
-    ProcedureSpecificationContext *procedureSpecification();
-    antlr4::tree::TerminalNode *RIGHT_BRACE();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  NestedQuerySpecificationContext* nestedQuerySpecification();
-
-  class  QuerySpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    QuerySpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    ProcedureBodyContext *procedureBody();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  QuerySpecificationContext* querySpecification();
 
   class  UnsignedNumericLiteralContext : public antlr4::ParserRuleContext {
   public:
@@ -2112,7 +1959,7 @@ public:
     virtual size_t getRuleIndex() const override;
     LinearCatalogModifyingStatementContext *linearCatalogModifyingStatement();
     LinearDataModifyingStatementContext *linearDataModifyingStatement();
-    CompositeQueryStatementContext *compositeQueryStatement();
+    CompositeQueryExpressionContext *compositeQueryExpression();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -2261,7 +2108,7 @@ public:
   public:
     GraphExpressionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    NestedGraphQuerySpecificationContext *nestedGraphQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
     ObjectExpressionPrimaryContext *objectExpressionPrimary();
     GraphReferenceContext *graphReference();
     ObjectNameOrBindingVariableContext *objectNameOrBindingVariable();
@@ -2288,24 +2135,11 @@ public:
 
   CurrentGraphContext* currentGraph();
 
-  class  NestedGraphQuerySpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    NestedGraphQuerySpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    NestedQuerySpecificationContext *nestedQuerySpecification();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  NestedGraphQuerySpecificationContext* nestedGraphQuerySpecification();
-
   class  BindingTableExpressionContext : public antlr4::ParserRuleContext {
   public:
     BindingTableExpressionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    NestedBindingTableQuerySpecificationContext *nestedBindingTableQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
     ObjectExpressionPrimaryContext *objectExpressionPrimary();
     BindingTableReferenceContext *bindingTableReference();
     ObjectNameOrBindingVariableContext *objectNameOrBindingVariable();
@@ -2316,19 +2150,6 @@ public:
   };
 
   BindingTableExpressionContext* bindingTableExpression();
-
-  class  NestedBindingTableQuerySpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    NestedBindingTableQuerySpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    NestedQuerySpecificationContext *nestedQuerySpecification();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  NestedBindingTableQuerySpecificationContext* nestedBindingTableQuerySpecification();
 
   class  ObjectExpressionPrimaryContext : public antlr4::ParserRuleContext {
   public:
@@ -2366,7 +2187,7 @@ public:
     SimpleCatalogModifyingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     PrimitiveCatalogModifyingStatementContext *primitiveCatalogModifyingStatement();
-    CallCatalogModifyingProcedureStatementContext *callCatalogModifyingProcedureStatement();
+    CallProcedureStatementContext *callProcedureStatement();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -2608,25 +2429,12 @@ public:
 
   DropGraphTypeStatementContext* dropGraphTypeStatement();
 
-  class  CallCatalogModifyingProcedureStatementContext : public antlr4::ParserRuleContext {
-  public:
-    CallCatalogModifyingProcedureStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    CallProcedureStatementContext *callProcedureStatement();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  CallCatalogModifyingProcedureStatementContext* callCatalogModifyingProcedureStatement();
-
   class  LinearDataModifyingStatementContext : public antlr4::ParserRuleContext {
   public:
     LinearDataModifyingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    FocusedLinearDataModifyingStatementContext *focusedLinearDataModifyingStatement();
-    AmbientLinearDataModifyingStatementContext *ambientLinearDataModifyingStatement();
+    LinearDataModifyingStatementBodyContext *linearDataModifyingStatementBody();
+    NestedDataModifyingProcedureContext *nestedDataModifyingProcedure();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -2635,97 +2443,42 @@ public:
 
   LinearDataModifyingStatementContext* linearDataModifyingStatement();
 
-  class  FocusedLinearDataModifyingStatementContext : public antlr4::ParserRuleContext {
+  class  LinearDataModifyingStatementBodyContext : public antlr4::ParserRuleContext {
   public:
-    FocusedLinearDataModifyingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    FocusedLinearDataModifyingStatementBodyContext *focusedLinearDataModifyingStatementBody();
-    FocusedNestedDataModifyingProcedureSpecificationContext *focusedNestedDataModifyingProcedureSpecification();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  FocusedLinearDataModifyingStatementContext* focusedLinearDataModifyingStatement();
-
-  class  FocusedLinearDataModifyingStatementBodyContext : public antlr4::ParserRuleContext {
-  public:
-    FocusedLinearDataModifyingStatementBodyContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    LinearDataModifyingStatementBodyContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     UseGraphClauseContext *useGraphClause();
-    SimpleLinearDataAccessingStatementContext *simpleLinearDataAccessingStatement();
-    PrimitiveResultStatementContext *primitiveResultStatement();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  FocusedLinearDataModifyingStatementBodyContext* focusedLinearDataModifyingStatementBody();
-
-  class  FocusedNestedDataModifyingProcedureSpecificationContext : public antlr4::ParserRuleContext {
-  public:
-    FocusedNestedDataModifyingProcedureSpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    UseGraphClauseContext *useGraphClause();
-    NestedDataModifyingProcedureSpecificationContext *nestedDataModifyingProcedureSpecification();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  FocusedNestedDataModifyingProcedureSpecificationContext* focusedNestedDataModifyingProcedureSpecification();
-
-  class  AmbientLinearDataModifyingStatementContext : public antlr4::ParserRuleContext {
-  public:
-    AmbientLinearDataModifyingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    AmbientLinearDataModifyingStatementBodyContext *ambientLinearDataModifyingStatementBody();
-    NestedDataModifyingProcedureSpecificationContext *nestedDataModifyingProcedureSpecification();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  AmbientLinearDataModifyingStatementContext* ambientLinearDataModifyingStatement();
-
-  class  AmbientLinearDataModifyingStatementBodyContext : public antlr4::ParserRuleContext {
-  public:
-    AmbientLinearDataModifyingStatementBodyContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    SimpleLinearDataAccessingStatementContext *simpleLinearDataAccessingStatement();
-    PrimitiveResultStatementContext *primitiveResultStatement();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  AmbientLinearDataModifyingStatementBodyContext* ambientLinearDataModifyingStatementBody();
-
-  class  SimpleLinearDataAccessingStatementContext : public antlr4::ParserRuleContext {
-  public:
-    SimpleLinearDataAccessingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
     std::vector<SimpleDataAccessingStatementContext *> simpleDataAccessingStatement();
     SimpleDataAccessingStatementContext* simpleDataAccessingStatement(size_t i);
+    PrimitiveResultStatementContext *primitiveResultStatement();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
    
   };
 
-  SimpleLinearDataAccessingStatementContext* simpleLinearDataAccessingStatement();
+  LinearDataModifyingStatementBodyContext* linearDataModifyingStatementBody();
+
+  class  NestedDataModifyingProcedureContext : public antlr4::ParserRuleContext {
+  public:
+    NestedDataModifyingProcedureContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
+    UseGraphClauseContext *useGraphClause();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  NestedDataModifyingProcedureContext* nestedDataModifyingProcedure();
 
   class  SimpleDataAccessingStatementContext : public antlr4::ParserRuleContext {
   public:
     SimpleDataAccessingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    SimpleQueryStatementContext *simpleQueryStatement();
-    SimpleDataModifyingStatementContext *simpleDataModifyingStatement();
+    PrimitiveQueryStatementContext *primitiveQueryStatement();
+    PrimitiveDataModifyingStatementContext *primitiveDataModifyingStatement();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -2733,20 +2486,6 @@ public:
   };
 
   SimpleDataAccessingStatementContext* simpleDataAccessingStatement();
-
-  class  SimpleDataModifyingStatementContext : public antlr4::ParserRuleContext {
-  public:
-    SimpleDataModifyingStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    PrimitiveDataModifyingStatementContext *primitiveDataModifyingStatement();
-    CallDataModifyingProcedureStatementContext *callDataModifyingProcedureStatement();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  SimpleDataModifyingStatementContext* simpleDataModifyingStatement();
 
   class  PrimitiveDataModifyingStatementContext : public antlr4::ParserRuleContext {
   public:
@@ -3020,19 +2759,6 @@ public:
 
   CallDataModifyingProcedureStatementContext* callDataModifyingProcedureStatement();
 
-  class  CompositeQueryStatementContext : public antlr4::ParserRuleContext {
-  public:
-    CompositeQueryStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    CompositeQueryExpressionContext *compositeQueryExpression();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  CompositeQueryStatementContext* compositeQueryStatement();
-
   class  CompositeQueryExpressionContext : public antlr4::ParserRuleContext {
   public:
     CompositeQueryExpressionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
@@ -3171,7 +2897,7 @@ public:
     FocusedNestedQuerySpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     UseGraphClauseContext *useGraphClause();
-    NestedQuerySpecificationContext *nestedQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -3186,7 +2912,7 @@ public:
     virtual size_t getRuleIndex() const override;
     PrimitiveResultStatementContext *primitiveResultStatement();
     SimpleLinearQueryStatementContext *simpleLinearQueryStatement();
-    NestedQuerySpecificationContext *nestedQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -3199,8 +2925,8 @@ public:
   public:
     SimpleLinearQueryStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    std::vector<SimpleQueryStatementContext *> simpleQueryStatement();
-    SimpleQueryStatementContext* simpleQueryStatement(size_t i);
+    std::vector<PrimitiveQueryStatementContext *> primitiveQueryStatement();
+    PrimitiveQueryStatementContext* primitiveQueryStatement(size_t i);
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -3208,20 +2934,6 @@ public:
   };
 
   SimpleLinearQueryStatementContext* simpleLinearQueryStatement();
-
-  class  SimpleQueryStatementContext : public antlr4::ParserRuleContext {
-  public:
-    SimpleQueryStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    PrimitiveQueryStatementContext *primitiveQueryStatement();
-    CallQueryStatementContext *callQueryStatement();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  SimpleQueryStatementContext* simpleQueryStatement();
 
   class  PrimitiveQueryStatementContext : public antlr4::ParserRuleContext {
   public:
@@ -3232,6 +2944,7 @@ public:
     ForStatementContext *forStatement();
     FilterStatementContext *filterStatement();
     OrderByAndPageStatementContext *orderByAndPageStatement();
+    CallQueryStatementContext *callQueryStatement();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -3259,7 +2972,8 @@ public:
     SimpleMatchStatementContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *MATCH();
-    GraphPatternBindingTableContext *graphPatternBindingTable();
+    GraphPatternContext *graphPattern();
+    GraphPatternYieldClauseContext *graphPatternYieldClause();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -3499,8 +3213,6 @@ public:
     ReturnItemListContext *returnItemList();
     SetQuantifierContext *setQuantifier();
     GroupByClauseContext *groupByClause();
-    antlr4::tree::TerminalNode *NO();
-    antlr4::tree::TerminalNode *BINDINGS();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -3683,7 +3395,7 @@ public:
   public:
     SelectQuerySpecificationContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
-    NestedQuerySpecificationContext *nestedQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
     GraphExpressionContext *graphExpression();
 
 
@@ -3892,20 +3604,6 @@ public:
   };
 
   ParameterContext* parameter();
-
-  class  GraphPatternBindingTableContext : public antlr4::ParserRuleContext {
-  public:
-    GraphPatternBindingTableContext(antlr4::ParserRuleContext *parent, size_t invokingState);
-    virtual size_t getRuleIndex() const override;
-    GraphPatternContext *graphPattern();
-    GraphPatternYieldClauseContext *graphPatternYieldClause();
-
-
-    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
-   
-  };
-
-  GraphPatternBindingTableContext* graphPatternBindingTable();
 
   class  GraphPatternYieldClauseContext : public antlr4::ParserRuleContext {
   public:
@@ -8246,7 +7944,7 @@ public:
     antlr4::tree::TerminalNode *LEFT_PAREN();
     antlr4::tree::TerminalNode *RIGHT_PAREN();
     MatchStatementBlockContext *matchStatementBlock();
-    NestedQuerySpecificationContext *nestedQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
   };
@@ -8397,7 +8095,7 @@ public:
     GqlValueQueryExpressionContext(ExpressionAtomContext *ctx);
 
     antlr4::tree::TerminalNode *VALUE();
-    NestedQuerySpecificationContext *nestedQuerySpecification();
+    NestedProcedureSpecificationContext *nestedProcedureSpecification();
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
   };
@@ -8520,6 +8218,7 @@ public:
     DurationFunctionContext *durationFunction();
     ListFunctionContext *listFunction();
     StringFunctionContext *stringFunction();
+    LabelsFunctionContext *labelsFunction();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
@@ -8864,6 +8563,22 @@ public:
   };
 
   CaseFunctionContext* caseFunction();
+
+  class  LabelsFunctionContext : public antlr4::ParserRuleContext {
+  public:
+    LabelsFunctionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *LABELS();
+    antlr4::tree::TerminalNode *LEFT_PAREN();
+    VariableContext *variable();
+    antlr4::tree::TerminalNode *RIGHT_PAREN();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  LabelsFunctionContext* labelsFunction();
 
   class  SimpleWhenClauseContext : public antlr4::ParserRuleContext {
   public:
