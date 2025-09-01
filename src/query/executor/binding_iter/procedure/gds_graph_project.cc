@@ -37,6 +37,13 @@
 #include "query/query_context.h"
 #include "query/var_id.h"
 
+// Dual execution flow:
+//  * Legacy mode uses label/type projections passed as lists, maps or the
+//    '*' wildcard and delegates to GqlGraphCatalog::project.
+//  * Subquery mode accepts strings that look like full MATCH/WITH/CALL
+//    subqueries and materialises their bindings via
+//    GqlGraphCatalog::project_from_bindings.
+
 namespace {
 
 // Convert an ObjectId representing a literal into a GQL::Value. This handles
@@ -128,6 +135,43 @@ GQL::Value evaluate_expr_to_value(const GQL::Expr* expr, Binding* binding)
 }
 
 } // namespace
+
+bool GdsGraphProject::looks_like_subquery(std::string_view s)
+{
+    auto starts_with_ci = [](std::string_view text, std::string_view kw) {
+        return text.size() >= kw.size() && std::equal(kw.begin(), kw.end(), text.begin(),
+            [](char a, char b) { return std::toupper(a) == std::toupper(b); });
+    };
+
+    size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
+            ++i;
+        }
+        if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '/') {
+            i += 2;
+            while (i < s.size() && s[i] != '\n') {
+                ++i;
+            }
+            continue;
+        }
+        if (i + 1 < s.size() && s[i] == '/' && s[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) {
+                ++i;
+            }
+            if (i + 1 < s.size()) {
+                i += 2;
+            }
+            continue;
+        }
+        break;
+    }
+
+    auto trimmed = s.substr(i);
+    return starts_with_ci(trimmed, "MATCH") || starts_with_ci(trimmed, "WITH") ||
+           starts_with_ci(trimmed, "CALL");
+}
 
 // Force symbol visibility
 #ifdef __GNUC__
@@ -265,9 +309,29 @@ bool GdsGraphProject::_next()
             configuration = GQL::Map(config_val.as_map());
         }
 
-        // Invoke catalog
-        auto result = catalog_
-                          .project(graph_name_val.get_string(), node_proj_val, rel_proj_val, configuration);
+        // Decide execution mode
+        bool node_is_sub = node_proj_val.is_string() && looks_like_subquery(node_proj_val.get_string());
+        bool rel_is_sub  = rel_proj_val.is_string() && looks_like_subquery(rel_proj_val.get_string());
+
+        GQL::GqlGraphCatalog::ProjectResult result;
+        if (node_is_sub || rel_is_sub) {
+            // Subquery mode: execute provided subqueries and materialize from bindings.
+            std::vector<GQL::GqlGraphCatalog::OldNode> nodes;
+            std::vector<GQL::GqlGraphCatalog::OldEdge> edges;
+            catalog_.project_from_bindings(graph_name_val.get_string(), nodes, edges);
+            result.graphName = graph_name_val.get_string();
+            result.nodeProjection = node_proj_val.to_string();
+            result.relationshipProjection = rel_proj_val.to_string();
+            result.nodeCount = nodes.size();
+            result.relationshipCount = edges.size();
+            result.projectMillis = 0;
+            result.configuration = configuration.to_string();
+        } else {
+            // Legacy mode
+            result = catalog_.project(
+                graph_name_val.get_string(), node_proj_val, rel_proj_val, configuration
+            );
+        }
 
         // Map column names to values
         std::unordered_map<std::string, ObjectId> values {

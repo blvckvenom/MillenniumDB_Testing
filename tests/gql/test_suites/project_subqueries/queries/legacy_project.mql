@@ -1,0 +1,2 @@
+CALL gdsgraphproject("glegacy","*","*")
+YIELD graphName,nodeCount,relationshipCount;

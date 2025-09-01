@@ -25,6 +25,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <set>
+#include <unordered_set>
+#include <tuple>
 #include <algorithm>
 #include <thread>
 #include <chrono>
@@ -386,6 +388,47 @@ GqlGraphCatalog::DropResult GqlGraphCatalog::drop(const std::string& graphName,
         WARN("Failed to remove ", file_path.string(), ": ", e.what());
     }
     return result;
+}
+
+GqlGraphCatalog::StoredGraph& GqlGraphCatalog::project_from_bindings(
+    const std::string& graphName,
+    const std::vector<OldNode>& nodes,
+    const std::vector<OldEdge>& edges)
+{
+    StoredGraph graph;
+    graph.nodeProjection = "subquery";
+    graph.relationshipProjection = "subquery";
+    graph.configuration.clear();
+    auto now = std::chrono::system_clock::now();
+    graph.creationTime = now;
+    graph.modificationTime = now;
+
+    std::unordered_set<std::size_t> seen_nodes;
+    for (const auto& n : nodes) {
+        if (seen_nodes.insert(n.id).second) {
+            graph.originalToProjectedId[n.id] = graph.projectedNodes.size();
+            graph.projectedNodes.push_back(n.id);
+        }
+    }
+
+    std::set<std::tuple<std::size_t, std::size_t, std::string>> seen_edges;
+    for (const auto& e : edges) {
+        auto it_src = graph.originalToProjectedId.find(e.srcId);
+        auto it_dst = graph.originalToProjectedId.find(e.dstId);
+        if (it_src == graph.originalToProjectedId.end() || it_dst == graph.originalToProjectedId.end()) {
+            continue;
+        }
+        auto key = std::make_tuple(it_src->second, it_dst->second, e.type);
+        if (!seen_edges.insert(key).second) {
+            continue;
+        }
+        StoredGraph::Edge edge{it_src->second, it_dst->second, e.type};
+        graph.edges.push_back(edge);
+    }
+
+    graphs_[graphName] = graph;
+    save_graph_to_disk(graphName, graphs_[graphName]);
+    return graphs_[graphName];
 }
 
 void GqlGraphCatalog::save_graph_to_disk(const std::string& graphName, const StoredGraph& graph) const

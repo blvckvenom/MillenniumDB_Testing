@@ -73,7 +73,7 @@ private:
     void _begin(Binding& parent_binding) override;
     bool _next() override;
     void _reset() override;
-    
+
     /// Reference to the graph catalog
     GQL::GqlGraphCatalog& catalog_;
     
@@ -88,4 +88,9 @@ private:
     
     /// Parent binding for writing results
     Binding* parent_binding = nullptr;
+
+    /// Helper that checks if a string looks like a subquery by ignoring
+    /// leading whitespace/comments and verifying it starts with MATCH, WITH
+    /// or CALL. Defined in the .cc file.
+    static bool looks_like_subquery(std::string_view s);
 };

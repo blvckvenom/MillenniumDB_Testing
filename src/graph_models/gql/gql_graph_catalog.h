@@ -97,6 +97,33 @@ public:
         std::optional<GraphListEntry> droppedGraph;
     };
 
+    struct OldNode {
+        std::size_t id;
+        std::vector<std::string> labels;
+    };
+
+    struct OldEdge {
+        std::size_t srcId;
+        std::size_t dstId;
+        std::string type;
+    };
+
+    struct StoredGraph {
+        std::vector<std::size_t> projectedNodes;
+        std::unordered_map<std::size_t, std::size_t> originalToProjectedId;
+        struct Edge {
+            std::size_t source;
+            std::size_t target;
+            std::string type;
+        };
+        std::vector<Edge> edges;
+        std::string nodeProjection;
+        std::string relationshipProjection;
+        std::chrono::system_clock::time_point creationTime;
+        std::chrono::system_clock::time_point modificationTime;
+        std::string configuration;
+    };
+
     /// Construct a catalog. The catalogDirectory specifies where on disk
     /// projected graphs will be stored. If the directory does not exist it
     /// will be created. All existing graphs in the directory will be loaded
@@ -131,28 +158,13 @@ public:
                     const std::string& dbName = "",
                     const std::string& username = "");
 
-private:
-    /// Internal representation of a stored graph. Nodes are represented by
-    /// consecutive identifiers starting at zero. The original node identifiers
-    /// are mapped to these internal IDs by originalToProjectedId. Relationships
-    /// are stored as triples (source internal id, target internal id, type).
-    struct StoredGraph {
-        std::vector<std::size_t> projectedNodes;
-        std::unordered_map<std::size_t, std::size_t> originalToProjectedId;
-        struct Edge {
-            std::size_t source;
-            std::size_t target;
-            std::string type;
-        };
-        std::vector<Edge> edges;
-        // Metadata
-        std::string nodeProjection;
-        std::string relationshipProjection;
-        std::chrono::system_clock::time_point creationTime;
-        std::chrono::system_clock::time_point modificationTime;
-        std::string configuration;
-    };
+    StoredGraph& project_from_bindings(
+        const std::string& graphName,
+        const std::vector<OldNode>& nodes,
+        const std::vector<OldEdge>& edges
+    );
 
+private:
     /// Helper to persist a graph to disk as a JSON file under the catalog
     /// directory. The filename is derived from the graph name. Any existing
     /// file for this graph will be overwritten.
