@@ -24,17 +24,25 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+#include <tuple>
+#include <set>
+#include <unordered_set>
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_graph_catalog.h"
 #include "graph_models/gql/gql_value.h"
+#include "graph_models/gql/gql_object_id.h"
 #include "graph_models/object_id.h"
 #include "query/executor/binding.h"
+#include "query/optimizer/property_graph_model/binding_list_iter_constructor.h"
+#include "query/parser/gql_query_parser.h"
+#include "query/parser/op/gql/op_return.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_term.h"
 #include "query/parser/expr/gql/expr_var.h"
 #include "query/query_context.h"
+#include "misc/logger.h"
 #include "query/var_id.h"
 
 // Dual execution flow:
@@ -315,9 +323,123 @@ bool GdsGraphProject::_next()
 
         GQL::GqlGraphCatalog::ProjectResult result;
         if (node_is_sub || rel_is_sub) {
+            if (!(node_is_sub && rel_is_sub)) {
+                throw std::runtime_error(
+                    "nodeQuery y edgeQuery deben ser ambas subconsultas o ninguna"
+                );
+            }
+
             // Subquery mode: execute provided subqueries and materialize from bindings.
+            QueryContext* prev_ctx = &get_query_ctx();
+
+            // --- Execute node subquery ---
+            QueryContext node_ctx;
+            node_ctx.thread_info = prev_ctx->thread_info;
+            set_query_ctx(&node_ctx);
+
+            auto node_plan = GQL::QueryParser::get_query_plan(node_proj_val.get_string());
+            auto* node_return = dynamic_cast<GQL::OpReturn*>(node_plan.get());
+            if (node_return == nullptr || node_return->get_expr_vars().size() != 1) {
+                set_query_ctx(prev_ctx);
+                throw std::runtime_error("nodeQuery debe retornar la variable 'n' de tipo nodo");
+            }
+
+            bool found_n = false;
+            VarId n_var = node_ctx.get_var("n", &found_n);
+            if (!found_n || node_return->get_expr_vars()[0].id != n_var.id) {
+                set_query_ctx(prev_ctx);
+                throw std::runtime_error("nodeQuery debe retornar la variable 'n' de tipo nodo");
+            }
+
+            GQL::PathBindingIterConstructor node_constructor;
+            node_plan->accept_visitor(node_constructor);
+            std::unique_ptr<BindingIter> node_iter = std::move(node_constructor.tmp_iter);
+
+            Binding node_binding { node_ctx.get_var_size() };
+            node_iter->begin(node_binding);
+
+            std::unordered_set<std::size_t> node_set;
             std::vector<GQL::GqlGraphCatalog::OldNode> nodes;
+            std::size_t read_nodes = 0;
+            while (node_iter->next()) {
+                ++read_nodes;
+                ObjectId oid = node_binding[n_var];
+                if (GQL_OID::get_generic_type(oid) != GQL_OID::GenericType::NODE) {
+                    set_query_ctx(prev_ctx);
+                    throw std::runtime_error("nodeQuery debe retornar la variable 'n' de tipo nodo");
+                }
+                std::size_t id = oid.id & ObjectId::MASK_EXTERNAL_ID;
+                if (node_set.insert(id).second) {
+                    nodes.push_back({id, {}});
+                }
+            }
+            logger(Category::Info) << "read_nodes=" << read_nodes;
+
+            // --- Execute edge subquery ---
+            QueryContext edge_ctx;
+            edge_ctx.thread_info = prev_ctx->thread_info;
+            set_query_ctx(&edge_ctx);
+
+            auto edge_plan = GQL::QueryParser::get_query_plan(rel_proj_val.get_string());
+            auto* edge_return = dynamic_cast<GQL::OpReturn*>(edge_plan.get());
+            if (edge_return == nullptr || edge_return->get_expr_vars().size() != 3) {
+                set_query_ctx(prev_ctx);
+                throw std::runtime_error("edgeQuery debe retornar 'a'(nodo), 'r'(relación) y 'b'(nodo) con esos nombres");
+            }
+
+            bool found_a = false, found_r = false, found_b = false;
+            VarId a_var = edge_ctx.get_var("a", &found_a);
+            VarId r_var = edge_ctx.get_var("r", &found_r);
+            VarId b_var = edge_ctx.get_var("b", &found_b);
+
+            std::set<VarId> expected { a_var, r_var, b_var };
+            auto vars_edge = edge_return->get_expr_vars();
+            if (!found_a || !found_r || !found_b || std::set<VarId>(vars_edge.begin(), vars_edge.end()) != expected) {
+                set_query_ctx(prev_ctx);
+                throw std::runtime_error("edgeQuery debe retornar 'a'(nodo), 'r'(relación) y 'b'(nodo) con esos nombres");
+            }
+
+            GQL::PathBindingIterConstructor edge_constructor;
+            edge_plan->accept_visitor(edge_constructor);
+            std::unique_ptr<BindingIter> edge_iter = std::move(edge_constructor.tmp_iter);
+
+            Binding edge_binding { edge_ctx.get_var_size() };
+            edge_iter->begin(edge_binding);
+
             std::vector<GQL::GqlGraphCatalog::OldEdge> edges;
+            std::set<std::tuple<std::size_t,std::size_t,std::string>> edge_dedup;
+            std::size_t read_edges = 0;
+            while (edge_iter->next()) {
+                ++read_edges;
+                ObjectId a_oid = edge_binding[a_var];
+                ObjectId r_oid = edge_binding[r_var];
+                ObjectId b_oid = edge_binding[b_var];
+
+                if (GQL_OID::get_generic_type(a_oid) != GQL_OID::GenericType::NODE ||
+                    GQL_OID::get_generic_type(b_oid) != GQL_OID::GenericType::NODE ||
+                    GQL_OID::get_generic_type(r_oid) != GQL_OID::GenericType::EDGE) {
+                    set_query_ctx(prev_ctx);
+                    throw std::runtime_error("edgeQuery debe retornar 'a'(nodo), 'r'(relación) y 'b'(nodo) con esos nombres");
+                }
+
+                std::size_t src = a_oid.id & ObjectId::MASK_EXTERNAL_ID;
+                std::size_t dst = b_oid.id & ObjectId::MASK_EXTERNAL_ID;
+                if (node_set.count(src) == 0 || node_set.count(dst) == 0) {
+                    continue;
+                }
+                std::string type = GQL::Conversions::to_lexical_str(r_oid);
+                auto key = std::make_tuple(src, dst, type);
+                if (edge_dedup.insert(key).second) {
+                    edges.push_back({src, dst, type});
+                }
+            }
+            logger(Category::Info) << "read_edges=" << read_edges;
+            logger(Category::Info) << "edges_after_filter=" << edges.size();
+            logger(Category::Info) << "materialized_nodes=" << nodes.size();
+            logger(Category::Info) << "materialized_edges=" << edges.size();
+
+            set_query_ctx(prev_ctx);
+
             catalog_.project_from_bindings(graph_name_val.get_string(), nodes, edges);
             result.graphName = graph_name_val.get_string();
             result.nodeProjection = node_proj_val.to_string();
