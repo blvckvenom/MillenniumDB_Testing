@@ -26,6 +26,12 @@ class BindingExprCosineSimilarity;
 class BindingExprCosineDistance;
 class BindingExprManhattanDistance;
 class BindingExprEuclideanDistance;
+class BindingExprEditDistance;
+class BindingExprNormalize;
+class BindingExprStr;
+class BindingExprLabels;
+class BindingExprType;
+class BindingExprProperties;
 } // namespace MQL
 
 namespace SPARQL {
@@ -159,6 +165,7 @@ class BindingExprSearchedCase;
 class BindingExprCast;
 class BindingExprNodeLabels;
 class BindingExprEdgeLabels;
+class BindingExprProperties;
 } // namespace GQL
 
 class BindingExprVisitor {
@@ -187,6 +194,12 @@ public:
     virtual void visit(MQL::BindingExprCosineDistance&)    { throw LogicException("visit MQL::BindingExprCosineDistance not implemented"); }
     virtual void visit(MQL::BindingExprManhattanDistance&) { throw LogicException("visit MQL::BindingExprManhattanDistance not implemented"); }
     virtual void visit(MQL::BindingExprEuclideanDistance&) { throw LogicException("visit MQL::BindingExprEuclideanDistance not implemented"); }
+    virtual void visit(MQL::BindingExprEditDistance&)      { throw LogicException("visit MQL::BindingExprEditDistance not implemented"); }
+    virtual void visit(MQL::BindingExprNormalize&)         { throw LogicException("visit MQL::BindingExprNormalize not implemented"); }
+    virtual void visit(MQL::BindingExprStr&)               { throw LogicException("visit MQL::BindingExprStr not implemented"); }
+    virtual void visit(MQL::BindingExprLabels&)            { throw LogicException("visit MQL::BindingExprLabels not implemented"); }
+    virtual void visit(MQL::BindingExprType&)              { throw LogicException("visit MQL::BindingExprType not implemented"); }
+    virtual void visit(MQL::BindingExprProperties&)        { throw LogicException("visit MQL::BindingExprProperties not implemented"); }
 
     virtual void visit(SPARQL::BindingExprAbs&)            { throw LogicException("visit SPARQL::BindingExprAbs not implemented"); }
     virtual void visit(SPARQL::BindingExprAddition&)       { throw LogicException("visit SPARQL::BindingExprAddition not implemented"); }
@@ -316,4 +329,5 @@ public:
     virtual void visit(GQL::BindingExprCast&) { throw LogicException("visit GQL::BindingExprCast not implemented"); }
     virtual void visit(GQL::BindingExprNodeLabels&) { throw LogicException("visit GQL::BindingExprNodeLabels not implemented"); }
     virtual void visit(GQL::BindingExprEdgeLabels&) { throw LogicException("visit GQL::BindingExprEdgeLabels not implemented"); }
+    virtual void visit(GQL::BindingExprProperties&) { throw LogicException("visit GQL::BindingExprEdgeLabels not implemented"); }
 };

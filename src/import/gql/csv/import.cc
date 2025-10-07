@@ -3,11 +3,11 @@
 #include <iostream>
 
 #include "graph_models/inliner.h"
-#include "import/import_helper.h"
 #include "import/external_helper.h"
+#include "import/import_helper.h"
 #include "misc/fatal_error.h"
 #include "misc/unicode_escape.h"
-#include "storage/index/random_access_table/edge_table_mem_import.h"
+#include "storage/index/lists/list_encoder.h"
 
 using namespace Import::GQL::CSV;
 
@@ -33,11 +33,13 @@ OnDiskImport::OnDiskImport(
     state_transitions = new int[Token::TOTAL_TOKENS * State::TOTAL_STATES];
     create_automata();
     label_splitter = list_separator;
+    list_buffer = new char[StringManager::MAX_STRING_SIZE];
 }
 
 OnDiskImport::~OnDiskImport()
 {
     delete[] state_transitions;
+    delete[] list_buffer;
 }
 
 void OnDiskImport::start_import(
@@ -143,28 +145,6 @@ void OnDiskImport::start_import(
     directed_equal_edges.finish_appends();
     undirected_equal_edges.finish_appends();
 
-    // Directed Edges Table
-    {
-        EdgeTableMemImport<3> table_writer(db_folder + "/d_edges.table");
-
-        directed_edges.begin_tuple_iter();
-        while (directed_edges.has_next_tuple()) {
-            auto& tuple = directed_edges.next_tuple();
-            table_writer.insert_tuple(tuple);
-        }
-    }
-
-    // Undirected Edges Table
-    {
-        EdgeTableMemImport<3> table_writer(db_folder + "/u_edges.table");
-
-        undirected_edges.begin_tuple_iter();
-        while (undirected_edges.has_next_tuple()) {
-            auto& tuple = undirected_edges.next_tuple();
-            table_writer.insert_tuple(tuple);
-        }
-    }
-
     node_labels.start_indexing(buffer, buffer_size, { 0, 1 });
     edge_labels.start_indexing(buffer, buffer_size, { 0, 1 });
     node_properties.start_indexing(buffer, buffer_size, { 0, 1, 2 });
@@ -243,7 +223,8 @@ void OnDiskImport::start_import(
         size_t COL_N1 = 0, COL_N2 = 1, COL_EDGE = 2;
         NoStat<3> stat;
 
-        undirected_edges.create_bpt(db_folder + "/u_edge", { COL_N1, COL_N2, COL_EDGE }, stat);
+        undirected_edges.create_bpt(db_folder + "/n1_n2_edge", { COL_N1, COL_N2, COL_EDGE }, stat);
+        undirected_edges.create_bpt(db_folder + "/edge_n1_n2", { COL_EDGE, COL_N1, COL_N2 }, stat);
     }
 
     // Directed edges
@@ -253,6 +234,7 @@ void OnDiskImport::start_import(
 
         directed_edges.create_bpt(db_folder + "/from_to_edge", { COL_FROM, COL_TO, COL_EDGE }, no_stat);
         directed_edges.create_bpt(db_folder + "/to_from_edge", { COL_TO, COL_FROM, COL_EDGE }, no_stat);
+        directed_edges.create_bpt(db_folder + "/edge_from_to", { COL_EDGE, COL_FROM, COL_TO }, no_stat);
     }
 
     // Undirected equal edges
@@ -280,6 +262,16 @@ void OnDiskImport::start_import(
 
     catalog.print(std::cout);
     print_duration("Total import time", start);
+}
+
+uint64_t OnDiskImport::get_str_id(char* str, uint64_t str_size)
+{
+    if (str_size < 8) {
+        return Inliner::inline_string(str) | ObjectId::MASK_STRING_SIMPLE_INLINED;
+    } else {
+        return external_helper->get_or_create_external_string_id(str, str_size)
+             | ObjectId::MASK_STRING_SIMPLE;
+    }
 }
 
 void OnDiskImport::try_save_node_property(uint64_t node_id, uint64_t key_id, uint64_t value_id)
@@ -489,6 +481,8 @@ void OnDiskImport::save_header_column()
             new_column_type = CSVType::DATE;
         else if (split_new_col[1] == "DATETIME")
             new_column_type = CSVType::DATETIME;
+        else if (split_new_col[1] == "LIST")
+            new_column_type = CSVType::LIST;
 
         else
             new_column_type = CSVType::UNDEFINED;
@@ -679,11 +673,7 @@ void OnDiskImport::process_node_line()
         case CSVType::STR: {
             uint64_t value_id;
             normalize_string_literal(col);
-            if (col.value_size < 8)
-                value_id = Inliner::inline_string(col.value_str) | ObjectId::MASK_STRING_SIMPLE_INLINED;
-            else
-                value_id = external_helper->get_or_create_external_string_id(col.value_str, col.value_size)
-                         | ObjectId::MASK_STRING_SIMPLE;
+            value_id = get_str_id(col.value_str, col.value_size);
 
             uint64_t key_id = get_node_key_id(col.name);
             if ((value_id & ObjectId::MOD_MASK) == ObjectId::MOD_TMP) {
@@ -727,6 +717,30 @@ void OnDiskImport::process_node_line()
             }
             uint64_t key_id = get_node_key_id(col.name);
             node_properties.push_back({ node_id, key_id, value_id });
+            break;
+        }
+        case CSVType::LIST: {
+            std::vector<std::string> str_list = split(col.value_str, list_splitter);
+            std::vector<ObjectId> oid_list;
+
+            for (auto& elem : str_list) {
+                if (elem.size() == 0) {
+                    continue;
+                }
+                uint64_t value_id = get_str_id(elem.data(), elem.size());
+                oid_list.push_back(ObjectId(value_id));
+            }
+
+            uint64_t encoded_size = ListEncoder::encode(oid_list, list_buffer);
+            uint64_t list_id = external_helper->get_or_create_external_string_id(list_buffer, encoded_size)
+                             | ObjectId::MASK_LIST;
+
+            uint64_t key_id = get_node_key_id(col.name);
+            if ((list_id & ObjectId::MOD_MASK) == ObjectId::MOD_TMP) {
+                pending_node_properties->push_back({ node_id, key_id, list_id });
+            } else {
+                node_properties.push_back({ node_id, key_id, list_id });
+            }
             break;
         }
 
@@ -876,11 +890,7 @@ void OnDiskImport::save_edge_line()
         case CSVType::STR: {
             uint64_t value_id;
             normalize_string_literal(col);
-            if (col.value_size < 8)
-                value_id = Inliner::inline_string(col.value_str) | ObjectId::MASK_STRING_SIMPLE_INLINED;
-            else
-                value_id = external_helper->get_or_create_external_string_id(col.value_str, col.value_size)
-                         | ObjectId::MASK_STRING_SIMPLE;
+            value_id = get_str_id(col.value_str, col.value_size);
 
             uint64_t key_id = get_edge_key_id(col.name);
             if ((value_id & ObjectId::MOD_MASK) == ObjectId::MOD_TMP) {
@@ -924,6 +934,30 @@ void OnDiskImport::save_edge_line()
             }
             uint64_t key_id = get_edge_key_id(col.name);
             edge_properties.push_back({ edge_id, key_id, value_id });
+            break;
+        }
+        case CSVType::LIST: {
+            std::vector<std::string> str_list = split(col.value_str, list_splitter);
+            std::vector<ObjectId> oid_list;
+
+            for (auto& elem : str_list) {
+                if (elem.size() == 0) {
+                    continue;
+                }
+                uint64_t value_id = get_str_id(elem.data(), elem.size());
+                oid_list.push_back(ObjectId(value_id));
+            }
+
+            uint64_t encoded_size = ListEncoder::encode(oid_list, list_buffer);
+            uint64_t list_id = external_helper->get_or_create_external_string_id(list_buffer, encoded_size)
+                             | ObjectId::MASK_LIST;
+
+            uint64_t key_id = get_edge_key_id(col.name);
+            if ((list_id & ObjectId::MOD_MASK) == ObjectId::MOD_TMP) {
+                pending_edge_properties->push_back({ edge_id, key_id, list_id });
+            } else {
+                edge_properties.push_back({ edge_id, key_id, list_id });
+            }
             break;
         }
 

@@ -8,6 +8,7 @@
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
 #include "graph_models/inliner.h"
+#include "storage/index/lists/list_encoder.h"
 #include "system/path_manager.h"
 #include "system/string_manager.h"
 #include "system/tmp_manager.h"
@@ -201,7 +202,8 @@ std::string Conversions::to_lexical_str(ObjectId oid)
     case GQL_OID::Type::EDGE_LABEL:
     case GQL_OID::Type::NODE_KEY:
     case GQL_OID::Type::EDGE_KEY:
-    case GQL_OID::Type::LIST: {
+    case GQL_OID::Type::LIST:
+    case GQL_OID::Type::DICTIONARY: {
         return "";
     }
     }
@@ -271,15 +273,35 @@ ObjectId Conversions::pack_list(const std::vector<ObjectId>& list)
     TmpLists& tmp_list = tmp_manager.get_tmp_list();
     uint32_t file_id = tmp_list.get_file_id();
     uint64_t list_offset = tmp_list.insert(list);
-    return ObjectId(ObjectId::MASK_LIST | (uint64_t(file_id) << 40) | list_offset);
+    return ObjectId(ObjectId::MASK_LIST_TMP | (uint64_t(file_id) << 40) | list_offset);
 }
 
 void Conversions::unpack_list(ObjectId list_id, std::vector<ObjectId>& out)
 {
-    auto& lists = tmp_manager.get_tmp_list();
-    assert((LIST_FILE_ID_MASK & list_id.id) >> 40 == lists.get_file_id());
+    switch (list_id.get_type()) {
+    case ObjectId::MASK_LIST:
+    case ObjectId::MASK_LIST_TMP: {
+        auto& lists = tmp_manager.get_tmp_list();
+        assert((LIST_FILE_ID_MASK & list_id.id) >> 40 == lists.get_file_id());
+        lists.get(out, list_id.id & LIST_OFFSET_MASK);
+        break;
+    }
+    case ObjectId::MASK_LIST_EXTERN: {
+        char* buffer = get_query_ctx().get_buffer1();
 
-    lists.get(out, list_id.id & LIST_OFFSET_MASK);
+        auto external_id = list_id.get_value();
+        string_manager.print_to_buffer(buffer, external_id);
+        out = ListEncoder::decode(buffer);
+        break;
+    }
+    }
+}
+
+std::vector<ObjectId> Conversions::unpack_list(ObjectId list_id)
+{
+    std::vector<ObjectId> list;
+    unpack_list(list_id, list);
+    return list;
 }
 
 ObjectId Conversions::pack_path(const std::vector<ObjectId>& oid_list)
@@ -290,6 +312,7 @@ ObjectId Conversions::pack_path(const std::vector<ObjectId>& oid_list)
 
 void Conversions::unpack_path(ObjectId oid, std::vector<ObjectId>& out)
 {
+    oid = ObjectId((oid.id & ~ObjectId::TYPE_MASK) | ObjectId::MASK_LIST_TMP);
     unpack_list(oid, out);
 }
 
@@ -327,8 +350,7 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
         break;
     }
     case GQL_OID::Type::LIST: {
-        std::vector<ObjectId> out;
-        Conversions::unpack_list(oid, out);
+        std::vector<ObjectId> out = Conversions::unpack_list(oid);
         os << "[";
         for (auto it = out.begin(); it != out.end(); ++it) {
             if (it != out.begin()) {
@@ -337,6 +359,12 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
             debug_print(os, *it);
         }
         os << "]";
+        break;
+    }
+    case GQL_OID::Type::DICTIONARY: {
+        std::unique_ptr<Dictionary> dict;
+        Common::Conversions::unpack_dictionary(oid, dict);
+        dict->to_string(os);
         break;
     }
     case GQL_OID::Type::STRING_SIMPLE_INLINE:

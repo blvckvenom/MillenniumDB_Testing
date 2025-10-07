@@ -17,6 +17,7 @@ namespace GQL_OID {
         LABEL,
         KEY,
         LIST,
+        DICTIONARY,
         // GEOMETRY, ?
     };
 
@@ -36,6 +37,7 @@ namespace GQL_OID {
         LABEL,
         KEY,
         LIST,
+        DICTIONARY,
         // POINT, ?
     };
 
@@ -68,6 +70,7 @@ namespace GQL_OID {
         NODE_KEY,
         EDGE_KEY,
         LIST,
+        DICTIONARY,
         // POINT, ?
     };
 
@@ -93,6 +96,8 @@ namespace GQL_OID {
         case (ObjectId::MASK_EDGE_KEY >> 56):
             return Type::EDGE_KEY;
         case (ObjectId::MASK_LIST >> 56):
+        case (ObjectId::MASK_LIST_EXTERN >> 56):
+        case (ObjectId::MASK_LIST_TMP >> 56):
             return Type::LIST;
 
         case (ObjectId::MASK_STRING_SIMPLE_INLINED >> 56):
@@ -124,6 +129,10 @@ namespace GQL_OID {
 
         case (ObjectId::MASK_GQL_PATH >> 56):
             return Type::PATH;
+        case (ObjectId::MASK_DICTIONARY >> 56):
+        case (ObjectId::MASK_DICTIONARY_EXTERN >> 56):
+        case (ObjectId::MASK_DICTIONARY_TMP >> 56):
+            return Type::DICTIONARY;
 
         case (ObjectId::MASK_DT_DATE >> 56):
             return Type::DATE;
@@ -187,7 +196,9 @@ namespace GQL_OID {
                 return GenericSubType::DATE;
             case Type::PATH:
                 return GenericSubType::PATH;
-        }
+            case Type::DICTIONARY:
+                return GenericSubType::DICTIONARY;
+            }
         assert(false);
         return GenericSubType::NULL_ID;
     }
@@ -235,6 +246,8 @@ namespace GQL_OID {
                 return GenericType::DATE;
             case Type::PATH:
                 return GenericType::PATH;
+            case Type::DICTIONARY:
+                return GenericType::DICTIONARY;
             default:
                 assert(false);
                 return GenericType::NULL_ID;

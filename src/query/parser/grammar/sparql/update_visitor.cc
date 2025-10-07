@@ -6,6 +6,8 @@
 #include "misc/transliterator.h"
 #include "misc/unicode_escape.h"
 #include "query/parser/op/sparql/ops.h"
+#include "query/update/sparql/hnsw_index_options.h"
+#include "query/update/sparql/text_index_options.h"
 #include "storage/index/hnsw/hnsw_metric.h"
 
 using namespace SPARQL;
@@ -51,14 +53,27 @@ std::string UpdateVisitor::iriCtxToString(SUP::IriContext* ctx)
 std::string UpdateVisitor::stringCtxToString(SUP::StringContext* ctx)
 {
     std::string str = ctx->getText();
+
     if (ctx->STRING_LITERAL1() || ctx->STRING_LITERAL2()) {
         // One quote per side
         str = str.substr(1, str.size() - 2);
-    } else {
+        return UnicodeEscape::normalize_string(str);
+    }
+
+    if (ctx->STRING_LITERAL_LONG1() || ctx->STRING_LITERAL_LONG2()) {
         // Three quotes per side
         str = str.substr(3, str.size() - 6);
+        return UnicodeEscape::normalize_string(str);
     }
-    return UnicodeEscape::normalize_string(str);
+
+    if (ctx->STRING_RAW1() || ctx->STRING_RAW2()) {
+        // Raw character + one quote per side
+        return str.substr(2, str.size() - 3);
+    }
+
+    // if (ctx->STRING_RAW_LONG1() || ctx->STRING_RAW_LONG2())
+    // Raw character + three quote per side
+    return str.substr(4, str.size() - 7);
 }
 
 ObjectId UpdateVisitor::handleIntegerString(const std::string& str, const std::string& iri)
