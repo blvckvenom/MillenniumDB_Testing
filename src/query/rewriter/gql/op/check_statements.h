@@ -27,5 +27,7 @@ public:
     void visit(OpLinearPattern&) override;
     void visit(OpUnitTable&) override;
     void visit(OpEmpty&) override;
+    void visit(OpCall&) override;
+    void visit(OpProject&) override;
 };
 } // namespace GQL

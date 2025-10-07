@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "query/exceptions.h"
 #include "query/executor/query_executor/gql/return_executor.h"
 #include "query/executor/query_executor/query_executor.h"
 #include "query/parser/op/gql/op_visitor.h"
@@ -34,6 +35,8 @@ public:
     void visit(OpQueryStatements&) override { }
     void visit(OpGroupBy&) override { }
     void visit(OpUnitTable&) override { }
+    void visit(OpCall&) override;
+    void visit(OpProject&) override { throw NotSupportedException("PROJECT"); }
 
 private:
     ReturnType return_type;

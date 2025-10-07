@@ -26,6 +26,8 @@ public:
     void visit(OpPathUnion& op) override;
     void visit(OpLet& op) override;
     void visit(OpGroupBy& op) override;
+    void visit(OpCall&) override;
+    void visit(OpProject&) override;
     void visit(OpUnitTable&) override;
     void visit(OpEmpty&) override;
 

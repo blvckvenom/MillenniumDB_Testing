@@ -31,6 +31,8 @@ public:
     void visit(OpPathUnion&) override;
     void visit(OpNode&) override;
     void visit(OpEdge&) override;
+    void visit(OpCall&) override;
+    void visit(OpProject&) override;
     void visit(OpUnitTable&) override;
     void visit(OpEmpty&) override;
 };

@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "query/exceptions.h"
 #include "query/parser/op//gql/op_visitor.h"
 
 class StreamingQueryExecutor;
@@ -30,5 +31,7 @@ public:
     void visit(OpGroupBy&) override { }
     void visit(OpUnitTable&) override { }
     void visit(OpEmpty&) override { }
+    void visit(OpCall&) override;
+    void visit(OpProject&) override { throw NotSupportedException("PROJECT"); }
 };
 } // namespace GQL

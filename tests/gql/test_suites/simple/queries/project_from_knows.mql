@@ -1,0 +1,8 @@
+PROJECT g AS {
+  MATCH (p:Person)-[k:Knows]->(q:Person)
+  RETURN p AS src, k AS e, q AS dst
+}
+FROM g
+MATCH (a)-[edge]->(b)
+RETURN a, edge, b
+ORDER BY a, edge, b;

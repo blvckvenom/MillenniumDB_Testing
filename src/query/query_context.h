@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <memory>
 #include <ostream>
 #include <random>
 #include <set>
@@ -15,6 +16,7 @@
 #include "graph_models/object_id.h"
 #include "query/id.h"
 #include "query/var_id.h"
+#include "query/virtual_graph.h"
 #include "system/buffer_manager.h"
 #include "system/string_manager.h"
 #include "system/tmp_manager.h"
@@ -76,6 +78,8 @@ private:
 
     std::map<VarId, ObjectId> edge_directions;
 
+    std::map<VarId, std::shared_ptr<VirtualGraph>> virtual_graphs;
+
 public:
     QueryContext()
     {
@@ -116,6 +120,8 @@ public:
         cancellation_token = get_uuid();
 
         tmp_manager.reset(thread_info.worker_index);
+
+        virtual_graphs.clear();
     }
 
     std::string get_uuid() {
@@ -196,6 +202,24 @@ public:
 
     void debug_print(std::ostream& os, ObjectId oid) {
         _debug_print(os, oid);
+    }
+
+    void register_virtual_graph(VarId alias, std::shared_ptr<VirtualGraph> graph)
+    {
+        if (!graph) {
+            virtual_graphs.erase(alias);
+        } else {
+            virtual_graphs[alias] = std::move(graph);
+        }
+    }
+
+    std::shared_ptr<VirtualGraph> get_virtual_graph(VarId alias) const
+    {
+        auto it = virtual_graphs.find(alias);
+        if (it == virtual_graphs.end()) {
+            return nullptr;
+        }
+        return it->second;
     }
 
     void debug_print(std::ostream& os, Id id) {

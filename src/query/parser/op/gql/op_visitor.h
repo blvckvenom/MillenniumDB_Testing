@@ -12,6 +12,8 @@ class OpPathUnion;
 class OpRepetition;
 class OpLinearPattern;
 class OpFilter;
+class OpCall;
+class OpProject;
 class OpLet;
 class OpOrderBy;
 class OpQueryStatements;
@@ -34,6 +36,8 @@ public:
     virtual void visit(OpRepetition&) = 0;
     virtual void visit(OpLinearPattern&) = 0;
     virtual void visit(OpFilter&) = 0;
+    virtual void visit(OpCall&) = 0;
+    virtual void visit(OpProject&) = 0;
     virtual void visit(OpLet&) = 0;
     virtual void visit(OpOrderBy&) = 0;
     virtual void visit(OpQueryStatements&) = 0;

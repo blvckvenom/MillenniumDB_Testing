@@ -1,5 +1,5 @@
 
-// Generated from GQLParser.g4 by ANTLR 4.13.1
+// Generated from GQLParser.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -615,6 +615,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitProjectQueryStatement(GQLParser::ProjectQueryStatementContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitFilterStatement(GQLParser::FilterStatementContext *ctx) override {
     return visitChildren(ctx);
   }
@@ -715,23 +719,23 @@ public:
     return visitChildren(ctx);
   }
 
-  virtual std::any visitProcedureCall(GQLParser::ProcedureCallContext *ctx) override {
+  virtual std::any visitProjectStatement(GQLParser::ProjectStatementContext *ctx) override {
     return visitChildren(ctx);
   }
 
-  virtual std::any visitInlineProcedureCall(GQLParser::InlineProcedureCallContext *ctx) override {
+  virtual std::any visitProjectSubquery(GQLParser::ProjectSubqueryContext *ctx) override {
     return visitChildren(ctx);
   }
 
-  virtual std::any visitVariableScopeClause(GQLParser::VariableScopeClauseContext *ctx) override {
+  virtual std::any visitCallSubquery(GQLParser::CallSubqueryContext *ctx) override {
     return visitChildren(ctx);
   }
 
-  virtual std::any visitBindingVariableReferenceList(GQLParser::BindingVariableReferenceListContext *ctx) override {
+  virtual std::any visitCallYieldClause(GQLParser::CallYieldClauseContext *ctx) override {
     return visitChildren(ctx);
   }
 
-  virtual std::any visitNamedProcedureCall(GQLParser::NamedProcedureCallContext *ctx) override {
+  virtual std::any visitCallYieldItem(GQLParser::CallYieldItemContext *ctx) override {
     return visitChildren(ctx);
   }
 

@@ -87,3 +87,15 @@ void CheckUnboundedRepetition::visit(OpEdge&) { }
 void CheckUnboundedRepetition::visit(OpUnitTable&) { }
 
 void CheckUnboundedRepetition::visit(OpEmpty&) { }
+
+void CheckUnboundedRepetition::visit(OpCall& op_call)
+{
+    op_call.subquery->accept_visitor(*this);
+}
+
+void CheckUnboundedRepetition::visit(OpProject& op_project)
+{
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+}

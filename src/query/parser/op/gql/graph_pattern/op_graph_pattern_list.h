@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "query/parser/op/gql/op.h"
 
 namespace GQL {
@@ -7,9 +9,14 @@ namespace GQL {
 class OpGraphPatternList : public Op {
 public:
     std::vector<std::unique_ptr<Op>> patterns;
+    std::optional<VarId> graph_alias;
 
-    OpGraphPatternList(std::vector<std::unique_ptr<Op>>&& patterns) :
-        patterns(std::move(patterns))
+    OpGraphPatternList(
+        std::vector<std::unique_ptr<Op>>&& patterns,
+        std::optional<VarId> alias = std::nullopt
+    ) :
+        patterns(std::move(patterns)),
+        graph_alias(alias)
     { }
 
     std::unique_ptr<Op> clone() const override
@@ -19,7 +26,8 @@ public:
         for (auto& pattern : patterns) {
             patterns_clone.push_back(pattern->clone());
         }
-        return std::make_unique<OpGraphPatternList>(std::move(patterns_clone));
+        auto result = std::make_unique<OpGraphPatternList>(std::move(patterns_clone), graph_alias);
+        return result;
     }
 
     void accept_visitor(OpVisitor& visitor) override
@@ -59,7 +67,11 @@ public:
     std::ostream& print_to_ostream(std::ostream& os, int indent = 0) const override
     {
         os << std::string(indent, ' ');
-        os << "OpGraphPatternList(\n";
+        os << "OpGraphPatternList(";
+        if (graph_alias.has_value()) {
+            os << "alias=" << *graph_alias << ", ";
+        }
+        os << "\n";
         for (auto& pattern : patterns) {
             pattern->print_to_ostream(os, indent + 2);
         }

@@ -1,5 +1,5 @@
 
-// Generated from GQLParser.g4 by ANTLR 4.13.1
+// Generated from GQLParser.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -319,6 +319,8 @@ public:
 
     virtual std::any visitCallQueryStatement(GQLParser::CallQueryStatementContext *context) = 0;
 
+    virtual std::any visitProjectQueryStatement(GQLParser::ProjectQueryStatementContext *context) = 0;
+
     virtual std::any visitFilterStatement(GQLParser::FilterStatementContext *context) = 0;
 
     virtual std::any visitLetStatement(GQLParser::LetStatementContext *context) = 0;
@@ -369,15 +371,15 @@ public:
 
     virtual std::any visitCallProcedureStatement(GQLParser::CallProcedureStatementContext *context) = 0;
 
-    virtual std::any visitProcedureCall(GQLParser::ProcedureCallContext *context) = 0;
+    virtual std::any visitProjectStatement(GQLParser::ProjectStatementContext *context) = 0;
 
-    virtual std::any visitInlineProcedureCall(GQLParser::InlineProcedureCallContext *context) = 0;
+    virtual std::any visitProjectSubquery(GQLParser::ProjectSubqueryContext *context) = 0;
 
-    virtual std::any visitVariableScopeClause(GQLParser::VariableScopeClauseContext *context) = 0;
+    virtual std::any visitCallSubquery(GQLParser::CallSubqueryContext *context) = 0;
 
-    virtual std::any visitBindingVariableReferenceList(GQLParser::BindingVariableReferenceListContext *context) = 0;
+    virtual std::any visitCallYieldClause(GQLParser::CallYieldClauseContext *context) = 0;
 
-    virtual std::any visitNamedProcedureCall(GQLParser::NamedProcedureCallContext *context) = 0;
+    virtual std::any visitCallYieldItem(GQLParser::CallYieldItemContext *context) = 0;
 
     virtual std::any visitProcedureArgumentList(GQLParser::ProcedureArgumentListContext *context) = 0;
 

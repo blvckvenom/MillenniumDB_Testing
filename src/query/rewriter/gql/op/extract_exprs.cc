@@ -47,7 +47,7 @@ void ExtractExprs::visit(OpGraphPatternList& op_graph_pattern_list)
         pattern->accept_visitor(*this);
         new_patterns.push_back(std::move(tmp));
     }
-    tmp = std::make_unique<OpGraphPatternList>(std::move(new_patterns));
+    tmp = std::make_unique<OpGraphPatternList>(std::move(new_patterns), op_graph_pattern_list.graph_alias);
 }
 
 void ExtractExprs::visit(OpGraphPattern& op_graph_pattern)
@@ -130,6 +130,32 @@ void ExtractExprs::visit(OpNode& op)
 void ExtractExprs::visit(OpEdge& op)
 {
     tmp = std::make_unique<OpEdge>(op);
+}
+
+void ExtractExprs::visit(OpCall& op_call)
+{
+    op_call.subquery->accept_visitor(*this);
+    auto new_call = std::make_unique<OpCall>(
+        std::move(tmp),
+        op_call.yield_items,
+        op_call.has_explicit_yield
+    );
+    new_call->yield_types = op_call.yield_types;
+    tmp = std::move(new_call);
+}
+
+void ExtractExprs::visit(OpProject& op_project)
+{
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+    auto new_project = std::make_unique<OpProject>(
+        op_project.alias,
+        std::move(tmp)
+    );
+    new_project->projected_items = op_project.projected_items;
+    new_project->projected_types = op_project.projected_types;
+    tmp = std::move(new_project);
 }
 
 void ExtractExprs::visit(OpLet& op_let)

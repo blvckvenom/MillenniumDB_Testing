@@ -139,3 +139,31 @@ void RewriteRuleVisitor::visit(OpPathUnion& op)
         pattern->accept_visitor(*this);
     }
 }
+
+void RewriteRuleVisitor::visit(OpCall& op_call)
+{
+    for (auto& rule : rules) {
+        if (rule->is_possible_to_regroup(op_call.subquery)) {
+            op_call.subquery = rule->regroup(std::move(op_call.subquery));
+            has_rewritten = true;
+        }
+    }
+
+    if (op_call.subquery != nullptr) {
+        op_call.subquery->accept_visitor(*this);
+    }
+}
+
+void RewriteRuleVisitor::visit(OpProject& op_project)
+{
+    for (auto& rule : rules) {
+        if (rule->is_possible_to_regroup(op_project.subquery)) {
+            op_project.subquery = rule->regroup(std::move(op_project.subquery));
+            has_rewritten = true;
+        }
+    }
+
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+}

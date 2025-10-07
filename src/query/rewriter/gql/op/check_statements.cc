@@ -48,3 +48,27 @@ void CheckStatements::visit(OpRepetition&) { }
 void CheckStatements::visit(OpLinearPattern&) { }
 void CheckStatements::visit(OpUnitTable&) { }
 void CheckStatements::visit(OpEmpty&) { }
+
+void CheckStatements::visit(OpCall& op_call)
+{
+    bool previous_has_match_or_let = has_match_or_let;
+    has_match_or_let = false;
+    op_call.subquery->accept_visitor(*this);
+    has_match_or_let = true;
+    if (previous_has_match_or_let) {
+        has_match_or_let = true;
+    }
+}
+
+void CheckStatements::visit(OpProject& op_project)
+{
+    bool previous_has_match_or_let = has_match_or_let;
+    has_match_or_let = false;
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+    has_match_or_let = true;
+    if (previous_has_match_or_let) {
+        has_match_or_let = true;
+    }
+}

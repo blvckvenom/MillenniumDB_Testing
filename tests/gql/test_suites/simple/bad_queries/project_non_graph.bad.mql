@@ -1,0 +1,5 @@
+PROJECT g AS {
+  MATCH (n)
+  RETURN 1 AS value
+}
+RETURN 1;

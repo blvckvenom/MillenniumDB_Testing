@@ -8,6 +8,7 @@
 #include "query/parser/op/gql/op.h"
 #include "query/rewriter/gql/op/add_linear_patterns.h"
 #include "query/rewriter/gql/op/add_starting_enum.h"
+#include "query/rewriter/gql/op/bind_call.h"
 #include "query/rewriter/gql/op/check_statements.h"
 #include "query/rewriter/gql/op/check_unbounded_repetition.h"
 #include "query/rewriter/gql/op/check_var_existence.h"
@@ -63,6 +64,9 @@ public:
 
     static std::unique_ptr<Op> rewrite(std::unique_ptr<Op> op)
     {
+        BindCall bind_call;
+        op->accept_visitor(bind_call);
+
         CheckVarExistence var_visitor;
         op->accept_visitor(var_visitor);
 

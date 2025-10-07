@@ -682,6 +682,7 @@ primitiveQueryStatement
    | filterStatement
    | orderByAndPageStatement
    | callQueryStatement
+   | projectQueryStatement
    ;
 
 matchStatement
@@ -690,7 +691,7 @@ matchStatement
    ;
 
 simpleMatchStatement
-   : MATCH graphPattern graphPatternYieldClause?
+   : (FROM alias=identifier)? MATCH graphPattern graphPatternYieldClause?
    ;
 
 optionalMatchStatement
@@ -709,6 +710,10 @@ matchStatementBlock
 
 callQueryStatement
    : callProcedureStatement
+   ;
+
+projectQueryStatement
+   : projectStatement
    ;
 
 filterStatement
@@ -814,28 +819,27 @@ selectQuerySpecification
    ;
 
 callProcedureStatement
-   : OPTIONAL? CALL procedureCall
+   : CALL LEFT_BRACE callSubquery RIGHT_BRACE callYieldClause?
    ;
 
-procedureCall
-   : inlineProcedureCall
-   | namedProcedureCall
+projectStatement
+   : PROJECT identifier AS (LEFT_BRACE projectSubquery RIGHT_BRACE | projectSubquery)
    ;
 
-inlineProcedureCall
-   : variableScopeClause? nestedProcedureSpecification
+projectSubquery
+   : linearDataModifyingStatementBody
    ;
 
-variableScopeClause
-   : LEFT_PAREN bindingVariableReferenceList? RIGHT_PAREN
+callSubquery
+   : linearDataModifyingStatementBody
    ;
 
-bindingVariableReferenceList
-   : bindingVariableReference (COMMA bindingVariableReference)*
+callYieldClause
+   : YIELD callYieldItem (COMMA callYieldItem)*
    ;
 
-namedProcedureCall
-   : procedureReference LEFT_PAREN procedureArgumentList? RIGHT_PAREN yieldClause?
+callYieldItem
+   : identifier
    ;
 
 procedureArgumentList

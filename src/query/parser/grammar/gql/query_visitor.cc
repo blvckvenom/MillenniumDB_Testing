@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <list>
 #include <memory>
+#include <string>
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
@@ -83,6 +84,10 @@ std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQuerySta
     } else if (ctx->filterStatement()) {
         ctx->filterStatement()->accept(this);
         current_op = std::make_unique<OpFilter>(std::move(filter_items));
+    } else if (ctx->callQueryStatement()) {
+        ctx->callQueryStatement()->accept(this);
+    } else if (ctx->projectQueryStatement()) {
+        ctx->projectQueryStatement()->accept(this);
     }
     return 0;
 }
@@ -91,6 +96,18 @@ std::any QueryVisitor::visitMatchStatement(GQLParser::MatchStatementContext* ctx
 {
     LOG_VISITOR
     visitChildren(ctx);
+    return 0;
+}
+
+std::any QueryVisitor::visitSimpleMatchStatement(GQLParser::SimpleMatchStatementContext* ctx)
+{
+    LOG_VISITOR
+    auto previous_alias = current_graph_alias;
+    if (ctx->identifier()) {
+        current_graph_alias = get_query_ctx().get_or_create_var(ctx->identifier()->getText());
+    }
+    visitChildren(ctx);
+    current_graph_alias = previous_alias;
     return 0;
 }
 
@@ -138,7 +155,7 @@ std::any QueryVisitor::visitPathPatternList(GQLParser::PathPatternListContext* c
     }
 
     // We create this OP, even if the size of the vector is 1. This OP means that there is a match statement.
-    current_op = std::make_unique<OpGraphPatternList>(std::move(basic_graph_patterns));
+    current_op = std::make_unique<OpGraphPatternList>(std::move(basic_graph_patterns), current_graph_alias);
     return 0;
 }
 
@@ -2095,9 +2112,73 @@ std::any QueryVisitor::visitBindingVariableDefinitionBlock(GQLParser::BindingVar
     throw NotSupportedException("Variable definition block");
 }
 
-std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext*)
+std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx)
 {
-    throw NotSupportedException("Call");
+    LOG_VISITOR
+
+    auto call_ctx = ctx->callProcedureStatement();
+
+    QueryVisitor subquery_visitor;
+    try {
+        call_ctx->callSubquery()->accept(&subquery_visitor);
+    } catch (const NotSupportedException& e) {
+        std::string message(e.what());
+        if (message.find("`Update`") != std::string::npos || message.find("`Create/Drop`") != std::string::npos) {
+            throw QuerySemanticException("CALL block contains write statements");
+        }
+        throw;
+    }
+
+    std::vector<VarId> yield_vars;
+    bool has_explicit_yield = false;
+    if (auto* yield_clause = call_ctx->callYieldClause()) {
+        has_explicit_yield = true;
+        for (auto* yield_item : yield_clause->callYieldItem()) {
+            std::string var_name = yield_item->identifier()->getText();
+            yield_vars.push_back(get_query_ctx().get_or_create_var(var_name));
+        }
+    }
+
+    current_op = std::make_unique<OpCall>(
+        std::move(subquery_visitor.current_op),
+        std::move(yield_vars),
+        has_explicit_yield
+    );
+
+    return 0;
+}
+
+std::any QueryVisitor::visitProjectQueryStatement(GQLParser::ProjectQueryStatementContext* ctx)
+{
+    LOG_VISITOR
+
+    ctx->projectStatement()->accept(this);
+    return 0;
+}
+
+std::any QueryVisitor::visitProjectStatement(GQLParser::ProjectStatementContext* ctx)
+{
+    LOG_VISITOR
+
+    QueryVisitor subquery_visitor;
+    try {
+        ctx->projectSubquery()->accept(&subquery_visitor);
+    } catch (const NotSupportedException& e) {
+        std::string message(e.what());
+        if (message.find("`Update`") != std::string::npos || message.find("`Create/Drop`") != std::string::npos) {
+            throw QuerySemanticException("PROJECT block contains write statements");
+        }
+        throw;
+    }
+
+    VarId alias = get_query_ctx().get_or_create_var(ctx->identifier()->getText());
+
+    current_op = std::make_unique<OpProject>(
+        alias,
+        std::move(subquery_visitor.current_op)
+    );
+
+    return 0;
 }
 
 std::any QueryVisitor::visitForStatement(GQLParser::ForStatementContext*)

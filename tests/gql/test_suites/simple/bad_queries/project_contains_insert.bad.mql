@@ -1,0 +1,5 @@
+PROJECT g AS {
+  INSERT (n)
+  RETURN n
+}
+RETURN 1;

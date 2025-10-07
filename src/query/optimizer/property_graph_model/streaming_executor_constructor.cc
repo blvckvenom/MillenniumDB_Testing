@@ -3,6 +3,7 @@
 #include "query/executor/query_executor/gql/return_streaming_executor.h"
 #include "query/optimizer/property_graph_model/binding_list_iter_constructor.h"
 #include "query/parser/op/gql/op_return.h"
+#include "query/exceptions.h"
 
 using namespace GQL;
 
@@ -20,4 +21,9 @@ void StreamingExecutorConstructor::visit(OpReturn& op_return)
     }
 
     executor = std::make_unique<ReturnStreamingExecutor>(std::move(binding_iter), std::move(projection_vars));
+}
+
+void StreamingExecutorConstructor::visit(OpCall&)
+{
+    throw NotSupportedException("CALL");
 }

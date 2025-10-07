@@ -1,0 +1,5 @@
+CALL {
+  MATCH (p:Person)
+  RETURN p
+} YIELD p
+RETURN p

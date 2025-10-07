@@ -32,7 +32,7 @@ void PushLabels::visit(OpGraphPatternList& op_graph_pattern_list)
         patterns.push_back(std::move(tmp));
     }
 
-    tmp = std::make_unique<OpGraphPatternList>(std::move(patterns));
+    tmp = std::make_unique<OpGraphPatternList>(std::move(patterns), op_graph_pattern_list.graph_alias);
 }
 
 void PushLabels::visit(OpBasicGraphPattern& op_basic_graph_pattern)
@@ -158,6 +158,32 @@ void PushLabels::visit(OpEdge& op)
 {
     vars_in_linear_pattern.insert(op.id);
     tmp = op.clone();
+}
+
+void PushLabels::visit(OpCall& op_call)
+{
+    op_call.subquery->accept_visitor(*this);
+    auto new_call = std::make_unique<OpCall>(
+        std::move(tmp),
+        op_call.yield_items,
+        op_call.has_explicit_yield
+    );
+    new_call->yield_types = op_call.yield_types;
+    tmp = std::move(new_call);
+}
+
+void PushLabels::visit(OpProject& op_project)
+{
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+    auto new_project = std::make_unique<OpProject>(
+        op_project.alias,
+        std::move(tmp)
+    );
+    new_project->projected_items = op_project.projected_items;
+    new_project->projected_types = op_project.projected_types;
+    tmp = std::move(new_project);
 }
 
 void PushLabels::visit(OpFilter& op_filter)

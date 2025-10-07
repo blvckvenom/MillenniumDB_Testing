@@ -40,6 +40,7 @@ public:
         auto op_graph_pattern_list = dynamic_cast<OpGraphPatternList*>(unknown_op.get());
         std::vector<std::unique_ptr<Op>> new_pattern_list;
         auto new_bgp = std::make_unique<OpBasicGraphPattern>();
+        auto alias = op_graph_pattern_list->graph_alias;
 
         for (auto& pattern : op_graph_pattern_list->patterns) {
             auto op_graph_pattern = dynamic_cast<OpGraphPattern*>(pattern.get());
@@ -62,7 +63,7 @@ public:
 
         auto new_graph_pattern = std::make_unique<OpGraphPattern>(std::move(new_bgp), PathMode());
         new_pattern_list.push_back(std::move(new_graph_pattern));
-        return std::make_unique<OpGraphPatternList>(std::move(new_pattern_list));
+        return std::make_unique<OpGraphPatternList>(std::move(new_pattern_list), alias);
     }
 
     bool is_possible_to_regroup_op_graph_pattern(const OpGraphPattern* op_graph_pattern)

@@ -3,6 +3,7 @@
 #include "query/executor/query_executor/gql/return_executor.h"
 #include "query/optimizer/property_graph_model/binding_list_iter_constructor.h"
 #include "query/parser/op/gql/op_return.h"
+#include "query/exceptions.h"
 
 using namespace GQL;
 
@@ -24,4 +25,9 @@ void ExecutorConstructor::visit(OpReturn& op_return)
         std::move(projection_vars),
         return_type
     );
+}
+
+void ExecutorConstructor::visit(OpCall&)
+{
+    throw NotSupportedException("CALL");
 }

@@ -84,6 +84,18 @@ void AddStartingEnum::visit(OpNode&) { }
 
 void AddStartingEnum::visit(OpEdge&) { }
 
+void AddStartingEnum::visit(OpCall& op_call)
+{
+    op_call.subquery->accept_visitor(*this);
+}
+
+void AddStartingEnum::visit(OpProject& op_project)
+{
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+}
+
 void AddStartingEnum::visit(OpUnitTable&) { }
 
 void AddStartingEnum::visit(OpEmpty&) { }

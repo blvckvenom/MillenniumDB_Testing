@@ -1,0 +1,8 @@
+PROJECT people AS {
+  MATCH (p:Person)
+  RETURN p
+}
+FROM people
+MATCH (n)
+RETURN n
+ORDER BY n;

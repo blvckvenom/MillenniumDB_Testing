@@ -1,0 +1,5 @@
+CALL {
+  INSERT (n)
+  RETURN n
+} YIELD n
+RETURN n;

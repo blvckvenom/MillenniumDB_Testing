@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "query/parser/expr/gql/expr.h"
@@ -91,12 +92,16 @@ public:
 
     std::vector<std::unique_ptr<Expr>> current_expr_list;
 
+    std::optional<VarId> current_graph_alias;
+
     std::any visitSessionCloseCommand(GQLParser::SessionCloseCommandContext* ctx) override;
     std::any visitSessionActivityCommand(GQLParser::SessionActivityCommandContext* ctx) override;
     std::any visitNextStatement(GQLParser::NextStatementContext* ctx) override;
     std::any visitQueryConjunction(GQLParser::QueryConjunctionContext* ctx) override;
     std::any visitNestedDataModifyingProcedure(GQLParser::NestedDataModifyingProcedureContext* ctx) override;
     std::any visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx) override;
+    std::any visitProjectQueryStatement(GQLParser::ProjectQueryStatementContext* ctx) override;
+    std::any visitProjectStatement(GQLParser::ProjectStatementContext* ctx) override;
     std::any visitForStatement(GQLParser::ForStatementContext* ctx) override;
 
     std::any visitPrimitiveQueryStatement(GQLParser::PrimitiveQueryStatementContext* ctx) override;
@@ -121,6 +126,7 @@ public:
     std::any visitReturnItemList(GQLParser::ReturnItemListContext* ctx) override;
     std::any visitGroupingElementList(GQLParser::GroupingElementListContext* ctx) override;
     std::any visitMatchStatement(GQLParser::MatchStatementContext* ctx) override;
+    std::any visitSimpleMatchStatement(GQLParser::SimpleMatchStatementContext* ctx) override;
     std::any visitLetStatement(GQLParser::LetStatementContext* ctx) override;
     std::any visitLetVariableDefinitionList(GQLParser::LetVariableDefinitionListContext* ctx) override;
     std::any visitLetVariableDefinition(GQLParser::LetVariableDefinitionContext* ctx) override;

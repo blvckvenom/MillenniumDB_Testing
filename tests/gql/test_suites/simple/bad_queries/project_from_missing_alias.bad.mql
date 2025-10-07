@@ -1,0 +1,3 @@
+FROM missing
+MATCH (n)
+RETURN n;

@@ -3,7 +3,10 @@
 #include "graph_models/gql/comparisons.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
+#include "query/exceptions.h"
 #include "query/executor/binding_iter/aggregation/aggregation.h"
+#include "query/executor/binding_iter/call_table.h"
+#include "query/executor/binding_iter/project_graph.h"
 #include "query/executor/binding_iter/binding_expr/binding_expr_var.h"
 #include "query/executor/binding_iter/distinct_hash.h"
 #include "query/executor/binding_iter/expr_evaluator.h"
@@ -21,6 +24,7 @@
 #include "query/executor/binding_iter/set_variable_value.h"
 #include "query/executor/binding_iter/single_result_binding_iter.h"
 #include "query/executor/binding_iter/slice.h"
+#include "query/executor/binding_iter/virtual_graph_filter.h"
 #include "query/optimizer/plan/join_order/greedy_optimizer.h"
 #include "query/optimizer/plan/join_order/selinger_optimizer.h"
 #include "query/optimizer/property_graph_model/expr_to_binding_expr.h"
@@ -318,6 +322,33 @@ void PathBindingIterConstructor::visit(OpGraphPatternList& op)
         }
     }
 
+    if (op.graph_alias.has_value()) {
+        auto graph = get_query_ctx().get_virtual_graph(*op.graph_alias);
+        if (!graph) {
+            throw QuerySemanticException(
+                "FROM alias not found: " + get_query_ctx().get_var_name(*op.graph_alias)
+            );
+        }
+
+        std::vector<VarId> node_vars;
+        std::vector<VarId> edge_vars;
+        auto types = op.get_var_types();
+        for (auto& [var, type] : types) {
+            if (type.type == GQL::VarType::Node) {
+                node_vars.push_back(var);
+            } else if (type.type == GQL::VarType::Edge) {
+                edge_vars.push_back(var);
+            }
+        }
+
+        current_tmp = std::make_unique<VirtualGraphFilter>(
+            std::move(current_tmp),
+            std::move(graph),
+            std::move(node_vars),
+            std::move(edge_vars)
+        );
+    }
+
     if (previous_iter != nullptr) {
         tmp_iter = std::make_unique<IndexNestedLoopJoin>(std::move(previous_iter), std::move(current_tmp));
     } else {
@@ -573,6 +604,66 @@ void PathBindingIterConstructor::visit(OpUnitTable&)
 void PathBindingIterConstructor::visit(OpEmpty&)
 {
     tmp_iter = std::make_unique<EmptyBindingIter>();
+}
+
+void PathBindingIterConstructor::visit(OpCall& op_call)
+{
+    auto* subquery_return = dynamic_cast<OpReturn*>(op_call.subquery.get());
+    if (subquery_return == nullptr) {
+        throw QuerySemanticException("CALL subquery must end with RETURN");
+    }
+
+    PathBindingIterConstructor subquery_constructor;
+    subquery_return->accept_visitor(subquery_constructor);
+
+    if (subquery_constructor.tmp_iter == nullptr) {
+        throw QueryException("CALL subquery failed to produce a plan");
+    }
+
+    auto subquery_iter = std::move(subquery_constructor.tmp_iter);
+    auto call_iter = std::make_unique<CallTable>(std::move(subquery_iter), op_call.yield_items);
+
+    for (auto& var : op_call.yield_items) {
+        assigned_vars.insert(var);
+    }
+
+    if (tmp_iter != nullptr) {
+        tmp_iter = std::make_unique<IndexNestedLoopJoin>(std::move(tmp_iter), std::move(call_iter));
+    } else {
+        tmp_iter = std::move(call_iter);
+    }
+}
+
+void PathBindingIterConstructor::visit(OpProject& op_project)
+{
+    if (op_project.subquery == nullptr) {
+        throw QuerySemanticException("PROJECT subquery must end with RETURN");
+    }
+
+    auto* subquery_return = dynamic_cast<OpReturn*>(op_project.subquery.get());
+    if (subquery_return == nullptr) {
+        throw QuerySemanticException("PROJECT subquery must end with RETURN");
+    }
+
+    PathBindingIterConstructor subquery_constructor;
+    subquery_return->accept_visitor(subquery_constructor);
+
+    if (subquery_constructor.tmp_iter == nullptr) {
+        throw QueryException("PROJECT subquery failed to produce a plan");
+    }
+
+    auto project_iter = std::make_unique<ProjectGraph>(
+        op_project.alias,
+        std::move(subquery_constructor.tmp_iter),
+        op_project.projected_items,
+        op_project.projected_types
+    );
+
+    if (tmp_iter != nullptr) {
+        tmp_iter = std::make_unique<IndexNestedLoopJoin>(std::move(tmp_iter), std::move(project_iter));
+    } else {
+        tmp_iter = std::move(project_iter);
+    }
 }
 
 std::unique_ptr<BindingIter>

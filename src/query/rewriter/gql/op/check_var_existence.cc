@@ -234,4 +234,52 @@ void CheckVarExistence::visit(OpUnitTable&) { }
 
 void CheckVarExistence::visit(OpEmpty&) { }
 
+void CheckVarExistence::visit(OpCall& op_call)
+{
+    auto previous_variables = variables;
+    auto previous_let_variables = let_variables;
+    auto previous_group_vars = group_vars;
+    auto previous_return_vars = op_return_vars;
+
+    variables.clear();
+    let_variables.clear();
+    group_vars.clear();
+    op_return_vars.clear();
+
+    op_call.subquery->accept_visitor(*this);
+
+    variables = std::move(previous_variables);
+    let_variables = std::move(previous_let_variables);
+    group_vars = std::move(previous_group_vars);
+    op_return_vars = std::move(previous_return_vars);
+
+    for (auto& var : op_call.yield_items) {
+        variables.insert(var);
+    }
+}
+
+void CheckVarExistence::visit(OpProject& op_project)
+{
+    auto previous_variables = variables;
+    auto previous_let_variables = let_variables;
+    auto previous_group_vars = group_vars;
+    auto previous_return_vars = op_return_vars;
+
+    variables.clear();
+    let_variables.clear();
+    group_vars.clear();
+    op_return_vars.clear();
+
+    if (op_project.subquery != nullptr) {
+        op_project.subquery->accept_visitor(*this);
+    }
+
+    variables = std::move(previous_variables);
+    let_variables = std::move(previous_let_variables);
+    group_vars = std::move(previous_group_vars);
+    op_return_vars = std::move(previous_return_vars);
+
+    variables.insert(op_project.alias);
+}
+
 } // namespace GQL

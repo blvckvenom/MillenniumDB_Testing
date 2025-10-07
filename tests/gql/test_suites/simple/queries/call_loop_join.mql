@@ -1,0 +1,6 @@
+CALL {
+  MATCH (p:Person)
+  RETURN p
+} YIELD p
+MATCH (p)-[r:Loops]->(p)
+RETURN p, r
