@@ -8,18 +8,43 @@ namespace MDBServer {
 
 class StreamingQuadResponseWriter : public StreamingResponseWriter {
 public:
-    StreamingQuadResponseWriter(StreamingSession& session) : StreamingResponseWriter(session) { }
+    StreamingQuadResponseWriter(StreamingSession& session) :
+        StreamingResponseWriter(session)
+    { }
 
-    uint64_t get_model_id() const override {
+    uint64_t get_model_id() const override
+    {
         return QuadCatalog::MODEL_ID;
     }
 
-    uint64_t get_catalog_version() const override {
+    uint64_t get_catalog_version() const override
+    {
         return QuadCatalog::MAJOR_VERSION;
     }
 
-    std::string encode_object_id(const ObjectId& oid) const override {
-        const auto type  = oid.get_type();
+    std::string encode_list(const ObjectId& oid) const
+    {
+        std::vector<ObjectId> oid_list = MQL::Conversions::unpack_list(oid);
+
+        std::string res;
+        res += static_cast<char>(Protocol::DataType::LIST);
+        res += encode_size(oid_list.size());
+
+        for (auto it = oid_list.begin(); it != oid_list.end(); ++it) {
+            res += encode_object_id(*it);
+        }
+        return res;
+    }
+
+    std::string encode_dictionary_key(const ObjectId& oid) const override
+    {
+        auto str = MQL::Conversions::to_lexical_str(oid);
+        return encode_string(str, Protocol::DataType::STRING);
+    }
+
+    std::string encode_object_id(const ObjectId& oid) const override
+    {
+        const auto type = oid.get_type();
         const auto value = oid.get_value();
         switch (type) {
         case ObjectId::MASK_NULL: {
@@ -95,8 +120,22 @@ public:
             const auto tensor = Common::Conversions::unpack_tensor<double>(oid);
             return encode_tensor<double>(tensor);
         }
+        case ObjectId::MASK_DICTIONARY:
+        case ObjectId::MASK_DICTIONARY_TMP: {
+            std::unique_ptr<Dictionary> dictionary;
+            Common::Conversions::unpack_dictionary(oid, dictionary);
+            return encode_dictionary(*dictionary);
+        }
+        case ObjectId::MASK_LIST:
+        case ObjectId::MASK_LIST_EXTERN:
+        case ObjectId::MASK_LIST_TMP: {
+            std::vector<ObjectId> list = MQL::Conversions::unpack_list(oid);
+            return encode_list(oid);
+        }
         default:
-            throw std::logic_error("Unmanaged type in StreamingQuadResponseWriter::encode_object_id: " + std::to_string(type));
+            throw std::logic_error(
+                "Unmanaged type in StreamingQuadResponseWriter::encode_object_id: " + std::to_string(type)
+            );
         }
     }
 };

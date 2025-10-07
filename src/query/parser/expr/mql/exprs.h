@@ -28,6 +28,12 @@
 #include "query/parser/expr/mql/bool_expr/expr_or.h"                                 // IWYU pragma: export
 #include "query/parser/expr/mql/function/expr_cosine_distance.h"                     // IWYU pragma: export
 #include "query/parser/expr/mql/function/expr_cosine_similarity.h"                   // IWYU pragma: export
+#include "query/parser/expr/mql/function/expr_edit_distance.h"                       // IWYU pragma: export
 #include "query/parser/expr/mql/function/expr_euclidean_distance.h"                  // IWYU pragma: export
 #include "query/parser/expr/mql/function/expr_manhattan_distance.h"                  // IWYU pragma: export
+#include "query/parser/expr/mql/function/expr_normalize.h"                           // IWYU pragma: export
 #include "query/parser/expr/mql/function/expr_regex.h"                               // IWYU pragma: export
+#include "query/parser/expr/mql/function/expr_str.h"                                 // IWYU pragma: export
+#include "query/parser/expr/mql/function/expr_labels.h"                              // IWYU pragma: export
+#include "query/parser/expr/mql/function/expr_type.h"                                // IWYU pragma: export
+#include "query/parser/expr/mql/function/expr_properties.h"                          // IWYU pragma: export

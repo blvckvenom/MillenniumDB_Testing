@@ -215,6 +215,44 @@ void ExprPrinter::visit(ExprEuclideanDistance& expr)
     os << ')';
 }
 
+void ExprPrinter::visit(ExprEditDistance& expr)
+{
+    os << "EDIT_DISTANCE(";
+    expr.expr1->accept_visitor(*this);
+    os << ", ";
+    expr.expr2->accept_visitor(*this);
+    os << ')';
+}
+
+void ExprPrinter::visit(MQL::ExprNormalize& expr)
+{
+    os << "NORMALIZE(";
+    expr.expr->accept_visitor(*this);
+    os << ")";
+}
+
+void ExprPrinter::visit(MQL::ExprStr& expr)
+{
+    os << "STR(";
+    expr.expr->accept_visitor(*this);
+    os << ")";
+}
+
+void ExprPrinter::visit(MQL::ExprLabels& expr)
+{
+    os << "LABELS(" << expr.var << ")";
+}
+
+void ExprPrinter::visit(MQL::ExprType& expr)
+{
+    os << "TYPE(" << expr.var << ")";
+}
+
+void ExprPrinter::visit(MQL::ExprProperties& expr)
+{
+    os << "PROPERTIES(" << expr.var << ")";
+}
+
 void ExprPrinter::visit(MQL::ExprAggAvg& expr)
 {
     os << "AVG(";

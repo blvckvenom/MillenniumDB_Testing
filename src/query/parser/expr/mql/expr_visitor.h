@@ -35,6 +35,12 @@ class ExprCosineSimilarity;
 class ExprCosineDistance;
 class ExprManhattanDistance;
 class ExprEuclideanDistance;
+class ExprEditDistance;
+class ExprNormalize;
+class ExprStr;
+class ExprLabels;
+class ExprType;
+class ExprProperties;
 
 class ExprVisitor {
 public:
@@ -71,5 +77,11 @@ public:
     virtual void visit(MQL::ExprCosineDistance&) = 0;
     virtual void visit(MQL::ExprManhattanDistance&) = 0;
     virtual void visit(MQL::ExprEuclideanDistance&) = 0;
+    virtual void visit(MQL::ExprEditDistance&) = 0;
+    virtual void visit(MQL::ExprNormalize&) = 0;
+    virtual void visit(MQL::ExprStr&) = 0;
+    virtual void visit(MQL::ExprLabels&) = 0;
+    virtual void visit(MQL::ExprType&) = 0;
+    virtual void visit(MQL::ExprProperties&) = 0;
 };
 } // namespace MQL

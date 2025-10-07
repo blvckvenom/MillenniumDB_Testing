@@ -5,7 +5,6 @@
 #include "query/id.h"
 #include "query/parser/expr/mql/expr_visitor.h"
 #include "query/parser/op/mql/op_visitor.h"
-#include "query/var_id.h"
 
 namespace MQL {
 /**
@@ -19,12 +18,12 @@ private:
     template<typename T>
     using SetType = boost::container::flat_set<T>;
 
-    SetType<VarId> declared_vars;   // all declared variables
+    SetType<VarId> declared_vars; // all declared variables
     SetType<VarId> unjoinable_vars; // variables that must not be joined (e.g. path variable)
-    SetType<VarId> alias_vars;      // e.g. RETURN 1 + 1 AS ?alias
+    SetType<VarId> alias_vars; // e.g. RETURN 1 + 1 AS ?alias
 
-    void insert_joinable_var(VarId var);
-    void insert_unjoinable_var(VarId var);
+    void try_insert_joinable_var(Id var);
+    void try_insert_unjoinable_var(Id var);
 
 public:
     SetType<Id> used_properties;
@@ -37,22 +36,12 @@ public:
     void visit(OpOrderBy&) override;
     void visit(OpReturn&) override;
     void visit(OpSequence&) override;
+    void visit(OpUpdate&) override;
     void visit(OpWhere&) override;
 
+    void visit(OpUnitTable&) override { }
     void visit(OpDescribe&) override { }
-    void visit(OpDisjointTerm&) override { }
-    void visit(OpDisjointVar&) override { }
-    void visit(OpEdge&) override { }
-    void visit(OpLabel&) override { }
-    void visit(OpPath&) override { }
-    void visit(OpProperty&) override { }
     void visit(OpShow&) override { }
-
-    /* There are impossible to have in a read only query*/
-    void visit(OpInsert&) override { }
-    void visit(OpUpdate&) override { }
-    void visit(OpCreateHNSWIndex&) override { }
-    void visit(OpCreateTextIndex&) override { }
 };
 
 class CheckVarNamesExpr : public ExprVisitor {
@@ -99,6 +88,12 @@ public:
     void visit(ExprCosineDistance&) override;
     void visit(ExprManhattanDistance&) override;
     void visit(ExprEuclideanDistance&) override;
+    void visit(ExprEditDistance&) override;
+    void visit(ExprNormalize&) override;
+    void visit(ExprStr&) override;
+    void visit(ExprLabels&) override;
+    void visit(ExprType&) override;
+    void visit(ExprProperties&) override;
 
     void visit(ExprAggAvg&) override;
     void visit(ExprAggCountAll&) override;

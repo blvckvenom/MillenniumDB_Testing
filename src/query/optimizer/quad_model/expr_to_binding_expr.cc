@@ -381,6 +381,46 @@ void ExprToBindingExpr::visit(ExprEuclideanDistance& expr)
     tmp = std::make_unique<BindingExprEuclideanDistance>(std::move(expr1), std::move(expr2));
 }
 
+void ExprToBindingExpr::visit(ExprEditDistance& expr)
+{
+    expr.expr1->accept_visitor(*this);
+    auto expr1 = std::move(tmp);
+
+    expr.expr2->accept_visitor(*this);
+    auto expr2 = std::move(tmp);
+
+    tmp = std::make_unique<BindingExprEditDistance>(std::move(expr1), std::move(expr2));
+}
+
+void ExprToBindingExpr::visit(ExprNormalize& expr)
+{
+    expr.expr->accept_visitor(*this);
+
+    tmp = std::make_unique<BindingExprNormalize>(std::move(tmp));
+}
+
+void ExprToBindingExpr::visit(ExprStr& expr)
+{
+    expr.expr->accept_visitor(*this);
+
+    tmp = std::make_unique<BindingExprStr>(std::move(tmp));
+}
+
+void ExprToBindingExpr::visit(ExprLabels& expr)
+{
+    tmp = std::make_unique<BindingExprLabels>(expr.var);
+}
+
+void ExprToBindingExpr::visit(ExprType& expr)
+{
+    tmp = std::make_unique<BindingExprType>(expr.var);
+}
+
+void ExprToBindingExpr::visit(ExprProperties& expr)
+{
+    tmp = std::make_unique<BindingExprProperties>(expr.var);
+}
+
 template<typename AggType, class... Args>
 void ExprToBindingExpr::check_and_make_aggregate(Expr* expr, Args&&... args)
 {
