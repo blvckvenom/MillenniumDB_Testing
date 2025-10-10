@@ -1,6 +1,7 @@
 #include "bin/mdb-csv-import.h"
 #include "bin/mdb-dump.h"
 #include "bin/mdb-import.h"
+#include "bin/mdb-projection.h"
 #include "bin/mdb-server.h"
 #include "cli/cli.h"
 
@@ -93,6 +94,22 @@ void print_cli_help()
             "\n";
 }
 
+void print_projection_help()
+{
+    cout << "\nProjection Management Usage:"
+            "\n  mdb list-projections <db_folder>"
+            "\n      List all projections in a GQL database"
+            "\n"
+            "\n  mdb drop-projection <db_folder> <projection_name>"
+            "\n      Delete a projection from a GQL database"
+            "\n"
+            "\n  mdb inspect-projection <db_folder> <projection_name>"
+            "\n      Show detailed information about a projection"
+            "\n"
+            "\nNote: Projections are only supported for GQL databases"
+            "\n";
+}
+
 void print_help()
 {
     print_mdb_version();
@@ -106,6 +123,9 @@ void print_help()
             "\n * csv-import                          create a new database from csv files"
             "\n * dump                                export a database into a file"
             "\n * cli                                 start the CLI for querying a database"
+            "\n * list-projections                    list all projections in a GQL database"
+            "\n * drop-projection                     delete a projection from a GQL database"
+            "\n * inspect-projection                  show projection details"
             "\n * help,--help                         print this help message"
             "\n";
 
@@ -114,6 +134,7 @@ void print_help()
     print_csv_import_help();
     print_dump_help();
     print_cli_help();
+    print_projection_help();
 }
 
 int main(int argc, char* argv[])
@@ -164,6 +185,8 @@ int main(int argc, char* argv[])
             print_dump_help();
         } else if (subcommand == "cli") {
             print_cli_help();
+        } else if (subcommand == "list-projections" || subcommand == "drop-projection" || subcommand == "inspect-projection") {
+            print_projection_help();
         } else {
             print_help();
         }
@@ -189,6 +212,15 @@ int main(int argc, char* argv[])
     if (subcommand == "dump") {
         DumpConfig config = parse_dump_config(args);
         return mdb_dump(config);
+    }
+    if (subcommand == "list-projections") {
+        return mdb_list_projections(args);
+    }
+    if (subcommand == "drop-projection") {
+        return mdb_drop_projection(args);
+    }
+    if (subcommand == "inspect-projection") {
+        return mdb_inspect_projection(args);
     }
 #ifndef NO_MDB_CLI
     if (subcommand == "cli") {

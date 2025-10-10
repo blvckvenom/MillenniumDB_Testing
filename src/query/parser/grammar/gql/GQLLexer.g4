@@ -852,6 +852,10 @@ PROPERTY_EXISTS
    : 'PROPERTY_EXISTS'
    ;
 
+PROJECT
+   : 'PROJECT'
+   ;
+
 RADIANS
    : 'RADIANS'
    ;
@@ -1231,7 +1235,6 @@ PRE_RESERVED_WORD
    | 'PARTITION'
    | 'PROCEDURE'
    | 'PRODUCT'
-   | 'PROJECT'
    | 'QUERY'
    | 'RECORDS'
    | 'REFERENCE'

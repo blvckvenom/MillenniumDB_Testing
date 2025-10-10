@@ -1530,6 +1530,16 @@ std::any QueryVisitor::visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunction
     return 0;
 }
 
+std::any QueryVisitor::visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->projectionName);
+    auto projection_name_expr = std::move(current_expr);
+    VarId agg_var = get_query_ctx().get_internal_var();
+    current_expr = std::make_unique<ExprAggProject>(std::move(projection_name_expr), agg_var);
+    return 0;
+}
+
 std::any QueryVisitor::visitPropertyReference(GQLParser::PropertyReferenceContext* ctx)
 {
     LOG_VISITOR

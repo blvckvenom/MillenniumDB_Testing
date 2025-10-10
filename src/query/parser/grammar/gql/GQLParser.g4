@@ -1422,6 +1422,7 @@ aggregateFunction
    : COUNT LEFT_PAREN ASTERISK RIGHT_PAREN                                                                  #gqlCountAllFunction
    | generalSetFunctionType LEFT_PAREN setQuantifier? expression RIGHT_PAREN                                #gqlGeneralSetFunction
    | binarySetFunctionType LEFT_PAREN setQuantifier? lhs = expression COMMA rhs = expression RIGHT_PAREN    #gqlBinarySetFunction
+   | PROJECT LEFT_PAREN projectionName = characterStringLiteral RIGHT_PAREN                                 #gqlProjectFunction
    ;
 
 generalSetFunctionType

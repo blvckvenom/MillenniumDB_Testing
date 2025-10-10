@@ -25,6 +25,7 @@ public:
     void visit(ExprAggCollect&) override { }
     void visit(ExprAggPercentileCont&) override { }
     void visit(ExprAggPercentileDisc&) override { }
+    void visit(ExprAggProject&) override { }
     void visit(ExprTerm&) override { }
 
     void visit(ExprVar& expr) override

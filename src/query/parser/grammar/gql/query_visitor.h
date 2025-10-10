@@ -232,6 +232,7 @@ public:
     std::any visitGqlCountAllFunction(GQLParser::GqlCountAllFunctionContext*) override;
     std::any visitGqlGeneralSetFunction(GQLParser::GqlGeneralSetFunctionContext* ctx) override;
     std::any visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunctionContext* ctx) override;
+    std::any visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext* ctx) override;
 
     std::any visitLabelsFunction(GQLParser::LabelsFunctionContext* ctx) override;
     std::any visitPropertiesFunction(GQLParser::PropertiesFunctionContext* ctx) override;

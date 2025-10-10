@@ -653,6 +653,8 @@ public:
 
     virtual std::any visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunctionContext *context) = 0;
 
+    virtual std::any visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext *context) = 0;
+
     virtual std::any visitGeneralSetFunctionType(GQLParser::GeneralSetFunctionTypeContext *context) = 0;
 
     virtual std::any visitSetQuantifier(GQLParser::SetQuantifierContext *context) = 0;
