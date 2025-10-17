@@ -17,9 +17,9 @@ AssignProperties::AssignProperties(
                                                            ScanRange::get(e.key),
                                                            ScanRange::get(e.value, false) };
         if (e.type == VarType::Node) {
-            prop_scans.emplace_back(*gql_model.node_key_value, std::move(ranges));
+            prop_scans.emplace_back(gql_model.get_node_key_value(), std::move(ranges));
         } else {
-            prop_scans.emplace_back(*gql_model.edge_key_value, std::move(ranges));
+            prop_scans.emplace_back(gql_model.get_edge_key_value(), std::move(ranges));
         }
         property_vars.emplace_back(e.value);
     }

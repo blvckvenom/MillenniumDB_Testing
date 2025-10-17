@@ -1,0 +1,54 @@
+<svg width="169pt" height="124pt" viewBox="0.00 0.00 168.97 124.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 120)">
+<title>G</title>
+<polygon fill="white" stroke="none" points="-4,4 -4,-120 164.97,-120 164.97,4 -4,4"/>
+<!-- elem1 -->
+<g id="node1" class="node">
+<title>elem1</title>
+<polygon fill="lightblue" stroke="none" points="67.08,-116 0,-116 0,-72 67.08,-72 67.08,-116"/>
+<polygon fill="none" stroke="black" points="0,-94 0,-116 67.08,-116 67.08,-94 0,-94"/>
+<text text-anchor="start" x="11.75" y="-102" font-family="Times,serif" font-size="10.00">edge: none</text>
+<polygon fill="none" stroke="black" points="0,-72 0,-94 67.08,-94 67.08,-72 0,-72"/>
+<text text-anchor="start" x="5" y="-80" font-family="Times,serif" font-size="10.00">node: {a} - n0</text>
+</g>
+<!-- elem2 -->
+<g id="node2" class="node">
+<title>elem2</title>
+<polygon fill="lightgrey" stroke="none" points="160.97,-116 93.32,-116 93.32,-72 160.97,-72 160.97,-116"/>
+<polygon fill="none" stroke="black" points="93.32,-94 93.32,-116 160.97,-116 160.97,-94 93.32,-94"/>
+<text text-anchor="start" x="102.71" y="-102" font-family="Times,serif" font-size="10.00">edge: e - e1 </text>
+<polygon fill="none" stroke="black" points="93.32,-72 93.32,-94 160.97,-94 160.97,-72 93.32,-72"/>
+<text text-anchor="start" x="98.32" y="-80" font-family="Times,serif" font-size="10.00">node: {b} - n1</text>
+</g>
+<!-- elem1&#45;&gt;elem2 -->
+<g id="edge1" class="edge">
+<title>elem1-&gt;elem2</title>
+<path fill="none" stroke="black" d="M67.07,-94C72.04,-94 77.23,-94 82.39,-94"/>
+<polygon fill="black" stroke="black" points="82.02,-97.5 92.02,-94 82.02,-90.5 82.02,-97.5"/>
+</g>
+<!-- elem3 -->
+<g id="node3" class="node">
+<title>elem3</title>
+<polygon fill="lightblue" stroke="none" points="67.08,-44 0,-44 0,0 67.08,0 67.08,-44"/>
+<polygon fill="none" stroke="black" points="0,-22 0,-44 67.08,-44 67.08,-22 0,-22"/>
+<text text-anchor="start" x="11.75" y="-30" font-family="Times,serif" font-size="10.00">edge: none</text>
+<polygon fill="none" stroke="black" points="0,0 0,-22 67.08,-22 67.08,0 0,0"/>
+<text text-anchor="start" x="5" y="-8" font-family="Times,serif" font-size="10.00">node: {c} - n1</text>
+</g>
+<!-- elem4 -->
+<g id="node4" class="node">
+<title>elem4</title>
+<polygon fill="lightgrey" stroke="none" points="160.97,-44 93.32,-44 93.32,0 160.97,0 160.97,-44"/>
+<polygon fill="none" stroke="black" points="93.32,-22 93.32,-44 160.97,-44 160.97,-22 93.32,-22"/>
+<text text-anchor="start" x="102.71" y="-30" font-family="Times,serif" font-size="10.00">edge: e - e2 </text>
+<polygon fill="none" stroke="black" points="93.32,0 93.32,-22 160.97,-22 160.97,0 93.32,0"/>
+<text text-anchor="start" x="98.32" y="-8" font-family="Times,serif" font-size="10.00">node: {d} - n2</text>
+</g>
+<!-- elem3&#45;&gt;elem4 -->
+<g id="edge2" class="edge">
+<title>elem3-&gt;elem4</title>
+<path fill="none" stroke="black" d="M67.07,-22C72.04,-22 77.23,-22 82.39,-22"/>
+<polygon fill="black" stroke="black" points="82.02,-25.5 92.02,-22 82.02,-18.5 82.02,-25.5"/>
+</g>
+</g>
+</svg>

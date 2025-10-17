@@ -19,6 +19,11 @@
 #include "system/string_manager.h"
 #include "system/tmp_manager.h"
 
+// Forward declaration to avoid circular dependencies
+namespace GQL {
+    class ProjectionQueryContext;
+}
+
 struct ThreadInfo {
     bool interruption_requested = false;
 
@@ -50,6 +55,12 @@ public:
     // Used only by BindingExprBNode of the RDF model.
     std::unordered_map<std::string, uint64_t> blank_node_ids;
 
+    // Active projection name for GQL USE GRAPH clause
+    std::string active_projection;
+
+    // Projection query context (loaded when active_projection is set)
+    std::unique_ptr<GQL::ProjectionQueryContext> projection_ctx;
+
     // Debug prints ObjectIds
     static inline std::ostream& (*_debug_print)(std::ostream&, ObjectId);
 
@@ -77,46 +88,29 @@ private:
     std::map<VarId, ObjectId> edge_directions;
 
 public:
-    QueryContext()
-    {
-        buffer1 = new char[StringManager::MAX_STRING_SIZE];
-        buffer2 = new char[StringManager::MAX_STRING_SIZE];
-    }
-
-    QueryContext(QueryContext&& other) :
-        buffer1(std::exchange(other.buffer1, nullptr)),
-        buffer2(std::exchange(other.buffer2, nullptr))
-    { }
-
+    // Constructors and destructor defined in .cc file to handle unique_ptr with incomplete type
+    QueryContext();
+    QueryContext(QueryContext&& other);
     QueryContext(const QueryContext& other) = delete;
-
-    ~QueryContext()
-    {
-        delete[] buffer1;
-        delete[] buffer2;
-    }
+    ~QueryContext();
 
     // Cleans up everything. Must be called before parsing the query
-    void prepare(BufferManager::VersionScope& version_scope, std::chrono::seconds timeout) {
-        blank_node_ids.clear();
-        blank_node_count = 0;
+    // Defined in .cc file to handle unique_ptr operations
+    void prepare(BufferManager::VersionScope& version_scope, std::chrono::seconds timeout);
 
-        var_ctx.internal_var_counter = 0;
-        var_ctx.var_names = {};
-        var_ctx.var_map.clear();
-
-        const auto start = std::chrono::system_clock::now();
-        thread_info.interruption_requested = false;
-        thread_info.time_start = start;
-        thread_info.timeout = start + timeout;
-
-        start_version  = version_scope.start_version;
-        result_version = version_scope.start_version + (version_scope.is_editable ? 1 : 0);
-
-        cancellation_token = get_uuid();
-
-        tmp_manager.reset(thread_info.worker_index);
+    // Projection management methods (for GQL USE GRAPH support)
+    bool is_using_projection() const {
+        return !active_projection.empty();
     }
+
+    void set_active_projection(const std::string& projection_name) {
+        active_projection = projection_name;
+    }
+
+    // Methods that manipulate projection_ctx defined in .cc file
+    void clear_active_projection();
+    void load_projection(const std::string& proj_name);
+    void unload_projection();
 
     std::string get_uuid() {
         boost::uuids::uuid uuid = uuid_generator();

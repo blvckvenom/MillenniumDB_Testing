@@ -11,7 +11,7 @@ namespace GQL {
 class ProjectionCatalog {
 public:
     static constexpr uint8_t MAJOR_VERSION = 1;
-    static constexpr uint8_t MINOR_VERSION = 0;
+    static constexpr uint8_t MINOR_VERSION = 1;  // Bumped for optional labels/properties support
     static constexpr uint8_t magic_number[] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};
     static constexpr uint8_t MODEL_ID = 255; // Special ID for projections
 
@@ -32,17 +32,31 @@ public:
     uint64_t directed_edge_count = 0;
     uint64_t undirected_edge_count = 0;
 
-    // Configuration
-    bool has_node_properties = false;
-    bool has_edge_properties = false;
+    // Feature flags (what's included in this projection)
+    bool includes_node_labels = false;
+    bool includes_edge_labels = false;
+    bool includes_node_properties = false;
+    bool includes_edge_properties = false;
+
+    // Legacy flags (backward compatibility)
+    bool has_node_properties = false;  // Deprecated: use includes_node_properties
+    bool has_edge_properties = false;  // Deprecated: use includes_edge_properties
     bool undirected_relationships = false;
+
+    // Property metadata (which specific properties were included)
+    std::vector<std::string> included_node_properties;  // Empty = all properties
+    std::vector<std::string> included_edge_properties;  // Empty = all properties
+
+    // Legacy property names (backward compatibility)
+    std::vector<std::string> node_property_names;  // Deprecated
+    std::vector<std::string> edge_property_names;  // Deprecated
+
+    // Statistics
+    uint64_t distinct_node_labels = 0;
+    uint64_t distinct_edge_labels = 0;
 
     // Query information (for debugging/reference)
     std::string original_query;
-
-    // Property metadata
-    std::vector<std::string> node_property_names;
-    std::vector<std::string> edge_property_names;
 
     // Timing information
     uint64_t projection_millis = 0;

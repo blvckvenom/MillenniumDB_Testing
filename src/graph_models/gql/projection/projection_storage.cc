@@ -1,7 +1,10 @@
 #include "projection_storage.h"
 
+#include <chrono>
+#include <filesystem>
 #include <stdexcept>
 
+#include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 #include "storage/index/record.h"
@@ -35,6 +38,54 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
         rel_dir = projection_dir;
     }
 
+    // Extract projection name from path (last component)
+    size_t last_slash = projection_dir.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+        projection_name = projection_dir.substr(last_slash + 1);
+    } else {
+        projection_name = projection_dir;
+    }
+
+    // Pre-allocate for better performance
+    inserted_nodes.reserve(INITIAL_CAPACITY);
+    inserted_edges.reserve(INITIAL_CAPACITY);
+    node_batch.reserve(BATCH_SIZE);
+    edge_batch.reserve(BATCH_SIZE);
+}
+
+ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const std::string& db_folder, const std::string& projection_name_)
+    : projection_dir(projection_dir_), projection_name(projection_name_)
+{
+    // Calculate relative path from db_folder
+    if (projection_dir.find(db_folder) == 0) {
+        rel_dir = projection_dir.substr(db_folder.length());
+        if (!rel_dir.empty() && rel_dir[0] == '/') {
+            rel_dir = rel_dir.substr(1);
+        }
+    } else {
+        rel_dir = projection_dir;
+    }
+
+    // Pre-allocate for better performance
+    inserted_nodes.reserve(INITIAL_CAPACITY);
+    inserted_edges.reserve(INITIAL_CAPACITY);
+    node_batch.reserve(BATCH_SIZE);
+    edge_batch.reserve(BATCH_SIZE);
+}
+
+ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const std::string& db_folder, const std::string& projection_name_, const Features& features_)
+    : projection_dir(projection_dir_), projection_name(projection_name_), features(features_)
+{
+    // Calculate relative path from db_folder
+    if (projection_dir.find(db_folder) == 0) {
+        rel_dir = projection_dir.substr(db_folder.length());
+        if (!rel_dir.empty() && rel_dir[0] == '/') {
+            rel_dir = rel_dir.substr(1);
+        }
+    } else {
+        rel_dir = projection_dir;
+    }
+
     // Pre-allocate for better performance
     inserted_nodes.reserve(INITIAL_CAPACITY);
     inserted_edges.reserve(INITIAL_CAPACITY);
@@ -50,19 +101,84 @@ void ProjectionStorage::init() {
     // Initialize B+tree indexes using relative paths
     // rel_dir is relative to file_manager's db_folder (e.g., "projections/test_projection")
 
-    // Initialize empty BPlusTree files (using absolute paths)
+    // Initialize required indexes (always created)
     init_empty_bptree<1>(projection_dir + "/nodes");
     init_empty_bptree<3>(projection_dir + "/from_to_edge");
     init_empty_bptree<3>(projection_dir + "/to_from_edge");
     init_empty_bptree<2>(projection_dir + "/edge_direction");
 
-    // Now create BPlusTree objects (using relative paths for file_manager)
     nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
     from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
     to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
     edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
 
-    // Property indexes will be created on demand
+    // Initialize optional label indexes if requested
+    if (features.include_node_labels) {
+        init_empty_bptree<2>(projection_dir + "/node_label");
+        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+    }
+
+    if (features.include_edge_labels) {
+        init_empty_bptree<2>(projection_dir + "/edge_label");
+        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+    }
+
+    // Initialize optional property indexes if requested
+    if (features.include_node_properties) {
+        init_empty_bptree<3>(projection_dir + "/node_key_value");
+        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
+    }
+
+    if (features.include_edge_properties) {
+        init_empty_bptree<3>(projection_dir + "/edge_key_value");
+        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
+    }
+}
+
+void ProjectionStorage::open() {
+    // Open existing BPlusTree objects (using relative paths for file_manager)
+    // Do NOT call init_empty_bptree - the files already exist!
+
+    // Load catalog to restore statistics and metadata
+    std::filesystem::path proj_path(projection_dir);
+    if (std::filesystem::exists(proj_path / "catalog.dat")) {
+        ProjectionCatalog catalog(projection_dir);
+        catalog.load();
+
+        // Restore statistics from catalog
+        node_count = catalog.node_count;
+        edge_count = catalog.edge_count;
+        directed_edge_count = catalog.directed_edge_count;
+        undirected_edge_count = catalog.undirected_edge_count;
+    }
+
+    // Open required indexes (always present)
+    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
+    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
+    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
+    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
+
+    // Open optional label indexes if they exist
+    if (std::filesystem::exists(proj_path / "node_label.leaf")) {
+        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+        features.include_node_labels = true;
+    }
+
+    if (std::filesystem::exists(proj_path / "edge_label.leaf")) {
+        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+        features.include_edge_labels = true;
+    }
+
+    // Open optional property indexes if they exist
+    if (std::filesystem::exists(proj_path / "node_key_value.leaf")) {
+        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
+        features.include_node_properties = true;
+    }
+
+    if (std::filesystem::exists(proj_path / "edge_key_value.leaf")) {
+        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
+        features.include_edge_properties = true;
+    }
 }
 
 void ProjectionStorage::add_node(const ProjectedNode& node) {
@@ -88,8 +204,12 @@ void ProjectionStorage::add_edge(const ProjectedEdge& edge) {
 
     // Check if already inserted
     if (inserted_edges.find(edge_id) != inserted_edges.end()) {
+        std::cerr << "[ProjectionStorage] Skipping duplicate edge 0x" << std::hex << edge_id << std::dec << std::endl;
         return;
     }
+
+    std::cerr << "[ProjectionStorage] Adding edge 0x" << std::hex << edge_id << std::dec
+              << " to batch (size before: " << edge_batch.size() << ")" << std::endl;
 
     // Add to batch
     edge_batch.push_back(edge);
@@ -97,8 +217,35 @@ void ProjectionStorage::add_edge(const ProjectedEdge& edge) {
 
     // Flush batch if it reaches threshold
     if (edge_batch.size() >= BATCH_SIZE) {
+        std::cerr << "[ProjectionStorage] Batch full, flushing " << edge_batch.size() << " edges" << std::endl;
         flush_edge_batch();
     }
+}
+
+void ProjectionStorage::add_node_label(ObjectId node_id, ObjectId label_id) {
+    // Only insert if label index is enabled
+    if (!node_label_index) {
+        return;
+    }
+
+    Record<2> label_record;
+    label_record[0] = node_id.id;
+    label_record[1] = label_id.id;
+
+    node_label_index->insert(label_record);
+}
+
+void ProjectionStorage::add_edge_label(ObjectId edge_id, ObjectId label_id) {
+    // Only insert if label index is enabled
+    if (!edge_label_index) {
+        return;
+    }
+
+    Record<2> label_record;
+    label_record[0] = edge_id.id;
+    label_record[1] = label_id.id;
+
+    edge_label_index->insert(label_record);
 }
 
 bool ProjectionStorage::has_node(ObjectId node_id) const {
@@ -139,6 +286,9 @@ void ProjectionStorage::flush() {
     // Flush any pending batched writes
     flush_node_batch();
     flush_edge_batch();
+
+    // Save catalog with projection metadata
+    save_catalog();
 
     // B+trees are automatically flushed when they go out of scope
     // This method is here for explicit control if needed
@@ -189,10 +339,18 @@ void ProjectionStorage::flush_edge_batch() {
         return;
     }
 
+    std::cerr << "[ProjectionStorage] flush_edge_batch: Flushing " << edge_batch.size() << " edges to B+tree" << std::endl;
+
     for (const auto& edge : edge_batch) {
         uint64_t from_id = edge.from_node.id;
         uint64_t to_id = edge.to_node.id;
         uint64_t edge_id = edge.edge_id.id;
+
+        // For undirected edges, normalize the ordering to avoid duplicates
+        // Always store with lower node ID first to ensure consistent (from, to) pairs
+        if (!edge.is_directed && from_id > to_id) {
+            std::swap(from_id, to_id);
+        }
 
         // Insert into from->to index
         Record<3> from_to_record;
@@ -200,8 +358,11 @@ void ProjectionStorage::flush_edge_batch() {
         from_to_record[1] = to_id;
         from_to_record[2] = edge_id;
 
-        if (from_to_edge_index->insert(from_to_record)) {
+        bool inserted = from_to_edge_index->insert(from_to_record);
+        if (inserted) {
             edge_count++;
+            std::cerr << "[ProjectionStorage] Inserted edge 0x" << std::hex << edge_id << std::dec
+                      << " into from_to_edge_index (" << from_id << " -> " << to_id << "), edge_count=" << edge_count << std::endl;
 
             if (edge.is_directed) {
                 directed_edge_count++;
@@ -247,6 +408,115 @@ void ProjectionStorage::flush_edge_batch() {
     }
 
     edge_batch.clear();
+}
+
+std::vector<ObjectId> ProjectionStorage::get_all_node_ids() const {
+    std::vector<ObjectId> node_ids;
+
+    if (!nodes_index) {
+        return node_ids;
+    }
+
+    // Scan all nodes in the B+tree
+    Record<1> min_record;
+    min_record[0] = 0;
+
+    Record<1> max_record;
+    max_record[0] = UINT64_MAX;
+
+    bool interruption_requested = false;
+    auto iter = nodes_index->get_range(&interruption_requested, min_record, max_record);
+
+    const Record<1>* record;
+    while ((record = iter.next()) != nullptr) {
+        node_ids.push_back(ObjectId((*record)[0]));
+    }
+
+    return node_ids;
+}
+
+std::vector<std::tuple<ObjectId, ObjectId, ObjectId, bool>> ProjectionStorage::get_all_edges_info() const {
+    std::vector<std::tuple<ObjectId, ObjectId, ObjectId, bool>> edges;
+
+    if (!from_to_edge_index || !edge_direction_index) {
+        return edges;
+    }
+
+    // Scan all edges in the from_to_edge B+tree
+    Record<3> min_record;
+    min_record[0] = 0;
+    min_record[1] = 0;
+    min_record[2] = 0;
+
+    Record<3> max_record;
+    max_record[0] = UINT64_MAX;
+    max_record[1] = UINT64_MAX;
+    max_record[2] = UINT64_MAX;
+
+    bool interruption_requested = false;
+    auto iter = from_to_edge_index->get_range(&interruption_requested, min_record, max_record);
+
+    const Record<3>* record;
+    while ((record = iter.next()) != nullptr) {
+        ObjectId from_node((*record)[0]);
+        ObjectId to_node((*record)[1]);
+        ObjectId edge_id((*record)[2]);
+
+        // Look up direction for this edge
+        Record<2> dir_min;
+        dir_min[0] = edge_id.id;
+        dir_min[1] = 0;
+
+        Record<2> dir_max;
+        dir_max[0] = edge_id.id;
+        dir_max[1] = 1;
+
+        bool interruption = false;
+        auto dir_iter = edge_direction_index->get_range(&interruption, dir_min, dir_max);
+        const Record<2>* dir_record = dir_iter.next();
+
+        bool is_directed = true;
+        if (dir_record != nullptr) {
+            is_directed = ((*dir_record)[1] == 1);
+        }
+
+        edges.push_back(std::make_tuple(from_node, to_node, edge_id, is_directed));
+    }
+
+    return edges;
+}
+
+void ProjectionStorage::save_catalog() {
+    // Don't create catalog if projection name is empty (e.g., when opening existing projection)
+    if (projection_name.empty()) {
+        return;
+    }
+
+    ProjectionCatalog catalog(projection_dir);
+
+    // Set projection metadata
+    catalog.projection_name = projection_name;
+    catalog.creation_timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+
+    // Set statistics
+    catalog.node_count = node_count;
+    catalog.edge_count = edge_count;
+    catalog.directed_edge_count = directed_edge_count;
+    catalog.undirected_edge_count = undirected_edge_count;
+
+    // Set legacy configuration flags (v1.0 compatibility)
+    catalog.has_node_properties = (node_properties_index != nullptr);
+    catalog.has_edge_properties = (edge_properties_index != nullptr);
+    catalog.undirected_relationships = (undirected_edge_count > 0);
+
+    // Set v1.1 feature flags (optional indexes)
+    catalog.includes_node_labels = features.include_node_labels;
+    catalog.includes_edge_labels = features.include_edge_labels;
+    catalog.includes_node_properties = features.include_node_properties;
+    catalog.includes_edge_properties = features.include_edge_properties;
+
+    // Save to disk
+    catalog.save();
 }
 
 } // namespace GQL

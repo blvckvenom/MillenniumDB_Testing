@@ -1,0 +1,47 @@
+<svg width="130pt" height="81pt" viewBox="0.00 0.00 130.40 81.20" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 77.2)">
+<polygon fill="white" stroke="none" points="-4,4 -4,-77.2 126.4,-77.2 126.4,4 -4,4"/>
+<!-- authorl -->
+<g id="node1" class="node">
+<title>authorl</title>
+<text text-anchor="middle" x="18" y="-64.2" font-family="Times,serif" font-size="10.00">Author</text>
+</g>
+<!-- bookl -->
+<g id="node2" class="node">
+<title>bookl</title>
+<text text-anchor="middle" x="104.4" y="-64.2" font-family="Times,serif" font-size="10.00">Author</text>
+</g>
+<!-- arrowl -->
+<g id="node3" class="node">
+<title>arrowl</title>
+<text text-anchor="middle" x="61.2" y="-46.8" font-family="Times,serif" font-size="8.00">Knows</text>
+</g>
+<!-- author_props -->
+<g id="node4" class="node">
+<title>author_props</title>
+<text text-anchor="middle" x="18" y="-12" font-family="Times,serif" font-size="8.00">name:John</text>
+<text text-anchor="middle" x="18" y="-2.4" font-family="Times,serif" font-size="8.00">born:1954</text>
+</g>
+<!-- books_props -->
+<g id="node5" class="node">
+<title>books_props</title>
+<text text-anchor="middle" x="104.4" y="-12" font-family="Times,serif" font-size="8.00">name:Jane</text>
+<text text-anchor="middle" x="104.4" y="-2.4" font-family="Times,serif" font-size="8.00">born:1959</text>
+</g>
+<!-- author -->
+<g id="node6" class="node">
+<title>author</title>
+<ellipse fill="lightgreen" stroke="black" cx="18" cy="-38.4" rx="18" ry="18"/>
+</g>
+<!-- book -->
+<g id="node7" class="node">
+<title>book</title>
+<ellipse fill="lightgreen" stroke="black" cx="104.4" cy="-38.4" rx="18" ry="18"/>
+</g>
+<!-- author&#45;&#45;book -->
+<g id="edge1" class="edge">
+<title>author--book</title>
+<path fill="none" stroke="black" d="M35.9,-38.4C50.73,-38.4 71.7,-38.4 86.52,-38.4"/>
+</g>
+</g>
+</svg>

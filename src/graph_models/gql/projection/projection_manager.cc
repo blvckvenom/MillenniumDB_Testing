@@ -59,9 +59,16 @@ std::string ProjectionManager::create_projection(const std::string& projection_n
 
     std::string proj_dir = projections_root + "/" + projection_name;
 
-    // Create projection directory
-    if (!fs::create_directories(proj_dir)) {
-        throw std::runtime_error("Failed to create projection directory: " + proj_dir);
+    // Create projection directory (create_directories returns false if already exists, which is fine)
+    try {
+        fs::create_directories(proj_dir);
+    } catch (const fs::filesystem_error& e) {
+        throw std::runtime_error("Failed to create projection directory: " + proj_dir + " - " + e.what());
+    }
+
+    // Verify the directory exists
+    if (!fs::exists(proj_dir) || !fs::is_directory(proj_dir)) {
+        throw std::runtime_error("Projection directory does not exist after creation: " + proj_dir);
     }
 
     projection_dirs[projection_name] = proj_dir;

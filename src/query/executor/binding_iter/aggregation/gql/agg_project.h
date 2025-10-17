@@ -1,74 +1,134 @@
 #pragma once
 
+#include <iostream>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 
+#include "graph_models/gql/conversions.h"
+#include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
+#include "storage/index/bplus_tree/bplus_tree.h"
 #include "query/executor/binding_iter/aggregation/agg.h"
 #include "query/executor/binding_iter/binding_expr/binding_expr_printer.h"
+#include "query/parser/expr/gql/agg/expr_agg_project.h"  // For ProjectionOptions
 #include "query/query_context.h"
 #include "system/string_manager.h"
 
 namespace GQL {
 // Aggregate function that creates a graph projection from MATCH results
-// Usage: MATCH (n)-[r]->(m) RETURN PROJECT('projection_name')
+// Usage: MATCH (n)-[r]->(m) RETURN PROJECT('projection_name' [INCLUDE LABELS] [INCLUDE PROPERTIES])
 class AggProject : public Agg {
 public:
-    AggProject(VarId var_id, std::unique_ptr<BindingExpr> projection_name_expr) :
-        Agg(var_id, std::move(projection_name_expr))
+    AggProject(
+        VarId var_id,
+        std::unique_ptr<BindingExpr> projection_name_expr,
+        ProjectionOptions options = ProjectionOptions()
+    ) :
+        Agg(var_id, std::move(projection_name_expr)),
+        options(options)
     { }
 
     void begin() override
     {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::begin() called" << std::endl;
+        #endif
+
         // Reset state for new group
         projection_storage.reset();
         projection_name.clear();
+        projection_name_oid = ObjectId(ObjectId::MASK_NULL);
+        initialized = false;
+    }
+
+    void initialize_if_needed()
+    {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::initialize_if_needed() - initialized=" << initialized << std::endl;
+        #endif
+
+        if (initialized) {
+            return;
+        }
 
         // Evaluate the projection name expression to get the actual string
         // This should be a string literal in typical usage
         ObjectId name_oid = expr->eval(*binding);
 
-        // Extract the string value
+        // Cache the ObjectId for later return
+        projection_name_oid = name_oid;
+
+        // DEBUG: Log the ObjectId for troubleshooting
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject: Evaluated expression to ObjectId: 0x"
+                  << std::hex << name_oid.id << std::dec << std::endl;
+        #endif
+
+        // Extract the string value using GQL's unpack_string function
         auto type = GQL_OID::get_type(name_oid);
-        if (type == GQL_OID::Type::STRING_SIMPLE_INLINE) {
-            // Extract inline string
-            uint64_t value = name_oid.get_value();
-            char str[8];
-            int len = 0;
-            for (int i = 6; i >= 0; i--) {
-                char c = static_cast<char>((value >> (i * 8)) & 0xFF);
-                if (c == '\0') break;
-                str[len++] = c;
-            }
-            projection_name = std::string(str, len);
-        } else if (type == GQL_OID::Type::STRING_SIMPLE_EXTERN || type == GQL_OID::Type::STRING_SIMPLE_TMP) {
-            // Extract external string
-            uint64_t external_id = name_oid.get_value();
-            char buffer[StringManager::MAX_STRING_SIZE];
-            string_manager.print_to_buffer(buffer, external_id);
-            projection_name = std::string(buffer);
+        if (type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
+            type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
+            type == GQL_OID::Type::STRING_SIMPLE_TMP) {
+            projection_name = Conversions::unpack_string(name_oid);
         } else {
-            throw std::runtime_error("PROJECT() requires a string literal as projection name");
+            std::stringstream ss;
+            ss << "PROJECT() requires a string literal as projection name. "
+               << "Got type: " << static_cast<int>(type)
+               << ", ObjectId: 0x" << std::hex << name_oid.id << std::dec;
+            throw std::runtime_error(ss.str());
+        }
+
+        // Validate projection name is not empty
+        if (projection_name.empty()) {
+            std::stringstream ss;
+            ss << "PROJECT() projection name cannot be empty. "
+               << "ObjectId: 0x" << std::hex << name_oid.id << std::dec
+               << " evaluated to empty string";
+            throw std::runtime_error(ss.str());
         }
 
         // Create the projection directory
         auto& proj_manager = ProjectionManager::get_instance();
         std::string proj_dir = proj_manager.create_projection(projection_name);
 
-        // Initialize the projection storage
+        // Convert ProjectionOptions to ProjectionStorage::Features
+        ProjectionStorage::Features features;
+        features.include_node_labels = options.include_labels;
+        features.include_edge_labels = options.include_labels;
+        features.include_node_properties = options.include_properties;
+        features.include_edge_properties = options.include_properties;
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject: Creating projection with features - labels: "
+                  << options.include_labels << ", properties: " << options.include_properties << std::endl;
+        #endif
+
+        // Initialize the projection storage with projection name and features
         projection_storage = std::make_unique<ProjectionStorage>(
             proj_dir,
-            proj_manager.get_db_folder()
+            proj_manager.get_db_folder(),
+            projection_name,  // Pass projection name for catalog
+            features          // Pass features for optional indexes
         );
         projection_storage->init();
+
+        initialized = true;
     }
 
     void process() override
     {
+        // Initialize on first process() call when binding has actual data
+        initialize_if_needed();
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::process() called, binding size: " << binding->size << std::endl;
+        #endif
+
         if (!projection_storage) {
             throw std::runtime_error("ProjectionStorage not initialized in AggProject::process()");
         }
@@ -77,6 +137,8 @@ public:
         std::map<ObjectId, std::unordered_map<std::string, ObjectId>> node_properties;
         std::map<ObjectId, std::unordered_map<std::string, ObjectId>> edge_properties;
         std::map<ObjectId, bool> edges_seen;
+        std::map<ObjectId, std::pair<ObjectId, ObjectId>> edge_endpoints; // edge_id -> (from, to)
+        std::vector<ObjectId> node_sequence; // Track order of nodes seen
 
         // First pass: collect nodes, edges, and identify property variables
         for (size_t i = 0; i < binding->size; i++) {
@@ -90,6 +152,11 @@ public:
 
             auto var_name = get_query_ctx().get_var_name(var_id);
             auto type = GQL_OID::get_type(oid);
+
+            // DEBUG: Print what we're processing
+            std::cerr << "[DEBUG] Var " << i << " (" << var_name << "): OID=0x"
+                      << std::hex << oid.id << std::dec
+                      << " type=" << static_cast<int>(type) << std::endl;
 
             // Check if this is a property variable (contains '.')
             size_t dot_pos = var_name.find('.');
@@ -116,7 +183,10 @@ public:
             }
             // Handle nodes
             else if (type == GQL_OID::Type::NODE) {
-                // Just mark that we've seen this node; will add with properties later
+                // Track node sequence for edge endpoint inference
+                node_sequence.push_back(oid);
+
+                // Mark that we've seen this node; will add with properties later
                 if (node_properties.find(oid) == node_properties.end()) {
                     node_properties[oid] = std::unordered_map<std::string, ObjectId>();
                 }
@@ -127,6 +197,32 @@ public:
                 if (edge_properties.find(oid) == edge_properties.end()) {
                     edge_properties[oid] = std::unordered_map<std::string, ObjectId>();
                 }
+
+                // Infer edge endpoints from adjacent nodes
+                // Heuristic: if we have seen at least one node, use the last node as 'from'
+                // and look ahead for the next node as 'to'
+                ObjectId from_node = ObjectId(ObjectId::NULL_ID);
+                ObjectId to_node = ObjectId(ObjectId::NULL_ID);
+
+                if (!node_sequence.empty()) {
+                    // Use the last node seen as the 'from' node
+                    from_node = node_sequence.back();
+
+                    // Look ahead for the next node
+                    for (size_t j = i + 1; j < binding->size; j++) {
+                        VarId next_var_id(j);
+                        ObjectId next_oid = (*binding)[next_var_id];
+                        if (next_oid.is_valid()) {
+                            auto next_type = GQL_OID::get_type(next_oid);
+                            if (next_type == GQL_OID::Type::NODE) {
+                                to_node = next_oid;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                edge_endpoints[oid] = std::make_pair(from_node, to_node);
             }
         }
 
@@ -136,9 +232,13 @@ public:
             node.node_id = node_id;
             node.properties = props;
             projection_storage->add_node(node);
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            std::cerr << "  Added node: 0x" << std::hex << node_id.id << std::dec << std::endl;
+            #endif
         }
 
         // Third pass: add edges with their properties
+        std::cerr << "[AggProject] Adding " << edges_seen.size() << " edges to projection storage" << std::endl;
         for (const auto& [edge_id, is_directed] : edges_seen) {
             ProjectedEdge edge;
             edge.edge_id = edge_id;
@@ -150,19 +250,86 @@ public:
                 edge.properties = props_it->second;
             }
 
-            // TODO: Extract from/to nodes by analyzing adjacent bindings
-            // For now, we store edges with placeholder from/to
-            // Proper implementation requires pattern metadata passed during initialization
-            edge.from_node = ObjectId(ObjectId::NULL_ID);
-            edge.to_node = ObjectId(ObjectId::NULL_ID);
+            // Use inferred endpoints from adjacency heuristic
+            auto endpoints_it = edge_endpoints.find(edge_id);
+            if (endpoints_it != edge_endpoints.end()) {
+                edge.from_node = endpoints_it->second.first;
+                edge.to_node = endpoints_it->second.second;
+            } else {
+                // Fallback to NULL if no endpoints found
+                edge.from_node = ObjectId(ObjectId::NULL_ID);
+                edge.to_node = ObjectId(ObjectId::NULL_ID);
+            }
 
+            std::cerr << "[AggProject] Calling add_edge for edge 0x" << std::hex << edge_id.id << std::dec
+                      << " (" << (is_directed ? "directed" : "undirected") << ")" << std::endl;
             projection_storage->add_edge(edge);
         }
+        std::cerr << "[AggProject] Finished adding edges from MATCH results" << std::endl;
+
+        // Fourth pass: extract labels from main graph if requested
+        if (options.include_labels) {
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            std::cerr << "AggProject: Extracting labels from main graph" << std::endl;
+            #endif
+
+            // Extract node labels from main graph
+            for (const auto& [node_id, props] : node_properties) {
+                bool interruption = false;
+                BptIter<2> it = gql_model.node_label
+                                    ->get_range(&interruption, { node_id.id, 0 }, { node_id.id, UINT64_MAX });
+
+                auto record = it.next();
+                while (record != nullptr) {
+                    ObjectId label_id((*record)[1]);
+                    projection_storage->add_node_label(node_id, label_id);
+
+                    #ifdef DEBUG_GQL_QUERY_VISITOR
+                    std::cerr << "    Added node label: node=0x" << std::hex << node_id.id
+                              << " label=0x" << label_id.id << std::dec << std::endl;
+                    #endif
+
+                    record = it.next();
+                }
+            }
+
+            // Extract edge labels from main graph
+            for (const auto& [edge_id, is_directed] : edges_seen) {
+                bool interruption = false;
+                BptIter<2> it = gql_model.edge_label
+                                    ->get_range(&interruption, { edge_id.id, 0 }, { edge_id.id, UINT64_MAX });
+
+                auto record = it.next();
+                while (record != nullptr) {
+                    ObjectId label_id((*record)[1]);
+                    projection_storage->add_edge_label(edge_id, label_id);
+
+                    #ifdef DEBUG_GQL_QUERY_VISITOR
+                    std::cerr << "    Added edge label: edge=0x" << std::hex << edge_id.id
+                              << " label=0x" << label_id.id << std::dec << std::endl;
+                    #endif
+
+                    record = it.next();
+                }
+            }
+
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            std::cerr << "AggProject: Label extraction complete" << std::endl;
+            #endif
+        }
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::process() complete - nodes: " << node_properties.size()
+                  << ", edges: " << edges_seen.size() << std::endl;
+        #endif
     }
 
     // Called at the end of aggregation to get the result
     ObjectId get() override
     {
+        // Initialize if needed (handles case of empty result set)
+        initialize_if_needed();
+
         if (!projection_storage) {
             throw std::runtime_error("ProjectionStorage not initialized in AggProject::get()");
         }
@@ -170,10 +337,21 @@ public:
         // Flush any pending writes
         projection_storage->flush();
 
-        // Return the projection name as a string ObjectId
-        // This allows the query to return the projection name as the result
-        uint64_t external_id = string_manager.get_str_id(projection_name);
-        return ObjectId(ObjectId::MASK_STRING_SIMPLE_EXTERN | external_id);
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::get() - flushed projection storage" << std::endl;
+        #endif
+
+        // Refresh ProjectionManager cache so the new projection is immediately visible
+        // This allows list-projections and USE queries to find it without server restart
+        auto& proj_manager = ProjectionManager::get_instance();
+        proj_manager.scan_projections();
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::get() - refreshed projection manager cache" << std::endl;
+        #endif
+
+        // Return the cached projection name ObjectId
+        return projection_name_oid;
     }
 
     std::ostream& print(std::ostream& os) const override
@@ -188,5 +366,8 @@ public:
 private:
     std::unique_ptr<ProjectionStorage> projection_storage;
     std::string projection_name;
+    ObjectId projection_name_oid;
+    bool initialized = false;
+    ProjectionOptions options;  // Options for what to include in projection
 };
 } // namespace GQL

@@ -108,7 +108,10 @@ set(PROFILE_TARGETS
 set(TEST_TARGETS
     compare_datetime
     iri_prefixes-test
+    projection_inspect
+    projection_inspect_enhanced
     projection_storage_test
+    projection_features_test
     regular_path_expr_to_rpq_dfa
     scsu-test
     tensor_operations

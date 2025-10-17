@@ -6,11 +6,12 @@
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
+#include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/rdf_model/conversions.h"
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
 
-// #define DEBUG_GQL_QUERY_VISITOR
+#define DEBUG_GQL_QUERY_VISITOR
 
 #ifdef DEBUG_GQL_QUERY_VISITOR
 
@@ -50,6 +51,11 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
 {
     LOG_VISITOR
     std::vector<std::unique_ptr<Op>> query_statements;
+
+    // Visit USE GRAPH clause if present (must be done before processing the query)
+    if (ctx->useGraphClause()) {
+        visit(ctx->useGraphClause());
+    }
 
     // for now we visit only if there is a return statement
     if (!ctx->primitiveResultStatement()) {
@@ -1533,10 +1539,80 @@ std::any QueryVisitor::visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunction
 std::any QueryVisitor::visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext* ctx)
 {
     LOG_VISITOR
+
+    // Null check and validation
+    if (!ctx->projectionName) {
+        throw QuerySemanticException("PROJECT() requires a projection name parameter");
+    }
+
+    // DEBUG: Log what we're about to visit
+    #ifdef DEBUG_GQL_QUERY_VISITOR
+    LOG_INFO("PROJECT function - visiting projectionName: " + ctx->projectionName->getText());
+    #endif
+
     visit(ctx->projectionName);
     auto projection_name_expr = std::move(current_expr);
+
+    // Validate that we got a valid expression
+    if (!projection_name_expr) {
+        throw QuerySemanticException("PROJECT() projection name expression is invalid");
+    }
+
+    // DEBUG: Verify the expression type
+    #ifdef DEBUG_GQL_QUERY_VISITOR
+    if (auto* term = dynamic_cast<ExprTerm*>(projection_name_expr.get())) {
+        LOG_INFO("PROJECT function - got ExprTerm with ObjectId: 0x" + std::to_string(term->term.id));
+    }
+    #endif
+
     VarId agg_var = get_query_ctx().get_internal_var();
-    current_expr = std::make_unique<ExprAggProject>(std::move(projection_name_expr), agg_var);
+
+    // Parse projection options if present
+    ProjectionOptions options;
+    if (ctx->projectionOptions()) {
+        // Reset current options before visiting
+        current_projection_options = ProjectionOptions();
+        visit(ctx->projectionOptions());
+        options = current_projection_options;
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - options: labels=" + std::to_string(options.include_labels) +
+                 ", properties=" + std::to_string(options.include_properties));
+        #endif
+    }
+
+    current_expr = std::make_unique<ExprAggProject>(std::move(projection_name_expr), agg_var, options);
+    return 0;
+}
+
+std::any QueryVisitor::visitProjectionOptions(GQLParser::ProjectionOptionsContext* ctx)
+{
+    LOG_VISITOR
+
+    // Visit all INCLUDE clauses
+    for (auto* include_clause : ctx->projectionIncludeClause()) {
+        visit(include_clause);
+    }
+
+    return 0;
+}
+
+std::any QueryVisitor::visitProjectionIncludeClause(GQLParser::ProjectionIncludeClauseContext* ctx)
+{
+    LOG_VISITOR
+
+    if (ctx->LABELS()) {
+        current_projection_options.include_labels = true;
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("Projection option: INCLUDE LABELS");
+        #endif
+    } else if (ctx->PROPERTIES()) {
+        current_projection_options.include_properties = true;
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("Projection option: INCLUDE PROPERTIES");
+        #endif
+    }
+
     return 0;
 }
 
@@ -1692,7 +1768,7 @@ std::any QueryVisitor::visitSingleQuotedCharacterSequence(GQLParser::SingleQuote
         }
         raw_string = std::string(raw_string, start_pos, raw_string.size() - 2);
 
-        ObjectId oid = SPARQL::Conversions::pack_string_simple(raw_string);
+        ObjectId oid = Conversions::pack_string_simple(raw_string);
         str_expressions.push_back(std::make_unique<ExprTerm>(oid));
     }
 
@@ -1720,7 +1796,7 @@ std::any QueryVisitor::visitDoubleQuotedCharacterSequence(GQLParser::DoubleQuote
         }
         raw_string = std::string(raw_string, start_pos, raw_string.size() - 2);
 
-        ObjectId oid = SPARQL::Conversions::pack_string_simple(raw_string);
+        ObjectId oid = Conversions::pack_string_simple(raw_string);
         str_expressions.push_back(std::make_unique<ExprTerm>(oid));
     }
 
@@ -2145,9 +2221,143 @@ std::any QueryVisitor::visitNestedProcedureSpecification(GQLParser::NestedProced
     throw NotSupportedException("Nested procedure");
 }
 
-std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext*)
+std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* ctx)
 {
-    throw NotSupportedException("Graph expression");
+    LOG_VISITOR
+
+    // Debug: log what we have
+    std::cerr << "[visitGraphExpression] graphReference=" << (ctx->graphReference() ? "YES" : "NO")
+              << ", objectNameOrBindingVariable=" << (ctx->objectNameOrBindingVariable() ? "YES" : "NO")
+              << ", objectExpressionPrimary=" << (ctx->objectExpressionPrimary() ? "YES" : "NO")
+              << ", currentGraph=" << (ctx->currentGraph() ? "YES" : "NO")
+              << ", getText()=\"" << ctx->getText() << "\""
+              << std::endl;
+
+    // Handle graph reference (projection name)
+    if (ctx->graphReference()) {
+        return visitGraphReference(ctx->graphReference());
+    }
+
+    // Handle objectNameOrBindingVariable (simple string like "my_projection")
+    if (ctx->objectNameOrBindingVariable()) {
+        std::string projection_name = ctx->objectNameOrBindingVariable()->getText();
+
+        // Verify projection exists
+        auto& proj_manager = ProjectionManager::get_instance();
+        if (!proj_manager.projection_exists(projection_name)) {
+            auto projections = proj_manager.list_projections();
+            std::string available;
+            for (size_t i = 0; i < projections.size(); i++) {
+                if (i > 0) available += ", ";
+                available += projections[i].name;
+            }
+            throw QuerySemanticException(
+                "Projection '" + projection_name + "' does not exist. Available projections: [" +
+                (available.empty() ? "none" : available) + "]"
+            );
+        }
+
+        // Load projection into QueryContext
+        get_query_ctx().load_projection(projection_name);
+        return 0;
+    }
+
+    // Handle objectExpressionPrimary (could be a string literal)
+    if (ctx->objectExpressionPrimary()) {
+        // This might be a string literal like "test_friends"
+        std::string projection_name = ctx->getText();
+
+        // Remove surrounding quotes if present
+        if (projection_name.length() >= 2 &&
+            (projection_name[0] == '"' || projection_name[0] == '\'') &&
+            projection_name[0] == projection_name[projection_name.length() - 1]) {
+            projection_name = projection_name.substr(1, projection_name.length() - 2);
+        }
+
+        // Verify projection exists
+        auto& proj_manager = ProjectionManager::get_instance();
+        if (!proj_manager.projection_exists(projection_name)) {
+            auto projections = proj_manager.list_projections();
+            std::string available;
+            for (size_t i = 0; i < projections.size(); i++) {
+                if (i > 0) available += ", ";
+                available += projections[i].name;
+            }
+            throw QuerySemanticException(
+                "Projection '" + projection_name + "' does not exist. Available projections: [" +
+                (available.empty() ? "none" : available) + "]"
+            );
+        }
+
+        // Load projection into QueryContext
+        get_query_ctx().load_projection(projection_name);
+        return 0;
+    }
+
+    // Handle CURRENT_GRAPH - clear any active projection
+    if (ctx->currentGraph()) {
+        get_query_ctx().active_projection.clear();
+        return 0;
+    }
+
+    // Other graph expression types not yet supported
+    throw NotSupportedException("Graph expression (only graphReference and currentGraph supported)");
+}
+
+std::any QueryVisitor::visitGraphReference(GQLParser::GraphReferenceContext* ctx)
+{
+    LOG_VISITOR
+    std::cerr << "[QueryVisitor] visitGraphReference() called" << std::endl;
+    std::string projection_name;
+
+    // Extract projection name from different possible syntaxes
+    if (ctx->delimitedGraphName()) {
+        // Handle delimited identifier (e.g., "my_projection" or `my_projection`)
+        auto text = ctx->delimitedGraphName()->getText();
+        // Remove surrounding quotes or backticks
+        projection_name = text.substr(1, text.length() - 2);
+    } else if (ctx->catalogObjectParentReference() && ctx->graphName()) {
+        // Handle qualified name (catalog.schema.graph_name)
+        // For now, just use the graph name part
+        projection_name = ctx->graphName()->getText();
+    } else if (ctx->homeGraph()) {
+        // HOME_GRAPH refers to the main graph
+        get_query_ctx().active_projection.clear();
+        return 0;
+    } else {
+        throw QuerySemanticException("Invalid graph reference syntax");
+    }
+
+    // Verify projection exists
+    auto& proj_manager = ProjectionManager::get_instance();
+    if (!proj_manager.projection_exists(projection_name)) {
+        // List available projections for error message
+        auto projections = proj_manager.list_projections();
+        std::string available;
+        for (size_t i = 0; i < projections.size(); i++) {
+            if (i > 0) available += ", ";
+            available += projections[i].name;
+        }
+
+        throw QuerySemanticException(
+            "Projection '" + projection_name + "' does not exist. Available projections: [" +
+            (available.empty() ? "none" : available) + "]"
+        );
+    }
+
+    // Load projection into QueryContext (this sets active_projection and loads the B+tree indexes)
+    get_query_ctx().load_projection(projection_name);
+
+    return 0;
+}
+
+std::any QueryVisitor::visitUseGraphClause(GQLParser::UseGraphClauseContext* ctx)
+{
+    LOG_VISITOR
+    if (ctx->graphExpression()) {
+        visitGraphExpression(ctx->graphExpression());
+    }
+    return 0;
 }
 
 std::any QueryVisitor::visitBindingTableExpression(GQLParser::BindingTableExpressionContext*)

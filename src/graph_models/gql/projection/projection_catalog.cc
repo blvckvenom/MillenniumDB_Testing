@@ -56,7 +56,7 @@ void ProjectionCatalog::load() {
     }
     // Minor version differences are acceptable (forward compatible)
 
-    // Read catalog data
+    // Read catalog data (common to all v1.x versions)
     projection_name = read_string(file);
     creation_timestamp = read_uint64(file);
 
@@ -74,6 +74,20 @@ void ProjectionCatalog::load() {
 
     node_property_names = read_strvec(file);
     edge_property_names = read_strvec(file);
+
+    // Read new fields added in v1.1 (optional labels/properties)
+    if (minor_ver >= 1) {
+        includes_node_labels = read_uint8(file) != 0;
+        includes_edge_labels = read_uint8(file) != 0;
+        includes_node_properties = read_uint8(file) != 0;
+        includes_edge_properties = read_uint8(file) != 0;
+
+        included_node_properties = read_strvec(file);
+        included_edge_properties = read_strvec(file);
+
+        distinct_node_labels = read_uint64(file);
+        distinct_edge_labels = read_uint64(file);
+    }
 
     file.close();
 }
@@ -99,7 +113,7 @@ void ProjectionCatalog::save() {
     write_uint8(file, MAJOR_VERSION);
     write_uint8(file, MINOR_VERSION);
 
-    // Write catalog data
+    // Write catalog data (v1.0 fields)
     write_string(file, projection_name);
     write_uint64(file, creation_timestamp);
 
@@ -118,6 +132,18 @@ void ProjectionCatalog::save() {
     write_strvec(file, node_property_names);
     write_strvec(file, edge_property_names);
 
+    // Write v1.1 fields (optional labels/properties)
+    write_uint8(file, includes_node_labels ? 1 : 0);
+    write_uint8(file, includes_edge_labels ? 1 : 0);
+    write_uint8(file, includes_node_properties ? 1 : 0);
+    write_uint8(file, includes_edge_properties ? 1 : 0);
+
+    write_strvec(file, included_node_properties);
+    write_strvec(file, included_edge_properties);
+
+    write_uint64(file, distinct_node_labels);
+    write_uint64(file, distinct_edge_labels);
+
     file.close();
 }
 
@@ -128,8 +154,43 @@ void ProjectionCatalog::print(std::ostream& os) const {
     os << "Edges: " << edge_count
        << " (Directed: " << directed_edge_count
        << ", Undirected: " << undirected_edge_count << ")\n";
-    os << "Properties: Nodes=" << (has_node_properties ? "Yes" : "No")
-       << ", Edges=" << (has_edge_properties ? "Yes" : "No") << "\n";
+
+    // Show v1.1 features if available
+    os << "Features:\n";
+    os << "  Node Labels: " << (includes_node_labels ? "Yes" : "No");
+    if (includes_node_labels && distinct_node_labels > 0) {
+        os << " (" << distinct_node_labels << " distinct)";
+    }
+    os << "\n";
+
+    os << "  Edge Labels: " << (includes_edge_labels ? "Yes" : "No");
+    if (includes_edge_labels && distinct_edge_labels > 0) {
+        os << " (" << distinct_edge_labels << " distinct)";
+    }
+    os << "\n";
+
+    os << "  Node Properties: " << (includes_node_properties ? "Yes" : "No");
+    if (includes_node_properties && !included_node_properties.empty()) {
+        os << " [";
+        for (size_t i = 0; i < included_node_properties.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << included_node_properties[i];
+        }
+        os << "]";
+    }
+    os << "\n";
+
+    os << "  Edge Properties: " << (includes_edge_properties ? "Yes" : "No");
+    if (includes_edge_properties && !included_edge_properties.empty()) {
+        os << " [";
+        for (size_t i = 0; i < included_edge_properties.size(); ++i) {
+            if (i > 0) os << ", ";
+            os << included_edge_properties[i];
+        }
+        os << "]";
+    }
+    os << "\n";
+
     os << "Creation time: " << projection_millis << "ms\n";
 }
 

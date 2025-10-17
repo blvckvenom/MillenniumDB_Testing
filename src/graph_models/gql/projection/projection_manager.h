@@ -47,14 +47,16 @@ public:
     // Get database folder
     const std::string& get_db_folder() const { return db_folder; }
 
+    // Refresh projection cache by rescanning projection directory
+    // Useful after creating new projections to make them immediately visible
+    void scan_projections();
+
 private:
     ProjectionManager() = default;
     ~ProjectionManager() = default;
 
     ProjectionManager(const ProjectionManager&) = delete;
     ProjectionManager& operator=(const ProjectionManager&) = delete;
-
-    void scan_projections();
     void remove_directory(const std::string& path);
 
     std::string db_folder;

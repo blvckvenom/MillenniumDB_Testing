@@ -249,7 +249,7 @@ int main(int argc, char* argv[])
                 return RunCLI(Model::RDF, config.query_timeout);
             }
             case Catalog::ModelID::GQL: {
-                auto model_destroyer = GQLModel::init();
+                auto model_destroyer = GQLModel::init(config.db_directory);
                 return RunCLI(Model::GQL, config.query_timeout);
             }
             }

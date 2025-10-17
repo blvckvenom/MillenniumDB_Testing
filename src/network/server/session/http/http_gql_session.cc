@@ -100,12 +100,26 @@ void HttpGQLSession::execute_readonly_query(
     GQL::ReturnType response_type
 )
 {
+    // Check if query contains PROJECT function - if so, we need an editable scope
+    // to persist the projection data to disk
+    bool needs_editable = (query.find("PROJECT") != std::string::npos
+                        || query.find("project") != std::string::npos);
+
     // Declared here because the destruction need to be after calling execute_query_plan
-    auto read_only_version_scope = buffer_manager.init_version_readonly();
+    std::unique_ptr<BufferManager::VersionScope> version_scope;
+
+    if (needs_editable) {
+        // Use editable scope for queries that modify data (e.g., PROJECT)
+        std::lock_guard<std::mutex> lock(server.update_execution_mutex);
+        version_scope = buffer_manager.init_version_editable();
+    } else {
+        // Use readonly scope for pure read queries
+        version_scope = buffer_manager.init_version_readonly();
+    }
 
     {
         std::lock_guard<std::mutex> lock(server.thread_info_vec_mutex);
-        get_query_ctx().prepare(*read_only_version_scope, query_timeout);
+        get_query_ctx().prepare(*version_scope, query_timeout);
     }
     logger(Category::Info) << "Cancellation: " << get_query_ctx().thread_info.worker_index << ' '
                            << get_query_ctx().cancellation_token;
@@ -113,6 +127,13 @@ void HttpGQLSession::execute_readonly_query(
     std::unique_ptr<QueryExecutor> physical_plan;
     try {
         auto logical_plan = create_readonly_logical_plan(query);
+
+        // Load projection context if USE GRAPH was specified
+        auto& ctx = get_query_ctx();
+        if (ctx.is_using_projection()) {
+            ctx.load_projection(ctx.active_projection);
+        }
+
         physical_plan = create_readonly_physical_plan(*logical_plan, response_type);
     } catch (const QueryParsingException& e) {
         std::string msg = "Query Parsing Exception. Line " + std::to_string(e.line)
@@ -146,6 +167,11 @@ void HttpGQLSession::execute_readonly_query(
 
     try {
         execute_readonly_query_plan(*physical_plan, os, response_type);
+
+        // If we used an editable scope, mark it as committed so changes persist
+        if (needs_editable) {
+            version_scope->commited = true;
+        }
     } catch (const ConnectionException& e) {
         logger(Category::Error) << "Connection Exception: " << e.what();
     } catch (const InterruptedException& e) {

@@ -544,6 +544,10 @@ IN
    : 'IN'
    ;
 
+INCLUDE
+   : 'INCLUDE'
+   ;
+
 INSERT
    : 'INSERT'
    ;
