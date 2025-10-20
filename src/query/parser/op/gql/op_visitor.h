@@ -18,6 +18,7 @@ class OpQueryStatements;
 class OpGroupBy;
 class OpUnitTable;
 class OpEmpty;
+class OpProcedure;
 
 class OpVisitor {
 public:
@@ -40,5 +41,6 @@ public:
     virtual void visit(OpGroupBy&) = 0;
     virtual void visit(OpUnitTable&) = 0;
     virtual void visit(OpEmpty&) = 0;
+    virtual void visit(OpProcedure&) = 0;
 };
 } // namespace GQL
