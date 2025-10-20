@@ -80,17 +80,20 @@ BPlusTree<3>& GQLModel::get_to_from_edge() {
 BPlusTree<2>& GQLModel::get_node_label() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
-            "Cannot use node labels with projection '" + ctx.active_projection + "'.\n\n"
-            "Reason: This projection does not include node label information.\n\n"
-            "Solutions:\n"
-            "  1. Query the main graph instead:\n"
-            "     Remove the USE clause from your query\n\n"
-            "  2. Recreate projection with labels (FUTURE FEATURE):\n"
-            "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE NODE LABELS)\n\n"
-            "  3. Switch to main graph temporarily:\n"
-            "     USE CURRENT_GRAPH MATCH ... RETURN ..."
-        );
+        if (!ctx.projection_ctx || !ctx.projection_ctx->node_label_index) {
+            throw std::runtime_error(
+                "Cannot use node labels with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include node label information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with labels:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE LABELS)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->node_label_index;
     }
     return *node_label;
 }
@@ -98,35 +101,83 @@ BPlusTree<2>& GQLModel::get_node_label() {
 BPlusTree<2>& GQLModel::get_edge_label() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
-            "Cannot use edge labels with projection '" + ctx.active_projection + "'.\n\n"
-            "Reason: This projection does not include edge label information.\n\n"
-            "Solutions:\n"
-            "  1. Query the main graph instead:\n"
-            "     Remove the USE clause from your query\n\n"
-            "  2. Recreate projection with labels (FUTURE FEATURE):\n"
-            "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE EDGE LABELS)\n\n"
-            "  3. Switch to main graph temporarily:\n"
-            "     USE CURRENT_GRAPH MATCH ... RETURN ..."
-        );
+        if (!ctx.projection_ctx || !ctx.projection_ctx->edge_label_index) {
+            throw std::runtime_error(
+                "Cannot use edge labels with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include edge label information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with labels:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE LABELS)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->edge_label_index;
     }
     return *edge_label;
+}
+
+BPlusTree<2>& GQLModel::get_label_node() {
+    auto& ctx = get_query_ctx();
+    if (ctx.is_using_projection()) {
+        if (!ctx.projection_ctx || !ctx.projection_ctx->label_node_index) {
+            throw std::runtime_error(
+                "Cannot use node labels with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include node label information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with labels:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE LABELS)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->label_node_index;
+    }
+    return *label_node;
+}
+
+BPlusTree<2>& GQLModel::get_label_edge() {
+    auto& ctx = get_query_ctx();
+    if (ctx.is_using_projection()) {
+        if (!ctx.projection_ctx || !ctx.projection_ctx->label_edge_index) {
+            throw std::runtime_error(
+                "Cannot use edge labels with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include edge label information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with labels:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE LABELS)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->label_edge_index;
+    }
+    return *label_edge;
 }
 
 BPlusTree<3>& GQLModel::get_node_key_value() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
-            "Cannot access node properties with projection '" + ctx.active_projection + "'.\n\n"
-            "Reason: This projection does not include node property information.\n\n"
-            "Solutions:\n"
-            "  1. Query the main graph instead:\n"
-            "     Remove the USE clause from your query\n\n"
-            "  2. Recreate projection with properties (FUTURE FEATURE):\n"
-            "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE NODE PROPERTIES (name, age))\n\n"
-            "  3. Switch to main graph temporarily:\n"
-            "     USE CURRENT_GRAPH MATCH ... RETURN ..."
-        );
+        if (!ctx.projection_ctx || !ctx.projection_ctx->node_key_value_index) {
+            throw std::runtime_error(
+                "Cannot access node properties with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include node property information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with properties:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE PROPERTIES)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->node_key_value_index;
     }
     return *node_key_value;
 }
@@ -134,19 +185,64 @@ BPlusTree<3>& GQLModel::get_node_key_value() {
 BPlusTree<3>& GQLModel::get_edge_key_value() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
-            "Cannot access edge properties with projection '" + ctx.active_projection + "'.\n\n"
-            "Reason: This projection does not include edge property information.\n\n"
-            "Solutions:\n"
-            "  1. Query the main graph instead:\n"
-            "     Remove the USE clause from your query\n\n"
-            "  2. Recreate projection with properties (FUTURE FEATURE):\n"
-            "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE EDGE PROPERTIES (since, weight))\n\n"
-            "  3. Switch to main graph temporarily:\n"
-            "     USE CURRENT_GRAPH MATCH ... RETURN ..."
-        );
+        if (!ctx.projection_ctx || !ctx.projection_ctx->edge_key_value_index) {
+            throw std::runtime_error(
+                "Cannot access edge properties with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include edge property information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with properties:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE PROPERTIES)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->edge_key_value_index;
     }
     return *edge_key_value;
+}
+
+BPlusTree<3>& GQLModel::get_key_value_node() {
+    auto& ctx = get_query_ctx();
+    if (ctx.is_using_projection()) {
+        if (!ctx.projection_ctx || !ctx.projection_ctx->key_value_node_index) {
+            throw std::runtime_error(
+                "Cannot access node properties with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include node property information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with properties:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE PROPERTIES)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->key_value_node_index;
+    }
+    return *key_value_node;
+}
+
+BPlusTree<3>& GQLModel::get_key_value_edge() {
+    auto& ctx = get_query_ctx();
+    if (ctx.is_using_projection()) {
+        if (!ctx.projection_ctx || !ctx.projection_ctx->key_value_edge_index) {
+            throw std::runtime_error(
+                "Cannot access edge properties with projection '" + ctx.active_projection + "'.\n\n"
+                "Reason: This projection does not include edge property information.\n\n"
+                "Solutions:\n"
+                "  1. Query the main graph instead:\n"
+                "     Remove the USE clause from your query\n\n"
+                "  2. Recreate projection with properties:\n"
+                "     MATCH ... RETURN PROJECT(\"" + ctx.active_projection + "\", INCLUDE PROPERTIES)\n\n"
+                "  3. Switch to main graph temporarily:\n"
+                "     USE CURRENT_GRAPH MATCH ... RETURN ..."
+            );
+        }
+        return *ctx.projection_ctx->key_value_edge_index;
+    }
+    return *key_value_edge;
 }
 
 BPlusTree<3>& GQLModel::get_edge_from_to() {

@@ -318,6 +318,60 @@ public:
             #endif
         }
 
+        // Fifth pass: extract properties from main graph if requested
+        if (options.include_properties) {
+            std::cerr << "[AggProject] PROPERTY EXTRACTION STARTED - include_properties=" << options.include_properties << std::endl;
+            std::cerr << "[AggProject] Number of nodes to extract properties for: " << node_properties.size() << std::endl;
+
+            // Extract node properties from main graph
+            for (const auto& [node_id, props] : node_properties) {
+                std::cerr << "[AggProject] Extracting properties for node 0x" << std::hex << node_id.id << std::dec << std::endl;
+                bool interruption = false;
+                BptIter<3> it = gql_model.node_key_value
+                                    ->get_range(&interruption, { node_id.id, 0, 0 }, { node_id.id, UINT64_MAX, UINT64_MAX });
+
+                auto record = it.next();
+                int prop_count = 0;
+                while (record != nullptr) {
+                    ObjectId key_id((*record)[1]);
+                    ObjectId value_id((*record)[2]);
+                    projection_storage->add_node_property(node_id, key_id, value_id);
+                    prop_count++;
+
+                    std::cerr << "[AggProject]     Added node property #" << prop_count << ": node=0x" << std::hex << node_id.id
+                              << " key=0x" << key_id.id << " value=0x" << value_id.id << std::dec << std::endl;
+
+                    record = it.next();
+                }
+                std::cerr << "[AggProject]   Total properties for node 0x" << std::hex << node_id.id << std::dec << ": " << prop_count << std::endl;
+            }
+
+            // Extract edge properties from main graph
+            std::cerr << "[AggProject] Number of edges to extract properties for: " << edges_seen.size() << std::endl;
+            for (const auto& [edge_id, is_directed] : edges_seen) {
+                bool interruption = false;
+                BptIter<3> it = gql_model.edge_key_value
+                                    ->get_range(&interruption, { edge_id.id, 0, 0 }, { edge_id.id, UINT64_MAX, UINT64_MAX });
+
+                auto record = it.next();
+                int edge_prop_count = 0;
+                while (record != nullptr) {
+                    ObjectId key_id((*record)[1]);
+                    ObjectId value_id((*record)[2]);
+                    projection_storage->add_edge_property(edge_id, key_id, value_id);
+                    edge_prop_count++;
+
+                    std::cerr << "[AggProject]     Added edge property #" << edge_prop_count << ": edge=0x" << std::hex << edge_id.id
+                              << " key=0x" << key_id.id << " value=0x" << value_id.id << std::dec << std::endl;
+
+                    record = it.next();
+                }
+                std::cerr << "[AggProject]   Total properties for edge 0x" << std::hex << edge_id.id << std::dec << ": " << edge_prop_count << std::endl;
+            }
+
+            std::cerr << "[AggProject] PROPERTY EXTRACTION COMPLETE" << std::endl;
+        }
+
         #ifdef DEBUG_GQL_QUERY_VISITOR
         std::cerr << "AggProject::process() complete - nodes: " << node_properties.size()
                   << ", edges: " << edges_seen.size() << std::endl;

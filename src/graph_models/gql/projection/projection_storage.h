@@ -79,6 +79,12 @@ public:
     // Add an edge label to the projection (requires INCLUDE LABELS)
     void add_edge_label(ObjectId edge_id, ObjectId label_id);
 
+    // Add a node property to the projection (requires INCLUDE PROPERTIES)
+    void add_node_property(ObjectId node_id, ObjectId key_id, ObjectId value_id);
+
+    // Add an edge property to the projection (requires INCLUDE PROPERTIES)
+    void add_edge_property(ObjectId edge_id, ObjectId key_id, ObjectId value_id);
+
     // Check if a node exists
     bool has_node(ObjectId node_id) const;
 
@@ -112,11 +118,15 @@ public:
 
     // Getters for optional label indexes (may be null if not included)
     BPlusTree<2>* get_node_label_index() { return node_label_index.get(); }
+    BPlusTree<2>* get_label_node_index() { return label_node_index.get(); }
     BPlusTree<2>* get_edge_label_index() { return edge_label_index.get(); }
+    BPlusTree<2>* get_label_edge_index() { return label_edge_index.get(); }
 
     // Getters for optional property indexes (may be null if not included)
     BPlusTree<3>* get_node_key_value_index() { return node_key_value_index.get(); }
+    BPlusTree<3>* get_key_value_node_index() { return key_value_node_index.get(); }
     BPlusTree<3>* get_edge_key_value_index() { return edge_key_value_index.get(); }
+    BPlusTree<3>* get_key_value_edge_index() { return key_value_edge_index.get(); }
 
     // Const versions for read-only access
     const BPlusTree<1>* get_nodes_index() const { return nodes_index.get(); }
@@ -125,9 +135,13 @@ public:
     const BPlusTree<2>* get_edge_direction_index() const { return edge_direction_index.get(); }
 
     const BPlusTree<2>* get_node_label_index() const { return node_label_index.get(); }
+    const BPlusTree<2>* get_label_node_index() const { return label_node_index.get(); }
     const BPlusTree<2>* get_edge_label_index() const { return edge_label_index.get(); }
+    const BPlusTree<2>* get_label_edge_index() const { return label_edge_index.get(); }
     const BPlusTree<3>* get_node_key_value_index() const { return node_key_value_index.get(); }
+    const BPlusTree<3>* get_key_value_node_index() const { return key_value_node_index.get(); }
     const BPlusTree<3>* get_edge_key_value_index() const { return edge_key_value_index.get(); }
+    const BPlusTree<3>* get_key_value_edge_index() const { return key_value_edge_index.get(); }
 
 private:
     // Flush batched nodes to B+tree
@@ -153,12 +167,16 @@ private:
     std::unique_ptr<BPlusTree<2>> edge_direction_index;  // {edge_id, is_directed}
 
     // Optional label indexes (only if INCLUDE LABELS specified)
-    std::unique_ptr<BPlusTree<2>> node_label_index;      // {node_id, label_id}
-    std::unique_ptr<BPlusTree<2>> edge_label_index;      // {edge_id, label_id}
+    std::unique_ptr<BPlusTree<2>> node_label_index;      // {node_id, label_id} - given node, find labels
+    std::unique_ptr<BPlusTree<2>> label_node_index;      // {label_id, node_id} - given label, find nodes
+    std::unique_ptr<BPlusTree<2>> edge_label_index;      // {edge_id, label_id} - given edge, find labels
+    std::unique_ptr<BPlusTree<2>> label_edge_index;      // {label_id, edge_id} - given label, find edges
 
     // Optional property indexes (only if INCLUDE PROPERTIES specified)
-    std::unique_ptr<BPlusTree<3>> node_key_value_index;  // {node_id, key_id, value_id}
-    std::unique_ptr<BPlusTree<3>> edge_key_value_index;  // {edge_id, key_id, value_id}
+    std::unique_ptr<BPlusTree<3>> node_key_value_index;  // {node_id, key_id, value_id} - given node, find properties
+    std::unique_ptr<BPlusTree<3>> key_value_node_index;  // {key_id, value_id, node_id} - given property, find nodes
+    std::unique_ptr<BPlusTree<3>> edge_key_value_index;  // {edge_id, key_id, value_id} - given edge, find properties
+    std::unique_ptr<BPlusTree<3>> key_value_edge_index;  // {key_id, value_id, edge_id} - given property, find edges
 
     // Legacy property storage (deprecated - for backward compatibility)
     std::unique_ptr<BPlusTree<3>> node_properties_index; // {node_id, prop_key, prop_value}

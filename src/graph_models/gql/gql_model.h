@@ -58,13 +58,17 @@ public:
     BPlusTree<2>& get_equal_d_edge();
     BPlusTree<2>& get_equal_u_edge();
 
-    // Label indexes (NOT in projections - will throw error if used with projection)
-    BPlusTree<2>& get_node_label();
-    BPlusTree<2>& get_edge_label();
+    // Label indexes (optional in projections if INCLUDE LABELS was used)
+    BPlusTree<2>& get_node_label();  // {node_id, label_id}
+    BPlusTree<2>& get_label_node();  // {label_id, node_id}
+    BPlusTree<2>& get_edge_label();  // {edge_id, label_id}
+    BPlusTree<2>& get_label_edge();  // {label_id, edge_id}
 
-    // Property indexes (NOT in projections - will throw error if used with projection)
-    BPlusTree<3>& get_node_key_value();
-    BPlusTree<3>& get_edge_key_value();
+    // Property indexes (optional in projections if INCLUDE PROPERTIES was used)
+    BPlusTree<3>& get_node_key_value();  // {node_id, key_id, value_id}
+    BPlusTree<3>& get_key_value_node();  // {key_id, value_id, node_id}
+    BPlusTree<3>& get_edge_key_value();  // {edge_id, key_id, value_id}
+    BPlusTree<3>& get_key_value_edge();  // {key_id, value_id, edge_id}
 
 private:
     GQLModel();

@@ -115,23 +115,31 @@ void ProjectionStorage::init() {
     // Initialize optional label indexes if requested
     if (features.include_node_labels) {
         init_empty_bptree<2>(projection_dir + "/node_label");
+        init_empty_bptree<2>(projection_dir + "/label_node");  // Auxiliary index for label->node lookup
         node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+        label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
     }
 
     if (features.include_edge_labels) {
         init_empty_bptree<2>(projection_dir + "/edge_label");
+        init_empty_bptree<2>(projection_dir + "/label_edge");  // Auxiliary index for label->edge lookup
         edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+        label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
     }
 
     // Initialize optional property indexes if requested
     if (features.include_node_properties) {
         init_empty_bptree<3>(projection_dir + "/node_key_value");
+        init_empty_bptree<3>(projection_dir + "/key_value_node");  // Auxiliary index for key/value->node lookup
         node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
+        key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");
     }
 
     if (features.include_edge_properties) {
         init_empty_bptree<3>(projection_dir + "/edge_key_value");
+        init_empty_bptree<3>(projection_dir + "/key_value_edge");  // Auxiliary index for key/value->edge lookup
         edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
+        key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
     }
 }
 
@@ -162,22 +170,38 @@ void ProjectionStorage::open() {
     if (std::filesystem::exists(proj_path / "node_label.leaf")) {
         node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
         features.include_node_labels = true;
+        // Also open auxiliary index if it exists
+        if (std::filesystem::exists(proj_path / "label_node.leaf")) {
+            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
+        }
     }
 
     if (std::filesystem::exists(proj_path / "edge_label.leaf")) {
         edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
         features.include_edge_labels = true;
+        // Also open auxiliary index if it exists
+        if (std::filesystem::exists(proj_path / "label_edge.leaf")) {
+            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
+        }
     }
 
     // Open optional property indexes if they exist
     if (std::filesystem::exists(proj_path / "node_key_value.leaf")) {
         node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
         features.include_node_properties = true;
+        // Also open auxiliary index if it exists
+        if (std::filesystem::exists(proj_path / "key_value_node.leaf")) {
+            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");
+        }
     }
 
     if (std::filesystem::exists(proj_path / "edge_key_value.leaf")) {
         edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
         features.include_edge_properties = true;
+        // Also open auxiliary index if it exists
+        if (std::filesystem::exists(proj_path / "key_value_edge.leaf")) {
+            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
+        }
     }
 }
 
@@ -228,11 +252,19 @@ void ProjectionStorage::add_node_label(ObjectId node_id, ObjectId label_id) {
         return;
     }
 
-    Record<2> label_record;
-    label_record[0] = node_id.id;
-    label_record[1] = label_id.id;
+    // Write to primary index: {node_id, label_id}
+    Record<2> node_label_record;
+    node_label_record[0] = node_id.id;
+    node_label_record[1] = label_id.id;
+    node_label_index->insert(node_label_record);
 
-    node_label_index->insert(label_record);
+    // Write to auxiliary index: {label_id, node_id} (for efficient label->nodes queries)
+    if (label_node_index) {
+        Record<2> label_node_record;
+        label_node_record[0] = label_id.id;
+        label_node_record[1] = node_id.id;
+        label_node_index->insert(label_node_record);
+    }
 }
 
 void ProjectionStorage::add_edge_label(ObjectId edge_id, ObjectId label_id) {
@@ -241,11 +273,65 @@ void ProjectionStorage::add_edge_label(ObjectId edge_id, ObjectId label_id) {
         return;
     }
 
-    Record<2> label_record;
-    label_record[0] = edge_id.id;
-    label_record[1] = label_id.id;
+    // Write to primary index: {edge_id, label_id}
+    Record<2> edge_label_record;
+    edge_label_record[0] = edge_id.id;
+    edge_label_record[1] = label_id.id;
+    edge_label_index->insert(edge_label_record);
 
-    edge_label_index->insert(label_record);
+    // Write to auxiliary index: {label_id, edge_id} (for efficient label->edges queries)
+    if (label_edge_index) {
+        Record<2> label_edge_record;
+        label_edge_record[0] = label_id.id;
+        label_edge_record[1] = edge_id.id;
+        label_edge_index->insert(label_edge_record);
+    }
+}
+
+void ProjectionStorage::add_node_property(ObjectId node_id, ObjectId key_id, ObjectId value_id) {
+    // Only insert if property index is enabled
+    if (!node_key_value_index) {
+        return;
+    }
+
+    // Write to primary index: {node_id, key_id, value_id}
+    Record<3> node_prop_record;
+    node_prop_record[0] = node_id.id;
+    node_prop_record[1] = key_id.id;
+    node_prop_record[2] = value_id.id;
+    node_key_value_index->insert(node_prop_record);
+
+    // Write to auxiliary index: {key_id, value_id, node_id} (for efficient property->nodes queries)
+    if (key_value_node_index) {
+        Record<3> key_value_node_record;
+        key_value_node_record[0] = key_id.id;
+        key_value_node_record[1] = value_id.id;
+        key_value_node_record[2] = node_id.id;
+        key_value_node_index->insert(key_value_node_record);
+    }
+}
+
+void ProjectionStorage::add_edge_property(ObjectId edge_id, ObjectId key_id, ObjectId value_id) {
+    // Only insert if property index is enabled
+    if (!edge_key_value_index) {
+        return;
+    }
+
+    // Write to primary index: {edge_id, key_id, value_id}
+    Record<3> edge_prop_record;
+    edge_prop_record[0] = edge_id.id;
+    edge_prop_record[1] = key_id.id;
+    edge_prop_record[2] = value_id.id;
+    edge_key_value_index->insert(edge_prop_record);
+
+    // Write to auxiliary index: {key_id, value_id, edge_id} (for efficient property->edges queries)
+    if (key_value_edge_index) {
+        Record<3> key_value_edge_record;
+        key_value_edge_record[0] = key_id.id;
+        key_value_edge_record[1] = value_id.id;
+        key_value_edge_record[2] = edge_id.id;
+        key_value_edge_index->insert(key_value_edge_record);
+    }
 }
 
 bool ProjectionStorage::has_node(ObjectId node_id) const {
