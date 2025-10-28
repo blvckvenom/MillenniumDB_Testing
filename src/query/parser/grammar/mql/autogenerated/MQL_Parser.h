@@ -1773,7 +1773,7 @@ public:
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *K_LABELS();
     antlr4::tree::TerminalNode *L_PAR();
-    antlr4::tree::TerminalNode *VARIABLE();
+    ConditionalOrExprContext *conditionalOrExpr();
     antlr4::tree::TerminalNode *R_PAR();
 
 
@@ -1789,7 +1789,7 @@ public:
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *K_PROPERTIES();
     antlr4::tree::TerminalNode *L_PAR();
-    antlr4::tree::TerminalNode *VARIABLE();
+    ConditionalOrExprContext *conditionalOrExpr();
     antlr4::tree::TerminalNode *R_PAR();
 
 
@@ -1805,7 +1805,7 @@ public:
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *K_TYPE();
     antlr4::tree::TerminalNode *L_PAR();
-    antlr4::tree::TerminalNode *VARIABLE();
+    ConditionalOrExprContext *conditionalOrExpr();
     antlr4::tree::TerminalNode *R_PAR();
 
 

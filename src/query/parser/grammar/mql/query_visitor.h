@@ -17,6 +17,8 @@ class Expr;
 class OpBasicGraphPattern;
 
 class QueryVisitor : public MQL_ParserBaseVisitor {
+public:
+
 private:
     struct ReturnInfo {
         std::vector<std::pair<std::unique_ptr<Expr>, VarId>> items;

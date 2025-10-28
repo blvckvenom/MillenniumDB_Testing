@@ -432,18 +432,18 @@ void mql_parserParserInitialize() {
   	937,155,1,0,0,0,938,939,5,45,0,0,939,940,5,104,0,0,940,941,3,128,64,0,
   	941,942,5,105,0,0,942,157,1,0,0,0,943,944,5,61,0,0,944,945,5,104,0,0,
   	945,946,3,128,64,0,946,947,5,105,0,0,947,159,1,0,0,0,948,949,5,37,0,0,
-  	949,950,5,104,0,0,950,951,5,83,0,0,951,952,5,105,0,0,952,161,1,0,0,0,
-  	953,954,5,54,0,0,954,955,5,104,0,0,955,956,5,83,0,0,956,957,5,105,0,0,
-  	957,163,1,0,0,0,958,959,5,63,0,0,959,960,5,104,0,0,960,961,5,83,0,0,961,
-  	962,5,105,0,0,962,165,1,0,0,0,963,964,7,12,0,0,964,167,1,0,0,0,965,966,
-  	7,13,0,0,966,169,1,0,0,0,967,968,7,14,0,0,968,171,1,0,0,0,118,177,185,
-  	193,202,208,213,217,226,234,239,247,257,269,272,277,282,286,295,300,307,
-  	312,317,319,327,332,337,342,344,349,352,355,358,364,366,372,387,390,398,
-  	408,416,427,444,457,462,469,473,477,481,483,489,493,502,505,509,516,521,
-  	525,527,537,546,550,556,569,575,581,587,590,599,602,609,616,624,628,632,
-  	635,641,643,653,657,660,665,668,670,675,682,685,690,694,699,706,709,713,
-  	716,719,729,739,750,756,763,770,775,788,795,803,809,814,818,825,833,843,
-  	847,854,861,865,868,877,890,899
+  	949,950,5,104,0,0,950,951,3,128,64,0,951,952,5,105,0,0,952,161,1,0,0,
+  	0,953,954,5,54,0,0,954,955,5,104,0,0,955,956,3,128,64,0,956,957,5,105,
+  	0,0,957,163,1,0,0,0,958,959,5,63,0,0,959,960,5,104,0,0,960,961,3,128,
+  	64,0,961,962,5,105,0,0,962,165,1,0,0,0,963,964,7,12,0,0,964,167,1,0,0,
+  	0,965,966,7,13,0,0,966,169,1,0,0,0,967,968,7,14,0,0,968,171,1,0,0,0,118,
+  	177,185,193,202,208,213,217,226,234,239,247,257,269,272,277,282,286,295,
+  	300,307,312,317,319,327,332,337,342,344,349,352,355,358,364,366,372,387,
+  	390,398,408,416,427,444,457,462,469,473,477,481,483,489,493,502,505,509,
+  	516,521,525,527,537,546,550,556,569,575,581,587,590,599,602,609,616,624,
+  	628,632,635,641,643,653,657,660,665,668,670,675,682,685,690,694,699,706,
+  	709,713,716,719,729,739,750,756,763,770,775,788,795,803,809,814,818,825,
+  	833,843,847,854,861,865,868,877,890,899
   };
   staticData->serializedATN = antlr4::atn::SerializedATNView(serializedATNSegment, sizeof(serializedATNSegment) / sizeof(serializedATNSegment[0]));
 
@@ -9144,8 +9144,8 @@ tree::TerminalNode* MQL_Parser::LabelsContext::L_PAR() {
   return getToken(MQL_Parser::L_PAR, 0);
 }
 
-tree::TerminalNode* MQL_Parser::LabelsContext::VARIABLE() {
-  return getToken(MQL_Parser::VARIABLE, 0);
+MQL_Parser::ConditionalOrExprContext* MQL_Parser::LabelsContext::conditionalOrExpr() {
+  return getRuleContext<MQL_Parser::ConditionalOrExprContext>(0);
 }
 
 tree::TerminalNode* MQL_Parser::LabelsContext::R_PAR() {
@@ -9183,7 +9183,7 @@ MQL_Parser::LabelsContext* MQL_Parser::labels() {
     setState(949);
     match(MQL_Parser::L_PAR);
     setState(950);
-    match(MQL_Parser::VARIABLE);
+    conditionalOrExpr();
     setState(951);
     match(MQL_Parser::R_PAR);
    
@@ -9211,8 +9211,8 @@ tree::TerminalNode* MQL_Parser::PropertiesFunctionContext::L_PAR() {
   return getToken(MQL_Parser::L_PAR, 0);
 }
 
-tree::TerminalNode* MQL_Parser::PropertiesFunctionContext::VARIABLE() {
-  return getToken(MQL_Parser::VARIABLE, 0);
+MQL_Parser::ConditionalOrExprContext* MQL_Parser::PropertiesFunctionContext::conditionalOrExpr() {
+  return getRuleContext<MQL_Parser::ConditionalOrExprContext>(0);
 }
 
 tree::TerminalNode* MQL_Parser::PropertiesFunctionContext::R_PAR() {
@@ -9250,7 +9250,7 @@ MQL_Parser::PropertiesFunctionContext* MQL_Parser::propertiesFunction() {
     setState(954);
     match(MQL_Parser::L_PAR);
     setState(955);
-    match(MQL_Parser::VARIABLE);
+    conditionalOrExpr();
     setState(956);
     match(MQL_Parser::R_PAR);
    
@@ -9278,8 +9278,8 @@ tree::TerminalNode* MQL_Parser::TypeContext::L_PAR() {
   return getToken(MQL_Parser::L_PAR, 0);
 }
 
-tree::TerminalNode* MQL_Parser::TypeContext::VARIABLE() {
-  return getToken(MQL_Parser::VARIABLE, 0);
+MQL_Parser::ConditionalOrExprContext* MQL_Parser::TypeContext::conditionalOrExpr() {
+  return getRuleContext<MQL_Parser::ConditionalOrExprContext>(0);
 }
 
 tree::TerminalNode* MQL_Parser::TypeContext::R_PAR() {
@@ -9317,7 +9317,7 @@ MQL_Parser::TypeContext* MQL_Parser::type() {
     setState(959);
     match(MQL_Parser::L_PAR);
     setState(960);
-    match(MQL_Parser::VARIABLE);
+    conditionalOrExpr();
     setState(961);
     match(MQL_Parser::R_PAR);
    
