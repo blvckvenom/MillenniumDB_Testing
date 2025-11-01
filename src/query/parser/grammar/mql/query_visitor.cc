@@ -122,14 +122,25 @@ Any QueryVisitor::visitSimpleQuery(MQL_Parser::SimpleQueryContext* ctx)
 
     for (auto& primitiveStatement : primitiveStatements) {
         visit(primitiveStatement);
-        assert(current_op != nullptr);
-        if (current_expr) {
+        if (auto where_stmt = primitiveStatement->whereStatement()) {
+            assert(current_expr != nullptr);
             if (current_expr->has_aggregation()) {
                 throw QueryException("Cannot have aggregations inside WHERE, use HAVING INSTEAD");
             }
-            current_op = std::make_unique<OpWhere>(std::move(current_op), std::move(current_expr));
+            if (sequence.empty()) {
+                throw QueryException("Invalid WHERE placement");
+            }
+            sequence.back() = std::make_unique<OpWhere>(std::move(sequence.back()), std::move(current_expr));
+        } else {
+            assert(current_op != nullptr);
+            if (current_expr) {
+                if (current_expr->has_aggregation()) {
+                    throw QueryException("Cannot have aggregations inside WHERE, use HAVING INSTEAD");
+                }
+                current_op = std::make_unique<OpWhere>(std::move(current_op), std::move(current_expr));
+            }
+            sequence.emplace_back(std::move(current_op));
         }
-        sequence.emplace_back(std::move(current_op));
     }
     if (sequence.size() > 1) {
         current_op = std::make_unique<OpSequence>(std::move(sequence));
@@ -488,8 +499,7 @@ Any QueryVisitor::visitCallStatement(MQL_Parser::CallStatementContext* ctx)
     }
 
     // validate yield statement
-    const auto available_yield_var_names = OpCall::get_procedure_available_yield_variable_names(procedure_type
-    );
+    auto available_yield_var_names = OpCall::get_procedure_available_yield_variable_names(procedure_type);
 
     auto check_yield_var = [&](const std::string& var_name) -> void {
         std::string var_names_str = "{ ";
@@ -593,9 +603,8 @@ Any QueryVisitor::visitYieldStatement(MQL_Parser::YieldStatementContext* ctx)
     return 0;
 }
 
-Any QueryVisitor::visitLetStatement(MQL_Parser::LetStatementContext* ctx)
-{
-    OpLet::VarExprType var_expr;
+Any QueryVisitor::visitLetStatement(MQL_Parser::LetStatementContext* ctx) {
+    OpLet::VarExprVecType var_expr;
 
     const auto letDefinitionList = ctx->letDefinition();
     for (auto& definition : letDefinitionList) {
@@ -1626,9 +1635,8 @@ Any QueryVisitor::visitEditDistance(MQL_Parser::EditDistanceContext* ctx)
 Any QueryVisitor::visitNormalize(MQL_Parser::NormalizeContext* ctx)
 {
     visit(ctx->conditionalOrExpr());
-    auto expr = std::move(current_expr);
 
-    current_expr = std::make_unique<ExprNormalize>(std::move(expr));
+    current_expr = std::make_unique<ExprNormalize>(std::move(current_expr));
 
     return 0;
 }
@@ -1636,36 +1644,36 @@ Any QueryVisitor::visitNormalize(MQL_Parser::NormalizeContext* ctx)
 Any QueryVisitor::visitStr(MQL_Parser::StrContext* ctx)
 {
     visit(ctx->conditionalOrExpr());
-    auto expr = std::move(current_expr);
 
-    current_expr = std::make_unique<ExprStr>(std::move(expr));
+    current_expr = std::make_unique<ExprStr>(std::move(current_expr));
+
     return 0;
 }
 
 Any QueryVisitor::visitLabels(MQL_Parser::LabelsContext* ctx)
 {
-    std::string var_name = ctx->VARIABLE()->getText();
-    var_name.erase(0, 1); // remove leading '?'
-    VarId var_id = get_query_ctx().get_or_create_var(var_name);
-    current_expr = std::make_unique<ExprLabels>(var_id);
+    visit(ctx->conditionalOrExpr());
+
+    current_expr = std::make_unique<ExprLabels>(std::move(current_expr));
+
     return 0;
 }
 
 Any QueryVisitor::visitType(MQL_Parser::TypeContext* ctx)
 {
-    std::string var_name = ctx->VARIABLE()->getText();
-    var_name.erase(0, 1); // remove leading '?'
-    VarId var_id = get_query_ctx().get_or_create_var(var_name);
-    current_expr = std::make_unique<ExprType>(var_id);
+    visit(ctx->conditionalOrExpr());
+
+    current_expr = std::make_unique<ExprType>(std::move(current_expr));
+
     return 0;
 }
 
 Any QueryVisitor::visitPropertiesFunction(MQL_Parser::PropertiesFunctionContext* ctx)
 {
-    std::string var_name = ctx->VARIABLE()->getText();
-    var_name.erase(0, 1); // remove leading '?'
-    VarId var_id = get_query_ctx().get_or_create_var(var_name);
-    current_expr = std::make_unique<ExprProperties>(var_id);
+    visit(ctx->conditionalOrExpr());
+
+    current_expr = std::make_unique<ExprProperties>(std::move(current_expr));
+
     return 0;
 }
 
@@ -1708,6 +1716,8 @@ void QueryVisitor::parse_index_options(
 
 Any QueryVisitor::visitCreateIndexQuery(MQL_Parser::CreateIndexQueryContext* ctx)
 {
+    update_info.update_ctx = std::make_unique<UpdateContext>();
+
     std::string index_name = ctx->STRING()->getText();
     index_name = index_name.substr(1, index_name.size() - 2);
 
@@ -1842,6 +1852,12 @@ Any QueryVisitor::visitCreateIndexQuery(MQL_Parser::CreateIndexQueryContext* ctx
     } else {
         throw QueryException("Invalid index type \"" + index_type + "\"");
     }
+
+    current_op = std::make_unique<OpUpdate>(
+        std::make_unique<OpUnitTable>(),
+        std::move(update_info.update_ctx),
+        std::move(update_info.update_actions)
+    );
 
     return 0;
 }
