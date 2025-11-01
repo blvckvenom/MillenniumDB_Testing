@@ -21,32 +21,8 @@ QueryContext::~QueryContext() {
     // projection_ctx will be automatically destroyed here with complete type
 }
 
-void QueryContext::prepare(BufferManager::VersionScope& version_scope, std::chrono::seconds timeout) {
-    blank_node_ids.clear();
-    blank_node_count = 0;
-
-    var_ctx.internal_var_counter = 0;
-    var_ctx.var_names = {};
-    var_ctx.var_map.clear();
-
-    // NOTE: Do NOT reset projection context here!
-    // The projection is set during query parsing (visitUseGraphClause)
-    // and must persist through query execution.
-    // active_projection.clear();  // REMOVED - projection set by parser must persist
-    // projection_ctx.reset();      // REMOVED - projection set by parser must persist
-
-    const auto start = std::chrono::system_clock::now();
-    thread_info.interruption_requested = false;
-    thread_info.time_start = start;
-    thread_info.timeout = start + timeout;
-
-    start_version  = version_scope.start_version;
-    result_version = version_scope.start_version + (version_scope.is_editable ? 1 : 0);
-
-    cancellation_token = get_uuid();
-
-    tmp_manager.reset(thread_info.worker_index);
-}
+// Note: prepare() is now implemented inline in query_context.h (from origin/main)
+// The inline implementation is identical to the previous .cc implementation
 
 void QueryContext::clear_active_projection() {
     active_projection.clear();
