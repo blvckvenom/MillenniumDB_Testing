@@ -1,7 +1,7 @@
 # 📚 MillenniumDB - Documentación del Sistema de Proyecciones y GNN
 
-**Última actualización**: 20 de Octubre, 2025
-**Versión**: 2.0 (Reorganizada y consolidada)
+**Última actualización**: 1 de Noviembre, 2025
+**Versión**: 2.1 (Reorganizada + Investigación Exhaustiva)
 
 ---
 
@@ -139,6 +139,47 @@ docs/
 
 ---
 
+## 🔬 Investigaciones Activas
+
+### Investigación Exhaustiva del Sistema PROJECT (1 de Noviembre, 2025)
+
+**Ubicación**: [`../investigacion_project_2025_11_01/`](../investigacion_project_2025_11_01/)
+
+**Análisis completo** del estado actual del sistema PROJECT, identificación de bugs, funcionalidades faltantes, y roadmap detallado de mejoras:
+
+**Contenido**:
+- 📊 **[INFORME_ESTADO_PROJECT_EXHAUSTIVO.md](../investigacion_project_2025_11_01/INFORME_ESTADO_PROJECT_EXHAUSTIVO.md)** (1,987 líneas)
+  - Resumen ejecutivo con métricas clave
+  - Metodología de investigación exhaustiva
+  - Arquitectura actual (6 fases de ejecución)
+  - 7 funcionalidades implementadas (análisis detallado)
+  - 4 bugs identificados (1 crítico, 1 medio, 2 menores)
+  - 15 funcionalidades faltantes priorizadas
+  - Análisis comparativo vs Neo4j GDS
+  - Roadmap de mejoras (6-12 meses)
+
+- 🧪 **[test_project_exhaustive.sh](../investigacion_project_2025_11_01/test_project_exhaustive.sh)** - Script con 60+ casos de prueba
+- 📝 **[README.md](../investigacion_project_2025_11_01/README.md)** - Índice y resumen ejecutivo
+
+**Hallazgos Clave**:
+- ✅ Funcionalidades Core: 7/7 (100%)
+- ❌ Funcionalidades Avanzadas: 0/15 (0%)
+- ⚠️ Neo4j GDS Paridad: 41%
+- 🔴 Bug crítico: `USE CURRENT_GRAPH` no funciona (fix: 2-3h)
+- 🟡 Bug medio: Labels no se validan (fix: 3-4h)
+- ⚠️ Faltan 3 features críticas que bloquean GNN:
+  1. UNDIRECTED orientation (4-6 semanas)
+  2. Relationship aggregation (4-6 semanas)
+  3. Management commands (4-5 semanas)
+
+**Tiempo de Lectura**:
+- Resumen ejecutivo: 10 minutos
+- Informe completo: 60-90 minutos
+
+**Audiencia**: Desarrolladores, product managers, investigadores
+
+---
+
 ## 📊 Archivos de Código Fuente Principales
 
 ### Core de Proyecciones (PROJECT/USE)
@@ -162,10 +203,10 @@ docs/
 
 | Archivo | Descripción | Estado |
 |---------|-------------|--------|
-| `tests_projection/unit_tests/projection_storage_test.cc` | Test unitario de ProjectionStorage | ✅ Completo |
-| `tests_projection/unit_tests/projection_features_test.cc` | Test de backward compatibility | ✅ Completo |
-| `tests_projection/scripts/test_label_support.sh` | Test end-to-end de labels | ✅ Completo |
-| `tests_projection/scripts/test_quick.sh` | Test rápido de todas las features | ✅ Completo |
+| `tests/projection/unit_tests/projection_storage_test.cc` | Test unitario de ProjectionStorage | ✅ Completo |
+| `tests/projection/unit_tests/projection_features_test.cc` | Test de backward compatibility | ✅ Completo |
+| `tests/projection/scripts/test_label_support.sh` | Test end-to-end de labels | ✅ Completo |
+| `tests/projection/scripts/test_quick.sh` | Test rápido de todas las features | ✅ Completo |
 
 ---
 
@@ -325,7 +366,7 @@ curl -X POST http://localhost:1234/gql --data \
 
 ```bash
 # Usar el script de test rápido
-cd tests_projection/scripts
+cd tests/projection/scripts
 ./test_quick.sh
 ```
 
@@ -427,10 +468,17 @@ Para reportar bugs o sugerir mejoras:
 
 ## 📜 Historial de Cambios
 
+### v2.1 (Noviembre 1, 2025) - Investigación Exhaustiva + Consolidación
+- ✅ Investigación exhaustiva del sistema PROJECT (1,987 líneas)
+- ✅ Consolidados tests en `tests/projection/` (estructura estándar)
+- ✅ Movida guía de navegación a `docs/GUIA_NAVEGACION.md`
+- ✅ Archivados documentos históricos (Oct 20, 2025)
+- ✅ Root limpio con solo 3 archivos .md esenciales
+
 ### v2.0 (Octubre 20, 2025) - Reorganización Completa
 - ✅ Reorganizada toda la documentación en 4 categorías lógicas
 - ✅ Creado índice maestro de navegación
-- ✅ Movidos tests de proyecciones a `tests_projection/`
+- ✅ Organizados tests de proyecciones
 - ✅ Agregadas guías de inicio rápido para 4 perfiles de usuarios
 - ✅ Documentación exhaustiva del estado actual y roadmap GNN
 

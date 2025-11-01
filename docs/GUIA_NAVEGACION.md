@@ -1,6 +1,6 @@
 # 📚 Guía de Navegación: Documentación y Tests
 
-**Última actualización**: 20 de Octubre, 2025
+**Última actualización**: 1 de Noviembre, 2025
 
 ---
 
@@ -13,7 +13,7 @@
 | **Aprender a usar PROJECT/USE** | [`docs/01_PROJECT_System/PROJECT_USE_RESUMEN.md`](docs/01_PROJECT_System/PROJECT_USE_RESUMEN.md) |
 | **Entender el código interno** | [`docs/01_PROJECT_System/PROJECT_CODIGO_INTERNO.md`](docs/01_PROJECT_System/PROJECT_CODIGO_INTERNO.md) |
 | **Implementar GNN/ML** | [`docs/02_GNN_Architecture/ROADMAP_PREREQUISITOS_GNN_NATIVA.md`](docs/02_GNN_Architecture/ROADMAP_PREREQUISITOS_GNN_NATIVA.md) |
-| **Ejecutar tests** | [`tests_projection/README.md`](tests_projection/README.md) |
+| **Ejecutar tests** | [`tests/projection/README.md`](../tests/projection/README.md) |
 | **Debug de problemas** | [`docs/04_Debugging_History/`](docs/04_Debugging_History/) |
 | **Índice completo** | [`docs/README.md`](docs/README.md) ⭐ |
 
@@ -31,11 +31,14 @@ MillenniumDB/
 │   ├── 03_Implementation_Phases/ ........ Historial de fases
 │   └── 04_Debugging_History/ ............ Problemas resueltos
 │
-├── tests_projection/ ..................... Tests de proyecciones
-│   ├── README.md ........................ Guía de tests
-│   ├── unit_tests/ ...................... Tests C++
-│   ├── integration_tests/ ............... Tests Python (futuro)
-│   └── scripts/ ......................... Scripts bash
+├── tests/
+│   └── projection/ ....................... Tests de proyecciones
+│       ├── README.md ..................... Guía de tests
+│       ├── unit_tests/ ................... Tests C++
+│       ├── integration_tests/ ............ Tests Python (futuro)
+│       ├── scripts/ ...................... Scripts bash (nuevos)
+│       ├── scripts_archive/ .............. Scripts bash (legacy)
+│       └── queries_archive/ .............. Queries GQL (legacy)
 │
 ├── src/ .................................. Código fuente
 │   ├── query/executor/binding_iter/aggregation/gql/
@@ -84,7 +87,7 @@ MillenniumDB/
 
 ## 🧪 Tests
 
-### **👉 [`tests_projection/README.md`](tests_projection/README.md)**
+### **👉 [`tests/projection/README.md`](../tests/projection/README.md)**
 
 **Guía completa de tests de proyecciones.** Incluye:
 
@@ -105,7 +108,7 @@ MillenniumDB/
 
 1. **Lee** [`docs/01_PROJECT_System/PROJECT_USE_RESUMEN.md`](docs/01_PROJECT_System/PROJECT_USE_RESUMEN.md) (30 min)
 2. **Ejecuta** ejemplos del resumen (15 min)
-3. **Ejecuta** [`tests_projection/scripts/test_quick.sh`](tests_projection/scripts/test_quick.sh) (5 min)
+3. **Ejecuta** [`tests/projection/scripts/test_quick.sh`](../tests/projection/scripts/test_quick.sh) (5 min)
 
 **Total**: ~50 minutos para entender y usar el sistema.
 
@@ -176,7 +179,7 @@ MillenniumDB/
 1. **[`docs/README.md`](docs/README.md)** - Índice maestro
 2. **[`docs/01_PROJECT_System/PROJECT_USE_RESUMEN.md`](docs/01_PROJECT_System/PROJECT_USE_RESUMEN.md)** - Inicio rápido
 3. **[`docs/02_GNN_Architecture/ROADMAP_PREREQUISITOS_GNN_NATIVA.md`](docs/02_GNN_Architecture/ROADMAP_PREREQUISITOS_GNN_NATIVA.md)** - Siguiente fase
-4. **[`tests_projection/README.md`](tests_projection/README.md)** - Ejecutar tests
+4. **[`tests/projection/README.md`](../tests/projection/README.md)** - Ejecutar tests
 
 ### Código Fuente Clave
 
@@ -191,10 +194,10 @@ MillenniumDB/
 
 ### Tests Clave
 
-1. **`tests_projection/unit_tests/projection_features_test.cc`**
+1. **`tests/projection/unit_tests/projection_features_test.cc`**
    - Test de backward compatibility
 
-2. **`tests_projection/scripts/test_quick.sh`**
+2. **`tests/projection/scripts/test_quick.sh`**
    - Test rápido de todas las features
 
 ---
@@ -222,7 +225,7 @@ USE "nombre" MATCH ()-[e]->() RETURN count(e)                # Contar aristas
 # TESTS
 ./scripts/run-tests                                          # Todos los tests
 ./build/Release/bin/projection_features_test                 # Test unitario
-./tests_projection/scripts/test_quick.sh                     # Test integración
+./tests/projection/scripts/test_quick.sh                     # Test integración
 ```
 
 ---
@@ -257,6 +260,47 @@ MATCH (n)-[e]->(m) RETURN PROJECT("nombre" INCLUDE LABELS)
 
 ---
 
+## 🔬 Investigación Activa
+
+### 📁 **investigacion_project_2025_11_01/** (Investigación Exhaustiva)
+
+**Fecha**: 1 de Noviembre, 2025
+**Estado**: ✅ **COMPLETA** - Análisis exhaustivo del sistema PROJECT
+
+**Contenido**:
+- 📊 **INFORME_ESTADO_PROJECT_EXHAUSTIVO.md** (1,987 líneas)
+  - Análisis completo de funcionalidades (7/7 core, 0/15 avanzadas)
+  - 4 bugs identificados (1 crítico, 1 medio, 2 menores)
+  - 15 funcionalidades faltantes priorizadas
+  - Comparación vs Neo4j GDS (41% paridad)
+  - Roadmap de 6-12 meses
+
+- 🧪 **test_project_exhaustive.sh** - Script de testing con 60+ casos
+- 📝 **README.md** - Índice de la investigación
+- 🤖 **PROMPT_NEO4J_COMPARISON.md** - Mega-prompt para análisis comparativo
+
+**Hallazgos Principales**:
+1. 🔴 Bug crítico: `USE CURRENT_GRAPH` no funciona (fix: 2-3h)
+2. 🟡 Bug medio: Labels no se validan correctamente (fix: 3-4h)
+3. ⚠️ Falta UNDIRECTED orientation (bloquea 80% de GNN algorithms)
+4. ⚠️ Falta relationship aggregation (bloquea multigraphs)
+5. ⚠️ Faltan comandos de gestión (LIST/DESCRIBE/DROP/REFRESH)
+
+**Métricas Clave**:
+- ✅ Funcionalidades Core: 7/7 (100%)
+- ❌ Funcionalidades Avanzadas: 0/15 (0%)
+- ⚠️ Neo4j GDS Paridad: 41%
+- ⚠️ Tests pasando: 91.7%
+- 🗺️ Esfuerzo para 80% paridad: 23-31 semanas
+
+**Para desarrolladores**: Leer resumen ejecutivo del informe (10 min)
+**Para product managers**: Revisar roadmap y prioridades (20 min)
+**Para investigadores**: Ejecutar test_project_exhaustive.sh (5 min)
+
+**Ver**: [`investigacion_project_2025_11_01/README.md`](investigacion_project_2025_11_01/README.md)
+
+---
+
 ## 📞 Contacto
 
 - **GitHub Issues**: https://github.com/MillenniumDB/MillenniumDB/issues
@@ -266,16 +310,19 @@ MATCH (n)-[e]->(m) RETURN PROJECT("nombre" INCLUDE LABELS)
 
 ## 📜 Versión
 
-**v2.0** (Octubre 20, 2025)
+**v2.1** (1 de Noviembre, 2025)
 
 Cambios principales:
 - ✅ Reorganizada toda la documentación en `docs/`
-- ✅ Reorganizados tests en `tests_projection/`
+- ✅ Reorganizados tests en `tests/projection/`
 - ✅ Creados índices maestros con guías de navegación
 - ✅ Agregados 4 perfiles de usuario (nuevo, dev, ML, debug)
 - ✅ Documentación 100% exhaustiva y actualizada
+- ✅ **NUEVO**: Investigación exhaustiva del sistema PROJECT (Nov 1)
+- ✅ **NUEVO**: Archivados documentos históricos (Oct 20)
+- ✅ Root limpio con solo 4 archivos .md esenciales
 
-**Próxima actualización**: Al completar pre-requisitos GNN (Q1 2026)
+**Próxima actualización**: Al completar bug fixes críticos (Q4 2025)
 
 ---
 
