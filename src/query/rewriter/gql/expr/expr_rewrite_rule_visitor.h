@@ -434,6 +434,17 @@ public:
         visit_expr_with_expr<ExprAggPercentileDisc>(expr);
     }
 
+    void visit(GQL::ExprAggProject& expr) override
+    {
+        for (auto& rule : rules) {
+            if (rule->is_possible_to_regroup(expr.projection_name_expr)) {
+                expr.projection_name_expr = rule->regroup(std::move(expr.projection_name_expr));
+                has_rewritten = true;
+            }
+        }
+        expr.projection_name_expr->accept_visitor(*this);
+    }
+
     void visit(GQL::ExprAggCountAll&) override { }
     void visit(GQL::ExprTerm&) override { }
     void visit(GQL::ExprHasNodeLabel&) override { }

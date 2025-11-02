@@ -113,7 +113,7 @@ inline int mdb_server(const SystemConfig& conf)
         }
         case Catalog::ModelID::GQL: {
             std::cout << "Initializing GQL Model..." << std::endl;
-            model_destroyer = GQLModel::init();
+            model_destroyer = GQLModel::init(conf.db_directory);
 
             gql_model.catalog.print(std::cout);
             server.model_id = MDBServer::Protocol::GQL_MODEL_ID;

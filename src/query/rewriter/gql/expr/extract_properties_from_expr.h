@@ -410,5 +410,10 @@ public:
     {
         tmp = expr.clone();
     }
+
+    void visit(ExprAggProject& expr)
+    {
+        tmp = expr.clone();
+    }
 };
 } // namespace GQL

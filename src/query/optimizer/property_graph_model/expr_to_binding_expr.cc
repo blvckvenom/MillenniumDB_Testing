@@ -636,6 +636,11 @@ void ExprToBindingExpr::visit(ExprAggPercentileDisc& expr)
     }
 }
 
+void ExprToBindingExpr::visit(ExprAggProject& expr)
+{
+    check_and_make_aggregate<AggProject>(expr.projection_name_expr.get(), expr.var, expr.options);
+}
+
 template<typename AggType, class... Args>
 void ExprToBindingExpr::check_and_make_aggregate(Expr* expr, VarId var, Args&&... args)
 {

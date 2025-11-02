@@ -113,5 +113,6 @@ public:
     void visit(ExprAggCollect&) override;
     void visit(ExprAggPercentileCont&) override;
     void visit(ExprAggPercentileDisc&) override;
+    void visit(ExprAggProject&) override;
 };
 } // namespace GQL

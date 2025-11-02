@@ -64,26 +64,26 @@ std::unique_ptr<BindingIter> DirectedEdgePlan::get_binding_iter() const
         ranges[0] = ScanRange::get(edge, edge_assigned);
         ranges[1] = ScanRange::get(from, from_assigned);
         ranges[2] = ScanRange::get(to, to_assigned);
-        return add_direction_iter(std::make_unique<IndexScan<3>>(*gql_model.edge_from_to, std::move(ranges)));
+        return add_direction_iter(std::make_unique<IndexScan<3>>(gql_model.get_edge_from_to(), std::move(ranges)));
     }
 
     if (from == to) {
         std::array<std::unique_ptr<ScanRange>, 2> ranges;
         ranges[0] = ScanRange::get(from, from_assigned);
         ranges[1] = ScanRange::get(edge, edge_assigned);
-        return add_direction_iter(std::make_unique<IndexScan<2>>(*gql_model.equal_d_edge, std::move(ranges)));
+        return add_direction_iter(std::make_unique<IndexScan<2>>(gql_model.get_equal_d_edge(), std::move(ranges)));
     }
 
     if (to_assigned) {
         ranges[0] = ScanRange::get(to, to_assigned);
         ranges[1] = ScanRange::get(from, from_assigned);
         ranges[2] = ScanRange::get(edge, edge_assigned);
-        return add_direction_iter(std::make_unique<IndexScan<3>>(*gql_model.to_from_edge, std::move(ranges)));
+        return add_direction_iter(std::make_unique<IndexScan<3>>(gql_model.get_to_from_edge(), std::move(ranges)));
     } else {
         ranges[0] = ScanRange::get(from, from_assigned);
         ranges[1] = ScanRange::get(to, to_assigned);
         ranges[2] = ScanRange::get(edge, edge_assigned);
-        return add_direction_iter(std::make_unique<IndexScan<3>>(*gql_model.from_to_edge, std::move(ranges)));
+        return add_direction_iter(std::make_unique<IndexScan<3>>(gql_model.get_from_to_edge(), std::move(ranges)));
     }
 }
 

@@ -544,6 +544,10 @@ IN
    : 'IN'
    ;
 
+INCLUDE
+   : 'INCLUDE'
+   ;
+
 INSERT
    : 'INSERT'
    ;
@@ -850,6 +854,10 @@ PROPERTIES
 
 PROPERTY_EXISTS
    : 'PROPERTY_EXISTS'
+   ;
+
+PROJECT
+   : 'PROJECT'
    ;
 
 RADIANS
@@ -1231,7 +1239,6 @@ PRE_RESERVED_WORD
    | 'PARTITION'
    | 'PROCEDURE'
    | 'PRODUCT'
-   | 'PROJECT'
    | 'QUERY'
    | 'RECORDS'
    | 'REFERENCE'
