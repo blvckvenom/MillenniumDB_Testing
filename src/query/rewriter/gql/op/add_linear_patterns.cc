@@ -1,5 +1,6 @@
 #include "add_linear_patterns.h"
 
+#include "query/parser/op/gql/op_call_procedure.h"
 #include "query/parser/op/gql/ops.h"
 
 using namespace GQL;
@@ -164,3 +165,8 @@ void AddLinearPatterns::visit(OpEmpty& op)
 }
 
 void AddLinearPatterns::visit(OpLinearPattern&) { }
+
+void AddLinearPatterns::visit(OpCallProcedure& op)
+{
+    tmp = op.clone();
+}

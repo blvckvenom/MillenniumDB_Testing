@@ -1,0 +1,2 @@
+CALL test_hello() YIELD message
+RETURN DISTINCT message

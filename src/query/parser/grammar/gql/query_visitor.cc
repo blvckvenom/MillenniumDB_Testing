@@ -10,6 +10,8 @@
 #include "graph_models/rdf_model/conversions.h"
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
+#include "query/parser/op/gql/op_call_procedure.h"
+#include "query/procedure/procedure_catalog.h"
 
 #define DEBUG_GQL_QUERY_VISITOR
 
@@ -69,6 +71,10 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
 
     for (auto& child : ctx->simpleDataAccessingStatement()) {
         visit(child);
+        if (current_op == nullptr) {
+            std::cerr << "WARNING: visit(simpleDataAccessingStatement) did not set current_op!" << std::endl;
+            std::cerr << "Statement text: " << child->getText() << std::endl;
+        }
         query_statements.push_back(std::move(current_op));
     }
     current_op = std::make_unique<OpQueryStatements>(std::move(query_statements));
@@ -89,6 +95,8 @@ std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQuerySta
     } else if (ctx->filterStatement()) {
         ctx->filterStatement()->accept(this);
         current_op = std::make_unique<OpFilter>(std::move(filter_items));
+    } else if (ctx->callQueryStatement()) {
+        ctx->callQueryStatement()->accept(this);
     }
     return 0;
 }
@@ -1567,6 +1575,35 @@ std::any QueryVisitor::visitGqlProjectFunction(GQLParser::GqlProjectFunctionCont
 
     VarId agg_var = get_query_ctx().get_internal_var();
 
+    // Parse optional source node expression
+    std::unique_ptr<Expr> source_node_expr = nullptr;
+    if (ctx->sourceNode) {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - parsing sourceNode");
+        #endif
+        visit(ctx->sourceNode);
+        source_node_expr = std::move(current_expr);
+    }
+
+    // Parse optional target node expression
+    std::unique_ptr<Expr> target_node_expr = nullptr;
+    if (ctx->targetNode) {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - parsing targetNode");
+        #endif
+        visit(ctx->targetNode);
+        target_node_expr = std::move(current_expr);
+    }
+
+    // Parse optional dataConfig (recordLiteral with property lists)
+    DataConfig data_config;
+    if (ctx->dataConfig) {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - parsing dataConfig");
+        #endif
+        data_config = parse_data_config(ctx->dataConfig);
+    }
+
     // Parse projection options if present
     ProjectionOptions options;
     if (ctx->projectionOptions()) {
@@ -1581,7 +1618,14 @@ std::any QueryVisitor::visitGqlProjectFunction(GQLParser::GqlProjectFunctionCont
         #endif
     }
 
-    current_expr = std::make_unique<ExprAggProject>(std::move(projection_name_expr), agg_var, options);
+    current_expr = std::make_unique<ExprAggProject>(
+        std::move(projection_name_expr),
+        agg_var,
+        options,
+        std::move(source_node_expr),
+        std::move(target_node_expr),
+        std::move(data_config)
+    );
     return 0;
 }
 
@@ -1614,6 +1658,99 @@ std::any QueryVisitor::visitProjectionIncludeClause(GQLParser::ProjectionInclude
     }
 
     return 0;
+}
+
+DataConfig QueryVisitor::parse_data_config(GQLParser::RecordLiteralContext* ctx)
+{
+    DataConfig config;
+
+    // If no fields, return empty config
+    if (!ctx->recordFieldLiteral().size()) {
+        return config;
+    }
+
+    // Iterate through all key-value pairs in the record literal
+    for (auto* field : ctx->recordFieldLiteral()) {
+        std::string key = field->key->getText();
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("DataConfig parsing field: " + key);
+        #endif
+
+        // Check if the value is a listLiteral
+        auto* value_literal = field->value;
+        if (!value_literal || !value_literal->listLiteral()) {
+            // Skip non-list values
+            continue;
+        }
+
+        // Parse the string list based on the key
+        if (key == "sourceNodeProperties") {
+            config.source_node_properties = parse_string_list(value_literal->listLiteral());
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed " + std::to_string(config.source_node_properties->size()) + " source node properties");
+            #endif
+        } else if (key == "targetNodeProperties") {
+            config.target_node_properties = parse_string_list(value_literal->listLiteral());
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed " + std::to_string(config.target_node_properties->size()) + " target node properties");
+            #endif
+        } else if (key == "relationshipProperties") {
+            config.relationship_properties = parse_string_list(value_literal->listLiteral());
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed " + std::to_string(config.relationship_properties->size()) + " relationship properties");
+            #endif
+        }
+        // Silently ignore unknown keys
+    }
+
+    return config;
+}
+
+std::vector<std::string> QueryVisitor::parse_string_list(GQLParser::ListLiteralContext* ctx)
+{
+    std::vector<std::string> result;
+
+    // If empty list, return empty vector
+    if (!ctx->generalLiteral().size()) {
+        return result;
+    }
+
+    // Iterate through all elements in the list
+    for (auto* literal : ctx->generalLiteral()) {
+        // We expect predefinedTypeLiteral -> characterStringLiteral
+        if (!literal->predefinedTypeLiteral() ||
+            !literal->predefinedTypeLiteral()->characterStringLiteral()) {
+            // Skip non-string literals
+            continue;
+        }
+
+        auto* char_string = literal->predefinedTypeLiteral()->characterStringLiteral();
+        std::string raw_string;
+
+        // Extract the raw string text (with quotes)
+        if (char_string->singleQuotedCharacterSequence()) {
+            raw_string = char_string->singleQuotedCharacterSequence()->getText();
+        } else if (char_string->doubleQuotedCharacterSequence()) {
+            raw_string = char_string->doubleQuotedCharacterSequence()->getText();
+        } else {
+            // Skip if no quoted sequence
+            continue;
+        }
+
+        // Strip quotes: remove first and last character
+        // e.g., 'age' -> age  or  "age" -> age
+        if (raw_string.size() >= 2) {
+            std::string prop_name = raw_string.substr(1, raw_string.size() - 2);
+            result.push_back(prop_name);
+
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed property name: " + prop_name);
+            #endif
+        }
+    }
+
+    return result;
 }
 
 std::any QueryVisitor::visitPropertyReference(GQLParser::PropertyReferenceContext* ctx)
@@ -2181,9 +2318,125 @@ std::any QueryVisitor::visitBindingVariableDefinitionBlock(GQLParser::BindingVar
     throw NotSupportedException("Variable definition block");
 }
 
-std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext*)
+std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx)
 {
-    throw NotSupportedException("Call");
+    LOG_VISITOR
+
+    // Get the call procedure statement
+    auto call_proc_ctx = ctx->callProcedureStatement();
+    if (!call_proc_ctx) {
+        throw QuerySemanticException("Missing call procedure statement");
+    }
+
+    // Check for OPTIONAL flag
+    bool optional = call_proc_ctx->OPTIONAL() != nullptr;
+
+    // Get the procedure call
+    auto proc_call_ctx = call_proc_ctx->procedureCall();
+    if (!proc_call_ctx) {
+        throw QuerySemanticException("Missing procedure call");
+    }
+
+    // For now, only support named procedures (not inline)
+    auto named_ctx = proc_call_ctx->namedProcedureCall();
+    if (!named_ctx) {
+        throw NotSupportedException("Inline procedures are not yet supported. Use named procedures only.");
+    }
+
+    // Extract procedure name
+    auto proc_ref_ctx = named_ctx->procedureReference();
+    if (!proc_ref_ctx) {
+        throw QuerySemanticException("Missing procedure reference");
+    }
+
+    std::string proc_name;
+
+    // Handle catalogProcedureParentAndName
+    if (proc_ref_ctx->catalogProcedureParentAndName()) {
+        auto cat_name_ctx = proc_ref_ctx->catalogProcedureParentAndName();
+
+        // Build qualified name if there's a parent reference
+        if (cat_name_ctx->catalogObjectParentReference()) {
+            // Extract parent parts (e.g., "gds.graph")
+            std::string parent = cat_name_ctx->catalogObjectParentReference()->getText();
+            proc_name = parent + ".";
+        }
+
+        // Add procedure name
+        if (cat_name_ctx->procedureName()) {
+            proc_name += cat_name_ctx->procedureName()->getText();
+        } else {
+            throw QuerySemanticException("Missing procedure name");
+        }
+    } else if (proc_ref_ctx->referenceParameter()) {
+        throw NotSupportedException("Dynamic procedure names (via parameters) are not yet supported");
+    } else {
+        throw QuerySemanticException("Invalid procedure reference");
+    }
+
+    // Lookup procedure in catalog
+    auto& catalog = ProcedureCatalog::get_instance();
+    Procedure* procedure = catalog.lookup(proc_name);
+
+    if (!procedure) {
+        // List available procedures for better error message
+        auto available = catalog.list_procedures();
+        std::string available_str;
+        for (size_t i = 0; i < available.size() && i < 5; i++) {
+            if (i > 0) available_str += ", ";
+            available_str += available[i];
+        }
+        if (available.size() > 5) {
+            available_str += ", ...";
+        }
+
+        throw QuerySemanticException(
+            "Procedure '" + proc_name + "' not found. Available procedures: [" +
+            (available_str.empty() ? "none" : available_str) + "]"
+        );
+    }
+
+    // Process arguments
+    std::vector<std::unique_ptr<Expr>> arguments;
+    if (named_ctx->procedureArgumentList()) {
+        for (auto arg_ctx : named_ctx->procedureArgumentList()->procedureArgument()) {
+            // Visit the argument expression
+            visit(arg_ctx->expression());
+            arguments.push_back(std::move(current_expr));
+        }
+    }
+
+    // Process YIELD clause
+    std::vector<OpCallProcedure::YieldItem> yield_items;
+    if (named_ctx->yieldClause()) {
+        auto yield_ctx = named_ctx->yieldClause();
+
+        for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
+            // Get field name
+            std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
+
+            // Get variable name (use alias if present, otherwise use field name)
+            std::string var_name = field_name;
+            if (item_ctx->yieldItemAlias()) {
+                var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+            }
+
+            // Get or create variable ID
+            VarId var = get_query_ctx().get_or_create_var(var_name);
+
+            yield_items.emplace_back(field_name, var);
+        }
+    }
+
+    // Create OpCallProcedure operator
+    current_op = std::make_unique<OpCallProcedure>(
+        procedure,
+        std::move(arguments),
+        std::move(yield_items),
+        optional
+    );
+
+    return 0;
 }
 
 std::any QueryVisitor::visitForStatement(GQLParser::ForStatementContext*)

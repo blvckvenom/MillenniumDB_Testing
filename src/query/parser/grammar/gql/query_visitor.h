@@ -74,6 +74,10 @@ private:
     OpEdge create_edge(VarId left_node, VarId right_node, VarId edge_id, VarId direction_var, EdgeType type);
     uint64_t get_unsigned_integer(std::string& str);
 
+    // Helper methods for parsing DataConfig parameter
+    DataConfig parse_data_config(GQLParser::RecordLiteralContext* ctx);
+    std::vector<std::string> parse_string_list(GQLParser::ListLiteralContext* ctx);
+
     std::vector<std::unique_ptr<Expr>> filter_items;
     std::vector<OpReturn::Item> return_items;
 

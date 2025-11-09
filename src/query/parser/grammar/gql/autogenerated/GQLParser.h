@@ -5521,11 +5521,19 @@ public:
     GqlProjectFunctionContext(AggregateFunctionContext *ctx);
 
     GQLParser::CharacterStringLiteralContext *projectionName = nullptr;
+    GQLParser::ExpressionContext *sourceNode = nullptr;
+    GQLParser::ExpressionContext *targetNode = nullptr;
+    GQLParser::RecordLiteralContext *dataConfig = nullptr;
     antlr4::tree::TerminalNode *PROJECT();
     antlr4::tree::TerminalNode *LEFT_PAREN();
     antlr4::tree::TerminalNode *RIGHT_PAREN();
     CharacterStringLiteralContext *characterStringLiteral();
+    std::vector<antlr4::tree::TerminalNode *> COMMA();
+    antlr4::tree::TerminalNode* COMMA(size_t i);
     ProjectionOptionsContext *projectionOptions();
+    std::vector<ExpressionContext *> expression();
+    ExpressionContext* expression(size_t i);
+    RecordLiteralContext *recordLiteral();
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
   };

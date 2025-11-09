@@ -1,5 +1,7 @@
 #include "push_labels.h"
 
+#include "query/parser/op/gql/op_call_procedure.h"
+
 using namespace GQL;
 
 void PushLabels::visit(OpQueryStatements& op_statements)
@@ -173,4 +175,9 @@ void PushLabels::visit(OpUnitTable& op)
 void PushLabels::visit(OpEmpty& op)
 {
     tmp = std::make_unique<OpEmpty>(op);
+}
+
+void PushLabels::visit(OpCallProcedure& op)
+{
+    tmp = op.clone();
 }
