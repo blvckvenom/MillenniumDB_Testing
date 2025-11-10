@@ -7,6 +7,7 @@
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/rdf_model/conversions.h"
+#include "misc/transliterator.h"
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
 
@@ -2095,9 +2096,43 @@ std::any QueryVisitor::visitBindingVariableDefinitionBlock(GQLParser::BindingVar
     throw NotSupportedException("Variable definition block");
 }
 
-std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext*)
+std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx)
 {
-    throw NotSupportedException("Call");
+    LOG_VISITOR
+
+    // TODO: validar que todos los subnodos existan (callProcedureStatement, procedureCall, etc.)
+    GQLParser::ProcedureCallContext* procedure_call = ctx->callProcedureStatement()->procedureCall();
+    // TODO: soportar inlineProcedureCall y otras variantes; por ahora asumimos namedProcedureCall
+    GQLParser::NamedProcedureCallContext* named_procedure_call = procedure_call->namedProcedureCall();
+    // TODO: obtener correctamente el nombre (procedureReference -> catalogProcedureParentAndName -> procedureName)
+    const std::string procedure_name = named_procedure_call->procedureReference()
+        ->catalogProcedureParentAndName()
+        ->procedureName()
+        ->getText();
+    const std::string procedure_name_lowercased = Transliterator::lowercase(procedure_name);
+
+    OpProcedure::ProcedureType procedure_type;
+    if (procedure_name_lowercased == "hello_world") {
+        procedure_type = OpProcedure::ProcedureType::HELLO_WORLD;
+    } else {
+        throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
+    }
+
+    // TODO: procesar argumentos
+    current_call_argument_exprs.clear();
+    // TODO: procesar YIELD
+    current_call_yield_var2alias.clear();
+
+    std::vector<VarId> yield_vars;
+    yield_vars.emplace_back(get_query_ctx().get_or_create_var("message"));
+
+    current_op = std::make_unique<OpProcedure>(
+        procedure_type,
+        std::move(current_call_argument_exprs),
+        std::move(yield_vars)
+    );
+
+    return 0;
 }
 
 std::any QueryVisitor::visitForStatement(GQLParser::ForStatementContext*)

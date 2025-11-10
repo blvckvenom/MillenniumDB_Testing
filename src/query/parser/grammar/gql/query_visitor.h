@@ -76,6 +76,9 @@ private:
     std::vector<std::unique_ptr<Expr>> filter_items;
     std::vector<OpReturn::Item> return_items;
 
+    std::vector<std::unique_ptr<Expr>> current_call_argument_exprs;
+    std::map<std::string, VarId> current_call_yield_var2alias;
+
     std::vector<std::unique_ptr<Expr>> order_by_items;
     std::vector<bool> order_by_ascending;
     std::vector<bool> order_nulls;
