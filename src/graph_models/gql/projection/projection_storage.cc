@@ -1,5 +1,6 @@
 #include "projection_storage.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
@@ -385,35 +386,58 @@ void ProjectionStorage::flush_node_batch() {
         return;
     }
 
+    // OPTIMIZATION: Collect node records and sort before insertion
+    // Sorted insertion improves B+Tree performance via better cache locality and fewer page splits
+    std::vector<Record<1>> node_records;
+    std::vector<Record<3>> node_property_records;
+
+    node_records.reserve(node_batch.size());
+
     for (const auto& node : node_batch) {
         uint64_t node_id_val = node.node_id.id;
 
-        // Insert into nodes index
+        // Collect node record
         Record<1> node_record;
         node_record[0] = node_id_val;
+        node_records.push_back(node_record);
 
-        if (nodes_index->insert(node_record)) {
-            node_count++;
-        }
-
-        // Handle node properties if present
+        // Collect node properties if present
         if (!node.properties.empty()) {
-            if (!node_properties_index) {
-                init_empty_bptree<3>(projection_dir + "/node_properties");
-                node_properties_index = std::make_unique<BPlusTree<3>>(
-                    rel_dir + "/node_properties"
-                );
-            }
-
             for (const auto& [prop_name, prop_value] : node.properties) {
-                // Store property (simplified - in production would need property name encoding)
                 Record<3> prop_record;
                 prop_record[0] = node_id_val;
                 prop_record[1] = std::hash<std::string>{}(prop_name); // Simplified
                 prop_record[2] = prop_value.id;
-
-                node_properties_index->insert(prop_record);
+                node_property_records.push_back(prop_record);
             }
+        }
+    }
+
+    // Sort records by key for optimal B+Tree insertion
+    std::sort(node_records.begin(), node_records.end());
+
+    // Insert sorted node records
+    for (const auto& record : node_records) {
+        if (nodes_index->insert(record)) {
+            node_count++;
+        }
+    }
+
+    // Handle node properties if any were collected
+    if (!node_property_records.empty()) {
+        if (!node_properties_index) {
+            init_empty_bptree<3>(projection_dir + "/node_properties");
+            node_properties_index = std::make_unique<BPlusTree<3>>(
+                rel_dir + "/node_properties"
+            );
+        }
+
+        // Sort property records by (node_id, property_name_hash, value)
+        std::sort(node_property_records.begin(), node_property_records.end());
+
+        // Insert sorted property records
+        for (const auto& record : node_property_records) {
+            node_properties_index->insert(record);
         }
     }
 
@@ -427,6 +451,17 @@ void ProjectionStorage::flush_edge_batch() {
 
     std::cerr << "[ProjectionStorage] flush_edge_batch: Flushing " << edge_batch.size() << " edges to B+tree" << std::endl;
 
+    // OPTIMIZATION: Collect all edge records and sort before insertion
+    // Separate vectors for each index to enable sorted batch insertion
+    std::vector<Record<3>> from_to_records;
+    std::vector<Record<3>> to_from_records;
+    std::vector<Record<2>> direction_records;
+    std::vector<Record<4>> edge_property_records;
+
+    from_to_records.reserve(edge_batch.size());
+    to_from_records.reserve(edge_batch.size());
+    direction_records.reserve(edge_batch.size());
+
     for (const auto& edge : edge_batch) {
         uint64_t from_id = edge.from_node.id;
         uint64_t to_id = edge.to_node.id;
@@ -438,58 +473,89 @@ void ProjectionStorage::flush_edge_batch() {
             std::swap(from_id, to_id);
         }
 
-        // Insert into from->to index
+        // Collect from->to record
         Record<3> from_to_record;
         from_to_record[0] = from_id;
         from_to_record[1] = to_id;
         from_to_record[2] = edge_id;
+        from_to_records.push_back(from_to_record);
 
-        bool inserted = from_to_edge_index->insert(from_to_record);
-        if (inserted) {
-            edge_count++;
-            std::cerr << "[ProjectionStorage] Inserted edge 0x" << std::hex << edge_id << std::dec
-                      << " into from_to_edge_index (" << from_id << " -> " << to_id << "), edge_count=" << edge_count << std::endl;
-
-            if (edge.is_directed) {
-                directed_edge_count++;
-            } else {
-                undirected_edge_count++;
-            }
-        }
-
-        // Insert into to->from index
+        // Collect to->from record
         Record<3> to_from_record;
         to_from_record[0] = to_id;
         to_from_record[1] = from_id;
         to_from_record[2] = edge_id;
+        to_from_records.push_back(to_from_record);
 
-        to_from_edge_index->insert(to_from_record);
-
-        // Store edge direction
+        // Collect direction record
         Record<2> direction_record;
         direction_record[0] = edge_id;
         direction_record[1] = edge.is_directed ? 1 : 0;
+        direction_records.push_back(direction_record);
 
-        edge_direction_index->insert(direction_record);
-
-        // Handle edge properties if present
+        // Collect edge properties if present
         if (!edge.properties.empty()) {
-            if (!edge_properties_index) {
-                init_empty_bptree<4>(projection_dir + "/edge_properties");
-                edge_properties_index = std::make_unique<BPlusTree<4>>(
-                    rel_dir + "/edge_properties"
-                );
-            }
-
             for (const auto& [prop_name, prop_value] : edge.properties) {
                 Record<4> prop_record;
                 prop_record[0] = edge_id;
                 prop_record[1] = std::hash<std::string>{}(prop_name); // Simplified
                 prop_record[2] = prop_value.id;
                 prop_record[3] = 0; // Reserved
-
-                edge_properties_index->insert(prop_record);
+                edge_property_records.push_back(prop_record);
             }
+        }
+    }
+
+    // Sort all record collections by key for optimal B+Tree insertion
+    std::sort(from_to_records.begin(), from_to_records.end());
+    std::sort(to_from_records.begin(), to_from_records.end());
+    std::sort(direction_records.begin(), direction_records.end());
+
+    // Insert sorted from->to records
+    for (const auto& record : from_to_records) {
+        bool inserted = from_to_edge_index->insert(record);
+        if (inserted) {
+            edge_count++;
+            std::cerr << "[ProjectionStorage] Inserted edge 0x" << std::hex << record[2] << std::dec
+                      << " into from_to_edge_index (" << record[0] << " -> " << record[1]
+                      << "), edge_count=" << edge_count << std::endl;
+        }
+    }
+
+    // Update directed/undirected counts (must iterate original batch for is_directed flag)
+    for (const auto& edge : edge_batch) {
+        if (edge.is_directed) {
+            directed_edge_count++;
+        } else {
+            undirected_edge_count++;
+        }
+    }
+
+    // Insert sorted to->from records
+    for (const auto& record : to_from_records) {
+        to_from_edge_index->insert(record);
+    }
+
+    // Insert sorted direction records
+    for (const auto& record : direction_records) {
+        edge_direction_index->insert(record);
+    }
+
+    // Handle edge properties if any were collected
+    if (!edge_property_records.empty()) {
+        if (!edge_properties_index) {
+            init_empty_bptree<4>(projection_dir + "/edge_properties");
+            edge_properties_index = std::make_unique<BPlusTree<4>>(
+                rel_dir + "/edge_properties"
+            );
+        }
+
+        // Sort property records by (edge_id, property_name_hash, value, reserved)
+        std::sort(edge_property_records.begin(), edge_property_records.end());
+
+        // Insert sorted property records
+        for (const auto& record : edge_property_records) {
+            edge_properties_index->insert(record);
         }
     }
 
