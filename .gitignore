@@ -113,3 +113,11 @@ third_party/boost_1_82
 
 # Test databases (temporary artifacts)
 /test_db/
+/test_data/
+/test_results/
+
+# Investigation and working materials (keep local, don't commit)
+/investigacion_project_2025_11_01/
+
+# Debug directory
+/debug/
