@@ -5,6 +5,9 @@
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_query_context.h"
+#include "query/procedure/procedure_catalog.h"
+#include "query/procedure/builtin/test_hello.h"
+#include "query/procedure/builtin/project_procedure.h"
 #include "query/query_context.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -22,6 +25,11 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
     if (!db_folder.empty()) {
         GQL::ProjectionManager::get_instance().init(db_folder);
     }
+
+    // Register built-in procedures
+    auto& catalog = GQL::ProcedureCatalog::get_instance();
+    catalog.register_procedure(std::make_unique<GQL::Procedures::TestHello>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::ProjectProcedure>());
 
     return std::make_unique<ModelDestroyer>([]() { gql_model.~GQLModel(); });
 }

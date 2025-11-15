@@ -3,6 +3,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -15,7 +16,7 @@
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "query/executor/binding_iter/aggregation/agg.h"
 #include "query/executor/binding_iter/binding_expr/binding_expr_printer.h"
-#include "query/parser/expr/gql/agg/expr_agg_project.h"  // For ProjectionOptions
+#include "query/parser/expr/gql/agg/expr_agg_project.h"  // For ProjectionOptions and DataConfig
 #include "query/query_context.h"
 #include "system/string_manager.h"
 
@@ -27,11 +28,25 @@ public:
     AggProject(
         VarId var_id,
         std::unique_ptr<BindingExpr> projection_name_expr,
-        ProjectionOptions options = ProjectionOptions()
+        ProjectionOptions options = ProjectionOptions(),
+        DataConfig data_config = DataConfig()
     ) :
         Agg(var_id, std::move(projection_name_expr)),
-        options(options)
-    { }
+        options(options),
+        data_config(data_config)
+    {
+        // Validate mutually exclusive modes
+        if (!data_config.is_empty() &&
+            (options.include_labels || options.include_properties)) {
+            throw std::runtime_error(
+                "PROJECT: Cannot combine dataConfig with INCLUDE clauses. "
+                "Use either:\n"
+                "  Mode 1 (Implicit): PROJECT('name' INCLUDE LABELS INCLUDE PROPERTIES)\n"
+                "  Mode 2 (Explicit): PROJECT('name', source, target, {sourceNodeProperties: ['age']})\n"
+                "Do not mix both modes."
+            );
+        }
+    }
 
     void begin() override
     {
@@ -100,8 +115,21 @@ public:
         ProjectionStorage::Features features;
         features.include_node_labels = options.include_labels;
         features.include_edge_labels = options.include_labels;
-        features.include_node_properties = options.include_properties;
-        features.include_edge_properties = options.include_properties;
+
+        // For Mode 2 (explicit), enable property indexes if dataConfig specifies properties
+        // For Mode 1 (implicit), use the include_properties option
+        if (!data_config.is_empty()) {
+            // Mode 2: Enable property indexes if any properties are specified
+            features.include_node_properties =
+                (data_config.source_node_properties && !data_config.source_node_properties->empty()) ||
+                (data_config.target_node_properties && !data_config.target_node_properties->empty());
+            features.include_edge_properties =
+                (data_config.relationship_properties && !data_config.relationship_properties->empty());
+        } else {
+            // Mode 1: Use the option flags
+            features.include_node_properties = options.include_properties;
+            features.include_edge_properties = options.include_properties;
+        }
 
         #ifdef DEBUG_GQL_QUERY_VISITOR
         std::cerr << "AggProject: Creating projection with features - labels: "
@@ -124,6 +152,19 @@ public:
     {
         // Initialize on first process() call when binding has actual data
         initialize_if_needed();
+
+        // Dispatch to appropriate processing mode
+        if (data_config.is_empty()) {
+            process_implicit();  // Backward compatible: implicit property detection
+        } else {
+            process_explicit();  // Selective properties: use DataConfig
+        }
+    }
+
+    // Process with implicit property detection (original behavior)
+    // Scans all variables and detects properties via naming convention (e.g., "n.age")
+    void process_implicit()
+    {
 
         #ifdef DEBUG_GQL_QUERY_VISITOR
         std::cerr << "AggProject::process() called, binding size: " << binding->size << std::endl;
@@ -373,7 +414,199 @@ public:
         }
 
         #ifdef DEBUG_GQL_QUERY_VISITOR
-        std::cerr << "AggProject::process() complete - nodes: " << node_properties.size()
+        std::cerr << "AggProject::process_implicit() complete - nodes: " << node_properties.size()
+                  << ", edges: " << edges_seen.size() << std::endl;
+        #endif
+    }
+
+    // Process with explicit selective property inclusion (new behavior)
+    // Uses data_config to include only specified properties
+    void process_explicit()
+    {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::process_explicit() called, binding size: " << binding->size << std::endl;
+        #endif
+
+        if (!projection_storage) {
+            throw std::runtime_error("ProjectionStorage not initialized in AggProject::process_explicit()");
+        }
+
+        // Maps to track nodes and edges with their properties
+        std::map<ObjectId, std::unordered_map<std::string, ObjectId>> node_properties;
+        std::map<ObjectId, std::unordered_map<std::string, ObjectId>> edge_properties;
+        std::map<ObjectId, bool> edges_seen;
+        std::map<ObjectId, std::pair<ObjectId, ObjectId>> edge_endpoints;
+        std::vector<ObjectId> node_sequence;
+
+        // First pass: collect nodes and edges from bindings (same as implicit)
+        for (size_t i = 0; i < binding->size; i++) {
+            VarId var_id(i);
+            ObjectId oid = (*binding)[var_id];
+
+            if (!oid.is_valid()) {
+                continue;
+            }
+
+            auto var_name = get_query_ctx().get_var_name(var_id);
+            auto type = GQL_OID::get_type(oid);
+
+            // Handle nodes
+            if (type == GQL_OID::Type::NODE) {
+                node_sequence.push_back(oid);
+                if (node_properties.find(oid) == node_properties.end()) {
+                    node_properties[oid] = std::unordered_map<std::string, ObjectId>();
+                }
+            }
+            // Handle edges
+            else if (type == GQL_OID::Type::DIRECTED_EDGE || type == GQL_OID::Type::UNDIRECTED_EDGE) {
+                edges_seen[oid] = (type == GQL_OID::Type::DIRECTED_EDGE);
+                if (edge_properties.find(oid) == edge_properties.end()) {
+                    edge_properties[oid] = std::unordered_map<std::string, ObjectId>();
+                }
+
+                // Infer edge endpoints from adjacent nodes (same heuristic as implicit)
+                ObjectId from_node = ObjectId(ObjectId::NULL_ID);
+                ObjectId to_node = ObjectId(ObjectId::NULL_ID);
+
+                if (!node_sequence.empty()) {
+                    from_node = node_sequence.back();
+                    for (size_t j = i + 1; j < binding->size; j++) {
+                        VarId next_var_id(j);
+                        ObjectId next_oid = (*binding)[next_var_id];
+                        if (next_oid.is_valid()) {
+                            auto next_type = GQL_OID::get_type(next_oid);
+                            if (next_type == GQL_OID::Type::NODE) {
+                                to_node = next_oid;
+                                break;
+                            }
+                        }
+                    }
+                }
+                edge_endpoints[oid] = std::make_pair(from_node, to_node);
+            }
+        }
+
+        // Second pass: add nodes (without properties yet)
+        for (const auto& [node_id, props] : node_properties) {
+            ProjectedNode node;
+            node.node_id = node_id;
+            // Properties will be added in fourth pass
+            projection_storage->add_node(node);
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            std::cerr << "  Added node: 0x" << std::hex << node_id.id << std::dec << std::endl;
+            #endif
+        }
+
+        // Third pass: add edges (without properties yet)
+        std::cerr << "[AggProject::explicit] Adding " << edges_seen.size() << " edges to projection storage" << std::endl;
+        for (const auto& [edge_id, is_directed] : edges_seen) {
+            ProjectedEdge edge;
+            edge.edge_id = edge_id;
+            edge.is_directed = is_directed;
+
+            // Use inferred endpoints
+            auto endpoints_it = edge_endpoints.find(edge_id);
+            if (endpoints_it != edge_endpoints.end()) {
+                edge.from_node = endpoints_it->second.first;
+                edge.to_node = endpoints_it->second.second;
+            } else {
+                edge.from_node = ObjectId(ObjectId::NULL_ID);
+                edge.to_node = ObjectId(ObjectId::NULL_ID);
+            }
+
+            projection_storage->add_edge(edge);
+        }
+
+        // Fourth pass: extract SELECTIVE properties from main graph
+        // Combine source and target node properties (simplified approach)
+        std::set<std::string> node_props_to_extract;
+        if (data_config.source_node_properties) {
+            for (const auto& prop : *data_config.source_node_properties) {
+                node_props_to_extract.insert(prop);
+            }
+        }
+        if (data_config.target_node_properties) {
+            for (const auto& prop : *data_config.target_node_properties) {
+                node_props_to_extract.insert(prop);
+            }
+        }
+
+        // Extract specified node properties from main graph
+        if (!node_props_to_extract.empty()) {
+            std::cerr << "[AggProject::explicit] Extracting " << node_props_to_extract.size()
+                      << " selective node properties from main graph" << std::endl;
+
+            for (const auto& [node_id, props] : node_properties) {
+                for (const std::string& prop_name : node_props_to_extract) {
+                    // Convert property name to ObjectId
+                    ObjectId key_id = Conversions::pack_node_property(prop_name);
+
+                    // Query main graph for this specific property
+                    // node_key_value is indexed: {node_id, key_id, value_id}
+                    bool interruption = false;
+                    BptIter<3> it = gql_model.node_key_value->get_range(
+                        &interruption,
+                        { node_id.id, key_id.id, 0 },
+                        { node_id.id, key_id.id, UINT64_MAX }
+                    );
+
+                    auto record = it.next();
+                    if (record != nullptr) {
+                        ObjectId value_id((*record)[2]);
+                        projection_storage->add_node_property(node_id, key_id, value_id);
+
+                        std::cerr << "[AggProject::explicit] Added node property: node=0x" << std::hex
+                                  << node_id.id << " key=" << prop_name << " value=0x"
+                                  << value_id.id << std::dec << std::endl;
+                    } else {
+                        // Property not found - skip gracefully (no error)
+                        std::cerr << "[AggProject::explicit] Property '" << prop_name
+                                  << "' not found for node 0x" << std::hex << node_id.id
+                                  << std::dec << " - skipping" << std::endl;
+                    }
+                }
+            }
+        }
+
+        // Extract specified relationship properties from main graph
+        if (data_config.relationship_properties) {
+            std::cerr << "[AggProject::explicit] Extracting " << data_config.relationship_properties->size()
+                      << " selective relationship properties from main graph" << std::endl;
+
+            for (const auto& [edge_id, is_directed] : edges_seen) {
+                for (const std::string& prop_name : *data_config.relationship_properties) {
+                    // Convert property name to ObjectId
+                    ObjectId key_id = Conversions::pack_edge_property(prop_name);
+
+                    // Query main graph for this specific property
+                    // edge_key_value is indexed: {edge_id, key_id, value_id}
+                    bool interruption = false;
+                    BptIter<3> it = gql_model.edge_key_value->get_range(
+                        &interruption,
+                        { edge_id.id, key_id.id, 0 },
+                        { edge_id.id, key_id.id, UINT64_MAX }
+                    );
+
+                    auto record = it.next();
+                    if (record != nullptr) {
+                        ObjectId value_id((*record)[2]);
+                        projection_storage->add_edge_property(edge_id, key_id, value_id);
+
+                        std::cerr << "[AggProject::explicit] Added edge property: edge=0x" << std::hex
+                                  << edge_id.id << " key=" << prop_name << " value=0x"
+                                  << value_id.id << std::dec << std::endl;
+                    } else {
+                        // Property not found - skip gracefully (no error)
+                        std::cerr << "[AggProject::explicit] Property '" << prop_name
+                                  << "' not found for edge 0x" << std::hex << edge_id.id
+                                  << std::dec << " - skipping" << std::endl;
+                    }
+                }
+            }
+        }
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        std::cerr << "AggProject::process_explicit() complete - nodes: " << node_properties.size()
                   << ", edges: " << edges_seen.size() << std::endl;
         #endif
     }
@@ -423,5 +656,6 @@ private:
     ObjectId projection_name_oid;
     bool initialized = false;
     ProjectionOptions options;  // Options for what to include in projection
+    DataConfig data_config;     // Configuration for selective properties
 };
 } // namespace GQL
