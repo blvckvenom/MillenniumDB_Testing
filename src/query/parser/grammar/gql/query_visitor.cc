@@ -2018,6 +2018,76 @@ std::any QueryVisitor::visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx
     return 0;
 }
 
+std::any QueryVisitor::visitListLiteral(GQLParser::ListLiteralContext* ctx)
+{
+    LOG_VISITOR
+    std::vector<ObjectId> list_oids;
+
+    // Iterate through all general literals in the list
+    auto literals = ctx->generalLiteral();
+    for (auto* literal : literals) {
+        // Visit each literal to evaluate it
+        visit(literal);
+
+        // Extract ObjectId from the evaluated expression
+        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
+        if (!expr_term) {
+            throw QuerySemanticException(
+                "List literal at line " + std::to_string(ctx->getStart()->getLine()) +
+                " contains non-literal element"
+            );
+        }
+
+        list_oids.push_back(expr_term->term);
+    }
+
+    // Pack the list into an ObjectId
+    ObjectId list_oid = GQL::Conversions::pack_list(list_oids);
+    current_expr = std::make_unique<ExprTerm>(list_oid);
+
+    return 0;
+}
+
+std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
+{
+    LOG_VISITOR
+    std::map<ObjectId, std::unique_ptr<DictionaryItem>> dict_map;
+
+    // Iterate through all record fields
+    auto fields = ctx->recordFieldLiteral();
+    for (auto* field : fields) {
+        // Extract the key (variable name)
+        std::string key_str = field->key->getText();
+
+        // Create ObjectId for the key using pack_string_simple
+        ObjectId key_oid = GQL::Conversions::pack_string_simple(key_str);
+
+        // Visit the value (generalLiteral) to evaluate it
+        visit(field->value);
+
+        // Extract ObjectId from the evaluated expression
+        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
+        if (!expr_term) {
+            throw QuerySemanticException(
+                "Record literal at line " + std::to_string(ctx->getStart()->getLine()) +
+                " contains non-literal value for key '" + key_str + "'"
+            );
+        }
+
+        // Add to dictionary map as DictionaryLiteral
+        dict_map[key_oid] = std::make_unique<DictionaryLiteral>(expr_term->term);
+    }
+
+    // Create the Dictionary object (automatically creates DictionaryObject)
+    auto dict = std::make_unique<Dictionary>(std::move(dict_map));
+
+    // Pack the dictionary into an ObjectId
+    ObjectId dict_oid = Common::Conversions::pack_dictionary(dict);
+    current_expr = std::make_unique<ExprTerm>(dict_oid);
+
+    return 0;
+}
+
 std::any QueryVisitor::visitDateFunction(GQLParser::DateFunctionContext* ctx)
 {
     // DATE
@@ -2302,8 +2372,126 @@ std::any QueryVisitor::visitEndTransactionCommand(GQLParser::EndTransactionComma
 }
 
 std::any
-    QueryVisitor::visitLinearCatalogModifyingStatement(GQLParser::LinearCatalogModifyingStatementContext*)
+    QueryVisitor::visitLinearCatalogModifyingStatement(GQLParser::LinearCatalogModifyingStatementContext* ctx)
 {
+    // Check if this is a CALL procedure statement (not DDL)
+    auto simple_stmts = ctx->simpleCatalogModifyingStatement();
+    if (simple_stmts.size() == 1) {
+        auto simple = simple_stmts[0];
+        if (simple->callProcedureStatement()) {
+            // This is a CALL procedure, not a DDL statement
+            // Process it using the same logic as visitCallQueryStatement
+            auto call_proc_ctx = simple->callProcedureStatement();
+
+            // Extract OPTIONAL flag
+            bool optional = call_proc_ctx->OPTIONAL() != nullptr;
+
+            // Get the procedure call
+            auto proc_call_ctx = call_proc_ctx->procedureCall();
+            if (!proc_call_ctx) {
+                throw QuerySemanticException("Missing procedure call");
+            }
+
+            // For now, only support named procedures (not inline)
+            auto named_ctx = proc_call_ctx->namedProcedureCall();
+            if (!named_ctx) {
+                throw NotSupportedException("Inline procedures are not yet supported. Use named procedures only.");
+            }
+
+            // Extract procedure name
+            auto proc_ref_ctx = named_ctx->procedureReference();
+            if (!proc_ref_ctx) {
+                throw QuerySemanticException("Missing procedure reference");
+            }
+
+            std::string proc_name;
+
+            // Handle catalogProcedureParentAndName
+            if (proc_ref_ctx->catalogProcedureParentAndName()) {
+                auto cat_name_ctx = proc_ref_ctx->catalogProcedureParentAndName();
+
+                // Build qualified name if there's a parent reference
+                if (cat_name_ctx->catalogObjectParentReference()) {
+                    std::string parent = cat_name_ctx->catalogObjectParentReference()->getText();
+                    proc_name = parent + ".";
+                }
+
+                // Add procedure name
+                if (cat_name_ctx->procedureName()) {
+                    proc_name += cat_name_ctx->procedureName()->getText();
+                } else {
+                    throw QuerySemanticException("Missing procedure name");
+                }
+            } else if (proc_ref_ctx->referenceParameter()) {
+                throw NotSupportedException("Dynamic procedure names (via parameters) are not yet supported");
+            } else {
+                throw QuerySemanticException("Invalid procedure reference");
+            }
+
+            // Lookup procedure in catalog
+            auto& catalog = ProcedureCatalog::get_instance();
+            Procedure* procedure = catalog.lookup(proc_name);
+
+            if (!procedure) {
+                auto available = catalog.list_procedures();
+                std::string available_str;
+                for (size_t i = 0; i < available.size() && i < 5; i++) {
+                    if (i > 0) available_str += ", ";
+                    available_str += available[i];
+                }
+                if (available.size() > 5) {
+                    available_str += ", ...";
+                }
+
+                throw QuerySemanticException(
+                    "Procedure '" + proc_name + "' not found. Available procedures: [" +
+                    (available_str.empty() ? "none" : available_str) + "]"
+                );
+            }
+
+            // Process arguments
+            std::vector<std::unique_ptr<Expr>> arguments;
+            if (named_ctx->procedureArgumentList()) {
+                for (auto arg_ctx : named_ctx->procedureArgumentList()->procedureArgument()) {
+                    visit(arg_ctx->expression());
+                    arguments.push_back(std::move(current_expr));
+                }
+            }
+
+            // Process YIELD clause
+            std::vector<OpCallProcedure::YieldItem> yield_items;
+            if (named_ctx->yieldClause()) {
+                auto yield_ctx = named_ctx->yieldClause();
+
+                for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
+                    std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
+
+                    // Get variable name (use alias if present, otherwise use field name)
+                    std::string var_name = field_name;
+                    if (item_ctx->yieldItemAlias()) {
+                        var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                    }
+
+                    // Get or create variable ID
+                    VarId var = get_query_ctx().get_or_create_var(var_name);
+
+                    yield_items.emplace_back(field_name, var);
+                }
+            }
+
+            // Create OpCallProcedure operator (following visitor pattern)
+            current_op = std::make_unique<OpCallProcedure>(
+                procedure,
+                std::move(arguments),
+                std::move(yield_items),
+                optional
+            );
+
+            return 0;
+        }
+    }
+
+    // Otherwise, it's a true DDL statement (CREATE/DROP) which isn't implemented
     throw NotSupportedException("Create/Drop");
 }
 

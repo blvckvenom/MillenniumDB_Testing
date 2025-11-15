@@ -77,8 +77,8 @@ bool CallProcedure::_next()
 
         // Evaluate and store arguments
         context->arguments.reserve(arguments.size());
-        for (auto& arg_expr : arguments) {
-            ObjectId arg_value = arg_expr->eval(*parent_binding);
+        for (size_t i = 0; i < arguments.size(); i++) {
+            ObjectId arg_value = arguments[i]->eval(*parent_binding);
             context->arguments.push_back(arg_value);
         }
 
@@ -115,9 +115,17 @@ bool CallProcedure::_next()
 
     } catch (const std::exception& e) {
         if (optional) {
-            // OPTIONAL CALL: suppress error and return false (no results)
+            // ISO §15.1 OPTIONAL CALL: Return row with null fields (not empty result)
+            // When procedure fails, OPTIONAL returns one record with all fields set to null
             executed = true;
-            return false;
+
+            // Bind all YIELD variables to NULL
+            for (const auto& [field_name, var_id] : yield_items) {
+                parent_binding->add(var_id, ObjectId::get_null());
+            }
+
+            // Return true to indicate we have one result row (with null values)
+            return true;
         } else {
             // Re-throw exception if not OPTIONAL
             throw;

@@ -205,6 +205,8 @@ public:
     std::any visitIntegerLiteral(GQLParser::IntegerLiteralContext* ctx) override;
     std::any visitFloatLiteral(GQLParser::FloatLiteralContext* ctx) override;
     std::any visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx) override;
+    std::any visitListLiteral(GQLParser::ListLiteralContext* ctx) override;
+    std::any visitRecordLiteral(GQLParser::RecordLiteralContext* ctx) override;
     std::any visitGqlUnaryExpression(GQLParser::GqlUnaryExpressionContext* ctx) override;
 
     std::any visitOrderByAndPageStatement(GQLParser::OrderByAndPageStatementContext* ctx) override;
