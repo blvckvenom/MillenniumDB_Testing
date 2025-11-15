@@ -87,3 +87,5 @@ void AddStartingEnum::visit(OpEdge&) { }
 void AddStartingEnum::visit(OpUnitTable&) { }
 
 void AddStartingEnum::visit(OpEmpty&) { }
+
+void AddStartingEnum::visit(OpCallProcedure&) { }

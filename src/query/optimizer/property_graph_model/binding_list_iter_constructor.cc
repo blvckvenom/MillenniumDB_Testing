@@ -584,8 +584,8 @@ void PathBindingIterConstructor::visit(OpCallProcedure& op_call)
     binding_arguments.reserve(op_call.arguments.size());
 
     ExprToBindingExpr expr_converter(this, {}, false);
-    for (auto& arg_expr : op_call.arguments) {
-        arg_expr->accept_visitor(expr_converter);
+    for (size_t i = 0; i < op_call.arguments.size(); i++) {
+        op_call.arguments[i]->accept_visitor(expr_converter);
         binding_arguments.push_back(std::move(expr_converter.tmp));
     }
 

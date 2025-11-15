@@ -17,6 +17,7 @@ public:
     { }
 
     void visit(OpReturn&) override;
+    void visit(OpCallProcedure&) override;
 
     void visit(OpGraphPattern&) override { }
     void visit(OpEmpty&) override { }
@@ -34,7 +35,6 @@ public:
     void visit(OpQueryStatements&) override { }
     void visit(OpGroupBy&) override { }
     void visit(OpUnitTable&) override { }
-    void visit(OpCallProcedure&) override { }
 
 private:
     ReturnType return_type;

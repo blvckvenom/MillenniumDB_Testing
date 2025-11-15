@@ -87,3 +87,5 @@ void CheckUnboundedRepetition::visit(OpEdge&) { }
 void CheckUnboundedRepetition::visit(OpUnitTable&) { }
 
 void CheckUnboundedRepetition::visit(OpEmpty&) { }
+
+void CheckUnboundedRepetition::visit(OpCallProcedure&) { }
