@@ -56,6 +56,8 @@ TEST_SUITES: list[str] = [
     "path_binding",
     "group_by",
     "call_procedure",
+    "projection_native",
+    "projection_properties",
 ]
 
 # Tests with the following query files fill be ignored

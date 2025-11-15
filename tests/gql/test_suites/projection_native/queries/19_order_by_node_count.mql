@@ -1,0 +1,4 @@
+CALL graph_project('test_order', 'User', 'KNOWS')
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount
+ORDER BY nodeCount DESC

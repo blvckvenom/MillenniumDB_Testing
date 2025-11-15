@@ -108,10 +108,14 @@ set(PROFILE_TARGETS
 set(TEST_TARGETS
     compare_datetime
     iri_prefixes-test
+    # native_projection_builder_test  # DISABLED: needs API updates
+    native_scanner_test
+    # project_procedure_test  # DISABLED: needs ProcedureContext updates
     projection_inspect
     projection_inspect_enhanced
     projection_storage_test
     projection_features_test
+    property_projection_test
     regular_path_expr_to_rpq_dfa
     scsu-test
     tensor_operations

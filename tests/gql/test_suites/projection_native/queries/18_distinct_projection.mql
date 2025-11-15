@@ -1,0 +1,3 @@
+CALL graph_project('test_distinct', 'User', 'KNOWS')
+YIELD graphName, nodeCount
+RETURN DISTINCT graphName, nodeCount
