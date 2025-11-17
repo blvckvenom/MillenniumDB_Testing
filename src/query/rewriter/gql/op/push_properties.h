@@ -26,6 +26,7 @@ public:
     void visit(OpLinearPattern&) override;
     void visit(OpLet&) override;
     void visit(OpGroupBy&) override;
+    void visit(OpProcedure&) override;
 
     void visit(OpWhere&) override;
     void visit(OpPathUnion&) override;

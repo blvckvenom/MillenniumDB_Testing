@@ -48,3 +48,7 @@ void CheckStatements::visit(OpRepetition&) { }
 void CheckStatements::visit(OpLinearPattern&) { }
 void CheckStatements::visit(OpUnitTable&) { }
 void CheckStatements::visit(OpEmpty&) { }
+void CheckStatements::visit(OpProcedure&)
+{
+    has_match_or_let = true;
+}

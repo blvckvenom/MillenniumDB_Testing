@@ -174,3 +174,8 @@ void PushProperties::visit(OpEmpty& op)
 {
     tmp = std::make_unique<OpEmpty>(op);
 }
+
+void PushProperties::visit(OpProcedure& op)
+{
+    tmp = op.clone();
+}

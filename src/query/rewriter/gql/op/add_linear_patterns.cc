@@ -163,4 +163,11 @@ void AddLinearPatterns::visit(OpEmpty& op)
     tmp = std::make_unique<OpEmpty>(op);
 }
 
+void AddLinearPatterns::visit(OpProcedure& op)
+{
+    linear_pattern = None;
+    consecutive_nodes_found = false;
+    tmp = op.clone();
+}
+
 void AddLinearPatterns::visit(OpLinearPattern&) { }

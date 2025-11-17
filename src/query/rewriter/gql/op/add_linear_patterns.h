@@ -24,6 +24,7 @@ public:
     void visit(OpRepetition&) override;
     void visit(OpReturn&) override;
     void visit(OpLet&) override;
+    void visit(OpProcedure&) override;
 
     void visit(OpGroupBy&) override;
     void visit(OpOrderBy&) override;

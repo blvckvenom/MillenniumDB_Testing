@@ -87,3 +87,9 @@ void AddStartingEnum::visit(OpEdge&) { }
 void AddStartingEnum::visit(OpUnitTable&) { }
 
 void AddStartingEnum::visit(OpEmpty&) { }
+
+void AddStartingEnum::visit(OpProcedure&)
+{
+    // Procedimientos no alteran la detección de repeticiones; no hacemos nada.
+    repetition_found = false;
+}

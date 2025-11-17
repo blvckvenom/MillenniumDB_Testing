@@ -174,3 +174,8 @@ void PushLabels::visit(OpEmpty& op)
 {
     tmp = std::make_unique<OpEmpty>(op);
 }
+
+void PushLabels::visit(OpProcedure& op)
+{
+    tmp = op.clone();
+}

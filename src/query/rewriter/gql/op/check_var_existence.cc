@@ -234,4 +234,10 @@ void CheckVarExistence::visit(OpUnitTable&) { }
 
 void CheckVarExistence::visit(OpEmpty&) { }
 
+void CheckVarExistence::visit(OpProcedure& op_procedure)
+{
+    for (const auto& yield_var : op_procedure.yield_vars) {
+        variables.insert(yield_var);
+    }
+}
 } // namespace GQL

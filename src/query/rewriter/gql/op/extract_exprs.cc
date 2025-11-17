@@ -152,4 +152,9 @@ void ExtractExprs::visit(OpEmpty& op)
     tmp = std::make_unique<OpEmpty>(op);
 }
 
+void ExtractExprs::visit(OpProcedure& op)
+{
+    tmp = op.clone();
+}
+
 } // namespace GQL

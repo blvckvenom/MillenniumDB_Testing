@@ -28,6 +28,7 @@ public:
     void visit(OpGroupBy& op) override;
     void visit(OpUnitTable&) override;
     void visit(OpEmpty&) override;
+    void visit(OpProcedure&) override;
 
     void visit(OpNode&) override;
     void visit(OpEdge&) override;
