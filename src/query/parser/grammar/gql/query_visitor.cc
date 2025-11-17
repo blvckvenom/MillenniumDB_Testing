@@ -84,6 +84,8 @@ std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQuerySta
     } else if (ctx->filterStatement()) {
         ctx->filterStatement()->accept(this);
         current_op = std::make_unique<OpFilter>(std::move(filter_items));
+    } else if (ctx->callQueryStatement()) {
+        ctx->callQueryStatement()->accept(this);
     }
     return 0;
 }
