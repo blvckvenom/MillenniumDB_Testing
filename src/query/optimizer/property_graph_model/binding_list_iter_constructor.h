@@ -41,6 +41,7 @@ public:
     void visit(OpEdge&) override;
     void visit(OpUnitTable& op) override;
     void visit(OpEmpty&) override;
+    void visit(OpProcedure&) override;
 
     std::unique_ptr<BindingIter> tmp_iter;
 

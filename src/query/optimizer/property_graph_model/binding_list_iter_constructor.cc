@@ -21,6 +21,7 @@
 #include "query/executor/binding_iter/set_variable_value.h"
 #include "query/executor/binding_iter/single_result_binding_iter.h"
 #include "query/executor/binding_iter/slice.h"
+#include "query/executor/binding_iter/procedure/hello_world.h"
 #include "query/optimizer/plan/join_order/greedy_optimizer.h"
 #include "query/optimizer/plan/join_order/selinger_optimizer.h"
 #include "query/optimizer/property_graph_model/expr_to_binding_expr.h"
@@ -574,6 +575,39 @@ void PathBindingIterConstructor::visit(OpEmpty&)
 {
     tmp_iter = std::make_unique<EmptyBindingIter>();
 }
+
+void PathBindingIterConstructor::visit(OpProcedure& op_procedure)
+{
+    std::vector<std::unique_ptr<BindingExpr>> argument_binding_exprs;
+    argument_binding_exprs.reserve(op_procedure.argument_exprs.size());
+
+    for (auto& argument_expr : op_procedure.argument_exprs) {
+        ExprToBindingExpr expr_to_binding_expr(this, {}, false);
+        argument_expr->accept_visitor(expr_to_binding_expr);
+        argument_binding_exprs.emplace_back(std::move(expr_to_binding_expr.tmp));
+    }
+
+    auto yield_vars = op_procedure.yield_vars;
+
+    switch (op_procedure.procedure_type) {
+    case OpProcedure::ProcedureType::HELLO_WORLD:
+        tmp_iter = std::make_unique<Procedure::HelloWorld>(
+            std::move(argument_binding_exprs),
+            std::move(yield_vars)
+        );
+        break;
+    default:
+        throw NotSupportedException(
+            "PathBindingIterConstructor::visit(OpProcedure&): Not implemented procedure with procedure_type: "
+            + std::to_string(static_cast<uint8_t>(op_procedure.procedure_type))
+        );
+    }
+
+    for (const auto& yield_var : op_procedure.yield_vars) {
+        assigned_vars.insert(yield_var);
+    }
+}
+
 
 std::unique_ptr<BindingIter>
     PathBindingIterConstructor::get_pending_properties(std::unique_ptr<BindingIter> binding_iter)

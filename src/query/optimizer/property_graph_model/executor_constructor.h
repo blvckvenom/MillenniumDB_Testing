@@ -34,6 +34,7 @@ public:
     void visit(OpQueryStatements&) override { }
     void visit(OpGroupBy&) override { }
     void visit(OpUnitTable&) override { }
+    void visit(OpProcedure&) override { }
 
 private:
     ReturnType return_type;
