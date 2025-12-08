@@ -2116,6 +2116,8 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
     OpProcedure::ProcedureType procedure_type;
     if (procedure_name_lowercased == "hello_world") {
         procedure_type = OpProcedure::ProcedureType::HELLO_WORLD;
+    } else if (procedure_name_lowercased == "neighbors") {
+        procedure_type = OpProcedure::ProcedureType::NEIGHBORS;
     } else {
         throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
     }
@@ -2126,7 +2128,12 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
     current_call_yield_var2alias.clear();
 
     std::vector<VarId> yield_vars;
-    yield_vars.emplace_back(get_query_ctx().get_or_create_var("message"));
+    if (procedure_type == OpProcedure::ProcedureType::HELLO_WORLD) {
+        yield_vars.emplace_back(get_query_ctx().get_or_create_var("message"));
+    } else if (procedure_type == OpProcedure::ProcedureType::NEIGHBORS) {
+        yield_vars.emplace_back(get_query_ctx().get_or_create_var("node"));
+        yield_vars.emplace_back(get_query_ctx().get_or_create_var("neighbor"));
+    }
 
     current_op = std::make_unique<OpProcedure>(
         procedure_type,
