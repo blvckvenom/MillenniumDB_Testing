@@ -17,13 +17,16 @@ namespace GQL {
 class OpProcedure : public Op {
 public:
     enum class ProcedureType : uint8_t {
-        HELLO_WORLD // primera función analítica de juguete
+        HELLO_WORLD, // primera función analítica de juguete
+        NEIGHBORS // devolver todos los vecinos de todos los nodos
     };
     static std::string get_procedure_string(ProcedureType procedure_type)
     {
         switch (procedure_type) {
         case ProcedureType::HELLO_WORLD:
             return "HELLO_WORLD";
+        case ProcedureType::NEIGHBORS:
+            return "NEIGHBORS";
         default:
             throw NotSupportedException(
                 "OpProcedure::get_procedure_string: Unhandled procedure type: "
@@ -36,6 +39,8 @@ public:
         switch (procedure_type) {
         case ProcedureType::HELLO_WORLD:
             return { "message" };
+        case ProcedureType::NEIGHBORS:
+            return { "node", "neighbor" };
         default:
             throw NotSupportedException(
                 "OpProcedure::get_procedure_available_yield_variable_names: Unhandled procedure type: "
