@@ -2133,6 +2133,8 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
     } else if (procedure_type == OpProcedure::ProcedureType::NEIGHBORS) {
         yield_vars.emplace_back(get_query_ctx().get_or_create_var("node"));
         yield_vars.emplace_back(get_query_ctx().get_or_create_var("neighbor"));
+        singleton_types[yield_vars[0]] = VarType::Node;
+        singleton_types[yield_vars[1]] = VarType::Node;
     }
 
     current_op = std::make_unique<OpProcedure>(
