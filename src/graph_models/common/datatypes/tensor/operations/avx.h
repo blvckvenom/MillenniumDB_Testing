@@ -19,12 +19,15 @@ struct AVXInterface<float> {
 
     static inline reg_type load(const value_type* ptr)
     {
-        return _mm256_load_ps(ptr);
+        // Use unaligned load - data from external sources (GNN tensors, mmap'd files)
+        // may not be 32-byte aligned. Performance difference is minimal on modern CPUs.
+        return _mm256_loadu_ps(ptr);
     }
 
     static inline void store(value_type* ptr, reg_type va)
     {
-        _mm256_store_ps(ptr, va);
+        // Use unaligned store to match unaligned load
+        _mm256_storeu_ps(ptr, va);
     }
 
     static inline reg_type set_zero()
@@ -537,6 +540,59 @@ struct computation {
         }
 
         return res;
+    }
+
+    // Compute ||v||² (squared L2 norm) using AVX2
+    static inline T norm_squared(const T* ptr, size_type n)
+    {
+        auto sumv = AVXI::set_zero();
+
+        size_type i = 0;
+        for (; i + AVXI::reg_width <= n; i += AVXI::reg_width) {
+            const auto v = AVXI::load(ptr + i);
+            sumv = AVXI::add(sumv, AVXI::mul(v, v));
+        }
+
+        T res = AVXI::hsum(sumv);
+
+        for (; i < n; ++i) {
+            res += ptr[i] * ptr[i];
+        }
+
+        return res;
+    }
+
+    // Cosine distance using pre-computed norms: 1 - (a·b)/(sqrt(||a||²) × sqrt(||b||²))
+    // This avoids redundant norm computation when the query norm is known
+    static inline T cosine_distance_with_norms(
+        const T* lhs, T lhs_norm_sq,
+        const T* rhs, T rhs_norm_sq,
+        size_type n
+    )
+    {
+        // Only compute dot product (norms already known)
+        auto abv = AVXI::set_zero();
+
+        size_type i = 0;
+        for (; i + AVXI::reg_width <= n; i += AVXI::reg_width) {
+            const auto va = AVXI::load(lhs + i);
+            const auto vb = AVXI::load(rhs + i);
+            abv = AVXI::add(abv, AVXI::mul(va, vb));
+        }
+
+        T ab = AVXI::hsum(abv);
+
+        for (; i < n; ++i) {
+            ab += lhs[i] * rhs[i];
+        }
+
+        // Handle zero vectors (max distance)
+        if (lhs_norm_sq == T{0} || rhs_norm_sq == T{0}) {
+            return T{2.0};
+        }
+
+        const T similarity = ab / std::sqrt(lhs_norm_sq * rhs_norm_sq);
+        return T{1.0} - std::min(T{1.0}, std::max(T{-1.0}, similarity));
     }
 };
 
