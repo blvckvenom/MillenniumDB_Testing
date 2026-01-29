@@ -3,11 +3,10 @@
 
 obj/*
 bin/*
-build/
+
 
 # editor metadata
 tags
-compile_commands.json
 cscope.out
 
 ### C++ ###
@@ -75,7 +74,7 @@ TODO/*
 
 .antlr
 
-third_party/boost_1_82
+
 
 # Python virtual environment
 .venv
@@ -111,13 +110,35 @@ third_party/boost_1_82
 
 **/.DS_Store
 
-# Test databases (temporary artifacts)
-/test_db/
-/test_data/
-/test_results/
+# Build directories (generated)
+/build/
 
-# Investigation and working materials (keep local, don't commit)
-/investigacion_project_2025_11_01/
+# Tesis - repositorio separado
+Tesis/
 
-# Debug directory
-/debug/
+# Documentación e investigaciones (locales)
+/docs/
+
+# Ideas y borradores locales
+/Partial_Idea/
+
+# Claude Code configuration (local)
+/.claude/
+/CLAUDE.md
+/.cclsp.json
+/.mcp.json
+
+# Doxygen
+/Doxyfile
+
+# Third-party dependencies (see third_party/DEPENDENCIES.md for installation)
+# Only antlr4-runtime-4.13.1 is tracked in the repository
+/third_party/*
+!/third_party/antlr4-runtime-4.13.1/
+!/third_party/DEPENDENCIES.md
+
+# Large GNN datasets (download via scripts/download_gnn_datasets.py)
+data/example/gql/ogbn-*/
+data/example/gql/cora/
+scripts/gnn_datasets/ogb_data/
+*.npy
