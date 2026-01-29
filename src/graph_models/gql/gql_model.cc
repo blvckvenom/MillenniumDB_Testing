@@ -6,8 +6,21 @@
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_query_context.h"
 #include "query/procedure/procedure_catalog.h"
-#include "query/procedure/builtin/test_hello.h"
 #include "query/procedure/builtin/project_procedure.h"
+#include "query/procedure/builtin/graph_exists_procedure.h"
+#include "query/procedure/builtin/graph_drop_procedure.h"
+#include "query/procedure/builtin/graph_list_procedure.h"
+#ifdef ENABLE_GNN
+#include "query/procedure/builtin/gnn_offline_sample_procedure.h"
+#include "query/procedure/builtin/gnn_sample_list_procedure.h"
+#include "query/procedure/builtin/gnn_sample_info_procedure.h"
+#include "query/procedure/builtin/gnn_sample_drop_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_create_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_find_similar_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_list_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_drop_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_info_procedure.h"
+#endif
 #include "query/query_context.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -28,8 +41,25 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
 
     // Register built-in procedures
     auto& catalog = GQL::ProcedureCatalog::get_instance();
-    catalog.register_procedure(std::make_unique<GQL::Procedures::TestHello>());
     catalog.register_procedure(std::make_unique<GQL::Procedures::ProjectProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GraphExistsProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GraphDropProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GraphListProcedure>());
+
+#ifdef ENABLE_GNN
+    // Register GNN sampling procedures (only when GNN module is enabled)
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnOfflineSampleProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnSampleListProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnSampleInfoProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnSampleDropProcedure>());
+
+    // Register GNN HNSW index procedures (ANN search over embeddings)
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswCreateProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswFindSimilarProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswListProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswDropProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswInfoProcedure>());
+#endif
 
     return std::make_unique<ModelDestroyer>([]() { gql_model.~GQLModel(); });
 }
@@ -256,11 +286,18 @@ BPlusTree<3>& GQLModel::get_key_value_edge() {
 BPlusTree<3>& GQLModel::get_edge_from_to() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
-            "Edge-first index ordering is not supported in projections. "
-            "Projection '" + ctx.active_projection + "' uses a simplified index structure. "
-            "This may indicate the query optimizer selected a plan incompatible with projections."
-        );
+        std::cerr << "[GQLModel] get_edge_from_to() called for projection, using edge_from_to_index" << std::endl;
+        if (!ctx.projection_ctx || !ctx.projection_ctx->edge_from_to_index) {
+            throw std::runtime_error(
+                "Edge-first index not available for projection '" + ctx.active_projection + "'.\n\n"
+                "This projection was created before edge-first indexes were added.\n\n"
+                "Solutions:\n"
+                "  1. Recreate the projection to include edge-first indexes\n"
+                "  2. Use a node-based query pattern instead:\n"
+                "     MATCH (n)-[e:Type]->() RETURN e"
+            );
+        }
+        return *ctx.projection_ctx->edge_from_to_index;
     }
     return *edge_from_to;
 }
@@ -306,14 +343,16 @@ BPlusTree<3>& GQLModel::get_n1_n2_edge() {
 BPlusTree<3>& GQLModel::get_edge_n1_n2() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        std::cerr << "[GQLModel] get_edge_n1_n2() called for projection, returning from_to_edge_index" << std::endl;
-        if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
-            throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
+        std::cerr << "[GQLModel] get_edge_n1_n2() called for projection, using edge_n1_n2_index" << std::endl;
+        if (!ctx.projection_ctx || !ctx.projection_ctx->edge_n1_n2_index) {
+            // Fallback to from_to_edge_index for older projections without edge_n1_n2_index
+            std::cerr << "[GQLModel] edge_n1_n2_index not available, falling back to from_to_edge_index" << std::endl;
+            if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
+                throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
+            }
+            return *ctx.projection_ctx->from_to_edge_index;
         }
-        // For projections, edge_n1_n2 queries use the from_to_edge_index
-        // Note: This may not be optimal since from_to_edge is ordered by (from, to, edge)
-        // rather than (edge, from, to), but it should still work for scanning
-        return *ctx.projection_ctx->from_to_edge_index;
+        return *ctx.projection_ctx->edge_n1_n2_index;
     }
     return *edge_n1_n2;
 }

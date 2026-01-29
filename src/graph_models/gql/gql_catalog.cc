@@ -38,8 +38,24 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
 
         node_keys2id = convert_strvec_to_map(node_keys_str);
         edge_keys2id = convert_strvec_to_map(edge_keys_str);
+
+        // GNN tensor metadata (added in minor version 1)
+        if (diff_minor_version == 0) {
+            has_gnn_tensors = read_uint64() != 0;
+            gnn_tensor_num_rows = read_uint64();
+            gnn_tensor_num_cols = read_uint64();
+        }
+
+#ifdef ENABLE_GNN
+        // Initialize HNSW index manager (loads existing indexes from disk)
+        hnsw_index_manager.init();
+#endif
     } else {
         has_changes = true;
+#ifdef ENABLE_GNN
+        // Initialize HNSW index manager for new database
+        hnsw_index_manager.init();
+#endif
     }
 }
 
@@ -66,6 +82,14 @@ void GQLCatalog::print(std::ostream& os)
     os << "  Distinct Edge Labels: " << edge_label2total_count.size() << "\n";
     os << "  Distinct Node Keys:   " << node_key2total_count.size() << "\n";
     os << "  Distinct Edge Keys:   " << edge_key2total_count.size() << "\n";
+    if (has_gnn_tensors) {
+        os << "  GNN Node Features:    " << gnn_tensor_num_rows << " x " << gnn_tensor_num_cols << "\n";
+    }
+#ifdef ENABLE_GNN
+    if (hnsw_index_manager.num_hnsw_indexes() > 0) {
+        os << "  HNSW Indexes:         " << hnsw_index_manager.num_hnsw_indexes() << "\n";
+    }
+#endif
     os << "-------------------------------------\n";
 }
 
@@ -94,4 +118,9 @@ void GQLCatalog::save()
 
     write_strvec(node_keys_str);
     write_strvec(edge_keys_str);
+
+    // GNN tensor metadata (minor version 1)
+    write_uint64(has_gnn_tensors ? 1 : 0);
+    write_uint64(gnn_tensor_num_rows);
+    write_uint64(gnn_tensor_num_cols);
 }

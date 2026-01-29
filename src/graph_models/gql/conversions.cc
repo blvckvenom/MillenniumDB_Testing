@@ -7,7 +7,9 @@
 
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
+#include "graph_models/gql/projection/projection_query_context.h"
 #include "graph_models/inliner.h"
+#include "query/query_context.h"
 #include "storage/index/lists/list_encoder.h"
 #include "system/path_manager.h"
 #include "system/string_manager.h"
@@ -250,6 +252,19 @@ ObjectId Conversions::pack_edge_label(const std::string& label)
 
 ObjectId Conversions::pack_node_property(const std::string& property)
 {
+    // Check projection-specific keys first (for synthetic properties)
+    // Guard: only access query context if it's been initialized
+    if (QueryContext::_query_ctx != nullptr) {
+        auto& ctx = get_query_ctx();
+        if (ctx.projection_ctx) {
+            auto it = ctx.projection_ctx->node_keys2id.find(property);
+            if (it != ctx.projection_ctx->node_keys2id.end()) {
+                return ObjectId(it->second | ObjectId::MASK_NODE_KEY);
+            }
+        }
+    }
+
+    // Fall back to main catalog
     if (gql_model.catalog.node_keys2id.count(property)) {
         uint64_t label_id = gql_model.catalog.node_keys2id[property];
         return ObjectId(label_id | ObjectId::MASK_NODE_KEY);
@@ -260,6 +275,19 @@ ObjectId Conversions::pack_node_property(const std::string& property)
 
 ObjectId Conversions::pack_edge_property(const std::string& property)
 {
+    // Check projection-specific keys first (for synthetic properties like _count)
+    // Guard: only access query context if it's been initialized
+    if (QueryContext::_query_ctx != nullptr) {
+        auto& ctx = get_query_ctx();
+        if (ctx.projection_ctx) {
+            auto it = ctx.projection_ctx->edge_keys2id.find(property);
+            if (it != ctx.projection_ctx->edge_keys2id.end()) {
+                return ObjectId(it->second | ObjectId::MASK_EDGE_KEY);
+            }
+        }
+    }
+
+    // Fall back to main catalog
     if (gql_model.catalog.edge_keys2id.count(property)) {
         uint64_t label_id = gql_model.catalog.edge_keys2id[property];
         return ObjectId(label_id | ObjectId::MASK_EDGE_KEY);

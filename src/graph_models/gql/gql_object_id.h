@@ -4,8 +4,51 @@
 
 #include "graph_models/object_id.h"
 
+/**
+ * @brief GQL-specific ObjectId type system.
+ *
+ * This namespace provides type classification utilities for GQL (Graph Query Language)
+ * ObjectIds. The type system follows a 3-level hierarchy:
+ *
+ * 1. **GenericType**: High-level type categories (STRING, NUMERIC, NODE, EDGE, etc.)
+ * 2. **GenericSubType**: Refined subtypes (INTEGER vs FLOAT vs DOUBLE within NUMERIC)
+ * 3. **Type**: Complete type including storage mode (INLINE, EXTERN, TMP)
+ *
+ * ## ObjectId Layout (64 bits)
+ *
+ * ```
+ * [8-bit type prefix][56-bit value payload]
+ *  ├─ 4 bits: Generic type
+ *  ├─ 2 bits: Subtype
+ *  └─ 2 bits: Storage modifier (inline=0b00, extern=0b01, tmp=0b10)
+ * ```
+ *
+ * ## GQL-Specific Type Prefixes
+ *
+ * | Prefix | Type | Description |
+ * |--------|------|-------------|
+ * | 0xC0 | NODE | Graph node |
+ * | 0xE0 | DIRECTED_EDGE | Directed relationship |
+ * | 0xE4 | UNDIRECTED_EDGE | Undirected relationship |
+ * | 0xC4 | NODE_LABEL | Node label identifier |
+ * | 0xC8 | EDGE_LABEL | Edge label identifier |
+ * | 0xCC | NODE_KEY | Node property key |
+ * | 0xD0 | EDGE_KEY | Edge property key |
+ *
+ * @see ObjectId for base type mask definitions
+ * @see src/graph_models/object_id.h for complete mask reference
+ */
 namespace GQL_OID {
-    enum class GenericType {
+
+/**
+ * @brief High-level type categories for GQL values.
+ *
+ * Represents the most general classification of GQL types.
+ * Used for type checking in expressions and comparisons.
+ *
+ * @note These map to GQL standard value types (ISO/IEC 39075:2024 §4.4)
+ */
+enum class GenericType {
         NULL_ID = 0x00,
         STRING,
         NUMERIC,
@@ -21,6 +64,15 @@ namespace GQL_OID {
         // GEOMETRY, ?
     };
 
+    /**
+     * @brief Refined subtypes within each GenericType category.
+     *
+     * Provides finer granularity than GenericType while still abstracting
+     * away storage details. For example, INTEGER, FLOAT, DOUBLE, DECIMAL
+     * are all NUMERIC at the generic level but distinct subtypes.
+     *
+     * Used for type coercion and comparison semantics.
+     */
     enum class GenericSubType {
         NULL_ID = 0x00,
         // URI,
@@ -41,6 +93,25 @@ namespace GQL_OID {
         // POINT, ?
     };
 
+    /**
+     * @brief Complete type enumeration including storage mode.
+     *
+     * The most specific type classification, distinguishing between:
+     * - **INLINE**: Value stored directly in the 56-bit payload (small values)
+     * - **EXTERN**: Value stored in external dictionary, payload contains reference
+     * - **TMP**: Temporary value created during query execution
+     *
+     * ## Storage Mode Selection
+     *
+     * | Type | Inline Threshold | External Storage |
+     * |------|------------------|------------------|
+     * | STRING | ≤7 bytes | String dictionary |
+     * | INT | 56-bit range | 64-bit external |
+     * | DECIMAL | Small precision | External decimal |
+     * | DOUBLE | N/A | Always external |
+     *
+     * @see get_type() to extract Type from ObjectId
+     */
     enum class Type {
         NULL_ID = 0x00,
         // URI,
@@ -74,8 +145,28 @@ namespace GQL_OID {
         // POINT, ?
     };
 
+    /// Maximum bytes for inline string storage (longer strings use external dictionary)
     static constexpr int MAX_INLINE_LEN_STRING = 7;
 
+    /**
+     * @brief Extracts the complete Type from an ObjectId.
+     *
+     * Examines the 8-bit type prefix and returns the corresponding Type enum value.
+     * This is the primary type introspection function for GQL values.
+     *
+     * @param oid The ObjectId to examine
+     * @return The Type of the ObjectId
+     *
+     * @note Performance: O(1) - single switch on masked value
+     *
+     * Example:
+     * @code
+     * ObjectId node_id = ...; // Some node
+     * if (GQL_OID::get_type(node_id) == GQL_OID::Type::NODE) {
+     *     // Handle node
+     * }
+     * @endcode
+     */
     inline constexpr Type get_type(ObjectId oid) {
         switch (oid.id >> 56) {
         case (ObjectId::MASK_NULL >> 56):
@@ -150,6 +241,17 @@ namespace GQL_OID {
         // return static_cast<Type>(oid.id);
     }
 
+    /**
+     * @brief Gets the GenericSubType for an ObjectId.
+     *
+     * Maps the complete Type to its parent subtype category.
+     * Useful for type coercion decisions (e.g., can INTEGER be compared with FLOAT?).
+     *
+     * @param oid The ObjectId to examine
+     * @return The GenericSubType category
+     *
+     * @note All storage modes (INLINE/EXTERN/TMP) map to the same subtype
+     */
     inline GenericSubType get_generic_sub_type(ObjectId oid) {
         switch (get_type(oid)) {
             case Type::NULL_ID:
@@ -203,6 +305,20 @@ namespace GQL_OID {
         return GenericSubType::NULL_ID;
     }
 
+    /**
+     * @brief Gets the highest-level GenericType for an ObjectId.
+     *
+     * Returns the broadest type category. Used for:
+     * - Type compatibility checking in expressions
+     * - Determining comparison semantics (numeric vs string comparison)
+     * - Query result type inference
+     *
+     * @param oid The ObjectId to examine
+     * @return The GenericType category
+     *
+     * @note All numeric types (INT, FLOAT, DOUBLE, DECIMAL) return GenericType::NUMERIC
+     * @note Both DIRECTED_EDGE and UNDIRECTED_EDGE return GenericType::EDGE
+     */
     inline GenericType get_generic_type(ObjectId oid) {
         switch (get_type(oid)) {
             case Type::NULL_ID:
