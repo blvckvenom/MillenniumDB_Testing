@@ -2,6 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+# First: Attribution
+Never claim authorship of the code or mention that you wrote it.
+
 ## Overview
 
 MillenniumDB is a graph-oriented database management system (DBMS) developed by the Millennium Institute for Foundational Research on Data (IMFD). It supports multiple graph models and query languages:
@@ -12,171 +15,38 @@ MillenniumDB is a graph-oriented database management system (DBMS) developed by 
 
 The project is in active development and not production-ready. Each graph model has its own query language - once you import data in one model, you must use that model's query language.
 
-## Setup and Dependencies
-
-### System Requirements
-- x86-64 Linux distribution (Windows via WSL, MacOS on Apple Silicon supported)
-- GCC >= 8.1
-- CMake >= 3.12
-- Git
-- libssl
-- ncursesw and less (for CLI)
-- Python >= 3.8 with venv (for tests)
-- ICU library (libicu-dev)
-- Boost 1.82 (must be manually installed)
-
-### Install Dependencies
-
-Ubuntu/Debian:
-```bash
-sudo apt update && sudo apt install git g++ cmake libssl-dev libncurses-dev less python3 python3-venv libicu-dev
-```
-
-MacOS:
-```bash
-brew install cmake ncurses openssl@3 icu4c
-```
-
-### Install Boost 1.82
-
-Boost must be manually downloaded and placed in the third_party directory:
-```bash
-wget -q --show-progress https://archives.boost.io/release/1.82.0/source/boost_1_82_0.tar.gz
-tar -xf boost_1_82_0.tar.gz
-mkdir -p $MDB_HOME/third_party/boost_1_82/include
-mv boost_1_82_0/boost $MDB_HOME/third_party/boost_1_82/include
-rm -r boost_1_82_0.tar.gz boost_1_82_0
-```
-
 ## Build Commands
 
-### Standard Builds
-
 ```bash
-# Release build (recommended for normal use)
-cmake -B build/Release -D CMAKE_BUILD_TYPE=Release
-cmake --build build/Release -j <n>  # Use -j <n> for parallel compilation
+# Release build (recommended)
+cmake -B build/Release -D CMAKE_BUILD_TYPE=Release && cmake --build build/Release -j $(nproc)
 
 # Debug build (with sanitizers)
-cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug
-cmake --build build/Debug
+cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug && cmake --build build/Debug -j $(nproc)
 
-# Profile build (requires gperftools/tcmalloc)
-cmake -B build/Profile -D CMAKE_BUILD_TYPE=Release -D PROFILE=ON
-cmake --build build/Profile
-```
-
-The main executable is `mdb` and will be located in `build/<BuildType>/bin/mdb`.
-
-### Verify Build
-```bash
+# Verify build
 build/Release/bin/mdb help
 ```
 
+For detailed setup, dependencies, and Boost installation: see `docs/MillenniumDB.wiki/Setup.md`
+
 ## Testing
 
-### Run All Tests
 ```bash
-./scripts/run-tests
-```
-
-### Run Specific Test Suites
-```bash
+./scripts/run-tests           # All tests
 ./scripts/run-tests sparql    # SPARQL integration tests
-./scripts/run-tests mql        # MQL integration tests (Quad Model)
-./scripts/run-tests gql        # GQL integration tests
-./scripts/run-tests unit       # Unit tests via ctest
+./scripts/run-tests mql       # MQL integration tests
+./scripts/run-tests gql       # GQL integration tests
+./scripts/run-tests unit      # Unit tests via ctest
 ```
 
-The test script automatically:
-1. Sets up a Python virtual environment with dependencies
-2. Builds the Debug configuration
-3. Runs Python-based integration tests and ctest unit tests
+The test script automatically sets up Python venv, builds Debug, and runs integration tests.
 
-Unit test executables are defined in CMakeLists.txt:108-149 and located in `src/tests/`.
+## Database Paths
 
-## Common Usage Workflows
-
-### Creating and Running a Database
-
-**RDF Model Example:**
-```bash
-# 1. Import data
-build/Release/bin/mdb import data/example/rdf/cora/cora.ttl data/dbs/rdf/cora
-
-# 2. Start server
-build/Release/bin/mdb server data/dbs/rdf/cora
-
-# 3. Query via web interface: http://localhost:4321
-# Or via HTTP: http://localhost:1234/sparql
-# Or use the query script:
-echo "SELECT * WHERE { ?s ?p ?o . } LIMIT 10" > my_query.rq
-bash scripts/query my_query.rq
-```
-
-**Quad Model Example:**
-```bash
-build/Release/bin/mdb import data/example/qm/cora/cora.qm data/dbs/qm/cora
-build/Release/bin/mdb server data/dbs/qm/cora
-echo "MATCH (?from)-[?edge :?type]->(?to) RETURN * LIMIT 10" > my_query.rq
-bash scripts/query my_query.rq
-```
-
-**GQL Example:**
-```bash
-build/Release/bin/mdb import data/example/gql/posts/posts.gql data/dbs/gql/posts
-build/Release/bin/mdb server data/dbs/gql/posts
-echo "MATCH (from)-[edge]->(to) RETURN * LIMIT 10" > my_query.rq
-bash scripts/query my_query.rq
-```
-
-### MDB Subcommands
-
-**Server:**
-```bash
-build/Release/bin/mdb server <db_folder> [OPTIONS]
-# Options: --port (default: 1234), --timeout (default: 60s), --threads,
-#          --browser (default: true), --browser-port (default: 4321),
-#          buffer size options, admin credentials
-```
-
-**Import:**
-```bash
-# From files
-build/Release/bin/mdb import <files...> <db_folder> [OPTIONS]
-# Formats: .ttl, .nt, .n3, .rdf (RDF), .gql (GQL), .qm (Quad Model)
-
-# From stdin (useful for compressed files)
-bzcat file.ttl.bz2 | build/Release/bin/mdb import <db_folder> --format ttl
-
-# Options: --buffer-strings, --buffer-tensors, --prefixes (RDF),
-#          --btree-permutations (RDF: 3, 4, or 6, default 4)
-```
-
-**CSV Import:**
-```bash
-build/Release/bin/mdb csv-import <gql|quad> <db_folder> --nodes <files> --edges <files>
-# Options: --buffer-strings, --buffer-tensors, --list-separator
-```
-
-**CLI (Interactive):**
-```bash
-build/Release/bin/mdb cli <db_folder> [OPTIONS]
-```
-
-**Dump (Export):**
-```bash
-build/Release/bin/mdb dump <db_folder> <output_prefix> <format>
-# RDF formats: nt, ttl
-# Quad Model formats: qm, json
-# GQL: Not yet supported
-```
-
-**Query Script:**
-```bash
-./scripts/query <query_file> [CSV|TSV|JSON|XML]
-# Sends POST request to http://localhost:1234/sparql
-```
+**GQL Data:**
+- **Import source (example data)**: `data/example/gql/` - Sample GQL datasets for importing
+- **Database destination**: `data/dbs/gql/` - Location where imported GQL databases are stored
 
 ## Code Architecture
 
@@ -201,14 +71,11 @@ build/Release/bin/mdb dump <db_folder> <output_prefix> <format>
   - `executor/`: Iterator-based query execution (`binding_iter/`)
   - `optimizer/`: Query optimization
   - `rewriter/`: Query rewriting passes
-  - `update/`: Update operations
 - **src/import/**: Data importers for each model and format
 - **src/network/**: HTTP server and client protocol handling
-- **src/system/**: System initialization and resource management
-- **src/third_party/**: Embedded dependencies (serd, murmur3, xxHash, dragonbox)
-- **third_party/**: External dependencies (ANTLR4 runtime, Boost headers)
 - **tests/**: Integration test suites (sparql/, mql/, gql/)
-- **MillenniumDB.wiki/**: Comprehensive documentation (cloned as submodule)
+
+
 
 ### Key Architectural Concepts
 
@@ -217,47 +84,99 @@ All database values are represented as 64-bit ObjectIds:
 - 8 bits: Type information (4-bit generic type, 2-bit subtype, 2-bit modifier)
 - 56 bits: Value payload
 
-Type encoding supports:
-- Storage modes: inline (small values), external (dictionary reference), tmp (temporary results)
-- Type hierarchy: NULL, anonymous nodes, named nodes, IRIs, strings (simple/XSD/language/datatype), numerics (int/decimal/float/double), datetime types, booleans, edges, paths, tensors, lists, dictionaries, GQL-specific types (nodes, directed/undirected edges, labels, keys)
+Type encoding supports storage modes (inline, external, tmp) and type hierarchy (NULL, nodes, IRIs, strings, numerics, datetime, booleans, edges, paths, tensors, GQL-specific types).
 
 **Model Isolation:**
-Each graph model (RDF, Quad, GQL) is completely separate:
-- Different import formats and logic
-- Different query parsers (ANTLR grammars in `src/query/parser/grammar/`)
-- Different query execution strategies
-- Shared storage layer with different indexing strategies (e.g., RDF uses SPO/POS/OSP permutations)
+Each graph model (RDF, Quad, GQL) is completely separate with different import formats, query parsers (ANTLR grammars), execution strategies, and indexing (e.g., RDF uses SPO/POS/OSP permutations).
 
 **Storage Layer:**
-- Custom B+tree implementations for all indexes
-- Page-based storage with buffer management
-- String dictionary for external string storage (strings > inline threshold)
-- Model-specific catalog stored in database directory
+Custom B+tree implementations, page-based storage with buffer management, string dictionary for external storage, model-specific catalog.
 
 **Query Execution:**
-- Iterator-based volcano model
-- Binding iterators in `src/query/executor/binding_iter/` produce result rows
-- Worst-case optimal join algorithms (WCO joins for SPARQL)
-- Regular path query evaluation using specialized data structures
+Iterator-based volcano model with binding iterators in `src/query/executor/binding_iter/`. Supports worst-case optimal joins and regular path query evaluation.
 
-**Tensor Support:**
-MillenniumDB supports tensor operations (floats and doubles) as first-class types. See MillenniumDB.wiki/Working-with-tensors.md for details.
+**Tensor Compatibility:**
+Tensors for GNN must not be related to existing tensor implementation. See `docs/MillenniumDB.wiki/Working-with-tensors.md`.
 
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
-- **Compiler flags:** `-march=native` for CPU-specific optimizations, `-fno-operator-names` to avoid conflicts
-- **Debug builds:** Include AddressSanitizer and UndefinedBehaviorSanitizer (`-fsanitize=undefined,address`)
-- **Release builds:** `-O3` optimization with optional IPO (interprocedural optimization)
-- **Profile builds:** Link with tcmalloc and gperftools for profiling, require `PROFILE=ON` flag
-- **CLI:** Can be disabled at compile time with `-DNO_MDB_CLI` definition
-- **Parallel compilation:** CMake automatically uses (NUM_CORES - 1) for parallel builds
+- **Compiler flags:** `-march=native` for CPU optimizations, `-fno-operator-names`
+- **Debug builds:** Include AddressSanitizer and UndefinedBehaviorSanitizer
+- **Release builds:** `-O3` optimization with optional IPO
+- **Profile builds:** Require `PROFILE=ON` flag and gperftools/tcmalloc
+
+## ANTLR4 Parser Regeneration
+
+The query parsers (GQL, MQL, SPARQL) are generated from `.g4` grammars using ANTLR4. When modifying grammar files, the autogenerated parser code must be regenerated.
+
+**Prerequisites:**
+- Java (openjdk-11+ works, tested with openjdk-21)
+- zsh (`sudo apt install zsh`) — required by the generate scripts
+- ANTLR4 jar at `/usr/local/lib/antlr-4.13.1-complete.jar` — **must match runtime version 4.13.1**
+
+**Install ANTLR4 jar:**
+```bash
+sudo curl -o /usr/local/lib/antlr-4.13.1-complete.jar https://www.antlr.org/download/antlr-4.13.1-complete.jar
+```
+
+**Regenerate GQL parser:**
+```bash
+cd src/query/parser/grammar/gql/
+./generate.sh
+```
+
+Each grammar model has its own `generate.sh`:
+- `src/query/parser/grammar/gql/generate.sh`
+- `src/query/parser/grammar/mql/generate.sh`
+- `src/query/parser/grammar/sparql/generate.sh`
+
+Generated files go to the `autogenerated/` subdirectory. The scripts rename `.cpp` → `.cc` to match project conventions.
 
 ## Documentation References
 
-- Main wiki: `MillenniumDB.wiki/` (GitHub wiki cloned as Git submodule)
-- Setup guide: `MillenniumDB.wiki/Setup.md`
-- Usage examples: `MillenniumDB.wiki/Creating-and-running-a-database.md`
-- Model documentation: `MillenniumDB.wiki/Database-models.md`, `Quad-Model.md`, `MQL.md`, `GQL*.md`
-- SPARQL status: `MillenniumDB.wiki/SPARQL-Implementation-Status.md`
-- Example data: `data/example/{rdf,qm,gql}/`
+- **Setup guide**: `docs/MillenniumDB.wiki/Setup.md`
+- **Usage examples**: `docs/MillenniumDB.wiki/Creating-and-running-a-database.md`
+- **Model documentation**: `docs/MillenniumDB.wiki/Database-models.md`, `Quad-Model.md`, `MQL.md`, `GQL*.md`
+- **SPARQL status**: `docs/MillenniumDB.wiki/SPARQL-Implementation-Status.md`
+- **Example data**: `data/example/{rdf,qm,gql}/`
+
+## Investigations
+
+Technical investigations are documented in `investigations/`:
+- `investigations/active/` - Ongoing investigations
+- `investigations/archive/` - Completed or paused investigations
+- `investigations/templates/` - Templates for new documents
+
+All documents must include timestamps (see `.claude/rules/investigations.md`).
+
+## External Reference Documentation
+
+**ISO GQL Standard (ISO/IEC 39075:2024):**
+- Full PDF: `docs/external_references/ISO_IEC_39075_extracted/ISO IEC 39075-2024.pdf`
+- Section Index: `docs/external_references/ISO_IEC_39075_extracted/INDEX.md`
+
+**Neo4j Graph Data Science:**
+- Full Manual: `docs/external_references/NEO4J_USER_MANUAL_DOC/neo4j_graph_data_science_manual_.md`
+
+## GQL Native Projection
+
+For GQL projection development, use the dedicated skill:
+
+**Skill:** `.claude/skills/gql-projection-dev/`
+- Implementation status, key files, quick commands
+- Syntax reference: `references/syntax-reference.md`
+- Validation patterns: `references/validation-patterns.md`
+
+**Implementation Location:** `src/graph_models/gql/projection/`
+
+## Claude Code Configuration
+
+This project includes Claude Code configuration:
+
+- **MCP Servers**: `.mcp.json` - C++ semantic analysis via clangd
+- **Modular Rules**: `.claude/rules/` - Context-specific coding standards
+- **Hooks**: `.claude/hooks/` - Automatic code validation
+- **Skills**: `.claude/skills/` - Specialized tools (architecture-researcher, gql-projection-dev)
+
+See `.claude/` directory for full configuration details.
