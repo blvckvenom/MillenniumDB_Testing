@@ -6,6 +6,7 @@
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
+#include "graph_models/gql/graph_reference.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/rdf_model/conversions.h"
 #include "query/parser/expr/gql/exprs.h"
@@ -72,8 +73,10 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
     for (auto& child : ctx->simpleDataAccessingStatement()) {
         visit(child);
         if (current_op == nullptr) {
+#ifndef NDEBUG
             std::cerr << "WARNING: visit(simpleDataAccessingStatement) did not set current_op!" << std::endl;
             std::cerr << "Statement text: " << child->getText() << std::endl;
+#endif
         }
         query_statements.push_back(std::move(current_op));
     }
@@ -2048,6 +2051,37 @@ std::any QueryVisitor::visitListLiteral(GQLParser::ListLiteralContext* ctx)
     return 0;
 }
 
+std::any QueryVisitor::visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx)
+{
+    LOG_VISITOR
+    std::vector<ObjectId> list_oids;
+
+    // Iterate through all expressions in the list
+    // Grammar: listValueTypeName? LEFT_BRACKET (expression (COMMA expression)*)? RIGHT_BRACKET
+    auto expressions = ctx->expression();
+    for (auto* expr_ctx : expressions) {
+        // Visit each expression to evaluate it
+        visit(expr_ctx);
+
+        // Extract ObjectId from the evaluated expression
+        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
+        if (!expr_term) {
+            throw QuerySemanticException(
+                "List constructor at line " + std::to_string(ctx->getStart()->getLine()) +
+                " contains non-evaluable element"
+            );
+        }
+
+        list_oids.push_back(expr_term->term);
+    }
+
+    // Pack the list into an ObjectId
+    ObjectId list_oid = GQL::Conversions::pack_list(list_oids);
+    current_expr = std::make_unique<ExprTerm>(list_oid);
+
+    return 0;
+}
+
 std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
 {
     LOG_VISITOR
@@ -2079,6 +2113,65 @@ std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
     }
 
     // Create the Dictionary object (automatically creates DictionaryObject)
+    auto dict = std::make_unique<Dictionary>(std::move(dict_map));
+
+    // Pack the dictionary into an ObjectId
+    ObjectId dict_oid = Common::Conversions::pack_dictionary(dict);
+    current_expr = std::make_unique<ExprTerm>(dict_oid);
+
+    return 0;
+}
+
+std::any QueryVisitor::visitGqlCollectionExpression(GQLParser::GqlCollectionExpressionContext* ctx)
+{
+    LOG_VISITOR
+    // collectionValueConstructor contains: listValueConstructor | recordValueConstructor | pathValueConstructor
+    // We dispatch to the appropriate one by visiting the child context
+    auto* collection = ctx->collectionValueConstructor();
+    if (collection->recordValueConstructor()) {
+        return visit(collection->recordValueConstructor());
+    } else if (collection->listValueConstructor()) {
+        return visit(collection->listValueConstructor());
+    } else if (collection->pathValueConstructor()) {
+        return visit(collection->pathValueConstructor());
+    }
+    throw QuerySemanticException(
+        "Unknown collection type at line " + std::to_string(ctx->getStart()->getLine())
+    );
+}
+
+std::any QueryVisitor::visitRecordValueConstructor(GQLParser::RecordValueConstructorContext* ctx)
+{
+    LOG_VISITOR
+    std::map<ObjectId, std::unique_ptr<DictionaryItem>> dict_map;
+
+    // Grammar: RECORD? LEFT_BRACE (field (COMMA field)*)? RIGHT_BRACE
+    // field: key = fieldName COLON value = expression
+    auto fields = ctx->field();
+    for (auto* field_ctx : fields) {
+        // Extract the key (fieldName)
+        std::string key_str = field_ctx->key->getText();
+
+        // Create ObjectId for the key using pack_string_simple
+        ObjectId key_oid = GQL::Conversions::pack_string_simple(key_str);
+
+        // Visit the value (full expression) to evaluate it
+        visit(field_ctx->value);
+
+        // Extract ObjectId from the evaluated expression
+        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
+        if (!expr_term) {
+            throw QuerySemanticException(
+                "Record value constructor at line " + std::to_string(ctx->getStart()->getLine()) +
+                " contains non-evaluable value for key '" + key_str + "'"
+            );
+        }
+
+        // Add to dictionary map as DictionaryLiteral
+        dict_map[key_oid] = std::make_unique<DictionaryLiteral>(expr_term->term);
+    }
+
+    // Create the Dictionary object
     auto dict = std::make_unique<Dictionary>(std::move(dict_map));
 
     // Pack the dictionary into an ObjectId
@@ -2411,9 +2504,11 @@ std::any
                 auto cat_name_ctx = proc_ref_ctx->catalogProcedureParentAndName();
 
                 // Build qualified name if there's a parent reference
+                // Note: catalogObjectParentReference includes the trailing period (e.g., "gnn.")
+                // per the grammar rule: (objectName PERIOD)+
                 if (cat_name_ctx->catalogObjectParentReference()) {
-                    std::string parent = cat_name_ctx->catalogObjectParentReference()->getText();
-                    proc_name = parent + ".";
+                    proc_name = cat_name_ctx->catalogObjectParentReference()->getText();
+                    // The getText() already includes the trailing period, don't add another
                 }
 
                 // Add procedure name
@@ -2463,19 +2558,29 @@ std::any
             if (named_ctx->yieldClause()) {
                 auto yield_ctx = named_ctx->yieldClause();
 
-                for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
-                    std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
-
-                    // Get variable name (use alias if present, otherwise use field name)
-                    std::string var_name = field_name;
-                    if (item_ctx->yieldItemAlias()) {
-                        var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                if (yield_ctx->ASTERISK()) {
+                    // YIELD * - expand to all yield fields from procedure metadata
+                    auto fields = procedure->yield_fields();
+                    for (const auto& field : fields) {
+                        VarId var = get_query_ctx().get_or_create_var(field.name);
+                        yield_items.emplace_back(field.name, var);
                     }
+                } else {
+                    // Explicit field list
+                    for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
+                        std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
 
-                    // Get or create variable ID
-                    VarId var = get_query_ctx().get_or_create_var(var_name);
+                        // Get variable name (use alias if present, otherwise use field name)
+                        std::string var_name = field_name;
+                        if (item_ctx->yieldItemAlias()) {
+                            var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                        }
 
-                    yield_items.emplace_back(field_name, var);
+                        // Get or create variable ID
+                        VarId var = get_query_ctx().get_or_create_var(var_name);
+
+                        yield_items.emplace_back(field_name, var);
+                    }
                 }
             }
 
@@ -2544,10 +2649,11 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         auto cat_name_ctx = proc_ref_ctx->catalogProcedureParentAndName();
 
         // Build qualified name if there's a parent reference
+        // Note: catalogObjectParentReference includes the trailing period (e.g., "gnn.")
+        // per the grammar rule: (objectName PERIOD)+
         if (cat_name_ctx->catalogObjectParentReference()) {
-            // Extract parent parts (e.g., "gds.graph")
-            std::string parent = cat_name_ctx->catalogObjectParentReference()->getText();
-            proc_name = parent + ".";
+            proc_name = cat_name_ctx->catalogObjectParentReference()->getText();
+            // The getText() already includes the trailing period, don't add another
         }
 
         // Add procedure name
@@ -2599,20 +2705,30 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
     if (named_ctx->yieldClause()) {
         auto yield_ctx = named_ctx->yieldClause();
 
-        for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
-            // Get field name
-            std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
-
-            // Get variable name (use alias if present, otherwise use field name)
-            std::string var_name = field_name;
-            if (item_ctx->yieldItemAlias()) {
-                var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+        if (yield_ctx->ASTERISK()) {
+            // YIELD * - expand to all yield fields from procedure metadata
+            auto fields = procedure->yield_fields();
+            for (const auto& field : fields) {
+                VarId var = get_query_ctx().get_or_create_var(field.name);
+                yield_items.emplace_back(field.name, var);
             }
+        } else {
+            // Explicit field list
+            for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
+                // Get field name
+                std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
 
-            // Get or create variable ID
-            VarId var = get_query_ctx().get_or_create_var(var_name);
+                // Get variable name (use alias if present, otherwise use field name)
+                std::string var_name = field_name;
+                if (item_ctx->yieldItemAlias()) {
+                    var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                }
 
-            yield_items.emplace_back(field_name, var);
+                // Get or create variable ID
+                VarId var = get_query_ctx().get_or_create_var(var_name);
+
+                yield_items.emplace_back(field_name, var);
+            }
         }
     }
 
@@ -2666,14 +2782,6 @@ std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* c
 {
     LOG_VISITOR
 
-    // Debug: log what we have
-    std::cerr << "[visitGraphExpression] graphReference=" << (ctx->graphReference() ? "YES" : "NO")
-              << ", objectNameOrBindingVariable=" << (ctx->objectNameOrBindingVariable() ? "YES" : "NO")
-              << ", objectExpressionPrimary=" << (ctx->objectExpressionPrimary() ? "YES" : "NO")
-              << ", currentGraph=" << (ctx->currentGraph() ? "YES" : "NO")
-              << ", getText()=\"" << ctx->getText() << "\""
-              << std::endl;
-
     // Handle graph reference (projection name)
     if (ctx->graphReference()) {
         return visitGraphReference(ctx->graphReference());
@@ -2703,16 +2811,47 @@ std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* c
         return 0;
     }
 
-    // Handle objectExpressionPrimary (could be a string literal)
+    // Handle objectExpressionPrimary (could be a string literal or HOME_GRAPH/CURRENT_GRAPH keyword)
     if (ctx->objectExpressionPrimary()) {
-        // This might be a string literal like "test_friends"
         std::string projection_name = ctx->getText();
 
-        // Remove surrounding quotes if present
+        // Check for HOME_GRAPH keyword (may be parsed as objectExpressionPrimary due to ANTLR ordering)
+        if (projection_name == "HOME_GRAPH" || projection_name == "HOME_PROPERTY_GRAPH") {
+            // HOME_GRAPH clears the active projection (returns to main graph)
+            get_query_ctx().active_projection.clear();
+            return 0;
+        }
+
+        // Check for CURRENT_GRAPH keyword (may be parsed as objectExpressionPrimary)
+        if (projection_name == "CURRENT_GRAPH" || projection_name == "CURRENT_PROPERTY_GRAPH") {
+            // CURRENT_GRAPH maintains current context (clears active projection)
+            get_query_ctx().active_projection.clear();
+            return 0;
+        }
+
+        // Remove surrounding quotes if present (for string literals like "test_friends")
         if (projection_name.length() >= 2 &&
             (projection_name[0] == '"' || projection_name[0] == '\'') &&
             projection_name[0] == projection_name[projection_name.length() - 1]) {
             projection_name = projection_name.substr(1, projection_name.length() - 2);
+        }
+
+        // Handle qualified names (catalog.schema.graph_name)
+        // Due to ANTLR grammar ordering, qualified names may be matched as objectExpressionPrimary
+        // instead of graphReference. Extract just the graph name (last component after final dot).
+        //
+        // CURRENT LIMITATION (2025-12):
+        // MillenniumDB uses a flat projection namespace (like Neo4j GDS).
+        // Catalog/schema prefixes are parsed but ignored for projection resolution.
+        // See: ISO/IEC 39075:2024 Section 17.2 <graph reference>
+        // See: GraphReference struct in graph_models/gql/graph_reference.h
+        auto last_dot = projection_name.rfind('.');
+        if (last_dot != std::string::npos) {
+            std::string full_name = projection_name;
+            projection_name = projection_name.substr(last_dot + 1);
+            LOG_INFO("Qualified graph reference used: '" << full_name
+                     << "' - using only graph name '" << projection_name
+                     << "' (catalog/schema prefix ignored, flat namespace)");
         }
 
         // Verify projection exists
@@ -2748,26 +2887,70 @@ std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* c
 std::any QueryVisitor::visitGraphReference(GQLParser::GraphReferenceContext* ctx)
 {
     LOG_VISITOR
-    std::cerr << "[QueryVisitor] visitGraphReference() called" << std::endl;
-    std::string projection_name;
+
+    // ISO GQL (ISO/IEC 39075:2024) Section 17.2 defines <graph reference> as:
+    //   <graph reference> ::=
+    //       <catalog object parent reference> <graph name>
+    //     | <delimited graph name>
+    //     | <home graph>
+    //     | <reference parameter specification>
+    //
+    // CURRENT LIMITATION (2025-12):
+    // MillenniumDB uses a flat projection namespace (like Neo4j GDS).
+    // Qualified references (catalog.schema.graph) are parsed and stored in
+    // GraphReference struct for future extensibility, but only the graph_name
+    // is used for resolution. This is intentional:
+    // - Full catalog support requires Feature GT03 (multi-graph transactions)
+    // - Neo4j GDS also uses flat namespace for projections
+    // - GNN training workflows don't require multi-catalog support
+    //
+    // See: docs/external_references/ISO_IEC_39075_extracted/sections/section_014_pages_261-280.md
+    // See: GraphReference struct in graph_models/gql/graph_reference.h
+
+    GraphReference ref;
+    ref.original_text = ctx->getText();
 
     // Extract projection name from different possible syntaxes
     if (ctx->delimitedGraphName()) {
         // Handle delimited identifier (e.g., "my_projection" or `my_projection`)
         auto text = ctx->delimitedGraphName()->getText();
         // Remove surrounding quotes or backticks
-        projection_name = text.substr(1, text.length() - 2);
+        ref.graph_name = text.substr(1, text.length() - 2);
     } else if (ctx->catalogObjectParentReference() && ctx->graphName()) {
         // Handle qualified name (catalog.schema.graph_name)
-        // For now, just use the graph name part
-        projection_name = ctx->graphName()->getText();
+        // Parse the catalog object parent reference to extract components
+        auto parent_ref = ctx->catalogObjectParentReference();
+        std::string parent_text = parent_ref->getText();
+
+        // Parse parent reference: could be "catalog.schema." or "schema." or "catalog/schema/"
+        // The objectName() list contains the parsed name components
+        auto object_names = parent_ref->objectName();
+        if (object_names.size() >= 2) {
+            ref.catalog = object_names[0]->getText();
+            ref.schema = object_names[1]->getText();
+        } else if (object_names.size() == 1) {
+            ref.schema = object_names[0]->getText();
+        }
+
+        ref.graph_name = ctx->graphName()->getText();
+
+        // Log when qualified reference is used but prefix is ignored
+        if (ref.is_qualified()) {
+            LOG_INFO("Qualified graph reference used: '" << ref.get_qualified_name()
+                     << "' - using only graph name '" << ref.graph_name
+                     << "' (catalog/schema prefix ignored, flat namespace)");
+        }
     } else if (ctx->homeGraph()) {
         // HOME_GRAPH refers to the main graph
+        ref.is_home_graph = true;
         get_query_ctx().active_projection.clear();
         return 0;
     } else {
         throw QuerySemanticException("Invalid graph reference syntax");
     }
+
+    // Use the effective name for resolution (currently just graph_name)
+    std::string projection_name = ref.get_effective_name();
 
     // Verify projection exists
     auto& proj_manager = ProjectionManager::get_instance();

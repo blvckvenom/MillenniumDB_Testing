@@ -1378,7 +1378,7 @@ whereClause
    ;
 
 yieldClause
-   : YIELD yieldItemList
+   : YIELD (ASTERISK | yieldItemList)
    ;
 
 yieldItemList
@@ -2618,6 +2618,7 @@ keyword
    | PRECISION
    | PROPERTY
    | PROPERTY_EXISTS
+   | PROPERTIES
    | RADIANS
    | READ
    | REAL

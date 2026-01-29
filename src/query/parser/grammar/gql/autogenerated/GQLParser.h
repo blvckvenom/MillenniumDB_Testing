@@ -5352,6 +5352,7 @@ public:
     YieldClauseContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *YIELD();
+    antlr4::tree::TerminalNode *ASTERISK();
     YieldItemListContext *yieldItemList();
 
 
@@ -9408,6 +9409,7 @@ public:
     antlr4::tree::TerminalNode *PRECISION();
     antlr4::tree::TerminalNode *PROPERTY();
     antlr4::tree::TerminalNode *PROPERTY_EXISTS();
+    antlr4::tree::TerminalNode *PROPERTIES();
     antlr4::tree::TerminalNode *RADIANS();
     antlr4::tree::TerminalNode *READ();
     antlr4::tree::TerminalNode *REAL();
