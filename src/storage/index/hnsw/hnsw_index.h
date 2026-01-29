@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <shared_mutex>
 #include <string>
 
 #include <boost/dynamic_bitset.hpp>
@@ -114,6 +117,85 @@ public:
         return node_storage.size();
     }
 
+    // ==================== Raw Embeddings Support (for GNN) ====================
+
+    /**
+     * @brief Index embeddings from raw float array (GNN tensor store).
+     *
+     * This method allows indexing node embeddings that are stored externally
+     * (e.g., in GnnTensorStore) rather than in MDB's internal tensor storage.
+     * The embeddings are copied into the index for efficient querying.
+     *
+     * @param embeddings Pointer to contiguous float array [num_nodes × dimensions]
+     * @param num_nodes Number of nodes/embeddings to index
+     * @param dim Embedding dimension (must match index dimensions)
+     * @return Number of successfully indexed nodes
+     */
+    uint_fast32_t index_from_raw_embeddings(
+        const float* embeddings,
+        uint64_t num_nodes,
+        uint64_t dim
+    );
+
+    /**
+     * @brief Index embeddings using parallel construction (multi-threaded).
+     *
+     * Uses a thread pool to parallelize HNSW index construction:
+     * - Norm computation is fully parallel
+     * - Neighbor search is parallel (read-only graph access)
+     * - Node connection is batched with fine-grained locking
+     *
+     * @param embeddings Pointer to contiguous float array [num_nodes × dimensions]
+     * @param num_nodes Number of nodes/embeddings to index
+     * @param dim Embedding dimension (must match index dimensions)
+     * @param num_threads Number of worker threads (default: hardware_concurrency)
+     * @return Number of successfully indexed nodes
+     */
+    uint_fast32_t index_from_raw_embeddings_parallel(
+        const float* embeddings,
+        uint64_t num_nodes,
+        uint64_t dim,
+        size_t num_threads
+    );
+
+    /**
+     * @brief Compute and cache norms for all raw embeddings.
+     * Called automatically during index_from_raw_embeddings[_parallel].
+     */
+    void compute_embedding_norms();
+
+    /**
+     * @brief Get the pre-computed squared norm for a node.
+     * @param node_id Internal node ID
+     * @return ||embedding||² for the node
+     */
+    inline float get_embedding_norm_sq(uint32_t node_id) const {
+        return raw_embedding_norms_[node_id];
+    }
+
+    /**
+     * @brief Query using raw embeddings mode.
+     *
+     * Similar to query() but uses internal raw_embeddings_ storage instead
+     * of looking up tensors via ObjectId.
+     *
+     * @param query_embedding Pointer to query vector (dim floats)
+     * @param num_neighbors Number of results to return (k)
+     * @param num_candidates Number of candidates to explore (ef)
+     * @return Heap containing (distance, node_id) pairs
+     */
+    HNSWHeap query_raw(
+        const float* query_embedding,
+        uint64_t num_neighbors,
+        uint64_t num_candidates
+    );
+
+    /**
+     * @brief Check if index uses raw embeddings mode.
+     * @return true if using raw embeddings, false if using ObjectId tensors
+     */
+    bool uses_raw_embeddings() const { return uses_raw_embeddings_; }
+
 private:
     bool has_changes { false };
 
@@ -145,6 +227,44 @@ private:
 
     // deleted nodes
     boost::dynamic_bitset<> node_tombstones;
+
+    // ==================== Raw Embeddings Storage (for GNN) ====================
+    // When uses_raw_embeddings_ is true, embeddings are stored in raw_embeddings_
+    // instead of being looked up via ObjectId from TensorManager.
+    bool uses_raw_embeddings_ { false };
+    std::vector<float> raw_embeddings_;  // Flat array: [node_0_dim_0, node_0_dim_1, ..., node_n_dim_d]
+
+    // Pre-computed squared norms for raw embeddings (||v||² for each node)
+    // Used to avoid redundant norm computation in cosine distance calculations
+    std::vector<float> raw_embedding_norms_;
+
+    // Helper to get embedding for a node in raw mode
+    inline const float* get_raw_embedding(uint32_t node_id) const {
+        const size_t offset = static_cast<size_t>(node_id) * params.dimensions;
+        // Runtime bounds check (works in Release builds)
+        if (offset + params.dimensions > raw_embeddings_.size()) {
+            return nullptr;  // Return null for invalid node_id
+        }
+        return raw_embeddings_.data() + offset;
+    }
+
+    // ==================== Thread Safety for Parallel Construction ====================
+    // These are only used during parallel index construction
+    mutable std::shared_mutex graph_mutex_;        // Protects graph structure (shared for reads, exclusive for writes)
+    std::mutex entry_point_mutex_;                 // Protects entry point updates
+    std::unique_ptr<std::mutex[]> node_locks_;     // Per-node locks for neighbor updates
+    std::atomic<uint32_t> nodes_inserted_ { 0 };   // Progress counter for parallel construction
+
+    // Search at layer using raw embeddings (internal helper)
+    template<bool CheckTombstones>
+    HNSWHeap search_at_layer_raw(
+        const float* query_embedding,
+        const std::vector<Entry>& entry_points,
+        uint64_t num_neighbors,
+        uint64_t layer,
+        HNSWVisitedSet* visited_set_ptr,
+        HNSWHeap* discarded_heap_ptr
+    );
 
     // initialize constants for the index
     inline void init_constants()

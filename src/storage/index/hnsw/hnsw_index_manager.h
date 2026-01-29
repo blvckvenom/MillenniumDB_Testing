@@ -80,6 +80,10 @@ public:
         return res;
     }
 
+    // Drop (delete) an HNSW index by name
+    // Returns true if the index was found and dropped, false otherwise
+    bool drop_hnsw_index(const std::string& name);
+
     std::size_t num_hnsw_indexes() const
     {
         return name2hnsw_index.size();
