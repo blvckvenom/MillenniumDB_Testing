@@ -26,11 +26,17 @@ void ProjectionManager::init(const std::string& db_folder_) {
         fs::create_directories(projections_root);
     }
 
-    // Scan existing projections
-    scan_projections();
+    // Scan existing projections (lock already held, use internal method)
+    scan_projections_internal();
 }
 
 void ProjectionManager::scan_projections() {
+    std::lock_guard<std::mutex> lock(mutex);
+    scan_projections_internal();
+}
+
+void ProjectionManager::scan_projections_internal() {
+    // Must be called while holding the mutex!
     projection_dirs.clear();
 
     if (!fs::exists(projections_root)) {

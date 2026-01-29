@@ -1,6 +1,5 @@
 #include "native_scanner.h"
 
-#include <iostream>
 #include <stdexcept>
 
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -41,7 +40,7 @@ uint64_t NativeScanner::scan_label_node(
     // We need to use the full label_id as-is
     uint64_t search_label_id = label_id.id;
 
-    std::cerr << "[NativeScanner] scan_label_node: Scanning for label_id=0x" << std::hex << search_label_id << std::dec << std::endl;
+    // Debug logging removed for performance
 
     // Define range: all records where first key = search_label_id
     Record<2> min_record;
@@ -56,8 +55,6 @@ uint64_t NativeScanner::scan_label_node(
     bool interruption_requested = false;
     auto iter = label_node_index->get_range(&interruption_requested, min_record, max_record);
 
-    std::cerr << "[NativeScanner] scan_label_node: Range iterator created" << std::endl;
-
     // Iterate over matching records
     uint64_t count = 0;
     const Record<2>* record;
@@ -65,12 +62,10 @@ uint64_t NativeScanner::scan_label_node(
         // Record format: {label_id, node_id}
         // Extract node_id from second field
         ObjectId node_id((*record)[1]);
-        std::cerr << "[NativeScanner] scan_label_node: Found node_id=0x" << std::hex << node_id.id << std::dec << std::endl;
         callback(node_id);
         count++;
     }
 
-    std::cerr << "[NativeScanner] scan_label_node: Total nodes found: " << count << std::endl;
     return count;
 }
 
@@ -80,8 +75,6 @@ uint64_t NativeScanner::scan_label_edge(
 ) {
     // The label_edge B+Tree stores full ObjectIds WITH type masks
     uint64_t search_type_id = type_id.id;
-
-    std::cerr << "[NativeScanner] scan_label_edge: Scanning for type_id=0x" << std::hex << search_type_id << std::dec << std::endl;
 
     // Define range: all records where first key = search_type_id
     Record<2> min_record;
@@ -103,14 +96,10 @@ uint64_t NativeScanner::scan_label_edge(
         // Record format: {type_id, edge_id}
         // Extract edge_id from second field
         ObjectId edge_id((*record)[1]);
-        if (count < 5) {  // Only log first 5 to avoid spam
-            std::cerr << "[NativeScanner] scan_label_edge: Found edge_id=0x" << std::hex << edge_id.id << std::dec << std::endl;
-        }
         callback(edge_id);
         count++;
     }
 
-    std::cerr << "[NativeScanner] scan_label_edge: Total edges found: " << count << std::endl;
     return count;
 }
 
@@ -120,9 +109,6 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
 ) {
     // Scan label_edge index to get all edges with this type
     uint64_t search_type_id = type_id.id;
-
-    std::cerr << "[NativeScanner] scan_label_edge_with_endpoints: Scanning for type_id=0x"
-              << std::hex << search_type_id << std::dec << std::endl;
 
     // Define range: all records where first key = search_type_id
     Record<2> min_record;
@@ -172,9 +158,7 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
                     from_node = ObjectId((*endpoint_rec)[1]);
                     to_node = ObjectId((*endpoint_rec)[2]);
                 } else {
-                    // Edge not found - skip
-                    std::cerr << "[NativeScanner] WARNING: Undirected edge 0x" << std::hex
-                              << edge_id.id << " not found in edge_n1_n2" << std::dec << std::endl;
+                    // Edge not found in index - skip
                     continue;
                 }
             } else {
@@ -203,8 +187,7 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
                     }
                 }
                 if (!found) {
-                    std::cerr << "[NativeScanner] WARNING: Undirected edge 0x" << std::hex
-                              << edge_id.id << " not found" << std::dec << std::endl;
+                    // Edge not found in index - skip
                     continue;
                 }
             }
@@ -230,9 +213,7 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
                     from_node = ObjectId((*endpoint_rec)[1]);
                     to_node = ObjectId((*endpoint_rec)[2]);
                 } else {
-                    // Edge not found - skip
-                    std::cerr << "[NativeScanner] WARNING: Directed edge 0x" << std::hex
-                              << edge_id.id << " not found in edge_from_to" << std::dec << std::endl;
+                    // Edge not found in index - skip
                     continue;
                 }
             } else {
@@ -261,8 +242,7 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
                     }
                 }
                 if (!found) {
-                    std::cerr << "[NativeScanner] WARNING: Directed edge 0x" << std::hex
-                              << edge_id.id << " not found" << std::dec << std::endl;
+                    // Edge not found in index - skip
                     continue;
                 }
             }
@@ -273,26 +253,19 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
         count++;
     }
 
-    std::cerr << "[NativeScanner] scan_label_edge_with_endpoints: Total edges found: " << count << std::endl;
     return count;
 }
 
 std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id) {
-    std::cerr << "[NativeScanner] get_edge_endpoints: Looking up edge_id=0x" << std::hex << edge_id.id << std::dec << std::endl;
-
     // Detect edge type by examining the ObjectId mask
     uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
     bool is_undirected = (edge_type == ObjectId::MASK_UNDIRECTED_EDGE);
-
-    std::cerr << "[NativeScanner] Edge type mask: 0x" << std::hex << edge_type << std::dec
-              << (is_undirected ? " (UNDIRECTED)" : " (DIRECTED)") << std::endl;
 
     if (is_undirected) {
         // ===== UNDIRECTED EDGE (0xe4) =====
         // Fast path: Use edge_n1_n2 index if available (O(log n) lookup)
         // Index structure: {edge_id, n1, n2}
         if (edge_n1_n2_index) {
-            std::cerr << "[NativeScanner] Using fast path (edge_n1_n2 index)" << std::endl;
 
             Record<3> min_record;
             min_record[0] = edge_id.id;
@@ -312,14 +285,9 @@ std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id
                 // Record format: {edge_id, n1, n2}
                 ObjectId n1((*record)[1]);
                 ObjectId n2((*record)[2]);
-                std::cerr << "[NativeScanner] Found endpoints: n1=0x" << std::hex << n1.id
-                          << " n2=0x" << n2.id << std::dec << std::endl;
                 return {n1, n2};
             }
-
-            std::cerr << "[NativeScanner] Edge not found in edge_n1_n2 index, falling back to slow path" << std::endl;
-        } else {
-            std::cerr << "[NativeScanner] Using slow path (scanning n1_n2_edge)" << std::endl;
+            // Fall through to slow path if not found
         }
 
         // Slow path: Scan n1_n2_edge index (O(E) worst case)
@@ -344,8 +312,6 @@ std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id
                 // Found it! Extract endpoints
                 ObjectId n1((*record)[0]);
                 ObjectId n2((*record)[1]);
-                std::cerr << "[NativeScanner] Found in slow path: n1=0x" << std::hex << n1.id
-                          << " n2=0x" << n2.id << std::dec << std::endl;
                 return {n1, n2};
             }
         }
@@ -359,7 +325,6 @@ std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id
         // Fast path: Use edge_from_to index if available (O(log n) lookup)
         // Index structure: {edge_id, from, to}
         if (edge_from_to_index) {
-            std::cerr << "[NativeScanner] Using fast path (edge_from_to index)" << std::endl;
 
             Record<3> min_record;
             min_record[0] = edge_id.id;
@@ -379,14 +344,9 @@ std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id
                 // Record format: {edge_id, from, to}
                 ObjectId from_node((*record)[1]);
                 ObjectId to_node((*record)[2]);
-                std::cerr << "[NativeScanner] Found endpoints: from=0x" << std::hex << from_node.id
-                          << " to=0x" << to_node.id << std::dec << std::endl;
                 return {from_node, to_node};
             }
-
-            std::cerr << "[NativeScanner] Edge not found in edge_from_to index, falling back to slow path" << std::endl;
-        } else {
-            std::cerr << "[NativeScanner] Using slow path (scanning from_to_edge)" << std::endl;
+            // Fall through to slow path if not found
         }
 
         // Slow path: Scan from_to_edge index (O(E) worst case)
@@ -411,8 +371,6 @@ std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id
                 // Found it! Extract endpoints
                 ObjectId from_node((*record)[0]);
                 ObjectId to_node((*record)[1]);
-                std::cerr << "[NativeScanner] Found in slow path: from=0x" << std::hex << from_node.id
-                          << " to=0x" << to_node.id << std::dec << std::endl;
                 return {from_node, to_node};
             }
         }
@@ -421,6 +379,32 @@ std::pair<ObjectId, ObjectId> NativeScanner::get_edge_endpoints(ObjectId edge_id
             "NativeScanner::get_edge_endpoints: Directed edge not found: " + std::to_string(edge_id.id)
         );
     }
+}
+
+uint64_t NativeScanner::count_edges_by_type(ObjectId type_id) {
+    // Quick count of edges with this type by scanning label_edge index
+    uint64_t search_type_id = type_id.id;
+
+    // Define range: all records where first key = search_type_id
+    Record<2> min_record;
+    min_record[0] = search_type_id;
+    min_record[1] = 0;
+
+    Record<2> max_record;
+    max_record[0] = search_type_id;
+    max_record[1] = UINT64_MAX;
+
+    // Create range iterator with interruption support
+    bool interruption_requested = false;
+    auto iter = label_edge_index->get_range(&interruption_requested, min_record, max_record);
+
+    // Count matching records
+    uint64_t count = 0;
+    while (iter.next() != nullptr) {
+        count++;
+    }
+
+    return count;
 }
 
 } // namespace GQL

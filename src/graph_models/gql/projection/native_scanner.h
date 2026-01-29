@@ -125,6 +125,17 @@ public:
         std::function<void(ObjectId, ObjectId, ObjectId)> callback
     );
 
+    /**
+     * @brief Counts edges with the given type without full enumeration.
+     *
+     * Uses B+Tree range scan to count edges efficiently.
+     * Useful for estimating dataset size before choosing algorithm.
+     *
+     * @param type_id ObjectId of the edge type
+     * @return Number of edges with this type
+     */
+    uint64_t count_edges_by_type(ObjectId type_id);
+
 private:
     // Non-owning pointers to GQLModel indexes
     BPlusTree<2>* label_node_index;

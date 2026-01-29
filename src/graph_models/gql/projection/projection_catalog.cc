@@ -89,6 +89,56 @@ void ProjectionCatalog::load() {
         distinct_edge_labels = read_uint64(file);
     }
 
+    // Read property key mappings
+    if (minor_ver >= 3) {
+        // v1.3+ format: explicit (key_id, key_name) pairs
+        // This correctly preserves key IDs like COUNT_KEY_SYNTHETIC_ID
+
+        // Read node key mappings
+        uint32_t node_key_count = read_uint32(file);
+        node_keys_str.clear();
+        node_keys2id.clear();
+        for (uint32_t i = 0; i < node_key_count; ++i) {
+            uint64_t key_id = read_uint64(file);
+            std::string key_name = read_string(file);
+            node_keys2id[key_name] = key_id;
+            // Grow vector if needed to accommodate this key_id
+            if (key_id >= node_keys_str.size()) {
+                node_keys_str.resize(key_id + 1);
+            }
+            node_keys_str[key_id] = key_name;
+        }
+
+        // Read edge key mappings
+        uint32_t edge_key_count = read_uint32(file);
+        edge_keys_str.clear();
+        edge_keys2id.clear();
+        for (uint32_t i = 0; i < edge_key_count; ++i) {
+            uint64_t key_id = read_uint64(file);
+            std::string key_name = read_string(file);
+            edge_keys2id[key_name] = key_id;
+            // Grow vector if needed to accommodate this key_id
+            if (key_id >= edge_keys_str.size()) {
+                edge_keys_str.resize(key_id + 1);
+            }
+            edge_keys_str[key_id] = key_name;
+        }
+    } else if (minor_ver == 2) {
+        // v1.2 format: index-based (DEPRECATED - key IDs may be incorrect)
+        // Projections with aggregation properties like _count must be recreated
+        node_keys_str = read_strvec(file);
+        node_keys2id.clear();
+        for (size_t i = 0; i < node_keys_str.size(); ++i) {
+            node_keys2id[node_keys_str[i]] = i;
+        }
+
+        edge_keys_str = read_strvec(file);
+        edge_keys2id.clear();
+        for (size_t i = 0; i < edge_keys_str.size(); ++i) {
+            edge_keys2id[edge_keys_str[i]] = i;
+        }
+    }
+
     file.close();
 }
 
@@ -144,6 +194,23 @@ void ProjectionCatalog::save() {
     write_uint64(file, distinct_node_labels);
     write_uint64(file, distinct_edge_labels);
 
+    // Write v1.3 fields (property key mappings with explicit IDs)
+    // Write node key mappings as (key_id, key_name) pairs
+    write_uint32(file, static_cast<uint32_t>(node_keys2id.size()));
+    for (const auto& [name, id] : node_keys2id) {
+        write_uint64(file, id);
+        write_string(file, name);
+    }
+
+    // Write edge key mappings as (key_id, key_name) pairs
+    write_uint32(file, static_cast<uint32_t>(edge_keys2id.size()));
+    for (const auto& [name, id] : edge_keys2id) {
+        write_uint64(file, id);
+        write_string(file, name);
+    }
+
+    // Ensure data is flushed to OS buffer before close
+    file.flush();
     file.close();
 }
 
@@ -203,6 +270,21 @@ uint8_t ProjectionCatalog::read_uint8(std::fstream& file) {
     return res;
 }
 
+uint32_t ProjectionCatalog::read_uint32(std::fstream& file) {
+    uint32_t res = 0;
+    uint8_t buf[4];
+    file.read(reinterpret_cast<char*>(buf), sizeof(buf));
+
+    for (int i = 0, shift = 0; i < 4; ++i, shift += 8) {
+        res |= static_cast<uint32_t>(buf[i]) << shift;
+    }
+
+    if (!file.good()) {
+        throw std::runtime_error("Error reading uint32 from catalog");
+    }
+    return res;
+}
+
 uint64_t ProjectionCatalog::read_uint64(std::fstream& file) {
     uint64_t res = 0;
     uint8_t buf[8];
@@ -255,6 +337,14 @@ void ProjectionCatalog::write_uint8(std::fstream& file, uint8_t value) {
     file.put(static_cast<char>(value));
 }
 
+void ProjectionCatalog::write_uint32(std::fstream& file, uint32_t value) {
+    uint8_t buf[4];
+    for (size_t i = 0, shift = 0; i < sizeof(buf); ++i, shift += 8) {
+        buf[i] = (value >> shift) & 0xFF;
+    }
+    file.write(reinterpret_cast<const char*>(buf), sizeof(buf));
+}
+
 void ProjectionCatalog::write_uint64(std::fstream& file, uint64_t value) {
     uint8_t buf[8];
     for (size_t i = 0, shift = 0; i < sizeof(buf); ++i, shift += 8) {
@@ -289,6 +379,46 @@ void ProjectionCatalog::write_strvec(std::fstream& file, const std::vector<std::
     for (const auto& str : vec) {
         write_string(file, str);
     }
+}
+
+void ProjectionCatalog::add_node_key(const std::string& key_name, uint64_t key_id) {
+    if (node_keys2id.find(key_name) != node_keys2id.end()) {
+        return;  // Already registered
+    }
+    node_keys2id[key_name] = key_id;
+    // Ensure node_keys_str has space for the ID
+    if (key_id >= node_keys_str.size()) {
+        node_keys_str.resize(key_id + 1);
+    }
+    node_keys_str[key_id] = key_name;
+}
+
+void ProjectionCatalog::add_edge_key(const std::string& key_name, uint64_t key_id) {
+    if (edge_keys2id.find(key_name) != edge_keys2id.end()) {
+        return;  // Already registered
+    }
+    edge_keys2id[key_name] = key_id;
+    // Ensure edge_keys_str has space for the ID
+    if (key_id >= edge_keys_str.size()) {
+        edge_keys_str.resize(key_id + 1);
+    }
+    edge_keys_str[key_id] = key_name;
+}
+
+uint64_t ProjectionCatalog::get_node_key_id(const std::string& key_name) const {
+    auto it = node_keys2id.find(key_name);
+    if (it != node_keys2id.end()) {
+        return it->second;
+    }
+    return 0;  // Not found
+}
+
+uint64_t ProjectionCatalog::get_edge_key_id(const std::string& key_name) const {
+    auto it = edge_keys2id.find(key_name);
+    if (it != edge_keys2id.end()) {
+        return it->second;
+    }
+    return 0;  // Not found
 }
 
 } // namespace GQL
