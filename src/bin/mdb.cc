@@ -54,6 +54,8 @@ void print_import_help()
             "\n  Options for RDF:"
             "\n    --prefixes                         prefixes file path (for IRI compression)"
             "\n    --btree-permutations               3, 4 or 6 (default: 4)"
+            "\n  Options for GQL:"
+            "\n    --with-tensors <file.npy>          import node embeddings from NumPy file"
             "\n";
 }
 

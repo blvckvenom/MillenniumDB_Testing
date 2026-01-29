@@ -29,6 +29,7 @@ enum class ImportFileFormat {
 struct ImportConfig {
     std::vector<std::string> paths;
     std::string prefixes_file;
+    std::string tensor_file;  // Path to .npy file with node embeddings (GQL only)
     ImportFileFormat format = ImportFileFormat::UNASSIGNED;
     uint64_t strings_buffer_size = 2ULL * 1024 * 1024 * 1024;
     uint64_t tensors_buffer_size = 2ULL * 1024 * 1024 * 1024;
@@ -95,6 +96,11 @@ inline ImportConfig parse_import_config(const std::vector<std::string>& args)
                     return "";
                 } });
 
+    opt.insert({ "--with-tensors", [](ImportConfig& config, const std::string& value) {
+                    config.tensor_file = value;
+                    return "";
+                } });
+
     size_t i = 0;
 
     while (i < args.size()) {
@@ -130,6 +136,11 @@ inline ImportConfig parse_import_config(const std::vector<std::string>& args)
         const auto res = "--buffer-tensors must be at least "
                        + std::to_string(Import::ExternalData::MIN_IMPORT_BUFFER_SIZE) + " bytes";
         FATAL_ERROR(res);
+    }
+
+    // Validate tensor file exists if specified
+    if (!config.tensor_file.empty() && !Filesystem::is_regular_file(config.tensor_file)) {
+        FATAL_ERROR("Tensor file \"", config.tensor_file, "\" does not exist");
     }
 
     return config;
@@ -278,7 +289,12 @@ inline int mdb_import(ImportConfig& config)
         break;
     }
     case ImportFileFormat::GQL: {
-        Import::GQL::OnDiskImport importer(db_dir, config.strings_buffer_size, config.tensors_buffer_size);
+        Import::GQL::OnDiskImport importer(
+            db_dir,
+            config.strings_buffer_size,
+            config.tensors_buffer_size,
+            config.tensor_file
+        );
         if (input_files.empty()) {
             MDBIstreamWrapper in(std::cin);
             importer.start_import(in);

@@ -254,13 +254,21 @@ void HttpGQLSession::execute_readonly_query_plan(
         logger(Category::Info
         ) << "Timeout thrown after "
           << std::chrono::duration_cast<std::chrono::milliseconds>(execution_duration).count() << " ms";
+        // Write timeout error to response body
+        os << "\n# Error: Query timeout after "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(execution_duration).count() << " ms\n";
     } catch (const QueryExecutionException& e) {
         execution_duration = std::chrono::system_clock::now() - execution_start;
         logger(Category::Error) << e.what();
+        // Write error to response body
+        os << "\n# Error: " << e.what() << "\n";
     } catch (const std::exception& e) {
         logger(Category::Error) << "Unexpected Exception: " << e.what();
+        // Write error to response body so client sees the issue
+        os << "\n# Error: " << e.what() << "\n";
     } catch (...) {
         logger(Category::Error) << "Unknown exception";
+        os << "\n# Error: Unknown exception during query execution\n";
     }
 }
 

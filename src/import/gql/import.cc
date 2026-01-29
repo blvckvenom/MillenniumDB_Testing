@@ -1,8 +1,14 @@
 #include "import.h"
 
+#include <filesystem>
+
+#include "gnn/storage/file_gnn_tensor_store.h"
+#include "gnn/storage/gnn_dtype.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/inliner.h"
 #include "import/import_helper.h"
+#include "import/npy_loader.h"
+#include "misc/fatal_error.h"
 #include "misc/unicode_escape.h"
 #include "storage/index/lists/list_encoder.h"
 
@@ -11,12 +17,14 @@ using namespace Import::GQL;
 OnDiskImport::OnDiskImport(
     const std::string& db_folder,
     uint64_t strings_buffer_size,
-    uint64_t tensors_buffer_size
+    uint64_t tensors_buffer_size,
+    const std::string& tensor_file
 ) :
     catalog("catalog.dat"),
     strings_buffer_size(strings_buffer_size),
     tensors_buffer_size(tensors_buffer_size),
     db_folder(db_folder),
+    tensor_file_(tensor_file),
     node_labels(db_folder + "/node_labels"),
     edge_labels(db_folder + "/edge_labels"),
     node_properties(db_folder + "/node_properties"),
@@ -1006,6 +1014,12 @@ void OnDiskImport::start_import(MDBIstream& in)
 
     print_duration("Write B+tree indexes", start);
 
+    // Import node embeddings from NPY file if provided
+    if (!tensor_file_.empty()) {
+        import_node_tensors();
+        print_duration("Import node tensors", start);
+    }
+
     catalog.print(std::cout);
 
     print_duration("Total Import", import_start);
@@ -1088,4 +1102,122 @@ inline void OnDiskImport::process_pending(
 
     // process pending finished, clean up the last pending file
     pending_vector->skip_indexing();
+}
+
+void OnDiskImport::import_node_tensors() {
+    std::cout << "Loading node embeddings from: " << tensor_file_ << "\n";
+
+    // Validate the NPY file first
+    std::string validation_error;
+    if (!NpyLoader::validate(tensor_file_, validation_error)) {
+        FATAL_ERROR("Invalid tensor file: ", validation_error);
+    }
+
+    // Load the tensor data
+    NpyMetadata metadata;
+    auto data = NpyLoader::load_float32(tensor_file_, metadata);
+
+    // If float32 load failed, try float64
+    bool is_float64 = false;
+    std::vector<double> data_f64;
+    if (data.empty()) {
+        data_f64 = NpyLoader::load_float64(tensor_file_, metadata);
+        if (data_f64.empty()) {
+            FATAL_ERROR("Failed to load tensor file: ", tensor_file_);
+        }
+        is_float64 = true;
+    }
+
+    // Validate dimensions
+    if (metadata.shape.size() != 2) {
+        FATAL_ERROR("Expected 2D tensor (num_nodes, feature_dim), got ",
+                    metadata.shape.size(), "D");
+    }
+
+    uint64_t num_nodes = metadata.shape[0];
+    uint64_t feature_dim = metadata.shape[1];
+
+    // Validate node count matches
+    if (num_nodes != catalog.nodes_count) {
+        FATAL_ERROR("Tensor has ", num_nodes, " rows but graph has ",
+                    catalog.nodes_count, " nodes. They must match.");
+    }
+
+    // Check for integer overflow
+    if (num_nodes > SIZE_MAX / feature_dim / (is_float64 ? sizeof(double) : sizeof(float))) {
+        FATAL_ERROR("Tensor dimensions would cause overflow");
+    }
+
+    std::cout << "  Shape: " << num_nodes << " x " << feature_dim << "\n";
+    std::cout << "  Dtype: " << (is_float64 ? "float64" : "float32") << "\n";
+    std::cout << "  Order: " << (metadata.fortran_order ? "Fortran" : "C") << "\n";
+
+    // Convert Fortran order to C order if needed
+    // Fortran order stores data column-by-column, C order stores row-by-row
+    // For a 2D matrix [rows, cols]: F[i,j] = data[j*rows + i], C[i,j] = data[i*cols + j]
+    if (metadata.fortran_order) {
+        std::cout << "  Converting Fortran order to C order...\n";
+        if (is_float64) {
+            std::vector<double> c_order_data(data_f64.size());
+            for (uint64_t row = 0; row < num_nodes; ++row) {
+                for (uint64_t col = 0; col < feature_dim; ++col) {
+                    // Fortran: col * num_nodes + row
+                    // C: row * feature_dim + col
+                    c_order_data[row * feature_dim + col] = data_f64[col * num_nodes + row];
+                }
+            }
+            data_f64 = std::move(c_order_data);
+        } else {
+            std::vector<float> c_order_data(data.size());
+            for (uint64_t row = 0; row < num_nodes; ++row) {
+                for (uint64_t col = 0; col < feature_dim; ++col) {
+                    c_order_data[row * feature_dim + col] = data[col * num_nodes + row];
+                }
+            }
+            data = std::move(c_order_data);
+        }
+    }
+
+    // Create GNN tensor store directory
+    auto gnn_path = db_folder + "/gnn_tensors";
+    std::filesystem::create_directories(gnn_path);
+
+    // Initialize FileGnnTensorStore
+    mdb::gnn::FileGnnTensorStore tensor_store(gnn_path);
+
+    // Store the embedding matrix
+    std::vector<int64_t> shape = {
+        static_cast<int64_t>(num_nodes),
+        static_cast<int64_t>(feature_dim)
+    };
+
+    bool success = false;
+    if (is_float64) {
+        success = tensor_store.store(
+            "node_features",
+            data_f64.data(),
+            shape,
+            mdb::gnn::GnnDtype::FLOAT64
+        );
+    } else {
+        success = tensor_store.store(
+            "node_features",
+            data.data(),
+            shape,
+            mdb::gnn::GnnDtype::FLOAT32
+        );
+    }
+
+    if (!success) {
+        FATAL_ERROR("Failed to store tensors in GNN tensor store");
+    }
+
+    tensor_store.flush();
+
+    // Update catalog with tensor metadata
+    catalog.has_gnn_tensors = true;
+    catalog.gnn_tensor_num_rows = num_nodes;
+    catalog.gnn_tensor_num_cols = feature_dim;
+
+    std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim << "\n";
 }
