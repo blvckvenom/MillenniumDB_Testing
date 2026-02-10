@@ -1,5 +1,6 @@
 #include "push_properties.h"
 
+#include "query/parser/op/gql/op_call_procedure.h"
 #include "query/parser/op/gql/ops.h"
 
 using namespace GQL;
@@ -173,4 +174,9 @@ void PushProperties::visit(OpUnitTable& op)
 void PushProperties::visit(OpEmpty& op)
 {
     tmp = std::make_unique<OpEmpty>(op);
+}
+
+void PushProperties::visit(OpCallProcedure& op)
+{
+    tmp = op.clone();
 }

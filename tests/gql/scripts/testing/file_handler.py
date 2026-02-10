@@ -48,6 +48,12 @@ def get_test_suites() -> list[TestSuite]:
             log(Level.DEBUG, str(test))
             test_list.append(test)
 
+        # Run regular queries before bad queries so that state-dependent
+        # bad tests (e.g. duplicate projection name) see the expected state.
+        # Within each group, sort by filename for deterministic ordering
+        # (glob returns filesystem order which is not guaranteed alphabetical).
+        test_list.sort(key=lambda t: (isinstance(t, BadTest), t.query.name))
+
         test_suites.append(TestSuite(name=test_suite, tests=test_list))
 
         log(Level.END, test_suite)

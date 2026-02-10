@@ -1,5 +1,6 @@
 #include "check_var_existence.h"
 
+#include "query/parser/op/gql/op_call_procedure.h"
 #include "query/parser/op/gql/ops.h"
 #include "query/rewriter/gql/expr/check_group_vars.h"
 
@@ -233,5 +234,20 @@ void CheckVarExistence::visit(OpLinearPattern& op_linear_pattern)
 void CheckVarExistence::visit(OpUnitTable&) { }
 
 void CheckVarExistence::visit(OpEmpty&) { }
+
+void CheckVarExistence::visit(OpCallProcedure& op_call_procedure)
+{
+    // Check that argument variables exist
+    std::set<VarId> expr_variables;
+    for (auto& arg : op_call_procedure.arguments) {
+        expr_variables.merge(arg->get_all_vars());
+    }
+    check_expr_variables(expr_variables);
+
+    // Add YIELD variables to scope (these are outputs from the procedure)
+    for (auto& yield_item : op_call_procedure.yield_items) {
+        variables.insert(yield_item.var);
+    }
+}
 
 } // namespace GQL

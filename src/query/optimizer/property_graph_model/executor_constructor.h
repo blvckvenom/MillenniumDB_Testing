@@ -17,6 +17,7 @@ public:
     { }
 
     void visit(OpReturn&) override;
+    void visit(OpCallProcedure&) override;
 
     void visit(OpGraphPattern&) override { }
     void visit(OpEmpty&) override { }

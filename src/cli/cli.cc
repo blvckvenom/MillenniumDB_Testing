@@ -1810,6 +1810,12 @@ void CLI::ProcessGQLQuery(std::ostream& os, const std::string& query) {
         std::unique_ptr<GQL::Op> logical_plan;
         logical_plan = GQL::QueryParser::get_query_plan(query);
 
+        // Load projection context if USE GRAPH was specified
+        auto& ctx = get_query_ctx();
+        if (ctx.is_using_projection()) {
+            ctx.load_projection(ctx.active_projection);
+        }
+
         auto query_optimizer = GQL::ExecutorConstructor(GQL::ReturnType::TSV);
         logical_plan->accept_visitor(query_optimizer);
         auto physical_plan = std::move(query_optimizer.executor);

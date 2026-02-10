@@ -288,6 +288,10 @@ COPY
    : 'COPY'
    ;
 
+COSINEDISTANCE
+   : 'COSINEDISTANCE'
+   ;
+
 COS
    : 'COS'
    ;
@@ -542,6 +546,10 @@ IF
 
 IN
    : 'IN'
+   ;
+
+INCLUDE
+   : 'INCLUDE'
    ;
 
 INSERT
@@ -850,6 +858,10 @@ PROPERTIES
 
 PROPERTY_EXISTS
    : 'PROPERTY_EXISTS'
+   ;
+
+PROJECT
+   : 'PROJECT'
    ;
 
 RADIANS
@@ -1231,7 +1243,6 @@ PRE_RESERVED_WORD
    | 'PARTITION'
    | 'PROCEDURE'
    | 'PRODUCT'
-   | 'PROJECT'
    | 'QUERY'
    | 'RECORDS'
    | 'REFERENCE'

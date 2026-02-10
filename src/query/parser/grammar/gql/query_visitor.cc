@@ -5,12 +5,16 @@
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
+#include "graph_models/gql/graph_reference.h"
+#include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/rdf_model/conversions.h"
 #include "macros/time.h"
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
+#include "query/parser/op/gql/op_call_procedure.h"
+#include "query/procedure/procedure_catalog.h"
 
-// #define DEBUG_GQL_QUERY_VISITOR
+#define DEBUG_GQL_QUERY_VISITOR
 
 #ifdef DEBUG_GQL_QUERY_VISITOR
 
@@ -51,6 +55,11 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
     LOG_VISITOR
     std::vector<std::unique_ptr<Op>> query_statements;
 
+    // Visit USE GRAPH clause if present (must be done before processing the query)
+    if (ctx->useGraphClause()) {
+        visit(ctx->useGraphClause());
+    }
+
     // for now we visit only if there is a return statement
     auto primitiveResultStatement = ctx->primitiveResultStatement();
     if (!primitiveResultStatement) {
@@ -64,6 +73,12 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
 
     for (auto& child : ctx->simpleDataAccessingStatement()) {
         visit(child);
+        if (current_op == nullptr) {
+#ifndef NDEBUG
+            std::cerr << "WARNING: visit(simpleDataAccessingStatement) did not set current_op!" << std::endl;
+            std::cerr << "Statement text: " << child->getText() << std::endl;
+#endif
+        }
         query_statements.push_back(std::move(current_op));
     }
     current_op = std::make_unique<OpQueryStatements>(std::move(query_statements));
@@ -90,6 +105,8 @@ std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQuerySta
     } else if (filterStatement) {
         filterStatement->accept(this);
         current_op = std::make_unique<OpFilter>(std::move(filter_items));
+    } else if (ctx->callQueryStatement()) {
+        ctx->callQueryStatement()->accept(this);
     }
     return 0;
 }
@@ -1238,6 +1255,28 @@ std::any QueryVisitor::visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFu
     return 0;
 }
 
+std::any QueryVisitor::visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext* ctx)
+{
+    LOG_VISITOR
+    std::vector<std::unique_ptr<Expr>> expressions;
+    for (auto& fp : ctx->functionParameter()) {
+        if (auto unsignedLiteral = fp->unsignedLiteral()) {
+            visit(unsignedLiteral);
+        } else if (auto variable = fp->variable()) {
+            visit(variable);
+        } else if (auto propertyReference = fp->propertyReference()) {
+            visit(propertyReference);
+        } else if (auto functionCall = fp->functionCall()) {
+            visit(functionCall);
+        } else if (auto expression = fp->expression()) {
+            visit(expression);
+        }
+        expressions.push_back(std::move(current_expr));
+    }
+    current_expr = std::make_unique<ExprCosineDistance>(std::move(expressions[0]), std::move(expressions[1]));
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlSubstringFunction(GQLParser::GqlSubstringFunctionContext* ctx)
 {
     LOG_VISITOR
@@ -1591,6 +1630,215 @@ std::any QueryVisitor::visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunction
     return 0;
 }
 
+std::any QueryVisitor::visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext* ctx)
+{
+    LOG_VISITOR
+
+    // Null check and validation
+    if (!ctx->projectionName) {
+        throw QuerySemanticException("PROJECT() requires a projection name parameter");
+    }
+
+    // DEBUG: Log what we're about to visit
+    #ifdef DEBUG_GQL_QUERY_VISITOR
+    LOG_INFO("PROJECT function - visiting projectionName: " + ctx->projectionName->getText());
+    #endif
+
+    visit(ctx->projectionName);
+    auto projection_name_expr = std::move(current_expr);
+
+    // Validate that we got a valid expression
+    if (!projection_name_expr) {
+        throw QuerySemanticException("PROJECT() projection name expression is invalid");
+    }
+
+    // DEBUG: Verify the expression type
+    #ifdef DEBUG_GQL_QUERY_VISITOR
+    if (auto* term = dynamic_cast<ExprTerm*>(projection_name_expr.get())) {
+        LOG_INFO("PROJECT function - got ExprTerm with ObjectId: 0x" + std::to_string(term->term.id));
+    }
+    #endif
+
+    VarId agg_var = get_query_ctx().get_internal_var();
+
+    // Parse optional source node expression
+    std::unique_ptr<Expr> source_node_expr = nullptr;
+    if (ctx->sourceNode) {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - parsing sourceNode");
+        #endif
+        visit(ctx->sourceNode);
+        source_node_expr = std::move(current_expr);
+    }
+
+    // Parse optional target node expression
+    std::unique_ptr<Expr> target_node_expr = nullptr;
+    if (ctx->targetNode) {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - parsing targetNode");
+        #endif
+        visit(ctx->targetNode);
+        target_node_expr = std::move(current_expr);
+    }
+
+    // Parse optional dataConfig (recordLiteral with property lists)
+    DataConfig data_config;
+    if (ctx->dataConfig) {
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - parsing dataConfig");
+        #endif
+        data_config = parse_data_config(ctx->dataConfig);
+    }
+
+    // Parse projection options if present
+    ProjectionOptions options;
+    if (ctx->projectionOptions()) {
+        // Reset current options before visiting
+        current_projection_options = ProjectionOptions();
+        visit(ctx->projectionOptions());
+        options = current_projection_options;
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("PROJECT function - options: labels=" + std::to_string(options.include_labels) +
+                 ", properties=" + std::to_string(options.include_properties));
+        #endif
+    }
+
+    current_expr = std::make_unique<ExprAggProject>(
+        std::move(projection_name_expr),
+        agg_var,
+        options,
+        std::move(source_node_expr),
+        std::move(target_node_expr),
+        std::move(data_config)
+    );
+    return 0;
+}
+
+std::any QueryVisitor::visitProjectionOptions(GQLParser::ProjectionOptionsContext* ctx)
+{
+    LOG_VISITOR
+
+    // Visit all INCLUDE clauses
+    for (auto* include_clause : ctx->projectionIncludeClause()) {
+        visit(include_clause);
+    }
+
+    return 0;
+}
+
+std::any QueryVisitor::visitProjectionIncludeClause(GQLParser::ProjectionIncludeClauseContext* ctx)
+{
+    LOG_VISITOR
+
+    if (ctx->LABELS()) {
+        current_projection_options.include_labels = true;
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("Projection option: INCLUDE LABELS");
+        #endif
+    } else if (ctx->PROPERTIES()) {
+        current_projection_options.include_properties = true;
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("Projection option: INCLUDE PROPERTIES");
+        #endif
+    }
+
+    return 0;
+}
+
+DataConfig QueryVisitor::parse_data_config(GQLParser::RecordLiteralContext* ctx)
+{
+    DataConfig config;
+
+    // If no fields, return empty config
+    if (!ctx->recordFieldLiteral().size()) {
+        return config;
+    }
+
+    // Iterate through all key-value pairs in the record literal
+    for (auto* field : ctx->recordFieldLiteral()) {
+        std::string key = field->key->getText();
+
+        #ifdef DEBUG_GQL_QUERY_VISITOR
+        LOG_INFO("DataConfig parsing field: " + key);
+        #endif
+
+        // Check if the value is a listLiteral
+        auto* value_literal = field->value;
+        if (!value_literal || !value_literal->listLiteral()) {
+            // Skip non-list values
+            continue;
+        }
+
+        // Parse the string list based on the key
+        if (key == "sourceNodeProperties") {
+            config.source_node_properties = parse_string_list(value_literal->listLiteral());
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed " + std::to_string(config.source_node_properties->size()) + " source node properties");
+            #endif
+        } else if (key == "targetNodeProperties") {
+            config.target_node_properties = parse_string_list(value_literal->listLiteral());
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed " + std::to_string(config.target_node_properties->size()) + " target node properties");
+            #endif
+        } else if (key == "relationshipProperties") {
+            config.relationship_properties = parse_string_list(value_literal->listLiteral());
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed " + std::to_string(config.relationship_properties->size()) + " relationship properties");
+            #endif
+        }
+        // Silently ignore unknown keys
+    }
+
+    return config;
+}
+
+std::vector<std::string> QueryVisitor::parse_string_list(GQLParser::ListLiteralContext* ctx)
+{
+    std::vector<std::string> result;
+
+    // If empty list, return empty vector
+    if (!ctx->generalLiteral().size()) {
+        return result;
+    }
+
+    // Iterate through all elements in the list
+    for (auto* literal : ctx->generalLiteral()) {
+        // We expect predefinedTypeLiteral -> characterStringLiteral
+        if (!literal->predefinedTypeLiteral() ||
+            !literal->predefinedTypeLiteral()->characterStringLiteral()) {
+            // Skip non-string literals
+            continue;
+        }
+
+        auto* char_string = literal->predefinedTypeLiteral()->characterStringLiteral();
+        std::string raw_string;
+
+        // Extract the raw string text (with quotes)
+        if (char_string->singleQuotedCharacterSequence()) {
+            raw_string = char_string->singleQuotedCharacterSequence()->getText();
+        } else if (char_string->doubleQuotedCharacterSequence()) {
+            raw_string = char_string->doubleQuotedCharacterSequence()->getText();
+        } else {
+            // Skip if no quoted sequence
+            continue;
+        }
+
+        // Strip quotes: remove first and last character
+        // e.g., 'age' -> age  or  "age" -> age
+        if (raw_string.size() >= 2) {
+            std::string prop_name = raw_string.substr(1, raw_string.size() - 2);
+            result.push_back(prop_name);
+
+            #ifdef DEBUG_GQL_QUERY_VISITOR
+            LOG_INFO("Parsed property name: " + prop_name);
+            #endif
+        }
+    }
+
+    return result;
+}
+
 std::any QueryVisitor::visitPropertyReference(GQLParser::PropertyReferenceContext* ctx)
 {
     LOG_VISITOR
@@ -1744,7 +1992,7 @@ std::any QueryVisitor::visitSingleQuotedCharacterSequence(GQLParser::SingleQuote
         }
         raw_string = std::string(raw_string, start_pos, raw_string.size() - 2);
 
-        ObjectId oid = SPARQL::Conversions::pack_string_simple(raw_string);
+        ObjectId oid = Conversions::pack_string_simple(raw_string);
         str_expressions.push_back(std::make_unique<ExprTerm>(oid));
     }
 
@@ -1772,7 +2020,7 @@ std::any QueryVisitor::visitDoubleQuotedCharacterSequence(GQLParser::DoubleQuote
         }
         raw_string = std::string(raw_string, start_pos, raw_string.size() - 2);
 
-        ObjectId oid = SPARQL::Conversions::pack_string_simple(raw_string);
+        ObjectId oid = Conversions::pack_string_simple(raw_string);
         str_expressions.push_back(std::make_unique<ExprTerm>(oid));
     }
 
@@ -1888,6 +2136,77 @@ std::any QueryVisitor::visitListLiteral(GQLParser::ListLiteralContext* ctx)
     }
     ObjectId list_oid = Conversions::pack_list(list);
     current_expr = std::make_unique<ExprTerm>(list_oid);
+    return 0;
+}
+
+std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
+{
+    LOG_VISITOR
+    std::map<ObjectId, std::unique_ptr<DictionaryItem>> dict_map;
+
+    auto fields = ctx->recordFieldLiteral();
+    for (auto* field : fields) {
+        std::string key_str = field->key->getText();
+        ObjectId key_oid = Conversions::pack_string_simple(key_str);
+        visit(field->value);
+
+        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
+        if (!expr_term) {
+            throw QuerySemanticException(
+                "Record literal at line " + std::to_string(ctx->getStart()->getLine()) +
+                " contains non-literal value for key '" + key_str + "'"
+            );
+        }
+        dict_map[key_oid] = std::make_unique<DictionaryLiteral>(expr_term->term);
+    }
+
+    auto dict = std::make_unique<Dictionary>(std::move(dict_map));
+    ObjectId dict_oid = Common::Conversions::pack_dictionary(dict);
+    current_expr = std::make_unique<ExprTerm>(dict_oid);
+
+    return 0;
+}
+
+std::any QueryVisitor::visitGqlCollectionExpression(GQLParser::GqlCollectionExpressionContext* ctx)
+{
+    LOG_VISITOR
+    auto* collection = ctx->collectionValueConstructor();
+    if (collection->recordValueConstructor()) {
+        return visit(collection->recordValueConstructor());
+    } else if (collection->listValueConstructor()) {
+        return visit(collection->listValueConstructor());
+    } else if (collection->pathValueConstructor()) {
+        return visit(collection->pathValueConstructor());
+    }
+    throw QuerySemanticException(
+        "Unknown collection type at line " + std::to_string(ctx->getStart()->getLine())
+    );
+}
+
+std::any QueryVisitor::visitRecordValueConstructor(GQLParser::RecordValueConstructorContext* ctx)
+{
+    LOG_VISITOR
+    std::map<ObjectId, std::unique_ptr<DictionaryItem>> dict_map;
+
+    auto fields = ctx->field();
+    for (auto* field_ctx : fields) {
+        std::string key_str = field_ctx->key->getText();
+        ObjectId key_oid = Conversions::pack_string_simple(key_str);
+        visit(field_ctx->value);
+
+        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
+        if (!expr_term) {
+            throw QuerySemanticException(
+                "Record value constructor at line " + std::to_string(ctx->getStart()->getLine()) +
+                " contains non-evaluable value for key '" + key_str + "'"
+            );
+        }
+        dict_map[key_oid] = std::make_unique<DictionaryLiteral>(expr_term->term);
+    }
+
+    auto dict = std::make_unique<Dictionary>(std::move(dict_map));
+    ObjectId dict_oid = Common::Conversions::pack_dictionary(dict);
+    current_expr = std::make_unique<ExprTerm>(dict_oid);
     return 0;
 }
 
@@ -2157,8 +2476,138 @@ std::any QueryVisitor::visitEndTransactionCommand(GQLParser::EndTransactionComma
 }
 
 std::any
-    QueryVisitor::visitLinearCatalogModifyingStatement(GQLParser::LinearCatalogModifyingStatementContext*)
+    QueryVisitor::visitLinearCatalogModifyingStatement(GQLParser::LinearCatalogModifyingStatementContext* ctx)
 {
+    // Check if this is a CALL procedure statement (not DDL)
+    auto simple_stmts = ctx->simpleCatalogModifyingStatement();
+    if (simple_stmts.size() == 1) {
+        auto simple = simple_stmts[0];
+        if (simple->callProcedureStatement()) {
+            // This is a CALL procedure, not a DDL statement
+            // Process it using the same logic as visitCallQueryStatement
+            auto call_proc_ctx = simple->callProcedureStatement();
+
+            // Extract OPTIONAL flag
+            bool optional = call_proc_ctx->OPTIONAL() != nullptr;
+
+            // Get the procedure call
+            auto proc_call_ctx = call_proc_ctx->procedureCall();
+            if (!proc_call_ctx) {
+                throw QuerySemanticException("Missing procedure call");
+            }
+
+            // For now, only support named procedures (not inline)
+            auto named_ctx = proc_call_ctx->namedProcedureCall();
+            if (!named_ctx) {
+                throw NotSupportedException("Inline procedures are not yet supported. Use named procedures only.");
+            }
+
+            // Extract procedure name
+            auto proc_ref_ctx = named_ctx->procedureReference();
+            if (!proc_ref_ctx) {
+                throw QuerySemanticException("Missing procedure reference");
+            }
+
+            std::string proc_name;
+
+            // Handle catalogProcedureParentAndName
+            if (proc_ref_ctx->catalogProcedureParentAndName()) {
+                auto cat_name_ctx = proc_ref_ctx->catalogProcedureParentAndName();
+
+                // Build qualified name if there's a parent reference
+                // Note: catalogObjectParentReference includes the trailing period (e.g., "gnn.")
+                // per the grammar rule: (objectName PERIOD)+
+                if (cat_name_ctx->catalogObjectParentReference()) {
+                    proc_name = cat_name_ctx->catalogObjectParentReference()->getText();
+                    // The getText() already includes the trailing period, don't add another
+                }
+
+                // Add procedure name
+                if (cat_name_ctx->procedureName()) {
+                    proc_name += cat_name_ctx->procedureName()->getText();
+                } else {
+                    throw QuerySemanticException("Missing procedure name");
+                }
+            } else if (proc_ref_ctx->referenceParameter()) {
+                throw NotSupportedException("Dynamic procedure names (via parameters) are not yet supported");
+            } else {
+                throw QuerySemanticException("Invalid procedure reference");
+            }
+
+            // Lookup procedure in catalog
+            auto& catalog = ProcedureCatalog::get_instance();
+            Procedure* procedure = catalog.lookup(proc_name);
+
+            if (!procedure) {
+                auto available = catalog.list_procedures();
+                std::string available_str;
+                for (size_t i = 0; i < available.size() && i < 5; i++) {
+                    if (i > 0) available_str += ", ";
+                    available_str += available[i];
+                }
+                if (available.size() > 5) {
+                    available_str += ", ...";
+                }
+
+                throw QuerySemanticException(
+                    "Procedure '" + proc_name + "' not found. Available procedures: [" +
+                    (available_str.empty() ? "none" : available_str) + "]"
+                );
+            }
+
+            // Process arguments
+            std::vector<std::unique_ptr<Expr>> arguments;
+            if (named_ctx->procedureArgumentList()) {
+                for (auto arg_ctx : named_ctx->procedureArgumentList()->procedureArgument()) {
+                    visit(arg_ctx->expression());
+                    arguments.push_back(std::move(current_expr));
+                }
+            }
+
+            // Process YIELD clause
+            std::vector<OpCallProcedure::YieldItem> yield_items;
+            if (named_ctx->yieldClause()) {
+                auto yield_ctx = named_ctx->yieldClause();
+
+                if (yield_ctx->ASTERISK()) {
+                    // YIELD * - expand to all yield fields from procedure metadata
+                    auto fields = procedure->yield_fields();
+                    for (const auto& field : fields) {
+                        VarId var = get_query_ctx().get_or_create_var(field.name);
+                        yield_items.emplace_back(field.name, var);
+                    }
+                } else {
+                    // Explicit field list
+                    for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
+                        std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
+
+                        // Get variable name (use alias if present, otherwise use field name)
+                        std::string var_name = field_name;
+                        if (item_ctx->yieldItemAlias()) {
+                            var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                        }
+
+                        // Get or create variable ID
+                        VarId var = get_query_ctx().get_or_create_var(var_name);
+
+                        yield_items.emplace_back(field_name, var);
+                    }
+                }
+            }
+
+            // Create OpCallProcedure operator (following visitor pattern)
+            current_op = std::make_unique<OpCallProcedure>(
+                procedure,
+                std::move(arguments),
+                std::move(yield_items),
+                optional
+            );
+
+            return 0;
+        }
+    }
+
+    // Otherwise, it's a true DDL statement (CREATE/DROP) which isn't implemented
     throw NotSupportedException("Create/Drop");
 }
 
@@ -2173,9 +2622,136 @@ std::any QueryVisitor::visitBindingVariableDefinitionBlock(GQLParser::BindingVar
     throw NotSupportedException("Variable definition block");
 }
 
-std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext*)
+std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementContext* ctx)
 {
-    throw NotSupportedException("Call");
+    LOG_VISITOR
+
+    // Get the call procedure statement
+    auto call_proc_ctx = ctx->callProcedureStatement();
+    if (!call_proc_ctx) {
+        throw QuerySemanticException("Missing call procedure statement");
+    }
+
+    // Check for OPTIONAL flag
+    bool optional = call_proc_ctx->OPTIONAL() != nullptr;
+
+    // Get the procedure call
+    auto proc_call_ctx = call_proc_ctx->procedureCall();
+    if (!proc_call_ctx) {
+        throw QuerySemanticException("Missing procedure call");
+    }
+
+    // For now, only support named procedures (not inline)
+    auto named_ctx = proc_call_ctx->namedProcedureCall();
+    if (!named_ctx) {
+        throw NotSupportedException("Inline procedures are not yet supported. Use named procedures only.");
+    }
+
+    // Extract procedure name
+    auto proc_ref_ctx = named_ctx->procedureReference();
+    if (!proc_ref_ctx) {
+        throw QuerySemanticException("Missing procedure reference");
+    }
+
+    std::string proc_name;
+
+    // Handle catalogProcedureParentAndName
+    if (proc_ref_ctx->catalogProcedureParentAndName()) {
+        auto cat_name_ctx = proc_ref_ctx->catalogProcedureParentAndName();
+
+        // Build qualified name if there's a parent reference
+        // Note: catalogObjectParentReference includes the trailing period (e.g., "gnn.")
+        // per the grammar rule: (objectName PERIOD)+
+        if (cat_name_ctx->catalogObjectParentReference()) {
+            proc_name = cat_name_ctx->catalogObjectParentReference()->getText();
+            // The getText() already includes the trailing period, don't add another
+        }
+
+        // Add procedure name
+        if (cat_name_ctx->procedureName()) {
+            proc_name += cat_name_ctx->procedureName()->getText();
+        } else {
+            throw QuerySemanticException("Missing procedure name");
+        }
+    } else if (proc_ref_ctx->referenceParameter()) {
+        throw NotSupportedException("Dynamic procedure names (via parameters) are not yet supported");
+    } else {
+        throw QuerySemanticException("Invalid procedure reference");
+    }
+
+    // Lookup procedure in catalog
+    auto& catalog = ProcedureCatalog::get_instance();
+    Procedure* procedure = catalog.lookup(proc_name);
+
+    if (!procedure) {
+        // List available procedures for better error message
+        auto available = catalog.list_procedures();
+        std::string available_str;
+        for (size_t i = 0; i < available.size() && i < 5; i++) {
+            if (i > 0) available_str += ", ";
+            available_str += available[i];
+        }
+        if (available.size() > 5) {
+            available_str += ", ...";
+        }
+
+        throw QuerySemanticException(
+            "Procedure '" + proc_name + "' not found. Available procedures: [" +
+            (available_str.empty() ? "none" : available_str) + "]"
+        );
+    }
+
+    // Process arguments
+    std::vector<std::unique_ptr<Expr>> arguments;
+    if (named_ctx->procedureArgumentList()) {
+        for (auto arg_ctx : named_ctx->procedureArgumentList()->procedureArgument()) {
+            // Visit the argument expression
+            visit(arg_ctx->expression());
+            arguments.push_back(std::move(current_expr));
+        }
+    }
+
+    // Process YIELD clause
+    std::vector<OpCallProcedure::YieldItem> yield_items;
+    if (named_ctx->yieldClause()) {
+        auto yield_ctx = named_ctx->yieldClause();
+
+        if (yield_ctx->ASTERISK()) {
+            // YIELD * - expand to all yield fields from procedure metadata
+            auto fields = procedure->yield_fields();
+            for (const auto& field : fields) {
+                VarId var = get_query_ctx().get_or_create_var(field.name);
+                yield_items.emplace_back(field.name, var);
+            }
+        } else {
+            // Explicit field list
+            for (auto item_ctx : yield_ctx->yieldItemList()->yieldItem()) {
+                // Get field name
+                std::string field_name = item_ctx->yieldItemName()->fieldName()->getText();
+
+                // Get variable name (use alias if present, otherwise use field name)
+                std::string var_name = field_name;
+                if (item_ctx->yieldItemAlias()) {
+                    var_name = item_ctx->yieldItemAlias()->bindingVariable()->getText();
+                }
+
+                // Get or create variable ID
+                VarId var = get_query_ctx().get_or_create_var(var_name);
+
+                yield_items.emplace_back(field_name, var);
+            }
+        }
+    }
+
+    // Create OpCallProcedure operator
+    current_op = std::make_unique<OpCallProcedure>(
+        procedure,
+        std::move(arguments),
+        std::move(yield_items),
+        optional
+    );
+
+    return 0;
 }
 
 std::any QueryVisitor::visitForStatement(GQLParser::ForStatementContext*)
@@ -2213,9 +2789,217 @@ std::any QueryVisitor::visitNestedProcedureSpecification(GQLParser::NestedProced
     throw NotSupportedException("Nested procedure");
 }
 
-std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext*)
+std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* ctx)
 {
-    throw NotSupportedException("Graph expression");
+    LOG_VISITOR
+
+    // Handle graph reference (projection name)
+    if (ctx->graphReference()) {
+        return visitGraphReference(ctx->graphReference());
+    }
+
+    // Handle objectNameOrBindingVariable (simple string like "my_projection")
+    if (ctx->objectNameOrBindingVariable()) {
+        std::string projection_name = ctx->objectNameOrBindingVariable()->getText();
+
+        // Verify projection exists
+        auto& proj_manager = ProjectionManager::get_instance();
+        if (!proj_manager.projection_exists(projection_name)) {
+            auto projections = proj_manager.list_projections();
+            std::string available;
+            for (size_t i = 0; i < projections.size(); i++) {
+                if (i > 0) available += ", ";
+                available += projections[i].name;
+            }
+            throw QuerySemanticException(
+                "Projection '" + projection_name + "' does not exist. Available projections: [" +
+                (available.empty() ? "none" : available) + "]"
+            );
+        }
+
+        // Load projection into QueryContext
+        get_query_ctx().load_projection(projection_name);
+        return 0;
+    }
+
+    // Handle objectExpressionPrimary (could be a string literal or HOME_GRAPH/CURRENT_GRAPH keyword)
+    if (ctx->objectExpressionPrimary()) {
+        std::string projection_name = ctx->getText();
+
+        // Check for HOME_GRAPH keyword (may be parsed as objectExpressionPrimary due to ANTLR ordering)
+        if (projection_name == "HOME_GRAPH" || projection_name == "HOME_PROPERTY_GRAPH") {
+            // HOME_GRAPH clears the active projection (returns to main graph)
+            get_query_ctx().clear_active_projection();
+            return 0;
+        }
+
+        // Check for CURRENT_GRAPH keyword (may be parsed as objectExpressionPrimary)
+        if (projection_name == "CURRENT_GRAPH" || projection_name == "CURRENT_PROPERTY_GRAPH") {
+            // CURRENT_GRAPH maintains current context (clears active projection)
+            get_query_ctx().clear_active_projection();
+            return 0;
+        }
+
+        // Remove surrounding quotes if present (for string literals like "test_friends")
+        if (projection_name.length() >= 2 &&
+            (projection_name[0] == '"' || projection_name[0] == '\'') &&
+            projection_name[0] == projection_name[projection_name.length() - 1]) {
+            projection_name = projection_name.substr(1, projection_name.length() - 2);
+        }
+
+        // Handle qualified names (catalog.schema.graph_name)
+        // Due to ANTLR grammar ordering, qualified names may be matched as objectExpressionPrimary
+        // instead of graphReference. Extract just the graph name (last component after final dot).
+        //
+        // CURRENT LIMITATION (2025-12):
+        // MillenniumDB uses a flat projection namespace: catalog/schema
+        // prefixes (ISO/IEC 39075:2024 §17.2, "<graph reference> and
+        // <catalog graph parent and name>") are parsed but ignored for
+        // projection resolution. Neo4j GDS addresses projections the same
+        // way, by a single name in its graph catalog with no catalog/schema
+        // hierarchy (Neo4j Graph Data Science Manual, "Graph management").
+        // See: GraphReference struct in graph_models/gql/graph_reference.h
+        auto last_dot = projection_name.rfind('.');
+        if (last_dot != std::string::npos) {
+            std::string full_name = projection_name;
+            projection_name = projection_name.substr(last_dot + 1);
+            LOG_INFO("Qualified graph reference used: '" << full_name
+                     << "' - using only graph name '" << projection_name
+                     << "' (catalog/schema prefix ignored, flat namespace)");
+        }
+
+        // Verify projection exists
+        auto& proj_manager = ProjectionManager::get_instance();
+        if (!proj_manager.projection_exists(projection_name)) {
+            auto projections = proj_manager.list_projections();
+            std::string available;
+            for (size_t i = 0; i < projections.size(); i++) {
+                if (i > 0) available += ", ";
+                available += projections[i].name;
+            }
+            throw QuerySemanticException(
+                "Projection '" + projection_name + "' does not exist. Available projections: [" +
+                (available.empty() ? "none" : available) + "]"
+            );
+        }
+
+        // Load projection into QueryContext
+        get_query_ctx().load_projection(projection_name);
+        return 0;
+    }
+
+    // Handle CURRENT_GRAPH - clear any active projection
+    if (ctx->currentGraph()) {
+        get_query_ctx().clear_active_projection();
+        return 0;
+    }
+
+    // Other graph expression types not yet supported
+    throw NotSupportedException("Graph expression (only graphReference and currentGraph supported)");
+}
+
+std::any QueryVisitor::visitGraphReference(GQLParser::GraphReferenceContext* ctx)
+{
+    LOG_VISITOR
+
+    // ISO/IEC 39075:2024 §17.2, "<graph reference> and <catalog graph
+    // parent and name>", defines:
+    //   <graph reference> ::=
+    //       <catalog object parent reference> <graph name>
+    //     | <delimited graph name>
+    //     | <home graph>
+    //     | <reference parameter specification>
+    //
+    // CURRENT LIMITATION (2025-12):
+    // MillenniumDB uses a flat projection namespace. Qualified references
+    // (catalog.schema.graph) are parsed and stored in the GraphReference
+    // struct for future extensibility, but only the graph_name is used for
+    // resolution. This is intentional:
+    // - Working with several graphs at once is ISO/IEC 39075:2024 Feature
+    //   GT03, "Use of multiple graphs in a transaction", which is not
+    //   implemented.
+    // - Neo4j GDS also addresses projections by a single name in its graph
+    //   catalog, with no catalog/schema hierarchy (Neo4j Graph Data Science
+    //   Manual, "Graph management").
+    // - GNN training workflows don't require multi-catalog support.
+    //
+    // See: GraphReference struct in graph_models/gql/graph_reference.h
+
+    GraphReference ref;
+    ref.original_text = ctx->getText();
+
+    // Extract projection name from different possible syntaxes
+    if (ctx->delimitedGraphName()) {
+        // Handle delimited identifier (e.g., "my_projection" or `my_projection`)
+        auto text = ctx->delimitedGraphName()->getText();
+        // Remove surrounding quotes or backticks
+        ref.graph_name = text.substr(1, text.length() - 2);
+    } else if (ctx->catalogObjectParentReference() && ctx->graphName()) {
+        // Handle qualified name (catalog.schema.graph_name)
+        // Parse the catalog object parent reference to extract components
+        auto parent_ref = ctx->catalogObjectParentReference();
+        std::string parent_text = parent_ref->getText();
+
+        // Parse parent reference: could be "catalog.schema." or "schema." or "catalog/schema/"
+        // The objectName() list contains the parsed name components
+        auto object_names = parent_ref->objectName();
+        if (object_names.size() >= 2) {
+            ref.catalog = object_names[0]->getText();
+            ref.schema = object_names[1]->getText();
+        } else if (object_names.size() == 1) {
+            ref.schema = object_names[0]->getText();
+        }
+
+        ref.graph_name = ctx->graphName()->getText();
+
+        // Log when qualified reference is used but prefix is ignored
+        if (ref.is_qualified()) {
+            LOG_INFO("Qualified graph reference used: '" << ref.get_qualified_name()
+                     << "' - using only graph name '" << ref.graph_name
+                     << "' (catalog/schema prefix ignored, flat namespace)");
+        }
+    } else if (ctx->homeGraph()) {
+        // HOME_GRAPH refers to the main graph
+        ref.is_home_graph = true;
+        get_query_ctx().clear_active_projection();
+        return 0;
+    } else {
+        throw QuerySemanticException("Invalid graph reference syntax");
+    }
+
+    // Use the effective name for resolution (currently just graph_name)
+    std::string projection_name = ref.get_effective_name();
+
+    // Verify projection exists
+    auto& proj_manager = ProjectionManager::get_instance();
+    if (!proj_manager.projection_exists(projection_name)) {
+        // List available projections for error message
+        auto projections = proj_manager.list_projections();
+        std::string available;
+        for (size_t i = 0; i < projections.size(); i++) {
+            if (i > 0) available += ", ";
+            available += projections[i].name;
+        }
+
+        throw QuerySemanticException(
+            "Projection '" + projection_name + "' does not exist. Available projections: [" +
+            (available.empty() ? "none" : available) + "]"
+        );
+    }
+
+    // Load projection into QueryContext (this sets active_projection and loads the B+tree indexes)
+    get_query_ctx().load_projection(projection_name);
+
+    return 0;
+}
+
+std::any QueryVisitor::visitUseGraphClause(GQLParser::UseGraphClauseContext* ctx)
+{
+    LOG_VISITOR
+    if (ctx->graphExpression()) {
+        visitGraphExpression(ctx->graphExpression());
+    }
+    return 0;
 }
 
 std::any QueryVisitor::visitBindingTableExpression(GQLParser::BindingTableExpressionContext*)

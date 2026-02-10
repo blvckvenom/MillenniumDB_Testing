@@ -653,6 +653,12 @@ public:
 
     virtual std::any visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunctionContext *context) = 0;
 
+    virtual std::any visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext *context) = 0;
+
+    virtual std::any visitProjectionOptions(GQLParser::ProjectionOptionsContext *context) = 0;
+
+    virtual std::any visitProjectionIncludeClause(GQLParser::ProjectionIncludeClauseContext *context) = 0;
+
     virtual std::any visitGeneralSetFunctionType(GQLParser::GeneralSetFunctionTypeContext *context) = 0;
 
     virtual std::any visitSetQuantifier(GQLParser::SetQuantifierContext *context) = 0;
@@ -1016,6 +1022,8 @@ public:
     virtual std::any visitUnaryOperator(GQLParser::UnaryOperatorContext *context) = 0;
 
     virtual std::any visitFunctionCall(GQLParser::FunctionCallContext *context) = 0;
+
+    virtual std::any visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext *context) = 0;
 
     virtual std::any visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFunctionContext *context) = 0;
 

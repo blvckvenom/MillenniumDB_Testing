@@ -1,5 +1,7 @@
 #include "extract_exprs.h"
 
+#include "query/parser/op/gql/op_call_procedure.h"
+
 namespace GQL {
 
 void ExtractExprs::visit(OpQueryStatements& op_statements)
@@ -150,6 +152,11 @@ void ExtractExprs::visit(OpUnitTable& op)
 void ExtractExprs::visit(OpEmpty& op)
 {
     tmp = std::make_unique<OpEmpty>(op);
+}
+
+void ExtractExprs::visit(OpCallProcedure& op)
+{
+    tmp = op.clone();
 }
 
 } // namespace GQL

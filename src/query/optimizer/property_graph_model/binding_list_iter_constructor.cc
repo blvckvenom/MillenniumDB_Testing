@@ -9,6 +9,8 @@
 #include "query/executor/binding_iter/expr_evaluator.h"
 #include "query/executor/binding_iter/filter.h"
 #include "query/executor/binding_iter/gql/assign_properties.h"
+#include "query/executor/binding_iter/gql/call_procedure.h"
+#include "query/parser/op/gql/op_call_procedure.h"
 #include "query/executor/binding_iter/gql/check_repeated_variable.h"
 #include "query/executor/binding_iter/gql/extend_right.h"
 #include "query/executor/binding_iter/gql/linear_pattern_path.h"
@@ -573,6 +575,34 @@ void PathBindingIterConstructor::visit(OpUnitTable&)
 void PathBindingIterConstructor::visit(OpEmpty&)
 {
     tmp_iter = std::make_unique<EmptyBindingIter>();
+}
+
+void PathBindingIterConstructor::visit(OpCallProcedure& op_call)
+{
+    // Convert Expr arguments to BindingExpr arguments
+    std::vector<std::unique_ptr<BindingExpr>> binding_arguments;
+    binding_arguments.reserve(op_call.arguments.size());
+
+    ExprToBindingExpr expr_converter(this, {}, false);
+    for (size_t i = 0; i < op_call.arguments.size(); i++) {
+        op_call.arguments[i]->accept_visitor(expr_converter);
+        binding_arguments.push_back(std::move(expr_converter.tmp));
+    }
+
+    // Convert YieldItems to pairs of (field_name, var_id)
+    std::vector<std::pair<std::string, VarId>> yield_pairs;
+    yield_pairs.reserve(op_call.yield_items.size());
+    for (const auto& item : op_call.yield_items) {
+        yield_pairs.emplace_back(item.field_name, item.var);
+    }
+
+    // Create CallProcedure binding iterator
+    tmp_iter = std::make_unique<CallProcedure>(
+        op_call.procedure,
+        std::move(binding_arguments),
+        std::move(yield_pairs),
+        op_call.optional
+    );
 }
 
 std::unique_ptr<BindingIter>
