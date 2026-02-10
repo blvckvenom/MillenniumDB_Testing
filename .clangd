@@ -5,4 +5,38 @@ InlayHints:
   DeducedTypes: Yes
 
 CompileFlags:
-  CompilationDatabase: build/Release/
+  # Use GNN-Debug build which includes LibTorch paths
+  CompilationDatabase: build/GNN-Debug/
+
+  # Fallback flags for files not in compile_commands.json (e.g., new headers)
+  Add:
+    - "-xc++"
+    - "-std=c++17"
+    # System includes (GCC 13)
+    - "-isystem/usr/include/c++/13"
+    - "-isystem/usr/include/x86_64-linux-gnu/c++/13"
+    - "-isystem/usr/include/c++/13/backward"
+    - "-isystem/usr/lib/gcc/x86_64-linux-gnu/13/include"
+    - "-isystem/usr/local/include"
+    - "-isystem/usr/include/x86_64-linux-gnu"
+    - "-isystem/usr/include"
+    # Project includes
+    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/src"
+    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/src/gnn"
+    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/libtorch/include"
+    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/libtorch/include/torch/csrc/api/include"
+    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/boost_1_82/include"
+    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/antlr4-runtime-4.13.1/src"
+    - "-DGNN_CUDA_ENABLED"
+    - "-D_GLIBCXX_USE_CXX11_ABI=1"
+
+  # Remove problematic flags that clangd doesn't understand
+  Remove:
+    - "-fno-operator-names"
+    - "-march=native"
+    - "-funroll-loops"
+
+Diagnostics:
+  UnusedIncludes: None
+  ClangTidy:
+    Remove: ["*"]

@@ -1471,11 +1471,11 @@ Any QueryVisitor::visitComparisonExprIs(MQL_Parser::ComparisonExprIsContext* ctx
         );
     }
 
-    bool not = ctx->K_NOT() != nullptr;
-    if (not ) {
+    bool is_negated = ctx->K_NOT() != nullptr;
+    if (is_negated) {
         propertyTypeBitmap = ~propertyTypeBitmap;
     }
-    current_expr = std::make_unique<ExprIs>(not, std::move(current_expr), type, propertyTypeBitmap);
+    current_expr = std::make_unique<ExprIs>(is_negated, std::move(current_expr), type, propertyTypeBitmap);
 
     return 0;
 }
