@@ -3,6 +3,7 @@
 #include <type_traits>
 
 #include "graph_models/gql/conversions.h"
+#include "misc/logger.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_query_context.h"
 #include "query/procedure/procedure_catalog.h"
@@ -90,17 +91,13 @@ GQLModel::GQLModel() :
 
 BPlusTree<3>& GQLModel::get_from_to_edge() {
     auto& ctx = get_query_ctx();
-    std::cerr << "[GQLModel] get_from_to_edge() called, is_using_projection=" << ctx.is_using_projection()
-              << ", active_projection='" << ctx.active_projection << "'" << std::endl;
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
-            std::cerr << "[GQLModel] ERROR: Projection context not loaded!" << std::endl;
+            logger.error() << "Projection context not loaded in get_from_to_edge()";
             throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
         }
-        std::cerr << "[GQLModel] Using projection index" << std::endl;
         return *ctx.projection_ctx->from_to_edge_index;
     }
-    std::cerr << "[GQLModel] Using main graph index" << std::endl;
     return *from_to_edge;
 }
 
@@ -286,7 +283,6 @@ BPlusTree<3>& GQLModel::get_key_value_edge() {
 BPlusTree<3>& GQLModel::get_edge_from_to() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        std::cerr << "[GQLModel] get_edge_from_to() called for projection, using edge_from_to_index" << std::endl;
         if (!ctx.projection_ctx || !ctx.projection_ctx->edge_from_to_index) {
             throw std::runtime_error(
                 "Edge-first index not available for projection '" + ctx.active_projection + "'.\n\n"
@@ -329,7 +325,6 @@ BPlusTree<2>& GQLModel::get_equal_u_edge() {
 BPlusTree<3>& GQLModel::get_n1_n2_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        std::cerr << "[GQLModel] get_n1_n2_edge() called for projection, returning from_to_edge_index" << std::endl;
         if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
             throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
         }
@@ -343,10 +338,9 @@ BPlusTree<3>& GQLModel::get_n1_n2_edge() {
 BPlusTree<3>& GQLModel::get_edge_n1_n2() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        std::cerr << "[GQLModel] get_edge_n1_n2() called for projection, using edge_n1_n2_index" << std::endl;
         if (!ctx.projection_ctx || !ctx.projection_ctx->edge_n1_n2_index) {
             // Fallback to from_to_edge_index for older projections without edge_n1_n2_index
-            std::cerr << "[GQLModel] edge_n1_n2_index not available, falling back to from_to_edge_index" << std::endl;
+            logger.debug() << "edge_n1_n2_index not available, falling back to from_to_edge_index";
             if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
                 throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
             }
