@@ -119,7 +119,7 @@ CLI Usage:
 
 void print_projection_help()
 {
-    cout << "\nProjection Management Usage:"
+    std::cout << "\nProjection Management Usage:"
             "\n  mdb list-projections <db_folder>"
             "\n      List all projections in a GQL database"
             "\n"

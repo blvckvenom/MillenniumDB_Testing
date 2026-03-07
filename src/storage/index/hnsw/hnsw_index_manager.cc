@@ -204,7 +204,7 @@ bool HNSWIndexManager::drop_hnsw_index(const std::string& name)
             fs::remove_all(absolute_index_path);
         }
     } catch (const std::exception& e) {
-        logger(Category::Error) << "Failed to remove HNSW index directory: " << e.what();
+        logger.error() << "Failed to remove HNSW index directory: " << e.what();
     }
 
     has_changes_ = true;

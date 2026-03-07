@@ -2,8 +2,10 @@
 
 #include <filesystem>
 
+#ifdef ENABLE_GNN
 #include "gnn/storage/file_gnn_tensor_store.h"
 #include "gnn/storage/gnn_dtype.h"
+#endif
 #include "graph_models/common/conversions.h"
 #include "graph_models/inliner.h"
 #include "import/import_helper.h"
@@ -1016,11 +1018,13 @@ void OnDiskImport::start_import(MDBIstream& in)
     // keeping it alive during NPY load caused std::bad_alloc on large datasets.
     external_helper.reset();
 
+#ifdef ENABLE_GNN
     // Import node embeddings from NPY file if provided
     if (!tensor_file_.empty()) {
         import_node_tensors();
         print_duration("Import node tensors", start);
     }
+#endif
 
     catalog.print(std::cout);
 
@@ -1105,6 +1109,7 @@ inline void OnDiskImport::process_pending(
     pending_vector->skip_indexing();
 }
 
+#ifdef ENABLE_GNN
 void OnDiskImport::import_node_tensors() {
     std::cout << "Loading node embeddings from: " << tensor_file_ << "\n";
 
@@ -1253,3 +1258,4 @@ void OnDiskImport::import_node_tensors() {
 
     std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim << "\n";
 }
+#endif // ENABLE_GNN

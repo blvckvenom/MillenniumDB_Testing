@@ -224,8 +224,10 @@ private:
     // sets edge_id and push into undirected_edges or directed_edges
     void save_edge();
 
+#ifdef ENABLE_GNN
     // Import node embeddings from NPY file into GNN tensor store
     void import_node_tensors();
+#endif
 
     // processes a pending file by iterations, until no more pending tuples are available
     // the size of the tuples and a resolve+save function must be provided.
