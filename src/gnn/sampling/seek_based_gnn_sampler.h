@@ -8,7 +8,8 @@
 
 #include "graph_models/object_id.h"
 #include "gnn/projection/topology_accessor.h"
-#include "gnn/sampling/leapfrog_gnn_sampler.h"  // For BatchNeighbors
+#include "gnn/sampling/batch_neighbors.h"
+#include "gnn/sampling/leapfrog_gnn_sampler.h"
 
 namespace GQL {
 class ProjectionStorage;

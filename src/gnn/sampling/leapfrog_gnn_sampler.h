@@ -7,37 +7,13 @@
 
 #include "graph_models/object_id.h"
 #include "gnn/projection/topology_accessor.h"
+#include "gnn/sampling/batch_neighbors.h"
 
 namespace GQL {
 class ProjectionStorage;
 }
 
 namespace mdb::gnn {
-
-/**
- * @brief Result of batch neighbor sampling.
- *
- * Maps each seed node to its sampled neighbors and edge IDs.
- */
-struct BatchNeighbors {
-    /// Map: node_id -> vector of (neighbor_id, edge_id) pairs
-    std::unordered_map<uint64_t, std::vector<std::pair<ObjectId, ObjectId>>> neighbors;
-
-    /// Total neighbors collected across all seeds
-    size_t total_neighbors() const {
-        size_t count = 0;
-        for (const auto& [_, vec] : neighbors) {
-            count += vec.size();
-        }
-        return count;
-    }
-
-    /// Check if a node has any neighbors
-    bool has_neighbors(uint64_t node_id) const {
-        auto it = neighbors.find(node_id);
-        return it != neighbors.end() && !it->second.empty();
-    }
-};
 
 /**
  * @brief Optimized batch neighbor sampler using coordinated B+Tree iteration.

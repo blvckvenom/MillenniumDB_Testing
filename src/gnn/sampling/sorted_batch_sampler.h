@@ -7,58 +7,13 @@
 
 #include "graph_models/object_id.h"
 #include "gnn/projection/topology_accessor.h"
+#include "gnn/sampling/batch_neighbors.h"
 
 namespace GQL {
 class ProjectionStorage;
 }
 
 namespace mdb::gnn {
-
-/**
- * @brief Result of batch neighbor collection.
- *
- * Maps each source node to its sampled neighbors with edge IDs.
- */
-struct BatchNeighbors {
-    /// node_id -> [(neighbor_id, edge_id), ...]
-    std::unordered_map<uint64_t, std::vector<std::pair<ObjectId, ObjectId>>> neighbors;
-
-    /**
-     * @brief Get neighbors for a specific node.
-     * @return Empty vector if node not found
-     */
-    const std::vector<std::pair<ObjectId, ObjectId>>& get(ObjectId node_id) const {
-        static const std::vector<std::pair<ObjectId, ObjectId>> empty;
-        auto it = neighbors.find(node_id.id);
-        return it != neighbors.end() ? it->second : empty;
-    }
-
-    /**
-     * @brief Check if node has any neighbors.
-     */
-    bool has_neighbors(ObjectId node_id) const {
-        auto it = neighbors.find(node_id.id);
-        return it != neighbors.end() && !it->second.empty();
-    }
-
-    /**
-     * @brief Total number of nodes with neighbors.
-     */
-    size_t num_nodes() const {
-        return neighbors.size();
-    }
-
-    /**
-     * @brief Total number of edges across all nodes.
-     */
-    size_t total_edges() const {
-        size_t count = 0;
-        for (const auto& [_, edges] : neighbors) {
-            count += edges.size();
-        }
-        return count;
-    }
-};
 
 /**
  * @brief Optimized batch neighbor sampler using sorted traversal.
