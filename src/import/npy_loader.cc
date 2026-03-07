@@ -1,6 +1,7 @@
 #include "npy_loader.h"
 
 #include <fstream>
+#include <iostream>
 #include <npy.hpp>
 
 namespace Import {
@@ -16,7 +17,7 @@ std::vector<float> NpyLoader::load_float32(
     try {
         npy::LoadArrayFromNumpy(path, shape, fortran_order, data);
     } catch (const std::exception& e) {
-        // Return empty vector on error
+        std::cerr << "NpyLoader::load_float32 error for '" << path << "': " << e.what() << "\n";
         return {};
     }
 
@@ -43,7 +44,7 @@ std::vector<double> NpyLoader::load_float64(
     try {
         npy::LoadArrayFromNumpy(path, shape, fortran_order, data);
     } catch (const std::exception& e) {
-        // Return empty vector on error
+        std::cerr << "NpyLoader::load_float64 error for '" << path << "': " << e.what() << "\n";
         return {};
     }
 
@@ -57,6 +58,24 @@ std::vector<double> NpyLoader::load_float64(
     metadata_out.fortran_order = fortran_order;
 
     return data;
+}
+
+int NpyLoader::get_dtype_itemsize(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return 0;
+    }
+    try {
+        std::string header_s = npy::read_header(file);
+        npy::header_t header = npy::parse_header(header_s);
+        if (header.dtype.kind == 'f' && (header.dtype.itemsize == 4 || header.dtype.itemsize == 8)) {
+            return header.dtype.itemsize;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "NpyLoader::get_dtype_itemsize error for '" << path << "': " << e.what() << "\n";
+        return 0;
+    }
 }
 
 bool NpyLoader::validate(const std::string& path, std::string& error_out) {

@@ -73,6 +73,17 @@ public:
     static bool validate(const std::string& path, std::string& error_out);
 
     /**
+     * @brief Read dtype from NPY header without loading data.
+     *
+     * Returns the itemsize: 4 for float32, 8 for float64, 0 on error.
+     * This allows choosing the correct load function without trial-and-error.
+     *
+     * @param path Path to .npy file
+     * @return Itemsize (4 or 8), or 0 on error
+     */
+    static int get_dtype_itemsize(const std::string& path);
+
+    /**
      * @brief Get file size in bytes.
      *
      * @param path Path to file

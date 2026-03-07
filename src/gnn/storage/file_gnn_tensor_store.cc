@@ -129,23 +129,26 @@ bool FileGnnTensorStore::store(const std::string& key,
     size_t offset = 0;
 
     if (shard_sizes_.empty()) {
-        // First shard
         shard_sizes_.push_back(0);
     }
 
-    // Find shard with space
+    // Find existing shard with enough space
+    bool found = false;
     for (size_t i = 0; i < shard_sizes_.size(); ++i) {
         if (shard_sizes_[i] + aligned_size <= max_shard_size_) {
             shard_id = static_cast<uint32_t>(i);
             offset = shard_sizes_[i];
+            found = true;
             break;
         }
-        if (i == shard_sizes_.size() - 1) {
-            // Need new shard
-            shard_sizes_.push_back(0);
-            shard_id = static_cast<uint32_t>(shard_sizes_.size() - 1);
-            offset = 0;
-        }
+    }
+
+    if (!found) {
+        // No existing shard has space — create a new one.
+        // If aligned_size > max_shard_size_, the tensor gets its own oversized shard.
+        shard_sizes_.push_back(0);
+        shard_id = static_cast<uint32_t>(shard_sizes_.size() - 1);
+        offset = 0;
     }
 
     // Write data to shard file
@@ -347,17 +350,20 @@ size_t FileGnnTensorStore::compact() {
         uint32_t new_shard_id = 0;
         size_t new_offset = 0;
 
+        bool compact_found = false;
         for (size_t i = 0; i < new_shard_sizes.size(); ++i) {
             if (new_shard_sizes[i] + aligned_size <= max_shard_size_) {
                 new_shard_id = static_cast<uint32_t>(i);
                 new_offset = new_shard_sizes[i];
+                compact_found = true;
                 break;
             }
-            if (i == new_shard_sizes.size() - 1) {
-                new_shard_sizes.push_back(0);
-                new_shard_id = static_cast<uint32_t>(new_shard_sizes.size() - 1);
-                new_offset = 0;
-            }
+        }
+
+        if (!compact_found) {
+            new_shard_sizes.push_back(0);
+            new_shard_id = static_cast<uint32_t>(new_shard_sizes.size() - 1);
+            new_offset = 0;
         }
 
         // Write to new shard

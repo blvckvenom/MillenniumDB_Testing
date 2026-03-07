@@ -1011,6 +1011,11 @@ void OnDiskImport::start_import(MDBIstream& in)
 
     print_duration("Write B+tree indexes", start);
 
+    // Free the external_helper buffer (~4GB default) before loading NPY tensors.
+    // The buffer was only needed for string/tensor hashing and B+tree creation;
+    // keeping it alive during NPY load caused std::bad_alloc on large datasets.
+    external_helper.reset();
+
     // Import node embeddings from NPY file if provided
     if (!tensor_file_.empty()) {
         import_node_tensors();
@@ -1109,19 +1114,29 @@ void OnDiskImport::import_node_tensors() {
         FATAL_ERROR("Invalid tensor file: ", validation_error);
     }
 
-    // Load the tensor data
-    NpyMetadata metadata;
-    auto data = NpyLoader::load_float32(tensor_file_, metadata);
+    // BUG #3 FIX: Read dtype from header instead of trial-and-error
+    int dtype_itemsize = NpyLoader::get_dtype_itemsize(tensor_file_);
+    if (dtype_itemsize == 0) {
+        FATAL_ERROR("Cannot determine dtype of tensor file: ", tensor_file_,
+                    ". Expected float32 or float64.");
+    }
+    bool is_float64 = (dtype_itemsize == 8);
 
-    // If float32 load failed, try float64
-    bool is_float64 = false;
+    // Load tensor data using the correct dtype directly
+    NpyMetadata metadata;
+    std::vector<float> data;
     std::vector<double> data_f64;
-    if (data.empty()) {
+
+    if (is_float64) {
         data_f64 = NpyLoader::load_float64(tensor_file_, metadata);
         if (data_f64.empty()) {
-            FATAL_ERROR("Failed to load tensor file: ", tensor_file_);
+            FATAL_ERROR("Failed to load float64 tensor file: ", tensor_file_);
         }
-        is_float64 = true;
+    } else {
+        data = NpyLoader::load_float32(tensor_file_, metadata);
+        if (data.empty()) {
+            FATAL_ERROR("Failed to load float32 tensor file: ", tensor_file_);
+        }
     }
 
     // Validate dimensions
@@ -1132,6 +1147,15 @@ void OnDiskImport::import_node_tensors() {
 
     uint64_t num_nodes = metadata.shape[0];
     uint64_t feature_dim = metadata.shape[1];
+
+    // BUG #5 FIX: Validate shape matches actual data size
+    uint64_t expected_size = num_nodes * feature_dim;
+    uint64_t actual_size = is_float64 ? data_f64.size() : data.size();
+    if (expected_size != actual_size) {
+        FATAL_ERROR("Tensor shape mismatch: shape says ", num_nodes, " x ", feature_dim,
+                    " = ", expected_size, " elements, but data has ", actual_size,
+                    " elements. File may be truncated or corrupted.");
+    }
 
     // Validate node count matches
     if (num_nodes != catalog.nodes_count) {
@@ -1157,11 +1181,11 @@ void OnDiskImport::import_node_tensors() {
             std::vector<double> c_order_data(data_f64.size());
             for (uint64_t row = 0; row < num_nodes; ++row) {
                 for (uint64_t col = 0; col < feature_dim; ++col) {
-                    // Fortran: col * num_nodes + row
-                    // C: row * feature_dim + col
                     c_order_data[row * feature_dim + col] = data_f64[col * num_nodes + row];
                 }
             }
+            // BUG #1 FIX: Free original immediately before assigning new data
+            { std::vector<double>().swap(data_f64); }
             data_f64 = std::move(c_order_data);
         } else {
             std::vector<float> c_order_data(data.size());
@@ -1170,6 +1194,8 @@ void OnDiskImport::import_node_tensors() {
                     c_order_data[row * feature_dim + col] = data[col * num_nodes + row];
                 }
             }
+            // BUG #1 FIX: Free original immediately before assigning new data
+            { std::vector<float>().swap(data); }
             data = std::move(c_order_data);
         }
     }
@@ -1178,8 +1204,16 @@ void OnDiskImport::import_node_tensors() {
     auto gnn_path = db_folder + "/gnn_tensors";
     std::filesystem::create_directories(gnn_path);
 
-    // Initialize FileGnnTensorStore
-    mdb::gnn::FileGnnTensorStore tensor_store(gnn_path);
+    // Calculate tensor byte size to set appropriate shard size
+    size_t tensor_byte_size = num_nodes * feature_dim * (is_float64 ? sizeof(double) : sizeof(float));
+    // Ensure shard can fit the entire tensor (with alignment margin)
+    size_t shard_size = std::max(
+        mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE,
+        tensor_byte_size + 4096
+    );
+
+    // Initialize FileGnnTensorStore with shard size >= tensor size
+    mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, shard_size);
 
     // Store the embedding matrix
     std::vector<int64_t> shape = {
@@ -1195,6 +1229,7 @@ void OnDiskImport::import_node_tensors() {
             shape,
             mdb::gnn::GnnDtype::FLOAT64
         );
+        { std::vector<double>().swap(data_f64); }
     } else {
         success = tensor_store.store(
             "node_features",
@@ -1202,6 +1237,7 @@ void OnDiskImport::import_node_tensors() {
             shape,
             mdb::gnn::GnnDtype::FLOAT32
         );
+        { std::vector<float>().swap(data); }
     }
 
     if (!success) {
