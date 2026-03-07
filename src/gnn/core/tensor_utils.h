@@ -24,48 +24,9 @@
 #include <torch/torch.h>
 
 #include "cuda_context.h"
+#include "gnn/common/feature_matrix.h"
 
 namespace mdb::gnn {
-
-// ============================================================================
-// Feature Matrix Structure
-// ============================================================================
-
-/**
- * @brief Feature matrix with node ID mapping.
- *
- * Holds a tensor of node features along with mappings between
- * ObjectIds and row indices for efficient lookup.
- */
-struct FeatureMatrix {
-    torch::Tensor features;                          ///< [num_nodes, feature_dim]
-    std::vector<uint64_t> node_ids;                  ///< ObjectId values for each row
-    std::unordered_map<uint64_t, int64_t> id_to_row; ///< Reverse mapping
-
-    /**
-     * @brief Get row index for a node ID.
-     * @param node_id The ObjectId to look up
-     * @return Row index, or -1 if not found
-     */
-    int64_t get_row(uint64_t node_id) const {
-        auto it = id_to_row.find(node_id);
-        return (it != id_to_row.end()) ? it->second : -1;
-    }
-
-    /**
-     * @brief Get number of nodes in the matrix.
-     */
-    int64_t num_nodes() const {
-        return features.defined() ? features.size(0) : 0;
-    }
-
-    /**
-     * @brief Get feature dimension.
-     */
-    int64_t feature_dim() const {
-        return (features.defined() && features.dim() > 1) ? features.size(1) : 0;
-    }
-};
 
 // ============================================================================
 // Sparse Adjacency Structure
@@ -102,7 +63,7 @@ struct SparseAdjacency {
  * @return FeatureMatrix with features and ID mappings
  */
 FeatureMatrix build_feature_matrix(
-    const std::vector<uint64_t>& node_ids,
+    const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& features,
     torch::Device device = torch::kCPU
 );
@@ -115,7 +76,7 @@ FeatureMatrix build_feature_matrix(
  * @return FeatureMatrix with [N, D] features tensor
  */
 FeatureMatrix stack_features(
-    const std::vector<uint64_t>& node_ids,
+    const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& tensors
 );
 

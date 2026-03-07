@@ -10,7 +10,7 @@ namespace mdb::gnn {
 // ============================================================================
 
 FeatureMatrix build_feature_matrix(
-    const std::vector<uint64_t>& node_ids,
+    const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& features,
     torch::Device device
 ) {
@@ -54,7 +54,7 @@ FeatureMatrix build_feature_matrix(
     size_t bytes_per_row = static_cast<size_t>(feature_dim) * output.element_size();
 
     for (int64_t i = 0; i < num_nodes; ++i) {
-        id_to_row[node_ids[static_cast<size_t>(i)]] = i;
+        id_to_row[node_ids[static_cast<size_t>(i)].id] = i;
 
         // Ensure feature is contiguous and on CPU
         torch::Tensor feature = features[static_cast<size_t>(i)].contiguous();
@@ -76,13 +76,13 @@ FeatureMatrix build_feature_matrix(
 
     return FeatureMatrix{
         std::move(output),
-        std::vector<uint64_t>(node_ids),
+        std::vector<ObjectId>(node_ids),
         std::move(id_to_row)
     };
 }
 
 FeatureMatrix stack_features(
-    const std::vector<uint64_t>& node_ids,
+    const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& tensors
 ) {
     if (tensors.empty()) {
@@ -105,12 +105,12 @@ FeatureMatrix stack_features(
     // Build ID to row mapping
     std::unordered_map<uint64_t, int64_t> id_to_row;
     for (size_t i = 0; i < node_ids.size(); ++i) {
-        id_to_row[node_ids[i]] = static_cast<int64_t>(i);
+        id_to_row[node_ids[i].id] = static_cast<int64_t>(i);
     }
 
     return FeatureMatrix{
         std::move(stacked),
-        std::vector<uint64_t>(node_ids),
+        std::vector<ObjectId>(node_ids),
         std::move(id_to_row)
     };
 }
