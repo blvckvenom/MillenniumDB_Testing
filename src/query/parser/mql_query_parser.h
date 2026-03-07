@@ -9,6 +9,7 @@
 #include "query/parser/op/mql/op.h"
 #include "query/rewriter/mql/op/check_var_names.h"
 #include "query/rewriter/mql/op/evaluate_constants.h"
+#include "query/rewriter/mql/op/push_where_properties.h"
 #include "query/rewriter/mql/op/replace_parameters.h"
 
 namespace MQL {
@@ -53,7 +54,7 @@ public:
 
         auto res = std::move(visitor.current_op);
 
-        logger(Category::LogicalPlan) << "Initial logical plan:\n" << *res;
+        logger.debug() << "Initial logical plan:\n" << *res;
 
         if (!input_parameters.empty()) {
             std::map<VarId, ObjectId> query_parameters;
@@ -79,11 +80,10 @@ public:
         // OptimizeOptionalTree optimize_optional_tree;
         // res->accept_visitor(optimize_optional_tree);
 
-        // TODO: push negation inside, simplify constant expressions
-        // PushWhere push_where;
-        // res->accept_visitor(push_where);
+        PushWhereProperties push_where_properties;
+        res->accept_visitor(push_where_properties);
 
-        logger(Category::LogicalPlan) << *res;
+        logger.debug() << *res;
 
         return res;
     }

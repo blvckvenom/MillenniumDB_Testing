@@ -3,50 +3,26 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
 
-enum class Category {
-    Query,
-    LogicalPlan,
-    PhysicalPlan,
-    ExecutionStats,
-    Error,
-    Info,
-    Debug,
-    InvalidCategory,
-};
-
 struct CategoryConfig {
     std::ostream* os = &std::cout;
     bool enabled = true;
-    bool print_time = false;
-    bool print_category = false;
-    unsigned verbosity = 0;
+    std::string category_name;
 };
 
 class OStream {
     friend class Logger;
 
 private:
-    std::mutex* mutex;
-    Category category;
     CategoryConfig* config;
     std::stringstream stream;
 
-    OStream() :
-        mutex(nullptr),
-        category(Category::InvalidCategory),
-        config(nullptr)
-    { }
+    OStream();
 
-    OStream(std::mutex& mutex, Category category, CategoryConfig& config) :
-        mutex(&mutex),
-        category(category),
-        config(&config)
-    { }
+    OStream(CategoryConfig& config);
 
 public:
     ~OStream();
@@ -74,18 +50,83 @@ static_assert(!std::is_copy_constructible<OStream>());
 static_assert(!std::is_copy_assignable<OStream>());
 
 class Logger {
-private:
-    std::mutex mutex;
-
 public:
-    std::map<Category, CategoryConfig> categories;
-    std::map<std::string, std::ofstream> ofstreams;
+    CategoryConfig debug_config;
+    CategoryConfig error_config;
+    CategoryConfig info_config;
+
+    // not used by default, can be enabled by options
+    std::ofstream out_file;
+
+    static inline bool print_time = false;
+    static inline bool print_category = false;
+    static inline std::mutex mutex;
 
     Logger();
 
-    void log(Category category, std::function<void(std::ostream&)>, unsigned verbosity = 0);
+    void set_output_file(const std::string& file_path);
 
-    OStream operator()(Category category, unsigned verbosity = 0);
+    void set_print_time(bool b)
+    {
+        print_time = b;
+    }
+
+    void set_print_category(bool b)
+    {
+        print_category = b;
+    }
+
+    void debug(std::function<void(std::ostream&)> f)
+    {
+        return get(debug_config, f);
+    }
+
+    void error(std::function<void(std::ostream&)> f)
+    {
+        return get(error_config, f);
+    }
+
+    void info(std::function<void(std::ostream&)> f)
+    {
+        return get(info_config, f);
+    }
+
+    void enable_debug(bool b)
+    {
+        debug_config.enabled = b;
+    }
+
+    void enable_error(bool b)
+    {
+        error_config.enabled = b;
+    }
+
+    void enable_info(bool b)
+    {
+        info_config.enabled = b;
+    }
+
+    OStream debug()
+    {
+        return get(debug_config);
+    }
+
+    OStream error()
+    {
+        return get(error_config);
+    }
+
+    OStream info()
+    {
+        return get(info_config);
+    }
+
+    static void write_time(std::ostream& os);
+
+private:
+    OStream get(CategoryConfig& config);
+
+    void get(CategoryConfig& config, std::function<void(std::ostream&)> print_function);
 };
 
 inline Logger logger;

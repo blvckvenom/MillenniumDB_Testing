@@ -121,9 +121,13 @@ inline void create_default_params(const std::string& db_folder)
       << "# uncomment to set a hard limit in every query\n"
       << "# limit =\n"
       << "\n"
-      << "# if admin_user is enabled, updates require authentication\n"
-      << "# admin_user =\n"
-      << "# admin_password =\n"
+      << "# if admin-user is enabled, updates require authentication\n"
+      << "# admin-user =\n"
+      << "# admin-password =\n"
+      << "\n"
+      << "# if ssl-cert and ssl-key are specified https and wss will be enabled\n"
+      << "# ssl-cert = ./path/to/cert.pem\n"
+      << "# ssl-key = ./path/to/privkey.pem\n"
       << "\n"
       << "# buffer sizes:\n"
       << "strings-static = " << strings_static_buffer_str << "\n"
@@ -131,6 +135,14 @@ inline void create_default_params(const std::string& db_folder)
       << "private-buffer = " << private_pages_buffer_str << "\n"
       << "versioned-buffer = " << versioned_pages_buffer_str << "\n"
       << "tensors-static = " << tensors_static_buffer_str << "\n"
-      << "tensors-dynamic = " << tensors_dynamic_buffer_str << "\n";
+      << "tensors-dynamic = " << tensors_dynamic_buffer_str << "\n"
+      << "\n"
+      << "# logging:\n"
+      << "# log-path = ./server-log\n"
+      << "# log-timestamp = false\n"
+      << "# log-category = false\n"
+      << "# log-debug = false\n"
+      << "# log-error = true\n"
+      << "# log-info = true\n";
 }
 }} // namespace Import::GQL

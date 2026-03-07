@@ -88,10 +88,9 @@ struct SearchState {
         return SearchState(automaton_state, node_id, previous, inverse_direction, type_id);
     }
 
-    void print(
-        std::ostream& os,
-        std::function<void(std::ostream& os, ObjectId)> print_node,
-        std::function<void(std::ostream& os, ObjectId, bool)> print_edge,
+    void for_each(
+        std::function<void(ObjectId)> node_func,
+        std::function<void(ObjectId, bool)> edge_func,
         bool begin_at_left
     ) const;
 };
@@ -151,17 +150,52 @@ struct DirectionalSearchState {
         );
     }
 
-    void print(
-        std::ostream& os,
-        std::function<void(std::ostream& os, ObjectId)> print_node,
-        std::function<void(std::ostream& os, ObjectId, bool)> print_edge,
+    void for_each(
+        std::function<void(ObjectId)> node_func,
+        std::function<void(ObjectId, bool)> edge_func,
+        bool begin_at_left
+    ) const;
+};
+
+struct EndpointSearchState {
+    // The ID of the node the algorithm has reached
+    const ObjectId node_id;
+
+    // State of the automaton defining the path query
+    const uint32_t automaton_state;
+
+    EndpointSearchState(uint32_t automaton_state, ObjectId node_id) :
+        node_id(node_id),
+        automaton_state(automaton_state)
+    { }
+
+    // For ordered set
+    bool operator<(const EndpointSearchState& other) const
+    {
+        if (automaton_state < other.automaton_state) {
+            return true;
+        } else if (other.automaton_state < automaton_state) {
+            return false;
+        } else {
+            return node_id < other.node_id;
+        }
+    }
+
+    // For unordered set
+    bool operator==(const EndpointSearchState& other) const
+    {
+        return automaton_state == other.automaton_state && node_id == other.node_id;
+    }
+
+    void for_each(
+        std::function<void(ObjectId)> node_func,
+        std::function<void(ObjectId, bool)> edge_func,
         bool begin_at_left
     ) const;
 };
 
 }} // namespace Paths::Any
 
-// For unordered set
 template<>
 struct std::hash<Paths::Any::SearchState> {
     std::size_t operator()(const Paths::Any::SearchState& lhs) const
@@ -170,7 +204,14 @@ struct std::hash<Paths::Any::SearchState> {
     }
 };
 
-// For unordered set
+template<>
+struct std::hash<Paths::Any::EndpointSearchState> {
+    std::size_t operator()(const Paths::Any::EndpointSearchState& lhs) const
+    {
+        return lhs.automaton_state ^ lhs.node_id.id;
+    }
+};
+
 template<>
 struct std::hash<Paths::Any::DirectionalSearchState> {
     std::size_t operator()(const Paths::Any::DirectionalSearchState& lhs) const

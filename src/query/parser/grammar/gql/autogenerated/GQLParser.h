@@ -7989,6 +7989,19 @@ public:
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
   };
 
+  class  GqlInExpressionContext : public ExpressionPredicateContext {
+  public:
+    GqlInExpressionContext(ExpressionPredicateContext *ctx);
+
+    GQLParser::ExpressionAtomContext *lhs = nullptr;
+    GQLParser::ExpressionAtomContext *rhs = nullptr;
+    antlr4::tree::TerminalNode *IN();
+    std::vector<ExpressionAtomContext *> expressionAtom();
+    ExpressionAtomContext* expressionAtom(size_t i);
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+  };
+
   class  GqlExistsExpressionContext : public ExpressionPredicateContext {
   public:
     GqlExistsExpressionContext(ExpressionPredicateContext *ctx);

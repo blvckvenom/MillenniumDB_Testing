@@ -1,6 +1,5 @@
 #include "query_visitor.h"
 
-#include <iomanip>
 #include <list>
 #include <memory>
 
@@ -9,6 +8,7 @@
 #include "graph_models/gql/graph_reference.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/rdf_model/conversions.h"
+#include "macros/time.h"
 #include "query/parser/expr/gql/exprs.h"
 #include "query/parser/op/gql/ops.h"
 #include "query/parser/op/gql/op_call_procedure.h"
@@ -61,7 +61,8 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
     }
 
     // for now we visit only if there is a return statement
-    if (!ctx->primitiveResultStatement()) {
+    auto primitiveResultStatement = ctx->primitiveResultStatement();
+    if (!primitiveResultStatement) {
         current_op = std::make_unique<OpReturn>(
             std::make_unique<OpEmpty>(),
             std::vector<OpReturn::Item> {},
@@ -82,21 +83,27 @@ std::any QueryVisitor::visitLinearDataModifyingStatementBody(
     }
     current_op = std::make_unique<OpQueryStatements>(std::move(query_statements));
 
-    visit(ctx->primitiveResultStatement());
+    visit(primitiveResultStatement);
     return 0;
 }
 
 std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQueryStatementContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->matchStatement()) {
-        ctx->matchStatement()->accept(this);
-    } else if (ctx->letStatement()) {
-        ctx->letStatement()->accept(this);
-    } else if (ctx->orderByAndPageStatement()) {
-        ctx->orderByAndPageStatement()->accept(this);
-    } else if (ctx->filterStatement()) {
-        ctx->filterStatement()->accept(this);
+
+    auto matchStatement = ctx->matchStatement();
+    auto letStatement = ctx->letStatement();
+    auto orderByAndPageStatement = ctx->orderByAndPageStatement();
+    auto filterStatement = ctx->filterStatement();
+
+    if (matchStatement) {
+        matchStatement->accept(this);
+    } else if (letStatement) {
+        letStatement->accept(this);
+    } else if (orderByAndPageStatement) {
+        orderByAndPageStatement->accept(this);
+    } else if (filterStatement) {
+        filterStatement->accept(this);
         current_op = std::make_unique<OpFilter>(std::move(filter_items));
     } else if (ctx->callQueryStatement()) {
         ctx->callQueryStatement()->accept(this);
@@ -184,9 +191,11 @@ std::any QueryVisitor::visitPrimitiveResultStatement(GQLParser::PrimitiveResultS
     LOG_VISITOR
     visit(ctx->returnStatement());
 
-    if (ctx->orderByAndPageStatement()) {
+    auto orderByAndPageStatement = ctx->orderByAndPageStatement();
+
+    if (orderByAndPageStatement) {
         auto op_return = std::move(current_op);
-        visit(ctx->orderByAndPageStatement());
+        visit(orderByAndPageStatement);
 
         // we set the op order by as separate child of the op return
         auto op_return_ptr = dynamic_cast<OpReturn*>(op_return.get());
@@ -208,12 +217,14 @@ std::any QueryVisitor::visitReturnStatementBody(GQLParser::ReturnStatementBodyCo
     }
 
     distinct = false;
-    if (ctx->setQuantifier()) {
-        if (ctx->setQuantifier()->DISTINCT()) {
+    auto setQuantifier = ctx->setQuantifier();
+    if (setQuantifier) {
+        if (setQuantifier->DISTINCT()) {
             distinct = true;
         }
     }
 
+    auto returnItemList = ctx->returnItemList();
     if (ctx->ASTERISK()) {
         if (ctx->groupByClause()) {
             throw QuerySemanticException("A query that contains an asterisk (*) in the RETURN statement "
@@ -229,12 +240,13 @@ std::any QueryVisitor::visitReturnStatementBody(GQLParser::ReturnStatementBodyCo
                 return_items.emplace_back(std::make_unique<ExprVar>(var), std::nullopt);
             }
         }
-    } else if (ctx->returnItemList()) {
-        visit(ctx->returnItemList());
+    } else if (returnItemList) {
+        visit(returnItemList);
     }
 
-    if (ctx->groupByClause()) {
-        visit(ctx->groupByClause()->groupingElementList());
+    auto groupByClause = ctx->groupByClause();
+    if (groupByClause) {
+        visit(groupByClause->groupingElementList());
         if (!current_expr_list.empty()) {
             current_op = std::make_unique<OpGroupBy>(std::move(current_op), std::move(current_expr_list));
         }
@@ -250,10 +262,12 @@ std::any QueryVisitor::visitReturnItemList(GQLParser::ReturnItemListContext* ctx
     for (auto& item : ctx->returnItem()) {
         visit(item);
 
+        auto returnItemAlias = item->returnItemAlias();
+
         std::optional<VarId> alias = {};
-        if (item->returnItemAlias() != nullptr) {
+        if (returnItemAlias != nullptr) {
             // TODO: throw an exception if the alias is already defined
-            std::string alias_str = item->returnItemAlias()->identifier()->getText();
+            std::string alias_str = returnItemAlias->identifier()->getText();
             alias = get_query_ctx().get_or_create_var(alias_str);
         } else {
             std::string alias_str = item->expression()->getText();
@@ -341,8 +355,9 @@ std::any QueryVisitor::visitPathPattern(GQLParser::PathPatternContext* ctx)
 {
     LOG_VISITOR
 
-    if (ctx->pathPatternPrefix()) {
-        visit(ctx->pathPatternPrefix());
+    auto pathPatternPrefix = ctx->pathPatternPrefix();
+    if (pathPatternPrefix) {
+        visit(pathPatternPrefix);
     } else {
         path_mode = PathMode();
     }
@@ -352,8 +367,9 @@ std::any QueryVisitor::visitPathPattern(GQLParser::PathPatternContext* ctx)
 
     visit(ctx->pathPatternExpression());
 
-    if (ctx->pathVariableDeclaration()) {
-        visit(ctx->pathVariableDeclaration());
+    auto pathVariableDeclaration = ctx->pathVariableDeclaration();
+    if (pathVariableDeclaration) {
+        visit(pathVariableDeclaration);
         current_op = std::make_unique<OpGraphPattern>(std::move(current_op), this_path_mode, *current_id);
     } else {
         current_op = std::make_unique<OpGraphPattern>(std::move(current_op), this_path_mode);
@@ -367,8 +383,9 @@ std::any QueryVisitor::visitParenthesizedPathPatternExpression(
 {
     LOG_VISITOR
     // if the subpath does not contain a path mode, we use the path mode of the parent gp
-    if (ctx->pathModePrefix()) {
-        visit(ctx->pathModePrefix());
+    auto pathModePrefix = ctx->pathModePrefix();
+    if (pathModePrefix) {
+        visit(pathModePrefix);
     }
 
     // we copy the path mode, so we can remember it even if a child pattern overrides it
@@ -376,15 +393,17 @@ std::any QueryVisitor::visitParenthesizedPathPatternExpression(
 
     visit(ctx->pathPatternExpression());
 
-    if (ctx->subpathVariableDeclaration()) {
-        visit(ctx->subpathVariableDeclaration());
+    auto subpathVariableDeclaration = ctx->subpathVariableDeclaration();
+    if (subpathVariableDeclaration) {
+        visit(subpathVariableDeclaration);
         current_op = std::make_unique<OpGraphPattern>(std::move(current_op), this_path_mode, *current_id);
     } else {
         current_op = std::make_unique<OpGraphPattern>(std::move(current_op), this_path_mode);
     }
 
-    if (ctx->parenthesizedPathPatternWhereClause()) {
-        visit(ctx->parenthesizedPathPatternWhereClause());
+    auto parenthesizedPathPatternWhereClause = ctx->parenthesizedPathPatternWhereClause();
+    if (parenthesizedPathPatternWhereClause) {
+        visit(parenthesizedPathPatternWhereClause);
         std::vector<std::unique_ptr<Expr>> expr_list;
         expr_list.push_back(std::move(current_expr));
         current_op = std::make_unique<OpWhere>(std::move(current_op), std::move(expr_list));
@@ -398,8 +417,9 @@ std::any QueryVisitor::visitAllPathSearch(GQLParser::AllPathSearchContext* ctx)
 {
     LOG_VISITOR
     path_mode.selector = PathMode::ALL;
-    if (ctx->pathMode()) {
-        visit(ctx->pathMode());
+    auto pathMode = ctx->pathMode();
+    if (pathMode) {
+        visit(pathMode);
     }
     return 0;
 }
@@ -409,12 +429,14 @@ std::any QueryVisitor::visitAnyPathSearch(GQLParser::AnyPathSearchContext* ctx)
     LOG_VISITOR
     path_mode.selector = PathMode::ANY;
 
-    if (ctx->numberOfPaths()) {
-        path_mode.path_count = std::stoull(ctx->numberOfPaths()->getText());
+    auto numberOfPaths = ctx->numberOfPaths();
+    if (numberOfPaths) {
+        path_mode.path_count = std::stoull(numberOfPaths->getText());
     }
 
-    if (ctx->pathMode()) {
-        visit(ctx->pathMode());
+    auto pathMode = ctx->pathMode();
+    if (pathMode) {
+        visit(pathMode);
     }
 
     return 0;
@@ -423,33 +445,48 @@ std::any QueryVisitor::visitAnyPathSearch(GQLParser::AnyPathSearchContext* ctx)
 std::any QueryVisitor::visitShortestPathSearch(GQLParser::ShortestPathSearchContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->allShortestPathSearch()) {
+
+    auto allShortestPathSearch = ctx->allShortestPathSearch();
+    auto anyShortestPathSearch = ctx->anyShortestPathSearch();
+    auto countedShortestPathSearch = ctx->countedShortestPathSearch();
+    auto countedShortestGroupSearch = ctx->countedShortestGroupSearch();
+
+    if (allShortestPathSearch) {
         path_mode.selector = PathMode::ALL_SHORTEST;
-        if (ctx->allShortestPathSearch()->pathMode()) {
-            visit(ctx->allShortestPathSearch()->pathMode());
+
+        auto allShortestPathSearch_pathMode = allShortestPathSearch->pathMode();
+        if (allShortestPathSearch_pathMode) {
+            visit(allShortestPathSearch_pathMode);
         }
 
-    } else if (ctx->anyShortestPathSearch()) {
+    } else if (anyShortestPathSearch) {
         path_mode.selector = PathMode::ANY_SHORTEST;
-        if (ctx->anyShortestPathSearch()->pathMode()) {
-            visit(ctx->anyShortestPathSearch()->pathMode());
+
+        auto anyShortestPathSearch_pathMode = anyShortestPathSearch->pathMode();
+        if (anyShortestPathSearch_pathMode) {
+            visit(anyShortestPathSearch_pathMode);
         }
 
-    } else if (ctx->countedShortestPathSearch()) {
+    } else if (countedShortestPathSearch) {
         path_mode.selector = PathMode::SHORTEST_PATH_COUNT;
-        if (ctx->countedShortestPathSearch()->pathMode()) {
-            visit(ctx->countedShortestPathSearch()->pathMode());
+
+        auto countedShortestPathSearch_pathMode = countedShortestPathSearch->pathMode();
+        if (countedShortestPathSearch_pathMode) {
+            visit(countedShortestPathSearch_pathMode);
         }
 
-        path_mode.path_count = std::stoull(ctx->countedShortestPathSearch()->numberOfPaths()->getText());
+        path_mode.path_count = std::stoull(countedShortestPathSearch->numberOfPaths()->getText());
 
-    } else if (ctx->countedShortestGroupSearch()) {
+    } else if (countedShortestGroupSearch) {
         path_mode.selector = PathMode::SHORTEST_GROUP_COUNT;
-        if (ctx->countedShortestGroupSearch()->pathMode()) {
-            visit(ctx->countedShortestGroupSearch()->pathMode());
+
+        auto countedShortestGroupSearch_pathMode = countedShortestGroupSearch->pathMode();
+
+        if (countedShortestGroupSearch_pathMode) {
+            visit(countedShortestGroupSearch_pathMode);
         }
 
-        path_mode.path_count = std::stoull(ctx->countedShortestGroupSearch()->numberOfGroups()->getText());
+        path_mode.path_count = std::stoull(countedShortestGroupSearch->numberOfGroups()->getText());
     }
 
     return 0;
@@ -656,29 +693,32 @@ std::any QueryVisitor::visitEdgePattern(GQLParser::EdgePatternContext* ctx)
 {
     LOG_VISITOR
     current_pattern = Edge;
-    if (ctx->fullEdgePattern()) {
-        visitChildren(ctx);
-        auto pattern_ctx = ctx->fullEdgePattern();
 
-        if (pattern_ctx->fullEdgePointingLeft()) {
+    auto fullEdgePattern = ctx->fullEdgePattern();
+    auto abbreviatedEdgePattern = ctx->abbreviatedEdgePattern();
+
+    if (fullEdgePattern) {
+        visitChildren(ctx);
+
+        if (fullEdgePattern->fullEdgePointingLeft()) {
             edge_type = EdgePointingLeft;
-        } else if (pattern_ctx->fullEdgeUndirected()) {
+        } else if (fullEdgePattern->fullEdgeUndirected()) {
             edge_type = EdgeUndirected;
-        } else if (pattern_ctx->fullEdgePointingRight()) {
+        } else if (fullEdgePattern->fullEdgePointingRight()) {
             edge_type = EdgePointingRight;
-        } else if (pattern_ctx->fullEdgeLeftOrUndirected()) {
+        } else if (fullEdgePattern->fullEdgeLeftOrUndirected()) {
             edge_type = EdgeLeftOrUndirected;
-        } else if (pattern_ctx->fullEdgeUndirectedOrRight()) {
+        } else if (fullEdgePattern->fullEdgeUndirectedOrRight()) {
             edge_type = EdgeUndirectedOrRight;
-        } else if (pattern_ctx->fullEdgeLeftOrRight()) {
+        } else if (fullEdgePattern->fullEdgeLeftOrRight()) {
             edge_type = EdgeLeftOrRight;
-        } else if (pattern_ctx->fullEdgeAnyDirection()) {
+        } else if (fullEdgePattern->fullEdgeAnyDirection()) {
             edge_type = EdgeAnyDirection;
         }
-    } else if (ctx->abbreviatedEdgePattern()) {
+    } else if (abbreviatedEdgePattern) {
         current_id = std::make_unique<VarId>(get_query_ctx().get_internal_var());
 
-        std::string pattern_text = ctx->abbreviatedEdgePattern()->getText();
+        std::string pattern_text = abbreviatedEdgePattern->getText();
 
         if (pattern_text == "<-") {
             edge_type = EdgePointingLeft;
@@ -703,8 +743,9 @@ std::any QueryVisitor::visitEdgePattern(GQLParser::EdgePatternContext* ctx)
 std::any QueryVisitor::visitElementPatternFiller(GQLParser::ElementPatternFillerContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->elementVariableDeclaration()) {
-        visit(ctx->elementVariableDeclaration());
+    auto elementVariableDeclaration = ctx->elementVariableDeclaration();
+    if (elementVariableDeclaration) {
+        visit(elementVariableDeclaration);
     } else {
         current_id = std::make_unique<VarId>(get_query_ctx().get_internal_var());
     }
@@ -716,15 +757,17 @@ std::any QueryVisitor::visitElementPatternFiller(GQLParser::ElementPatternFiller
         singleton_types[*current_id] = VarType::Edge;
     }
 
-    if (ctx->isLabelExpression()) {
+    auto isLabelExpression = ctx->isLabelExpression();
+    if (isLabelExpression) {
         current_label_var_id = std::make_unique<VarId>(*current_id);
-        visit(ctx->isLabelExpression());
+        visit(isLabelExpression);
         current_expr_list.push_back(std::move(current_expr));
     } else {
     }
 
-    if (ctx->elementPatternPredicate()) {
-        visit(ctx->elementPatternPredicate());
+    auto elementPatternPredicate = ctx->elementPatternPredicate();
+    if (elementPatternPredicate) {
+        visit(elementPatternPredicate);
         current_expr_list.push_back(std::move(current_expr));
     }
 
@@ -750,30 +793,37 @@ std::any QueryVisitor::visitQuestionedPathPrimary(GQLParser::QuestionedPathPrima
 std::any QueryVisitor::visitGraphPatternQuantifier(GQLParser::GraphPatternQuantifierContext* ctx)
 {
     LOG_VISITOR
+
+    auto fixedQuantifier = ctx->fixedQuantifier();
+    auto generalQuantifier = ctx->generalQuantifier();
+
     if (ctx->ASTERISK()) {
         current_repetition = std::make_unique<OpRepetition::Repetition>(0, std::nullopt);
     } else if (ctx->PLUS_SIGN()) {
         current_repetition = std::make_unique<OpRepetition::Repetition>(1, std::nullopt);
-    } else if (ctx->fixedQuantifier()) {
-        std::string integer_str = ctx->fixedQuantifier()->UNSIGNED_DECIMAL_INTEGER()->getText();
+    } else if (fixedQuantifier) {
+        std::string integer_str = fixedQuantifier->UNSIGNED_DECIMAL_INTEGER()->getText();
 
         integer_str.erase(std::remove(integer_str.begin(), integer_str.end(), '_'), integer_str.end());
         uint64_t integer = std::stoull(integer_str);
 
         current_repetition = std::make_unique<OpRepetition::Repetition>(integer, integer);
 
-    } else if (ctx->generalQuantifier()) {
+    } else if (generalQuantifier) {
         uint64_t lower = 0;
         std::optional<uint64_t> upper = std::nullopt;
 
-        if (ctx->generalQuantifier()->lowerBound()) {
-            std::string integer_str = ctx->generalQuantifier()->lowerBound()->getText();
+        auto generalQuantifier_lowerBound = generalQuantifier->lowerBound();
+        auto generalQuantifier_upperBound = generalQuantifier->upperBound();
+
+        if (generalQuantifier_lowerBound) {
+            std::string integer_str = generalQuantifier_lowerBound->getText();
 
             integer_str.erase(std::remove(integer_str.begin(), integer_str.end(), '_'), integer_str.end());
             lower = std::stoull(integer_str);
         }
-        if (ctx->generalQuantifier()->upperBound()) {
-            std::string integer_str = ctx->generalQuantifier()->upperBound()->getText();
+        if (generalQuantifier_upperBound) {
+            std::string integer_str = generalQuantifier_upperBound->getText();
 
             integer_str.erase(std::remove(integer_str.begin(), integer_str.end(), '_'), integer_str.end());
             upper = std::stoull(integer_str);
@@ -889,17 +939,6 @@ std::any QueryVisitor::visitElementVariableDeclaration(GQLParser::ElementVariabl
     return 0;
 }
 
-std::any QueryVisitor::visitIsLabelExpression(GQLParser::IsLabelExpressionContext* ctx)
-{
-    LOG_VISITOR
-    if (ctx->isOrColon()->COLON()) {
-    } else if (ctx->isOrColon()->IS()) {
-    }
-
-    visit(ctx->labelExpression());
-    return 0;
-}
-
 std::any QueryVisitor::visitLabelExpression(GQLParser::LabelExpressionContext* ctx)
 {
     LOG_VISITOR
@@ -949,8 +988,9 @@ std::any QueryVisitor::visitLabelFactor(GQLParser::LabelFactorContext* ctx)
 std::any QueryVisitor::visitLabelPrimary(GQLParser::LabelPrimaryContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->parenthesizedLabelExpression()) {
-        visit(ctx->parenthesizedLabelExpression());
+    auto parenthesizedLabelExpression = ctx->parenthesizedLabelExpression();
+    if (parenthesizedLabelExpression) {
+        visit(parenthesizedLabelExpression);
         return 0;
     }
 
@@ -1077,6 +1117,18 @@ std::any QueryVisitor::visitGqlComparisonExpression(GQLParser::GqlComparisonExpr
     return 0;
 }
 
+std::any QueryVisitor::visitGqlInExpression(GQLParser::GqlInExpressionContext* ctx)
+{
+    visit(ctx->lhs);
+    auto lhs_expr = std::move(current_expr);
+
+    visit(ctx->rhs);
+    auto rhs_expr = std::move(current_expr);
+
+    current_expr = std::make_unique<ExprIn>(std::move(lhs_expr), std::move(rhs_expr));
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlLowArithmeticExpression(GQLParser::GqlLowArithmeticExpressionContext* ctx)
 {
     LOG_VISITOR
@@ -1114,16 +1166,16 @@ std::any QueryVisitor::visitGqlHighArithmeticExpression(GQLParser::GqlHighArithm
 std::any QueryVisitor::visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFunctionContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->functionParameter()->unsignedLiteral()) {
-        visit(ctx->functionParameter()->unsignedLiteral());
-    } else if (ctx->functionParameter()->variable()) {
-        visit(ctx->functionParameter()->variable());
-    } else if (ctx->functionParameter()->propertyReference()) {
-        visit(ctx->functionParameter()->propertyReference());
-    } else if (ctx->functionParameter()->functionCall()) {
-        visit(ctx->functionParameter()->functionCall());
-    } else if (ctx->functionParameter()->expression()) {
-        visit(ctx->functionParameter()->expression());
+    if (auto unsignedLiteral = ctx->functionParameter()->unsignedLiteral()) {
+        visit(unsignedLiteral);
+    } else if (auto variable = ctx->functionParameter()->variable()) {
+        visit(variable);
+    } else if (auto propertyReference = ctx->functionParameter()->propertyReference()) {
+        visit(propertyReference);
+    } else if (auto functionCall = ctx->functionParameter()->functionCall()) {
+        visit(functionCall);
+    } else if (auto expression = ctx->functionParameter()->expression()) {
+        visit(expression);
     }
 
     auto expr = std::move(current_expr);
@@ -1179,16 +1231,16 @@ std::any QueryVisitor::visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFu
     LOG_VISITOR
     std::vector<std::unique_ptr<Expr>> expressions;
     for (auto& oc : ctx->functionParameter()) {
-        if (oc->unsignedLiteral()) {
-            visit(oc->unsignedLiteral());
-        } else if (oc->variable()) {
-            visit(oc->variable());
-        } else if (oc->propertyReference()) {
-            visit(oc->propertyReference());
-        } else if (oc->functionCall()) {
-            visit(oc->functionCall());
-        } else if (oc->expression()) {
-            visit(oc->expression());
+        if (auto unsignedLiteral = oc->unsignedLiteral()) {
+            visit(unsignedLiteral);
+        } else if (auto variable = oc->variable()) {
+            visit(variable);
+        } else if (auto propertyReference = oc->propertyReference()) {
+            visit(propertyReference);
+        } else if (auto functionCall = oc->functionCall()) {
+            visit(functionCall);
+        } else if (auto expression = oc->expression()) {
+            visit(expression);
         }
         expressions.push_back(std::move(current_expr));
     }
@@ -1253,10 +1305,11 @@ std::any QueryVisitor::visitGqlSingleTrimStringFunction(GQLParser::GqlSingleTrim
         expressions.push_back(nullptr);
     }
     std::string specification;
-    if (ctx->trimSpecification()) {
-        if (ctx->trimSpecification()->LEADING()) {
+    auto trimSpecification = ctx->trimSpecification();
+    if (trimSpecification) {
+        if (trimSpecification->LEADING()) {
             specification = "LEADING";
-        } else if (ctx->trimSpecification()->TRAILING()) {
+        } else if (trimSpecification->TRAILING()) {
             specification = "TRAILING";
         } else {
             specification = "BOTH";
@@ -1279,8 +1332,10 @@ std::any QueryVisitor::visitGqlMultiTrimStringFunction(GQLParser::GqlMultiTrimSt
     std::vector<std::unique_ptr<Expr>> expressions;
     visit(ctx->trimSrc);
     expressions.push_back(std::move(current_expr));
-    if (ctx->delChar) {
-        visit(ctx->delChar);
+
+    auto delChar = ctx->delChar;
+    if (delChar) {
+        visit(delChar);
         expressions.push_back(std::move(current_expr));
     } else {
         expressions.push_back(nullptr);
@@ -1310,12 +1365,13 @@ std::any QueryVisitor::visitGqlNormStringFunction(GQLParser::GqlNormStringFuncti
     visit(ctx->expressionAtom());
 
     std::string form;
-    if (ctx->normalForm()) {
-        if (ctx->normalForm()->NFC()) {
+    auto normalForm = ctx->normalForm();
+    if (normalForm) {
+        if (normalForm->NFC()) {
             form = "NFC";
-        } else if (ctx->normalForm()->NFD()) {
+        } else if (normalForm->NFD()) {
             form = "NFD";
-        } else if (ctx->normalForm()->NFKC()) {
+        } else if (normalForm->NFKC()) {
             form = "NFKC";
         } else {
             form = "NFKD";
@@ -1366,28 +1422,30 @@ std::any QueryVisitor::visitGqlSimpleCaseFunction(GQLParser::GqlSimpleCaseFuncti
         std::vector<std::unique_ptr<Expr>> when_operands;
         std::string comp_operand;
         for (auto when_operand : when_clause->whenOperand()) {
-            if (when_operand->expressionAtom()) {
-                visit(when_operand->expressionAtom());
+            auto whenOperand_expressionAtom = when_operand->expressionAtom();
+            auto whenOperand_comparisonPredicateCond = when_operand->comparisonPredicateCond();
+
+            if (whenOperand_expressionAtom) {
+                visit(whenOperand_expressionAtom);
                 comp_operand = "=";
                 when_operands.push_back(std::move(current_expr));
-            } else if (when_operand->comparisonPredicateCond()) {
-                if (when_operand->comparisonPredicateCond()->compOp()->EQUALS_OPERATOR()) {
+            } else if (whenOperand_comparisonPredicateCond) {
+                auto comparisonPredicateCond_compOp = whenOperand_comparisonPredicateCond->compOp();
+
+                if (comparisonPredicateCond_compOp->EQUALS_OPERATOR()) {
                     comp_operand = "=";
-                } else if (when_operand->comparisonPredicateCond()->compOp()->NOT_EQUALS_OPERATOR()) {
+                } else if (comparisonPredicateCond_compOp->NOT_EQUALS_OPERATOR()) {
                     comp_operand = "!=";
-                } else if (when_operand->comparisonPredicateCond()->compOp()->LEFT_ANGLE_BRACKET()) {
+                } else if (comparisonPredicateCond_compOp->LEFT_ANGLE_BRACKET()) {
                     comp_operand = "<";
-                } else if (when_operand->comparisonPredicateCond()->compOp()->RIGHT_ANGLE_BRACKET()) {
+                } else if (comparisonPredicateCond_compOp->RIGHT_ANGLE_BRACKET()) {
                     comp_operand = ">";
-                } else if (when_operand->comparisonPredicateCond()->compOp()->LESS_THAN_OR_EQUALS_OPERATOR())
-                {
+                } else if (comparisonPredicateCond_compOp->LESS_THAN_OR_EQUALS_OPERATOR()) {
                     comp_operand = "<=";
-                } else if (when_operand->comparisonPredicateCond()->compOp()->GREATER_THAN_OR_EQUALS_OPERATOR(
-                           ))
-                {
+                } else if (comparisonPredicateCond_compOp->GREATER_THAN_OR_EQUALS_OPERATOR()) {
                     comp_operand = ">=";
                 }
-                visit(when_operand->comparisonPredicateCond()->expression());
+                visit(whenOperand_comparisonPredicateCond->expression());
                 when_operands.push_back(std::move(current_expr));
             }
         }
@@ -1398,8 +1456,8 @@ std::any QueryVisitor::visitGqlSimpleCaseFunction(GQLParser::GqlSimpleCaseFuncti
     }
 
     std::unique_ptr<Expr> else_clause;
-    if (ctx->elseClause()) {
-        visit(ctx->elseClause());
+    if (auto elseClause = ctx->elseClause()) {
+        visit(elseClause);
         else_clause = std::move(current_expr);
     } else {
         else_clause = nullptr;
@@ -1419,16 +1477,17 @@ std::any QueryVisitor::visitGqlSearchedCaseFunction(GQLParser::GqlSearchedCaseFu
     std::vector<std::pair<std::unique_ptr<Expr>, std::unique_ptr<Expr>>> when_clauses;
 
     for (auto when_clause : ctx->searchedWhenClause()) {
-        visit(when_clause->expression()[0]);
+        auto when_clause_expression = when_clause->expression();
+        visit(when_clause_expression[0]);
         auto condition = std::move(current_expr);
-        visit(when_clause->expression()[1]);
+        visit(when_clause_expression[1]);
         auto result = std::move(current_expr);
         when_clauses.emplace_back(std::make_pair(std::move(condition), std::move(result)));
     }
 
     std::unique_ptr<Expr> else_clause;
-    if (ctx->elseClause()) {
-        visit(ctx->elseClause());
+    if (auto elseClause = ctx->elseClause()) {
+        visit(elseClause);
         else_clause = std::move(current_expr);
     } else {
         else_clause = nullptr;
@@ -1484,8 +1543,9 @@ std::any QueryVisitor::visitGqlGeneralSetFunction(GQLParser::GqlGeneralSetFuncti
     LOG_VISITOR
     visit(ctx->expression());
     distinct = false;
-    if (ctx->setQuantifier()) {
-        if (ctx->setQuantifier()->DISTINCT()) {
+    auto setQuantifier = ctx->setQuantifier();
+    if (setQuantifier) {
+        if (setQuantifier->DISTINCT()) {
             distinct = true;
         }
     }
@@ -1521,8 +1581,9 @@ std::any QueryVisitor::visitGqlBinarySetFunction(GQLParser::GqlBinarySetFunction
     auto percentile = std::move(current_expr);
 
     distinct = false;
-    if (ctx->setQuantifier()) {
-        if (ctx->setQuantifier()->DISTINCT()) {
+    auto setQuantifier = ctx->setQuantifier();
+    if (setQuantifier) {
+        if (setQuantifier->DISTINCT()) {
             distinct = true;
         }
     }
@@ -1873,7 +1934,8 @@ std::any QueryVisitor::visitGqlLabeledExpression(GQLParser::GqlLabeledExpression
     }
     current_label_var_id = std::make_unique<VarId>(var_id);
 
-    visit(ctx->labeledPredicateCond()->labelExpression());
+    auto labeledPredicateCond = ctx->labeledPredicateCond();
+    visit(labeledPredicateCond->labelExpression());
     if (ctx->labeledPredicateCond()->NOT()) {
         current_expr = std::make_unique<ExprNot>(std::move(current_expr));
     }
@@ -2021,64 +2083,37 @@ std::any QueryVisitor::visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx
     return 0;
 }
 
-std::any QueryVisitor::visitListLiteral(GQLParser::ListLiteralContext* ctx)
+std::any QueryVisitor::visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx)
 {
-    LOG_VISITOR
-    std::vector<ObjectId> list_oids;
+    std::vector<ObjectId> list;
 
-    // Iterate through all general literals in the list
-    auto literals = ctx->generalLiteral();
-    for (auto* literal : literals) {
-        // Visit each literal to evaluate it
-        visit(literal);
-
-        // Extract ObjectId from the evaluated expression
-        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
-        if (!expr_term) {
-            throw QuerySemanticException(
-                "List literal at line " + std::to_string(ctx->getStart()->getLine()) +
-                " contains non-literal element"
-            );
+    for (auto& expr : ctx->expression()) {
+        visit(expr);
+        if (current_expr != nullptr) {
+            if (auto expr_term = dynamic_cast<ExprTerm*>(current_expr.get())) {
+                list.push_back(expr_term->term);
+            }
         }
-
-        list_oids.push_back(expr_term->term);
     }
-
-    // Pack the list into an ObjectId
-    ObjectId list_oid = GQL::Conversions::pack_list(list_oids);
+    ObjectId list_oid = Conversions::pack_list(list);
     current_expr = std::make_unique<ExprTerm>(list_oid);
-
     return 0;
 }
 
-std::any QueryVisitor::visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx)
+std::any QueryVisitor::visitListLiteral(GQLParser::ListLiteralContext* ctx)
 {
-    LOG_VISITOR
-    std::vector<ObjectId> list_oids;
+    std::vector<ObjectId> list;
 
-    // Iterate through all expressions in the list
-    // Grammar: listValueTypeName? LEFT_BRACKET (expression (COMMA expression)*)? RIGHT_BRACKET
-    auto expressions = ctx->expression();
-    for (auto* expr_ctx : expressions) {
-        // Visit each expression to evaluate it
-        visit(expr_ctx);
-
-        // Extract ObjectId from the evaluated expression
-        auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
-        if (!expr_term) {
-            throw QuerySemanticException(
-                "List constructor at line " + std::to_string(ctx->getStart()->getLine()) +
-                " contains non-evaluable element"
-            );
+    for (auto& expr : ctx->generalLiteral()) {
+        visit(expr);
+        if (current_expr != nullptr) {
+            if (auto expr_term = dynamic_cast<ExprTerm*>(current_expr.get())) {
+                list.push_back(expr_term->term);
+            }
         }
-
-        list_oids.push_back(expr_term->term);
     }
-
-    // Pack the list into an ObjectId
-    ObjectId list_oid = GQL::Conversions::pack_list(list_oids);
+    ObjectId list_oid = Conversions::pack_list(list);
     current_expr = std::make_unique<ExprTerm>(list_oid);
-
     return 0;
 }
 
@@ -2087,19 +2122,12 @@ std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
     LOG_VISITOR
     std::map<ObjectId, std::unique_ptr<DictionaryItem>> dict_map;
 
-    // Iterate through all record fields
     auto fields = ctx->recordFieldLiteral();
     for (auto* field : fields) {
-        // Extract the key (variable name)
         std::string key_str = field->key->getText();
-
-        // Create ObjectId for the key using pack_string_simple
-        ObjectId key_oid = GQL::Conversions::pack_string_simple(key_str);
-
-        // Visit the value (generalLiteral) to evaluate it
+        ObjectId key_oid = Conversions::pack_string_simple(key_str);
         visit(field->value);
 
-        // Extract ObjectId from the evaluated expression
         auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
         if (!expr_term) {
             throw QuerySemanticException(
@@ -2107,15 +2135,10 @@ std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
                 " contains non-literal value for key '" + key_str + "'"
             );
         }
-
-        // Add to dictionary map as DictionaryLiteral
         dict_map[key_oid] = std::make_unique<DictionaryLiteral>(expr_term->term);
     }
 
-    // Create the Dictionary object (automatically creates DictionaryObject)
     auto dict = std::make_unique<Dictionary>(std::move(dict_map));
-
-    // Pack the dictionary into an ObjectId
     ObjectId dict_oid = Common::Conversions::pack_dictionary(dict);
     current_expr = std::make_unique<ExprTerm>(dict_oid);
 
@@ -2125,8 +2148,6 @@ std::any QueryVisitor::visitRecordLiteral(GQLParser::RecordLiteralContext* ctx)
 std::any QueryVisitor::visitGqlCollectionExpression(GQLParser::GqlCollectionExpressionContext* ctx)
 {
     LOG_VISITOR
-    // collectionValueConstructor contains: listValueConstructor | recordValueConstructor | pathValueConstructor
-    // We dispatch to the appropriate one by visiting the child context
     auto* collection = ctx->collectionValueConstructor();
     if (collection->recordValueConstructor()) {
         return visit(collection->recordValueConstructor());
@@ -2145,20 +2166,12 @@ std::any QueryVisitor::visitRecordValueConstructor(GQLParser::RecordValueConstru
     LOG_VISITOR
     std::map<ObjectId, std::unique_ptr<DictionaryItem>> dict_map;
 
-    // Grammar: RECORD? LEFT_BRACE (field (COMMA field)*)? RIGHT_BRACE
-    // field: key = fieldName COLON value = expression
     auto fields = ctx->field();
     for (auto* field_ctx : fields) {
-        // Extract the key (fieldName)
         std::string key_str = field_ctx->key->getText();
-
-        // Create ObjectId for the key using pack_string_simple
-        ObjectId key_oid = GQL::Conversions::pack_string_simple(key_str);
-
-        // Visit the value (full expression) to evaluate it
+        ObjectId key_oid = Conversions::pack_string_simple(key_str);
         visit(field_ctx->value);
 
-        // Extract ObjectId from the evaluated expression
         auto* expr_term = dynamic_cast<ExprTerm*>(current_expr.get());
         if (!expr_term) {
             throw QuerySemanticException(
@@ -2166,39 +2179,29 @@ std::any QueryVisitor::visitRecordValueConstructor(GQLParser::RecordValueConstru
                 " contains non-evaluable value for key '" + key_str + "'"
             );
         }
-
-        // Add to dictionary map as DictionaryLiteral
         dict_map[key_oid] = std::make_unique<DictionaryLiteral>(expr_term->term);
     }
 
-    // Create the Dictionary object
     auto dict = std::make_unique<Dictionary>(std::move(dict_map));
-
-    // Pack the dictionary into an ObjectId
     ObjectId dict_oid = Common::Conversions::pack_dictionary(dict);
     current_expr = std::make_unique<ExprTerm>(dict_oid);
-
     return 0;
 }
 
 std::any QueryVisitor::visitDateFunction(GQLParser::DateFunctionContext* ctx)
 {
-    // DATE
-    if (ctx->dateFunctionParameters()) {
-        if (ctx->dateFunctionParameters()->dateString()) {
-            std::string date_str = ctx->dateFunctionParameters()->getText();
+    if (auto dateFunctionParameters = ctx->dateFunctionParameters()) {
+        // DATE
+        if (dateFunctionParameters->dateString()) {
+            std::string date_str = dateFunctionParameters->getText();
             date_str = date_str.substr(1, date_str.size() - 2);
             auto date = DateTime::from_date(date_str);
             current_expr = std::make_unique<ExprTerm>(Conversions::pack_date(date));
         }
-    }
-    // CURRENT_DATE
-    else
-    {
-        std::time_t t = std::chrono::system_clock::to_time_t(get_query_ctx().thread_info.time_start);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&t), "%Y-%m-%d");
-        ObjectId oid(DateTime::from_date(ss.str()));
+    } else {
+        // CURRENT_DATE
+        auto time_str = mdb_format_time(get_query_ctx().thread_info.time_start, "%Y-%m-%d");
+        ObjectId oid(DateTime::from_date(time_str));
         current_expr = std::make_unique<ExprTerm>(oid);
     }
     return 0;
@@ -2206,20 +2209,16 @@ std::any QueryVisitor::visitDateFunction(GQLParser::DateFunctionContext* ctx)
 
 std::any QueryVisitor::visitTimeFunction(GQLParser::TimeFunctionContext* ctx)
 {
-    // ZONED_TIME
-    if (ctx->timeFunctionParameters()) {
-        std::string date_str = ctx->timeFunctionParameters()->getText();
+    if (auto timeFunctionParameters = ctx->timeFunctionParameters()) {
+        // ZONED_TIME
+        std::string date_str = timeFunctionParameters->getText();
         date_str = date_str.substr(1, date_str.size() - 2);
         auto date = DateTime::from_zoned_time(date_str);
         current_expr = std::make_unique<ExprTerm>(Conversions::pack_date(date));
-    }
-    // CURRENT_TIME
-    else
-    {
-        std::time_t t = std::chrono::system_clock::to_time_t(get_query_ctx().thread_info.time_start);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&t), "%H:%M:%S");
-        ObjectId oid(DateTime::from_zoned_time(ss.str()));
+    } else {
+        // CURRENT_TIME
+        auto time_str = mdb_format_time(get_query_ctx().thread_info.time_start, "%H:%M:%S");
+        ObjectId oid(DateTime::from_zoned_time(time_str));
         current_expr = std::make_unique<ExprTerm>(oid);
     }
     return 0;
@@ -2227,17 +2226,15 @@ std::any QueryVisitor::visitTimeFunction(GQLParser::TimeFunctionContext* ctx)
 
 std::any QueryVisitor::visitLocalTimeFunction(GQLParser::LocalTimeFunctionContext* ctx)
 {
-    // LOCAL_TIME
-    if (ctx->timeFunctionParameters()) {
-        std::string date_str = ctx->timeFunctionParameters()->getText();
+    if (auto timeFunctionParameters = ctx->timeFunctionParameters()) {
+        // LOCAL_TIME
+        std::string date_str = timeFunctionParameters->getText();
         date_str = date_str.substr(1, date_str.size() - 2);
         auto date = DateTime::from_local_time(date_str);
         current_expr = std::make_unique<ExprTerm>(Conversions::pack_date(date));
     } else {
-        std::time_t t = std::chrono::system_clock::to_time_t(get_query_ctx().thread_info.time_start);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&t), "%H:%M:%S");
-        ObjectId oid(DateTime::from_local_time(ss.str()));
+        auto time_str = mdb_format_time(get_query_ctx().thread_info.time_start, "%H:%M:%S");
+        ObjectId oid(DateTime::from_local_time(time_str));
         current_expr = std::make_unique<ExprTerm>(oid);
     }
     return 0;
@@ -2245,21 +2242,16 @@ std::any QueryVisitor::visitLocalTimeFunction(GQLParser::LocalTimeFunctionContex
 
 std::any QueryVisitor::visitDatetimeFunction(GQLParser::DatetimeFunctionContext* ctx)
 {
-    // ZONED_DATETIME
-    if (ctx->datetimeFunctionParameters()) {
-        std::string date_str = ctx->datetimeFunctionParameters()->getText();
+    if (auto datetimeFunctionParameters = ctx->datetimeFunctionParameters()) {
+        // ZONED_DATETIME
+        std::string date_str = datetimeFunctionParameters->getText();
         date_str = date_str.substr(1, date_str.size() - 2);
         auto date = DateTime::from_zoned_datetime(date_str);
         current_expr = std::make_unique<ExprTerm>(Conversions::pack_date(date));
-    }
-    // CURRENT_TIMESTAMP
-    else
-    {
-        std::time_t t = std::chrono::system_clock::to_time_t(get_query_ctx().thread_info.time_start);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&t), "%Y-%m-%dT%H:%M:%SZ");
-        std::cout << ss.str() << std::endl;
-        ObjectId oid(DateTime::from_zoned_datetime(ss.str()));
+    } else {
+        // CURRENT_TIMESTAMP
+        auto time_str = mdb_format_time(get_query_ctx().thread_info.time_start, "%Y-%m-%dT%H:%M:%SZ");
+        ObjectId oid(DateTime::from_zoned_datetime(time_str));
         current_expr = std::make_unique<ExprTerm>(oid);
     }
     return 0;
@@ -2267,20 +2259,16 @@ std::any QueryVisitor::visitDatetimeFunction(GQLParser::DatetimeFunctionContext*
 
 std::any QueryVisitor::visitLocalDatetimeFunction(GQLParser::LocalDatetimeFunctionContext* ctx)
 {
-    // LOCAL_DATETIME
-    if (ctx->datetimeFunctionParameters()) {
-        std::string date_str = ctx->datetimeFunctionParameters()->getText();
+    if (auto datetimeFunctionParameters = ctx->datetimeFunctionParameters()) {
+        // LOCAL_DATETIME
+        std::string date_str = datetimeFunctionParameters->getText();
         date_str = date_str.substr(1, date_str.size() - 2);
         auto date = DateTime::from_local_datetime(date_str);
         current_expr = std::make_unique<ExprTerm>(Conversions::pack_date(date));
-    }
-    // LOCAL_TIMESTAMP
-    else
-    {
-        std::time_t t = std::chrono::system_clock::to_time_t(get_query_ctx().thread_info.time_start);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&t), "%Y-%m-%dT%H:%M:%S");
-        ObjectId oid(DateTime::from_local_datetime(ss.str()));
+    } else {
+        // LOCAL_TIMESTAMP
+        auto time_str = mdb_format_time(get_query_ctx().thread_info.time_start, "%Y-%m-%dT%H:%M:%S");
+        ObjectId oid(DateTime::from_local_datetime(time_str));
         current_expr = std::make_unique<ExprTerm>(oid);
     }
     return 0;
@@ -2316,18 +2304,18 @@ std::any QueryVisitor::visitGqlVariableExpression(GQLParser::GqlVariableExpressi
 std::any QueryVisitor::visitOrderByAndPageStatement(GQLParser::OrderByAndPageStatementContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->orderByClause()) {
-        ctx->orderByClause()->accept(this);
+    if (auto orderByClause = ctx->orderByClause()) {
+        orderByClause->accept(this);
     }
 
     uint64_t offset = Op::DEFAULT_OFFSET;
     uint64_t limit = Op::DEFAULT_LIMIT;
-    if (ctx->offsetClause()) {
-        std::string offset_str = ctx->offsetClause()->unsignedIntegerSpecification()->getText();
+    if (auto offsetClause = ctx->offsetClause()) {
+        std::string offset_str = offsetClause->unsignedIntegerSpecification()->getText();
         offset = get_unsigned_integer(offset_str);
     }
-    if (ctx->limitClause()) {
-        std::string limit_str = ctx->limitClause()->unsignedIntegerSpecification()->getText();
+    if (auto limitClause = ctx->limitClause()) {
+        std::string limit_str = limitClause->unsignedIntegerSpecification()->getText();
         limit = get_unsigned_integer(limit_str);
     }
 
@@ -2345,18 +2333,19 @@ std::any QueryVisitor::visitOrderByClause(GQLParser::OrderByClauseContext* ctx)
 {
     LOG_VISITOR
     for (auto& oc : ctx->sortSpecificationList()->sortSpecification()) {
-        if (oc->sortKey()) {
-            visit(oc->sortKey());
+        auto nullOrdering = oc->nullOrdering();
+        if (auto sortKey = oc->sortKey()) {
+            visit(sortKey);
             order_by_items.emplace_back(std::move(current_expr));
         } else {
             // it should not enter here unless grammar is modified
             throw QuerySemanticException("Unsupported ORDER BY condition: '" + oc->getText() + "'");
         }
-        if (oc->orderingSpecification()) {
-            if (oc->orderingSpecification()->DESC() || oc->orderingSpecification()->DESCENDING()) {
+        if (auto orderingSpecification = oc->orderingSpecification()) {
+            if (orderingSpecification->DESC() || orderingSpecification->DESCENDING()) {
                 order_by_ascending.push_back(false);
-                if (oc->nullOrdering()) {
-                    auto null_order = oc->nullOrdering()->getText();
+                if (nullOrdering) {
+                    auto null_order = nullOrdering->getText();
                     if (null_order == "NULLSFIRST") {
                         order_nulls.push_back(false);
                     } else {
@@ -2367,8 +2356,8 @@ std::any QueryVisitor::visitOrderByClause(GQLParser::OrderByClauseContext* ctx)
                 }
             } else {
                 order_by_ascending.push_back(true);
-                if (oc->nullOrdering()) {
-                    auto null_order = oc->nullOrdering()->getText();
+                if (nullOrdering) {
+                    auto null_order = nullOrdering->getText();
                     if (null_order == "NULLSFIRST") {
                         order_nulls.push_back(true);
                     } else {
@@ -2380,8 +2369,8 @@ std::any QueryVisitor::visitOrderByClause(GQLParser::OrderByClauseContext* ctx)
             }
         } else {
             order_by_ascending.push_back(true);
-            if (oc->nullOrdering()) {
-                auto null_order = oc->nullOrdering()->getText();
+            if (nullOrdering) {
+                auto null_order = nullOrdering->getText();
                 if (null_order == "NULLSFIRST") {
                     order_nulls.push_back(true);
                 } else {
@@ -2414,12 +2403,12 @@ std::any QueryVisitor::visitLimitClause(GQLParser::LimitClauseContext* ctx)
 std::any QueryVisitor::visitFilterStatement(GQLParser::FilterStatementContext* ctx)
 {
     LOG_VISITOR
-    if (ctx->whereClause()) {
-        visit(ctx->whereClause()->expression());
+    if (auto whereClause = ctx->whereClause()) {
+        visit(whereClause->expression());
         filter_items.emplace_back(std::move(current_expr));
     }
-    if (ctx->expression()) {
-        visit(ctx->expression());
+    if (auto filterExpression = ctx->expression()) {
+        visit(filterExpression);
         filter_items.emplace_back(std::move(current_expr));
     }
     return 0;

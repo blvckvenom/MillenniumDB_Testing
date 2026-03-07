@@ -4,6 +4,7 @@
 #include <mutex>
 #include <vector>
 
+#include <boost/asio/ssl.hpp>
 #include <boost/asio.hpp>
 
 #include "network/server/protocol.h"
@@ -59,11 +60,19 @@ public:
 
     void set_admin_user(const std::string& user, const std::string& password);
 
+    void enable_ssl(const std::string& cert_file, const std::string& key_file);
+
+    bool has_admin_user() const {
+        return !users.empty();
+    }
+
 private:
     static void browser_session(boost::asio::ip::tcp::socket&& socket);
 
     static void browser_listener(boost::asio::io_context* browser_io_context, int port);
 
     std::vector<LoginInfo> users;
+
+    std::optional<boost::asio::ssl::context> ssl_ctx;
 };
 } // namespace MDBServer

@@ -2148,6 +2148,7 @@ expressionPredicate
    | PROPERTY? GRAPH graphExpression                                                                    #gqlGraphRefValueExpression
    | BINDING? TABLE bindingTableExpression                                                              #gqlBindingTableValueExpression
    | LET letVariableDefinitionList IN expression END                                                    #gqlLetExpression
+   | lhs = expressionAtom IN rhs = expressionAtom                                                                   #gqlInExpression
    | expressionAtom                                                                                     #gqlAtomExpression
    ;
 

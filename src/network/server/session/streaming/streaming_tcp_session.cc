@@ -16,7 +16,7 @@ StreamingTCPSession::StreamingTCPSession(
     boost::asio::ip::tcp::socket&& socket_,
     std::chrono::seconds query_timeout_
 ) :
-    StreamingSession(server),
+    StreamingSession(server, false),
     query_timeout(query_timeout_),
     socket(std::move(socket_))
 {
@@ -53,16 +53,14 @@ void StreamingTCPSession::start_decode_chunk()
         [self](const boost::system::error_code& ec, std::size_t /*bytes_transferred*/) {
             if (ec) {
                 if (ec != asio::error::eof) {
-                    logger(Category::Error)
-                        << "StreamingTCPSession start_decode_chunk error: " << ec.message();
+                    logger.error() << "StreamingTCPSession start_decode_chunk error: " << ec.message();
                 }
                 return;
             }
 
             // read chunk size
             self->request_buffer.commit(2);
-            const auto initial_chunk_size_bytes = asio::buffer_cast<const uint8_t*>(self->request_buffer.data(
-            ));
+            auto initial_chunk_size_bytes = static_cast<const uint8_t*>(self->request_buffer.data().data());
             const uint16_t initial_chunk_size = (static_cast<uint16_t>(initial_chunk_size_bytes[0]) << 8)
                                               | initial_chunk_size_bytes[1];
             self->request_buffer.consume(2);
@@ -88,17 +86,19 @@ void StreamingTCPSession::decode_chunk(std::size_t chunk_size)
         try {
             request_handler->handle(decoded_chunks.data(), decoded_chunks.size());
         } catch (const InterruptedException& e) {
-            close_with_error("Interruption exception: Query timed out");
+            close_with_error("Query timed out");
+            return;
         } catch (const ProtocolException& e) {
             close_with_error("Protocol exception: " + std::string(e.what()));
+            return;
         } catch (const ConnectionException& e) {
-            logger(Category::Error) << "Connection exception: " << e.what();
+            logger.error() << "Connection exception: " << e.what();
             return;
         } catch (const std::exception& e) {
-            logger(Category::Error) << "Uncaught exception: " << e.what();
+            logger.error() << "Uncaught exception: " << e.what();
             return;
         } catch (...) {
-            logger(Category::Error) << "Unexpected exception!";
+            logger.error() << "Unexpected exception!";
             return;
         }
 
@@ -116,15 +116,14 @@ void StreamingTCPSession::decode_chunk(std::size_t chunk_size)
         [self, chunk_size](const boost::system::error_code& ec, std::size_t /*bytes_transferred*/) {
             if (ec) {
                 if (ec != asio::error::eof) {
-                    logger(Category::Error) << "StreamingTCPSession decode_chunk error: " << ec.message();
+                    logger.error() << "StreamingTCPSession decode_chunk error: " << ec.message();
                 }
                 return;
             }
 
-            self->request_buffer.commit(chunk_size + 2);
-
             // append decoded chunk
-            const auto chunk_bytes = asio::buffer_cast<const uint8_t*>(self->request_buffer.data());
+            self->request_buffer.commit(chunk_size + 2);
+            auto chunk_bytes = static_cast<const uint8_t*>(self->request_buffer.data().data());
             const auto old_size = self->decoded_chunks.size();
             self->decoded_chunks.resize(old_size + chunk_size);
             std::memcpy(self->decoded_chunks.data() + old_size, chunk_bytes, chunk_size);
@@ -173,13 +172,14 @@ bool StreamingTCPSession::try_cancel(uint_fast32_t worker_idx, const std::string
     return server.try_cancel(worker_idx, cancel_token);
 }
 
-void StreamingTCPSession::close_with_error(const std::string& msg) {
-    logger(Category::Error) << msg;
+void StreamingTCPSession::close_with_error(const std::string& msg)
+{
+    logger.error() << msg;
     request_handler->response_writer->write_error(msg);
     request_handler->response_writer->flush();
 
     socket.close(ec);
     if (ec) {
-        logger(Category::Debug) << "Close failed:" << ec.what();
+        logger.debug() << "Close failed:" << ec.what();
     }
 }

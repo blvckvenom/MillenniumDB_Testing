@@ -302,34 +302,29 @@ uint64_t OnDiskImport::get_datatype_value_id()
         value_id = DateTime::from_dateTime(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << " invalid dateTime: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid dateTime `", lexer.str, '`');
         }
     } else if (strcmp(datatype_beg, "date") == 0) {
         value_id = DateTime::from_date(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << "invalid date: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid date `", lexer.str, '`');
         }
     } else if (strcmp(datatype_beg, "time") == 0) {
         value_id = DateTime::from_time(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << "invalid time: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid time `", lexer.str, '`');
         }
     } else if (strcmp(datatype_beg, "dateTimeStamp") == 0) {
         value_id = DateTime::from_dateTimeStamp(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << "invalid dateTimeStamp: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid dateTimeStamp `", lexer.str, '`');
         }
     } else {
         parsing_errors++;
-        std::cout << "ERROR on line " << current_line << ", ";
-        std::cout << "unknown datatype: " << datatype_beg << "\n";
+        WARN("line ", current_line, ": unknown datatype `", lexer.str, '`');
     }
     return value_id;
 }
@@ -579,7 +574,7 @@ void OnDiskImport::finish_line()
 void OnDiskImport::print_error()
 {
     parsing_errors++;
-    std::cout << "ERROR on line " << current_line << "\n";
+    WARN("ERROR on line ", current_line);
 }
 
 void OnDiskImport::try_save_node_label(uint64_t node_id, uint64_t label_id)
@@ -649,9 +644,11 @@ void OnDiskImport::start_import(MDBIstream& in)
 
     std::cout << "-------------------------------------\n";
     if (parsing_errors != 0) {
-        std::cout << "\n!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!\n";
-        std::cout << "  " << parsing_errors << " errors found.\n";
-        std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+        WARN(
+            "\n!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!\n  ",
+            parsing_errors,
+            " errors found.\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        );
     }
     print_duration("Parsing", start);
 
@@ -1039,8 +1036,7 @@ void OnDiskImport::advance_automaton(int token)
         func();
     } catch (std::exception& e) {
         parsing_errors++;
-        std::cout << "ERROR on line " << current_line << "\n";
-        std::cout << e.what() << "\n";
+        WARN("ERROR on line ", current_line, "\n", e.what());
         current_state = State::WRONG_LINE;
     }
 }

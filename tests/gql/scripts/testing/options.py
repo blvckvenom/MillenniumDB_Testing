@@ -58,6 +58,7 @@ TEST_SUITES: list[str] = [
     "call_procedure",
     "projection_native",
     "projection_properties",
+    "list_exprs",
 ]
 
 # Tests with the following query files fill be ignored

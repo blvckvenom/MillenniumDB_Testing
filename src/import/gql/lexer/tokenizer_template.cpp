@@ -43,9 +43,7 @@ bool GQLTokenizer::fill(size_t need)
     cur -= free;
     mar -= free;
     token_start -= free;
-    // std::cout << "trying to read " << free << " bytes\n";
     auto r = in->read(lim, free);
-    // std::cout << "read " << r << " bytes\n";
     lim += r;
 
     if (lim < buf + GQLTokenizer_SIZE) {
@@ -90,8 +88,8 @@ Import::GQL::Token GQLTokenizer::_get_token()
             undirected   = [~];
             true         = "true";
             false        = "false";
-            string       = ["] ([^"\\] | [\\][^])* ["];
-            typed_string = [a-zA-Z]+ [ \r\t]* [(] [ \r\t]* ["] ([^"\\] | [\\][^])* ["] [ \r\t]* [)];
+            string       = ["] ([^"\\\n] | [\\][^])* ["];
+            typed_string = [a-zA-Z]+ [ \r\t]* [(] [ \r\t]* ["] ([^"\\\n] | [\\][^])* ["] [ \r\t]* [)];
             identifier   = [a-zA-Z][a-zA-Z0-9_]*;
             integer      = [-+]?[0-9]+;
             decimal      = [-+]?([0-9]*[.])?[0-9]+([eE][-+]?[0-9]+)?;

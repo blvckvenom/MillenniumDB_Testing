@@ -69,14 +69,52 @@ int64_t StreamingRequestReader::read_int64()
 
 float StreamingRequestReader::read_float()
 {
+    static_assert(sizeof(float) == sizeof(uint32_t));
+
     check_remaining_bytes(4);
-    float value;
-    auto value_bytes = reinterpret_cast<uint8_t*>(&value);
-    value_bytes[3] = request_bytes[current_pos++];
-    value_bytes[2] = request_bytes[current_pos++];
-    value_bytes[1] = request_bytes[current_pos++];
-    value_bytes[0] = request_bytes[current_pos++];
-    return value;
+
+    uint32_t u = static_cast<uint32_t>(request_bytes[current_pos++]) << 24;
+    u |= static_cast<uint32_t>(request_bytes[current_pos++]) << 16;
+    u |= static_cast<uint32_t>(request_bytes[current_pos++]) << 8;
+    u |= static_cast<uint32_t>(request_bytes[current_pos++]);
+
+    float f;
+    std::memcpy(&f, &u, sizeof(float));
+
+    return f;
+}
+
+template<typename T>
+tensor::Tensor<T> StreamingRequestReader::read_tensor()
+{
+    static_assert(sizeof(float) == sizeof(uint32_t));
+    static_assert(sizeof(double) == sizeof(uint64_t));
+
+    const auto size = read_size();
+    const auto num_bytes = sizeof(T) * size;
+    check_remaining_bytes(num_bytes);
+
+    tensor::Tensor<T> res(size);
+    for (std::size_t i = 0; i < size; ++i) {
+        if constexpr (std::is_same_v<T, float>) {
+            uint32_t u = static_cast<uint32_t>(request_bytes[current_pos++]) << 24;
+            u |= static_cast<uint32_t>(request_bytes[current_pos++]) << 16;
+            u |= static_cast<uint32_t>(request_bytes[current_pos++]) << 8;
+            u |= static_cast<uint32_t>(request_bytes[current_pos++]);
+            std::memcpy(&res[i], &u, sizeof(float));
+        } else if constexpr (std::is_same_v<T, double>) {
+            uint64_t u = static_cast<uint64_t>(request_bytes[current_pos++]) << 56;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]) << 48;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]) << 40;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]) << 32;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]) << 24;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]) << 16;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]) << 8;
+            u |= static_cast<uint64_t>(request_bytes[current_pos++]);
+            std::memcpy(&res[i], &u, sizeof(double));
+        }
+    }
+    return res;
 }
 
 uint_fast32_t StreamingRequestReader::read_size() {
@@ -111,3 +149,6 @@ void StreamingRequestReader::check_remaining_bytes(uint_fast32_t expected) const
         throw ProtocolException("Not enough data in the request: Request is incomplete");
     }
 }
+
+template tensor::Tensor<float> StreamingRequestReader::read_tensor<float>();
+template tensor::Tensor<double> StreamingRequestReader::read_tensor<double>();

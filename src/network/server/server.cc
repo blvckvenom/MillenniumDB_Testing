@@ -7,6 +7,7 @@
 
 #include <boost/beast.hpp>
 
+#include "misc/fatal_error.h"
 #include "misc/logger.h"
 #include "network/server/listener.h"
 #include "network/server/protocol.h"
@@ -101,7 +102,7 @@ void write(beast::tcp_stream& stream, http::message<isRequest, Body, Fields>&& m
 {
     (void) beast::http::write(stream, msg, ec);
     if (ec) {
-        logger(Category::Error) << "Browser write error: " << ec.message();
+        logger.error() << "Browser write error: " << ec.message();
     }
 }
 
@@ -238,8 +239,33 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
 
 void Server::browser_listener(asio::io_context* browser_io_context, int port)
 {
-    // Start the acceptor and listen for connections, dispatching them to the session
-    asio::ip::tcp::acceptor acceptor(*browser_io_context, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
+    asio::ip::tcp::acceptor acceptor(*browser_io_context);
+    asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), port);
+
+    boost::system::error_code ec;
+
+    acceptor.open(endpoint.protocol(), ec);
+    if (ec) {
+        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+    }
+
+    acceptor.set_option(asio::socket_base::reuse_address(true), ec);
+    if (ec) {
+        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+    }
+
+    acceptor.bind(endpoint, ec);
+    if (ec) {
+        if (ec == boost::asio::error::address_in_use) {
+            FATAL_ERROR("Browser port ", endpoint.port(), " already in use, try using a different port");
+        } else {
+            FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        }
+    }
+    acceptor.listen(asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+    }
 
     while (true) {
         asio::ip::tcp::socket socket(*browser_io_context);
@@ -259,7 +285,7 @@ void Server::run(
 {
     asio::io_context io_context(num_workers);
 
-    Listener listener(*this, io_context, tcp::endpoint(tcp::v4(), port), query_timeout);
+    Listener listener(*this, io_context, ssl_ctx, tcp::endpoint(tcp::v4(), port), query_timeout);
 
     std::signal(SIGTERM, &signal_shutdown_server);
     std::signal(SIGINT, &signal_shutdown_server);
@@ -283,15 +309,18 @@ void Server::run(
     listener.run();
     work_guard.reset();
 
-    std::cout << "MillenniumDB HTTP/WebSocket server listening on http://localhost:" << port << "\n";
+    logger.info() << "Server started";
+    std::cout << "\nMillenniumDB HTTP/WebSocket server listening on http://localhost:" << port << "\n";
+    if (ssl_ctx.has_value()) {
+        std::cout << "MillenniumDB HTTPS/WSS server listening on https://localhost:" << port << "\n";
+    }
 
     std::unique_ptr<asio::io_context> browser_io_context;
     if (launch_browser) {
         browser_io_context = std::make_unique<asio::io_context>(1);
         std::thread browser_listener_thread(browser_listener, browser_io_context.get(), browser_port);
         browser_listener_thread.detach();
-        std::cout << "MillenniumDB browser interface is available at http://localhost:" << browser_port
-                  << "\n";
+        std::cout << "MillenniumDB browser interface available at http://localhost:" << browser_port << "\n";
     }
 
     std::cout << "\nTo terminate the server, press Ctrl+C" << std::endl;
@@ -311,6 +340,8 @@ void Server::run(
     // Wait for all threads in the thread pool to exit
     for (auto& thread : threads)
         thread.join();
+
+    logger.info() << "Server shutdown";
 }
 
 void Server::signal_shutdown_server(int)
@@ -389,4 +420,11 @@ std::pair<std::string, std::chrono::system_clock::time_point>
 void Server::set_admin_user(const std::string& user, const std::string& password)
 {
     users.emplace_back(user, password);
+}
+
+void Server::enable_ssl(const std::string& cert_file, const std::string& key_file)
+{
+    ssl_ctx.emplace(asio::ssl::context(asio::ssl::context::tls_server));
+    ssl_ctx->use_certificate_chain_file(cert_file);
+    ssl_ctx->use_private_key_file(key_file, boost::asio::ssl::context::pem);
 }
