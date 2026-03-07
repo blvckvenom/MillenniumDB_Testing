@@ -88,6 +88,11 @@ public:
      */
     void set_random_seed(uint64_t seed);
 
+    /**
+     * @brief Get the current random seed (for template use).
+     */
+    uint64_t get_random_seed() const;
+
     // =========================================================================
     // Sampling Interface
     // =========================================================================
@@ -149,9 +154,8 @@ auto ReservoirSampler::sample_stream(Iterator begin, Iterator end, uint64_t k)
     std::vector<T> reservoir;
     reservoir.reserve(k);
 
-    // Need access to impl_->rng, but template must be in header
-    // Use a local RNG seeded from the impl's seed
-    std::mt19937_64 rng(42);  // Will be properly seeded in actual use
+    // Template can't access impl_->rng directly (pimpl), use bridge method
+    std::mt19937_64 rng(get_random_seed());
 
     uint64_t count = 0;
     for (auto it = begin; it != end; ++it, ++count) {

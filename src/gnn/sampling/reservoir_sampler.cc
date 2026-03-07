@@ -181,6 +181,10 @@ void ReservoirSampler::set_random_seed(uint64_t seed) {
     impl_->rng.seed(seed);
 }
 
+uint64_t ReservoirSampler::get_random_seed() const {
+    return impl_->random_seed;
+}
+
 std::vector<std::pair<ObjectId, ObjectId>> ReservoirSampler::sample_neighbors(
     ObjectId node_id,
     EdgeOrientation orientation
