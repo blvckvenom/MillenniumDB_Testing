@@ -2,10 +2,10 @@
 
 #include <cstring>
 #include <filesystem>
-#include <iostream>
 #include <memory>
 
 #include "graph_models/common/datatypes/tensor/operations/avx.h"
+#include "misc/logger.h"
 #include "graph_models/quad_model/quad_model.h"
 #include "storage/index/hnsw/hnsw_prefetch.h"
 #include "storage/index/hnsw/hnsw_thread_pool.h"
@@ -637,9 +637,6 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings(
     uint64_t dim
 )
 {
-    std::cerr << "[DEBUG] index_from_raw_embeddings: START - num_nodes=" << num_nodes
-              << ", dim=" << dim << ", params.dimensions=" << params.dimensions << std::endl;
-
     if (dim != params.dimensions) {
         throw std::runtime_error(
             "Embedding dimension mismatch: expected " + std::to_string(params.dimensions) +
@@ -649,26 +646,18 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings(
 
     // Switch to raw embeddings mode
     uses_raw_embeddings_ = true;
-    std::cerr << "[DEBUG] index_from_raw_embeddings: Resizing raw_embeddings_ to " << (num_nodes * dim) << std::endl;
 
     // Copy embeddings into internal storage
     raw_embeddings_.resize(num_nodes * dim);
-    std::cerr << "[DEBUG] index_from_raw_embeddings: raw_embeddings_ resized, copying data..." << std::endl;
     std::memcpy(raw_embeddings_.data(), embeddings, num_nodes * dim * sizeof(float));
-    std::cerr << "[DEBUG] index_from_raw_embeddings: Data copied successfully" << std::endl;
 
     // Reserve space for nodes
     node_storage.reserve(num_nodes);
     node_neighbors_at_layer.reserve(num_nodes);
-    std::cerr << "[DEBUG] index_from_raw_embeddings: Storage reserved, starting node insertion loop" << std::endl;
 
     uint_fast32_t total_indexed = 0;
 
     for (uint64_t node_id = 0; node_id < num_nodes; ++node_id) {
-        if (node_id < 5 || node_id % 10000 == 0) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: Processing node " << node_id << "/" << num_nodes << std::endl;
-        }
-
         const float* node_embedding = embeddings + (node_id * dim);
 
         // Create ObjectId for the node (GQL node encoding)
@@ -678,18 +667,10 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings(
 
         // Create new node at a random layer
         const uint64_t node_top_layer = get_random_layer();
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: node_id=" << node_id
-                      << ", node_top_layer=" << node_top_layer << std::endl;
-        }
         const uint64_t internal_node_id = create_new_node(node_oid, tensor_marker, node_top_layer);
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: internal_node_id=" << internal_node_id << std::endl;
-        }
 
         if (internal_node_id == 0) {
             // First node - just update params
-            std::cerr << "[DEBUG] index_from_raw_embeddings: First node, setting entry_point" << std::endl;
             params.entry_point_id = 0;
             params.layers = node_top_layer + 1;
             ++total_indexed;
@@ -697,39 +678,22 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings(
         }
 
         // Get entry point embedding
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: Getting entry point embedding, entry_point_id="
-                      << params.entry_point_id << std::endl;
-        }
         const float* entry_embedding = get_raw_embedding(params.entry_point_id);
         if (entry_embedding == nullptr) {
-            std::cerr << "[ERROR] index_from_raw_embeddings: entry_embedding is NULL!" << std::endl;
+            logger.error() << "index_from_raw_embeddings: entry_embedding is NULL!";
             continue;
         }
 
         // Compute distance to entry point
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: Creating tensors for distance computation" << std::endl;
-        }
         tensor::Tensor<float> query_tensor(node_embedding, node_embedding + dim);
         tensor::Tensor<float> entry_tensor(entry_embedding, entry_embedding + dim);
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: Computing distance" << std::endl;
-        }
         const float entry_dist = metric_func(query_tensor, entry_tensor);
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: entry_dist=" << entry_dist << std::endl;
-        }
 
         std::vector<Entry> entry_points;
         entry_points.emplace_back(entry_dist, params.entry_point_id);
 
         // Update the best entry point for layers in range [top_layer, node_top_layer)
         const uint64_t top_layer = params.layers - 1;
-        if (node_id < 5) {
-            std::cerr << "[DEBUG] index_from_raw_embeddings: top_layer=" << top_layer
-                      << ", node_top_layer=" << node_top_layer << std::endl;
-        }
         for (uint64_t current_layer = top_layer; current_layer > node_top_layer; --current_layer) {
             auto current_layer_nns = search_at_layer_raw<false>(
                 node_embedding,
@@ -799,32 +763,24 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings_parallel(
         return index_from_raw_embeddings(embeddings, num_nodes, dim);
     }
 
-    std::cerr << "[DEBUG] parallel: Starting Phase 1 - Setup" << std::endl;
-
     // ========== Phase 1: Setup (single-threaded) ==========
     uses_raw_embeddings_ = true;
 
     // Copy embeddings into internal storage
-    std::cerr << "[DEBUG] parallel: Resizing raw_embeddings_ to " << (num_nodes * dim) << std::endl;
     raw_embeddings_.resize(num_nodes * dim);
-    std::cerr << "[DEBUG] parallel: Copying embeddings" << std::endl;
     std::memcpy(raw_embeddings_.data(), embeddings, num_nodes * dim * sizeof(float));
 
     // Pre-allocate storage
-    std::cerr << "[DEBUG] parallel: Reserving node storage" << std::endl;
     node_storage.reserve(num_nodes);
     node_neighbors_at_layer.reserve(num_nodes);
     raw_embedding_norms_.resize(num_nodes);
 
     // Initialize per-node locks for fine-grained synchronization
-    std::cerr << "[DEBUG] parallel: Creating per-node locks for " << num_nodes << " nodes" << std::endl;
     node_locks_ = std::make_unique<std::mutex[]>(num_nodes);
 
-    std::cerr << "[DEBUG] parallel: Creating thread pool with " << num_threads << " threads" << std::endl;
     ThreadPool pool(num_threads);
 
     // ========== Phase 2: Compute norms (parallel) ==========
-    std::cerr << "[DEBUG] parallel: Starting Phase 2 - Compute norms" << std::endl;
     pool.parallel_for(0, num_nodes, [this, dim](size_t i) {
         const float* emb = get_raw_embedding(static_cast<uint32_t>(i));
         if (emb != nullptr) {
@@ -833,18 +789,14 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings_parallel(
             raw_embedding_norms_[i] = 0.0f;  // Safe default for invalid embeddings
         }
     });
-    std::cerr << "[DEBUG] parallel: Phase 2 complete" << std::endl;
 
     // ========== Phase 3: Generate layer assignments (sequential, deterministic) ==========
-    std::cerr << "[DEBUG] parallel: Starting Phase 3 - Generate layer assignments" << std::endl;
     std::vector<uint64_t> node_layers(num_nodes);
     for (uint64_t i = 0; i < num_nodes; ++i) {
         node_layers[i] = get_random_layer();
     }
-    std::cerr << "[DEBUG] parallel: Phase 3 complete" << std::endl;
 
     // ========== Phase 4: Insert first node (establishes entry point) ==========
-    std::cerr << "[DEBUG] parallel: Starting Phase 4 - Insert first node" << std::endl;
     {
         ObjectId node_oid(ObjectId::MASK_NODE | 0);
         ObjectId tensor_marker(ObjectId::MASK_TENSOR_FLOAT_TMP | 0);
@@ -852,21 +804,13 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings_parallel(
         params.entry_point_id = 0;
         params.layers = node_layers[0] + 1;
     }
-    std::cerr << "[DEBUG] parallel: Phase 4 complete, entry_point layers=" << params.layers << std::endl;
 
     // ========== Phase 5: Batch parallel insertion ==========
-    std::cerr << "[DEBUG] parallel: Starting Phase 5 - Batch parallel insertion" << std::endl;
     const size_t batch_size = std::max(size_t(500), num_threads * 16);
-    std::cerr << "[DEBUG] parallel: batch_size=" << batch_size << std::endl;
 
     for (uint64_t batch_start = 1; batch_start < num_nodes; batch_start += batch_size) {
         const uint64_t batch_end = std::min(batch_start + batch_size, num_nodes);
         const size_t batch_count = batch_end - batch_start;
-
-        if (batch_start % 10000 < batch_size) {
-            std::cerr << "[DEBUG] parallel: Processing batch " << batch_start << "-" << batch_end
-                      << " (progress: " << batch_start << "/" << num_nodes << ")" << std::endl;
-        }
 
         // Structure to hold search results for each node in batch
         struct NodeSearchResult {

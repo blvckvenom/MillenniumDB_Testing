@@ -18,8 +18,6 @@ using namespace GQL;
 using namespace GQL::Procedures;
 
 void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
-    std::cerr << "[DEBUG] gnn_hnsw_create: Starting execution" << std::endl;
-
     // Step 1: Validate argument count
     if (ctx.arguments.size() < 2 || ctx.arguments.size() > 3) {
         throw std::runtime_error(
@@ -120,9 +118,6 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    std::cerr << "[DEBUG] gnn_hnsw_create: Parsed arguments - index_name='" << index_name
-              << "', tensor_key='" << tensor_key << "', threads=" << num_threads << std::endl;
-
     // Step 6: Check if GNN tensors are available
     if (!gql_model.catalog.has_gnn_tensors) {
         throw std::runtime_error(
@@ -134,21 +129,16 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 7: Load GNN tensor store
-    std::cerr << "[DEBUG] gnn_hnsw_create: Loading GNN tensor store" << std::endl;
     std::string db_folder = file_manager.get_file_path("");
     if (!db_folder.empty() && db_folder.back() == '/') {
         db_folder.pop_back();
     }
 
     std::string gnn_path = db_folder + "/gnn_tensors";
-    std::cerr << "[DEBUG] gnn_hnsw_create: GNN path = " << gnn_path << std::endl;
     mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE, false);
-    std::cerr << "[DEBUG] gnn_hnsw_create: Tensor store loaded successfully" << std::endl;
 
     // Step 8: Load the tensor
-    std::cerr << "[DEBUG] gnn_hnsw_create: Loading tensor '" << tensor_key << "'" << std::endl;
     auto tensor_view = tensor_store.load(tensor_key);
-    std::cerr << "[DEBUG] gnn_hnsw_create: tensor_view.valid() = " << tensor_view.valid() << std::endl;
     if (!tensor_view.valid()) {
         // List available keys for helpful error message
         auto keys = tensor_store.list_keys();
@@ -170,11 +160,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 9: Validate tensor shape
-    std::cerr << "[DEBUG] gnn_hnsw_create: Getting tensor shape" << std::endl;
     const auto& shape = tensor_view.shape();
-    std::cerr << "[DEBUG] gnn_hnsw_create: shape.size() = " << shape.size() << std::endl;
-    if (shape.size() >= 1) std::cerr << "[DEBUG] gnn_hnsw_create: shape[0] = " << shape[0] << std::endl;
-    if (shape.size() >= 2) std::cerr << "[DEBUG] gnn_hnsw_create: shape[1] = " << shape[1] << std::endl;
     if (shape.size() != 2) {
         throw std::runtime_error(
             "Invalid tensor shape: expected 2D tensor [num_nodes, embedding_dim], "
@@ -193,13 +179,10 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 10: Create HNSW index
-    std::cerr << "[DEBUG] gnn_hnsw_create: Creating HNSW index with dim=" << dimension
-              << ", M=" << M << ", ef=" << ef_construction << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // Get metric function
     HNSW::MetricFuncType metric_func = HNSW::metric_type2metric_func(metric);
-    std::cerr << "[DEBUG] gnn_hnsw_create: Got metric function" << std::endl;
 
     // Create the index
     auto hnsw_index = HNSW::HNSWIndex::create(
@@ -209,12 +192,9 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         ef_construction,
         metric_func
     );
-    std::cerr << "[DEBUG] gnn_hnsw_create: HNSW index created successfully" << std::endl;
 
     // Step 11: Index the embeddings (parallel if multiple threads specified)
-    std::cerr << "[DEBUG] gnn_hnsw_create: Getting embeddings pointer" << std::endl;
     const float* embeddings = tensor_view.data_as<float>();
-    std::cerr << "[DEBUG] gnn_hnsw_create: embeddings pointer = " << (void*)embeddings << std::endl;
 
     // Defensive validation: ensure embeddings pointer is valid
     if (embeddings == nullptr) {
@@ -226,27 +206,17 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
 
     // Additional validation: verify first and last embedding are accessible
     // This helps catch memory mapping issues early
-    std::cerr << "[DEBUG] gnn_hnsw_create: Validating embedding access..." << std::endl;
     if (num_nodes > 0 && dimension > 0) {
-        std::cerr << "[DEBUG] gnn_hnsw_create: Accessing first element" << std::endl;
         volatile float first_check = embeddings[0];
-        std::cerr << "[DEBUG] gnn_hnsw_create: first_check = " << first_check << std::endl;
-        std::cerr << "[DEBUG] gnn_hnsw_create: Accessing last element at offset " << ((num_nodes - 1) * dimension) << std::endl;
         volatile float last_check = embeddings[(num_nodes - 1) * dimension];
-        std::cerr << "[DEBUG] gnn_hnsw_create: last_check = " << last_check << std::endl;
         (void)first_check;
         (void)last_check;
     }
-    std::cerr << "[DEBUG] gnn_hnsw_create: Embedding validation passed" << std::endl;
 
     uint_fast32_t indexed_count;
 
-    std::cerr << "[DEBUG] gnn_hnsw_create: Starting indexing with num_threads=" << num_threads
-              << ", num_nodes=" << num_nodes << std::endl;
-
     if (num_threads > 1 && num_nodes >= 1000) {
         // Use parallel construction for large datasets
-        std::cerr << "[DEBUG] gnn_hnsw_create: Using PARALLEL construction" << std::endl;
         indexed_count = hnsw_index->index_from_raw_embeddings_parallel(
             embeddings,
             num_nodes,
@@ -255,14 +225,12 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     } else {
         // Use sequential construction for small datasets or single thread
-        std::cerr << "[DEBUG] gnn_hnsw_create: Using SEQUENTIAL construction" << std::endl;
         indexed_count = hnsw_index->index_from_raw_embeddings(
             embeddings,
             num_nodes,
             dimension
         );
     }
-    std::cerr << "[DEBUG] gnn_hnsw_create: Indexing complete, indexed_count=" << indexed_count << std::endl;
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
