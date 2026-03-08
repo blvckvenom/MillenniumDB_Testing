@@ -23,6 +23,7 @@
 
 #include "gnn_dtype.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -99,9 +100,14 @@ public:
     /// @brief Returns the generation counter at the time this view was created
     uint64_t generation() const { return generation_; }
 
-    /// @brief Typed data access (no bounds checking)
+    /// @brief Typed data access (debug-checked)
     template<typename T>
-    const T* data_as() const { return static_cast<const T*>(data_); }
+    const T* data_as() const {
+        assert(data_ != nullptr && "data_as() called on invalid view");
+        assert(sizeof(T) == dtype_size(metadata_.dtype)
+               && "data_as<T>() type size mismatch with tensor dtype");
+        return static_cast<const T*>(data_);
+    }
 
 private:
     const void* data_ = nullptr;
