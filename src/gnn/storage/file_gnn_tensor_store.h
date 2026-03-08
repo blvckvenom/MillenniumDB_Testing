@@ -192,6 +192,7 @@ private:
 
     // In-memory index
     mutable std::shared_mutex mutex_;
+    mutable std::mutex shard_mutex_;
     std::unordered_map<std::string, IndexEntry> index_;
     size_t total_bytes_ = 0;
     size_t deleted_bytes_ = 0;

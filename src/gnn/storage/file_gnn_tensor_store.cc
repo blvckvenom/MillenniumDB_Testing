@@ -573,6 +573,7 @@ void FileGnnTensorStore::ensure_shard(uint32_t shard_id) {
 }
 
 void FileGnnTensorStore::map_shard(uint32_t shard_id) const {
+    std::lock_guard<std::mutex> shard_lock(shard_mutex_);
     // Ensure shards_ vector is large enough
     while (shards_.size() <= shard_id) {
         shards_.emplace_back();
