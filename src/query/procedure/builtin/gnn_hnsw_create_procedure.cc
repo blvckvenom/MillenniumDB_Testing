@@ -93,7 +93,8 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     HNSW::MetricType metric = HNSW::MetricType::COSINE_DISTANCE;
     uint64_t M = DEFAULT_M;
     uint64_t ef_construction = DEFAULT_EF_CONSTRUCTION;
-    size_t num_threads = std::thread::hardware_concurrency();  // Default: use all cores
+    const unsigned int hw_threads = std::thread::hardware_concurrency();
+    size_t num_threads = (hw_threads > 0) ? hw_threads : 1;  // Default: use all cores (fallback to 1 if unknown)
 
     if (ctx.arguments.size() >= 3) {
         try {
@@ -336,20 +337,23 @@ void GnnHnswCreateProcedure::parse_options(
             throw std::runtime_error("threads must be >= 1, got: " + std::to_string(*v));
         }
 
-        // Security check: prevent requesting more threads than available
-        const size_t max_threads = std::thread::hardware_concurrency();
-        if (max_threads > 0 && static_cast<size_t>(*v) > max_threads) {
+        // Resource check: prevent requesting more threads than available
+        const unsigned int hw_threads = std::thread::hardware_concurrency();
+        if (hw_threads == 0) {
+            // System can't determine thread count — accept any value
+            num_threads = static_cast<size_t>(*v);
+        } else if (static_cast<size_t>(*v) > hw_threads) {
             throw std::runtime_error(
-                "SECURITY WARNING: Requested " + std::to_string(*v) + " threads, "
-                "but only " + std::to_string(max_threads) + " hardware threads available.\n\n"
+                "RESOURCE WARNING: Requested " + std::to_string(*v) + " threads, "
+                "but only " + std::to_string(hw_threads) + " hardware threads available.\n\n"
                 "Requesting more threads than available can cause:\n"
                 "  - Excessive context switching overhead\n"
                 "  - Memory pressure from thread stacks\n"
                 "  - Potential system instability\n\n"
-                "Please specify threads <= " + std::to_string(max_threads) + " or omit the option to use all available cores."
+                "Please specify threads <= " + std::to_string(hw_threads) + " or omit the option to use all available cores."
             );
+        } else {
+            num_threads = static_cast<size_t>(*v);
         }
-
-        num_threads = static_cast<size_t>(*v);
     }
 }
