@@ -29,10 +29,9 @@ struct BatchNeighbors {
     }
 
     /// Get neighbors for a specific node (by ObjectId)
-    const std::vector<std::pair<ObjectId, ObjectId>>& get(ObjectId node_id) const {
-        static const std::vector<std::pair<ObjectId, ObjectId>> empty;
+    std::vector<std::pair<ObjectId, ObjectId>> get(ObjectId node_id) const {
         auto it = neighbors.find(node_id.id);
-        return it != neighbors.end() ? it->second : empty;
+        return it != neighbors.end() ? it->second : std::vector<std::pair<ObjectId, ObjectId>>{};
     }
 
     /// Check if a node has any neighbors (by raw uint64_t)
