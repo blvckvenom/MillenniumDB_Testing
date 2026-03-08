@@ -17,7 +17,7 @@ std::unique_ptr<QueryContext> query_ctx_ptr;
 
 #define ASSERT_TRUE(condition, message) \
     if (!(condition)) { \
-        std::cerr << "❌ FAIL: " << message << std::endl; \
+        std::cerr << "FAIL: " << message << std::endl; \
         failed_tests++; \
         return; \
     }
@@ -48,7 +48,7 @@ void init_test_database() {
     // Initialize projection manager
     ProjectionManager::get_instance().init("/tmp/test_properties_db");
 
-    std::cout << "✅ Test database initialized" << std::endl;
+    std::cout << "OK: Test database initialized" << std::endl;
 }
 
 // Test 1: Create projection WITHOUT properties
@@ -61,7 +61,7 @@ void test_baseline_projection() {
         builder.scan_edges_by_types({"Friend"});
         auto stats = builder.finalize();
 
-        std::cout << "✅ Baseline projection created:" << std::endl;
+        std::cout << "OK: Baseline projection created:" << std::endl;
         std::cout << "   Nodes: " << stats.node_count << std::endl;
         std::cout << "   Relationships: " << stats.relationship_count << std::endl;
         std::cout << "   Duration: " << stats.duration_ms.count() << "ms" << std::endl;
@@ -70,9 +70,9 @@ void test_baseline_projection() {
         ASSERT_TRUE(stats.relationship_count > 0, "Relationship count should be > 0");
 
         passed_tests++;
-        std::cout << "✅ Test 1 PASSED" << std::endl;
+        std::cout << "OK: Test 1 PASSED" << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "❌ Test 1 FAILED: " << e.what() << std::endl;
+        std::cerr << "FAIL: Test 1 FAILED: " << e.what() << std::endl;
         failed_tests++;
     }
 }
@@ -88,7 +88,7 @@ void test_node_properties_projection() {
         builder.scan_edges_by_types({"Friend"});
         auto stats = builder.finalize();
 
-        std::cout << "✅ Node properties projection created:" << std::endl;
+        std::cout << "OK: Node properties projection created:" << std::endl;
         std::cout << "   Nodes: " << stats.node_count << std::endl;
         std::cout << "   Relationships: " << stats.relationship_count << std::endl;
         std::cout << "   Duration: " << stats.duration_ms.count() << "ms" << std::endl;
@@ -97,9 +97,9 @@ void test_node_properties_projection() {
         ASSERT_TRUE(stats.relationship_count > 0, "Relationship count should be > 0");
 
         passed_tests++;
-        std::cout << "✅ Test 2 PASSED" << std::endl;
+        std::cout << "OK: Test 2 PASSED" << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "❌ Test 2 FAILED: " << e.what() << std::endl;
+        std::cerr << "FAIL: Test 2 FAILED: " << e.what() << std::endl;
         failed_tests++;
     }
 }
@@ -115,7 +115,7 @@ void test_edge_properties_projection() {
         builder.scan_edges_by_types({"Friend"});
         auto stats = builder.finalize();
 
-        std::cout << "✅ Edge properties projection created:" << std::endl;
+        std::cout << "OK: Edge properties projection created:" << std::endl;
         std::cout << "   Nodes: " << stats.node_count << std::endl;
         std::cout << "   Relationships: " << stats.relationship_count << std::endl;
         std::cout << "   Duration: " << stats.duration_ms.count() << "ms" << std::endl;
@@ -124,9 +124,9 @@ void test_edge_properties_projection() {
         ASSERT_TRUE(stats.relationship_count > 0, "Relationship count should be > 0");
 
         passed_tests++;
-        std::cout << "✅ Test 3 PASSED" << std::endl;
+        std::cout << "OK: Test 3 PASSED" << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "❌ Test 3 FAILED: " << e.what() << std::endl;
+        std::cerr << "FAIL: Test 3 FAILED: " << e.what() << std::endl;
         failed_tests++;
     }
 }
@@ -143,7 +143,7 @@ void test_full_properties_projection() {
         builder.scan_edges_by_types({"Friend"});
         auto stats = builder.finalize();
 
-        std::cout << "✅ Full properties projection created:" << std::endl;
+        std::cout << "OK: Full properties projection created:" << std::endl;
         std::cout << "   Nodes: " << stats.node_count << std::endl;
         std::cout << "   Relationships: " << stats.relationship_count << std::endl;
         std::cout << "   Duration: " << stats.duration_ms.count() << "ms" << std::endl;
@@ -154,9 +154,9 @@ void test_full_properties_projection() {
         ASSERT_TRUE(stats.relationship_count > 0, "Relationship count should be > 0");
 
         passed_tests++;
-        std::cout << "✅ Test 4 PASSED" << std::endl;
+        std::cout << "OK: Test 4 PASSED" << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "❌ Test 4 FAILED: " << e.what() << std::endl;
+        std::cerr << "FAIL: Test 4 FAILED: " << e.what() << std::endl;
         failed_tests++;
     }
 }
@@ -180,10 +180,10 @@ int main(int argc, char** argv) {
     std::cout << "Failed: " << failed_tests << "/" << (passed_tests + failed_tests) << std::endl;
 
     if (failed_tests == 0) {
-        std::cout << "✅ ALL TESTS PASSED!" << std::endl;
+        std::cout << "ALL TESTS PASSED" << std::endl;
         return 0;
     } else {
-        std::cerr << "❌ SOME TESTS FAILED" << std::endl;
+        std::cerr << "SOME TESTS FAILED" << std::endl;
         return 1;
     }
 }
