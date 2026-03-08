@@ -372,12 +372,33 @@ size_t FileGnnTensorStore::compact() {
 
         // Write to new shard
         auto new_shard_path = temp_path / ("data_" + std::to_string(new_shard_id) + ".bin");
-        int fd = open(new_shard_path.c_str(), O_WRONLY | O_CREAT, 0644);
-        if (fd >= 0) {
-            lseek(fd, static_cast<off_t>(new_offset), SEEK_SET);
-            write(fd, old_data, entry.metadata.byte_size);
-            close(fd);
+        int fd = open(new_shard_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            std::filesystem::remove_all(temp_path);
+            throw std::runtime_error("compact: failed to create shard: " + new_shard_path.string());
         }
+
+        if (lseek(fd, static_cast<off_t>(new_offset), SEEK_SET) < 0) {
+            close(fd);
+            std::filesystem::remove_all(temp_path);
+            throw std::runtime_error("compact: lseek failed");
+        }
+
+        const char* write_ptr = static_cast<const char*>(old_data);
+        size_t remaining = entry.metadata.byte_size;
+        while (remaining > 0) {
+            ssize_t written = ::write(fd, write_ptr, remaining);
+            if (written < 0) {
+                close(fd);
+                std::filesystem::remove_all(temp_path);
+                throw std::runtime_error("compact: write failed: " + std::string(strerror(errno)));
+            }
+            write_ptr += written;
+            remaining -= static_cast<size_t>(written);
+        }
+
+        fsync(fd);
+        close(fd);
 
         new_shard_sizes[new_shard_id] = new_offset + aligned_size;
 
@@ -388,24 +409,35 @@ size_t FileGnnTensorStore::compact() {
         new_index[key] = new_entry;
     }
 
-    // Unmap old shards
+    // Phase 1: Unmap old shards
     unmap_all_shards();
 
-    // Remove old files
-    std::filesystem::remove(index_path());
+    // Phase 2: Rename old files to .bak (recoverable)
     for (uint32_t i = 0; ; ++i) {
         auto path = shard_path(i);
-        if (!std::filesystem::exists(path)) {
-            break;
-        }
-        std::filesystem::remove(path);
+        if (!std::filesystem::exists(path)) break;
+        std::filesystem::rename(path, std::filesystem::path(path.string() + ".bak"));
+    }
+    auto idx_path = index_path();
+    if (std::filesystem::exists(idx_path)) {
+        std::filesystem::rename(idx_path, std::filesystem::path(idx_path.string() + ".bak"));
     }
 
-    // Move new files to main location
-    for (const auto& entry : std::filesystem::directory_iterator(temp_path)) {
-        std::filesystem::rename(entry.path(), base_path_ / entry.path().filename());
+    // Phase 3: Move new files into place
+    for (const auto& dir_entry : std::filesystem::directory_iterator(temp_path)) {
+        std::filesystem::rename(dir_entry.path(), base_path_ / dir_entry.path().filename());
     }
     std::filesystem::remove(temp_path);
+
+    // Phase 4: Delete .bak files (safe — new files in place)
+    for (uint32_t i = 0; ; ++i) {
+        auto bak = std::filesystem::path(shard_path(i).string() + ".bak");
+        if (!std::filesystem::exists(bak)) break;
+        std::filesystem::remove(bak);
+    }
+    if (auto idx_bak = std::filesystem::path(idx_path.string() + ".bak"); std::filesystem::exists(idx_bak)) {
+        std::filesystem::remove(idx_bak);
+    }
 
     // Update state
     index_ = std::move(new_index);
