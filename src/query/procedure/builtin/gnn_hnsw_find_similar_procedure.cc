@@ -113,21 +113,9 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
     if (hnsw_index == nullptr) {
         // List available indexes for helpful error
         auto index_names = gql_model.catalog.hnsw_index_manager.get_index_names();
-        std::string available;
-        if (index_names.empty()) {
-            available = "No HNSW indexes exist. Create one first with:\n"
-                        "  CALL gnn.hnsw.create('index_name', 'node_features')";
-        } else {
-            available = "Available indexes: [";
-            for (size_t i = 0; i < index_names.size(); i++) {
-                if (i > 0) available += ", ";
-                available += "'" + index_names[i] + "'";
-            }
-            available += "]";
-        }
-
         throw std::runtime_error(
-            "HNSW index '" + index_name + "' not found.\n\n" + available
+            format_not_found_error("HNSW index", index_name, index_names,
+                                   "CALL gnn.hnsw.create('index_name', 'node_features')")
         );
     }
 

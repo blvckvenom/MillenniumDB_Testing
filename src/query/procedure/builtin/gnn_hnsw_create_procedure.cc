@@ -165,20 +165,8 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     if (!tensor_view.valid()) {
         // List available keys for helpful error message
         auto keys = tensor_store.list_keys();
-        std::string available;
-        if (keys.empty()) {
-            available = "No tensors found in the store.";
-        } else {
-            available = "Available tensor keys: [";
-            for (size_t i = 0; i < keys.size(); i++) {
-                if (i > 0) available += ", ";
-                available += "'" + keys[i] + "'";
-            }
-            available += "]";
-        }
-
         throw std::runtime_error(
-            "Tensor '" + tensor_key + "' not found in GNN tensor store.\n\n" + available
+            format_not_found_error("tensor key", tensor_key, keys)
         );
     }
 

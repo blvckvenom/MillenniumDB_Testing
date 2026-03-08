@@ -133,21 +133,14 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     if (!manager.projection_exists(projection_name)) {
         // Provide helpful error with available projections
         auto projections = manager.list_projections();
-        std::string available;
-        if (projections.empty()) {
-            available = "No projections exist. Create one first with:\n"
-                        "  CALL graph_project('name', 'NodeLabel', 'EdgeType')";
-        } else {
-            available = "Available projections: [";
-            for (size_t i = 0; i < projections.size(); i++) {
-                if (i > 0) available += ", ";
-                available += "'" + projections[i].name + "'";
-            }
-            available += "]";
+        std::vector<std::string> proj_names;
+        proj_names.reserve(projections.size());
+        for (const auto& p : projections) {
+            proj_names.push_back(p.name);
         }
-
         throw std::runtime_error(
-            "Projection '" + projection_name + "' not found.\n\n" + available
+            format_not_found_error("projection", projection_name, proj_names,
+                                   "CALL graph_project('name', 'NodeLabel', 'EdgeType')")
         );
     }
 

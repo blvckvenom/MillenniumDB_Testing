@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "gnn_procedure_utils.h"
 #include "graph_models/gql/gql_model.h"
 #include "storage/index/hnsw/hnsw_metric.h"
 
@@ -38,20 +39,8 @@ void GnnHnswInfoProcedure::execute(ProcedureContext& ctx) {
     auto* index = gql_model.catalog.hnsw_index_manager.get_hnsw_index(index_name);
     if (index == nullptr) {
         auto index_names = gql_model.catalog.hnsw_index_manager.get_index_names();
-        std::string available;
-        if (index_names.empty()) {
-            available = "No HNSW indexes exist.";
-        } else {
-            available = "Available indexes: [";
-            for (size_t i = 0; i < index_names.size(); i++) {
-                if (i > 0) available += ", ";
-                available += "'" + index_names[i] + "'";
-            }
-            available += "]";
-        }
-
         throw std::runtime_error(
-            "HNSW index '" + index_name + "' not found.\n\n" + available
+            format_not_found_error("HNSW index", index_name, index_names)
         );
     }
 

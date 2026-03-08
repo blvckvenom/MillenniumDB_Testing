@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "gnn_procedure_utils.h"
 #include "graph_models/gql/gql_model.h"
 
 using namespace GQL;
@@ -39,20 +40,8 @@ void GnnHnswDropProcedure::execute(ProcedureContext& ctx) {
     if (!success) {
         // Index not found - provide helpful error
         auto index_names = gql_model.catalog.hnsw_index_manager.get_index_names();
-        std::string available;
-        if (index_names.empty()) {
-            available = "No HNSW indexes exist.";
-        } else {
-            available = "Available indexes: [";
-            for (size_t i = 0; i < index_names.size(); i++) {
-                if (i > 0) available += ", ";
-                available += "'" + index_names[i] + "'";
-            }
-            available += "]";
-        }
-
         throw std::runtime_error(
-            "HNSW index '" + index_name + "' not found.\n\n" + available
+            format_not_found_error("HNSW index", index_name, index_names)
         );
     }
 
