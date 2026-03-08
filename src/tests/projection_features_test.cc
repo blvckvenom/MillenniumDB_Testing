@@ -15,9 +15,11 @@ int main() {
     std::cout << "=== Phase A3: Backward Compatibility & Optional Features Test ===" << std::endl;
 
     try {
+        std::filesystem::remove_all("test_db_features");
+
         // Initialize system
         System system(
-            "test_db",
+            "test_db_features",
             1024 * 1024,      // str_static_size
             1024 * 1024,      // str_dynamic_size
             64 * 1024 * 1024, // shared_buffer_size
@@ -31,13 +33,13 @@ int main() {
         QueryContext::set_query_ctx(&query_ctx);
 
         auto& manager = GQL::ProjectionManager::get_instance();
-        manager.init("test_db");
+        manager.init("test_db_features");
 
         // Test 1: Create v1.0-style projection (no optional features)
         std::cout << "\nTest 1: Creating v1.0-style projection (topology only)...";
         std::string proj_v1_dir = manager.create_projection("legacy_projection");
         {
-            GQL::ProjectionStorage storage(proj_v1_dir, "test_db", "legacy_projection");
+            GQL::ProjectionStorage storage(proj_v1_dir, "test_db_features", "legacy_projection");
             storage.init();
 
             // Add some data
@@ -92,7 +94,7 @@ int main() {
         // Test 3: Open v1.0 projection and verify no optional indexes
         std::cout << "Test 3: Opening v1.0 projection (backward compatibility)...";
         {
-            GQL::ProjectionStorage storage(proj_v1_dir, "test_db");
+            GQL::ProjectionStorage storage(proj_v1_dir, "test_db_features");
             storage.open();
 
             // Required indexes should exist
@@ -137,7 +139,7 @@ int main() {
             features.include_node_properties = true;
             features.include_edge_properties = true;
 
-            GQL::ProjectionStorage storage(proj_v1_1_dir, "test_db", "full_featured_projection", features);
+            GQL::ProjectionStorage storage(proj_v1_1_dir, "test_db_features", "full_featured_projection", features);
             storage.init();
 
             // Add data
@@ -188,7 +190,7 @@ int main() {
         // Test 6: Open v1.1 projection and verify optional indexes exist
         std::cout << "Test 6: Opening v1.1 projection (auto-detection)...";
         {
-            GQL::ProjectionStorage storage(proj_v1_1_dir, "test_db");
+            GQL::ProjectionStorage storage(proj_v1_1_dir, "test_db_features");
             storage.open();
 
             // All indexes should exist (required + optional)
@@ -228,7 +230,7 @@ int main() {
             features.include_node_properties = false;
             features.include_edge_properties = false;
 
-            GQL::ProjectionStorage storage(proj_selective_dir, "test_db", "selective_projection", features);
+            GQL::ProjectionStorage storage(proj_selective_dir, "test_db_features", "selective_projection", features);
             storage.init();
 
             GQL::ProjectedNode node;
@@ -242,7 +244,7 @@ int main() {
         // Test 8: Verify selective features
         std::cout << "Test 8: Verifying selective features...";
         {
-            GQL::ProjectionStorage storage(proj_selective_dir, "test_db");
+            GQL::ProjectionStorage storage(proj_selective_dir, "test_db_features");
             storage.open();
 
             // Only node label index should exist
@@ -301,6 +303,7 @@ int main() {
         std::cout << " OK" << std::endl;
 
         std::cout << "\n=== All Phase A3 tests passed! ===" << std::endl;
+        std::filesystem::remove_all("test_db_features");
         return 0;
 
     } catch (const std::exception& e) {

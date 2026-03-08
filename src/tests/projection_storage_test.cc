@@ -1,4 +1,5 @@
 #include <iostream>
+#include <filesystem>
 
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_manager.h"
@@ -9,13 +10,15 @@
 
 // Simple test to verify projection storage layer compiles and links correctly
 int main() {
+    std::filesystem::remove_all("test_db_storage");
+
     std::cout << "Testing projection storage layer..." << std::endl;
 
     try {
         // Initialize system (including file_manager)
         // Use minimal buffer sizes for testing
         System system(
-            "test_db",              // db_folder
+            "test_db_storage",      // db_folder
             1024 * 1024,            // str_static_size (1MB)
             1024 * 1024,            // str_dynamic_size (1MB)
             64 * 1024 * 1024,       // shared_buffer_size (64MB)
@@ -32,7 +35,7 @@ int main() {
         // Test 1: ProjectionManager singleton
         std::cout << "Test 1: ProjectionManager initialization...";
         auto& manager = GQL::ProjectionManager::get_instance();
-        manager.init("test_db");
+        manager.init("test_db_storage");
         std::cout << " OK" << std::endl;
 
         // Test 2: Create a projection
@@ -52,7 +55,7 @@ int main() {
 
         // Test 4: ProjectionStorage initialization
         std::cout << "Test 4: ProjectionStorage initialization...";
-        GQL::ProjectionStorage storage(proj_dir, "test_db");
+        GQL::ProjectionStorage storage(proj_dir, "test_db_storage");
         storage.init();
         std::cout << " OK" << std::endl;
 
@@ -96,6 +99,7 @@ int main() {
         std::cout << " OK (dropped: " << (dropped ? "yes" : "no") << ")" << std::endl;
 
         std::cout << "\nAll tests passed!" << std::endl;
+        std::filesystem::remove_all("test_db_storage");
         return 0;
 
     } catch (const std::exception& e) {
