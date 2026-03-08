@@ -99,7 +99,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     double train_ratio = 0.7;
     double val_ratio = 0.15;
     double test_ratio = 0.15;
-    uint64_t random_seed = 42;
+    uint64_t random_seed = SamplingConfig::DEFAULT_RANDOM_SEED;
     std::string orientation_str = "REVERSE";
 
     if (ctx.arguments.size() >= 4) {

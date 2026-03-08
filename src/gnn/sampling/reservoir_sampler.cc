@@ -2,6 +2,7 @@
 
 #include <unordered_set>
 
+#include "gnn/sampling/sampling_config.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -14,7 +15,7 @@ namespace mdb::gnn {
 struct ReservoirSampler::Impl {
     GQL::ProjectionStorage& storage;
     uint64_t sample_size = 15;
-    uint64_t random_seed = 42;
+    uint64_t random_seed = SamplingConfig::DEFAULT_RANDOM_SEED;
     std::mt19937_64 rng;
     uint64_t last_stream_size_ = 0;
 

@@ -149,7 +149,8 @@ struct SamplingConfig {
     // Reproducibility
     // =========================================================================
 
-    uint64_t random_seed = 42;  ///< Random seed for deterministic sampling
+    static constexpr uint64_t DEFAULT_RANDOM_SEED = 42;
+    uint64_t random_seed = DEFAULT_RANDOM_SEED;  ///< Random seed for deterministic sampling
 
     // =========================================================================
     // Memory Optimization
