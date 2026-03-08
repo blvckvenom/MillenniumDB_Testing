@@ -525,10 +525,9 @@ HNSWHeap HNSWIndex::search_at_layer(
         // explore candidate's neighborhood
         for (const Entry& candidate_neighbor_entry : node_neighbors_at_layer[candidate_entry.node_id][layer])
         {
-            if (visited_set_ptr->contains(candidate_neighbor_entry.node_id)) {
+            if (visited_set_ptr->test_and_set(candidate_neighbor_entry.node_id)) {
                 continue;
             }
-            visited_set_ptr->emplace(candidate_neighbor_entry.node_id);
 
             const auto candidate_neighbor_tensor = Common::Conversions::to_tensor<float>(
                 node_storage[candidate_neighbor_entry.node_id].tensor_oid
@@ -1057,6 +1056,10 @@ HNSWHeap HNSWIndex::search_at_layer_raw(
     // Check if we have pre-computed norms available
     const bool use_optimized_distance = !raw_embedding_norms_.empty();
 
+    // Pre-allocate scratch tensors for fallback distance computation (avoids per-iteration allocation)
+    tensor::Tensor<float> query_tensor_scratch(query_embedding, query_embedding + params.dimensions);
+    tensor::Tensor<float> neighbor_tensor_scratch(params.dimensions);
+
     while (!candidates_heap.empty()) {
         const Entry candidate_entry = candidates_heap.get_min();
         if (candidate_entry.distance > top_k_heap.get_max().distance) {
@@ -1095,7 +1098,7 @@ HNSWHeap HNSWIndex::search_at_layer_raw(
 
         // Explore candidate's neighborhood
         for (const Entry& candidate_neighbor_entry : neighbors) {
-            if (visited_set_ptr->contains(candidate_neighbor_entry.node_id)) {
+            if (visited_set_ptr->test_and_set(candidate_neighbor_entry.node_id)) {
                 continue;
             }
             // Bounds check for embedding access
@@ -1108,8 +1111,6 @@ HNSWHeap HNSWIndex::search_at_layer_raw(
             if (neighbor_embedding == nullptr) {
                 continue;  // Skip if embedding not accessible
             }
-
-            visited_set_ptr->emplace(candidate_neighbor_entry.node_id);
 
             // Compute distance using optimized path if norms available
             float candidate_neighbor_dist;
@@ -1124,10 +1125,10 @@ HNSWHeap HNSWIndex::search_at_layer_raw(
                     params.dimensions
                 );
             } else {
-                // Fallback to standard metric function
-                tensor::Tensor<float> query_tensor(query_embedding, query_embedding + params.dimensions);
-                tensor::Tensor<float> neighbor_tensor(neighbor_embedding, neighbor_embedding + params.dimensions);
-                candidate_neighbor_dist = metric_func(query_tensor, neighbor_tensor);
+                // Fallback: reuse pre-allocated scratch tensors (query unchanged, copy neighbor data)
+                std::memcpy(neighbor_tensor_scratch.data(), neighbor_embedding,
+                            params.dimensions * sizeof(float));
+                candidate_neighbor_dist = metric_func(query_tensor_scratch, neighbor_tensor_scratch);
             }
 
             if constexpr (CheckTombstones) {
