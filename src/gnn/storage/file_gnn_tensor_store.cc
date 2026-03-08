@@ -207,8 +207,9 @@ GnnTensorView FileGnnTensorStore::load(const std::string& key) const {
 
     const IndexEntry& entry = it->second;
 
-    // Ensure shard is memory-mapped
-    map_shard(entry.shard_id);
+    // Hold shard_mutex_ across both map AND read to prevent vector reallocation race
+    std::lock_guard<std::mutex> shard_lock(shard_mutex_);
+    map_shard_impl(entry.shard_id);
 
     if (entry.shard_id >= shards_.size() || shards_[entry.shard_id].data == nullptr) {
         return GnnTensorView();  // Mapping failed
@@ -577,6 +578,12 @@ void FileGnnTensorStore::ensure_shard(uint32_t shard_id) {
 
 void FileGnnTensorStore::map_shard(uint32_t shard_id) const {
     std::lock_guard<std::mutex> shard_lock(shard_mutex_);
+    map_shard_impl(shard_id);
+}
+
+void FileGnnTensorStore::map_shard_impl(uint32_t shard_id) const {
+    // NOTE: Caller must hold shard_mutex_
+
     // Ensure shards_ vector is large enough
     while (shards_.size() <= shard_id) {
         shards_.emplace_back();

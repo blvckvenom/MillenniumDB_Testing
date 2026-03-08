@@ -206,6 +206,7 @@ private:
     void save_index();
     void ensure_shard(uint32_t shard_id);
     void map_shard(uint32_t shard_id) const;
+    void map_shard_impl(uint32_t shard_id) const;  // Caller must hold shard_mutex_
     void unmap_all_shards();
 
     // Alignment helper
