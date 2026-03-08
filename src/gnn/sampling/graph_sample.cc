@@ -149,4 +149,33 @@ GraphSample GraphSample::deserialize(std::istream& in) {
     return sample;
 }
 
+SplitType GraphSample::read_split(std::istream& in) {
+    // Header validation
+    uint32_t magic = read_value<uint32_t>(in);
+    if (magic != MAGIC) {
+        throw std::runtime_error(
+            "GraphSample::read_split: invalid magic number (expected 0x" +
+            std::to_string(MAGIC) + ", got 0x" + std::to_string(magic) + ")"
+        );
+    }
+
+    uint32_t version = read_value<uint32_t>(in);
+    if (version != VERSION && version != 1) {
+        throw std::runtime_error(
+            "GraphSample::read_split: unsupported version " + std::to_string(version)
+        );
+    }
+
+    // Skip batch_id (8 bytes)
+    read_value<uint64_t>(in);
+
+    // v1 compatibility: skip legacy epoch field (8 bytes)
+    if (version == 1) {
+        read_value<uint64_t>(in);
+    }
+
+    // Read and return the split field
+    return static_cast<SplitType>(read_value<uint8_t>(in));
+}
+
 } // namespace mdb::gnn

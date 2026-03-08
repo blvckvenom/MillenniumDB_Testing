@@ -322,6 +322,20 @@ struct GraphSample {
      * @throws std::runtime_error on read failure or invalid format
      */
     static GraphSample deserialize(std::istream& in);
+
+    /**
+     * @brief Read only the split field from a serialized GraphSample.
+     *
+     * Reads the header (magic, version, batch_id, and optionally the
+     * legacy epoch for v1) to extract the SplitType without
+     * deserializing the full sample. This is much faster for building
+     * the split index during init_read_mode().
+     *
+     * @param in Input stream positioned at the start of a serialized GraphSample
+     * @return The SplitType of the sample
+     * @throws std::runtime_error on read failure or invalid format
+     */
+    static SplitType read_split(std::istream& in);
 };
 
 } // namespace mdb::gnn

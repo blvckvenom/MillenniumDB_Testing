@@ -239,15 +239,16 @@ struct SampleStorage::Impl {
             batch_index[i] = {offset, size};
         }
 
-        // Build split index from stored data
+        // Build split index by reading only the split field from each batch header
+        // instead of deserializing the entire GraphSample
         auto data_path = storage_path / BATCH_DATA_FILE;
         std::ifstream data_in(data_path, std::ios::binary);
         if (data_in) {
             for (uint64_t i = 0; i < batch_index.size(); ++i) {
                 if (batch_index[i].second == 0) continue;
                 data_in.seekg(batch_index[i].first);
-                GraphSample sample = GraphSample::deserialize(data_in);
-                split_index[static_cast<int>(sample.split)].push_back(i);
+                SplitType split = GraphSample::read_split(data_in);
+                split_index[static_cast<int>(split)].push_back(i);
             }
         }
     }
