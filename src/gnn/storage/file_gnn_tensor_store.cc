@@ -630,23 +630,25 @@ void FileGnnTensorStore::map_shard_impl(uint32_t shard_id) const {
 
     auto path = shard_path(shard_id);
     if (!std::filesystem::exists(path)) {
-        return;  // Shard doesn't exist yet
+        throw std::runtime_error("Tensor shard file not found: " + path.string());
     }
 
     size_t file_size = std::filesystem::file_size(path);
     if (file_size == 0) {
-        return;  // Empty file
+        throw std::runtime_error("Tensor shard file is empty: " + path.string());
     }
 
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
-        return;  // Failed to open
+        throw std::runtime_error("Failed to open tensor shard: " + path.string()
+                                 + " (" + strerror(errno) + ")");
     }
 
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mapped == MAP_FAILED) {
         close(fd);
-        return;
+        throw std::runtime_error("Failed to mmap tensor shard: " + path.string()
+                                 + " (" + strerror(errno) + ")");
     }
 
     // Advise kernel we'll read sequentially (optimization for batch loading)
