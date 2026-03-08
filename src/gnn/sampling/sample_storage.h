@@ -15,31 +15,32 @@ namespace mdb::gnn {
 /**
  * @brief Persistent storage for pre-computed GNN samples.
  *
- * Stores GraphSamples to disk using B+Trees for efficient retrieval.
- * This enables:
+ * Stores GraphSamples to disk using flat binary files with an index for
+ * efficient random access by batch_id. This enables:
  * - Reuse of samples across training runs (no re-sampling)
  * - Out-of-core training (samples larger than memory)
  * - Reproducible training (deterministic sample order)
  *
- * ## Storage Structure
+ * ## Storage Layout
  *
  * ```
  * <db_folder>/samples/<sample_name>/
  * ├── catalog.dat          # Metadata (SampleCatalog)
- * ├── batch_nodes.dir      # B+Tree directory pages
- * ├── batch_nodes.leaf     # B+Tree leaf pages
- * ├── batch_edges.dir      # B+Tree directory pages
- * ├── batch_edges.leaf     # B+Tree leaf pages
+ * ├── batches.dat          # Serialized GraphSample objects (binary)
+ * ├── batches.idx          # Index: [offset, size] pairs per batch_id
  * └── frequency.dat        # Node frequency data
  * ```
  *
- * ## B+Tree Schemas
+ * ## File Formats
  *
- * **batch_nodes** (Record<4>): `{batch_id, layer, position, node_id}`
- * - Enables reconstruction of nodes_per_layer for any batch
+ * **batches.dat**: Magic (`BTCH`), version (uint32), then concatenated
+ * serialized GraphSample blobs.
  *
- * **batch_edges** (Record<6>): `{batch_id, layer, position, src_idx, dst_idx, edge_id}`
- * - Enables reconstruction of edges_per_layer for any batch
+ * **batches.idx**: Magic (`INDX`), version (uint32), entry count (uint64),
+ * then `[offset, size]` pairs (each uint64) — one per batch_id.
+ *
+ * **frequency.dat**: Magic (`FREQ`), version (uint32), entry count (uint64),
+ * then `[node_id, count]` pairs (each uint64).
  *
  * ## Usage
  *
@@ -77,7 +78,7 @@ public:
     /**
      * @brief Create new sample storage.
      *
-     * Creates directory structure and initializes B+Trees.
+     * Creates directory structure and initializes storage files.
      *
      * @param db_folder Database root folder
      * @param config Sampling configuration (determines sample_name)
@@ -129,7 +130,7 @@ public:
     /**
      * @brief Write a single sample to storage.
      *
-     * Samples must be written in batch_id order for optimal B+Tree performance.
+     * Samples must be written in batch_id order for optimal index performance.
      *
      * @param sample Sample to write
      * @throws std::runtime_error if not in write mode or write fails
