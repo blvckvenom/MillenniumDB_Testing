@@ -130,6 +130,28 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    // num_nodes and dimension are needed after tensor_store is released (for yield results)
+    uint64_t num_nodes = 0;
+    uint64_t dimension = 0;
+
+    // Step 10: Create HNSW index
+    // Wrap create-build-write-load in try/catch so that if any step after
+    // HNSWIndex::create() throws, we clean up the on-disk directory it created.
+    auto start_time = std::chrono::high_resolution_clock::now();
+    uint_fast32_t indexed_count;
+    decltype(std::chrono::high_resolution_clock::now() - start_time) build_duration{};
+
+    try {
+
+    // hnsw_index declared here so it survives the inner tensor_store scope
+    std::unique_ptr<HNSW::HNSWIndex> hnsw_index;
+
+    // Steps 7-9, 11: Load tensor store, validate, create + build the HNSW index.
+    // Scoped so the tensor store's mmap (~2.3GB for 799K x 768d x float32)
+    // is released as soon as HNSW indexing finishes — before write_to_disk.
+    // The HNSW index keeps its own copy of the vectors, so the mmap is
+    // no longer needed after index_from_raw_embeddings returns.
+    {
     // Step 7: Load GNN tensor store
     std::string db_folder = file_manager.get_file_path("");
     if (!db_folder.empty() && db_folder.back() == '/') {
@@ -170,8 +192,8 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    uint64_t num_nodes = static_cast<uint64_t>(shape[0]);
-    uint64_t dimension = static_cast<uint64_t>(shape[1]);
+    num_nodes = static_cast<uint64_t>(shape[0]);
+    dimension = static_cast<uint64_t>(shape[1]);
 
     if (tensor_view.dtype() != mdb::gnn::GnnDtype::FLOAT32) {
         throw std::runtime_error(
@@ -180,19 +202,9 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Step 10: Create HNSW index
-    // Wrap create-build-write-load in try/catch so that if any step after
-    // HNSWIndex::create() throws, we clean up the on-disk directory it created.
-    auto start_time = std::chrono::high_resolution_clock::now();
-    uint_fast32_t indexed_count;
-    decltype(std::chrono::high_resolution_clock::now() - start_time) build_duration{};
-
-    try {
-    // Get metric function
+    // Step 10: Create HNSW index (after dimension is known from tensor shape)
     HNSW::MetricFuncType metric_func = HNSW::metric_type2metric_func(metric);
-
-    // Create the index
-    auto hnsw_index = HNSW::HNSWIndex::create(
+    hnsw_index = HNSW::HNSWIndex::create(
         index_name,
         dimension,
         M,
@@ -236,6 +248,8 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
             dimension
         );
     }
+
+    } // End tensor_store scope — releases mmap (~2.3GB) before write_to_disk
 
     build_duration = std::chrono::high_resolution_clock::now() - start_time;
 
