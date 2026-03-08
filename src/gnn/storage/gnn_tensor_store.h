@@ -26,8 +26,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,9 @@ struct GnnTensorMetadata {
         if (shape.empty()) return 0;
         int64_t total = 1;
         for (auto dim : shape) {
+            if (dim != 0 && total > std::numeric_limits<int64_t>::max() / dim) {
+                throw std::overflow_error("Tensor numel() overflow: shape too large");
+            }
             total *= dim;
         }
         return total;
