@@ -239,24 +239,27 @@ int main() {
             std::cout << " FAIL: " << e.what() << std::endl;
         }
 
-        // Test 12: Case sensitivity
+        // Test 12: Case sensitivity — procedures should be case-sensitive
         test_count++;
         std::cout << "Test 12: Case sensitivity...";
         try {
-            // Try uppercase (should fail if case-sensitive)
-            auto* proc_upper = catalog.lookup("PROJECT");
             auto* proc_lower = catalog.lookup("project");
+            auto* proc_upper = catalog.lookup("PROJECT");
 
-            if (proc_lower != nullptr) {
-                if (proc_upper == nullptr) {
-                    std::cout << " PASS (case-sensitive)" << std::endl;
+            if (proc_lower == nullptr) {
+                std::cout << " FAIL (procedure 'project' not found)" << std::endl;
+            } else if (proc_upper == nullptr) {
+                // Case-sensitive: lowercase found but uppercase not
+                std::cout << " PASS (case-sensitive: lowercase only)" << std::endl;
+                passed++;
+            } else {
+                // Case-insensitive: both found — verify they're the same
+                if (proc_lower == proc_upper) {
+                    std::cout << " PASS (case-insensitive: same procedure)" << std::endl;
                     passed++;
                 } else {
-                    std::cout << " PASS (case-insensitive)" << std::endl;
-                    passed++;
+                    std::cout << " FAIL (different procedures for different cases)" << std::endl;
                 }
-            } else {
-                std::cout << " FAIL (procedure not found)" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cout << " FAIL: " << e.what() << std::endl;
