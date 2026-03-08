@@ -1,2 +1,2 @@
-CALL test_hello() YIELD message AS greeting
-RETURN greeting
+CALL graph_exists('nonexistent_projection') YIELD exists AS projection_found
+RETURN projection_found
