@@ -298,99 +298,35 @@ void GnnOfflineSampleProcedure::parse_options(
     uint64_t& random_seed,
     std::string& orientation
 ) {
-    ObjectId arg = ctx.get_argument(arg_index);
-    auto type = GQL_OID::get_type(arg);
-
-    if (type != GQL_OID::Type::DICTIONARY) {
-        throw std::runtime_error(
-            "options must be a MAP/DICTIONARY, got type: " +
-            std::to_string(static_cast<int>(type))
-        );
-    }
-
-    // Unpack dictionary
-    std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(arg);
-    auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
-    if (!dict_obj) {
-        throw std::runtime_error("Failed to parse options map");
-    }
-
-    // Helper to get value from dictionary
-    auto get_value = [&](const std::string& key) -> std::optional<ObjectId> {
-        for (const auto& [key_oid, val_item] : dict_obj->keys) {
-            std::string key_str = Conversions::unpack_string(key_oid);
-            if (key_str == key) {
-                auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-                if (lit) {
-                    return lit->object_id;
-                }
-            }
-        }
-        return std::nullopt;
-    };
+    DictOptions opts(ctx.get_argument(arg_index));
 
     // Parse batchSize
-    if (auto value = get_value("batchSize")) {
-        auto vtype = GQL_OID::get_type(*value);
-        if (vtype == GQL_OID::Type::INT56_INLINE ||
-            vtype == GQL_OID::Type::INT64_EXTERN ||
-            vtype == GQL_OID::Type::INT64_TMP)
-        {
-            int64_t v = Conversions::unpack_int(*value);
-            if (v <= 0) {
-                throw std::runtime_error("batchSize must be positive, got: " + std::to_string(v));
-            }
-            batch_size = static_cast<uint64_t>(v);
-        } else {
-            throw std::runtime_error("batchSize must be an integer");
+    if (auto v = opts.get_int("batchSize")) {
+        if (*v <= 0) {
+            throw std::runtime_error("batchSize must be positive, got: " + std::to_string(*v));
         }
+        batch_size = static_cast<uint64_t>(*v);
     }
 
-    // Helper to parse double from various numeric types
-    auto parse_double = [](ObjectId oid, const std::string& name) -> double {
-        auto vtype = GQL_OID::get_type(oid);
-        if (vtype == GQL_OID::Type::INT56_INLINE ||
-            vtype == GQL_OID::Type::INT64_EXTERN ||
-            vtype == GQL_OID::Type::INT64_TMP)
-        {
-            return static_cast<double>(Conversions::unpack_int(oid));
-        }
-        if (vtype == GQL_OID::Type::FLOAT32) {
-            return static_cast<double>(Conversions::unpack_float(oid));
-        }
-        if (vtype == GQL_OID::Type::DOUBLE64_EXTERN ||
-            vtype == GQL_OID::Type::DOUBLE64_TMP)
-        {
-            return Conversions::unpack_double(oid);
-        }
-        if (vtype == GQL_OID::Type::DECIMAL_INLINE ||
-            vtype == GQL_OID::Type::DECIMAL_EXTERN ||
-            vtype == GQL_OID::Type::DECIMAL_TMP)
-        {
-            return Common::Conversions::unpack_decimal(oid).to_double();
-        }
-        throw std::runtime_error(name + " must be a numeric value");
-    };
-
     // Parse trainRatio
-    if (auto value = get_value("trainRatio")) {
-        train_ratio = parse_double(*value, "trainRatio");
+    if (auto v = opts.get_double("trainRatio")) {
+        train_ratio = *v;
         if (train_ratio < 0.0 || train_ratio > 1.0) {
             throw std::runtime_error("trainRatio must be between 0.0 and 1.0");
         }
     }
 
     // Parse validationRatio
-    if (auto value = get_value("validationRatio")) {
-        val_ratio = parse_double(*value, "validationRatio");
+    if (auto v = opts.get_double("validationRatio")) {
+        val_ratio = *v;
         if (val_ratio < 0.0 || val_ratio > 1.0) {
             throw std::runtime_error("validationRatio must be between 0.0 and 1.0");
         }
     }
 
     // Parse testRatio
-    if (auto value = get_value("testRatio")) {
-        test_ratio = parse_double(*value, "testRatio");
+    if (auto v = opts.get_double("testRatio")) {
+        test_ratio = *v;
         if (test_ratio < 0.0 || test_ratio > 1.0) {
             throw std::runtime_error("testRatio must be between 0.0 and 1.0");
         }
@@ -406,28 +342,12 @@ void GnnOfflineSampleProcedure::parse_options(
     }
 
     // Parse randomSeed
-    if (auto value = get_value("randomSeed")) {
-        auto vtype = GQL_OID::get_type(*value);
-        if (vtype == GQL_OID::Type::INT56_INLINE ||
-            vtype == GQL_OID::Type::INT64_EXTERN ||
-            vtype == GQL_OID::Type::INT64_TMP)
-        {
-            random_seed = static_cast<uint64_t>(Conversions::unpack_int(*value));
-        } else {
-            throw std::runtime_error("randomSeed must be an integer");
-        }
+    if (auto v = opts.get_int("randomSeed")) {
+        random_seed = static_cast<uint64_t>(*v);
     }
 
     // Parse orientation
-    if (auto value = get_value("orientation")) {
-        auto vtype = GQL_OID::get_type(*value);
-        if (vtype == GQL_OID::Type::STRING_SIMPLE_INLINE ||
-            vtype == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
-            vtype == GQL_OID::Type::STRING_SIMPLE_TMP)
-        {
-            orientation = Conversions::unpack_string(*value);
-        } else {
-            throw std::runtime_error("orientation must be a string");
-        }
+    if (auto v = opts.get_string("orientation")) {
+        orientation = *v;
     }
 }
