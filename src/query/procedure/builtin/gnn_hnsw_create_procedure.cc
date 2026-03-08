@@ -21,6 +21,15 @@
 using namespace GQL;
 using namespace GQL::Procedures;
 
+namespace {
+    constexpr uint64_t DEFAULT_M = 16;
+    constexpr uint64_t DEFAULT_EF_CONSTRUCTION = 200;
+    // Max M (neighbors per node) capped at 256.
+    // Rationale: Each node stores M bidirectional links. At M=256 with 4-byte IDs,
+    // that's ~2KB per node just for links. For 799K nodes, M=256 uses ~1.5GB.
+    constexpr uint64_t MAX_M = 256;
+} // anonymous namespace
+
 void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     // Step 1: Validate argument count
     if (ctx.arguments.size() < 2 || ctx.arguments.size() > 3) {
@@ -82,8 +91,8 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
 
     // Step 4: Parse optional options map
     HNSW::MetricType metric = HNSW::MetricType::COSINE_DISTANCE;
-    uint64_t M = 16;
-    uint64_t ef_construction = 200;
+    uint64_t M = DEFAULT_M;
+    uint64_t ef_construction = DEFAULT_EF_CONSTRUCTION;
     size_t num_threads = std::thread::hardware_concurrency();  // Default: use all cores
 
     if (ctx.arguments.size() >= 3) {
@@ -307,8 +316,8 @@ void GnnHnswCreateProcedure::parse_options(
         if (*v <= 0) {
             throw std::runtime_error("M must be positive, got: " + std::to_string(*v));
         }
-        if (*v > 256) {
-            throw std::runtime_error("M too large (max 256), got: " + std::to_string(*v));
+        if (*v > static_cast<int64_t>(MAX_M)) {
+            throw std::runtime_error("M too large (max " + std::to_string(MAX_M) + "), got: " + std::to_string(*v));
         }
         M = static_cast<uint64_t>(*v);
     }
