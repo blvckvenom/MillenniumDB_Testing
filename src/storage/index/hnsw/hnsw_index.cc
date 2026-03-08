@@ -940,7 +940,8 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings_parallel(
                 }
 
                 // Update entry point if this node has higher layer
-                if (node_top_layer >= params.layers) {
+                const uint64_t top_layer = params.layers - 1;
+                if (node_top_layer > top_layer) {
                     params.entry_point_id = node_id;
                     params.layers = node_top_layer + 1;
                 }
