@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "misc/logger.h"
+
 namespace mdb::gnn {
 
 // =============================================================================
@@ -336,8 +338,10 @@ SampleStorage::~SampleStorage() {
     if (impl_ && impl_->write_mode && !impl_->finalized) {
         try {
             impl_->finalize_impl();
+        } catch (const std::exception& e) {
+            logger.error() << "SampleStorage finalization failed in destructor: " << e.what();
         } catch (...) {
-            // Ignore errors in destructor
+            logger.error() << "SampleStorage finalization failed with unknown exception";
         }
     }
 }
