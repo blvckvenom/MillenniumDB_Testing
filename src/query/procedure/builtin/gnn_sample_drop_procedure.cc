@@ -12,9 +12,9 @@ using namespace mdb::gnn;
 
 void GnnSampleDropProcedure::execute(ProcedureContext& ctx) {
     // Validate argument count
-    if (ctx.arguments.size() < 1) {
+    if (ctx.arguments.size() != 1) {
         throw std::runtime_error(
-            "gnn.sample_drop() requires 1 argument: sampleName\n"
+            "gnn.sample_drop() requires exactly 1 argument: sampleName\n"
             "Usage: CALL gnn.sample_drop('mySamples') YIELD success, message"
         );
     }

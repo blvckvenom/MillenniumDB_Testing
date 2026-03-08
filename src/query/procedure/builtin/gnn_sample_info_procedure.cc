@@ -15,9 +15,9 @@ using namespace mdb::gnn;
 
 void GnnSampleInfoProcedure::execute(ProcedureContext& ctx) {
     // Validate argument count
-    if (ctx.arguments.size() < 1) {
+    if (ctx.arguments.size() != 1) {
         throw std::runtime_error(
-            "gnn.sample_info() requires 1 argument: sampleName\n"
+            "gnn.sample_info() requires exactly 1 argument: sampleName\n"
             "Usage: CALL gnn.sample_info('mySamples') YIELD ..."
         );
     }
