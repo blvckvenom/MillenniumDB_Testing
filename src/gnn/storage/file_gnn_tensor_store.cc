@@ -177,8 +177,11 @@ bool FileGnnTensorStore::store(const std::string& key,
     shard_sizes_[shard_id] = offset + aligned_size;
 
     // Invalidate memory mapping for this shard (will be re-mapped on next load)
-    if (shard_id < shards_.size() && shards_[shard_id].data != nullptr) {
-        shards_[shard_id] = MappedShard();  // Unmap
+    {
+        std::lock_guard<std::mutex> shard_lock(shard_mutex_);
+        if (shard_id < shards_.size() && shards_[shard_id].data != nullptr) {
+            shards_[shard_id] = MappedShard();  // Unmap
+        }
     }
 
     // Update index
@@ -613,6 +616,7 @@ void FileGnnTensorStore::map_shard(uint32_t shard_id) const {
 }
 
 void FileGnnTensorStore::unmap_all_shards() {
+    std::lock_guard<std::mutex> shard_lock(shard_mutex_);
     shards_.clear();
 }
 
