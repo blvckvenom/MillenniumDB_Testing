@@ -1,5 +1,7 @@
 #include "gnn/sampling/reservoir_sampler.h"
 
+#include <unordered_set>
+
 #include "graph_models/gql/projection/projection_storage.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -15,6 +17,11 @@ struct ReservoirSampler::Impl {
     uint64_t random_seed = 42;
     std::mt19937_64 rng;
     uint64_t last_stream_size_ = 0;
+
+    // Tracks ALL edge IDs seen across forward and reverse passes to avoid
+    // undirected sampling bias. Without this, edges evicted from the reservoir
+    // during the forward pass could be re-added during the reverse pass.
+    std::unordered_set<uint64_t> all_seen_edges_;
 
     explicit Impl(GQL::ProjectionStorage& storage_)
         : storage(storage_)
@@ -50,6 +57,9 @@ struct ReservoirSampler::Impl {
         std::vector<std::pair<ObjectId, ObjectId>> reservoir;
         reservoir.reserve(sample_size);
 
+        // Clear comprehensive edge tracking for this sampling call
+        all_seen_edges_.clear();
+
         BPlusTree<3>* index = get_index(orientation);
         if (!index) {
             last_stream_size_ = 0;
@@ -69,6 +79,11 @@ struct ReservoirSampler::Impl {
         while ((record = iter.next()) != nullptr) {
             uint64_t neighbor_id = (*record)[1];
             uint64_t edge_id = (*record)[2];
+
+            // Track every edge seen during the forward pass so that
+            // add_reverse_neighbors can correctly deduplicate, even for
+            // edges that were evicted from the reservoir.
+            all_seen_edges_.insert(edge_id);
 
             std::pair<ObjectId, ObjectId> item = {
                 ObjectId(neighbor_id),
@@ -110,11 +125,9 @@ struct ReservoirSampler::Impl {
         BPlusTree<3>* reverse_index = storage.get_to_from_edge_index();
         if (!reverse_index) return;
 
-        // Track existing edge IDs to avoid duplicates
-        std::unordered_set<uint64_t> seen_edges;
-        for (const auto& [_, edge_id] : reservoir) {
-            seen_edges.insert(edge_id.id);
-        }
+        // Use all_seen_edges_ which already contains every edge ID from the
+        // forward pass (not just the k entries in the reservoir). This prevents
+        // bias toward bidirectional edges when F > k forward edges were seen.
 
         Record<3> min_record = {node_id.id, 0, 0};
         Record<3> max_record = {node_id.id, UINT64_MAX, UINT64_MAX};
@@ -127,11 +140,11 @@ struct ReservoirSampler::Impl {
             uint64_t neighbor_id = (*record)[1];
             uint64_t edge_id = (*record)[2];
 
-            // Skip duplicates
-            if (seen_edges.find(edge_id) != seen_edges.end()) {
+            // Skip edges already seen during the forward pass
+            if (all_seen_edges_.find(edge_id) != all_seen_edges_.end()) {
                 continue;
             }
-            seen_edges.insert(edge_id);
+            all_seen_edges_.insert(edge_id);
 
             std::pair<ObjectId, ObjectId> item = {
                 ObjectId(neighbor_id),
