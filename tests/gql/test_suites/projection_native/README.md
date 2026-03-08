@@ -54,7 +54,7 @@ tests/gql/test_suites/projection_native/
 | 02 | List variant multiple labels | 8 nodes, 9 edges |
 | 03 | List with three labels | 10 nodes, 8 edges |
 | 04 | All nodes, single edge type | 15 nodes, 4 edges |
-| 05 | Edge endpoint filtering | 5 nodes, 2 edges (filtered) |
+| 05 | Edge endpoint filtering | 5 nodes, 0 edges (all filtered) |
 | 06 | Isolated nodes (no edges) | 2 nodes, 0 edges |
 
 **Coverage**: String/list variants, endpoint filtering, isolated nodes
@@ -65,8 +65,8 @@ tests/gql/test_suites/projection_native/
 |------|-------------|-----------------|
 | 07 | Partial YIELD fields | Only graphName, nodeCount |
 | 08 | YIELD with aliases | Renamed fields in output |
-| 09 | RETURN * (all fields) | All 4 YIELD fields |
-| 10 | Check projectMillis field | Valid timing value |
+| 09 | RETURN * (all fields) | All 3 YIELD fields |
+| 10 | Check graphName and nodeCount | graphName and nodeCount only |
 
 **Coverage**: YIELD field selection, aliases, RETURN *, timing
 
@@ -179,10 +179,10 @@ YIELD graphName, nodeCount, relationshipCount
 RETURN graphName, nodeCount, relationshipCount
 ```
 
-**Expected**: Only 2 edges (WROTE from User to Comment), LIKES and COMMENTED_ON filtered out
+**Expected**: 0 edges (LIKES, WROTE, COMMENTED_ON all filtered out because endpoints are not all User)
 ```csv
 graphName,nodeCount,relationshipCount
-"test_filtering",5,2
+"test_filtering",5,0
 ```
 
 ## Adding New Tests
