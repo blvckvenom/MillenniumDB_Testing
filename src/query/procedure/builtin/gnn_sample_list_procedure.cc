@@ -5,7 +5,7 @@
 #include <stdexcept>
 
 #include "gnn/sampling/sample_catalog.h"
-#include "system/file_manager.h"
+#include "gnn_procedure_utils.h"
 
 using namespace GQL;
 using namespace GQL::Procedures;
@@ -13,10 +13,7 @@ using namespace mdb::gnn;
 
 void GnnSampleListProcedure::execute(ProcedureContext& ctx) {
     // Get database folder
-    std::string db_folder = file_manager.get_file_path("");
-    if (!db_folder.empty() && db_folder.back() == '/') {
-        db_folder.pop_back();
-    }
+    std::string db_folder = get_db_folder();
 
     // Samples are stored in <db_folder>/samples/
     std::filesystem::path samples_root = std::filesystem::path(db_folder) / "samples";

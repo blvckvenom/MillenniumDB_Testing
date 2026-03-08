@@ -4,7 +4,7 @@
 #include <stdexcept>
 
 #include "gnn/sampling/sample_storage.h"
-#include "system/file_manager.h"
+#include "gnn_procedure_utils.h"
 
 using namespace GQL;
 using namespace GQL::Procedures;
@@ -40,10 +40,7 @@ void GnnSampleDropProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Get database folder
-    std::string db_folder = file_manager.get_file_path("");
-    if (!db_folder.empty() && db_folder.back() == '/') {
-        db_folder.pop_back();
-    }
+    std::string db_folder = get_db_folder();
 
     // Check if sample exists
     if (!SampleStorage::exists(db_folder, sample_name)) {

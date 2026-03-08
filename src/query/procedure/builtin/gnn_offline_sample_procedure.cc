@@ -12,7 +12,7 @@
 #include "graph_models/gql/gql_object_id.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
-#include "system/file_manager.h"
+#include "gnn_procedure_utils.h"
 
 using namespace GQL;
 using namespace GQL::Procedures;
@@ -152,10 +152,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 7: Check if sample already exists
-    std::string db_folder = file_manager.get_file_path("");
-    if (!db_folder.empty() && db_folder.back() == '/') {
-        db_folder.pop_back();
-    }
+    std::string db_folder = get_db_folder();
 
     if (SampleStorage::exists(db_folder, sample_name)) {
         throw std::runtime_error(

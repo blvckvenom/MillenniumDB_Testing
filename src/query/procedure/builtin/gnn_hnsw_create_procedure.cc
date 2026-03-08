@@ -15,6 +15,7 @@
 #include "storage/index/hnsw/hnsw_index.h"
 #include "storage/index/hnsw/hnsw_index_manager.h"
 #include "storage/index/hnsw/hnsw_metric.h"
+#include "gnn_procedure_utils.h"
 #include "system/file_manager.h"
 
 using namespace GQL;
@@ -154,10 +155,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     // no longer needed after index_from_raw_embeddings returns.
     {
     // Step 7: Load GNN tensor store
-    std::string db_folder = file_manager.get_file_path("");
-    if (!db_folder.empty() && db_folder.back() == '/') {
-        db_folder.pop_back();
-    }
+    std::string db_folder = get_db_folder();
 
     std::string gnn_path = db_folder + "/gnn_tensors";
     mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE, false);

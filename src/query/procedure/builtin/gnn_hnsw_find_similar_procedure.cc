@@ -9,7 +9,7 @@
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
 #include "storage/index/hnsw/hnsw_index.h"
-#include "system/file_manager.h"
+#include "gnn_procedure_utils.h"
 
 using namespace GQL;
 using namespace GQL::Procedures;
@@ -152,10 +152,7 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 9: Load GNN tensor store to get the query embedding
-    std::string db_folder = file_manager.get_file_path("");
-    if (!db_folder.empty() && db_folder.back() == '/') {
-        db_folder.pop_back();
-    }
+    std::string db_folder = get_db_folder();
 
     std::string gnn_path = db_folder + "/gnn_tensors";
     mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE, false);
