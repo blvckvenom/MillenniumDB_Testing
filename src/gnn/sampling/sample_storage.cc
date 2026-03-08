@@ -44,6 +44,9 @@ struct SampleStorage::Impl {
     // Frequency tracking
     std::unordered_map<uint64_t, uint64_t> node_frequencies;
 
+    /// Index: split_type -> batch IDs (populated on load/write)
+    std::unordered_map<int, std::vector<uint64_t>> split_index;
+
     // Statistics tracking
     uint64_t total_batches_written = 0;
     uint64_t train_batches_written = 0;
@@ -123,6 +126,9 @@ struct SampleStorage::Impl {
 
         // Track edges
         total_edges_written += sample.total_edges();
+
+        // Update split index
+        split_index[static_cast<int>(sample.split)].push_back(sample.batch_id);
     }
 
     void finalize_impl() {
@@ -215,6 +221,18 @@ struct SampleStorage::Impl {
             uint64_t offset = read_value<uint64_t>(index_in);
             uint64_t size = read_value<uint64_t>(index_in);
             batch_index[i] = {offset, size};
+        }
+
+        // Build split index from stored data
+        auto data_path = storage_path / BATCH_DATA_FILE;
+        std::ifstream data_in(data_path, std::ios::binary);
+        if (data_in) {
+            for (uint64_t i = 0; i < batch_index.size(); ++i) {
+                if (batch_index[i].second == 0) continue;
+                data_in.seekg(batch_index[i].first);
+                GraphSample sample = GraphSample::deserialize(data_in);
+                split_index[static_cast<int>(sample.split)].push_back(i);
+            }
         }
     }
 
@@ -373,20 +391,11 @@ std::vector<GraphSample> SampleStorage::read_samples(const std::vector<uint64_t>
 }
 
 std::vector<uint64_t> SampleStorage::get_batch_ids(SplitType split) {
-    std::vector<uint64_t> ids;
-
-    // Read all samples to find matching split
-    // TODO: Optimize with separate index by split
-    for (uint64_t i = 0; i < impl_->batch_index.size(); ++i) {
-        if (impl_->batch_index[i].second == 0) continue;  // Skip empty slots
-
-        GraphSample sample = read_sample(i);
-        if (sample.split == split) {
-            ids.push_back(i);
-        }
+    auto it = impl_->split_index.find(static_cast<int>(split));
+    if (it != impl_->split_index.end()) {
+        return it->second;
     }
-
-    return ids;
+    return {};
 }
 
 std::vector<uint64_t> SampleStorage::get_all_batch_ids() {
