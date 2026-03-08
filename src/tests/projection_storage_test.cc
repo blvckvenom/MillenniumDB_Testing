@@ -69,7 +69,12 @@ int main() {
             node.node_id = ObjectId(i);
             storage.add_node(node);
         }
-        std::cout << " OK (count: " << storage.get_node_count() << ")" << std::endl;
+        auto node_count = storage.get_node_count();
+        if (node_count != 5) {
+            std::cerr << "\nFAIL Test 5: expected node count 5, got " << node_count << std::endl;
+            return 1;
+        }
+        std::cout << " OK (count: " << node_count << ")" << std::endl;
 
         // Test 6: Add edges
         std::cout << "Test 6: Adding edges...";
@@ -81,12 +86,21 @@ int main() {
             edge.is_directed = true;
             storage.add_edge(edge);
         }
-        std::cout << " OK (count: " << storage.get_edge_count() << ")" << std::endl;
+        auto edge_count = storage.get_edge_count();
+        if (edge_count != 4) {
+            std::cerr << "\nFAIL Test 6: expected edge count 4, got " << edge_count << std::endl;
+            return 1;
+        }
+        std::cout << " OK (count: " << edge_count << ")" << std::endl;
 
         // Test 7: Check node existence
         std::cout << "Test 7: Checking node existence...";
         bool exists = storage.has_node(ObjectId(3));
-        std::cout << " OK (node 3 exists: " << (exists ? "yes" : "no") << ")" << std::endl;
+        if (!exists) {
+            std::cerr << "FAIL Test 7: node 3 should exist" << std::endl;
+            return 1;
+        }
+        std::cout << " OK (node 3 exists: yes)" << std::endl;
 
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";
