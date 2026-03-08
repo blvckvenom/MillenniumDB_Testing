@@ -1,4 +1,4 @@
-CALL graph_project('test_limit', 'User', 'KNOWS')
-YIELD graphName, nodeCount, relationshipCount
-RETURN graphName, nodeCount, relationshipCount
-LIMIT 1
+MATCH (u:User)
+RETURN u.name, u.age
+ORDER BY u.age ASC
+LIMIT 3

@@ -1,3 +1,2 @@
-CALL graph_project('test_distinct', 'User', 'KNOWS')
-YIELD graphName, nodeCount
-RETURN DISTINCT graphName, nodeCount
+MATCH (u:User)
+RETURN DISTINCT u.city

@@ -1,2 +1,4 @@
-graphName,nodeCount,relationshipCount
-"test_limit",5,5
+u.name,u.age
+"Bob",25
+"Dave",28
+"Alice",30
