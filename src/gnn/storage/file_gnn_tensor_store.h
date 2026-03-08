@@ -40,6 +40,7 @@
 
 #include "gnn_tensor_store.h"
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -196,6 +197,9 @@ private:
     std::unordered_map<std::string, IndexEntry> index_;
     size_t total_bytes_ = 0;
     size_t deleted_bytes_ = 0;
+
+    // Generation counter: incremented on every compact/remap
+    std::atomic<uint64_t> generation_{0};
 
     // Memory-mapped shards
     mutable std::vector<MappedShard> shards_;

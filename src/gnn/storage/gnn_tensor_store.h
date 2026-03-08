@@ -72,8 +72,8 @@ class GnnTensorView {
 public:
     GnnTensorView() = default;
 
-    GnnTensorView(const void* data, GnnTensorMetadata metadata)
-        : data_(data), metadata_(std::move(metadata)) {}
+    GnnTensorView(const void* data, GnnTensorMetadata metadata, uint64_t generation = 0)
+        : data_(data), metadata_(std::move(metadata)), generation_(generation) {}
 
     /// @brief Returns pointer to raw data (nullptr if invalid)
     const void* data() const { return data_; }
@@ -96,6 +96,9 @@ public:
     /// @brief Check if view is valid
     bool valid() const { return data_ != nullptr; }
 
+    /// @brief Returns the generation counter at the time this view was created
+    uint64_t generation() const { return generation_; }
+
     /// @brief Typed data access (no bounds checking)
     template<typename T>
     const T* data_as() const { return static_cast<const T*>(data_); }
@@ -103,6 +106,7 @@ public:
 private:
     const void* data_ = nullptr;
     GnnTensorMetadata metadata_;
+    uint64_t generation_ = 0;
 };
 
 /**

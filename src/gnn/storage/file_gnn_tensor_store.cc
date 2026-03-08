@@ -216,7 +216,7 @@ GnnTensorView FileGnnTensorStore::load(const std::string& key) const {
     }
 
     const void* data_ptr = static_cast<const char*>(shards_[entry.shard_id].data) + entry.offset;
-    return GnnTensorView(data_ptr, entry.metadata);
+    return GnnTensorView(data_ptr, entry.metadata, generation_.load());
 }
 
 bool FileGnnTensorStore::remove(const std::string& key) {
@@ -438,6 +438,9 @@ size_t FileGnnTensorStore::compact() {
     if (auto idx_bak = std::filesystem::path(idx_path.string() + ".bak"); std::filesystem::exists(idx_bak)) {
         std::filesystem::remove(idx_bak);
     }
+
+    // Increment generation so callers can detect stale views
+    ++generation_;
 
     // Update state
     index_ = std::move(new_index);
