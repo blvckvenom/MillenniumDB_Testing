@@ -11,6 +11,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+namespace {
+struct FdGuard {
+    int fd = -1;
+    explicit FdGuard(int fd) : fd(fd) {}
+    ~FdGuard() { if (fd >= 0) close(fd); }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    int release() { int tmp = fd; fd = -1; return tmp; }
+};
+} // anonymous namespace
+
 namespace mdb::gnn {
 
 // ============================================================================
@@ -155,19 +166,17 @@ bool FileGnnTensorStore::store(const std::string& key,
     ensure_shard(shard_id);
 
     std::filesystem::path shard_file = shard_path(shard_id);
-    int fd = open(shard_file.c_str(), O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) {
+    FdGuard guard(open(shard_file.c_str(), O_WRONLY | O_CREAT, 0644));
+    if (guard.fd < 0) {
         return false;
     }
 
     // Seek to offset and write
-    if (lseek(fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
-        close(fd);
+    if (lseek(guard.fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
         return false;
     }
 
-    ssize_t written = write(fd, data, metadata.byte_size);
-    close(fd);
+    ssize_t written = write(guard.fd, data, metadata.byte_size);
 
     if (written != static_cast<ssize_t>(metadata.byte_size)) {
         return false;
@@ -372,14 +381,13 @@ size_t FileGnnTensorStore::compact() {
 
         // Write to new shard
         auto new_shard_path = temp_path / ("data_" + std::to_string(new_shard_id) + ".bin");
-        int fd = open(new_shard_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
+        FdGuard guard(open(new_shard_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+        if (guard.fd < 0) {
             std::filesystem::remove_all(temp_path);
             throw std::runtime_error("compact: failed to create shard: " + new_shard_path.string());
         }
 
-        if (lseek(fd, static_cast<off_t>(new_offset), SEEK_SET) < 0) {
-            close(fd);
+        if (lseek(guard.fd, static_cast<off_t>(new_offset), SEEK_SET) < 0) {
             std::filesystem::remove_all(temp_path);
             throw std::runtime_error("compact: lseek failed");
         }
@@ -387,9 +395,8 @@ size_t FileGnnTensorStore::compact() {
         const char* write_ptr = static_cast<const char*>(old_data);
         size_t remaining = entry.metadata.byte_size;
         while (remaining > 0) {
-            ssize_t written = ::write(fd, write_ptr, remaining);
+            ssize_t written = ::write(guard.fd, write_ptr, remaining);
             if (written < 0) {
-                close(fd);
                 std::filesystem::remove_all(temp_path);
                 throw std::runtime_error("compact: write failed: " + std::string(strerror(errno)));
             }
@@ -397,8 +404,7 @@ size_t FileGnnTensorStore::compact() {
             remaining -= static_cast<size_t>(written);
         }
 
-        fsync(fd);
-        close(fd);
+        fsync(guard.fd);
 
         new_shard_sizes[new_shard_id] = new_offset + aligned_size;
 
@@ -638,15 +644,14 @@ void FileGnnTensorStore::map_shard_impl(uint32_t shard_id) const {
         throw std::runtime_error("Tensor shard file is empty: " + path.string());
     }
 
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    FdGuard guard(open(path.c_str(), O_RDONLY));
+    if (guard.fd < 0) {
         throw std::runtime_error("Failed to open tensor shard: " + path.string()
                                  + " (" + strerror(errno) + ")");
     }
 
-    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, guard.fd, 0);
     if (mapped == MAP_FAILED) {
-        close(fd);
         throw std::runtime_error("Failed to mmap tensor shard: " + path.string()
                                  + " (" + strerror(errno) + ")");
     }
@@ -656,7 +661,7 @@ void FileGnnTensorStore::map_shard_impl(uint32_t shard_id) const {
 
     shards_[shard_id].data = mapped;
     shards_[shard_id].size = file_size;
-    shards_[shard_id].fd = fd;
+    shards_[shard_id].fd = guard.release();
 }
 
 void FileGnnTensorStore::unmap_all_shards() {
