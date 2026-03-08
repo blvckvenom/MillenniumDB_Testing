@@ -90,13 +90,29 @@ struct SampleStorage::Impl {
         // Record offset before writing
         uint64_t offset = batch_data_stream->tellp();
 
-        // Serialize sample to buffer
+        // Serialize sample to an in-memory buffer first.
+        // If serialize() throws, no side-effects have occurred.
         std::ostringstream buffer(std::ios::binary);
         sample.serialize(buffer);
         std::string data = buffer.str();
 
-        // Write to file
+        // Write to file. If write fails, we must not update any statistics.
         batch_data_stream->write(data.data(), data.size());
+        if (!batch_data_stream->good()) {
+            // Attempt to seek back to the original offset so the data file
+            // remains consistent for any subsequent writes after recovery.
+            batch_data_stream->clear();
+            batch_data_stream->seekp(offset);
+            throw std::runtime_error("Failed to write batch data for batch_id "
+                                     + std::to_string(sample.batch_id));
+        }
+
+        // --- Point of no return ------------------------------------------------
+        // The write succeeded. All mutations below update in-memory statistics
+        // and index structures. These are non-throwing (STL container operations
+        // with pre-reserved or small allocations), so we will not leave the
+        // storage in an inconsistent state.
+        // -----------------------------------------------------------------------
 
         // Update index
         if (sample.batch_id >= batch_index.size()) {
