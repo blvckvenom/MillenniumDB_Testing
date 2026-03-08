@@ -625,6 +625,10 @@ void HNSWIndex::compute_embedding_norms()
 
     for (uint64_t i = 0; i < num_nodes; ++i) {
         const float* emb = get_raw_embedding(i);
+        if (emb == nullptr) {
+            raw_embedding_norms_[i] = 0.0f;  // Safe default for missing embeddings
+            continue;
+        }
         raw_embedding_norms_[i] = tensor::avx::computation<float>::norm_squared(
             emb, params.dimensions
         );
@@ -968,6 +972,10 @@ HNSWHeap HNSWIndex::query_raw(
 
     // Initialize with entry point
     const float* entry_embedding = get_raw_embedding(params.entry_point_id);
+    if (entry_embedding == nullptr) {
+        // Entry point has no valid embedding — cannot search
+        return HNSWHeap(num_neighbors);
+    }
     tensor::Tensor<float> query_tensor(query_embedding, query_embedding + params.dimensions);
     tensor::Tensor<float> entry_tensor(entry_embedding, entry_embedding + params.dimensions);
     const float entry_dist = metric_func(query_tensor, entry_tensor);
@@ -1073,7 +1081,9 @@ HNSWHeap HNSWIndex::search_at_layer_raw(
             if (prefetch_count >= 3) break;  // Prefetch up to 3 ahead
             if (!visited_set_ptr->contains(neighbor_entry.node_id) &&
                 neighbor_entry.node_id < num_nodes) {
-                prefetch_embedding(get_raw_embedding(neighbor_entry.node_id), params.dimensions);
+                const float* prefetch_emb = get_raw_embedding(neighbor_entry.node_id);
+                if (prefetch_emb == nullptr) continue;
+                prefetch_embedding(prefetch_emb, params.dimensions);
                 if (use_optimized_distance &&
                     neighbor_entry.node_id < raw_embedding_norms_.size()) {
                     prefetch_norm(raw_embedding_norms_.data(), neighbor_entry.node_id);

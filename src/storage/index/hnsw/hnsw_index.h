@@ -170,6 +170,10 @@ public:
      * @return ||embedding||² for the node
      */
     inline float get_embedding_norm_sq(uint32_t node_id) const {
+        assert(node_id < raw_embedding_norms_.size() && "node_id out of bounds in get_embedding_norm_sq");
+        if (node_id >= raw_embedding_norms_.size()) {
+            return 0.0f;  // Safe fallback in release builds
+        }
         return raw_embedding_norms_[node_id];
     }
 
