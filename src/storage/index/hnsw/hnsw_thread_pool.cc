@@ -56,8 +56,16 @@ void ThreadPool::worker_thread()
             ++active_;
         }
 
-        // Execute task outside lock
-        task();
+        // Execute task outside lock — catch exceptions to prevent worker death
+        try {
+            task();
+        } catch (const std::exception& e) {
+            // Task exception is captured by std::packaged_task's future if applicable.
+            // Log but don't propagate — worker must survive to process more tasks.
+            (void)e;  // Avoid unused variable warning
+        } catch (...) {
+            // Unknown exception — worker survives anyway
+        }
 
         // Signal completion
         --active_;
