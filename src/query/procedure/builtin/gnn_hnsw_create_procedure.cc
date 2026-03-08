@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <stdexcept>
 #include <thread>
 
@@ -11,6 +12,7 @@
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
 #include "storage/index/hnsw/hnsw_index.h"
+#include "storage/index/hnsw/hnsw_index_manager.h"
 #include "storage/index/hnsw/hnsw_metric.h"
 #include "system/file_manager.h"
 
@@ -179,8 +181,13 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 10: Create HNSW index
+    // Wrap create-build-write-load in try/catch so that if any step after
+    // HNSWIndex::create() throws, we clean up the on-disk directory it created.
     auto start_time = std::chrono::high_resolution_clock::now();
+    uint_fast32_t indexed_count;
+    decltype(std::chrono::high_resolution_clock::now() - start_time) build_duration{};
 
+    try {
     // Get metric function
     HNSW::MetricFuncType metric_func = HNSW::metric_type2metric_func(metric);
 
@@ -213,8 +220,6 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         (void)last_check;
     }
 
-    uint_fast32_t indexed_count;
-
     if (num_threads > 1 && num_nodes >= 1000) {
         // Use parallel construction for large datasets
         indexed_count = hnsw_index->index_from_raw_embeddings_parallel(
@@ -232,10 +237,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        end_time - start_time
-    ).count();
+    build_duration = std::chrono::high_resolution_clock::now() - start_time;
 
     // Step 12: Register the index with the manager
     // Note: The index is stored in the manager but we need to save it to disk
@@ -246,6 +248,20 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     metadata.metric_type = metric;
     metadata.predicate = tensor_key;  // Use tensor key as predicate for tracking
     gql_model.catalog.hnsw_index_manager.load_hnsw_index(index_name, metadata);
+
+    } catch (...) {
+        // HNSWIndex::create() may have already created the on-disk directory.
+        // Remove it so we don't leave orphaned files.
+        namespace fs = std::filesystem;
+        const auto relative_index_path = fs::path(HNSW::HNSWIndexManager::HNSW_INDEX_DIR) / index_name;
+        const auto absolute_index_path = file_manager.get_file_path(relative_index_path);
+        std::error_code ec;
+        fs::remove_all(absolute_index_path, ec);
+        // ec intentionally ignored — best-effort cleanup; re-throw the original error
+        throw;
+    }
+
+    auto build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(build_duration).count();
 
     // Step 13: Yield results
     ctx.yield("indexName", ctx.create_string(index_name));
