@@ -683,7 +683,8 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings(
         // Get entry point embedding
         const float* entry_embedding = get_raw_embedding(params.entry_point_id);
         if (entry_embedding == nullptr) {
-            logger.error() << "index_from_raw_embeddings: entry_embedding is NULL!";
+            logger.error() << "index_from_raw_embeddings: skipping node " << node_id
+                           << " - entry point embedding is NULL (node created but orphaned)";
             continue;
         }
 
@@ -832,7 +833,9 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings_parallel(
         pool.parallel_for(batch_start, batch_end, [&, this](size_t node_id) {
             const float* node_embedding = get_raw_embedding(static_cast<uint32_t>(node_id));
             if (node_embedding == nullptr) {
-                return;  // Skip this node if embedding not accessible
+                logger.error() << "Parallel build: skipping node " << node_id
+                               << " with null embedding (node created but orphaned)";
+                return;
             }
             const uint64_t node_top_layer = node_layers[node_id];
 
@@ -848,7 +851,9 @@ uint_fast32_t HNSWIndex::index_from_raw_embeddings_parallel(
             // Compute distance to entry point (with bounds checks)
             const float* entry_embedding = get_raw_embedding(static_cast<uint32_t>(current_entry_point));
             if (entry_embedding == nullptr) {
-                return;  // Skip if entry point embedding not accessible
+                logger.error() << "Parallel build: skipping node " << node_id
+                               << " - entry point embedding is NULL (node created but orphaned)";
+                return;
             }
             float entry_dist;
             if (node_id < raw_embedding_norms_.size() &&
