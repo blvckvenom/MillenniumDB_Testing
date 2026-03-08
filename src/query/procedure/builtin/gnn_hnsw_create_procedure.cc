@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
+#include <sys/mman.h>
 #include <thread>
 
 #include "gnn/storage/file_gnn_tensor_store.h"
@@ -223,13 +224,10 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Additional validation: verify first and last embedding are accessible
-    // This helps catch memory mapping issues early
+    // Prefault pages to detect mapping issues early
     if (num_nodes > 0 && dimension > 0) {
-        volatile float first_check = embeddings[0];
-        volatile float last_check = embeddings[(num_nodes - 1) * dimension];
-        (void)first_check;
-        (void)last_check;
+        size_t total_bytes = static_cast<size_t>(num_nodes) * dimension * sizeof(float);
+        madvise(const_cast<float*>(embeddings), total_bytes, MADV_WILLNEED);
     }
 
     if (num_threads > 1 && num_nodes >= 1000) {
