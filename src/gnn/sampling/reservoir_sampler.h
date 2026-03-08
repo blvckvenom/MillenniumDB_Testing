@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
-#include <random>
 #include <vector>
 
 #include "graph_models/object_id.h"
@@ -89,9 +89,12 @@ public:
     void set_random_seed(uint64_t seed);
 
     /**
-     * @brief Get the current random seed (for template use).
+     * @brief Get the current random seed.
      */
     uint64_t get_random_seed() const;
+
+    /// Bridge to impl RNG — generates next random value (for template use)
+    uint64_t next_random_uint64();
 
     // =========================================================================
     // Sampling Interface
@@ -154,16 +157,14 @@ auto ReservoirSampler::sample_stream(Iterator begin, Iterator end, uint64_t k)
     std::vector<T> reservoir;
     reservoir.reserve(k);
 
-    // Template can't access impl_->rng directly (pimpl), use bridge method
-    std::mt19937_64 rng(get_random_seed());
-
     uint64_t count = 0;
     for (auto it = begin; it != end; ++it, ++count) {
         if (count < k) {
             reservoir.push_back(*it);
         } else {
-            std::uniform_int_distribution<uint64_t> dist(0, count);
-            uint64_t j = dist(rng);
+            // Use stateful RNG bridge instead of recreating a local engine.
+            // Modulo bias is negligible for reservoir sampling.
+            uint64_t j = next_random_uint64() % (count + 1);
             if (j < k) {
                 reservoir[j] = *it;
             }

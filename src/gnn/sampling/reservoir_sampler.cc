@@ -205,6 +205,10 @@ std::vector<std::pair<ObjectId, ObjectId>> ReservoirSampler::sample_neighbors(
     return impl_->do_sample_neighbors(node_id, orientation);
 }
 
+uint64_t ReservoirSampler::next_random_uint64() {
+    return impl_->rng();
+}
+
 uint64_t ReservoirSampler::last_stream_size() const {
     return impl_->last_stream_size_;
 }
