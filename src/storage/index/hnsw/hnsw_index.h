@@ -200,6 +200,20 @@ public:
      */
     bool uses_raw_embeddings() const { return uses_raw_embeddings_; }
 
+    /**
+     * @brief Get embedding for a node in raw mode.
+     * @param node_id Internal node ID
+     * @return Pointer to embedding floats, or nullptr if out of bounds
+     */
+    inline const float* get_raw_embedding(uint32_t node_id) const {
+        const size_t offset = static_cast<size_t>(node_id) * params.dimensions;
+        // Runtime bounds check (works in Release builds)
+        if (offset + params.dimensions > raw_embeddings_.size()) {
+            return nullptr;  // Return null for invalid node_id
+        }
+        return raw_embeddings_.data() + offset;
+    }
+
 private:
     bool has_changes { false };
 
@@ -241,16 +255,6 @@ private:
     // Pre-computed squared norms for raw embeddings (||v||² for each node)
     // Used to avoid redundant norm computation in cosine distance calculations
     std::vector<float> raw_embedding_norms_;
-
-    // Helper to get embedding for a node in raw mode
-    inline const float* get_raw_embedding(uint32_t node_id) const {
-        const size_t offset = static_cast<size_t>(node_id) * params.dimensions;
-        // Runtime bounds check (works in Release builds)
-        if (offset + params.dimensions > raw_embeddings_.size()) {
-            return nullptr;  // Return null for invalid node_id
-        }
-        return raw_embeddings_.data() + offset;
-    }
 
     // ==================== Thread Safety for Parallel Construction ====================
     // These are only used during parallel index construction

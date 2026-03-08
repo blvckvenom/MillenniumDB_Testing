@@ -4,7 +4,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include "gnn/storage/file_gnn_tensor_store.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
@@ -139,33 +138,19 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Step 9: Load GNN tensor store to get the query embedding
-    std::string db_folder = get_db_folder();
-
-    std::string gnn_path = db_folder + "/gnn_tensors";
-    mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE, false);
-
-    // Get the tensor key from the index metadata
-    auto& metadata_map = gql_model.catalog.hnsw_index_manager.get_name2metadata();
-    auto it = metadata_map.find(index_name);
-    std::string tensor_key = "node_features";  // Default
-    if (it != metadata_map.end()) {
-        tensor_key = it->second.predicate;  // We stored tensor_key in predicate field
-    }
-
-    auto tensor_view = tensor_store.load(tensor_key);
-    if (!tensor_view.valid()) {
+    // Step 9: Get the query embedding directly from the HNSW index.
+    // The index already holds all raw embeddings in memory (loaded at startup),
+    // so we avoid reopening the FileGnnTensorStore per query.
+    const float* query_embedding = hnsw_index->get_raw_embedding(static_cast<uint32_t>(node_id));
+    if (query_embedding == nullptr) {
         throw std::runtime_error(
-            "Failed to load tensor '" + tensor_key + "' for query embedding.\n"
-            "The GNN tensor store may have been modified since the index was created."
+            "Failed to retrieve embedding for node " + std::to_string(node_id) +
+            " from HNSW index '" + index_name + "'.\n"
+            "The index may be corrupted or the node ID is out of bounds."
         );
     }
 
-    // Step 10: Get the query embedding
-    const float* embeddings = tensor_view.data_as<float>();
-    const float* query_embedding = embeddings + (node_id * dim);
-
-    // Step 11: Execute HNSW query
+    // Step 10: Execute HNSW query
     HNSW::HNSWHeap results = hnsw_index->query_raw(
         query_embedding,
         static_cast<uint64_t>(k),
