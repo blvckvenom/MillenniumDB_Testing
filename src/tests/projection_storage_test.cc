@@ -43,77 +43,83 @@ int main() {
         std::string proj_dir = manager.create_projection("test_projection");
         std::cout << " OK (dir: " << proj_dir << ")" << std::endl;
 
-        // Test 3: ProjectionCatalog
-        std::cout << "Test 3: ProjectionCatalog...";
-        GQL::ProjectionCatalog catalog(proj_dir);
-        catalog.projection_name = "test_projection";
-        catalog.node_count = 10;
-        catalog.edge_count = 20;
-        catalog.creation_timestamp = 1234567890;
-        catalog.save();
-        std::cout << " OK" << std::endl;
+        // Scope catalog and storage so they destruct before drop_projection
+        {
+            // Test 3: ProjectionCatalog
+            std::cout << "Test 3: ProjectionCatalog...";
+            GQL::ProjectionCatalog catalog(proj_dir);
+            catalog.projection_name = "test_projection";
+            catalog.node_count = 10;
+            catalog.edge_count = 20;
+            catalog.creation_timestamp = 1234567890;
+            catalog.save();
+            std::cout << " OK" << std::endl;
 
-        // Test 4: ProjectionStorage initialization
-        std::cout << "Test 4: ProjectionStorage initialization...";
-        GQL::ProjectionStorage storage(proj_dir, "test_db_storage");
-        storage.init();
-        std::cout << " OK" << std::endl;
+            // Test 4: ProjectionStorage initialization
+            std::cout << "Test 4: ProjectionStorage initialization...";
+            GQL::ProjectionStorage storage(proj_dir, "test_db_storage");
+            storage.init();
+            std::cout << " OK" << std::endl;
 
-        // Test 5: Add nodes
-        std::cout << "Test 5: Adding nodes...";
-        std::cout.flush();
-        for (uint64_t i = 1; i <= 5; i++) {
-            std::cout << " [" << i << "]";
+            // Test 5: Add nodes
+            std::cout << "Test 5: Adding nodes...";
             std::cout.flush();
-            GQL::ProjectedNode node;
-            node.node_id = ObjectId(i);
-            storage.add_node(node);
-        }
-        auto node_count = storage.get_node_count();
-        if (node_count != 5) {
-            std::cerr << "\nFAIL Test 5: expected node count 5, got " << node_count << std::endl;
-            return 1;
-        }
-        std::cout << " OK (count: " << node_count << ")" << std::endl;
+            for (uint64_t i = 1; i <= 5; i++) {
+                std::cout << " [" << i << "]";
+                std::cout.flush();
+                GQL::ProjectedNode node;
+                node.node_id = ObjectId(i);
+                storage.add_node(node);
+            }
+            // Flush batched nodes to disk before checking counts
+            storage.flush();
+            auto node_count = storage.get_node_count();
+            if (node_count != 5) {
+                std::cerr << "\nFAIL Test 5: expected node count 5, got " << node_count << std::endl;
+                return 1;
+            }
+            std::cout << " OK (count: " << node_count << ")" << std::endl;
 
-        // Test 6: Add edges
-        std::cout << "Test 6: Adding edges...";
-        for (uint64_t i = 1; i < 5; i++) {
-            GQL::ProjectedEdge edge;
-            edge.from_node = ObjectId(i);
-            edge.to_node = ObjectId(i + 1);
-            edge.edge_id = ObjectId(100 + i);
-            edge.is_directed = true;
-            storage.add_edge(edge);
-        }
-        auto edge_count = storage.get_edge_count();
-        if (edge_count != 4) {
-            std::cerr << "\nFAIL Test 6: expected edge count 4, got " << edge_count << std::endl;
-            return 1;
-        }
-        std::cout << " OK (count: " << edge_count << ")" << std::endl;
+            // Test 6: Add edges
+            std::cout << "Test 6: Adding edges...";
+            for (uint64_t i = 1; i < 5; i++) {
+                GQL::ProjectedEdge edge;
+                edge.from_node = ObjectId(i);
+                edge.to_node = ObjectId(i + 1);
+                edge.edge_id = ObjectId(100 + i);
+                edge.is_directed = true;
+                storage.add_edge(edge);
+            }
+            // Flush batched edges to disk before checking counts
+            storage.flush();
+            auto edge_count = storage.get_edge_count();
+            if (edge_count != 4) {
+                std::cerr << "\nFAIL Test 6: expected edge count 4, got " << edge_count << std::endl;
+                return 1;
+            }
+            std::cout << " OK (count: " << edge_count << ")" << std::endl;
 
-        // Test 7: Check node existence
-        std::cout << "Test 7: Checking node existence...";
-        bool exists = storage.has_node(ObjectId(3));
-        if (!exists) {
-            std::cerr << "FAIL Test 7: node 3 should exist" << std::endl;
-            return 1;
-        }
-        std::cout << " OK (node 3 exists: yes)" << std::endl;
+            // Test 7: Check node existence
+            std::cout << "Test 7: Checking node existence...";
+            bool exists = storage.has_node(ObjectId(3));
+            if (!exists) {
+                std::cerr << "FAIL Test 7: node 3 should exist" << std::endl;
+                return 1;
+            }
+            std::cout << " OK (node 3 exists: yes)" << std::endl;
+        } // storage and catalog destruct here, before drop
 
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";
         auto projections = manager.list_projections();
         std::cout << " OK (found: " << projections.size() << ")" << std::endl;
 
-        // Test 9: Drop projection
+        // Test 9: Drop projection (directory is deleted)
         std::cout << "Test 9: Dropping projection...";
         bool dropped = manager.drop_projection("test_projection");
         std::cout << " OK (dropped: " << (dropped ? "yes" : "no") << ")" << std::endl;
 
         std::cout << "\nAll tests passed!" << std::endl;
-        std::filesystem::remove_all("test_db_storage");
         return 0;
 
     } catch (const std::exception& e) {
