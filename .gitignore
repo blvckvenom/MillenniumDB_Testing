@@ -142,3 +142,6 @@ data/example/gql/ogbn-*/
 data/example/gql/cora/
 scripts/gnn_datasets/ogb_data/
 *.npy
+
+# Git worktrees (isolated workspaces)
+/.worktrees/
