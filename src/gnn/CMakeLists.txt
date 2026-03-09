@@ -160,38 +160,52 @@ if(BUILD_TESTING)
     find_package(GTest QUIET)
 
     if(GTest_FOUND)
-        add_executable(test_gnn_core
-            # Phase 0: Core tests
-            tests/test_cuda_context.cc
-            tests/test_tensor_utils.cc
-            tests/test_memory_pool.cc
-            tests/test_sparse_ops.cc
+        # test_gnn_core: only build if source files exist (created in later phases)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_context.cc")
+            add_executable(test_gnn_core
+                # Phase 0: Core tests
+                tests/test_cuda_context.cc
+                tests/test_tensor_utils.cc
+                tests/test_memory_pool.cc
+                tests/test_sparse_ops.cc
 
-            # GNN Tensor Storage tests
-            tests/test_gnn_tensor_store.cc
+                # GNN Tensor Storage tests
+                tests/test_gnn_tensor_store.cc
 
-            # Phase 1: Projection integration tests
-            tests/test_projection_accessors.cc
+                # Phase 1: Projection integration tests
+                tests/test_projection_accessors.cc
 
-            # DVM-1: TopologyAccessor correctness verification
-            tests/test_topology_accessor_correctness.cc
+                # DVM-1: TopologyAccessor correctness verification
+                tests/test_topology_accessor_correctness.cc
 
-            # DVM-2: UNDIRECTED orientation bidirectional traversal
-            tests/test_undirected_orientation.cc
+                # DVM-2: UNDIRECTED orientation bidirectional traversal
+                tests/test_undirected_orientation.cc
+            )
+
+            target_link_libraries(test_gnn_core
+                mdb_gnn_core
+                GTest::gtest_main
+            )
+
+            # Set RPATH for test executable to find LibTorch at runtime
+            set_target_properties(test_gnn_core PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+
+            add_test(NAME GNNCoreTests COMMAND test_gnn_core)
+        endif()
+
+        # FeatureMatrix tests (Step 0 redesign)
+        add_executable(test_feature_matrix
+            tests/test_feature_matrix.cc
         )
-
-        target_link_libraries(test_gnn_core
-            mdb_gnn_core
-            GTest::gtest_main
-        )
-
-        # Set RPATH for test executable to find LibTorch at runtime
-        set_target_properties(test_gnn_core PROPERTIES
+        target_link_libraries(test_feature_matrix mdb_gnn_core GTest::gtest_main)
+        set_target_properties(test_feature_matrix PROPERTIES
             BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
-
-        add_test(NAME GNNCoreTests COMMAND test_gnn_core)
+        add_test(NAME FeatureMatrixTests COMMAND test_feature_matrix)
 
         message(STATUS "GNN tests enabled")
     else()
