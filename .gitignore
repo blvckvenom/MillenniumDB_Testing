@@ -145,3 +145,12 @@ scripts/gnn_datasets/ogb_data/
 
 # Git worktrees (isolated workspaces)
 /.worktrees/
+
+# Local test suites (GNN fork)
+/tests_Proj_GNN/
+
+# Planning docs (Claude Code internal)
+/.planning/
+
+# Downloaded dataset cache (regenerable via scripts/)
+data/example/gql/.cache/
