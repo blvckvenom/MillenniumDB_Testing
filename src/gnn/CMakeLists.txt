@@ -62,6 +62,9 @@ add_library(mdb_gnn_core STATIC
     storage/file_gnn_tensor_store.cc
     storage/gnn_tensor_converter.cc
 
+    # Phase 0: Storage - FeatureMatrix (redesign)
+    storage/feature_matrix.cc
+
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
     projection/topology_accessor.cc
