@@ -210,16 +210,55 @@ const void* FeatureMatrix::row(uint64_t row_id) const {
 
 // --- scan() ---
 
-void FeatureMatrix::scan(RowCallback /*callback*/) const {
-    throw std::runtime_error("FeatureMatrix::scan not implemented yet");
+void FeatureMatrix::scan(RowCallback callback) const {
+    if (mmap_ptr_ == nullptr) {
+        throw std::runtime_error("FeatureMatrix::scan: not mapped");
+    }
+
+    // Hint: sequential access pattern for the full data region
+    ::madvise(mmap_ptr_, mmap_size_, MADV_SEQUENTIAL);
+
+    for (uint64_t i = 0; i < header_.num_rows; ++i) {
+        callback(i, row(i));
+    }
+
+    // Restore default policy
+    ::madvise(mmap_ptr_, mmap_size_, MADV_NORMAL);
 }
 
 // --- extract_rows() ---
 
 void FeatureMatrix::extract_rows(
-    const std::vector<uint64_t>& /*row_ids*/, void* /*out*/) const
+    const std::vector<uint64_t>& row_ids, void* out) const
 {
-    throw std::runtime_error("FeatureMatrix::extract_rows not implemented yet");
+    if (row_ids.empty()) return;
+
+    if (mmap_ptr_ == nullptr) {
+        throw std::runtime_error("FeatureMatrix::extract_rows: not mapped");
+    }
+
+    const size_t rb = header_.row_bytes();
+    char* out_bytes = static_cast<char*>(out);
+
+    // Build (row_id, original_position) pairs, then sort by row_id
+    // for sequential disk access
+    std::vector<std::pair<uint64_t, size_t>> sorted_ids;
+    sorted_ids.reserve(row_ids.size());
+    for (size_t i = 0; i < row_ids.size(); ++i) {
+        sorted_ids.emplace_back(row_ids[i], i);
+    }
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+
+    // Prefetch hint for the data region
+    ::madvise(mmap_ptr_, mmap_size_, MADV_WILLNEED);
+
+    // Copy rows in sorted order, placing each at its original position in output
+    for (const auto& [rid, orig_pos] : sorted_ids) {
+        const void* src = row(rid); // bounds-checked
+        std::memcpy(out_bytes + orig_pos * rb, src, rb);
+    }
+
+    ::madvise(mmap_ptr_, mmap_size_, MADV_NORMAL);
 }
 
 // --- create_streaming() ---
