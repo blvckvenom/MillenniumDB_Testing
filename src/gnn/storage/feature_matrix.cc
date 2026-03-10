@@ -264,20 +264,83 @@ void FeatureMatrix::extract_rows(
 // --- create_streaming() ---
 
 FeatureMatrix FeatureMatrix::create_streaming(
-    const fs::path& /*path*/, uint64_t /*num_rows*/, uint64_t /*num_cols*/,
-    GnnDtype /*dtype*/, RowWriter /*writer*/)
+    const fs::path& path,
+    uint64_t num_rows,
+    uint64_t num_cols,
+    GnnDtype dtype,
+    RowWriter writer)
 {
-    throw std::runtime_error("FeatureMatrix::create_streaming not implemented yet");
+    if (num_rows == 0 || num_cols == 0) {
+        throw std::invalid_argument(
+            "FeatureMatrix::create_streaming: num_rows and num_cols must be > 0");
+    }
+
+    auto header = FeatureMatrixHeader::make(num_rows, num_cols, dtype);
+    const size_t rb = header.row_bytes();
+
+    // Overflow check
+    if (rb > 0 && num_rows > SIZE_MAX / rb) {
+        throw std::overflow_error(
+            "FeatureMatrix::create_streaming: data size would overflow size_t");
+    }
+    size_t data_size = header.data_bytes();
+    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "FeatureMatrix::create_streaming: cannot open " + path.string() +
+            ": " + std::strerror(errno));
+    }
+    FdGuard guard(fd);
+
+    // Write header
+    write_all(fd, &header, sizeof(header));
+
+    // Write rows one at a time via callback
+    std::vector<char> row_buf(rb);
+    for (uint64_t i = 0; i < num_rows; ++i) {
+        writer(i, row_buf.data(), rb);
+        write_all(fd, row_buf.data(), rb);
+    }
+
+    if (::fsync(fd) < 0) {
+        throw std::runtime_error(
+            "FeatureMatrix::create_streaming: fsync failed: " +
+            std::string(std::strerror(errno)));
+    }
+
+    // mmap the result
+    FeatureMatrix fm;
+    fm.header_    = header;
+    fm.path_      = path;
+    fm.mmap_size_ = file_size;
+    fm.mmap_ptr_  = mmap_file_readonly(path, file_size);
+    return fm;
 }
 
 // --- create_reordered() ---
 
 FeatureMatrix FeatureMatrix::create_reordered(
-    const FeatureMatrix& /*source*/,
-    const std::vector<uint64_t>& /*permutation*/,
-    const fs::path& /*output_path*/)
+    const FeatureMatrix& source,
+    const std::vector<uint64_t>& permutation,
+    const fs::path& output_path)
 {
-    throw std::runtime_error("FeatureMatrix::create_reordered not implemented yet");
+    if (permutation.size() != source.num_rows()) {
+        throw std::invalid_argument(
+            "FeatureMatrix::create_reordered: permutation size (" +
+            std::to_string(permutation.size()) + ") != source num_rows (" +
+            std::to_string(source.num_rows()) + ")");
+    }
+
+    return create_streaming(
+        output_path,
+        source.num_rows(),
+        source.num_cols(),
+        source.dtype(),
+        [&](uint64_t row_id, void* dest, uint64_t rb) {
+            std::memcpy(dest, source.row(permutation[row_id]), rb);
+        });
 }
 
 } // namespace mdb::gnn
