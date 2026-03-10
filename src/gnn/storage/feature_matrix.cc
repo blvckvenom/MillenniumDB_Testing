@@ -11,7 +11,7 @@
 
 namespace mdb::gnn {
 
-// --- RAII file descriptor guard ---
+// --- RAII helpers ---
 namespace {
 
 class FdGuard {
@@ -24,6 +24,24 @@ public:
     void release() { fd_ = -1; }
 private:
     int fd_;
+};
+
+// RAII guard that restores madvise hint on scope exit (even if exception thrown)
+class MadviseGuard {
+public:
+    MadviseGuard(void* addr, size_t len, int advice)
+        : addr_(addr), len_(len)
+    {
+        ::madvise(addr_, len_, advice);
+    }
+    ~MadviseGuard() {
+        ::madvise(addr_, len_, MADV_NORMAL);
+    }
+    MadviseGuard(const MadviseGuard&) = delete;
+    MadviseGuard& operator=(const MadviseGuard&) = delete;
+private:
+    void*  addr_;
+    size_t len_;
 };
 
 void write_all(int fd, const void* buf, size_t count) {
@@ -69,6 +87,7 @@ FeatureMatrix::FeatureMatrix(FeatureMatrix&& other) noexcept
 {
     other.mmap_ptr_  = nullptr;
     other.mmap_size_ = 0;
+    other.header_    = {};  // zero out moved-from header (num_rows=0)
 }
 
 FeatureMatrix& FeatureMatrix::operator=(FeatureMatrix&& other) noexcept {
@@ -83,6 +102,7 @@ FeatureMatrix& FeatureMatrix::operator=(FeatureMatrix&& other) noexcept {
         mmap_size_ = other.mmap_size_;
         other.mmap_ptr_  = nullptr;
         other.mmap_size_ = 0;
+        other.header_    = {};
     }
     return *this;
 }
@@ -200,6 +220,9 @@ FeatureMatrix FeatureMatrix::open(const fs::path& path) {
 // --- row() ---
 
 const void* FeatureMatrix::row(uint64_t row_id) const {
+    if (mmap_ptr_ == nullptr) {
+        throw std::runtime_error("FeatureMatrix::row: not mapped (moved-from or uninitialized)");
+    }
     if (row_id >= header_.num_rows) {
         throw std::out_of_range(
             "FeatureMatrix::row: row_id " + std::to_string(row_id) +
@@ -215,15 +238,13 @@ void FeatureMatrix::scan(RowCallback callback) const {
         throw std::runtime_error("FeatureMatrix::scan: not mapped");
     }
 
-    // Hint: sequential access pattern for the full data region
-    ::madvise(mmap_ptr_, mmap_size_, MADV_SEQUENTIAL);
+    // RAII guard: sets MADV_SEQUENTIAL now, restores MADV_NORMAL on scope exit
+    // (even if callback throws an exception)
+    MadviseGuard madvise_guard(mmap_ptr_, mmap_size_, MADV_SEQUENTIAL);
 
     for (uint64_t i = 0; i < header_.num_rows; ++i) {
         callback(i, row(i));
     }
-
-    // Restore default policy
-    ::madvise(mmap_ptr_, mmap_size_, MADV_NORMAL);
 }
 
 // --- extract_rows() ---
@@ -235,6 +256,16 @@ void FeatureMatrix::extract_rows(
 
     if (mmap_ptr_ == nullptr) {
         throw std::runtime_error("FeatureMatrix::extract_rows: not mapped");
+    }
+
+    // Validate all row_ids before doing any work
+    for (size_t i = 0; i < row_ids.size(); ++i) {
+        if (row_ids[i] >= header_.num_rows) {
+            throw std::out_of_range(
+                "FeatureMatrix::extract_rows: row_ids[" + std::to_string(i) +
+                "] = " + std::to_string(row_ids[i]) +
+                " out of range [0, " + std::to_string(header_.num_rows) + ")");
+        }
     }
 
     const size_t rb = header_.row_bytes();
@@ -249,16 +280,14 @@ void FeatureMatrix::extract_rows(
     }
     std::sort(sorted_ids.begin(), sorted_ids.end());
 
-    // Prefetch hint for the data region
-    ::madvise(mmap_ptr_, mmap_size_, MADV_WILLNEED);
+    // RAII guard: prefetch hint, restored to NORMAL on exit
+    MadviseGuard madvise_guard(mmap_ptr_, mmap_size_, MADV_WILLNEED);
 
     // Copy rows in sorted order, placing each at its original position in output
+    const char* base = static_cast<const char*>(data_ptr());
     for (const auto& [rid, orig_pos] : sorted_ids) {
-        const void* src = row(rid); // bounds-checked
-        std::memcpy(out_bytes + orig_pos * rb, src, rb);
+        std::memcpy(out_bytes + orig_pos * rb, base + rid * rb, rb);
     }
-
-    ::madvise(mmap_ptr_, mmap_size_, MADV_NORMAL);
 }
 
 // --- create_streaming() ---
@@ -331,6 +360,16 @@ FeatureMatrix FeatureMatrix::create_reordered(
             "FeatureMatrix::create_reordered: permutation size (" +
             std::to_string(permutation.size()) + ") != source num_rows (" +
             std::to_string(source.num_rows()) + ")");
+    }
+
+    // Validate all indices before writing anything
+    for (size_t i = 0; i < permutation.size(); ++i) {
+        if (permutation[i] >= source.num_rows()) {
+            throw std::out_of_range(
+                "FeatureMatrix::create_reordered: permutation[" + std::to_string(i) +
+                "] = " + std::to_string(permutation[i]) +
+                " out of range [0, " + std::to_string(source.num_rows()) + ")");
+        }
     }
 
     return create_streaming(
