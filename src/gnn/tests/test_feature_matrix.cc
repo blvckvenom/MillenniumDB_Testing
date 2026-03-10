@@ -9,6 +9,8 @@
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "gnn/storage/row_mapping.h"
+#include "graph_models/object_id.h"
 
 namespace fs = std::filesystem;
 using namespace mdb::gnn;
@@ -461,4 +463,84 @@ TEST_F(FeatureMatrixTest, AllDtypesRoundtrip) {
         EXPECT_EQ(fm.row_as<uint8_t>(0)[0], 1);
         EXPECT_EQ(fm.row_as<uint8_t>(0)[1], 0);
     }
+}
+
+// ===========================================================================
+// RowMapping Tests
+// ===========================================================================
+
+TEST_F(FeatureMatrixTest, RowMappingRoundtrip) {
+    std::vector<ObjectId> ids;
+    for (uint64_t i = 0; i < 100; ++i) {
+        ids.push_back(ObjectId(i * 7 + 3)); // arbitrary IDs
+    }
+
+    auto path = test_path("mapping.rmap");
+    auto rm_write = RowMapping::create(path, ids);
+    EXPECT_EQ(rm_write.size(), 100u);
+
+    auto rm_read = RowMapping::open(path);
+    EXPECT_EQ(rm_read.size(), 100u);
+
+    for (uint64_t i = 0; i < 100; ++i) {
+        EXPECT_EQ(rm_read.get(i).id, ids[i].id);
+    }
+}
+
+TEST_F(FeatureMatrixTest, RowMappingFind) {
+    std::vector<ObjectId> ids = {ObjectId(42), ObjectId(99), ObjectId(7)};
+    auto rm = RowMapping::create(test_path("find.rmap"), ids);
+
+    auto idx = rm.find(ObjectId(99));
+    ASSERT_TRUE(idx.has_value());
+    EXPECT_EQ(idx.value(), 1u);
+
+    auto miss = rm.find(ObjectId(12345));
+    EXPECT_FALSE(miss.has_value());
+}
+
+TEST_F(FeatureMatrixTest, RowMappingEmpty) {
+    std::vector<ObjectId> ids;
+    auto rm = RowMapping::create(test_path("empty.rmap"), ids);
+    EXPECT_EQ(rm.size(), 0u);
+    EXPECT_THROW(rm.get(0), std::out_of_range);
+    EXPECT_FALSE(rm.find(ObjectId(1)).has_value());
+}
+
+TEST_F(FeatureMatrixTest, RowMappingPersistence) {
+    std::vector<ObjectId> ids = {ObjectId(100), ObjectId(200)};
+    auto path = test_path("persist.rmap");
+
+    // Create and destroy
+    { auto rm = RowMapping::create(path, ids); }
+
+    // Re-open
+    auto rm = RowMapping::open(path);
+    EXPECT_EQ(rm.size(), 2u);
+    EXPECT_EQ(rm.get(0).id, 100u);
+    EXPECT_EQ(rm.get(1).id, 200u);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingOpenNonExistentThrows) {
+    EXPECT_THROW(RowMapping::open(test_path("nope.rmap")), std::runtime_error);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingOutOfBoundsThrows) {
+    std::vector<ObjectId> ids = {ObjectId(1)};
+    auto rm = RowMapping::create(test_path("oob.rmap"), ids);
+    EXPECT_THROW(rm.get(1), std::out_of_range);
+    EXPECT_THROW(rm.get(999), std::out_of_range);
+    EXPECT_NO_THROW(rm.get(0));
+}
+
+TEST_F(FeatureMatrixTest, RowMappingMovedFrom) {
+    std::vector<ObjectId> ids = {ObjectId(42)};
+    auto rm1 = RowMapping::create(test_path("move.rmap"), ids);
+    auto rm2 = std::move(rm1);
+
+    EXPECT_EQ(rm2.size(), 1u);
+    EXPECT_EQ(rm2.get(0).id, 42u);
+
+    EXPECT_EQ(rm1.size(), 0u);
+    EXPECT_THROW(rm1.get(0), std::runtime_error);
 }

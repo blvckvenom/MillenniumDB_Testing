@@ -64,6 +64,7 @@ add_library(mdb_gnn_core STATIC
 
     # Phase 0: Storage - FeatureMatrix (redesign)
     storage/feature_matrix.cc
+    storage/row_mapping.cc
 
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
