@@ -149,7 +149,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/antlr4-runtime-4.13.1)
 include_directories(${CMAKE_SOURCE_DIR}/third_party/antlr4-runtime-4.13.1/src)
 include_directories(${CMAKE_SOURCE_DIR}/third_party/boost_1_82/include)
 include_directories(${CMAKE_SOURCE_DIR}/third_party/libnpy)
-include_directories(${CMAKE_SOURCE_DIR}/third_party/ska_sort)
+include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/third_party/ska_sort)
 
 # Optional: GNN Module with LibTorch
 option(ENABLE_GNN "Enable GNN training module with LibTorch" OFF)
