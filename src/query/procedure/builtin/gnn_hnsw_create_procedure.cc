@@ -7,7 +7,7 @@
 #include <sys/mman.h>
 #include <thread>
 
-#include "gnn/storage/file_gnn_tensor_store.h"
+#include "gnn/storage/feature_matrix.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
@@ -133,7 +133,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 6: Check if GNN tensors are available
-    if (!gql_model.catalog.has_gnn_tensors) {
+    if (!gql_model.catalog.has_gnn_features()) {
         throw std::runtime_error(
             "No GNN tensors found in this database.\n\n"
             "To use gnn_hnsw_create(), import your database with tensors:\n"
@@ -155,51 +155,41 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
 
     try {
 
-    // hnsw_index declared here so it survives the inner tensor_store scope
+    // hnsw_index declared here so it survives the inner FeatureMatrix scope
     std::unique_ptr<HNSW::HNSWIndex> hnsw_index;
 
-    // Steps 7-9, 11: Load tensor store, validate, create + build the HNSW index.
-    // Scoped so the tensor store's mmap (~2.3GB for 799K x 768d x float32)
-    // is released as soon as HNSW indexing finishes — before write_to_disk.
-    // The HNSW index keeps its own copy of the vectors, so the mmap is
-    // no longer needed after index_from_raw_embeddings returns.
+    // Steps 7-9, 11: Load FeatureMatrix, validate, create + build the HNSW index.
+    // Scoped so the FeatureMatrix mmap is released as soon as HNSW indexing
+    // finishes — before write_to_disk. The HNSW index keeps its own copy of
+    // the vectors, so the mmap is no longer needed after indexing returns.
     {
-    // Step 7: Load GNN tensor store
+    // Step 7: Open FeatureMatrix for the requested tensor key
     std::string db_folder = get_db_folder();
+    namespace fs = std::filesystem;
 
-    std::string gnn_path = db_folder + "/gnn_tensors";
-    mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE, false);
-
-    // Step 8: Load the tensor
-    auto tensor_view = tensor_store.load(tensor_key);
-    if (!tensor_view.valid()) {
-        // List available keys for helpful error message
-        auto keys = tensor_store.list_keys();
+    auto fmat_path = fs::path(db_folder) / "gnn_features" / (tensor_key + ".fmat");
+    if (!fs::exists(fmat_path)) {
+        // List available features from catalog for helpful error message
+        const auto& names = gql_model.catalog.gnn_feature_names;
         throw std::runtime_error(
-            format_not_found_error("tensor key", tensor_key, keys)
+            format_not_found_error("feature matrix", tensor_key, names)
         );
     }
 
-    // Step 9: Validate tensor shape
-    const auto& shape = tensor_view.shape();
-    if (shape.size() != 2) {
+    auto feature_matrix = mdb::gnn::FeatureMatrix::open(fmat_path);
+
+    // Step 8-9: Read dimensions from FeatureMatrix header (self-describing)
+    num_nodes = feature_matrix.num_rows();
+    dimension = feature_matrix.num_cols();
+
+    if (feature_matrix.dtype() != mdb::gnn::GnnDtype::FLOAT32) {
         throw std::runtime_error(
-            "Invalid tensor shape: expected 2D tensor [num_nodes, embedding_dim], "
-            "got " + std::to_string(shape.size()) + "D tensor."
+            "Invalid feature matrix dtype: expected FLOAT32, got " +
+            std::to_string(static_cast<int>(feature_matrix.dtype()))
         );
     }
 
-    num_nodes = static_cast<uint64_t>(shape[0]);
-    dimension = static_cast<uint64_t>(shape[1]);
-
-    if (tensor_view.dtype() != mdb::gnn::GnnDtype::FLOAT32) {
-        throw std::runtime_error(
-            "Invalid tensor dtype: expected FLOAT32, got " +
-            std::to_string(static_cast<int>(tensor_view.dtype()))
-        );
-    }
-
-    // Step 10: Create HNSW index (after dimension is known from tensor shape)
+    // Step 10: Create HNSW index (after dimension is known)
     HNSW::MetricFuncType metric_func = HNSW::metric_type2metric_func(metric);
     hnsw_index = HNSW::HNSWIndex::create(
         index_name,
@@ -210,15 +200,9 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     );
 
     // Step 11: Index the embeddings (parallel if multiple threads specified)
-    const float* embeddings = tensor_view.data_as<float>();
-
-    // Defensive validation: ensure embeddings pointer is valid
-    if (embeddings == nullptr) {
-        throw std::runtime_error(
-            "Failed to access tensor data for '" + tensor_key + "'.\n"
-            "The tensor exists but data pointer is null - possible memory mapping failure."
-        );
-    }
+    // FeatureMatrix data is contiguous row-major [N, D], so row_as<float>(0)
+    // points to the start of the entire data block.
+    const float* embeddings = feature_matrix.row_as<float>(0);
 
     // Prefault pages to detect mapping issues early
     if (num_nodes > 0 && dimension > 0) {
@@ -227,7 +211,6 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     }
 
     if (num_threads > 1 && num_nodes >= 1000) {
-        // Use parallel construction for large datasets
         indexed_count = hnsw_index->index_from_raw_embeddings_parallel(
             embeddings,
             num_nodes,
@@ -235,7 +218,6 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
             num_threads
         );
     } else {
-        // Use sequential construction for small datasets or single thread
         indexed_count = hnsw_index->index_from_raw_embeddings(
             embeddings,
             num_nodes,
@@ -243,7 +225,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    } // End tensor_store scope — releases mmap (~2.3GB) before write_to_disk
+    } // End FeatureMatrix scope — releases mmap before write_to_disk
 
     build_duration = std::chrono::high_resolution_clock::now() - start_time;
 

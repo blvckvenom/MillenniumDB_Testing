@@ -2,6 +2,10 @@
 
 /**
  * @file inmemory_gnn_tensor_store.h
+ * @brief DEPRECATED — use FeatureMatrix instead.
+ *
+ * @deprecated Use feature_matrix.h and row_mapping.h instead.
+ *
  * @brief In-memory implementation of GnnTensorStore.
  *
  * This implementation stores tensors entirely in memory using std::vector.

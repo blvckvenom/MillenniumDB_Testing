@@ -2,6 +2,20 @@
 
 /**
  * @file file_gnn_tensor_store.h
+ * @brief DEPRECATED — use FeatureMatrix instead.
+ *
+ * This file is superseded by feature_matrix.h + row_mapping.h.
+ * The FeatureMatrix design provides:
+ *   - Immutable [N,D] matrix with 64-byte self-describing header
+ *   - Zero-copy mmap reads (PROT_READ, MAP_PRIVATE)
+ *   - Sequential scan with MADV_SEQUENTIAL
+ *   - Sorted batch extraction with MADV_WILLNEED
+ *
+ * This file remains for backward compatibility with existing sampling code.
+ * It will be removed once all callsites are migrated.
+ *
+ * @deprecated Use feature_matrix.h and row_mapping.h instead.
+ *
  * @brief File-backed implementation of GnnTensorStore with memory-mapped access.
  *
  * This implementation persists tensors to disk using a binary format:

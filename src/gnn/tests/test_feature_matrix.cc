@@ -544,3 +544,276 @@ TEST_F(FeatureMatrixTest, RowMappingMovedFrom) {
     EXPECT_EQ(rm1.size(), 0u);
     EXPECT_THROW(rm1.get(0), std::runtime_error);
 }
+
+// ===========================================================================
+// Additional Edge Case Tests (robustness)
+// ===========================================================================
+
+// --- RowMapping edge cases ---
+
+TEST_F(FeatureMatrixTest, RowMappingCorruptedHeaderThrows) {
+    auto path = test_path("corrupt.rmap");
+    // Write a file with bad magic but enough size for header
+    std::vector<char> garbage(32, static_cast<char>(0xFF));
+    {
+        std::ofstream ofs(path, std::ios::binary);
+        ofs.write(garbage.data(), garbage.size());
+    }
+    EXPECT_THROW(RowMapping::open(path), std::runtime_error);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingTruncatedFileThrows) {
+    auto path = test_path("truncated.rmap");
+
+    // Create a valid mapping with 10 entries
+    std::vector<ObjectId> ids;
+    for (uint64_t i = 0; i < 10; ++i) ids.push_back(ObjectId(i));
+    { auto rm = RowMapping::create(path, ids); }
+
+    // Truncate to just the header + 2 entries (should expect 10)
+    fs::resize_file(path, RowMapping::HEADER_SIZE + 2 * sizeof(ObjectId));
+
+    EXPECT_THROW(RowMapping::open(path), std::runtime_error);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingFileTooSmallForHeaderThrows) {
+    auto path = test_path("tiny.rmap");
+    // Write a file smaller than the 16-byte header
+    std::ofstream ofs(path, std::ios::binary);
+    char byte = 0;
+    ofs.write(&byte, 1);
+    ofs.close();
+
+    EXPECT_THROW(RowMapping::open(path), std::runtime_error);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingLargeRoundtrip) {
+    const uint64_t N = 10000;
+    std::vector<ObjectId> ids;
+    ids.reserve(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        ids.push_back(ObjectId(i * 13 + 7)); // arbitrary but deterministic
+    }
+
+    auto path = test_path("large.rmap");
+    { auto rm = RowMapping::create(path, ids); }
+
+    auto rm = RowMapping::open(path);
+    EXPECT_EQ(rm.size(), N);
+
+    // Spot-check boundaries
+    EXPECT_EQ(rm.get(0).id, ids[0].id);
+    EXPECT_EQ(rm.get(N / 2).id, ids[N / 2].id);
+    EXPECT_EQ(rm.get(N - 1).id, ids[N - 1].id);
+    EXPECT_THROW(rm.get(N), std::out_of_range);
+
+    // find() at boundaries
+    EXPECT_TRUE(rm.find(ids[0]).has_value());
+    EXPECT_TRUE(rm.find(ids[N - 1]).has_value());
+    EXPECT_FALSE(rm.find(ObjectId(0xDEADBEEF)).has_value());
+}
+
+TEST_F(FeatureMatrixTest, RowMappingMoveAssignReleasesOld) {
+    std::vector<ObjectId> ids_a = {ObjectId(10), ObjectId(20)};
+    std::vector<ObjectId> ids_b = {ObjectId(30), ObjectId(40), ObjectId(50)};
+
+    auto rm = RowMapping::create(test_path("assign_a.rmap"), ids_a);
+    EXPECT_EQ(rm.size(), 2u);
+    EXPECT_EQ(rm.get(0).id, 10u);
+
+    // Move-assign over it — old mapping should be released (no leak)
+    rm = RowMapping::create(test_path("assign_b.rmap"), ids_b);
+    EXPECT_EQ(rm.size(), 3u);
+    EXPECT_EQ(rm.get(0).id, 30u);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingFindFirstOccurrence) {
+    // If duplicates exist, find() should return the first index
+    std::vector<ObjectId> ids = {ObjectId(5), ObjectId(10), ObjectId(5), ObjectId(10)};
+    auto rm = RowMapping::create(test_path("dup_find.rmap"), ids);
+
+    auto idx = rm.find(ObjectId(5));
+    ASSERT_TRUE(idx.has_value());
+    EXPECT_EQ(idx.value(), 0u);  // first occurrence
+
+    auto idx2 = rm.find(ObjectId(10));
+    ASSERT_TRUE(idx2.has_value());
+    EXPECT_EQ(idx2.value(), 1u);  // first occurrence
+}
+
+// --- FeatureMatrix edge cases ---
+
+TEST_F(FeatureMatrixTest, ScanOnMovedFromThrows) {
+    const uint64_t N = 3, D = 2;
+    std::vector<float> data(N * D, 1.0f);
+    auto fm1 = FeatureMatrix::create(test_path("scan_moved.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+
+    auto fm2 = std::move(fm1);
+
+    // fm1 is moved-from — scan should throw
+    EXPECT_THROW(fm1.scan([](uint64_t, const void*) {}), std::runtime_error);
+
+    // fm2 should scan fine
+    uint64_t count = 0;
+    EXPECT_NO_THROW(fm2.scan([&](uint64_t, const void*) { ++count; }));
+    EXPECT_EQ(count, N);
+}
+
+TEST_F(FeatureMatrixTest, ExtractRowsOnMovedFromThrows) {
+    const uint64_t N = 3, D = 2;
+    std::vector<float> data(N * D, 1.0f);
+    auto fm1 = FeatureMatrix::create(test_path("extract_moved.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+
+    auto fm2 = std::move(fm1);
+
+    std::vector<uint64_t> ids = {0};
+    std::vector<float> out(D);
+    EXPECT_THROW(fm1.extract_rows(ids, out.data()), std::runtime_error);
+}
+
+TEST_F(FeatureMatrixTest, ExtractRowsLargeRandomAccess) {
+    // Test with 1000 rows, extracting random subset in reverse order
+    const uint64_t N = 1000, D = 8;
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) data[i] = static_cast<float>(i);
+
+    auto fm = FeatureMatrix::create(test_path("large_extract.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+
+    // Extract rows in reverse order
+    std::vector<uint64_t> ids;
+    for (uint64_t i = N; i > 0; i -= 10) {
+        ids.push_back(i - 1);  // 999, 989, 979, ..., 9
+    }
+
+    std::vector<float> out(ids.size() * D);
+    EXPECT_NO_THROW(fm.extract_rows(ids, out.data()));
+
+    // Verify each extracted row matches source
+    for (size_t i = 0; i < ids.size(); ++i) {
+        uint64_t src_row = ids[i];
+        for (uint64_t j = 0; j < D; ++j) {
+            EXPECT_FLOAT_EQ(out[i * D + j], data[src_row * D + j])
+                << "Mismatch at output[" << i << "] (source row " << src_row << ") col " << j;
+        }
+    }
+}
+
+TEST_F(FeatureMatrixTest, CreateStreamingZeroDimsThrows) {
+    EXPECT_THROW(
+        FeatureMatrix::create_streaming(test_path("stream_zero.fmat"), 0, 10, GnnDtype::FLOAT32,
+            [](uint64_t, void*, uint64_t) {}),
+        std::invalid_argument);
+
+    EXPECT_THROW(
+        FeatureMatrix::create_streaming(test_path("stream_zero2.fmat"), 10, 0, GnnDtype::FLOAT32,
+            [](uint64_t, void*, uint64_t) {}),
+        std::invalid_argument);
+}
+
+TEST_F(FeatureMatrixTest, CreateReorderedIdentityPermutation) {
+    const uint64_t N = 5, D = 3;
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) data[i] = static_cast<float>(i);
+
+    auto src = FeatureMatrix::create(test_path("identity_src.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+
+    // Identity permutation — output should be identical to input
+    std::vector<uint64_t> perm = {0, 1, 2, 3, 4};
+    auto dst = FeatureMatrix::create_reordered(src, perm, test_path("identity_dst.fmat"));
+
+    for (uint64_t i = 0; i < N; ++i) {
+        const float* src_row = src.row_as<float>(i);
+        const float* dst_row = dst.row_as<float>(i);
+        for (uint64_t j = 0; j < D; ++j) {
+            EXPECT_FLOAT_EQ(src_row[j], dst_row[j]);
+        }
+    }
+}
+
+TEST_F(FeatureMatrixTest, HeaderFileLayoutSize) {
+    // Verify the header is exactly 64 bytes (critical for mmap alignment)
+    EXPECT_EQ(FeatureMatrixHeader::SIZE, 64u);
+    EXPECT_EQ(sizeof(FeatureMatrixHeader), FeatureMatrixHeader::SIZE);
+
+    // Verify RowMapping header is exactly 16 bytes
+    EXPECT_EQ(RowMapping::HEADER_SIZE, 16u);
+}
+
+TEST_F(FeatureMatrixTest, OpenFileWithExtraTrailingBytesSucceeds) {
+    const uint64_t N = 3, D = 2;
+    std::vector<float> data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    auto path = test_path("extra_bytes.fmat");
+
+    { auto fm = FeatureMatrix::create(path, N, D, GnnDtype::FLOAT32, data.data()); }
+
+    // Append extra bytes to file — open() should still work
+    // (file_size >= expected is OK, file_size < expected is an error)
+    {
+        std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        char padding[128] = {};
+        ofs.write(padding, sizeof(padding));
+    }
+
+    auto fm = FeatureMatrix::open(path);
+    EXPECT_EQ(fm.num_rows(), N);
+    EXPECT_EQ(fm.num_cols(), D);
+    EXPECT_FLOAT_EQ(fm.row_as<float>(0)[0], 1.0f);
+}
+
+TEST_F(FeatureMatrixTest, RowMappingOpenWithExtraTrailingBytesSucceeds) {
+    std::vector<ObjectId> ids = {ObjectId(1), ObjectId(2)};
+    auto path = test_path("extra.rmap");
+    { auto rm = RowMapping::create(path, ids); }
+
+    // Append extra bytes — should not break open()
+    {
+        std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        char padding[64] = {};
+        ofs.write(padding, sizeof(padding));
+    }
+
+    auto rm = RowMapping::open(path);
+    EXPECT_EQ(rm.size(), 2u);
+    EXPECT_EQ(rm.get(0).id, 1u);
+    EXPECT_EQ(rm.get(1).id, 2u);
+}
+
+TEST_F(FeatureMatrixTest, ScanAllDtypesVerifyRowSize) {
+    // Verify that row_bytes() matches dtype_size * num_cols for all dtypes
+    struct DtypeInfo {
+        GnnDtype dtype;
+        size_t expected_elem_size;
+    };
+    std::vector<DtypeInfo> infos = {
+        {GnnDtype::FLOAT32, 4},
+        {GnnDtype::FLOAT64, 8},
+        {GnnDtype::INT32,   4},
+        {GnnDtype::INT64,   8},
+        {GnnDtype::UINT8,   1},
+        {GnnDtype::BOOL,    1},
+    };
+
+    const uint64_t D = 10;
+    for (const auto& info : infos) {
+        auto header = FeatureMatrixHeader::make(1, D, info.dtype);
+        EXPECT_EQ(header.row_bytes(), D * info.expected_elem_size)
+            << "row_bytes mismatch for dtype " << static_cast<int>(info.dtype);
+    }
+}
+
+TEST_F(FeatureMatrixTest, CreateReorderedDuplicateSourceRows) {
+    // Permutation with duplicate source rows (not a true permutation)
+    // create_reordered doesn't enforce bijection — it's just an index mapping
+    const uint64_t N = 3, D = 2;
+    std::vector<float> data = {10.0f, 11.0f, 20.0f, 21.0f, 30.0f, 31.0f};
+    auto src = FeatureMatrix::create(test_path("dup_perm_src.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+
+    // All output rows come from source row 1
+    std::vector<uint64_t> perm = {1, 1, 1};
+    auto dst = FeatureMatrix::create_reordered(src, perm, test_path("dup_perm_dst.fmat"));
+
+    for (uint64_t i = 0; i < N; ++i) {
+        EXPECT_FLOAT_EQ(dst.row_as<float>(i)[0], 20.0f);
+        EXPECT_FLOAT_EQ(dst.row_as<float>(i)[1], 21.0f);
+    }
+}

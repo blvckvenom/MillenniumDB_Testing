@@ -2,6 +2,7 @@
 
 #include <ostream>
 #include <string>
+#include <vector>
 
 #include "storage/catalog/catalog.h"
 
@@ -40,7 +41,7 @@ class GQLCatalog : public Catalog {
 public:
     static constexpr uint8_t MODEL_ID = 2;         ///< GQL model identifier (distinguishes from RDF=0, QM=1)
     static constexpr uint8_t MAJOR_VERSION = 1;    ///< Catalog format major version
-    static constexpr uint8_t MINOR_VERSION = 1;    ///< Catalog format minor version (1 = added GNN tensor metadata)
+    static constexpr uint8_t MINOR_VERSION = 2;    ///< Catalog format minor version (2 = feature name registry)
 
     /**
      * @brief Constructs catalog from file.
@@ -118,11 +119,16 @@ public:
     boost::unordered_flat_map<std::string, uint64_t> edge_keys2id;         ///< Key name → index
     /// @}
 
-    /// @name GNN Tensor Metadata
+    /// @name GNN Feature Registry
     /// @{
-    bool has_gnn_tensors = false;           ///< Whether GNN tensors were imported
-    uint64_t gnn_tensor_num_rows = 0;       ///< Number of nodes with embeddings
-    uint64_t gnn_tensor_num_cols = 0;       ///< Embedding dimension
+    /// Names of FeatureMatrix files stored under <db_folder>/gnn_features/.
+    /// Each name (e.g. "node_features") maps to files:
+    ///   <db_folder>/gnn_features/<name>.fmat  (FeatureMatrix)
+    ///   <db_folder>/gnn_features/<name>.rmap  (RowMapping)
+    std::vector<std::string> gnn_feature_names;
+
+    /// Convenience: true if any GNN feature matrices are registered.
+    bool has_gnn_features() const { return !gnn_feature_names.empty(); }
     /// @}
 
 #ifdef ENABLE_GNN

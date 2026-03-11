@@ -1,10 +1,12 @@
 #include "import.h"
 
+#include <algorithm>
 #include <filesystem>
 
 #ifdef ENABLE_GNN
-#include "gnn/storage/file_gnn_tensor_store.h"
+#include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "gnn/storage/row_mapping.h"
 #endif
 #include "graph_models/common/conversions.h"
 #include "graph_models/inliner.h"
@@ -1205,57 +1207,42 @@ void OnDiskImport::import_node_tensors() {
         }
     }
 
-    // Create GNN tensor store directory
-    auto gnn_path = db_folder + "/gnn_tensors";
-    std::filesystem::create_directories(gnn_path);
+    // Create GNN features directory
+    namespace fs = std::filesystem;
+    auto gnn_features_dir = fs::path(db_folder) / "gnn_features";
+    fs::create_directories(gnn_features_dir);
 
-    // Calculate tensor byte size to set appropriate shard size
-    size_t tensor_byte_size = num_nodes * feature_dim * (is_float64 ? sizeof(double) : sizeof(float));
-    // Ensure shard can fit the entire tensor (with alignment margin)
-    size_t shard_size = std::max(
-        mdb::gnn::FileGnnTensorStore::DEFAULT_MAX_SHARD_SIZE,
-        tensor_byte_size + 4096
-    );
+    // Write FeatureMatrix (.fmat) — immutable mmap-backed [N,D] matrix
+    auto fmat_path = gnn_features_dir / "node_features.fmat";
+    auto gnn_dtype = is_float64 ? mdb::gnn::GnnDtype::FLOAT64 : mdb::gnn::GnnDtype::FLOAT32;
 
-    // Initialize FileGnnTensorStore with shard size >= tensor size
-    mdb::gnn::FileGnnTensorStore tensor_store(gnn_path, shard_size);
-
-    // Store the embedding matrix
-    std::vector<int64_t> shape = {
-        static_cast<int64_t>(num_nodes),
-        static_cast<int64_t>(feature_dim)
-    };
-
-    bool success = false;
     if (is_float64) {
-        success = tensor_store.store(
-            "node_features",
-            data_f64.data(),
-            shape,
-            mdb::gnn::GnnDtype::FLOAT64
-        );
+        mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data_f64.data());
         { std::vector<double>().swap(data_f64); }
     } else {
-        success = tensor_store.store(
-            "node_features",
-            data.data(),
-            shape,
-            mdb::gnn::GnnDtype::FLOAT32
-        );
+        mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data.data());
         { std::vector<float>().swap(data); }
     }
 
-    if (!success) {
-        FATAL_ERROR("Failed to store tensors in GNN tensor store");
+    // Write RowMapping (.rmap) — maps row index → node ObjectId
+    // Nodes are assigned sequential ObjectIds during import: i | MASK_NODE
+    auto rmap_path = gnn_features_dir / "node_features.rmap";
+    std::vector<ObjectId> node_oids;
+    node_oids.reserve(num_nodes);
+    for (uint64_t i = 0; i < num_nodes; ++i) {
+        node_oids.push_back(ObjectId(i | ObjectId::MASK_NODE));
+    }
+    mdb::gnn::RowMapping::create(rmap_path, node_oids);
+    { std::vector<ObjectId>().swap(node_oids); }
+
+    // Register feature in catalog (dimensions stored in .fmat header)
+    if (std::find(catalog.gnn_feature_names.begin(),
+                  catalog.gnn_feature_names.end(),
+                  "node_features") == catalog.gnn_feature_names.end()) {
+        catalog.gnn_feature_names.push_back("node_features");
     }
 
-    tensor_store.flush();
-
-    // Update catalog with tensor metadata
-    catalog.has_gnn_tensors = true;
-    catalog.gnn_tensor_num_rows = num_nodes;
-    catalog.gnn_tensor_num_cols = feature_dim;
-
-    std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim << "\n";
+    std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim
+              << " (" << fmat_path.string() << ")\n";
 }
 #endif // ENABLE_GNN
