@@ -41,7 +41,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
             "  YIELD indexName, dimension, nodeCount, buildTimeMs\n\n"
             "Parameters:\n"
             "  - indexName (STRING): Name for the HNSW index\n"
-            "  - tensorKey (STRING): Key in GnnTensorStore (e.g., 'node_features')\n"
+            "  - tensorKey (STRING): Name of the feature matrix (e.g., 'node_features')\n"
             "  - options (MAP, optional): metric, M, efConstruction\n\n"
             "Examples:\n"
             "  CALL gnn_hnsw_create('arxiv_idx', 'node_features')\n"
@@ -69,6 +69,9 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    // Validate index_name is safe for filesystem paths
+    validate_safe_name(index_name, "indexName");
+
     // Step 3: Parse tensorKey
     std::string tensor_key;
     try {
@@ -88,6 +91,9 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
             "Example: CALL gnn_hnsw_create('my_index', 'node_features')"
         );
     }
+
+    // Validate tensor_key is safe for filesystem paths
+    validate_safe_name(tensor_key, "tensorKey");
 
     // Step 4: Parse optional options map
     HNSW::MetricType metric = HNSW::MetricType::COSINE_DISTANCE;
@@ -184,8 +190,10 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
 
     if (feature_matrix.dtype() != mdb::gnn::GnnDtype::FLOAT32) {
         throw std::runtime_error(
-            "Invalid feature matrix dtype: expected FLOAT32, got " +
-            std::to_string(static_cast<int>(feature_matrix.dtype()))
+            "Invalid feature matrix dtype: HNSW indexing requires FLOAT32, got " +
+            mdb::gnn::dtype_name(feature_matrix.dtype()) + ".\n\n"
+            "Re-import your data with float32 tensors, or convert with:\n"
+            "  numpy: arr.astype(np.float32)"
         );
     }
 

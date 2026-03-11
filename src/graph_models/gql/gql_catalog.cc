@@ -41,13 +41,14 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
             // v2: feature name registry
             gnn_feature_names = read_strvec();
         } else if (diff_minor_version == 1) {
-            // v1 → v2 migration: read old 3-field format, convert
-            bool old_has_tensors = read_uint64() != 0;
+            // v1 → v2 migration: read and discard old 3-field format.
+            // We do NOT register "node_features" because the old data lives
+            // in gnn_tensors/ (FileGnnTensorStore shard format), not in
+            // gnn_features/node_features.fmat. Users must re-import with
+            // the new code to create .fmat files.
+            read_uint64(); // discard old has_gnn_tensors flag
             read_uint64(); // discard gnn_tensor_num_rows (now in .fmat header)
             read_uint64(); // discard gnn_tensor_num_cols (now in .fmat header)
-            if (old_has_tensors) {
-                gnn_feature_names.push_back("node_features");
-            }
             has_changes = true; // trigger re-save in v2 format
         } else if (diff_minor_version == 2) {
             // v0 → v2 migration: no GNN fields existed, nothing to read

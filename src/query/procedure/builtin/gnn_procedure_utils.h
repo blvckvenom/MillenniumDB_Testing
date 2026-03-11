@@ -14,6 +14,25 @@
 
 namespace GQL::Procedures {
 
+/// Validate that a name is safe for use in filesystem paths.
+/// Rejects empty strings, path separators, "..", and control characters.
+/// Used for user-supplied tensor keys and index names.
+inline void validate_safe_name(const std::string& name, const std::string& param_name) {
+    if (name.empty()) {
+        throw std::runtime_error(param_name + " cannot be empty.");
+    }
+    for (char c : name) {
+        if (c == '/' || c == '\\' || c == '\0') {
+            throw std::runtime_error(
+                param_name + " contains invalid character (path separator or null): '" + name + "'");
+        }
+    }
+    if (name == "." || name == "..") {
+        throw std::runtime_error(
+            param_name + " cannot be '.' or '..': '" + name + "'");
+    }
+}
+
 /// Get the database folder path with trailing slash stripped.
 /// Used by all GNN procedures that access the filesystem.
 inline std::string get_db_folder() {

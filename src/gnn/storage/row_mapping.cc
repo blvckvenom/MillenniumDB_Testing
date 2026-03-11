@@ -173,6 +173,14 @@ RowMapping RowMapping::open(const fs::path& path) {
             "RowMapping::open: invalid header in " + path.string());
     }
 
+    // Overflow check: prevent count * sizeof(ObjectId) from wrapping
+    if (count > (SIZE_MAX - HEADER_SIZE) / sizeof(ObjectId)) {
+        ::munmap(ptr, file_size);
+        throw std::runtime_error(
+            "RowMapping::open: count in header would overflow size computation: " +
+            path.string());
+    }
+
     size_t expected = HEADER_SIZE + count * sizeof(ObjectId);
     if (file_size < expected) {
         ::munmap(ptr, file_size);

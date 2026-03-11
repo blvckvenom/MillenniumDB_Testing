@@ -199,8 +199,28 @@ FeatureMatrix FeatureMatrix::open(const fs::path& path) {
             "FeatureMatrix::open: invalid header in " + path.string());
     }
 
+    // Overflow checks on untrusted header values before computing expected size
+    size_t ds = dtype_size(header.get_dtype());
+    if (ds > 0 && header.num_cols > SIZE_MAX / ds) {
+        ::munmap(ptr, file_size);
+        throw std::runtime_error(
+            "FeatureMatrix::open: num_cols * dtype_size overflows: " + path.string());
+    }
+    size_t rb = header.row_bytes();
+    if (rb > 0 && header.num_rows > SIZE_MAX / rb) {
+        ::munmap(ptr, file_size);
+        throw std::runtime_error(
+            "FeatureMatrix::open: num_rows * row_bytes overflows: " + path.string());
+    }
+    size_t db = header.data_bytes();
+    if (db > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+        ::munmap(ptr, file_size);
+        throw std::runtime_error(
+            "FeatureMatrix::open: header_size + data_bytes overflows: " + path.string());
+    }
+
     // Validate file size matches header expectations
-    size_t expected_size = FeatureMatrixHeader::SIZE + header.data_bytes();
+    size_t expected_size = FeatureMatrixHeader::SIZE + db;
     if (file_size < expected_size) {
         ::munmap(ptr, file_size);
         throw std::runtime_error(
