@@ -225,7 +225,7 @@ private:
     void save_edge();
 
 #ifdef ENABLE_GNN
-    // Import node embeddings from NPY file into GNN tensor store
+    // Import node embeddings from NPY file into GNN feature matrix
     void import_node_tensors();
 #endif
 

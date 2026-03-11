@@ -12,12 +12,15 @@
 namespace mdb::gnn {
 
 /**
- * @brief Feature matrix with node ID mapping.
+ * @brief LibTorch feature matrix with node ID mapping.
  *
- * Holds a tensor of node features along with mappings between
+ * Holds a torch::Tensor of node features along with mappings between
  * ObjectIds and row indices for efficient lookup.
+ *
+ * @note This is the LibTorch-backed variant. For the mmap-backed
+ *       storage matrix, see gnn/storage/feature_matrix.h.
  */
-struct FeatureMatrix {
+struct TorchFeatureMatrix {
     torch::Tensor features;                          ///< [num_nodes, feature_dim]
     std::vector<ObjectId> node_ids;                  ///< ObjectId for each row
     std::unordered_map<uint64_t, int64_t> id_to_row; ///< Reverse mapping (ObjectId.id -> row)
@@ -51,7 +54,7 @@ struct FeatureMatrix {
     torch::Tensor get_node_features(ObjectId node_id) const {
         int64_t row = get_row(node_id);
         if (row < 0) {
-            throw std::out_of_range("Node not found in FeatureMatrix");
+            throw std::out_of_range("Node not found in TorchFeatureMatrix");
         }
         return features[row];
     }

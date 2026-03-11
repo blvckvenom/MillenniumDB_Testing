@@ -9,13 +9,13 @@ namespace mdb::gnn {
 // Feature Matrix Construction
 // ============================================================================
 
-FeatureMatrix build_feature_matrix(
+TorchFeatureMatrix build_feature_matrix(
     const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& features,
     torch::Device device
 ) {
     if (node_ids.empty()) {
-        return FeatureMatrix{
+        return TorchFeatureMatrix{
             torch::empty({0, 0}, torch::TensorOptions().device(device)),
             {},
             {}
@@ -74,19 +74,19 @@ FeatureMatrix build_feature_matrix(
         output = output.to(device);
     }
 
-    return FeatureMatrix{
+    return TorchFeatureMatrix{
         std::move(output),
         std::vector<ObjectId>(node_ids),
         std::move(id_to_row)
     };
 }
 
-FeatureMatrix stack_features(
+TorchFeatureMatrix stack_features(
     const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& tensors
 ) {
     if (tensors.empty()) {
-        return FeatureMatrix{
+        return TorchFeatureMatrix{
             torch::empty({0, 0}),
             {},
             {}
@@ -108,7 +108,7 @@ FeatureMatrix stack_features(
         id_to_row[node_ids[i].id] = static_cast<int64_t>(i);
     }
 
-    return FeatureMatrix{
+    return TorchFeatureMatrix{
         std::move(stacked),
         std::vector<ObjectId>(node_ids),
         std::move(id_to_row)

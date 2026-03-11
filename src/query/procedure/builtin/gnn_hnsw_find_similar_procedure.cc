@@ -140,7 +140,7 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
 
     // Step 9: Get the query embedding directly from the HNSW index.
     // The index already holds all raw embeddings in memory (loaded at startup),
-    // so we avoid reopening the FileGnnTensorStore per query.
+    // so we avoid reopening the FeatureMatrix per query.
     const float* query_embedding = hnsw_index->get_raw_embedding(static_cast<uint32_t>(node_id));
     if (query_embedding == nullptr) {
         throw std::runtime_error(

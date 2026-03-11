@@ -81,7 +81,7 @@ struct CacheStats {
  * @endcode
  *
  * @see ProjectionStorage for underlying storage
- * @see FeatureMatrix for result structure
+ * @see TorchFeatureMatrix for result structure
  */
 class FeatureAccessor {
 public:
@@ -132,19 +132,19 @@ public:
      *
      * @param node_ids Nodes to fetch features for
      * @param property_name Property to extract
-     * @return FeatureMatrix with [N, D] tensor and id mappings
+     * @return TorchFeatureMatrix with [N, D] tensor and id mappings
      * @throws std::runtime_error if any node missing the property
      */
-    FeatureMatrix get_batch_features(
+    TorchFeatureMatrix get_batch_features(
         const std::vector<ObjectId>& node_ids,
         const std::string& property_name
     );
 
     /**
      * @brief Get multiple properties for multiple nodes.
-     * @return Map of property name to FeatureMatrix
+     * @return Map of property name to TorchFeatureMatrix
      */
-    std::unordered_map<std::string, FeatureMatrix> get_batch_features(
+    std::unordered_map<std::string, TorchFeatureMatrix> get_batch_features(
         const std::vector<ObjectId>& node_ids,
         const std::vector<std::string>& property_names
     );
@@ -169,10 +169,10 @@ public:
      *
      * @param edge_ids Edges to fetch features for
      * @param property_name Property to extract
-     * @return FeatureMatrix with [N, D] tensor and id mappings
+     * @return TorchFeatureMatrix with [N, D] tensor and id mappings
      * @throws std::runtime_error if any edge missing the property
      */
-    FeatureMatrix get_edge_batch_features(
+    TorchFeatureMatrix get_edge_batch_features(
         const std::vector<ObjectId>& edge_ids,
         const std::string& property_name
     );
@@ -188,9 +188,9 @@ public:
      *
      * @param node_ids Nodes to fetch
      * @param property_names Properties to concatenate (in order)
-     * @return FeatureMatrix with [N, D1+D2+...] tensor
+     * @return TorchFeatureMatrix with [N, D1+D2+...] tensor
      */
-    FeatureMatrix get_concatenated_features(
+    TorchFeatureMatrix get_concatenated_features(
         const std::vector<ObjectId>& node_ids,
         const std::vector<std::string>& property_names
     );

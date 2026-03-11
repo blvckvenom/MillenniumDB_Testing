@@ -1155,6 +1155,11 @@ void OnDiskImport::import_node_tensors() {
     uint64_t num_nodes = metadata.shape[0];
     uint64_t feature_dim = metadata.shape[1];
 
+    // Check for overflow before computing expected_size
+    if (feature_dim > 0 && num_nodes > UINT64_MAX / feature_dim) {
+        FATAL_ERROR("Tensor dimensions overflow: ", num_nodes, " x ", feature_dim);
+    }
+
     // BUG #5 FIX: Validate shape matches actual data size
     uint64_t expected_size = num_nodes * feature_dim;
     uint64_t actual_size = is_float64 ? data_f64.size() : data.size();

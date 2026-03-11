@@ -34,18 +34,13 @@ endif()
 # ----------------------------------------------------------------------------
 # Compiler Flags
 # ----------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+# Parse TORCH_CXX_FLAGS into a CMake list for target_compile_options.
+# This avoids polluting global CMAKE_CXX_FLAGS which would affect ALL targets.
+separate_arguments(TORCH_CXX_FLAGS_LIST UNIX_COMMAND "${TORCH_CXX_FLAGS}")
 
 # Ensure C++17 compatibility (MDB requirement)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# LibTorch uses the new C++ ABI
-add_definitions(-D_GLIBCXX_USE_CXX11_ABI=1)
-
-# IMPORTANT: LibTorch 2.5+ uses 'and'/'or' in preprocessor macros.
-# MDB's -fno-operator-names breaks this. We need to remove that flag for GNN.
-string(REPLACE "-fno-operator-names" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 
 # ----------------------------------------------------------------------------
 # GNN Core Library
@@ -111,6 +106,13 @@ target_include_directories(mdb_gnn_core PUBLIC
 target_link_libraries(mdb_gnn_core PUBLIC
     ${TORCH_LIBRARIES}
 )
+
+# Scope LibTorch flags to this target only (not globally).
+# -foperator-names re-enables 'and'/'or' as operators (LibTorch 2.5+ needs this;
+# MDB globally sets -fno-operator-names).
+# _GLIBCXX_USE_CXX11_ABI=1 is required by LibTorch's C++ ABI.
+target_compile_options(mdb_gnn_core PRIVATE -foperator-names ${TORCH_CXX_FLAGS_LIST})
+target_compile_definitions(mdb_gnn_core PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
 
 # Link with MDB libraries if they exist
 if(TARGET mdb_storage)

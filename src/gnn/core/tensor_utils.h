@@ -5,14 +5,14 @@
  * @brief LibTorch tensor utilities for GNN operations.
  *
  * This file provides utility functions for working with LibTorch tensors
- * in the GNN subsystem. For tensor storage, use GnnTensorStore and
- * GnnTensorConverter from gnn/storage/.
+ * in the GNN subsystem. For persistent tensor storage, use FeatureMatrix
+ * from gnn/storage/feature_matrix.h (mmap-backed [N,D] matrix).
  *
  * IMPORTANT: This file does NOT provide tensor storage functionality.
- * Use mdb::gnn::GnnTensorStore for storing and loading tensors.
+ * Use mdb::gnn::FeatureMatrix (gnn/storage/) for storing and loading tensors.
  *
- * @see gnn/storage/gnn_tensor_store.h for tensor storage
- * @see gnn/storage/gnn_tensor_converter.h for LibTorch conversion
+ * @see gnn/storage/feature_matrix.h for mmap-backed tensor storage
+ * @see gnn/common/feature_matrix.h for LibTorch TorchFeatureMatrix wrapper
  */
 
 #include <array>
@@ -60,9 +60,9 @@ struct SparseAdjacency {
  * @param node_ids Vector of node ObjectIds
  * @param features Vector of feature tensors (one per node, same dimension)
  * @param device Target device for the output tensor
- * @return FeatureMatrix with features and ID mappings
+ * @return TorchFeatureMatrix with features and ID mappings
  */
-FeatureMatrix build_feature_matrix(
+TorchFeatureMatrix build_feature_matrix(
     const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& features,
     torch::Device device = torch::kCPU
@@ -73,9 +73,9 @@ FeatureMatrix build_feature_matrix(
  *
  * @param node_ids Vector of node ObjectIds
  * @param tensors Vector of 1D tensors to stack
- * @return FeatureMatrix with [N, D] features tensor
+ * @return TorchFeatureMatrix with [N, D] features tensor
  */
-FeatureMatrix stack_features(
+TorchFeatureMatrix stack_features(
     const std::vector<ObjectId>& node_ids,
     const std::vector<torch::Tensor>& tensors
 );

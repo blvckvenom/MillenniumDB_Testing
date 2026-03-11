@@ -123,7 +123,7 @@ public:
      * @brief Index embeddings from raw float array (GNN tensor store).
      *
      * This method allows indexing node embeddings that are stored externally
-     * (e.g., in GnnTensorStore) rather than in MDB's internal tensor storage.
+     * (e.g., in FeatureMatrix) rather than in MDB's internal tensor storage.
      * The embeddings are copied into the index for efficient querying.
      *
      * @param embeddings Pointer to contiguous float array [num_nodes × dimensions]

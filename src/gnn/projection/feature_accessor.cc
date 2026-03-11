@@ -379,13 +379,13 @@ std::unordered_map<std::string, torch::Tensor> FeatureAccessor::get_features(
 /// Maximum tensor allocation size (4 GB)
 static constexpr size_t MAX_TENSOR_BYTES = 4ULL * 1024 * 1024 * 1024;
 
-FeatureMatrix FeatureAccessor::get_batch_features(
+TorchFeatureMatrix FeatureAccessor::get_batch_features(
     const std::vector<ObjectId>& node_ids,
     const std::string& property_name
 ) {
     if (node_ids.empty()) {
         int64_t dim = get_dimension(property_name);
-        return FeatureMatrix{
+        return TorchFeatureMatrix{
             torch::empty({0, dim > 0 ? dim : 1}, torch::kFloat32),
             {},
             {}
@@ -492,18 +492,18 @@ FeatureMatrix FeatureAccessor::get_batch_features(
     // Transfer to target device
     features = features.to(impl_->target_device);
 
-    return FeatureMatrix{
+    return TorchFeatureMatrix{
         std::move(features),
         std::move(result_ids),
         std::move(id_to_row)
     };
 }
 
-std::unordered_map<std::string, FeatureMatrix> FeatureAccessor::get_batch_features(
+std::unordered_map<std::string, TorchFeatureMatrix> FeatureAccessor::get_batch_features(
     const std::vector<ObjectId>& node_ids,
     const std::vector<std::string>& property_names
 ) {
-    std::unordered_map<std::string, FeatureMatrix> result;
+    std::unordered_map<std::string, TorchFeatureMatrix> result;
     result.reserve(property_names.size());
 
     for (const auto& name : property_names) {
@@ -554,12 +554,12 @@ torch::Tensor FeatureAccessor::get_edge_feature(ObjectId edge_id, const std::str
     return tensor.to(impl_->target_device);
 }
 
-FeatureMatrix FeatureAccessor::get_edge_batch_features(
+TorchFeatureMatrix FeatureAccessor::get_edge_batch_features(
     const std::vector<ObjectId>& edge_ids,
     const std::string& property_name
 ) {
     if (edge_ids.empty()) {
-        return FeatureMatrix{
+        return TorchFeatureMatrix{
             torch::empty({0, 1}, torch::kFloat32),
             {},
             {}
@@ -660,7 +660,7 @@ FeatureMatrix FeatureAccessor::get_edge_batch_features(
 
     features = features.to(impl_->target_device);
 
-    return FeatureMatrix{
+    return TorchFeatureMatrix{
         std::move(features),
         std::move(result_ids),
         std::move(id_to_row)
@@ -669,7 +669,7 @@ FeatureMatrix FeatureAccessor::get_edge_batch_features(
 
 // ----- Concatenated Features -----
 
-FeatureMatrix FeatureAccessor::get_concatenated_features(
+TorchFeatureMatrix FeatureAccessor::get_concatenated_features(
     const std::vector<ObjectId>& node_ids,
     const std::vector<std::string>& property_names
 ) {
@@ -683,7 +683,7 @@ FeatureMatrix FeatureAccessor::get_concatenated_features(
             int64_t dim = get_dimension(name);
             if (dim > 0) total_dim += dim;
         }
-        return FeatureMatrix{
+        return TorchFeatureMatrix{
             torch::empty({0, total_dim > 0 ? total_dim : 1}, torch::kFloat32),
             {},
             {}
@@ -691,7 +691,7 @@ FeatureMatrix FeatureAccessor::get_concatenated_features(
     }
 
     // Get feature matrices for each property
-    std::vector<FeatureMatrix> matrices;
+    std::vector<TorchFeatureMatrix> matrices;
     matrices.reserve(property_names.size());
 
     for (const auto& name : property_names) {
@@ -708,7 +708,7 @@ FeatureMatrix FeatureAccessor::get_concatenated_features(
 
     torch::Tensor concatenated = torch::cat(feature_tensors, /*dim=*/1);
 
-    return FeatureMatrix{
+    return TorchFeatureMatrix{
         std::move(concatenated),
         std::move(matrices[0].node_ids),
         std::move(matrices[0].id_to_row)

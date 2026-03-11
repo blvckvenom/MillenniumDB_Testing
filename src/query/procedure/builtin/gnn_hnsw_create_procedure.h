@@ -29,7 +29,7 @@ namespace Procedures {
  * | Name | Type | Required | Description |
  * |------|------|----------|-------------|
  * | indexName | STRING | Yes | Name for the HNSW index |
- * | tensorKey | STRING | Yes | Key in GnnTensorStore (e.g., 'node_features') |
+ * | tensorKey | STRING | Yes | Name of the feature matrix (e.g., 'node_features') |
  * | options | MAP | No | Configuration: metric, M, efConstruction |
  *
  * ## Options Map
@@ -83,7 +83,7 @@ public:
             Parameter("indexName", ParamType::STRING, true,
                 "Name for the HNSW index"),
             Parameter("tensorKey", ParamType::STRING, true,
-                "Key in GnnTensorStore (e.g., 'node_features')"),
+                "Name of the feature matrix (e.g., 'node_features')"),
             Parameter("options", ParamType::ANY, false,
                 "Optional configuration: {metric, M, efConstruction}")
         };
