@@ -7,8 +7,6 @@
 
 #include "graph_models/object_id.h"
 
-namespace fs = std::filesystem;
-
 namespace mdb::gnn {
 
 /**
@@ -31,8 +29,8 @@ public:
     static constexpr uint32_t VERSION = 1;
     static constexpr size_t   HEADER_SIZE = 16; // magic(4) + version(4) + count(8)
 
-    static RowMapping create(const fs::path& path, const std::vector<ObjectId>& ids);
-    static RowMapping open(const fs::path& path);
+    static RowMapping create(const std::filesystem::path& path, const std::vector<ObjectId>& ids);
+    static RowMapping open(const std::filesystem::path& path);
 
     // Move only (owns mmap)
     RowMapping(RowMapping&& other) noexcept;
@@ -50,12 +48,12 @@ public:
     /// Number of entries.
     uint64_t size() const { return count_; }
 
-    const fs::path& path() const { return path_; }
+    const std::filesystem::path& path() const { return path_; }
 
 private:
     RowMapping() = default;
 
-    fs::path path_;
+    std::filesystem::path path_;
     void*    mmap_ptr_  = nullptr;
     size_t   mmap_size_ = 0;
     uint64_t count_     = 0;

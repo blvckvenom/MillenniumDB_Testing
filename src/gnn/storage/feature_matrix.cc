@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -10,6 +11,8 @@
 #include <unistd.h>
 
 namespace mdb::gnn {
+
+namespace fs = std::filesystem;
 
 // --- RAII helpers ---
 namespace {
@@ -53,6 +56,10 @@ void write_all(int fd, const void* buf, size_t count) {
             if (errno == EINTR) continue;
             throw std::runtime_error(
                 "FeatureMatrix: write failed: " + std::string(std::strerror(errno)));
+        }
+        if (written == 0) {
+            throw std::runtime_error(
+                "FeatureMatrix: write returned 0 for non-zero count — disk full or I/O error");
         }
         p += written;
         remaining -= static_cast<size_t>(written);
@@ -195,8 +202,18 @@ FeatureMatrix FeatureMatrix::open(const fs::path& path) {
 
     if (!header.is_valid()) {
         ::munmap(ptr, file_size);
+        char detail[256];
+        std::snprintf(detail, sizeof(detail),
+            "magic=0x%08X (expected 0x%08X), version=%u (expected %u), "
+            "num_rows=%llu, num_cols=%llu, dtype=%u (max %u)",
+            header.magic, FeatureMatrixHeader::MAGIC,
+            header.version, FeatureMatrixHeader::VERSION,
+            static_cast<unsigned long long>(header.num_rows),
+            static_cast<unsigned long long>(header.num_cols),
+            header.dtype, static_cast<unsigned>(GnnDtype::MAX_VALUE));
         throw std::runtime_error(
-            "FeatureMatrix::open: invalid header in " + path.string());
+            "FeatureMatrix::open: invalid header in " + path.string() +
+            " — " + detail);
     }
 
     // Overflow checks on untrusted header values before computing expected size
@@ -253,6 +270,11 @@ const void* FeatureMatrix::row(uint64_t row_id) const {
 
 // --- scan() ---
 
+// NOTE: scan() and extract_rows() set process-wide madvise hints on the mmap region.
+// Calling both concurrently on the SAME FeatureMatrix instance causes conflicting hints.
+// This does not corrupt data, but may degrade readahead performance.
+// Current callers (HNSW build, import) never do this — they use row() directly.
+
 void FeatureMatrix::scan(RowCallback callback) const {
     if (mmap_ptr_ == nullptr) {
         throw std::runtime_error("FeatureMatrix::scan: not mapped");
@@ -273,6 +295,11 @@ void FeatureMatrix::extract_rows(
     const std::vector<uint64_t>& row_ids, void* out) const
 {
     if (row_ids.empty()) return;
+
+    if (out == nullptr) {
+        throw std::invalid_argument(
+            "FeatureMatrix::extract_rows: output pointer must not be null");
+    }
 
     if (mmap_ptr_ == nullptr) {
         throw std::runtime_error("FeatureMatrix::extract_rows: not mapped");
@@ -333,6 +360,10 @@ FeatureMatrix FeatureMatrix::create_streaming(
             "FeatureMatrix::create_streaming: data size would overflow size_t");
     }
     size_t data_size = header.data_bytes();
+    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+        throw std::overflow_error(
+            "FeatureMatrix::create_streaming: total file size would overflow size_t");
+    }
     size_t file_size = FeatureMatrixHeader::SIZE + data_size;
 
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);

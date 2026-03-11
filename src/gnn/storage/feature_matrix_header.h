@@ -40,7 +40,7 @@ struct FeatureMatrixHeader {
     bool is_valid() const {
         return magic == MAGIC && version == VERSION
             && num_rows > 0 && num_cols > 0
-            && dtype <= static_cast<uint8_t>(GnnDtype::BOOL);
+            && dtype <= static_cast<uint8_t>(GnnDtype::MAX_VALUE);
     }
 
     GnnDtype get_dtype() const {

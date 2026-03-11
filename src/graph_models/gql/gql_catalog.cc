@@ -37,22 +37,33 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
         edge_keys2id = convert_strvec_to_map(edge_keys_str);
 
         // --- GNN feature registry (version-dependent) ---
-        if (diff_minor_version == 0) {
-            // v2: feature name registry
-            gnn_feature_names = read_strvec();
-        } else if (diff_minor_version == 1) {
-            // v1 → v2 migration: read and discard old 3-field format.
-            // We do NOT register "node_features" because the old data lives
-            // in gnn_tensors/ (FileGnnTensorStore shard format), not in
-            // gnn_features/node_features.fmat. Users must re-import with
-            // the new code to create .fmat files.
-            read_uint64(); // discard old has_gnn_tensors flag
-            read_uint64(); // discard gnn_tensor_num_rows (now in .fmat header)
-            read_uint64(); // discard gnn_tensor_num_cols (now in .fmat header)
-            has_changes = true; // trigger re-save in v2 format
-        } else if (diff_minor_version == 2) {
-            // v0 → v2 migration: no GNN fields existed, nothing to read
-            has_changes = true;
+        // Compute the actual on-disk version for clarity and forward-compatibility.
+        // Using on_disk_version (not diff_minor_version) means future version bumps
+        // don't silently reassign existing case labels.
+        auto on_disk_version = static_cast<uint8_t>(MINOR_VERSION - diff_minor_version);
+        switch (on_disk_version) {
+            case 2:
+                // Current format: feature name registry
+                gnn_feature_names = read_strvec();
+                break;
+            case 1:
+                // v1 → v2 migration: read and discard old 3-field format.
+                // We do NOT register "node_features" because the old data lives
+                // in gnn_tensors/ (FileGnnTensorStore shard format), not in
+                // gnn_features/node_features.fmat. Users must re-import.
+                read_uint64(); // discard old has_gnn_tensors flag
+                read_uint64(); // discard gnn_tensor_num_rows
+                read_uint64(); // discard gnn_tensor_num_cols
+                has_changes = true;
+                break;
+            case 0:
+                // v0 → v2 migration: no GNN fields existed, nothing to read
+                has_changes = true;
+                break;
+            default:
+                throw std::runtime_error(
+                    "GQLCatalog: unexpected on-disk minor version " +
+                    std::to_string(on_disk_version));
         }
 
 #ifdef ENABLE_GNN

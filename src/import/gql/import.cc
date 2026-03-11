@@ -1026,6 +1026,12 @@ void OnDiskImport::start_import(MDBIstream& in)
         import_node_tensors();
         print_duration("Import node tensors", start);
     }
+#else
+    if (!tensor_file_.empty()) {
+        WARN("--with-tensors was specified but this build has ENABLE_GNN=OFF.\n"
+             "  Tensor file '", tensor_file_, "' was NOT imported.\n"
+             "  Rebuild with -D ENABLE_GNN=ON to enable tensor import.");
+    }
 #endif
 
     catalog.print(std::cout);
@@ -1217,28 +1223,36 @@ void OnDiskImport::import_node_tensors() {
     auto gnn_features_dir = fs::path(db_folder) / "gnn_features";
     fs::create_directories(gnn_features_dir);
 
-    // Write FeatureMatrix (.fmat) — immutable mmap-backed [N,D] matrix
+    // Write FeatureMatrix (.fmat) and RowMapping (.rmap)
     auto fmat_path = gnn_features_dir / "node_features.fmat";
+    auto rmap_path = gnn_features_dir / "node_features.rmap";
     auto gnn_dtype = is_float64 ? mdb::gnn::GnnDtype::FLOAT64 : mdb::gnn::GnnDtype::FLOAT32;
 
-    if (is_float64) {
-        mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data_f64.data());
-        { std::vector<double>().swap(data_f64); }
-    } else {
-        mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data.data());
-        { std::vector<float>().swap(data); }
-    }
+    try {
+        if (is_float64) {
+            mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data_f64.data());
+            { std::vector<double>().swap(data_f64); }
+        } else {
+            mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data.data());
+            { std::vector<float>().swap(data); }
+        }
 
-    // Write RowMapping (.rmap) — maps row index → node ObjectId
-    // Nodes are assigned sequential ObjectIds during import: i | MASK_NODE
-    auto rmap_path = gnn_features_dir / "node_features.rmap";
-    std::vector<ObjectId> node_oids;
-    node_oids.reserve(num_nodes);
-    for (uint64_t i = 0; i < num_nodes; ++i) {
-        node_oids.push_back(ObjectId(i | ObjectId::MASK_NODE));
+        // Write RowMapping (.rmap) — maps row index → node ObjectId
+        // Nodes are assigned sequential ObjectIds during import: i | MASK_NODE
+        std::vector<ObjectId> node_oids;
+        node_oids.reserve(num_nodes);
+        for (uint64_t i = 0; i < num_nodes; ++i) {
+            node_oids.push_back(ObjectId(i | ObjectId::MASK_NODE));
+        }
+        mdb::gnn::RowMapping::create(rmap_path, node_oids);
+        { std::vector<ObjectId>().swap(node_oids); }
+    } catch (...) {
+        // Best-effort cleanup of partial files
+        std::error_code ec;
+        fs::remove(fmat_path, ec);
+        fs::remove(rmap_path, ec);
+        throw;
     }
-    mdb::gnn::RowMapping::create(rmap_path, node_oids);
-    { std::vector<ObjectId>().swap(node_oids); }
 
     // Register feature in catalog (dimensions stored in .fmat header)
     if (std::find(catalog.gnn_feature_names.begin(),

@@ -107,7 +107,9 @@ void HttpGQLSession<stream_t>::execute_readonly_query(
     // Check if query contains PROJECT function - if so, we need an editable scope
     // to persist the projection data to disk
     bool needs_editable = (query.find("PROJECT") != std::string::npos
-                        || query.find("project") != std::string::npos);
+                        || query.find("project") != std::string::npos
+                        || query.find("CALL") != std::string::npos
+                        || query.find("call") != std::string::npos);
 
     // Declared here because the destruction need to be after calling execute_query_plan
     std::unique_ptr<BufferManager::VersionScope> version_scope;

@@ -166,9 +166,6 @@ if(ENABLE_GNN)
     # Add LibTorch include directories globally for GNN procedures
     include_directories(${TORCH_INCLUDE_DIRS})
 
-    # LibTorch uses 'and'/'or' in macros, remove -fno-operator-names for GNN compatibility
-    string(REPLACE "-fno-operator-names" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-
     add_subdirectory(${CMAKE_SOURCE_DIR}/src/gnn)
 endif()
 

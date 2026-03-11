@@ -9,8 +9,6 @@
 #include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
 
-namespace fs = std::filesystem;
-
 namespace mdb::gnn {
 
 /**
@@ -30,7 +28,7 @@ public:
     // --- Construction (one-time writes) ---
 
     static FeatureMatrix create(
-        const fs::path& path,
+        const std::filesystem::path& path,
         uint64_t num_rows,
         uint64_t num_cols,
         GnnDtype dtype,
@@ -39,14 +37,14 @@ public:
 
     using RowWriter = std::function<void(uint64_t row_id, void* dest, uint64_t row_bytes)>;
     static FeatureMatrix create_streaming(
-        const fs::path& path,
+        const std::filesystem::path& path,
         uint64_t num_rows,
         uint64_t num_cols,
         GnnDtype dtype,
         RowWriter writer
     );
 
-    static FeatureMatrix open(const fs::path& path);
+    static FeatureMatrix open(const std::filesystem::path& path);
 
     // --- Move only (owns mmap) ---
     FeatureMatrix(FeatureMatrix&& other) noexcept;
@@ -78,7 +76,7 @@ public:
     static FeatureMatrix create_reordered(
         const FeatureMatrix& source,
         const std::vector<uint64_t>& permutation,
-        const fs::path& output_path
+        const std::filesystem::path& output_path
     );
 
     // --- Metadata ---
@@ -87,13 +85,13 @@ public:
     GnnDtype    dtype()       const { return header_.get_dtype(); }
     size_t      row_bytes()   const { return header_.row_bytes(); }
     size_t      total_bytes() const { return header_.data_bytes(); }
-    const fs::path& path()    const { return path_; }
+    const std::filesystem::path& path()    const { return path_; }
 
 private:
     FeatureMatrix() = default;
 
     FeatureMatrixHeader header_{};
-    fs::path path_;
+    std::filesystem::path path_;
     void*    mmap_ptr_  = nullptr;  // points to start of mmap (includes header)
     size_t   mmap_size_ = 0;        // total mmap size (header + data)
 

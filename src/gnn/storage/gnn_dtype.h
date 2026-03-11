@@ -33,6 +33,10 @@ enum class GnnDtype : uint8_t {
     INT64   = 3,   ///< 64-bit signed integer
     UINT8   = 4,   ///< 8-bit unsigned integer (labels, masks)
     BOOL    = 5,   ///< Boolean (stored as 1 byte)
+
+    // Sentinel: update this when adding new dtypes above.
+    // Used by FeatureMatrixHeader::is_valid() for range validation.
+    MAX_VALUE = BOOL,
 };
 
 /**
@@ -69,7 +73,7 @@ inline std::string dtype_name(GnnDtype dtype) {
         case GnnDtype::UINT8:   return "uint8";
         case GnnDtype::BOOL:    return "bool";
     }
-    return "unknown";
+    throw std::invalid_argument("Unknown GnnDtype value: " + std::to_string(static_cast<int>(dtype)));
 }
 
 /**

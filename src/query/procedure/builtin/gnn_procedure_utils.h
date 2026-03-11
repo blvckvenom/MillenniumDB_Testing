@@ -26,6 +26,11 @@ inline void validate_safe_name(const std::string& name, const std::string& param
             throw std::runtime_error(
                 param_name + " contains invalid character (path separator or null): '" + name + "'");
         }
+        if (static_cast<unsigned char>(c) < 0x20) {
+            throw std::runtime_error(
+                param_name + " contains control character (byte " +
+                std::to_string(static_cast<unsigned char>(c)) + "): '" + name + "'");
+        }
     }
     if (name == "." || name == "..") {
         throw std::runtime_error(
@@ -103,9 +108,12 @@ public:
             std::string key_str = Conversions::unpack_string(key_oid);
             if (key_str == key) {
                 auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-                if (lit) {
-                    return lit->object_id;
+                if (!lit) {
+                    throw std::runtime_error(
+                        "Option '" + key + "' has an unsupported value type "
+                        "(expected a literal, got a nested structure)");
                 }
+                return lit->object_id;
             }
         }
         return std::nullopt;

@@ -10,6 +10,8 @@
 
 namespace mdb::gnn {
 
+namespace fs = std::filesystem;
+
 namespace {
 
 class FdGuard {
@@ -31,6 +33,10 @@ void write_all(int fd, const void* buf, size_t count) {
             if (errno == EINTR) continue;
             throw std::runtime_error(
                 "RowMapping: write failed: " + std::string(std::strerror(errno)));
+        }
+        if (written == 0) {
+            throw std::runtime_error(
+                "RowMapping: write returned 0 for non-zero count — disk full or I/O error");
         }
         p += written;
         remaining -= static_cast<size_t>(written);
@@ -87,6 +93,9 @@ RowMapping RowMapping::create(const fs::path& path, const std::vector<ObjectId>&
     size_t data_size = ids.size() * sizeof(ObjectId);
     if (!ids.empty() && data_size / sizeof(ObjectId) != ids.size()) {
         throw std::overflow_error("RowMapping::create: data size would overflow");
+    }
+    if (data_size > SIZE_MAX - HEADER_SIZE) {
+        throw std::overflow_error("RowMapping::create: total file size would overflow");
     }
     size_t file_size = HEADER_SIZE + data_size;
 
