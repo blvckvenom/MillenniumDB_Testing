@@ -215,7 +215,7 @@ public:
     }
 
 private:
-    bool has_changes { false };
+    std::atomic<bool> has_changes { false };
 
     MetricFuncType metric_func;
 
