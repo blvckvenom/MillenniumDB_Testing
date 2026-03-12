@@ -335,15 +335,16 @@ SampledSubgraph TopologyAccessor::sample_neighbors(
         result.dst_id_to_idx[seed_nodes[i].id] = static_cast<int64_t>(i);
     }
 
-    // Collect all neighbors using orientation-aware method
+    // Single pass: collect neighbors, sample, and store selected IDs for edge building.
+    // Uses one RNG source (impl_->rng) to guarantee src_set and edges are consistent.
     std::unordered_set<uint64_t> src_set;
-    std::vector<std::pair<int64_t, int64_t>> edges;  // (src_local, dst_local)
+    std::vector<std::vector<uint64_t>> per_dst_selected_ids;
+    per_dst_selected_ids.reserve(seed_nodes.size());
 
     for (size_t dst_idx = 0; dst_idx < seed_nodes.size(); ++dst_idx) {
-        // Use orientation-aware neighbor retrieval
         Neighbors neighbors = get_neighbors(seed_nodes[dst_idx], orientation);
 
-        // Sample if needed
+        // Sample if needed (Fisher-Yates partial shuffle)
         std::vector<size_t> selected_indices;
         if (fanout > 0 && strategy == SamplingStrategy::UNIFORM &&
             static_cast<int64_t>(neighbors.node_ids.size()) > fanout) {
@@ -351,7 +352,6 @@ SampledSubgraph TopologyAccessor::sample_neighbors(
             std::vector<size_t> indices(neighbors.node_ids.size());
             std::iota(indices.begin(), indices.end(), 0);
 
-            // Fisher-Yates shuffle
             for (int64_t i = 0; i < fanout; ++i) {
                 std::uniform_int_distribution<size_t> dist(i, indices.size() - 1);
                 size_t j = dist(impl_->rng);
@@ -363,11 +363,15 @@ SampledSubgraph TopologyAccessor::sample_neighbors(
             std::iota(selected_indices.begin(), selected_indices.end(), 0);
         }
 
-        // Add selected neighbors
+        // Collect selected neighbor IDs for both src_set and deferred edge building
+        std::vector<uint64_t> selected_ids;
+        selected_ids.reserve(selected_indices.size());
         for (size_t idx : selected_indices) {
             uint64_t neighbor_id = neighbors.node_ids[idx].id;
             src_set.insert(neighbor_id);
+            selected_ids.push_back(neighbor_id);
         }
+        per_dst_selected_ids.push_back(std::move(selected_ids));
     }
 
     // Build src nodes list and mapping
@@ -377,38 +381,13 @@ SampledSubgraph TopologyAccessor::sample_neighbors(
         result.src_nodes.push_back(ObjectId(id));
     }
 
-    // Build edges with local indices
+    // Build edges from stored selections (consistent with src_set)
     std::vector<int64_t> src_indices;
     std::vector<int64_t> dst_indices;
 
-    for (size_t dst_idx = 0; dst_idx < seed_nodes.size(); ++dst_idx) {
-        // Use same orientation for consistent results
-        Neighbors neighbors = get_neighbors(seed_nodes[dst_idx], orientation);
-
-        // Sample again (same logic to get consistent results)
-        std::vector<size_t> selected_indices;
-        if (fanout > 0 && strategy == SamplingStrategy::UNIFORM &&
-            static_cast<int64_t>(neighbors.node_ids.size()) > fanout) {
-
-            // Deterministic per-node RNG for reproducible sampling
-            std::vector<size_t> indices(neighbors.node_ids.size());
-            std::iota(indices.begin(), indices.end(), 0);
-
-            std::mt19937_64 local_rng(seed_nodes[dst_idx].id);  // Deterministic per-node
-            for (int64_t i = 0; i < fanout; ++i) {
-                std::uniform_int_distribution<size_t> dist(i, indices.size() - 1);
-                size_t j = dist(local_rng);
-                std::swap(indices[i], indices[j]);
-            }
-            selected_indices.assign(indices.begin(), indices.begin() + fanout);
-        } else {
-            selected_indices.resize(neighbors.node_ids.size());
-            std::iota(selected_indices.begin(), selected_indices.end(), 0);
-        }
-
-        for (size_t idx : selected_indices) {
-            uint64_t neighbor_id = neighbors.node_ids[idx].id;
-            src_indices.push_back(result.src_id_to_idx[neighbor_id]);
+    for (size_t dst_idx = 0; dst_idx < per_dst_selected_ids.size(); ++dst_idx) {
+        for (uint64_t neighbor_id : per_dst_selected_ids[dst_idx]) {
+            src_indices.push_back(result.src_id_to_idx.at(neighbor_id));
             dst_indices.push_back(static_cast<int64_t>(dst_idx));
         }
     }
