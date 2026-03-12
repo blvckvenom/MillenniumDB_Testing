@@ -78,6 +78,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    validate_safe_name(sample_name, "sampleName");
+
     // Step 4: Parse fanouts list
     std::vector<uint64_t> fanouts;
     try {

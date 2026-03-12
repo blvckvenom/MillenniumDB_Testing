@@ -39,6 +39,8 @@ void GnnSampleDropProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    validate_safe_name(sample_name, "sampleName");
+
     // Get database folder
     std::string db_folder = get_db_folder();
 

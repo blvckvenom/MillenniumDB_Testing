@@ -34,6 +34,8 @@ void GnnHnswDropProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error("Invalid index name: name cannot be empty.");
     }
 
+    validate_safe_name(index_name, "indexName");
+
     // Step 3: Drop the index
     bool success = gql_model.catalog.hnsw_index_manager.drop_hnsw_index(index_name);
 
