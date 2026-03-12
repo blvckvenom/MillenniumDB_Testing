@@ -176,7 +176,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     // Wrap create-build-write-load in try/catch so that if any step after
     // HNSWIndex::create() throws, we clean up the on-disk directory it created.
     auto start_time = std::chrono::high_resolution_clock::now();
-    uint_fast32_t indexed_count;
+    uint_fast32_t indexed_count = 0;
     decltype(std::chrono::high_resolution_clock::now() - start_time) build_duration{};
 
     try {
