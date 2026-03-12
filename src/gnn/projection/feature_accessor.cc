@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 
 #include "graph_models/gql/gql_model.h"
@@ -22,8 +23,8 @@ namespace mdb::gnn {
 /**
  * @brief Thread-safe LRU (Least Recently Used) cache with configurable hash function.
  *
- * Uses mutex-protected access with try_lock for non-blocking lookups under contention.
- * Based on Facebook HHVM patterns for high-throughput scenarios.
+ * Uses shared_mutex for reader-writer locking: shared access for read-only lookups,
+ * exclusive access for writes and LRU updates.
  *
  * @tparam K Key type
  * @tparam V Value type
@@ -38,23 +39,24 @@ public:
     /**
      * @brief Get value from cache (thread-safe).
      *
-     * Uses try_lock for non-blocking access under contention.
-     * If lock cannot be acquired, falls back to map-only lookup without LRU update.
+     * Tries exclusive lock first for full LRU update. If contended,
+     * falls back to shared lock for safe read-only lookup (no LRU reorder).
      */
     std::optional<V> get(const K& key) {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        if (!lock) {
-            // Skip LRU update under contention, do map-only lookup
-            return get_without_lru_update(key);
+        std::unique_lock<std::shared_mutex> ulock(mutex_, std::try_to_lock);
+        if (ulock) {
+            return get_with_lru_update(key);
         }
-        return get_with_lru_update(key);
+        // Under contention: shared lock for thread-safe read-only access
+        std::shared_lock<std::shared_mutex> slock(mutex_);
+        return get_without_lru_update(key);
     }
 
     /**
-     * @brief Insert or update value in cache (thread-safe).
+     * @brief Insert or update value in cache (thread-safe, exclusive lock).
      */
     void put(const K& key, V value) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
 
         auto it = cache_map_.find(key);
         if (it != cache_map_.end()) {
@@ -77,25 +79,25 @@ public:
     }
 
     /**
-     * @brief Clear all entries (thread-safe).
+     * @brief Clear all entries (thread-safe, exclusive lock).
      */
     void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         cache_map_.clear();
         cache_list_.clear();
     }
 
     /**
-     * @brief Get current cache size (thread-safe).
+     * @brief Get current cache size (thread-safe, shared lock).
      */
     size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         return cache_map_.size();
     }
 
 private:
     /**
-     * @brief Get with LRU update (must hold lock).
+     * @brief Get with LRU update (caller must hold exclusive lock).
      */
     std::optional<V> get_with_lru_update(const K& key) {
         auto it = cache_map_.find(key);
@@ -108,11 +110,9 @@ private:
     }
 
     /**
-     * @brief Get without LRU update (for contention fallback).
-     * Note: This is slightly racy but acceptable for a cache.
+     * @brief Get without LRU update (caller must hold at least shared lock).
      */
     std::optional<V> get_without_lru_update(const K& key) const {
-        // Read-only access without modifying LRU order
         auto it = cache_map_.find(key);
         if (it == cache_map_.end()) {
             return std::nullopt;
@@ -123,7 +123,7 @@ private:
     size_t capacity_;
     std::list<std::pair<K, V>> cache_list_;
     std::unordered_map<K, typename std::list<std::pair<K, V>>::iterator, Hash, KeyEqual> cache_map_;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
 };
 
 // ============================================================================
