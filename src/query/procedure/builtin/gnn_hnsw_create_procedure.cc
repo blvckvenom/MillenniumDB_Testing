@@ -151,6 +151,23 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    // Step 6b: Validate tensor_key is registered in the catalog
+    {
+        const auto& names = gql_model.catalog.gnn_feature_names;
+        if (std::find(names.begin(), names.end(), tensor_key) == names.end()) {
+            std::string available;
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i > 0) available += ", ";
+                available += "'" + names[i] + "'";
+            }
+            throw std::runtime_error(
+                "Feature '" + tensor_key + "' is not registered in the catalog.\n\n"
+                "Available features: " + available + "\n"
+                "Only features imported via mdb-import --with-tensors are valid."
+            );
+        }
+    }
+
     // num_nodes and dimension are needed after tensor_store is released (for yield results)
     uint64_t num_nodes = 0;
     uint64_t dimension = 0;
@@ -159,7 +176,7 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     // Wrap create-build-write-load in try/catch so that if any step after
     // HNSWIndex::create() throws, we clean up the on-disk directory it created.
     auto start_time = std::chrono::high_resolution_clock::now();
-    uint_fast32_t indexed_count;
+    uint_fast32_t indexed_count = 0;
     decltype(std::chrono::high_resolution_clock::now() - start_time) build_duration{};
 
     try {

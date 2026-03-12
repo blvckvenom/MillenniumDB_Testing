@@ -39,31 +39,57 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
         node_keys2id = convert_strvec_to_map(node_keys_str);
         edge_keys2id = convert_strvec_to_map(edge_keys_str);
 
-        // --- GNN feature registry (version-dependent) ---
+        // --- GNN feature registry + HNSW metadata (version-dependent) ---
         // Compute the actual on-disk version for clarity and forward-compatibility.
         // Using on_disk_version (not diff_minor_version) means future version bumps
         // don't silently reassign existing case labels.
         auto on_disk_version = static_cast<uint8_t>(MINOR_VERSION - diff_minor_version);
+
+#ifdef ENABLE_GNN
+        hnsw_index_manager.init();
+#endif
+
         switch (on_disk_version) {
-            case 2:
-                // Current format: feature name registry
+            case 3: {
+                // Current format: feature name registry + HNSW index metadata
                 gnn_feature_names = read_strvec();
+
+                const auto hnsw_count = read_uint64();
+#ifdef ENABLE_GNN
+                for (uint_fast32_t i = 0; i < hnsw_count; ++i) {
+                    const auto name = read_string();
+                    HNSW::HNSWIndexManager::HNSWIndexMetadata metadata;
+                    metadata.metric_type = static_cast<HNSW::MetricType>(read_uint8());
+                    metadata.predicate = read_string();
+                    hnsw_index_manager.load_hnsw_index(name, metadata);
+                }
+#else
+                // Skip HNSW metadata when GNN is disabled
+                for (uint_fast32_t i = 0; i < hnsw_count; ++i) {
+                    read_string();  // name
+                    read_uint8();   // metric_type
+                    read_string();  // predicate
+                }
+#endif
+                break;
+            }
+            case 2:
+                // v2 → v3 migration: feature names only, no HNSW metadata
+                gnn_feature_names = read_strvec();
+                has_changes = true;
                 break;
             case 1:
-                // v1 → v2 migration: read and discard old 3-field format.
+                // v1 → v3 migration: read and discard old 3-field format.
                 // We do NOT register "node_features" because the old data lives
                 // in gnn_tensors/ (FileGnnTensorStore shard format), not in
                 // gnn_features/node_features.fmat. Users must re-import.
                 read_uint64(); // discard old has_gnn_tensors flag
                 read_uint64(); // discard gnn_tensor_num_rows
                 read_uint64(); // discard gnn_tensor_num_cols
-                // Note: if the catalog is truncated, read_uint64() returns
-                // garbage, but we discard the values anyway. The rewrite
-                // (has_changes=true) will produce a clean v2 catalog.
                 has_changes = true;
                 break;
             case 0:
-                // v0 → v2 migration: no GNN fields existed, nothing to read
+                // v0 → v3 migration: no GNN fields existed, nothing to read
                 has_changes = true;
                 break;
             default:
@@ -71,15 +97,9 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
                     "GQLCatalog: unexpected on-disk minor version " +
                     std::to_string(on_disk_version));
         }
-
-#ifdef ENABLE_GNN
-        // Initialize HNSW index manager (loads existing indexes from disk)
-        hnsw_index_manager.init();
-#endif
     } else {
         has_changes = true;
 #ifdef ENABLE_GNN
-        // Initialize HNSW index manager for new database
         hnsw_index_manager.init();
 #endif
     }
@@ -87,7 +107,11 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
 
 GQLCatalog::~GQLCatalog()
 {
+#ifdef ENABLE_GNN
+    if (has_changes || hnsw_index_manager.has_changes()) {
+#else
     if (has_changes) {
+#endif
         save();
     }
 }
@@ -148,8 +172,21 @@ void GQLCatalog::save()
     write_strvec(node_keys_str);
     write_strvec(edge_keys_str);
 
-    // GNN feature registry (minor version 2)
+    // GNN feature registry
     write_strvec(gnn_feature_names);
+
+    // HNSW index metadata (minor version 3)
+#ifdef ENABLE_GNN
+    const auto hnsw_metadata = hnsw_index_manager.get_name2metadata();
+    write_uint64(hnsw_metadata.size());
+    for (const auto& [name, metadata] : hnsw_metadata) {
+        write_string(name);
+        write_uint8(static_cast<uint8_t>(metadata.metric_type));
+        write_string(metadata.predicate);
+    }
+#else
+    write_uint64(0);
+#endif
 }
 
 bool GQLCatalog::register_gnn_feature(const std::string& name) {

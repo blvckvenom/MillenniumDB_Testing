@@ -224,6 +224,11 @@ private:
 
     static std::string read_string(std::istream& in) {
         uint64_t len = read_value<uint64_t>(in);
+        if (len > 1'000'000) {
+            throw std::runtime_error(
+                "SampleCatalog: string length " + std::to_string(len) +
+                " exceeds 1MB limit (file likely corrupted)");
+        }
         std::string str(len, '\0');
         in.read(str.data(), len);
         return str;
@@ -297,6 +302,11 @@ private:
 
         // Fanouts
         uint64_t num_fanouts = read_value<uint64_t>(in);
+        if (num_fanouts > 100) {
+            throw std::runtime_error(
+                "SampleCatalog: fanout count " + std::to_string(num_fanouts) +
+                " exceeds limit of 100 (file likely corrupted)");
+        }
         fanouts.resize(num_fanouts);
         for (uint64_t i = 0; i < num_fanouts; ++i) {
             fanouts[i] = read_value<uint64_t>(in);

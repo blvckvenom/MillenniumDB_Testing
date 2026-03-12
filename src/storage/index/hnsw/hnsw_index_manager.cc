@@ -260,5 +260,6 @@ template uint_fast32_t HNSWIndexManager::create_hnsw_index<
     Catalog::ModelID::QUAD>(const std::string&, const std::string&, uint64_t, uint64_t, uint64_t, MetricType);
 template uint_fast32_t HNSWIndexManager::create_hnsw_index<
     Catalog::ModelID::RDF>(const std::string&, const std::string&, uint64_t, uint64_t, uint64_t, MetricType);
-template uint_fast32_t HNSWIndexManager::create_hnsw_index<
-    Catalog::ModelID::GQL>(const std::string&, const std::string&, uint64_t, uint64_t, uint64_t, MetricType);
+// Note: GQL uses a different HNSW creation path (direct HNSWIndex::create +
+// index_from_raw_embeddings + write_to_disk + load_hnsw_index) via
+// gnn_hnsw_create_procedure.cc, so no GQL template instantiation is needed.
