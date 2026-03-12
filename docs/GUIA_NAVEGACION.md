@@ -1,6 +1,6 @@
 # Guía de Navegación
 
-**Última actualización**: 25 de Diciembre, 2025
+**Última actualización**: 8 de Marzo, 2026
 
 ---
 
@@ -15,6 +15,10 @@
 | Manual Neo4j GDS | [external_references/NEO4J_USER_MANUAL_DOC/](external_references/NEO4J_USER_MANUAL_DOC/) |
 | Proyecciones nativas | [native_projection_review/](native_projection_review/) |
 | Validación de implementación | [validation_report/](validation_report/) |
+| Roadmap GNN (plan maestro) | [../Partial_Idea/README.md](../Partial_Idea/README.md) |
+| Planes de ejecución | [../docs/plans/INDEX.md](plans/INDEX.md) |
+| Módulo GNN (82 archivos) | [architecture/GNN_MODULE.md](architecture/GNN_MODULE.md) |
+| Trabajo diferido | [plans/DEFERRED_WORK.md](plans/DEFERRED_WORK.md) |
 
 ---
 
@@ -106,6 +110,59 @@ Reportes de validación del código:
 | `gql_grammar_analysis.md` | Análisis de gramática GQL |
 | `recommendations.md` | Recomendaciones de mejora |
 | `validation_matrix.md` | Matriz de validación |
+
+---
+
+### plans/
+
+Registros de trabajo completado y planificación:
+
+| Archivo | Descripción |
+|---------|-------------|
+| `INDEX.md` | Índice maestro que conecta Partial_Idea, .planning y docs/plans |
+| `DEFERRED_WORK.md` | Items diferidos de fases 10-13 con priorización |
+| `2026-03-06-merge-upstream-dev.md` | Merge de upstream/dev |
+| `2026-03-07-fix-gnn-fork-errors.md` | Campaña de 17 bug fixes |
+| `2026-03-08-audit-findings-complete.md` | Auditoría: 45 hallazgos |
+| `2026-03-08-fix-audit-findings.md` | Ejecución de 35 commits de fixes |
+
+---
+
+### architecture/
+
+Documentos de arquitectura del sistema:
+
+| Archivo | Descripción |
+|---------|-------------|
+| `GNN_MODULE.md` | Inventario de los 82 archivos del módulo GNN |
+| `TENSOR_SYSTEMS_CRITIQUE.md` | Análisis de tensores MDB vs GNN |
+| `diagrams/comparison_matrix.md` | Matriz comparativa de capacidades |
+
+---
+
+### Partial_Idea/ (fuera de docs/)
+
+Roadmap activo del pipeline GNN — **el plan maestro**:
+
+| Archivo | Descripción |
+|---------|-------------|
+| `README.md` | Visión general: 7 fases, 3 completas, 4 pendientes |
+| `GQL_PROCEDURE_INTEGRATION.md` | 9 procedimientos implementados + 3 pendientes |
+| `cross_cutting/EMBEDDING_MANAGEMENT.md` | HNSW y gestión de embeddings |
+| `phase_00-06/` | Documentación detallada de cada fase |
+
+---
+
+### .planning/phases/ (fuera de docs/)
+
+Planes de ejecución con tareas, código y summaries:
+
+| Fase | Nombre | Archivos |
+|------|--------|----------|
+| 10 | Tensor Integration Fix | `10-01-PLAN.md`, `10-01-SUMMARY.md` |
+| 11 | GQL Import Tensors | `11-01-PLAN.md`, `11-01-SUMMARY.md` |
+| 12 | HNSW + GNN Integration | `12-01-PLAN.md`, `12-01-SUMMARY.md` |
+| 13 | Projection Optimization | `13-01-PLAN.md`, `13-01-SUMMARY.md` |
 
 ---
 

@@ -1,6 +1,6 @@
 # MillenniumDB - Documentación Personal
 
-**Última actualización**: 25 de Diciembre, 2025
+**Última actualización**: 8 de Marzo, 2026
 
 ---
 
@@ -8,6 +8,7 @@
 
 Repositorio de documentación personal para el desarrollo de MillenniumDB, con énfasis en:
 - **GQL Native Projections** - Sistema de proyecciones de grafos
+- **Módulo GNN** - Pipeline de Graph Neural Networks (82 archivos)
 - **Estándar ISO GQL** - Referencia del estándar ISO/IEC 39075:2024
 - **Neo4j GDS** - Comparación con Graph Data Science de Neo4j
 
@@ -50,6 +51,20 @@ docs/
 │   ├── 02_neo4j_comparison.md   ← Comparación con Neo4j
 │   ├── 03_iso_compliance.md     ← Cumplimiento ISO
 │   └── 04_feature_gap_analysis.md   ← Análisis de brechas
+│
+├── architecture/                ← Documentos de arquitectura
+│   ├── GNN_MODULE.md            ← Inventario de 82 archivos GNN
+│   ├── TENSOR_SYSTEMS_CRITIQUE.md ← Tensores MDB vs GNN
+│   └── diagrams/                ← Diagramas y matrices
+│       └── comparison_matrix.md
+│
+├── plans/                       ← Registros de trabajo y planificación
+│   ├── INDEX.md                 ← Índice maestro de documentación
+│   ├── DEFERRED_WORK.md         ← Items diferidos (fases 10-13)
+│   ├── 2026-03-06-merge-upstream-dev.md
+│   ├── 2026-03-07-fix-gnn-fork-errors.md
+│   ├── 2026-03-08-audit-findings-complete.md
+│   └── 2026-03-08-fix-audit-findings.md
 │
 └── validation_report/           ← Reportes de validación
     ├── README.md                ← Descripción del reporte
@@ -107,6 +122,17 @@ Referencia completa del sistema Graph Data Science de Neo4j para comparación de
 - Algoritmos de grafos
 - Proyecciones nativas
 - Machine Learning en grafos
+
+### Para entender el módulo GNN
+
+1. **[architecture/GNN_MODULE.md](architecture/GNN_MODULE.md)** - Inventario de 82 archivos
+2. **[../Partial_Idea/README.md](../Partial_Idea/README.md)** - Roadmap del pipeline (7 fases)
+3. **[../Partial_Idea/GQL_PROCEDURE_INTEGRATION.md](../Partial_Idea/GQL_PROCEDURE_INTEGRATION.md)** - Procedimientos GQL
+
+### Para ver planificación y trabajo diferido
+
+1. **[plans/INDEX.md](plans/INDEX.md)** - Índice maestro que conecta las 3 fuentes de documentación
+2. **[plans/DEFERRED_WORK.md](plans/DEFERRED_WORK.md)** - Items pendientes de fases 10-13
 
 ---
 
