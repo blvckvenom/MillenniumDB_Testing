@@ -199,18 +199,20 @@ if(BUILD_TESTING)
             add_test(NAME GNNCoreTests COMMAND test_gnn_core)
         endif()
 
-        # FeatureMatrix tests (Step 0 redesign)
-        add_executable(test_feature_matrix
+        # GNN Storage tests (Step 0: FeatureMatrix + RowMapping)
+        # Multiple .cc files → one executable, filtered via --gtest_filter
+        add_executable(test_gnn_storage
             tests/test_feature_matrix.cc
+            tests/test_row_mapping.cc
         )
         # Note: ObjectId is header-only for construction/comparison;
         # operator<< lives in query/id.cc (linked via millenniumdb) but tests don't need it
-        target_link_libraries(test_feature_matrix mdb_gnn_core GTest::gtest_main)
-        set_target_properties(test_feature_matrix PROPERTIES
+        target_link_libraries(test_gnn_storage mdb_gnn_core GTest::gtest_main)
+        set_target_properties(test_gnn_storage PROPERTIES
             BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
-        add_test(NAME FeatureMatrixTests COMMAND test_feature_matrix)
+        add_test(NAME GnnStorageTests COMMAND test_gnn_storage)
 
         message(STATUS "GNN tests enabled")
     else()
