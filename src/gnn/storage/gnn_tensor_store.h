@@ -16,7 +16,8 @@
  *   3. Independent evolution of GNN and MDB tensor systems
  *   4. Clean separation of concerns
  *
- * Two implementations are provided:
+ * DEPRECATED: Use FeatureMatrix (src/gnn/storage/feature_matrix.h) instead.
+ * Two legacy implementations are kept for compatibility:
  *   - InMemoryGnnTensorStore: For testing and small datasets
  *   - FileGnnTensorStore: For production use with memory-mapped files
  */

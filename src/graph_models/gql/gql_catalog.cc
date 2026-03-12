@@ -81,8 +81,7 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
             case 1:
                 // v1 → v3 migration: read and discard old 3-field format.
                 // We do NOT register "node_features" because the old data lives
-                // in gnn_tensors/ (FileGnnTensorStore shard format), not in
-                // gnn_features/node_features.fmat. Users must re-import.
+                // in gnn_tensors/ (legacy FileGnnTensorStore shard format from v1). New data uses gnn_features/ (FeatureMatrix format).
                 read_uint64(); // discard old has_gnn_tensors flag
                 read_uint64(); // discard gnn_tensor_num_rows
                 read_uint64(); // discard gnn_tensor_num_cols

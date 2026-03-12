@@ -14,8 +14,7 @@
  *   - Small datasets that fit in RAM
  *   - Temporary tensor storage during computation
  *
- * For production use with large graphs, prefer FileGnnTensorStore which
- * uses memory-mapped files.
+ * For production use with large graphs, use FeatureMatrix instead.
  */
 
 #include "gnn_tensor_store.h"
