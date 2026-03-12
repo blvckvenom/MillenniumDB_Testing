@@ -133,7 +133,7 @@ TEST_SUITES: list[str] = [
 
 ## Expected Results
 
-All 13 tests should PASS with the following characteristics:
+All 14 tests should PASS with the following characteristics:
 
 **Performance Expectations**:
 - Property extraction overhead: <35% vs topology-only projections

@@ -61,9 +61,8 @@ TEST_SUITES: list[str] = [
     "list_exprs",
 ]
 
-# Test suites that require ENABLE_GNN=ON build
+# GNN test suites require ENABLE_GNN=ON build with LibTorch. Add suites here when GNN integration tests are created.
 GNN_TEST_SUITES: list[str] = [
-    # Future: "gnn_hnsw", "gnn_sampling", etc.
 ]
 
 

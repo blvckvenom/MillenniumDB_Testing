@@ -98,7 +98,7 @@ tests/gql/test_suites/projection_native/
 
 ### Run All GQL Tests
 ```bash
-cd /home/benito/B_MillenniumDB/MillenniumDB
+cd <project-root>
 ./scripts/run-tests gql
 ```
 

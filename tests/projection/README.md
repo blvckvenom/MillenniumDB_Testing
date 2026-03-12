@@ -17,7 +17,7 @@
 ## 🗂️ Estructura de Tests
 
 ```
-tests_projection/
+tests/projection/
 ├── README.md (este archivo) .................. Guía de tests de proyecciones
 │
 ├── unit_tests/ ............................... Tests unitarios en C++
@@ -54,7 +54,7 @@ Los tests unitarios están en `unit_tests/` y se compilan junto con el proyecto 
 
 **Cómo compilar**:
 ```bash
-cd /home/benito/B_MillenniumDB/MillenniumDB
+cd <project-root>
 cmake --build build/Release --target projection_storage_test
 ```
 
@@ -209,7 +209,7 @@ Los scripts de integración están en `scripts/` y prueban el sistema completo e
 
 **Cómo ejecutar**:
 ```bash
-cd /home/benito/B_MillenniumDB/MillenniumDB/tests_projection/scripts
+cd <project-root>/tests/projection/scripts
 ./test_label_support.sh
 ```
 
@@ -268,7 +268,7 @@ Phase 1 Testing Complete!
 
 **Cómo ejecutar**:
 ```bash
-cd /home/benito/B_MillenniumDB/MillenniumDB/tests_projection/scripts
+cd <project-root>/tests/projection/scripts
 ./test_quick.sh
 ```
 
@@ -322,7 +322,7 @@ name,age
 ### Ejecutar TODOS los Tests del Proyecto
 
 ```bash
-cd /home/benito/B_MillenniumDB/MillenniumDB
+cd <project-root>
 ./scripts/run-tests
 ```
 
@@ -339,7 +339,7 @@ Este script ejecuta:
 ### Ejecutar Solo Tests Unitarios de Proyecciones
 
 ```bash
-cd /home/benito/B_MillenniumDB/MillenniumDB
+cd <project-root>
 
 # Compilar tests
 cmake --build build/Release --target projection_storage_test
@@ -360,7 +360,7 @@ cmake --build build/Release --target projection_features_test
 ./build/Release/bin/mdb server test_db --port 1234 --browser false &
 
 # 2. Ejecutar tests
-cd tests_projection/scripts
+cd tests/projection/scripts
 ./test_quick.sh
 ./test_label_support.sh
 
@@ -374,16 +374,16 @@ pkill -f "mdb server"
 
 ### Test Unitario (C++)
 
-1. **Crear archivo** en `tests_projection/unit_tests/`:
+1. **Crear archivo** en `tests/projection/unit_tests/`:
    ```bash
-   touch tests_projection/unit_tests/my_new_test.cc
+   touch tests/projection/unit_tests/my_new_test.cc
    ```
 
 2. **Agregar al CMakeLists.txt**:
    ```cmake
    # En src/tests/CMakeLists.txt o CMakeLists.txt principal
    add_executable(my_new_test
-       ${CMAKE_SOURCE_DIR}/tests_projection/unit_tests/my_new_test.cc
+       ${CMAKE_SOURCE_DIR}/tests/projection/unit_tests/my_new_test.cc
    )
    target_link_libraries(my_new_test
        graph_models
@@ -402,10 +402,10 @@ pkill -f "mdb server"
 
 ### Test de Integración (Bash)
 
-1. **Crear script** en `tests_projection/scripts/`:
+1. **Crear script** en `tests/projection/scripts/`:
    ```bash
-   touch tests_projection/scripts/test_my_feature.sh
-   chmod +x tests_projection/scripts/test_my_feature.sh
+   touch tests/projection/scripts/test_my_feature.sh
+   chmod +x tests/projection/scripts/test_my_feature.sh
    ```
 
 2. **Estructura recomendada**:
@@ -443,7 +443,7 @@ pkill -f "mdb server"
 
 3. **Ejecutar**:
    ```bash
-   cd tests_projection/scripts
+   cd tests/projection/scripts
    ./test_my_feature.sh
    ```
 
@@ -538,7 +538,7 @@ Para reportar bugs en tests o sugerir nuevos tests:
 ## 📜 Historial
 
 ### v2.0 (Octubre 20, 2025)
-- ✅ Reorganizado tests en `tests_projection/`
+- ✅ Reorganizado tests en `tests/projection/`
 - ✅ Separados tests unitarios vs integración
 - ✅ Creado README.md completo
 - ✅ Copiados tests desde `src/tests/`
