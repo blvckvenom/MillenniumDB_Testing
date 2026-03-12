@@ -52,6 +52,10 @@ struct GnnTensorMetadata {
         if (shape.empty()) return 0;
         int64_t total = 1;
         for (auto dim : shape) {
+            if (dim < 0) {
+                throw std::invalid_argument(
+                    "Tensor dimension cannot be negative: " + std::to_string(dim));
+            }
             if (dim != 0 && total > std::numeric_limits<int64_t>::max() / dim) {
                 throw std::overflow_error("Tensor numel() overflow: shape too large");
             }
