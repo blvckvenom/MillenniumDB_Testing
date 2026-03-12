@@ -8,7 +8,7 @@ using namespace GQL::Procedures;
 
 void GnnHnswListProcedure::execute(ProcedureContext& ctx) {
     auto index_names = gql_model.catalog.hnsw_index_manager.get_index_names();
-    auto& metadata_map = gql_model.catalog.hnsw_index_manager.get_name2metadata();
+    auto metadata_map = gql_model.catalog.hnsw_index_manager.get_name2metadata();
 
     for (const auto& name : index_names) {
         auto* index = gql_model.catalog.hnsw_index_manager.get_hnsw_index(name);

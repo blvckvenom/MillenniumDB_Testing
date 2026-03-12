@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <ostream>
@@ -52,18 +53,20 @@ public:
         MetricType metric_type
     );
 
-    const boost::unordered_flat_map<std::string, HNSWIndexMetadata>& get_name2metadata() const
+    boost::unordered_flat_map<std::string, HNSWIndexMetadata> get_name2metadata() const
     {
+        std::shared_lock<std::shared_mutex> lck(name2hnsw_index_mutex);
         return name2metadata;
     }
 
     bool has_changes() const
     {
-        return has_changes_;
+        return has_changes_.load(std::memory_order_acquire);
     }
 
-    const boost::unordered_flat_map<std::string, std::vector<std::string>>& get_predicate2names() const
+    boost::unordered_flat_map<std::string, std::vector<std::string>> get_predicate2names() const
     {
+        std::shared_lock<std::shared_mutex> lck(name2hnsw_index_mutex);
         return predicate2names;
     }
 
@@ -86,14 +89,17 @@ public:
 
     std::size_t num_hnsw_indexes() const
     {
+        std::shared_lock<std::shared_mutex> lck(name2hnsw_index_mutex);
         return name2hnsw_index.size();
     }
 
 private:
-    bool has_changes_ = false;
+    std::atomic<bool> has_changes_ { false };
 
-    // Prevents concurrent access to name2text_search
-    std::shared_mutex name2hnsw_index_mutex;
+    // Prevents concurrent access to name2hnsw_index and related maps.
+    // Lock ordering: update_execution_mutex (server) → name2hnsw_index_mutex.
+    // Never acquire update_execution_mutex while holding this mutex.
+    mutable std::shared_mutex name2hnsw_index_mutex;
 
     // Name to hnsw index
     boost::unordered_flat_map<std::string, std::unique_ptr<HNSWIndex>> name2hnsw_index;

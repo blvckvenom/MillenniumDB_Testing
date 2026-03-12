@@ -127,6 +127,12 @@ public:
     ///   <db_folder>/gnn_features/<name>.rmap  (RowMapping)
     std::vector<std::string> gnn_feature_names;
 
+    /// Register a GNN feature name with validation and duplicate prevention.
+    /// @param name Feature name (must be a safe filesystem name)
+    /// @return true if newly registered, false if already present
+    /// @throws std::runtime_error if name fails validation
+    bool register_gnn_feature(const std::string& name);
+
     /// Convenience: true if any GNN feature matrices are registered.
     bool has_gnn_features() const { return !gnn_feature_names.empty(); }
     /// @}

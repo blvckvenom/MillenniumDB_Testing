@@ -203,6 +203,8 @@ if(BUILD_TESTING)
         add_executable(test_feature_matrix
             tests/test_feature_matrix.cc
         )
+        # Note: ObjectId is header-only for construction/comparison;
+        # operator<< lives in query/id.cc (linked via millenniumdb) but tests don't need it
         target_link_libraries(test_feature_matrix mdb_gnn_core GTest::gtest_main)
         set_target_properties(test_feature_matrix PROPERTIES
             BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"

@@ -49,7 +49,7 @@ void GnnHnswInfoProcedure::execute(ProcedureContext& ctx) {
 
     // Get metric string from metadata
     std::string metric_str = "unknown";
-    auto& metadata_map = gql_model.catalog.hnsw_index_manager.get_name2metadata();
+    auto metadata_map = gql_model.catalog.hnsw_index_manager.get_name2metadata();
     auto it = metadata_map.find(index_name);
     if (it != metadata_map.end()) {
         metric_str = HNSW::to_string(it->second.metric_type);

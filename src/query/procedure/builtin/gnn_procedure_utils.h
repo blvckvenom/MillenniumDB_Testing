@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "gnn/common/validate_name.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_object_id.h"
@@ -15,27 +16,10 @@
 namespace GQL::Procedures {
 
 /// Validate that a name is safe for use in filesystem paths.
-/// Rejects empty strings, path separators, "..", and control characters.
+/// Delegates to the shared mdb::gnn::validate_safe_name utility.
 /// Used for user-supplied tensor keys and index names.
 inline void validate_safe_name(const std::string& name, const std::string& param_name) {
-    if (name.empty()) {
-        throw std::runtime_error(param_name + " cannot be empty.");
-    }
-    for (char c : name) {
-        if (c == '/' || c == '\\' || c == '\0') {
-            throw std::runtime_error(
-                param_name + " contains invalid character (path separator or null): '" + name + "'");
-        }
-        if (static_cast<unsigned char>(c) < 0x20) {
-            throw std::runtime_error(
-                param_name + " contains control character (byte " +
-                std::to_string(static_cast<unsigned char>(c)) + "): '" + name + "'");
-        }
-    }
-    if (name == "." || name == "..") {
-        throw std::runtime_error(
-            param_name + " cannot be '.' or '..': '" + name + "'");
-    }
+    mdb::gnn::validate_safe_name(name, param_name);
 }
 
 /// Get the database folder path with trailing slash stripped.

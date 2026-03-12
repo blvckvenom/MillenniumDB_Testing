@@ -1,5 +1,8 @@
 #include "gql_catalog.h"
 
+#include <algorithm>
+
+#include "gnn/common/validate_name.h"
 #include "query/exceptions.h"
 
 GQLCatalog::GQLCatalog(const std::string& filename) :
@@ -54,6 +57,9 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
                 read_uint64(); // discard old has_gnn_tensors flag
                 read_uint64(); // discard gnn_tensor_num_rows
                 read_uint64(); // discard gnn_tensor_num_cols
+                // Note: if the catalog is truncated, read_uint64() returns
+                // garbage, but we discard the values anyway. The rewrite
+                // (has_changes=true) will produce a clean v2 catalog.
                 has_changes = true;
                 break;
             case 0:
@@ -144,4 +150,15 @@ void GQLCatalog::save()
 
     // GNN feature registry (minor version 2)
     write_strvec(gnn_feature_names);
+}
+
+bool GQLCatalog::register_gnn_feature(const std::string& name) {
+    mdb::gnn::validate_safe_name(name, "feature name");
+    auto it = std::find(gnn_feature_names.begin(), gnn_feature_names.end(), name);
+    if (it != gnn_feature_names.end()) {
+        return false;  // already registered
+    }
+    gnn_feature_names.push_back(name);
+    has_changes = true;
+    return true;
 }

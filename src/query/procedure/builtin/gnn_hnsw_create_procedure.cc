@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 #include "gnn/storage/feature_matrix.h"
 #include "graph_models/common/conversions.h"
@@ -188,11 +191,38 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     num_nodes = feature_matrix.num_rows();
     dimension = feature_matrix.num_cols();
 
-    if (feature_matrix.dtype() != mdb::gnn::GnnDtype::FLOAT32) {
+    // I2: HNSW internally uses uint32_t for node IDs
+    if (num_nodes > static_cast<uint64_t>(UINT32_MAX)) {
         throw std::runtime_error(
-            "Invalid feature matrix dtype: HNSW indexing requires FLOAT32, got " +
+            "FeatureMatrix has " + std::to_string(num_nodes) + " rows, but HNSW index "
+            "supports at most " + std::to_string(UINT32_MAX) + " nodes (32-bit limit)."
+        );
+    }
+
+    // I1: Support both FLOAT32 (direct mmap) and FLOAT64 (convert to float32)
+    const float* embeddings = nullptr;
+    std::vector<float> f32_buffer;  // Only allocated for float64 conversion
+
+    if (feature_matrix.dtype() == mdb::gnn::GnnDtype::FLOAT32) {
+        embeddings = feature_matrix.row_as<float>(0);
+    } else if (feature_matrix.dtype() == mdb::gnn::GnnDtype::FLOAT64) {
+        // Convert float64 -> float32 for HNSW indexing
+        const double* f64_data = feature_matrix.row_as<double>(0);
+        if (dimension > 0 && num_nodes > SIZE_MAX / dimension) {
+            throw std::overflow_error("float64-to-float32 conversion: total_elements overflow");
+        }
+        size_t total_elements = static_cast<size_t>(num_nodes) * dimension;
+        f32_buffer.resize(total_elements);
+        for (size_t i = 0; i < total_elements; ++i) {
+            f32_buffer[i] = static_cast<float>(f64_data[i]);
+        }
+        embeddings = f32_buffer.data();
+    } else {
+        throw std::runtime_error(
+            "Unsupported dtype for HNSW indexing: " +
             mdb::gnn::dtype_name(feature_matrix.dtype()) + ".\n\n"
-            "Re-import your data with float32 tensors, or convert with:\n"
+            "HNSW supports FLOAT32 and FLOAT64.\n"
+            "Re-import with a supported dtype, or convert with:\n"
             "  numpy: arr.astype(np.float32)"
         );
     }
@@ -208,14 +238,30 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     );
 
     // Step 11: Index the embeddings (parallel if multiple threads specified)
-    // FeatureMatrix data is contiguous row-major [N, D], so row_as<float>(0)
-    // points to the start of the entire data block.
-    const float* embeddings = feature_matrix.row_as<float>(0);
+    // NOTE: HNSW find-similar reconstructs ObjectIds as (MASK_NODE | hnsw_node_id),
+    // assuming a 1:1 identity mapping between row position and node ordinal.
+    // If FeatureMatrix rows are ever reordered (e.g., MinHash locality optimization),
+    // find-similar must be updated to use RowMapping for ObjectId lookup.
+    // TODO: Use RowMapping when row reordering is introduced (Step 2+).
 
-    // Prefault pages to detect mapping issues early
-    if (num_nodes > 0 && dimension > 0) {
-        size_t total_bytes = static_cast<size_t>(num_nodes) * dimension * sizeof(float);
-        madvise(const_cast<float*>(embeddings), total_bytes, MADV_WILLNEED);
+    // IO2: Guard overflow in total_bytes computation
+    if (dimension > 0 && num_nodes > SIZE_MAX / dimension / sizeof(float)) {
+        throw std::overflow_error("total_bytes computation would overflow");
+    }
+    size_t total_bytes = static_cast<size_t>(num_nodes) * dimension * sizeof(float);
+
+    // IO1: Prefault pages — only for the FLOAT32 mmap path (not heap buffer).
+    // Page-align the address because embeddings = mmap_base + 64-byte header,
+    // which is not page-aligned. Since 64 < page_size (4096), page_addr always
+    // equals mmap_base, so adj_bytes stays within the mmap region.
+    if (feature_matrix.dtype() == mdb::gnn::GnnDtype::FLOAT32 && num_nodes > 0 && dimension > 0) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size > 0) {
+            uintptr_t addr = reinterpret_cast<uintptr_t>(embeddings);
+            uintptr_t page_addr = addr & ~(static_cast<uintptr_t>(page_size) - 1);
+            size_t adj_bytes = total_bytes + static_cast<size_t>(addr - page_addr);
+            madvise(reinterpret_cast<void*>(page_addr), adj_bytes, MADV_WILLNEED);
+        }
     }
 
     if (num_threads > 1 && num_nodes >= 1000) {

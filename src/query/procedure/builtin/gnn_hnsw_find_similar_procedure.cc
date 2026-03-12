@@ -1,6 +1,7 @@
 #include "gnn_hnsw_find_similar_procedure.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <vector>
 
@@ -127,14 +128,24 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 8: Validate nodeId is within range
-    uint64_t dim = hnsw_index->get_params().dimensions;
     uint64_t index_size = hnsw_index->size();
 
     if (static_cast<uint64_t>(node_id) >= index_size) {
+        // R3: Guard against unsigned underflow when index_size == 0
+        std::string range_str = (index_size > 0)
+            ? "0-" + std::to_string(index_size - 1)
+            : "empty";
         throw std::runtime_error(
             "Invalid nodeId: " + std::to_string(node_id) + " is out of range.\n"
-            "Index '" + index_name + "' contains " + std::to_string(index_size) + " nodes (0-" +
-            std::to_string(index_size - 1) + ")."
+            "Index '" + index_name + "' contains " + std::to_string(index_size) +
+            " nodes (" + range_str + ")."
+        );
+    }
+
+    // I2: Guard against uint32_t truncation for large node IDs
+    if (static_cast<uint64_t>(node_id) > static_cast<uint64_t>(UINT32_MAX)) {
+        throw std::runtime_error(
+            "nodeId " + std::to_string(node_id) + " exceeds HNSW 32-bit node ID limit."
         );
     }
 

@@ -30,6 +30,8 @@ HNSWIndexManager::~HNSWIndexManager()
 
 void HNSWIndexManager::load_hnsw_index(const std::string& name, const HNSWIndexMetadata& metadata)
 {
+    std::unique_lock<std::shared_mutex> lck(name2hnsw_index_mutex);
+
     try {
         const auto metric_func = metric_type2metric_func(metadata.metric_type);
         auto hnsw_index = HNSWIndex::load(name, metric_func);
@@ -207,7 +209,7 @@ bool HNSWIndexManager::drop_hnsw_index(const std::string& name)
         logger.error() << "Failed to remove HNSW index directory: " << e.what();
     }
 
-    has_changes_ = true;
+    has_changes_.store(true, std::memory_order_release);
     return true;
 }
 
@@ -245,7 +247,7 @@ uint_fast32_t HNSWIndexManager::create_hnsw_index(
         name2hnsw_index[name] = std::move(hnsw_index);
         name2metadata[name] = { metric_type, predicate };
         predicate2names[predicate].emplace_back(name);
-        has_changes_ = true;
+        has_changes_.store(true, std::memory_order_release);
         return result;
     } catch (const std::exception& e) {
         throw std::runtime_error("Failed to create HNSW index \"" + name + "\": " + e.what());

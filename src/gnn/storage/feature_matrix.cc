@@ -35,6 +35,7 @@ public:
     MadviseGuard(void* addr, size_t len, int advice)
         : addr_(addr), len_(len)
     {
+        // madvise is advisory; ignore failures (e.g. ENOMEM under memory pressure)
         ::madvise(addr_, len_, advice);
     }
     ~MadviseGuard() {
@@ -143,6 +144,12 @@ FeatureMatrix FeatureMatrix::create(
 
     auto header = FeatureMatrixHeader::make(num_rows, num_cols, dtype);
 
+    // Overflow check: num_cols * dtype_size (before row_bytes computes it unchecked)
+    size_t ds = dtype_size(dtype);
+    if (ds > 0 && num_cols > SIZE_MAX / ds) {
+        throw std::overflow_error("FeatureMatrix::create: num_cols * dtype_size overflow");
+    }
+
     // Overflow check: num_rows * row_bytes
     size_t rb = header.row_bytes();
     if (rb > 0 && num_rows > SIZE_MAX / rb) {
@@ -168,6 +175,15 @@ FeatureMatrix FeatureMatrix::create(
     if (::fsync(fd) < 0) {
         throw std::runtime_error(
             "FeatureMatrix::create: fsync failed: " + std::string(std::strerror(errno)));
+    }
+
+    // Best-effort parent directory fsync for crash consistency
+    {
+        int dir_fd = ::open(path.parent_path().c_str(), O_RDONLY);
+        if (dir_fd >= 0) {
+            ::fsync(dir_fd);
+            ::close(dir_fd);
+        }
     }
 
     // mmap the written file read-only
@@ -352,6 +368,13 @@ FeatureMatrix FeatureMatrix::create_streaming(
     }
 
     auto header = FeatureMatrixHeader::make(num_rows, num_cols, dtype);
+
+    // Overflow check: num_cols * dtype_size (before row_bytes computes it unchecked)
+    size_t ds = dtype_size(dtype);
+    if (ds > 0 && num_cols > SIZE_MAX / ds) {
+        throw std::overflow_error("FeatureMatrix::create_streaming: num_cols * dtype_size overflow");
+    }
+
     const size_t rb = header.row_bytes();
 
     // Overflow check
@@ -377,17 +400,35 @@ FeatureMatrix FeatureMatrix::create_streaming(
     // Write header
     write_all(fd, &header, sizeof(header));
 
-    // Write rows one at a time via callback
-    std::vector<char> row_buf(rb);
-    for (uint64_t i = 0; i < num_rows; ++i) {
-        writer(i, row_buf.data(), rb);
-        write_all(fd, row_buf.data(), rb);
+    // Write rows one at a time via callback.
+    // If the writer callback throws, clean up the partially-written file.
+    try {
+        std::vector<char> row_buf(rb);
+        for (uint64_t i = 0; i < num_rows; ++i) {
+            writer(i, row_buf.data(), rb);
+            write_all(fd, row_buf.data(), rb);
+        }
+    } catch (...) {
+        ::close(fd);
+        guard.release();  // prevent double-close
+        std::error_code ec;
+        fs::remove(path, ec);
+        throw;
     }
 
     if (::fsync(fd) < 0) {
         throw std::runtime_error(
             "FeatureMatrix::create_streaming: fsync failed: " +
             std::string(std::strerror(errno)));
+    }
+
+    // Best-effort parent directory fsync for crash consistency
+    {
+        int dir_fd = ::open(path.parent_path().c_str(), O_RDONLY);
+        if (dir_fd >= 0) {
+            ::fsync(dir_fd);
+            ::close(dir_fd);
+        }
     }
 
     // mmap the result

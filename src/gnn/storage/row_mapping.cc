@@ -10,6 +10,9 @@
 
 namespace mdb::gnn {
 
+static_assert(RowMapping::HEADER_SIZE % alignof(ObjectId) == 0,
+              "HEADER_SIZE must be aligned to ObjectId alignment");
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -124,6 +127,15 @@ RowMapping RowMapping::create(const fs::path& path, const std::vector<ObjectId>&
     if (::fsync(fd) < 0) {
         throw std::runtime_error(
             "RowMapping::create: fsync failed: " + std::string(std::strerror(errno)));
+    }
+
+    // Best-effort parent directory fsync for crash consistency
+    {
+        int dir_fd = ::open(path.parent_path().c_str(), O_RDONLY);
+        if (dir_fd >= 0) {
+            ::fsync(dir_fd);
+            ::close(dir_fd);
+        }
     }
 
     // mmap read-only

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 
 #include "gnn/storage/gnn_dtype.h"
 
@@ -27,6 +28,9 @@ struct FeatureMatrixHeader {
     uint8_t  reserved[39]; // pad to 64 bytes
 
     static FeatureMatrixHeader make(uint64_t rows, uint64_t cols, GnnDtype dt) {
+        if (static_cast<uint8_t>(dt) > static_cast<uint8_t>(GnnDtype::MAX_VALUE)) {
+            throw std::invalid_argument("FeatureMatrixHeader::make: invalid dtype");
+        }
         FeatureMatrixHeader h{};
         std::memset(&h, 0, sizeof(h));
         h.magic    = MAGIC;
@@ -57,5 +61,9 @@ struct FeatureMatrixHeader {
 };
 
 static_assert(sizeof(FeatureMatrixHeader) == 64, "Header must be exactly 64 bytes");
+static_assert(std::is_standard_layout_v<FeatureMatrixHeader>,
+              "FeatureMatrixHeader must be standard layout for direct I/O");
+static_assert(std::is_trivially_copyable_v<FeatureMatrixHeader>,
+              "FeatureMatrixHeader must be trivially copyable for direct I/O");
 
 } // namespace mdb::gnn

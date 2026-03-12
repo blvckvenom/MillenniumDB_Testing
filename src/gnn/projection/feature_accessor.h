@@ -11,7 +11,7 @@
 #include <torch/torch.h>
 
 #include "graph_models/object_id.h"
-#include "gnn/common/feature_matrix.h"
+#include "gnn/common/torch_feature_matrix.h"
 
 namespace GQL {
 class ProjectionStorage;

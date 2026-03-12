@@ -1255,11 +1255,7 @@ void OnDiskImport::import_node_tensors() {
     }
 
     // Register feature in catalog (dimensions stored in .fmat header)
-    if (std::find(catalog.gnn_feature_names.begin(),
-                  catalog.gnn_feature_names.end(),
-                  "node_features") == catalog.gnn_feature_names.end()) {
-        catalog.gnn_feature_names.push_back("node_features");
-    }
+    catalog.register_gnn_feature("node_features");
 
     std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim
               << " (" << fmat_path.string() << ")\n";

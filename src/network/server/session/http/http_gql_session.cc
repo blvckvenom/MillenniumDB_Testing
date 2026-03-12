@@ -114,9 +114,14 @@ void HttpGQLSession<stream_t>::execute_readonly_query(
     // Declared here because the destruction need to be after calling execute_query_plan
     std::unique_ptr<BufferManager::VersionScope> version_scope;
 
+    // Hold update_execution_mutex for the entire execution when needs_editable is true.
+    // This serializes CALL/PROJECT mutations so they don't run concurrently.
+    // Non-editable (read-only) queries are NOT affected and still run concurrently.
+    std::unique_lock<std::mutex> update_lock(server.update_execution_mutex, std::defer_lock);
+
     if (needs_editable) {
         // Use editable scope for queries that modify data (e.g., PROJECT)
-        std::lock_guard<std::mutex> lock(server.update_execution_mutex);
+        update_lock.lock();
         version_scope = buffer_manager.init_version_editable();
     } else {
         // Use readonly scope for pure read queries

@@ -25,8 +25,6 @@ namespace mdb::gnn {
  */
 class RowMapping {
 public:
-    static constexpr uint32_t MAGIC   = 0x524D4150; // "RMAP"
-    static constexpr uint32_t VERSION = 1;
     static constexpr size_t   HEADER_SIZE = 16; // magic(4) + version(4) + count(8)
 
     static RowMapping create(const std::filesystem::path& path, const std::vector<ObjectId>& ids);
@@ -43,6 +41,8 @@ public:
     ObjectId get(uint64_t row_index) const;
 
     /// Linear search for an ObjectId. Returns its row index if found. O(N).
+    /// WARNING: Not suitable for repeated lookups on large mappings.
+    /// For batch operations, build an external hash map ObjectId -> row index.
     std::optional<uint64_t> find(ObjectId target) const;
 
     /// Number of entries.
@@ -51,6 +51,9 @@ public:
     const std::filesystem::path& path() const { return path_; }
 
 private:
+    static constexpr uint32_t MAGIC   = 0x524D4150; // "RMAP"
+    static constexpr uint32_t VERSION = 1;
+
     RowMapping() = default;
 
     std::filesystem::path path_;

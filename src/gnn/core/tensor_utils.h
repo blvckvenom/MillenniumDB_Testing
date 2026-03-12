@@ -12,7 +12,7 @@
  * Use mdb::gnn::FeatureMatrix (gnn/storage/) for storing and loading tensors.
  *
  * @see gnn/storage/feature_matrix.h for mmap-backed tensor storage
- * @see gnn/common/feature_matrix.h for LibTorch TorchFeatureMatrix wrapper
+ * @see gnn/common/torch_feature_matrix.h for LibTorch TorchFeatureMatrix wrapper
  */
 
 #include <array>
@@ -24,7 +24,7 @@
 #include <torch/torch.h>
 
 #include "cuda_context.h"
-#include "gnn/common/feature_matrix.h"
+#include "gnn/common/torch_feature_matrix.h"
 
 namespace mdb::gnn {
 

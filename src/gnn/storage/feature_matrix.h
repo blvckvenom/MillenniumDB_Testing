@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -59,6 +60,8 @@ public:
 
     template<typename T>
     const T* row_as(uint64_t row_id) const {
+        assert(sizeof(T) == dtype_size(header_.get_dtype())
+               && "row_as<T>() type size mismatch with stored dtype");
         return static_cast<const T*>(row(row_id));
     }
 
