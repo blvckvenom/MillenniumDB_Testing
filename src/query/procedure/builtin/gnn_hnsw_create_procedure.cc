@@ -151,6 +151,23 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    // Step 6b: Validate tensor_key is registered in the catalog
+    {
+        const auto& names = gql_model.catalog.gnn_feature_names;
+        if (std::find(names.begin(), names.end(), tensor_key) == names.end()) {
+            std::string available;
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (i > 0) available += ", ";
+                available += "'" + names[i] + "'";
+            }
+            throw std::runtime_error(
+                "Feature '" + tensor_key + "' is not registered in the catalog.\n\n"
+                "Available features: " + available + "\n"
+                "Only features imported via mdb-import --with-tensors are valid."
+            );
+        }
+    }
+
     // num_nodes and dimension are needed after tensor_store is released (for yield results)
     uint64_t num_nodes = 0;
     uint64_t dimension = 0;
