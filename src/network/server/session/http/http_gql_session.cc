@@ -1,6 +1,7 @@
 #include "http_gql_session.h"
 
 #include <boost/beast/ssl.hpp>
+#include <sstream>
 
 #include "misc/logger.h"
 #include "misc/trim.h"
@@ -165,11 +166,17 @@ void HttpGQLSession<stream_t>::execute_readonly_query(
     }
 
     try {
-        execute_readonly_query_plan(*physical_plan, os, response_type);
-
-        // If we used an editable scope, mark it as committed so changes persist
         if (needs_editable) {
+            // Buffer output for CALL/procedure queries so that if the
+            // procedure throws, we can return HTTP 500 instead of a
+            // truncated 200 response (the header hasn't been flushed
+            // to the client yet — it sits in the buffer).
+            std::ostringstream buffer;
+            execute_readonly_query_plan(*physical_plan, buffer, response_type);
+            os << buffer.str();
             version_scope->commited = true;
+        } else {
+            execute_readonly_query_plan(*physical_plan, os, response_type);
         }
     } catch (const ConnectionException& e) {
         logger.error() << "Connection(" << worker << ") exception: " << e.what();
@@ -177,6 +184,14 @@ void HttpGQLSession<stream_t>::execute_readonly_query(
         // Handled in execute_readonly_query_plan
     } catch (const QueryExecutionException& e) {
         // Handled in execute_readonly_query_plan
+    } catch (const std::exception& e) {
+        if (needs_editable) {
+            // Procedure failed — the buffered stream absorbed the 200
+            // header, so the real client socket is still clean and we
+            // can send a proper error response.
+            logger.error() << "Worker " << worker << " Procedure error: " << e.what();
+            send_internal_error(os, e.what());
+        }
     }
 }
 
@@ -238,6 +253,7 @@ void HttpGQLSession<stream_t>::execute_readonly_query_plan(
         logger.error() << "Worker " << worker << ": " << e.what();
     } catch (const std::exception& e) {
         logger.error() << "Worker " << worker << " Unexpected Exception: " << e.what();
+        throw;
     } catch (...) {
         logger.error() << "Worker " << worker << " Unknown exception";
     }
