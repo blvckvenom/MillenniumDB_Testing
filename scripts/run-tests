@@ -29,7 +29,7 @@ fi
 
 # Configure build and compile
 cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug
-cmake --build build/Debug
+cmake --build build/Debug -j $(nproc)
 
 # Remove SPARQL tmp dir
 [[ -d  $TESTS/sparql/tmp/ ]] && echo -e ${BLUE}Removing  $TESTS/sparql/tmp/${NC} && rm -r  $TESTS/sparql/tmp/
