@@ -76,4 +76,81 @@ static_assert(std::is_standard_layout_v<PackedBatchHeader>,
 static_assert(std::is_trivially_copyable_v<PackedBatchHeader>,
               "PackedBatchHeader must be trivially copyable for direct I/O");
 
+/**
+ * @brief Writes per-batch packed feature files.
+ *
+ * Each write_batch() creates one self-contained file with header + data.
+ * NOT thread-safe. Call from a single thread.
+ */
+class PackedBatchWriter {
+public:
+    /// Throws std::invalid_argument if feature_dim == 0.
+    PackedBatchWriter(const std::filesystem::path& dir,
+                      uint64_t feature_dim,
+                      GnnDtype dtype);
+
+    /// batch_id must equal batches_written() (sequential from 0).
+    void write_batch(uint64_t batch_id, const void* data, uint64_t num_nodes);
+
+    uint64_t feature_dim() const { return feature_dim_; }
+    GnnDtype dtype() const { return dtype_; }
+    uint64_t batches_written() const { return batches_written_; }
+    const std::filesystem::path& dir() const { return dir_; }
+
+private:
+    std::filesystem::path dir_;
+    uint64_t feature_dim_;
+    GnnDtype dtype_;
+    uint64_t batches_written_ = 0;
+
+    std::filesystem::path batch_path(uint64_t batch_id) const;
+};
+
+/**
+ * @brief Reads per-batch packed feature files.
+ *
+ * Thread-safe: each read_batch() opens its own fd.
+ */
+class PackedBatchReader {
+public:
+    /// Throws std::runtime_error if dir does not exist.
+    PackedBatchReader(const std::filesystem::path& dir,
+                      uint64_t num_batches,
+                      uint64_t feature_dim,
+                      GnnDtype dtype);
+
+    /// Thread-safe. Validates header against expected feature_dim/dtype.
+    uint64_t read_batch(uint64_t batch_id, void* out, size_t out_capacity) const;
+
+    PackedBatchHeader read_header(uint64_t batch_id) const;
+
+    uint64_t num_batches() const { return num_batches_; }
+    uint64_t feature_dim() const { return feature_dim_; }
+    GnnDtype dtype() const { return dtype_; }
+    const std::filesystem::path& dir() const { return dir_; }
+
+private:
+    std::filesystem::path dir_;
+    uint64_t num_batches_;
+    uint64_t feature_dim_;
+    GnnDtype dtype_;
+
+    std::filesystem::path batch_path(uint64_t batch_id) const;
+};
+
+/// Primary API: callback-based (streaming, constant memory).
+void generate_packed_batches(
+    const FeatureMatrix& features,
+    uint64_t num_batches,
+    std::function<std::vector<uint64_t>(uint64_t batch_id)> batch_provider,
+    const std::filesystem::path& output_dir
+);
+
+/// Convenience: materialized assignments (for tests, small datasets).
+void generate_packed_batches(
+    const FeatureMatrix& features,
+    const std::vector<std::vector<uint64_t>>& batch_assignments,
+    const std::filesystem::path& output_dir
+);
+
 } // namespace mdb::gnn
