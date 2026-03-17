@@ -1,6 +1,7 @@
 #include "gnn/sampling/minhash_reorderer.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cinttypes>
 #include <climits>
 #include <numeric>
@@ -16,20 +17,22 @@
 namespace mdb::gnn {
 
 // ===========================================================================
-// Constructor + hash
+// Constructor + Destructor
 // ===========================================================================
 
 MinHashReorderer::MinHashReorderer(const Config& config) : config_(config) {
     if (config_.num_hashes == 0) {
         throw std::invalid_argument("MinHashReorderer: num_hashes must be > 0");
     }
-    if (config_.hashes_per_pass == 0) {
+    if (config_.strategy == Strategy::MULTIPASS_BOUNDED && config_.hashes_per_pass == 0) {
         throw std::invalid_argument("MinHashReorderer: hashes_per_pass must be > 0");
     }
 
-    // Large prime for universal hash family h(x) = (a*x + b) mod p
-    // Broder et al. (2000): this is a sound approximation for min-wise independence
-    prime_ = 4294967311ULL; // 2^32 + 15
+    // Fix #4: Largest prime below 2^32, so all hash outputs fit in 32 bits
+    // without truncation when used in composite keys.
+    // Broder et al. (2000): h(x) = (a*x + b) mod p is a sound approximation
+    // for min-wise independence.
+    prime_ = 4294967291ULL; // 2^32 - 5
 
     std::mt19937_64 rng(config_.random_seed);
     std::uniform_int_distribution<uint64_t> dist(1, prime_ - 1);
@@ -40,7 +43,24 @@ MinHashReorderer::MinHashReorderer(const Config& config) : config_(config) {
     }
 }
 
+MinHashReorderer::~MinHashReorderer() {
+    // Fix #3: Clean up temp files if Strategy B was used
+    cleanup_temp_dir();
+}
+
+void MinHashReorderer::cleanup_temp_dir() noexcept {
+    if (!temp_dir_.empty()) {
+        try {
+            std::filesystem::remove_all(temp_dir_);
+        } catch (...) {
+            // Best effort — ignore cleanup failures in destructor
+        }
+        temp_dir_.clear();
+    }
+}
+
 uint64_t MinHashReorderer::hash(uint64_t x, uint32_t hash_idx) const {
+    assert(hash_idx < hash_coeffs_.size());
     auto [a, b] = hash_coeffs_[hash_idx];
     return (a * x + b) % prime_;
 }
@@ -49,12 +69,11 @@ uint64_t MinHashReorderer::hash(uint64_t x, uint32_t hash_idx) const {
 // build_access_graph (dispatch)
 // ===========================================================================
 
-void MinHashReorderer::build_access_graph(uint64_t num_batches, BatchProvider provider) {
+void MinHashReorderer::build_access_graph(uint64_t num_batches, const BatchProvider& provider) {
     if (graph_built_) {
         throw std::runtime_error("MinHashReorderer: build_access_graph already called");
     }
     total_batches_ = num_batches;
-    graph_built_ = true;
 
     switch (config_.strategy) {
         case Strategy::SEGMENTED:
@@ -64,13 +83,17 @@ void MinHashReorderer::build_access_graph(uint64_t num_batches, BatchProvider pr
             build_multipass(num_batches, provider);
             break;
     }
+
+    // Fix #2: Set graph_built_ AFTER the strategy call succeeds.
+    // If the strategy throws, graph_built_ remains false.
+    graph_built_ = true;
 }
 
 // ===========================================================================
 // Strategy A: Segmented (DiskGNN Algorithm 1)
 // ===========================================================================
 
-void MinHashReorderer::build_segmented(uint64_t num_batches, BatchProvider& provider) {
+void MinHashReorderer::build_segmented(uint64_t num_batches, const BatchProvider& provider) {
     for (uint64_t batch_id = 0; batch_id < num_batches; ++batch_id) {
         auto row_ids = provider(batch_id);
 
@@ -83,13 +106,13 @@ void MinHashReorderer::build_segmented(uint64_t num_batches, BatchProvider& prov
             // Grow arrays if needed
             if (row_id >= hash_values_.size()) {
                 hash_values_.resize(row_id + 1, UINT64_MAX);
-                accessed_.resize(row_id + 1, false);
+                accessed_.resize(row_id + 1, 0);
             }
-            accessed_[row_id] = true;
+            accessed_[row_id] = 1;
+            ++total_accesses_;
 
             // Apply all k hash functions, accumulate min into composite key
             // Composite: segment_id in high 32 bits, hash value in low 32 bits
-            // This ensures nodes group by segment first, then by MinHash
             for (uint32_t h = 0; h < config_.num_hashes; ++h) {
                 uint64_t hval = hash(batch_id, h);
                 uint64_t composite = (segment_id << 32) | (hval & 0xFFFFFFFF);
@@ -103,7 +126,7 @@ void MinHashReorderer::build_segmented(uint64_t num_batches, BatchProvider& prov
 // Strategy B: Multi-pass Bounded (original contribution)
 // ===========================================================================
 
-void MinHashReorderer::build_multipass(uint64_t num_batches, BatchProvider& provider) {
+void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider& provider) {
     namespace fs = std::filesystem;
 
     // Phase 0: Materialize batch assignments to temp file
@@ -116,7 +139,8 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, BatchProvider& prov
         int fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             throw std::runtime_error(
-                "MinHashReorderer: cannot create temp file: " + temp_path.string());
+                "MinHashReorderer: cannot create temp file: " + temp_path.string()
+                + ": " + safe_strerror(errno));
         }
         FdGuard guard(fd);
 
@@ -129,18 +153,22 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, BatchProvider& prov
                 write_all(fd, row_ids.data(), count * 8, temp_path.string());
                 for (uint64_t rid : row_ids) {
                     if (rid >= accessed_.size()) {
-                        accessed_.resize(rid + 1, false);
+                        accessed_.resize(rid + 1, 0);
                     }
-                    accessed_[rid] = true;
+                    accessed_[rid] = 1;
+                    ++total_accesses_;
                 }
             }
         }
 
         if (::fsync(fd) < 0) {
             throw std::runtime_error(
-                "MinHashReorderer: fsync failed: " + safe_strerror(errno));
+                "MinHashReorderer: fsync failed (" + temp_path.string()
+                + "): " + safe_strerror(errno));
         }
     }
+
+    fsync_directory(temp_path);
 
     // Phase 1..P: Multi-pass MinHash over temp file
     uint64_t N = accessed_.size();
@@ -148,23 +176,31 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, BatchProvider& prov
 
     uint32_t total_hashes = config_.num_hashes;
     uint32_t K = config_.hashes_per_pass;
-    std::vector<uint64_t> min_val;
 
     for (uint32_t h_start = 0; h_start < total_hashes; h_start += K) {
         uint32_t h_end = std::min(h_start + K, total_hashes);
         uint32_t num_h = h_end - h_start;
 
-        // Initialize min_val: one array per hash function in this pass
-        // Interleaved: min_val[row * num_h + h] for better cache behavior
-        min_val.assign(N * num_h, UINT64_MAX);
+        // Fix #5: Overflow guard before allocation
+        if (N > 0 && num_h > SIZE_MAX / N / sizeof(uint64_t)) {
+            throw std::overflow_error(
+                "MinHashReorderer: min_val allocation would overflow ("
+                + std::to_string(N) + " * " + std::to_string(num_h) + ")");
+        }
+
+        std::vector<uint64_t> min_val(N * num_h, UINT64_MAX);
 
         // Sequential scan of temp file
         int fd = ::open(temp_path.c_str(), O_RDONLY);
         if (fd < 0) {
             throw std::runtime_error(
-                "MinHashReorderer: cannot open temp file: " + temp_path.string());
+                "MinHashReorderer: cannot open temp file: " + temp_path.string()
+                + ": " + safe_strerror(errno));
         }
         FdGuard guard(fd);
+
+        // Fix #6: Pre-allocate buffer for bulk reading row_ids
+        std::vector<uint64_t> row_id_buf;
 
         for (uint64_t b = 0; b < num_batches; ++b) {
             uint64_t batch_id, count;
@@ -177,10 +213,23 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, BatchProvider& prov
                 hvals[h] = hash(batch_id, h_start + h);
             }
 
-            // Read row_ids and update min_val
+            if (count == 0) continue;
+
+            // Fix #6: Bulk read all row_ids at once
+            row_id_buf.resize(count);
+            read_all(fd, row_id_buf.data(), count * 8, temp_path.string());
+
+            // Update min_val for each row
             for (uint64_t i = 0; i < count; ++i) {
-                uint64_t rid;
-                read_all(fd, &rid, 8, temp_path.string());
+                uint64_t rid = row_id_buf[i];
+
+                // Fix #1: Bounds check on rid from temp file
+                if (rid >= N) {
+                    throw std::runtime_error(
+                        "MinHashReorderer: corrupted temp file — row_id "
+                        + std::to_string(rid) + " >= N=" + std::to_string(N));
+                }
+
                 for (uint32_t h = 0; h < num_h; ++h) {
                     uint64_t& mv = min_val[rid * num_h + h];
                     mv = std::min(mv, hvals[h]);
@@ -199,8 +248,8 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, BatchProvider& prov
         }
     }
 
-    // Cleanup temp files
-    fs::remove_all(temp_dir_);
+    // Cleanup temp files (also done in destructor as safety net)
+    cleanup_temp_dir();
 }
 
 // ===========================================================================
@@ -272,10 +321,12 @@ MinHashReorderer::Stats MinHashReorderer::get_stats() const {
     for (size_t i = 0; i < accessed_.size(); ++i) {
         if (accessed_[i]) ++accessed;
     }
+    // Fix #9: avg_batches_per_node = total_accesses / accessed_nodes (not total_batches / accessed)
     return Stats{
         accessed,
         total_batches_,
-        accessed > 0 ? static_cast<double>(total_batches_) / accessed : 0.0
+        total_accesses_,
+        accessed > 0 ? static_cast<double>(total_accesses_) / accessed : 0.0
     };
 }
 
