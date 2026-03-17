@@ -344,6 +344,13 @@ NodeProjectionVariant ProjectProcedure::parse_node_projection(ProcedureContext& 
     {
         std::string label = Conversions::unpack_string(arg);
 
+        if (label.empty()) {
+            throw std::runtime_error(
+                "nodeProjection label cannot be an empty string. "
+                "Provide a valid node label or '*' for all labels."
+            );
+        }
+
         // Wildcard expansion: '*' expands to all node labels from catalog
         if (label == "*") {
             return std::vector<std::string>(
@@ -415,6 +422,13 @@ RelationshipProjectionVariant ProjectProcedure::parse_relationship_projection(Pr
         type == GQL_OID::Type::STRING_SIMPLE_TMP)
     {
         std::string rel_type = Conversions::unpack_string(arg);
+
+        if (rel_type.empty()) {
+            throw std::runtime_error(
+                "relationshipProjection type cannot be an empty string. "
+                "Provide a valid relationship type or '*' for all types."
+            );
+        }
 
         // Wildcard expansion: '*' expands to all relationship types from catalog
         if (rel_type == "*") {
