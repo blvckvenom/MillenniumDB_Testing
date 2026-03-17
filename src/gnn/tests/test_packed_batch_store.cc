@@ -525,6 +525,42 @@ TEST_F(PackedBatchTest, ReaderDtypeMismatchThrows) {
     EXPECT_THROW(reader.read_batch(0, out.data(), out.size() * sizeof(double)), std::runtime_error);
 }
 
+// Edge case: single-node batch (boundary between empty and multi-node)
+TEST_F(PackedBatchTest, SingleNodeBatch) {
+    auto dir = test_path("single_node");
+    PackedBatchWriter writer(dir, 3, GnnDtype::FLOAT32);
+    std::vector<float> data = {1.0f, 2.0f, 3.0f};
+    writer.write_batch(0, data.data(), 1);
+
+    PackedBatchReader reader(dir, 1, 3, GnnDtype::FLOAT32);
+    std::vector<float> out(3);
+    uint64_t n = reader.read_batch(0, out.data(), out.size() * sizeof(float));
+    EXPECT_EQ(n, 1u);
+    EXPECT_FLOAT_EQ(out[0], 1.0f);
+    EXPECT_FLOAT_EQ(out[1], 2.0f);
+    EXPECT_FLOAT_EQ(out[2], 3.0f);
+}
+
+// Edge case: empty batch in the middle of non-empty batches
+TEST_F(PackedBatchTest, EmptyBatchInMiddle) {
+    auto dir = test_path("empty_middle");
+    PackedBatchWriter writer(dir, 2, GnnDtype::FLOAT32);
+
+    std::vector<float> data1 = {1, 2, 3, 4};
+    writer.write_batch(0, data1.data(), 2);
+    writer.write_batch(1, nullptr, 0);  // empty middle batch
+    std::vector<float> data2 = {5, 6};
+    writer.write_batch(2, data2.data(), 1);
+
+    PackedBatchReader reader(dir, 3, 2, GnnDtype::FLOAT32);
+
+    std::vector<float> out(4);
+    EXPECT_EQ(reader.read_batch(0, out.data(), 4 * sizeof(float)), 2u);
+    EXPECT_EQ(reader.read_batch(1, nullptr, 0), 0u);
+    EXPECT_EQ(reader.read_batch(2, out.data(), 2 * sizeof(float)), 1u);
+    EXPECT_FLOAT_EQ(out[0], 5.0f);
+}
+
 // Fix #8: read_header() out-of-bounds directly
 TEST_F(PackedBatchTest, ReadHeaderOutOfBoundsThrows) {
     auto dir = test_path("header_oob");

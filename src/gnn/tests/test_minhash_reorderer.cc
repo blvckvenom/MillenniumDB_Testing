@@ -407,6 +407,19 @@ TEST(MinHashMultipassTest, SegmentSizeIgnored) {
 
 using MinHashE2ETest = GnnStorageTest;
 
+// Edge case: single node accessed, rest unaccessed
+TEST(MinHashSegmentedTest, SingleNodeAccessed) {
+    MinHashReorderer r(make_config());
+    r.build_access_graph(1, [](uint64_t) { return std::vector<uint64_t>{5}; });
+    auto perm = r.compute_permutation(10);
+    EXPECT_EQ(perm.size(), 10u);
+    EXPECT_EQ(perm[0], 5u); // only accessed node goes first
+
+    std::vector<uint64_t> sorted = perm;
+    std::sort(sorted.begin(), sorted.end());
+    for (uint64_t i = 0; i < 10; ++i) EXPECT_EQ(sorted[i], i);
+}
+
 TEST_F(MinHashE2ETest, EndToEndReorderAndVerify) {
     const uint64_t N = 20, D = 3;
     std::vector<float> features(N * D);
@@ -429,6 +442,35 @@ TEST_F(MinHashE2ETest, EndToEndReorderAndVerify) {
     EXPECT_EQ(reordered.num_cols(), D);
 
     // Verify: every original row's features are preserved at the new position
+    for (uint64_t old_row = 0; old_row < N; ++old_row) {
+        uint64_t new_pos = inv[old_row];
+        const float* original = fm.row_as<float>(old_row);
+        const float* reordered_row = reordered.row_as<float>(new_pos);
+        for (uint64_t c = 0; c < D; ++c) {
+            EXPECT_FLOAT_EQ(original[c], reordered_row[c])
+                << "old_row=" << old_row << " new_pos=" << new_pos << " col=" << c;
+        }
+    }
+}
+
+TEST_F(MinHashE2ETest, EndToEndReorderStrategyB) {
+    const uint64_t N = 20, D = 3;
+    std::vector<float> features(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) features[i] = static_cast<float>(i);
+
+    auto fmat_path = test_path("e2e_b.fmat");
+    auto fm = FeatureMatrix::create(fmat_path, N, D, GnnDtype::FLOAT32, features.data());
+
+    MinHashReorderer reorderer(make_config(MinHashReorderer::Strategy::MULTIPASS_BOUNDED, 4, 2, 0));
+    reorderer.build_access_graph(5, [](uint64_t b) -> std::vector<uint64_t> {
+        return {b * 4, b * 4 + 1, b * 4 + 2, b * 4 + 3};
+    });
+    auto perm = reorderer.compute_permutation(N);
+    auto inv = MinHashReorderer::compute_inverse(perm);
+
+    auto reordered_path = test_path("e2e_b_reordered.fmat");
+    auto reordered = FeatureMatrix::create_reordered(fm, perm, reordered_path);
+
     for (uint64_t old_row = 0; old_row < N; ++old_row) {
         uint64_t new_pos = inv[old_row];
         const float* original = fm.row_as<float>(old_row);
