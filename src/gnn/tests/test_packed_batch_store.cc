@@ -378,7 +378,14 @@ TEST_F(PackedBatchTest, GenerateFromCallback) {
         std::vector<float> out(2 * D);
         uint64_t nodes = reader.read_batch(b, out.data(), out.size() * sizeof(float));
         EXPECT_EQ(nodes, 2u);
-        EXPECT_FLOAT_EQ(out[0], static_cast<float>(b * 2 * D));
+        // Verify ALL values, not just out[0]
+        for (uint64_t r = 0; r < 2; ++r) {
+            uint64_t src_row = b * 2 + r;
+            for (uint64_t c = 0; c < D; ++c) {
+                EXPECT_FLOAT_EQ(out[r * D + c], features[src_row * D + c])
+                    << "batch=" << b << " row=" << r << " col=" << c;
+            }
+        }
     }
 }
 
