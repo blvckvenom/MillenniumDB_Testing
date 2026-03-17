@@ -215,6 +215,17 @@ if(BUILD_TESTING)
         )
         add_test(NAME GnnStorageTests COMMAND test_gnn_storage)
 
+        # PackedBatchStore tests (Step 1: L4 per-batch packed features)
+        add_executable(test_packed_batch_store
+            tests/test_packed_batch_store.cc
+        )
+        target_link_libraries(test_packed_batch_store mdb_gnn_core GTest::gtest_main)
+        set_target_properties(test_packed_batch_store PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME PackedBatchStoreTests COMMAND test_packed_batch_store)
+
         message(STATUS "GNN tests enabled")
     else()
         message(STATUS "GTest not found. GNN tests disabled.")
