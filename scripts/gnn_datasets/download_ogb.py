@@ -58,30 +58,35 @@ DATASET_INFO = {
     "ogbn-arxiv": {
         "nodes": 169_343,
         "edges": 1_166_243,
+        "directed": True,
         "description": "Citation network of CS papers from arXiv",
         "download_size": "~300MB",
     },
     "ogbn-products": {
         "nodes": 2_449_029,
         "edges": 61_859_140,
+        "directed": False,
         "description": "Amazon product co-purchasing network",
         "download_size": "~1.5GB",
     },
     "ogbn-mag": {
         "nodes": 1_939_743,
         "edges": 21_111_007,
+        "directed": True,
         "description": "Microsoft Academic Graph (heterogeneous)",
         "download_size": "~500MB",
     },
     "ogbn-proteins": {
         "nodes": 132_534,
         "edges": 39_561_252,
+        "directed": False,
         "description": "Protein-protein association network",
         "download_size": "~200MB",
     },
     "ogbn-papers100M": {
         "nodes": 111_059_956,
         "edges": 1_615_685_872,
+        "directed": True,
         "description": "Large-scale citation network",
         "download_size": "~50GB",
     },
@@ -131,15 +136,19 @@ def convert_to_gql(
     Convert OGB data to MillenniumDB GQL format.
 
     MillenniumDB GQL import format:
-        Nodes: <id> :<label> [prop:value ...]
-        Edges: <from_id>-><to_id> :<label> [prop:value ...]
+        Nodes:           <id> :<label> [prop:value ...]
+        Directed edges:  <from_id>-><to_id> :<label> [prop:value ...]
+        Undirected edges: <id1>~<id2> :<label> [prop:value ...]
 
     Example:
         0 :Node label:3 split:"train" feat_dim:100
-        0->1 :CONNECTS
+        0->1 :CITES
+        0~1 :CONNECTS
     """
     output_path.mkdir(parents=True, exist_ok=True)
     gql_file = output_path / f"{dataset_name.replace('-', '_')}.gql"
+
+    is_directed = DATASET_INFO.get(dataset_name, {}).get("directed", True)
 
     num_nodes = edge_index.max() + 1
     if max_nodes and max_nodes < num_nodes:
@@ -189,23 +198,47 @@ def convert_to_gql(
             prop_str = " ".join(props)
             f.write(f"{node_id} :Node {prop_str}\n")
 
-        # Write edges in MillenniumDB format: <from_id>-><to_id> :<label>
+        # Write edges
         edge_count = 0
-        for i in range(edge_index.shape[1]):
-            src = edge_index[0, i]
-            dst = edge_index[1, i]
+        total_entries = edge_index.shape[1]
 
-            # Skip edges outside our node limit
-            if max_nodes and (src >= max_nodes or dst >= max_nodes):
-                continue
+        if is_directed:
+            for i in range(total_entries):
+                src = edge_index[0, i]
+                dst = edge_index[1, i]
 
-            if edge_count % 1_000_000 == 0:
-                print(f"    Edges: {edge_count:,}/{edge_index.shape[1]:,}")
+                if max_nodes and (src >= max_nodes or dst >= max_nodes):
+                    continue
 
-            f.write(f"{src}->{dst} :CONNECTS\n")
-            edge_count += 1
+                if edge_count % 1_000_000 == 0:
+                    print(f"    Edges: {edge_count:,}/{total_entries:,}")
 
-        print(f"  Wrote {num_nodes:,} nodes and {edge_count:,} edges")
+                f.write(f"{src}->{dst} :CONNECTS\n")
+                edge_count += 1
+        else:
+            # OGB doubles undirected edges via add_inverse_edge: (A,B) + (B,A).
+            # Deduplicate by keeping only src < dst; use ~ (undirected) syntax.
+            seen_self_loops: set = set()
+            for i in range(total_entries):
+                src = int(edge_index[0, i])
+                dst = int(edge_index[1, i])
+
+                if max_nodes and (src >= max_nodes or dst >= max_nodes):
+                    continue
+
+                if edge_count % 1_000_000 == 0:
+                    print(f"    Edges (dedup): {edge_count:,}/{total_entries:,}")
+
+                if src < dst:
+                    f.write(f"{src}~{dst} :CONNECTS\n")
+                    edge_count += 1
+                elif src == dst and src not in seen_self_loops:
+                    seen_self_loops.add(src)
+                    f.write(f"{src}~{dst} :CONNECTS\n")
+                    edge_count += 1
+
+        edge_type = "directed" if is_directed else "undirected"
+        print(f"  Wrote {num_nodes:,} nodes and {edge_count:,} {edge_type} edges")
 
     # Save full features to numpy file for GNN training
     if node_feat is not None:
