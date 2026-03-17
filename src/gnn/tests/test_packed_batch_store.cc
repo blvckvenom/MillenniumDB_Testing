@@ -475,3 +475,152 @@ TEST_F(PackedBatchTest, ConcurrentReads) {
     for (auto& th : threads) th.join();
     EXPECT_EQ(errors.load(), 0u);
 }
+
+// Fix #6: Concurrent reads on the SAME batch (true contention test)
+TEST_F(PackedBatchTest, ConcurrentReadsSameBatch) {
+    const uint64_t D = 4, N = 100;
+    auto dir = test_path("concurrent_same");
+    PackedBatchWriter writer(dir, D, GnnDtype::FLOAT32);
+    std::vector<float> data(N * D);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<float>(i);
+    writer.write_batch(0, data.data(), N);
+
+    PackedBatchReader reader(dir, 1, D, GnnDtype::FLOAT32);
+
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> errors{0};
+
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&]() {
+            for (int iter = 0; iter < 50; ++iter) {
+                std::vector<float> out(N * D);
+                uint64_t n = reader.read_batch(0, out.data(), out.size() * sizeof(float));
+                if (n != N) { ++errors; continue; }
+                // Verify full buffer content
+                for (size_t i = 0; i < out.size(); ++i) {
+                    if (out[i] != static_cast<float>(i)) { ++errors; break; }
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(errors.load(), 0u);
+}
+
+// ===========================================================================
+// Additional edge cases (from review)
+// ===========================================================================
+
+// Fix #7: Dtype mismatch between writer and reader
+TEST_F(PackedBatchTest, ReaderDtypeMismatchThrows) {
+    auto dir = test_path("dtype_mismatch");
+    PackedBatchWriter writer(dir, 4, GnnDtype::FLOAT32);
+    std::vector<float> data(4, 1.0f);
+    writer.write_batch(0, data.data(), 1);
+
+    // Reader expects FLOAT64 but file has FLOAT32
+    PackedBatchReader reader(dir, 1, 4, GnnDtype::FLOAT64);
+    std::vector<double> out(4);
+    EXPECT_THROW(reader.read_batch(0, out.data(), out.size() * sizeof(double)), std::runtime_error);
+}
+
+// Fix #8: read_header() out-of-bounds directly
+TEST_F(PackedBatchTest, ReadHeaderOutOfBoundsThrows) {
+    auto dir = test_path("header_oob");
+    PackedBatchWriter writer(dir, 4, GnnDtype::FLOAT32);
+    std::vector<float> data(4, 1.0f);
+    writer.write_batch(0, data.data(), 1);
+
+    PackedBatchReader reader(dir, 1, 4, GnnDtype::FLOAT32);
+    EXPECT_THROW(reader.read_header(1), std::out_of_range);
+    EXPECT_THROW(reader.read_header(999), std::out_of_range);
+}
+
+// Fix #14: INT64 dtype roundtrip
+TEST_F(PackedBatchTest, WriteAndReadInt64) {
+    const uint64_t N = 3, D = 2;
+    std::vector<int64_t> data = {-100, 200, -300, 400, -500, 600};
+
+    auto dir = test_path("read_i64");
+    PackedBatchWriter writer(dir, D, GnnDtype::INT64);
+    writer.write_batch(0, data.data(), N);
+
+    PackedBatchReader reader(dir, 1, D, GnnDtype::INT64);
+    std::vector<int64_t> out(N * D);
+    reader.read_batch(0, out.data(), out.size() * sizeof(int64_t));
+    for (size_t i = 0; i < data.size(); ++i) {
+        EXPECT_EQ(out[i], data[i]);
+    }
+}
+
+// Fix #15: Reserved bytes — non-zero reserved bytes are accepted (forward-compat)
+TEST_F(PackedBatchTest, HeaderNonZeroReservedBytesAccepted) {
+    auto h = PackedBatchHeader::make(10, 128, GnnDtype::FLOAT32);
+    h.reserved[0] = 0xFF;
+    h.reserved[6] = 0x42;
+    EXPECT_TRUE(h.is_valid()) << "is_valid() should accept non-zero reserved bytes for forward compatibility";
+}
+
+// Fix #16a: Empty assignments (0 batches)
+TEST_F(PackedBatchTest, GenerateEmptyAssignments) {
+    const uint64_t N = 5, D = 2;
+    std::vector<float> features(N * D, 1.0f);
+    auto fmat_path = test_path("gen_empty.fmat");
+    auto fm = FeatureMatrix::create(fmat_path, N, D, GnnDtype::FLOAT32, features.data());
+
+    auto packed_dir = test_path("gen_empty_packed");
+    std::vector<std::vector<uint64_t>> empty_assignments;
+    generate_packed_batches(fm, empty_assignments, packed_dir);
+
+    EXPECT_TRUE(fs::exists(packed_dir)); // directory created
+    // No batch files should exist
+    EXPECT_FALSE(fs::exists(packed_dir / "batch_000000.bin"));
+}
+
+// Fix #16b: Re-read same batch (idempotency)
+TEST_F(PackedBatchTest, ReReadSameBatch) {
+    const uint64_t N = 5, D = 3;
+    std::vector<float> data(N * D);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<float>(i);
+
+    auto dir = test_path("reread");
+    PackedBatchWriter writer(dir, D, GnnDtype::FLOAT32);
+    writer.write_batch(0, data.data(), N);
+
+    PackedBatchReader reader(dir, 1, D, GnnDtype::FLOAT32);
+    std::vector<float> out1(N * D), out2(N * D);
+
+    reader.read_batch(0, out1.data(), out1.size() * sizeof(float));
+    reader.read_batch(0, out2.data(), out2.size() * sizeof(float));
+
+    for (size_t i = 0; i < out1.size(); ++i) {
+        EXPECT_FLOAT_EQ(out1[i], out2[i]);
+    }
+}
+
+// Fix #16c: Large batch_id (>999999) filename correctness
+TEST_F(PackedBatchTest, LargeBatchIdFilename) {
+    auto dir = test_path("large_id");
+    PackedBatchWriter writer(dir, 2, GnnDtype::FLOAT32);
+
+    // Write batches 0 through 5 to satisfy sequential requirement, then check filename
+    for (uint64_t i = 0; i < 5; ++i) {
+        std::vector<float> data(2, static_cast<float>(i));
+        writer.write_batch(i, data.data(), 1);
+    }
+
+    // Verify filenames: 0-4 should be zero-padded to 6 digits
+    EXPECT_TRUE(fs::exists(dir / "batch_000000.bin"));
+    EXPECT_TRUE(fs::exists(dir / "batch_000004.bin"));
+}
+
+// Fix #5 (test): Reader rejects feature_dim=0
+TEST_F(PackedBatchTest, ReaderFeatureDimZeroThrows) {
+    auto dir = test_path("reader_dim0");
+    fs::create_directories(dir);
+    EXPECT_THROW(
+        PackedBatchReader(dir, 1, 0, GnnDtype::FLOAT32),
+        std::invalid_argument
+    );
+}

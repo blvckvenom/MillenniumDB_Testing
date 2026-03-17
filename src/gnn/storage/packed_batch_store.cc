@@ -2,12 +2,14 @@
 
 #include <cerrno>
 #include <cinttypes>
-#include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "gnn/common/posix_io.h"
 
 namespace mdb::gnn {
 
@@ -15,58 +17,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
-class FdGuard {
-public:
-    explicit FdGuard(int fd) : fd_(fd) {}
-    ~FdGuard() { if (fd_ >= 0) ::close(fd_); }
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-private:
-    int fd_;
-};
-
-void write_all(int fd, const void* buf, size_t count) {
-    const char* p = static_cast<const char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t written = ::write(fd, p, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "PackedBatchStore: write failed: " + std::string(std::strerror(errno)));
-        }
-        if (written == 0) {
-            throw std::runtime_error(
-                "PackedBatchStore: write returned 0 — disk full or I/O error");
-        }
-        p += written;
-        remaining -= static_cast<size_t>(written);
-    }
-}
-
-void read_all(int fd, void* buf, size_t count, const std::string& context) {
-    char* p = static_cast<char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t n = ::read(fd, p, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "PackedBatchStore: read failed: " + std::string(std::strerror(errno)));
-        }
-        if (n == 0) {
-            throw std::runtime_error(
-                "PackedBatchStore: unexpected EOF in " + context);
-        }
-        p += n;
-        remaining -= static_cast<size_t>(n);
-    }
-}
-
-fs::path make_batch_path(const fs::path& dir, uint64_t batch_id) {
-    char buf[32];
+std::string make_batch_filename(uint64_t batch_id) {
+    // "batch_" (6) + up to 20 digits + ".bin" (4) + NUL = max 31 chars
+    char buf[64];
     std::snprintf(buf, sizeof(buf), "batch_%06" PRIu64 ".bin", batch_id);
-    return dir / buf;
+    return std::string(buf);
 }
 
 } // anonymous namespace
@@ -87,7 +42,7 @@ PackedBatchWriter::PackedBatchWriter(const fs::path& dir,
 }
 
 std::filesystem::path PackedBatchWriter::batch_path(uint64_t batch_id) const {
-    return make_batch_path(dir_, batch_id);
+    return dir_ / make_batch_filename(batch_id);
 }
 
 void PackedBatchWriter::write_batch(uint64_t batch_id, const void* data,
@@ -104,23 +59,34 @@ void PackedBatchWriter::write_batch(uint64_t batch_id, const void* data,
 
     auto header = PackedBatchHeader::make(num_nodes, feature_dim_, dtype_);
     auto path = batch_path(batch_id);
+    std::string path_str = path.string();
 
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         throw std::runtime_error(
-            "PackedBatchWriter: cannot open " + path.string() + ": " + std::strerror(errno));
-    }
-    FdGuard guard(fd);
-
-    write_all(fd, &header, sizeof(header));
-    if (num_nodes > 0) {
-        write_all(fd, data, header.data_bytes());
+            "PackedBatchWriter: cannot open " + path_str + ": " + safe_strerror(errno));
     }
 
-    if (::fsync(fd) < 0) {
-        throw std::runtime_error(
-            "PackedBatchWriter: fsync failed: " + std::string(std::strerror(errno)));
+    try {
+        FdGuard guard(fd);
+
+        write_all(fd, &header, sizeof(header), path_str);
+        if (num_nodes > 0) {
+            write_all(fd, data, header.data_bytes(), path_str);
+        }
+
+        if (::fsync(fd) < 0) {
+            throw std::runtime_error(
+                "PackedBatchWriter: fsync failed for " + path_str + ": " + safe_strerror(errno));
+        }
+    } catch (...) {
+        // Clean up partial file on failure (Fix #10)
+        fs::remove(path);
+        throw;
     }
+
+    // Best-effort parent directory fsync for crash consistency (Fix #3)
+    fsync_directory(path);
 
     ++batches_written_;
 }
@@ -139,10 +105,15 @@ PackedBatchReader::PackedBatchReader(const fs::path& dir,
         throw std::runtime_error(
             "PackedBatchReader: directory not found: " + dir_.string());
     }
+    // Fix #5: symmetric with Writer validation
+    if (feature_dim_ == 0) {
+        throw std::invalid_argument(
+            "PackedBatchReader: feature_dim must be > 0");
+    }
 }
 
 std::filesystem::path PackedBatchReader::batch_path(uint64_t batch_id) const {
-    return make_batch_path(dir_, batch_id);
+    return dir_ / make_batch_filename(batch_id);
 }
 
 PackedBatchHeader PackedBatchReader::read_header(uint64_t batch_id) const {
@@ -153,29 +124,31 @@ PackedBatchHeader PackedBatchReader::read_header(uint64_t batch_id) const {
     }
 
     auto path = batch_path(batch_id);
+    std::string path_str = path.string();
+
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         throw std::runtime_error(
-            "PackedBatchReader: cannot open " + path.string() + ": " + std::strerror(errno));
+            "PackedBatchReader: cannot open " + path_str + ": " + safe_strerror(errno));
     }
     FdGuard guard(fd);
 
     PackedBatchHeader header;
-    read_all(fd, &header, sizeof(header), path.string());
+    read_all(fd, &header, sizeof(header), path_str);
 
     if (!header.is_valid()) {
         throw std::runtime_error(
-            "PackedBatchReader: invalid header in " + path.string());
+            "PackedBatchReader: invalid header in " + path_str);
     }
     if (header.feature_dim != feature_dim_) {
         throw std::runtime_error(
-            "PackedBatchReader: feature_dim mismatch in " + path.string() +
+            "PackedBatchReader: feature_dim mismatch in " + path_str +
             ": expected " + std::to_string(feature_dim_) +
             ", got " + std::to_string(header.feature_dim));
     }
     if (header.get_dtype() != dtype_) {
         throw std::runtime_error(
-            "PackedBatchReader: dtype mismatch in " + path.string());
+            "PackedBatchReader: dtype mismatch in " + path_str);
     }
 
     return header;
@@ -183,8 +156,43 @@ PackedBatchHeader PackedBatchReader::read_header(uint64_t batch_id) const {
 
 uint64_t PackedBatchReader::read_batch(uint64_t batch_id, void* out,
                                        size_t out_capacity) const {
-    auto header = read_header(batch_id);
-    size_t data_size = header.data_bytes();
+    // Fix #1: Single-open — read header + data from the same fd.
+    if (batch_id >= num_batches_) {
+        throw std::out_of_range(
+            "PackedBatchReader: batch_id " + std::to_string(batch_id) +
+            " >= num_batches " + std::to_string(num_batches_));
+    }
+
+    auto path = batch_path(batch_id);
+    std::string path_str = path.string();
+
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "PackedBatchReader: cannot open " + path_str + ": " + safe_strerror(errno));
+    }
+    FdGuard guard(fd);
+
+    // Read and validate header
+    PackedBatchHeader header;
+    read_all(fd, &header, sizeof(header), path_str);
+
+    if (!header.is_valid()) {
+        throw std::runtime_error(
+            "PackedBatchReader: invalid header in " + path_str);
+    }
+    if (header.feature_dim != feature_dim_) {
+        throw std::runtime_error(
+            "PackedBatchReader: feature_dim mismatch in " + path_str +
+            ": expected " + std::to_string(feature_dim_) +
+            ", got " + std::to_string(header.feature_dim));
+    }
+    if (header.get_dtype() != dtype_) {
+        throw std::runtime_error(
+            "PackedBatchReader: dtype mismatch in " + path_str);
+    }
+
+    size_t data_size = header.data_bytes(); // overflow-checked
 
     if (data_size == 0) {
         return 0;
@@ -192,25 +200,13 @@ uint64_t PackedBatchReader::read_batch(uint64_t batch_id, void* out,
 
     if (out_capacity < data_size) {
         throw std::runtime_error(
-            "PackedBatchReader: buffer too small — need " +
-            std::to_string(data_size) + " bytes, got " + std::to_string(out_capacity));
+            "PackedBatchReader: buffer too small for " + path_str +
+            " — need " + std::to_string(data_size) +
+            " bytes, got " + std::to_string(out_capacity));
     }
 
-    // Re-open file and skip header (read_header already validated)
-    auto path = batch_path(batch_id);
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error(
-            "PackedBatchReader: cannot open " + path.string() + ": " + std::strerror(errno));
-    }
-    FdGuard guard(fd);
-
-    if (::lseek(fd, PackedBatchHeader::SIZE, SEEK_SET) < 0) {
-        throw std::runtime_error(
-            "PackedBatchReader: lseek failed: " + std::string(std::strerror(errno)));
-    }
-
-    read_all(fd, out, data_size, path.string());
+    // Read data directly — fd is already positioned right after the header
+    read_all(fd, out, data_size, path_str);
 
     return header.num_nodes;
 }
@@ -239,6 +235,14 @@ void generate_packed_batches(
             continue;
         }
 
+        // Fix #2: Overflow guard before buffer allocation
+        if (row_bytes > 0 && N > SIZE_MAX / row_bytes) {
+            throw std::overflow_error(
+                "generate_packed_batches: batch " + std::to_string(b) +
+                " buffer size overflow (" + std::to_string(N) +
+                " nodes * " + std::to_string(row_bytes) + " bytes/row)");
+        }
+
         size_t needed = N * row_bytes;
         if (buffer.size() < needed) {
             buffer.resize(needed);
@@ -256,8 +260,8 @@ void generate_packed_batches(
 {
     generate_packed_batches(
         features,
-        batch_assignments.size(),
-        [&](uint64_t batch_id) { return batch_assignments[batch_id]; },
+        static_cast<uint64_t>(batch_assignments.size()),
+        [&](uint64_t batch_id) { return batch_assignments.at(batch_id); },
         output_dir
     );
 }

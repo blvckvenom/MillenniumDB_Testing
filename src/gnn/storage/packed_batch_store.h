@@ -89,6 +89,12 @@ public:
                       uint64_t feature_dim,
                       GnnDtype dtype);
 
+    // Non-copyable (batches_written_ aliasing would be dangerous)
+    PackedBatchWriter(const PackedBatchWriter&) = delete;
+    PackedBatchWriter& operator=(const PackedBatchWriter&) = delete;
+    PackedBatchWriter(PackedBatchWriter&&) = default;
+    PackedBatchWriter& operator=(PackedBatchWriter&&) = default;
+
     /// batch_id must equal batches_written() (sequential from 0).
     void write_batch(uint64_t batch_id, const void* data, uint64_t num_nodes);
 
