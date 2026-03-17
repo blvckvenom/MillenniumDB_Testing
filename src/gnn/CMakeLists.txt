@@ -227,6 +227,17 @@ if(BUILD_TESTING)
         )
         add_test(NAME PackedBatchStoreTests COMMAND test_packed_batch_store)
 
+        # MinHash Reorderer tests (Step 2: L3 disk cache reordering)
+        add_executable(test_minhash_reorderer
+            tests/test_minhash_reorderer.cc
+        )
+        target_link_libraries(test_minhash_reorderer mdb_gnn_core GTest::gtest_main)
+        set_target_properties(test_minhash_reorderer PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME MinHashReordererTests COMMAND test_minhash_reorderer)
+
         message(STATUS "GNN tests enabled")
     else()
         message(STATUS "GTest not found. GNN tests disabled.")
