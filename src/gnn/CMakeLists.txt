@@ -75,6 +75,7 @@ add_library(mdb_gnn_core STATIC
     sampling/reservoir_sampler.cc
     sampling/sample_storage.cc
     sampling/offline_sampling_engine.cc
+    sampling/minhash_reorderer.cc
 
     # Phase 7: Leapfrog Triejoin Optimization
     sampling/leapfrog_gnn_sampler.cc
