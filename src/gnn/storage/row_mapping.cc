@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -12,6 +13,13 @@ namespace mdb::gnn {
 
 static_assert(RowMapping::HEADER_SIZE % alignof(ObjectId) == 0,
               "HEADER_SIZE must be aligned to ObjectId alignment");
+
+// Fix 6: Guard noexcept move operations — if id_to_row_ or build_index_flag_
+// types change to non-nothrow-movable, this catches it at compile time.
+static_assert(std::is_nothrow_move_constructible_v<std::unordered_map<uint64_t, uint64_t>>,
+              "id_to_row_ must be nothrow-movable for RowMapping noexcept move operations");
+static_assert(std::is_nothrow_move_constructible_v<std::unique_ptr<std::once_flag>>,
+              "build_index_flag_ must be nothrow-movable for RowMapping noexcept move operations");
 
 namespace fs = std::filesystem;
 
@@ -54,7 +62,9 @@ RowMapping::RowMapping(RowMapping&& other) noexcept
     : path_(std::move(other.path_)),
       mmap_ptr_(other.mmap_ptr_),
       mmap_size_(other.mmap_size_),
-      count_(other.count_)
+      count_(other.count_),
+      build_index_flag_(std::move(other.build_index_flag_)),
+      id_to_row_(std::move(other.id_to_row_))
 {
     other.mmap_ptr_  = nullptr;
     other.mmap_size_ = 0;
@@ -66,10 +76,12 @@ RowMapping& RowMapping::operator=(RowMapping&& other) noexcept {
         if (mmap_ptr_ != nullptr) {
             ::munmap(mmap_ptr_, mmap_size_);
         }
-        path_      = std::move(other.path_);
-        mmap_ptr_  = other.mmap_ptr_;
-        mmap_size_ = other.mmap_size_;
-        count_     = other.count_;
+        path_             = std::move(other.path_);
+        mmap_ptr_         = other.mmap_ptr_;
+        mmap_size_        = other.mmap_size_;
+        count_            = other.count_;
+        build_index_flag_ = std::move(other.build_index_flag_);
+        id_to_row_        = std::move(other.id_to_row_);
         other.mmap_ptr_  = nullptr;
         other.mmap_size_ = 0;
         other.count_     = 0;
@@ -150,6 +162,7 @@ RowMapping RowMapping::create(const fs::path& path, const std::vector<ObjectId>&
     rm.mmap_ptr_  = ptr;
     rm.mmap_size_ = file_size;
     rm.count_     = count;
+    // Note: build_index() is NOT called here — it runs lazily on first find().
     return rm;
 }
 
@@ -216,6 +229,7 @@ RowMapping RowMapping::open(const fs::path& path) {
     rm.mmap_ptr_  = ptr;
     rm.mmap_size_ = file_size;
     rm.count_     = count;
+    // Note: build_index() is NOT called here — it runs lazily on first find().
     return rm;
 }
 
@@ -239,13 +253,23 @@ std::optional<uint64_t> RowMapping::find(ObjectId target) const {
     if (mmap_ptr_ == nullptr) {
         throw std::runtime_error("RowMapping::find: not mapped");
     }
-    const ObjectId* arr = data_ptr();
-    for (uint64_t i = 0; i < count_; ++i) {
-        if (arr[i].id == target.id) {
-            return i;
-        }
+    std::call_once(*build_index_flag_, [this] { build_index(); });
+    auto it = id_to_row_.find(target.id);
+    if (it != id_to_row_.end()) {
+        return it->second;
     }
     return std::nullopt;
+}
+
+// --- build_index() ---
+
+void RowMapping::build_index() const {
+    id_to_row_.reserve(count_);
+    const ObjectId* arr = data_ptr();
+    // Insert in forward order; first occurrence wins (later duplicates ignored)
+    for (uint64_t i = 0; i < count_; ++i) {
+        id_to_row_.emplace(arr[i].id, i);
+    }
 }
 
 } // namespace mdb::gnn

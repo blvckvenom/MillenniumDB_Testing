@@ -2,7 +2,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "graph_models/object_id.h"
@@ -15,13 +18,15 @@ namespace mdb::gnn {
  * File layout: [Header: 16 bytes][ObjectId[0]: 8 bytes][ObjectId[1]: 8 bytes]...
  * Header: MAGIC(4) + VERSION(4) + count(8)
  *
- * Thread-safe for concurrent reads (read-only mmap after construction).
+ * Thread-safe for concurrent reads after construction. Both the mmap region
+ * and the internal hash map (built lazily on first find()) are read-only
+ * once initialized.
  *
  * Usage:
  *   auto rm = RowMapping::create("mapping.rmap", object_ids);
  *   auto rm = RowMapping::open("mapping.rmap");
  *   ObjectId oid = rm.get(row_index);
- *   auto idx = rm.find(some_oid);  // linear search
+ *   auto idx = rm.find(some_oid);  // O(1) hash lookup
  */
 class RowMapping {
 public:
@@ -40,9 +45,9 @@ public:
     /// Get the ObjectId at a given row index. O(1).
     ObjectId get(uint64_t row_index) const;
 
-    /// Linear search for an ObjectId. Returns its row index if found. O(N).
-    /// WARNING: Not suitable for repeated lookups on large mappings.
-    /// For batch operations, build an external hash map ObjectId -> row index.
+    /// Hash map lookup for an ObjectId. Returns its row index if found. O(1).
+    /// The index is built lazily on the first call (thread-safe via std::call_once).
+    /// For duplicate ObjectIds, returns the first occurrence.
     std::optional<uint64_t> find(ObjectId target) const;
 
     /// Number of entries.
@@ -56,10 +61,18 @@ private:
 
     RowMapping() = default;
 
+    void build_index() const;
+
     std::filesystem::path path_;
     void*    mmap_ptr_  = nullptr;
     size_t   mmap_size_ = 0;
     uint64_t count_     = 0;
+
+    /// Lazy init flag for id_to_row_. Built on first find() via std::call_once.
+    mutable std::unique_ptr<std::once_flag> build_index_flag_ = std::make_unique<std::once_flag>();
+
+    /// ObjectId.id → first row index. Built lazily on first find().
+    mutable std::unordered_map<uint64_t, uint64_t> id_to_row_;
 
     const ObjectId* data_ptr() const;
 };

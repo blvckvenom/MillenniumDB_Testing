@@ -1,5 +1,7 @@
 #include "test_helpers.h"
 
+#include <chrono>
+
 #include "gnn/storage/row_mapping.h"
 #include "graph_models/object_id.h"
 
@@ -209,6 +211,153 @@ TEST_F(RowMappingTest, LargeVerifyAll) {
         ASSERT_TRUE(idx.has_value()) << "find() failed for index " << i;
         EXPECT_EQ(idx.value(), i);
     }
+}
+
+// ===========================================================================
+// HashMap Lookup (O(1) find)
+// ===========================================================================
+
+TEST_F(RowMappingTest, FindAllEntriesAfterOpen) {
+    // Exhaustive: every single entry must be findable after open()
+    const uint64_t N = 1000;
+    std::vector<ObjectId> ids;
+    ids.reserve(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        ids.push_back(ObjectId(i * 31 + 17)); // non-contiguous IDs
+    }
+
+    auto path = test_path("find_all_open.rmap");
+    { auto rm = RowMapping::create(path, ids); }
+
+    auto rm = RowMapping::open(path);
+    for (uint64_t i = 0; i < N; ++i) {
+        auto idx = rm.find(ids[i]);
+        ASSERT_TRUE(idx.has_value())
+            << "find() missed ObjectId(" << ids[i].id << ") at index " << i;
+        EXPECT_EQ(idx.value(), i);
+    }
+}
+
+TEST_F(RowMappingTest, FindAllEntriesAfterCreate) {
+    // Same exhaustive check but on the created mapping (not re-opened)
+    const uint64_t N = 1000;
+    std::vector<ObjectId> ids;
+    ids.reserve(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        ids.push_back(ObjectId(i * 31 + 17));
+    }
+
+    auto rm = RowMapping::create(test_path("find_all_create.rmap"), ids);
+    for (uint64_t i = 0; i < N; ++i) {
+        auto idx = rm.find(ids[i]);
+        ASSERT_TRUE(idx.has_value())
+            << "find() missed ObjectId(" << ids[i].id << ") at index " << i;
+        EXPECT_EQ(idx.value(), i);
+    }
+}
+
+TEST_F(RowMappingTest, FindAfterMoveConstructionPreservesLookup) {
+    std::vector<ObjectId> ids = {ObjectId(100), ObjectId(200), ObjectId(300)};
+    auto rm1 = RowMapping::create(test_path("find_move_ctor.rmap"), ids);
+
+    auto rm2 = std::move(rm1);
+
+    // Moved-to should have working find()
+    auto idx = rm2.find(ObjectId(200));
+    ASSERT_TRUE(idx.has_value());
+    EXPECT_EQ(idx.value(), 1u);
+
+    // Moved-from find() should throw (not mapped)
+    EXPECT_THROW(rm1.find(ObjectId(200)), std::runtime_error);
+}
+
+TEST_F(RowMappingTest, FindAfterMoveAssignmentPreservesLookup) {
+    // Fix 4: Test find() after move-assignment (not just move-construction)
+    std::vector<ObjectId> ids_a = {ObjectId(10), ObjectId(20)};
+    std::vector<ObjectId> ids_b = {ObjectId(30), ObjectId(40), ObjectId(50)};
+
+    auto rm = RowMapping::create(test_path("find_assign_a.rmap"), ids_a);
+    auto idx_a = rm.find(ObjectId(20));
+    ASSERT_TRUE(idx_a.has_value());
+    EXPECT_EQ(idx_a.value(), 1u);
+
+    // Move-assign a different mapping onto rm
+    auto rm_b = RowMapping::create(test_path("find_assign_b.rmap"), ids_b);
+    rm = std::move(rm_b);
+
+    // find() should now work on the new mapping
+    auto idx_b = rm.find(ObjectId(40));
+    ASSERT_TRUE(idx_b.has_value());
+    EXPECT_EQ(idx_b.value(), 1u);
+
+    // Old IDs should not be found
+    EXPECT_FALSE(rm.find(ObjectId(10)).has_value());
+    EXPECT_FALSE(rm.find(ObjectId(20)).has_value());
+
+    // Moved-from should throw
+    EXPECT_THROW(rm_b.find(ObjectId(30)), std::runtime_error);
+}
+
+TEST_F(RowMappingTest, FindPerformanceLargeMapping) {
+    // Fix 2: Separate correctness from timing to get accurate measurements.
+    const uint64_t N = 100000;
+    std::vector<ObjectId> ids;
+    ids.reserve(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        ids.push_back(ObjectId(i * 7919 + 42)); // scattered IDs
+    }
+
+    auto path = test_path("find_perf.rmap");
+    { auto rm = RowMapping::create(path, ids); }
+
+    auto rm = RowMapping::open(path);
+
+    // Pass 1: verify correctness (assertions, no timing)
+    for (uint64_t i = 0; i < N; i += 2) {
+        auto idx = rm.find(ids[i]);
+        ASSERT_TRUE(idx.has_value());
+        EXPECT_EQ(idx.value(), i);
+    }
+
+    // Pass 2: pure timing (no assertions — avoids string formatting overhead)
+    auto start = std::chrono::steady_clock::now();
+    for (uint64_t i = 0; i < N; i += 2) { // 50K lookups
+        volatile auto idx = rm.find(ids[i]);
+        (void)idx;
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+    // With O(1) this should take < 100ms. With O(N) it would take seconds.
+    EXPECT_LT(ms, 2000) << "find() took " << ms << "ms for 50K lookups on 100K entries — likely O(N)";
+}
+
+TEST_F(RowMappingTest, FindBoundaryValues) {
+    // Fix 3: ObjectId(0) = MASK_NULL, ObjectId(UINT64_MAX) = MASK_NOT_FOUND.
+    // Both are sentinel values in MillenniumDB. The hash of 0 can be degenerate
+    // on some implementations, and UINT64_MAX tests the top of the range.
+    std::vector<ObjectId> ids = {
+        ObjectId(0),
+        ObjectId(42),
+        ObjectId(UINT64_MAX)
+    };
+    auto rm = RowMapping::create(test_path("boundary.rmap"), ids);
+
+    auto idx0 = rm.find(ObjectId(0));
+    ASSERT_TRUE(idx0.has_value());
+    EXPECT_EQ(idx0.value(), 0u);
+
+    auto idx42 = rm.find(ObjectId(42));
+    ASSERT_TRUE(idx42.has_value());
+    EXPECT_EQ(idx42.value(), 1u);
+
+    auto idxmax = rm.find(ObjectId(UINT64_MAX));
+    ASSERT_TRUE(idxmax.has_value());
+    EXPECT_EQ(idxmax.value(), 2u);
+
+    // Nearby values should miss
+    EXPECT_FALSE(rm.find(ObjectId(1)).has_value());
+    EXPECT_FALSE(rm.find(ObjectId(UINT64_MAX - 1)).has_value());
 }
 
 // ===========================================================================
