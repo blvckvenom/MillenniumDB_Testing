@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "gnn/sampling/minhash_reorderer.h"
+#include "graph_models/object_id.h"
 
 namespace mdb::gnn {
 
@@ -58,6 +60,18 @@ public:
         const Config&        config,
         const std::filesystem::path& db_folder,
         const std::string&   feature_name
+    );
+
+    /// Translate ObjectIds to FeatureMatrix row indices.
+    /// If inverse is non-null, applies reorder mapping: old_row → inverse[old_row].
+    /// Throws with descriptive error if any ObjectId is missing from RowMapping
+    /// or if a row index exceeds inverse bounds.
+    /// Exposed for direct unit testing.
+    static std::vector<uint64_t> translate_to_rows(
+        const std::vector<ObjectId>&    oids,
+        const RowMapping&               rm,
+        const std::vector<uint64_t>*    inverse,
+        uint64_t                        batch_id
     );
 
 private:

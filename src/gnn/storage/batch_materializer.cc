@@ -17,9 +17,7 @@ namespace fs = std::filesystem;
 
 namespace mdb::gnn {
 
-/// Translate ObjectIds from a GraphSample to row indices in a FeatureMatrix.
-/// If inverse is non-null, applies reorder mapping: old_row → inverse[old_row].
-static std::vector<uint64_t> translate_to_rows(
+std::vector<uint64_t> BatchMaterializer::translate_to_rows(
     const std::vector<ObjectId>&    oids,
     const RowMapping&               rm,
     const std::vector<uint64_t>*    inverse,

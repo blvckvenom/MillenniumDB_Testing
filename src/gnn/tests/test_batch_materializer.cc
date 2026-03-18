@@ -654,3 +654,177 @@ TEST_F(BatchMaterializerTest, TimingValuesPlausible) {
     EXPECT_FALSE(result.packed_dir.empty());
     EXPECT_TRUE(fs::exists(result.packed_dir));
 }
+
+// =============================================================================
+// translate_to_rows: Direct unit tests (now public)
+// =============================================================================
+
+TEST_F(BatchMaterializerTest, TranslateToRows_NoInverse) {
+    auto rm = RowMapping::open(rmap_path_);
+
+    // Without inverse: ObjectId → direct row index
+    std::vector<ObjectId> oids = {node_oids_[3], node_oids_[0], node_oids_[7]};
+    auto rows = BatchMaterializer::translate_to_rows(oids, rm, nullptr, 0);
+
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0], 3u);  // node_oids_[3] → row 3
+    EXPECT_EQ(rows[1], 0u);  // node_oids_[0] → row 0
+    EXPECT_EQ(rows[2], 7u);  // node_oids_[7] → row 7
+}
+
+TEST_F(BatchMaterializerTest, TranslateToRows_WithKnownInverse) {
+    auto rm = RowMapping::open(rmap_path_);
+
+    // Known inverse: old_row 0→5, 1→3, 2→7, 3→0, 4→1, 5→2, 6→6, 7→4
+    std::vector<uint64_t> inverse = {5, 3, 7, 0, 1, 2, 6, 4};
+
+    std::vector<ObjectId> oids = {node_oids_[3], node_oids_[0], node_oids_[7]};
+    auto rows = BatchMaterializer::translate_to_rows(oids, rm, &inverse, 0);
+
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0], inverse[3]);  // node 3 → old_row 3 → inverse[3] = 0
+    EXPECT_EQ(rows[1], inverse[0]);  // node 0 → old_row 0 → inverse[0] = 5
+    EXPECT_EQ(rows[2], inverse[7]);  // node 7 → old_row 7 → inverse[7] = 4
+}
+
+TEST_F(BatchMaterializerTest, TranslateToRows_MissingOidThrows) {
+    auto rm = RowMapping::open(rmap_path_);
+
+    ObjectId bad_oid(0xD4000000DEADBEEFULL);
+    std::vector<ObjectId> oids = {node_oids_[0], bad_oid};
+
+    try {
+        BatchMaterializer::translate_to_rows(oids, rm, nullptr, 42);
+        FAIL() << "Expected runtime_error";
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("no corresponding feature row"), std::string::npos);
+        EXPECT_NE(msg.find("batch 42"), std::string::npos);
+    }
+}
+
+TEST_F(BatchMaterializerTest, TranslateToRows_InverseOutOfBoundsThrows) {
+    auto rm = RowMapping::open(rmap_path_);
+
+    // Inverse too small — only 4 entries but node 7 maps to old_row 7
+    std::vector<uint64_t> small_inverse = {0, 1, 2, 3};
+
+    std::vector<ObjectId> oids = {node_oids_[7]};  // old_row = 7 >= inverse.size() = 4
+
+    try {
+        BatchMaterializer::translate_to_rows(oids, rm, &small_inverse, 99);
+        FAIL() << "Expected runtime_error";
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("out of bounds"), std::string::npos);
+        EXPECT_NE(msg.find("batch 99"), std::string::npos);
+    }
+}
+
+// =============================================================================
+// FLOAT64: Pipeline works with double precision
+// =============================================================================
+
+TEST_F(BatchMaterializerTest, Float64Pipeline) {
+    // Create FLOAT64 FeatureMatrix
+    auto fmat64_path = gnn_dir_ / "test_f64.fmat";
+    auto rmap64_path = gnn_dir_ / "test_f64.rmap";
+
+    std::vector<double> features64(N * D);
+    for (uint64_t r = 0; r < N; ++r) {
+        for (uint64_t c = 0; c < D; ++c) {
+            features64[r * D + c] = static_cast<double>((r + 1) * 1000 + (c + 1));
+        }
+    }
+
+    FeatureMatrix::create(fmat64_path, N, D, GnnDtype::FLOAT64, features64.data());
+    RowMapping::create(rmap64_path, node_oids_);
+
+    auto samples = create_samples("f64_sample", {{0, 1, 2}, {3, 4, 5}});
+
+    BatchMaterializer::Config config;
+    config.reorder = false;
+
+    auto result = BatchMaterializer::materialize(
+        FeatureMatrix::open(fmat64_path),
+        RowMapping::open(rmap64_path),
+        samples, config, db_folder_, "test_f64");
+
+    ASSERT_EQ(result.total_batches, 2u);
+
+    // Verify FLOAT64 features in packed batch 0: nodes {0, 1, 2}
+    auto packed_dir = fs::path(result.packed_dir);
+    PackedBatchReader reader(packed_dir, 2, D, GnnDtype::FLOAT64);
+    auto hdr = reader.read_header(0);
+    ASSERT_EQ(hdr.num_nodes, 3u);
+
+    std::vector<double> buf(3 * D);
+    reader.read_batch(0, buf.data(), buf.size() * sizeof(double));
+
+    for (uint64_t i = 0; i < 3; ++i) {
+        for (uint64_t j = 0; j < D; ++j) {
+            double got = buf[i * D + j];
+            double want = static_cast<double>((i + 1) * 1000 + (j + 1));
+            EXPECT_DOUBLE_EQ(got, want)
+                << "FLOAT64 batch 0, node " << i << ", dim " << j;
+        }
+    }
+
+    // Verify file size: header(32) + 3 nodes × 4 dims × 8 bytes
+    uint64_t expected_size = 32 + 3 * D * sizeof(double);
+    EXPECT_EQ(fs::file_size(packed_dir / "batch_000000.bin"), expected_size);
+}
+
+// =============================================================================
+// MULTIPASS_BOUNDED: Second MinHash strategy works
+// =============================================================================
+
+TEST_F(BatchMaterializerTest, MultipassBoundedStrategy) {
+    auto samples = create_standard_samples("mp_sample");
+
+    BatchMaterializer::Config config;
+    config.reorder = true;
+    config.minhash.strategy = MinHashReorderer::Strategy::MULTIPASS_BOUNDED;
+    config.minhash.num_hashes = 2;
+    config.minhash.hashes_per_pass = 2;
+    config.minhash.random_seed = 42;
+
+    auto result = BatchMaterializer::materialize(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    ASSERT_TRUE(result.reordered);
+    ASSERT_EQ(result.total_batches, 3u);
+
+    // S4 property must hold regardless of strategy
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "mp_sample"));
+    auto packed_dir = fs::path(result.packed_dir);
+    PackedBatchReader reader(packed_dir, 3, D, GnnDtype::FLOAT32);
+
+    for (uint64_t bid = 0; bid < 3; ++bid) {
+        auto sample = samples2.read_sample(bid);
+        auto hdr = reader.read_header(bid);
+        ASSERT_EQ(hdr.num_nodes, sample.all_unique_nodes.size());
+
+        std::vector<float> packed(hdr.num_nodes * D);
+        reader.read_batch(bid, packed.data(), packed.size() * sizeof(float));
+
+        for (uint64_t i = 0; i < hdr.num_nodes; ++i) {
+            uint64_t node_idx = sample.all_unique_nodes[i].id & 0x00FFFFFFFFFFFFFFULL;
+            for (uint64_t j = 0; j < D; ++j) {
+                EXPECT_FLOAT_EQ(packed[i * D + j], expected_feature(node_idx, j))
+                    << "MULTIPASS batch " << bid << ", pos " << i << ", dim " << j;
+            }
+        }
+    }
+
+    // Reordered RowMapping must also be a bijection
+    auto reord_rm = RowMapping::open(gnn_dir_ / "test_feat_reordered.rmap");
+    std::set<uint64_t> oid_set;
+    for (uint64_t i = 0; i < N; ++i) {
+        oid_set.insert(reord_rm.get(i).id);
+    }
+    EXPECT_EQ(oid_set.size(), N);
+}

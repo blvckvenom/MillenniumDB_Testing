@@ -66,6 +66,12 @@ if [ ! -f "$CORA_GQL" ] || [ ! -f "$CORA_NPY" ]; then
     exit 1
 fi
 
+# Check port is available
+if ss -tlnp 2>/dev/null | grep -q ":$PORT"; then
+    echo "ERROR: Port $PORT already in use. Kill the process or change PORT."
+    exit 1
+fi
+
 # =============================================================================
 # Step 1: Import Cora with embeddings
 # =============================================================================
@@ -197,6 +203,57 @@ if [ "$PACKED_COUNT" = "$TOTAL_BATCHES" ]; then
     pass "Materialize: $PACKED_COUNT packed batch files"
 else
     fail "Materialize: expected $TOTAL_BATCHES packed files, got $PACKED_COUNT"
+fi
+
+# =============================================================================
+# Step 5b: Materialize without reorder (L4 only)
+# =============================================================================
+info "Step 5b: Materialize without reorder (separate sample)"
+
+SAMPLE_NOREORD=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_noreord', [10, 5], {batchSize: 256, randomSeed: 42}) YIELD sampleName, totalBatches RETURN sampleName, totalBatches")
+NR_BATCHES=$(echo "$SAMPLE_NOREORD" | tail -1 | cut -d',' -f2)
+
+MAT_NR=$(query "CALL gnn_materialize_batches('e2e_noreord', 'node_features', {reorder: 0}) YIELD totalBatches, reordered RETURN totalBatches, reordered")
+NR_REORDERED=$(echo "$MAT_NR" | tail -1 | cut -d',' -f2)
+
+if [ "$NR_REORDERED" = "false" ]; then
+    pass "No-reorder: reordered=false"
+else
+    fail "No-reorder: expected reordered=false, got $NR_REORDERED"
+fi
+
+# Verify NO reordered files were created for this feature (they exist from Step 5,
+# but the no-reorder path should NOT create new ones — it reuses existing)
+NR_PACKED="$DB_DIR/samples/e2e_noreord/packed"
+NR_COUNT=$(ls "$NR_PACKED"/batch_*.bin 2>/dev/null | wc -l)
+if [ "$NR_COUNT" = "$NR_BATCHES" ]; then
+    pass "No-reorder: $NR_COUNT packed batch files"
+else
+    fail "No-reorder: expected $NR_BATCHES packed files, got $NR_COUNT"
+fi
+
+# =============================================================================
+# Step 5c: Error path — already materialized
+# =============================================================================
+info "Step 5c: Error path — already materialized"
+
+ERR_OUT=$(query "CALL gnn_materialize_batches('e2e_sample', 'node_features') YIELD totalBatches RETURN totalBatches" 2>&1)
+if echo "$ERR_OUT" | grep -qi "already exist\|force"; then
+    pass "Error path: already materialized mentions force"
+else
+    fail "Error path: unexpected output: $ERR_OUT"
+fi
+
+# =============================================================================
+# Step 5d: Error path — non-existent sample
+# =============================================================================
+info "Step 5d: Error path — non-existent sample"
+
+ERR_OUT2=$(query "CALL gnn_materialize_batches('nonexistent_sample', 'node_features') YIELD totalBatches RETURN totalBatches" 2>&1)
+if echo "$ERR_OUT2" | grep -qi "not found"; then
+    pass "Error path: non-existent sample reports not found"
+else
+    fail "Error path: unexpected output: $ERR_OUT2"
 fi
 
 # =============================================================================
