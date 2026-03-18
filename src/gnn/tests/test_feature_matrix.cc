@@ -692,3 +692,64 @@ TEST_F(FeatureMatrixTest, ConcurrentReadsDoNotCorrupt) {
     for (auto& th : threads) th.join();
     EXPECT_FALSE(error_found.load()) << "Concurrent reads produced corrupted data";
 }
+
+// ===========================================================================
+// Fix C1: row_as<T> type-size mismatch detection
+// ===========================================================================
+
+// The assert in row_as<T> vanishes in Release. This test documents that
+// a type-size mismatch is caught in Debug (assert fires) but NOT in Release.
+// If the implementation is changed to use a runtime check, update this test.
+#ifndef NDEBUG
+TEST_F(FeatureMatrixTest, RowAsWrongTypeSizeAsserts) {
+    const uint64_t N = 3, D = 2;
+    std::vector<float> data(N * D, 1.0f); // FLOAT32 = 4 bytes
+    auto fm = FeatureMatrix::create(test_path("wrong_type.fmat"),
+                                     N, D, GnnDtype::FLOAT32, data.data());
+
+    // double = 8 bytes vs FLOAT32 = 4 bytes → assert should fire
+    EXPECT_DEATH(fm.row_as<double>(0), "")
+        << "row_as<double> on FLOAT32 matrix should assert in Debug";
+}
+#endif
+
+// ===========================================================================
+// Fix C2: Overflow guard coverage in create() and open()
+// ===========================================================================
+
+TEST(FeatureMatrixHeaderTest, ZeroColsIsInvalid) {
+    auto h = FeatureMatrixHeader::make(10, 0, GnnDtype::FLOAT32);
+    // make() doesn't reject zero cols, but is_valid() does
+    // Actually, let's check if make() even works with 0 cols
+    EXPECT_FALSE(h.is_valid()) << "Header with num_cols=0 should be invalid";
+}
+
+TEST_F(FeatureMatrixTest, CreateOverflowRowsColsThrows) {
+    // num_rows * num_cols * dtype_size would overflow size_t
+    // UINT64_MAX rows × 1 col × 4 bytes = overflow
+    EXPECT_THROW(
+        FeatureMatrix::create(test_path("overflow.fmat"),
+                               UINT64_MAX, 1, GnnDtype::FLOAT32, nullptr),
+        std::exception  // could be overflow_error or invalid_argument
+    ) << "Creating FeatureMatrix with overflowing dimensions should throw";
+}
+
+TEST_F(FeatureMatrixTest, OpenCraftedOverflowHeaderThrows) {
+    // Craft a .fmat file with valid magic+version but overflowing dimensions
+    auto path = test_path("overflow_header.fmat");
+    {
+        auto h = FeatureMatrixHeader::make(1, 1, GnnDtype::FLOAT32);
+        // Overwrite with huge dimensions that would overflow
+        h.num_rows = UINT64_MAX;
+        h.num_cols = UINT64_MAX;
+
+        std::ofstream ofs(path, std::ios::binary);
+        ofs.write(reinterpret_cast<const char*>(&h), sizeof(h));
+        // Write minimal data so file is "big enough" for header
+        char pad[8] = {};
+        ofs.write(pad, sizeof(pad));
+    }
+
+    EXPECT_THROW(FeatureMatrix::open(path), std::exception)
+        << "Opening FeatureMatrix with overflowing header dimensions should throw";
+}

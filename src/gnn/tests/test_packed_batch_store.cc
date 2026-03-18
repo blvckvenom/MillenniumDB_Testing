@@ -307,6 +307,7 @@ TEST_F(PackedBatchTest, ReadEmptyBatch) {
     EXPECT_EQ(nodes, 0u);
 }
 
+// Fix C3: Verify ALL values after close+reopen, not just out[0] and out[5]
 TEST_F(PackedBatchTest, PersistsAcrossOpenClose) {
     const uint64_t N = 3, D = 2;
     std::vector<float> data = {1,2, 3,4, 5,6};
@@ -317,8 +318,9 @@ TEST_F(PackedBatchTest, PersistsAcrossOpenClose) {
     PackedBatchReader reader(dir, 1, D, GnnDtype::FLOAT32);
     std::vector<float> out(N * D);
     reader.read_batch(0, out.data(), out.size() * sizeof(float));
-    EXPECT_FLOAT_EQ(out[0], 1.0f);
-    EXPECT_FLOAT_EQ(out[5], 6.0f);
+    for (size_t i = 0; i < data.size(); ++i) {
+        EXPECT_FLOAT_EQ(out[i], data[i]) << "Mismatch at index " << i << " after reopen";
+    }
 }
 
 // ===========================================================================

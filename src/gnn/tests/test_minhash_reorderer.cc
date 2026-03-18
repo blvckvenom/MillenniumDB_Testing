@@ -61,12 +61,14 @@ TEST(MinHashConfigTest, StatsBeforeBuildThrows) {
 // Deterministic expected values (golden test)
 // ===========================================================================
 
-// Verifies that the EXACT permutation output for a known input+seed is stable.
-// If the hash function, prime, or sorting changes, this test catches it.
+// Fix C4: Hardcoded expected values — catches any change to hash function,
+// prime, sort order, or composite key layout.
+// Generated with: seed=42, prime=4294967291, num_hashes=2
+// To update after intentional algorithm changes: run the test, capture actual,
+// replace the expected vector below.
 TEST(MinHashGoldenTest, SegmentedKnownPermutation) {
     MinHashReorderer r(make_config(MinHashReorderer::Strategy::SEGMENTED, 2, 8, 0, 42));
 
-    // 3 batches, 3 nodes each, total 5 unique nodes (0-4)
     r.build_access_graph(3, [](uint64_t b) -> std::vector<uint64_t> {
         if (b == 0) return {0, 1, 2};
         if (b == 1) return {1, 2, 3};
@@ -75,26 +77,10 @@ TEST(MinHashGoldenTest, SegmentedKnownPermutation) {
 
     auto perm = r.compute_permutation(5);
 
-    // Record the expected permutation for seed=42, prime=4294967291, num_hashes=2.
-    // If this changes, the hash algorithm or parameters changed — intentional or not.
-    // To update: run the test, get the actual output, replace expected.
-    std::vector<uint64_t> expected = perm; // First run: capture actual
-    // Verify it's a valid bijection first
-    auto sorted = perm;
-    std::sort(sorted.begin(), sorted.end());
-    for (uint64_t i = 0; i < 5; ++i) EXPECT_EQ(sorted[i], i);
-
-    // Re-run with same config to verify determinism
-    MinHashReorderer r2(make_config(MinHashReorderer::Strategy::SEGMENTED, 2, 8, 0, 42));
-    r2.build_access_graph(3, [](uint64_t b) -> std::vector<uint64_t> {
-        if (b == 0) return {0, 1, 2};
-        if (b == 1) return {1, 2, 3};
-        return {3, 4, 0};
-    });
-    auto perm2 = r2.compute_permutation(5);
-
-    // Exact match — same seed, same input, same output
-    EXPECT_EQ(perm, perm2) << "Permutation is not deterministic for same seed+input";
+    // HARDCODED expected: captured from verified run (2026-03-17)
+    std::vector<uint64_t> expected = {0, 1, 2, 3, 4};
+    EXPECT_EQ(perm, expected)
+        << "Segmented permutation changed — hash function, prime, or sort order modified?";
 }
 
 TEST(MinHashGoldenTest, MultipassKnownPermutation) {
@@ -108,23 +94,40 @@ TEST(MinHashGoldenTest, MultipassKnownPermutation) {
 
     auto perm = r.compute_permutation(5);
 
-    auto sorted = perm;
-    std::sort(sorted.begin(), sorted.end());
-    for (uint64_t i = 0; i < 5; ++i) EXPECT_EQ(sorted[i], i);
-
-    MinHashReorderer r2(make_config(MinHashReorderer::Strategy::MULTIPASS_BOUNDED, 2, 1, 0, 42));
-    r2.build_access_graph(3, [](uint64_t b) -> std::vector<uint64_t> {
-        if (b == 0) return {0, 1, 2};
-        if (b == 1) return {1, 2, 3};
-        return {3, 4, 0};
-    });
-    auto perm2 = r2.compute_permutation(5);
-
-    EXPECT_EQ(perm, perm2) << "Permutation is not deterministic for same seed+input";
+    // HARDCODED expected: captured from verified run (2026-03-17)
+    std::vector<uint64_t> expected = {0, 3, 4, 1, 2};
+    EXPECT_EQ(perm, expected)
+        << "Multipass permutation changed — hash function, fingerprint mixing, or sort modified?";
 }
 
-// Also verify GenerateFromCallback checks exact values (not just out[0])
-// GenerateVerifyAllFeatureContent already does this ✅ — no additional test needed
+// Fix C5: Verify the hash function actually differentiates nodes.
+// Each node has a UNIQUE batch membership set → each gets a different hash value
+// → the permutation must NOT be identity.
+TEST(MinHashGoldenTest, HashProducesNonTrivialReordering) {
+    MinHashReorderer r(make_config(MinHashReorderer::Strategy::SEGMENTED, 4, 8, 0, 42));
+
+    // 10 batches, each accessing a DIFFERENT subset of 8 nodes.
+    // Node 0: batches {0,1}, Node 1: batches {2,3}, Node 2: batches {4,5}, etc.
+    // This ensures each node has a unique batch set → unique hash → non-trivial ordering.
+    r.build_access_graph(10, [](uint64_t b) -> std::vector<uint64_t> {
+        // Each batch accesses one node (its index / 2) plus a shared node 7
+        return {b / 2, 7};
+    });
+
+    auto perm = r.compute_permutation(8);
+
+    // With unique batch memberships per node, the permutation MUST differ from identity
+    std::vector<uint64_t> identity = {0, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_NE(perm, identity)
+        << "Permutation is identity — hash function may not be differentiating nodes";
+
+    // Verify it's still a valid bijection
+    auto sorted = perm;
+    std::sort(sorted.begin(), sorted.end());
+    for (uint64_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(sorted[i], i);
+    }
+}
 
 // ===========================================================================
 // compute_inverse
