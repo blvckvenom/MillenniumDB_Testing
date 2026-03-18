@@ -61,6 +61,7 @@ add_library(mdb_gnn_core STATIC
     storage/feature_matrix.cc
     storage/row_mapping.cc
     storage/packed_batch_store.cc
+    storage/batch_materializer.cc
 
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
@@ -97,6 +98,9 @@ add_library(mdb_gnn_core STATIC
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_list_procedure.cc
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_drop_procedure.cc
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_info_procedure.cc
+
+    # Phase 3: Batch Materialization (L3 reorder + L4 packing)
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_materialize_batches_procedure.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -109,11 +113,10 @@ target_link_libraries(mdb_gnn_core PUBLIC
     ${TORCH_LIBRARIES}
 )
 
-# Scope LibTorch flags to this target only (not globally).
-# -foperator-names re-enables 'and'/'or' as operators (LibTorch 2.5+ needs this;
-# MDB globally sets -fno-operator-names).
-# _GLIBCXX_USE_CXX11_ABI=1 is required by LibTorch's C++ ABI.
-target_compile_options(mdb_gnn_core PRIVATE -foperator-names ${TORCH_CXX_FLAGS_LIST})
+# LibTorch C++ ABI flag (required for binary compatibility with LibTorch).
+# Note: -foperator-names is no longer needed here — the global -fno-operator-names
+# flag was removed since no code in the project uses alternative tokens as identifiers.
+target_compile_options(mdb_gnn_core PRIVATE ${TORCH_CXX_FLAGS_LIST})
 target_compile_definitions(mdb_gnn_core PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
 
 # Link with MDB libraries if they exist
@@ -243,7 +246,7 @@ if(BUILD_TESTING)
             tests/test_graph_sample.cc
         )
         target_link_libraries(test_graph_sample mdb_gnn_core GTest::gtest_main)
-        target_compile_options(test_graph_sample PRIVATE -foperator-names ${TORCH_CXX_FLAGS_LIST})
+        target_compile_options(test_graph_sample PRIVATE ${TORCH_CXX_FLAGS_LIST})
         target_compile_definitions(test_graph_sample PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
         set_target_properties(test_graph_sample PROPERTIES
             BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
