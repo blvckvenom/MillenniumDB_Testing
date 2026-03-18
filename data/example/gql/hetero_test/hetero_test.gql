@@ -1,0 +1,117 @@
+// Heterogeneous test dataset for GNN projection testing
+// Nodes: 35 (Paper=20, Author=10, Venue=5)
+// Edges: 74 (CITES=24, WRITES=30, PUBLISHED_IN=20)
+// Embeddings: 35 x 384 (all-MiniLM-L6-v2)
+//
+// Fields: ML (0-6), DB (7-13), NLP (14-19)
+// Cross-area authors: Grace (ML+DB), Hiro (DB+NLP)
+
+0 :Paper field:"ML" title:"Deep learning with convolutional neural networks for image classification"
+1 :Paper field:"ML" title:"Gradient descent optimization in large-scale neural network training"
+2 :Paper field:"ML" title:"Attention mechanisms and transformer architectures for sequence modeling"
+3 :Paper field:"ML" title:"Reinforcement learning with policy gradient methods in game environments"
+4 :Paper field:"ML" title:"Graph neural networks for node classification on citation networks"
+5 :Paper field:"ML" title:"Generative adversarial networks for synthetic image generation"
+6 :Paper field:"ML" title:"Transfer learning and fine-tuning pre-trained models for downstream tasks"
+7 :Paper field:"DB" title:"Query optimization in distributed relational database systems"
+8 :Paper field:"DB" title:"B-tree indexing structures for efficient range query processing"
+9 :Paper field:"DB" title:"Transaction isolation levels and concurrency control in OLTP workloads"
+10 :Paper field:"DB" title:"Graph database engines with worst-case optimal join algorithms"
+11 :Paper field:"DB" title:"Column-store compression techniques for analytical query processing"
+12 :Paper field:"DB" title:"Distributed consensus protocols for fault-tolerant data replication"
+13 :Paper field:"DB" title:"Approximate nearest neighbor search using locality-sensitive hashing"
+14 :Paper field:"NLP" title:"Word embeddings and distributional semantics for text similarity"
+15 :Paper field:"NLP" title:"Named entity recognition using bidirectional LSTM-CRF models"
+16 :Paper field:"NLP" title:"Machine translation with encoder-decoder attention networks"
+17 :Paper field:"NLP" title:"Sentiment analysis of social media text using fine-tuned transformers"
+18 :Paper field:"NLP" title:"Question answering with retrieval-augmented language models"
+19 :Paper field:"NLP" title:"Text summarization using abstractive sequence-to-sequence models"
+20 :Author name:"Alice Chen" area:"ML"
+21 :Author name:"Bob Kumar" area:"ML"
+22 :Author name:"Carlos Rivera" area:"DB"
+23 :Author name:"Diana Zhao" area:"DB"
+24 :Author name:"Elena Volkov" area:"NLP"
+25 :Author name:"Frank Miller" area:"NLP"
+26 :Author name:"Grace Lee" area:"ML_DB"
+27 :Author name:"Hiro Tanaka" area:"DB_NLP"
+28 :Author name:"Irene Costa" area:"ML"
+29 :Author name:"James Park" area:"NLP"
+30 :Venue name:"NeurIPS"
+31 :Venue name:"SIGMOD"
+32 :Venue name:"ACL"
+33 :Venue name:"ICML"
+34 :Venue name:"VLDB"
+1->0 :CITES
+2->0 :CITES
+4->2 :CITES
+5->0 :CITES
+6->2 :CITES
+3->4 :CITES
+6->4 :CITES
+8->7 :CITES
+9->7 :CITES
+10->8 :CITES
+11->7 :CITES
+12->9 :CITES
+13->8 :CITES
+15->14 :CITES
+16->14 :CITES
+17->14 :CITES
+18->16 :CITES
+19->16 :CITES
+4->10 :CITES
+10->4 :CITES
+2->16 :CITES
+16->2 :CITES
+13->14 :CITES
+18->2 :CITES
+20->0 :WRITES
+20->1 :WRITES
+20->5 :WRITES
+21->2 :WRITES
+21->3 :WRITES
+21->4 :WRITES
+22->7 :WRITES
+22->8 :WRITES
+22->10 :WRITES
+23->9 :WRITES
+23->11 :WRITES
+23->12 :WRITES
+24->14 :WRITES
+24->15 :WRITES
+24->17 :WRITES
+25->16 :WRITES
+25->18 :WRITES
+25->19 :WRITES
+26->4 :WRITES
+26->10 :WRITES
+26->6 :WRITES
+27->13 :WRITES
+27->14 :WRITES
+27->12 :WRITES
+28->0 :WRITES
+28->2 :WRITES
+28->6 :WRITES
+29->17 :WRITES
+29->18 :WRITES
+29->19 :WRITES
+0->30 :PUBLISHED_IN
+1->33 :PUBLISHED_IN
+2->30 :PUBLISHED_IN
+3->33 :PUBLISHED_IN
+4->30 :PUBLISHED_IN
+5->33 :PUBLISHED_IN
+6->30 :PUBLISHED_IN
+7->31 :PUBLISHED_IN
+8->34 :PUBLISHED_IN
+9->31 :PUBLISHED_IN
+10->31 :PUBLISHED_IN
+11->34 :PUBLISHED_IN
+12->34 :PUBLISHED_IN
+13->34 :PUBLISHED_IN
+14->32 :PUBLISHED_IN
+15->32 :PUBLISHED_IN
+16->32 :PUBLISHED_IN
+17->32 :PUBLISHED_IN
+18->32 :PUBLISHED_IN
+19->32 :PUBLISHED_IN
