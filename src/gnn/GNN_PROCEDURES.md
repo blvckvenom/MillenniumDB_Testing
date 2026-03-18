@@ -149,6 +149,32 @@ RETURN success, message
 
 ---
 
+### gnn_materialize_batches
+
+Materialize packed feature batches from offline sampling output (L3 MinHash
+reordering + L4 packed batch files). Bridges sampling → training.
+
+```gql
+CALL gnn_materialize_batches('sample_name', 'node_features', {
+    reorder: 1, strategy: 'SEGMENTED', numHashes: 2, segmentSize: 100, force: 0
+})
+YIELD sampleName, featureName, totalBatches, reordered,
+      reorderTimeMs, packTimeMs, totalTimeMs, packedDir
+RETURN *
+```
+
+**Parameters:** sampleName (STRING), featureName (STRING), options (MAP optional).
+
+**Options:** `reorder` (0/1, default 1), `strategy` ('SEGMENTED'|'MULTIPASS_BOUNDED'),
+`numHashes` (INT, default 2), `segmentSize` (INT, default 100), `force` (0/1, default 0).
+
+**Outputs on disk:**
+- `gnn_features/<name>_reordered.fmat` — L3 reordered FeatureMatrix (if reorder=1)
+- `gnn_features/<name>_reordered.rmap` — L3 reordered RowMapping (if reorder=1)
+- `samples/<sampleName>/packed/batch_NNNNNN.bin` — L4 per-batch packed files
+
+---
+
 ## Binary File Formats
 
 ### FeatureMatrix (.fmat)
