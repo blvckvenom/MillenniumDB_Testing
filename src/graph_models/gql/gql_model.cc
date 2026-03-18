@@ -21,6 +21,7 @@
 #include "query/procedure/builtin/gnn_hnsw_list_procedure.h"
 #include "query/procedure/builtin/gnn_hnsw_drop_procedure.h"
 #include "query/procedure/builtin/gnn_hnsw_info_procedure.h"
+#include "query/procedure/builtin/gnn_materialize_batches_procedure.h"
 #endif
 #include "query/query_context.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -60,6 +61,9 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswListProcedure>());
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswDropProcedure>());
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswInfoProcedure>());
+
+    // Register GNN batch materialization procedure (L3 reorder + L4 packing)
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnMaterializeBatchesProcedure>());
 #endif
 
     return std::make_unique<ModelDestroyer>([]() { gql_model.~GQLModel(); });
