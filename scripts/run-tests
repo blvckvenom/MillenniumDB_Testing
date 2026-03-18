@@ -28,7 +28,12 @@ if [[ ${1-} ]]; then
 fi
 
 # Configure build and compile
-cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug
+# Detect if GNN module should be enabled (check if LibTorch exists)
+GNN_FLAGS=""
+if [ -d "third_party/libtorch" ]; then
+    GNN_FLAGS="-D ENABLE_GNN=ON"
+fi
+cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug -D BUILD_TESTING=ON $GNN_FLAGS
 cmake --build build/Debug -j $(nproc)
 
 # Remove SPARQL tmp dir
