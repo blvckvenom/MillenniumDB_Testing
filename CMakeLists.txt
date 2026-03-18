@@ -153,6 +153,11 @@ include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/third_party/ska_sort)
 
 # Optional: GNN Module with LibTorch
 option(ENABLE_GNN "Enable GNN training module with LibTorch" OFF)
+
+# enable_testing() must be called before add_subdirectory(src/gnn) so that
+# add_test() calls in the GNN subdirectory are registered with ctest.
+enable_testing()
+
 if(ENABLE_GNN)
     message(STATUS "GNN module enabled - looking for LibTorch...")
 
@@ -215,7 +220,6 @@ foreach(target ${BUILD_TARGETS})
 endforeach(target)
 
 # Test targets
-enable_testing()
 foreach(target ${TEST_TARGETS})
     add_executable(${target} ${CMAKE_SOURCE_DIR}/src/tests/${target}.cc)
     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
