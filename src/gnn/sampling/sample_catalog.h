@@ -28,7 +28,7 @@ namespace mdb::gnn {
  * ```
  * Offset  Size     Field
  * 0       4        Magic ("GNNS" = 0x534E4E47)
- * 4       4        Version (currently 1)
+ * 4       4        Version (currently 2)
  * 8       8        Created timestamp (Unix epoch)
  * 16      8        Total batches
  * 24      8        Train batches
@@ -37,12 +37,15 @@ namespace mdb::gnn {
  * 48      8        Unique nodes
  * 56      8        Total edges
  * 64      8        Batch size
- * 80      8        Random seed
- * 88      8        Num layers (K)
- * 96      K*8      Fanouts array
+ * 72      8        Random seed
+ * 80      8        Num layers (K)
+ * 88      K*8      Fanouts array
  * ...     var      Projection name (length-prefixed string)
  * ...     var      Sample name (length-prefixed string)
  * ```
+ *
+ * V1 compatibility: between total_edges and batch_size, v1 has an
+ * extra uint64 legacy_num_epochs field (read and discarded).
  *
  * @see SampleStorage for the actual sample data
  */
