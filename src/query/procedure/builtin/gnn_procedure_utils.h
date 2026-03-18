@@ -119,6 +119,27 @@ public:
         throw std::runtime_error(key + " must be a string");
     }
 
+    /// Look up a boolean value by key. Returns nullopt if key is absent.
+    /// Accepts both BOOL type and INT (0=false, nonzero=true) for convenience.
+    /// Throws if the value exists but is not a boolean or integer type.
+    std::optional<bool> get_bool(const std::string& key) const {
+        auto value = get_value(key);
+        if (!value) return std::nullopt;
+
+        auto vtype = GQL_OID::get_type(*value);
+        if (vtype == GQL_OID::Type::BOOL) {
+            return Conversions::unpack_bool(*value);
+        }
+        // Also accept integers: 0 = false, nonzero = true
+        if (vtype == GQL_OID::Type::INT56_INLINE ||
+            vtype == GQL_OID::Type::INT64_EXTERN ||
+            vtype == GQL_OID::Type::INT64_TMP)
+        {
+            return Conversions::unpack_int(*value) != 0;
+        }
+        throw std::runtime_error(key + " must be a boolean or integer (0/1)");
+    }
+
     /// Look up an integer value by key. Returns nullopt if key is absent.
     /// Throws if the value exists but is not an integer type.
     std::optional<int64_t> get_int(const std::string& key) const {
