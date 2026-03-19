@@ -43,6 +43,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ----------------------------------------------------------------------------
+# Optional io_uring support for L3 direct I/O
+# ----------------------------------------------------------------------------
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(URING QUIET liburing)
+endif()
+if(URING_FOUND)
+    message(STATUS "io_uring support enabled (liburing ${URING_VERSION})")
+else()
+    message(STATUS "liburing not found — using pread fallback for L3 direct I/O")
+endif()
+
+# ----------------------------------------------------------------------------
 # GNN Core Library
 # ----------------------------------------------------------------------------
 add_library(mdb_gnn_core STATIC
@@ -65,6 +78,7 @@ add_library(mdb_gnn_core STATIC
     storage/cpu_cache.cc
     storage/gpu_cache.cc
     storage/four_level_store.cc
+    storage/direct_io_reader.cc
 
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
@@ -124,6 +138,13 @@ target_link_libraries(mdb_gnn_core PUBLIC
 # flag was removed since no code in the project uses alternative tokens as identifiers.
 target_compile_options(mdb_gnn_core PRIVATE ${TORCH_CXX_FLAGS_LIST})
 target_compile_definitions(mdb_gnn_core PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+
+# Optional io_uring linkage for DirectIoReader
+if(URING_FOUND)
+    target_compile_definitions(mdb_gnn_core PUBLIC ENABLE_IO_URING)
+    target_link_libraries(mdb_gnn_core PUBLIC ${URING_LIBRARIES})
+    target_include_directories(mdb_gnn_core PUBLIC ${URING_INCLUDE_DIRS})
+endif()
 
 # Link with MDB libraries if they exist
 if(TARGET mdb_storage)
@@ -298,6 +319,20 @@ if(BUILD_TESTING)
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
         add_test(NAME FourLevelStoreTests COMMAND test_four_level_store)
+
+        # DirectIoReader tests (O_DIRECT + io_uring, with pread fallback)
+        add_executable(test_direct_io
+            tests/test_direct_io.cc
+        )
+        target_link_libraries(test_direct_io
+            GTest::gtest_main
+            mdb_gnn_core
+        )
+        set_target_properties(test_direct_io PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME DirectIoTests COMMAND test_direct_io)
 
         message(STATUS "GNN tests enabled")
     else()

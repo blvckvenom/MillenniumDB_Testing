@@ -1,0 +1,137 @@
+#pragma once
+
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <vector>
+
+#ifdef ENABLE_IO_URING
+#include <liburing.h>
+#endif
+
+namespace mdb::gnn {
+
+/// Custom deleter for aligned memory (allocated with posix_memalign).
+struct AlignedDeleter {
+    void operator()(char* ptr) const { std::free(ptr); }
+};
+using AlignedBuffer = std::unique_ptr<char[], AlignedDeleter>;
+
+/**
+ * @brief Reads feature rows from disk bypassing OS page cache.
+ *
+ * Uses O_DIRECT to prevent page cache pollution (critical for RAM-bounded
+ * training where L3 mmap pages would compete with L2 for host memory).
+ *
+ * When ENABLE_IO_URING is defined and liburing is available at runtime,
+ * uses io_uring for async batch submission (single syscall for N reads).
+ * Falls back to synchronous pread() + POSIX_FADV_DONTNEED otherwise.
+ *
+ * O_DIRECT requires buffer addresses, read offsets, and read sizes to be
+ * aligned to the filesystem block size (typically 512 or 4096 bytes).
+ * Feature rows are typically NOT aligned (e.g., 1433 dims x 4 bytes = 5732).
+ * This reader handles alignment transparently: for each row, it reads
+ * the containing aligned region and extracts the needed bytes.
+ *
+ * Thread-safety: NOT thread-safe (single io_uring ring). Use one per thread.
+ */
+class DirectIoReader {
+public:
+    explicit DirectIoReader(const std::filesystem::path& file_path);
+    ~DirectIoReader();
+
+    // Not copyable, not movable (owns fd and io_uring ring)
+    DirectIoReader(const DirectIoReader&) = delete;
+    DirectIoReader& operator=(const DirectIoReader&) = delete;
+    DirectIoReader(DirectIoReader&&) = delete;
+    DirectIoReader& operator=(DirectIoReader&&) = delete;
+
+    /// Result of a read operation.
+    struct ReadResult {
+        AlignedBuffer data;      ///< aligned buffer containing the read data
+        size_t        size;      ///< total bytes in data
+        size_t        num_rows;  ///< number of rows read (0 for read_range)
+    };
+
+    /// Read specific rows from a feature file.
+    /// @param row_indices  Which rows to read (0-based).
+    /// @param row_bytes    Bytes per row.
+    /// @param data_offset  Byte offset from file start to first row (past header).
+    /// @return Aligned buffer containing rows in the ORDER of row_indices.
+    ReadResult read_rows(
+        const std::vector<uint64_t>& row_indices,
+        uint64_t row_bytes,
+        uint64_t data_offset
+    );
+
+    /// Read a contiguous byte range.
+    ReadResult read_range(uint64_t offset, uint64_t size);
+
+    /// Whether O_DIRECT is active (may be disabled on tmpfs, etc.).
+    bool is_direct() const { return direct_; }
+
+    /// Whether io_uring is active.
+    bool is_io_uring() const { return io_uring_active_; }
+
+    /// File size in bytes.
+    size_t file_size() const { return file_size_; }
+
+private:
+    int    fd_               = -1;
+    size_t file_size_        = 0;
+    bool   direct_           = false;
+    bool   io_uring_active_  = false;
+
+    /// Block alignment used for O_DIRECT reads. Detected at open time.
+    size_t block_align_ = 4096;
+
+#ifdef ENABLE_IO_URING
+    struct io_uring ring_;
+    bool ring_initialized_ = false;
+    static constexpr unsigned QUEUE_DEPTH = 64;
+#endif
+
+    /// Allocate aligned memory (required for O_DIRECT).
+    /// Returns nullptr-unique_ptr on size == 0.
+    static AlignedBuffer alloc_aligned(size_t size, size_t alignment = 4096);
+
+    /// Read using pread, retrying on EINTR and partial reads.
+    void pread_all(void* buf, size_t count, off_t offset);
+
+    /// Issue POSIX_FADV_DONTNEED for a range (best-effort, non-O_DIRECT mode).
+    void advise_dontneed(off_t offset, size_t len);
+
+    /// Aligned read helpers for O_DIRECT.
+    /// Round value down to nearest multiple of alignment.
+    static uint64_t align_down(uint64_t val, uint64_t align);
+    /// Round value up to nearest multiple of alignment.
+    static uint64_t align_up(uint64_t val, uint64_t align);
+
+    /// Internal: read a single aligned region and copy the relevant sub-range
+    /// into the destination buffer. Used when O_DIRECT is active.
+    void read_aligned_region(
+        char* dest,
+        uint64_t file_offset,
+        uint64_t wanted_bytes
+    );
+
+#ifdef ENABLE_IO_URING
+    /// Batch-submit reads via io_uring and collect completions.
+    struct IoOp {
+        uint64_t file_offset;   ///< aligned offset in file
+        uint64_t aligned_size;  ///< aligned read size
+        size_t   buf_offset;    ///< offset in aligned scratch buffer
+        size_t   dest_offset;   ///< offset in output buffer
+        uint64_t skip;          ///< bytes to skip from start of aligned read
+        uint64_t wanted;        ///< actual bytes needed
+    };
+    void submit_io_uring(
+        const std::vector<IoOp>& ops,
+        char* aligned_buf,
+        char* out_buf
+    );
+#endif
+};
+
+} // namespace mdb::gnn
