@@ -192,6 +192,16 @@ uint64_t PackedBatchReader::read_batch(uint64_t batch_id, void* out,
             "PackedBatchReader: dtype mismatch in " + path_str);
     }
 
+    // For v2 files, seek past the ObjectId table to reach feature data
+    if (header.has_oid_table()) {
+        off_t data_start = static_cast<off_t>(header.data_offset());
+        if (::lseek(fd, data_start, SEEK_SET) < 0) {
+            throw std::runtime_error(
+                "PackedBatchReader::read_batch: lseek past OID table failed: " +
+                std::string(std::strerror(errno)));
+        }
+    }
+
     size_t data_size = header.data_bytes(); // overflow-checked
 
     if (data_size == 0) {
@@ -205,7 +215,7 @@ uint64_t PackedBatchReader::read_batch(uint64_t batch_id, void* out,
             " bytes, got " + std::to_string(out_capacity));
     }
 
-    // Read data directly — fd is already positioned right after the header
+    // Read data directly — fd is positioned after header (v1) or after OID table (v2)
     read_all(fd, out, data_size, path_str);
 
     return header.num_nodes;

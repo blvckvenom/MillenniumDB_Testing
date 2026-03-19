@@ -5,6 +5,9 @@
 #include <cstring>
 #include <thread>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "gnn/storage/packed_batch_store.h"
 
 using PackedBatchTest = GnnStorageTest;
@@ -668,4 +671,68 @@ TEST_F(PackedBatchTest, ReaderFeatureDimZeroThrows) {
         PackedBatchReader(dir, 1, 0, GnnDtype::FLOAT32),
         std::invalid_argument
     );
+}
+
+// ===========================================================================
+// PackedBatchHeader v2 (ObjectId table support)
+// ===========================================================================
+
+TEST(PackedBatchHeaderV2, IsValidAcceptsBothVersions) {
+    auto h1 = PackedBatchHeader::make(10, 4, GnnDtype::FLOAT32);
+    EXPECT_TRUE(h1.is_valid());
+    EXPECT_EQ(h1.version, 1u);
+    EXPECT_FALSE(h1.has_oid_table());
+    EXPECT_EQ(h1.data_offset(), 32u);
+
+    auto h2 = PackedBatchHeader::make_v2(10, 4, GnnDtype::FLOAT32);
+    EXPECT_TRUE(h2.is_valid());
+    EXPECT_EQ(h2.version, 2u);
+    EXPECT_TRUE(h2.has_oid_table());
+    EXPECT_EQ(h2.data_offset(), 32u + 10u * 8u);
+}
+
+TEST(PackedBatchHeaderV2, DataOffsetAccountsForOidTable) {
+    auto h2 = PackedBatchHeader::make_v2(100, 128, GnnDtype::FLOAT32);
+    EXPECT_EQ(h2.data_offset(), 32u + 100u * 8u);
+
+    auto h1 = PackedBatchHeader::make(100, 128, GnnDtype::FLOAT32);
+    EXPECT_EQ(h1.data_offset(), 32u);
+}
+
+TEST_F(PackedBatchTest, ReaderSkipsOidTableCorrectly) {
+    // Manually write a v2 file and verify reader reads features, not OID bytes
+    auto tmp = test_path("test_v2_reader");
+    fs::create_directories(tmp);
+    auto path = tmp / "batch_000000.bin";
+
+    constexpr uint64_t N = 3, D = 2;
+    auto header = PackedBatchHeader::make_v2(N, D, GnnDtype::FLOAT32);
+
+    // OID table (should be SKIPPED by reader)
+    std::vector<uint64_t> oids = {100, 200, 300};
+    // Feature data (this is what reader should return)
+    std::vector<float> features = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+
+    // Write file: header + OID table + features
+    {
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ASSERT_GE(fd, 0);
+        ::write(fd, &header, sizeof(header));
+        ::write(fd, oids.data(), oids.size() * sizeof(uint64_t));
+        ::write(fd, features.data(), features.size() * sizeof(float));
+        ::fsync(fd);
+        ::close(fd);
+    }
+
+    // Read with PackedBatchReader — should get features, NOT oid bytes
+    std::vector<float> out(N * D);
+    PackedBatchReader reader(tmp.string(), 1, D, GnnDtype::FLOAT32);
+    reader.read_batch(0, out.data(), out.size() * sizeof(float));
+
+    EXPECT_FLOAT_EQ(out[0], 1.0f);
+    EXPECT_FLOAT_EQ(out[1], 2.0f);
+    EXPECT_FLOAT_EQ(out[2], 3.0f);
+    EXPECT_FLOAT_EQ(out[3], 4.0f);
+    EXPECT_FLOAT_EQ(out[4], 5.0f);
+    EXPECT_FLOAT_EQ(out[5], 6.0f);
 }

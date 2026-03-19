@@ -20,9 +20,10 @@ namespace mdb::gnn {
  * Data is row-major, contiguous, no padding between rows.
  */
 struct PackedBatchHeader {
-    static constexpr uint32_t MAGIC   = 0x474E4E42; // "GNNB"
-    static constexpr uint32_t VERSION = 1;
-    static constexpr size_t   SIZE    = 32;
+    static constexpr uint32_t MAGIC       = 0x474E4E42; // "GNNB"
+    static constexpr uint32_t VERSION     = 1;
+    static constexpr uint32_t MAX_VERSION = 2;
+    static constexpr size_t   SIZE        = 32;
 
     uint32_t magic;
     uint32_t version;
@@ -45,11 +46,28 @@ struct PackedBatchHeader {
         return h;
     }
 
+    /// Create a v2 header (includes ObjectId table after header).
+    static PackedBatchHeader make_v2(uint64_t nodes, uint64_t dim, GnnDtype dt) {
+        auto h = make(nodes, dim, dt);
+        h.version = 2;
+        return h;
+    }
+
     /// Unlike FeatureMatrixHeader, num_nodes == 0 IS valid (empty batch).
     bool is_valid() const {
-        return magic == MAGIC && version == VERSION
+        return magic == MAGIC && version >= 1 && version <= MAX_VERSION
             && feature_dim > 0
             && dtype <= static_cast<uint8_t>(GnnDtype::MAX_VALUE);
+    }
+
+    /// Whether this header has an ObjectId table (v2+).
+    bool has_oid_table() const { return version >= 2; }
+
+    /// Offset from file start to feature data.
+    /// v1: SIZE (32 bytes, immediately after header)
+    /// v2: SIZE + num_nodes * 8 (after header + OID table)
+    size_t data_offset() const {
+        return SIZE + (has_oid_table() ? num_nodes * sizeof(uint64_t) : 0);
     }
 
     GnnDtype get_dtype() const {
