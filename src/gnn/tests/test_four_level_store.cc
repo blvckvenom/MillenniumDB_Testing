@@ -3,14 +3,20 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <vector>
 
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/cpu_cache.h"
+#include "gnn/storage/four_level_store.h"
 #include "gnn/storage/gpu_cache.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "gnn/storage/packed_batch_store.h"
 #include "gnn/storage/row_mapping.h"
+#include "gnn/sampling/graph_sample.h"
+#include "gnn/sampling/sample_storage.h"
+#include "gnn/sampling/sampling_config.h"
 #include "graph_models/object_id.h"
 #include "gnn/tests/test_helpers.h"
 
@@ -779,4 +785,700 @@ TEST_F(FourLevelStoreTest, GpuCache_InterchangeableWithCpuCache) {
     // node 6 -> [701, 702, 703, 704]
     EXPECT_FLOAT_EQ(acc[1][0], 701.0f);
     EXPECT_FLOAT_EQ(acc[1][3], 704.0f);
+}
+
+// #############################################################################
+// FourLevelStore Coordinator Tests
+// #############################################################################
+
+/**
+ * Test fixture for the FourLevelStore coordinator.
+ *
+ * Uses a db_folder layout matching what build() expects, plus a
+ * create_samples() helper that writes SampleStorage with known batches.
+ * Feature value scheme: row r, dim c -> (r+1)*100 + (c+1).
+ */
+class FourLevelStoreCoordTest : public GnnStorageTest {
+protected:
+    static constexpr uint64_t N = 8;
+    static constexpr uint64_t D = 4;
+
+    std::vector<ObjectId> node_oids_;
+    std::vector<float> features_;
+
+    fs::path db_folder_;
+    fs::path gnn_dir_;
+    fs::path fmat_path_;
+    fs::path rmap_path_;
+
+    void SetUp() override {
+        GnnStorageTest::SetUp();
+
+        db_folder_ = test_dir_ / "test_db";
+        gnn_dir_   = db_folder_ / "gnn_features";
+        fs::create_directories(gnn_dir_);
+
+        fmat_path_ = gnn_dir_ / "test_feat.fmat";
+        rmap_path_ = gnn_dir_ / "test_feat.rmap";
+
+        node_oids_.resize(N);
+        for (uint64_t i = 0; i < N; ++i) {
+            node_oids_[i] = ObjectId(0xD400000000000000ULL | i);
+        }
+
+        features_.resize(N * D);
+        for (uint64_t r = 0; r < N; ++r) {
+            for (uint64_t c = 0; c < D; ++c) {
+                features_[r * D + c] = static_cast<float>((r + 1) * 100 + (c + 1));
+            }
+        }
+
+        FeatureMatrix::create(fmat_path_, N, D, GnnDtype::FLOAT32, features_.data());
+        RowMapping::create(rmap_path_, node_oids_);
+    }
+
+    float expected_feature(uint64_t row, uint64_t dim) const {
+        return static_cast<float>((row + 1) * 100 + (dim + 1));
+    }
+
+    /// Create SampleStorage with configurable batches.
+    /// Each batch is defined by a list of node indices.
+    SampleStorage create_samples(
+        const std::string& name,
+        const std::vector<std::vector<uint64_t>>& batch_node_indices)
+    {
+        SamplingConfig config;
+        config.projection_name = "test_proj";
+        config.sample_name = name;
+        config.fanouts = {2};
+        config.batch_size = 4;
+        config.train_ratio = 1.0;
+        config.val_ratio = 0.0;
+        config.test_ratio = 0.0;
+
+        auto storage = SampleStorage::create(db_folder_, config);
+
+        for (uint64_t bid = 0; bid < batch_node_indices.size(); ++bid) {
+            GraphSample s;
+            s.batch_id = bid;
+            s.split = SplitType::TRAIN;
+            for (uint64_t idx : batch_node_indices[bid]) {
+                s.nodes_per_layer.resize(1);
+                s.nodes_per_layer[0].push_back(node_oids_[idx]);
+                s.all_unique_nodes.push_back(node_oids_[idx]);
+            }
+            storage.write_sample(s);
+        }
+        storage.finalize();
+
+        return SampleStorage::open(
+            SampleStorage::get_storage_path(db_folder_, name));
+    }
+
+    /// Standard 5-batch setup with varying frequencies:
+    /// Batch 0: nodes {0, 1, 2}      -> freq: 0 += 1, 1 += 1, 2 += 1
+    /// Batch 1: nodes {0, 1, 3}      -> freq: 0 += 1, 1 += 1, 3 += 1
+    /// Batch 2: nodes {0, 3, 4}      -> freq: 0 += 1, 3 += 1, 4 += 1
+    /// Batch 3: nodes {0, 2, 5}      -> freq: 0 += 1, 2 += 1, 5 += 1
+    /// Batch 4: nodes {0, 6, 7}      -> freq: 0 += 1, 6 += 1, 7 += 1
+    ///
+    /// Final frequencies: 0=5, 1=2, 2=2, 3=2, 4=1, 5=1, 6=1, 7=1
+    /// With budget for 1 node each: L2 gets node 0 (no GPU in test)
+    /// L3: nodes 1,2,3 (freq > 1)
+    /// L4: nodes 4,5,6,7 (freq == 1)
+    SampleStorage create_frequency_samples(
+        const std::string& name = "fls_sample")
+    {
+        return create_samples(name, {
+            {0, 1, 2},
+            {0, 1, 3},
+            {0, 3, 4},
+            {0, 2, 5},
+            {0, 6, 7}
+        });
+    }
+
+    /// Build config with no GPU and a specific CPU budget.
+    FourLevelStore::Config make_config(
+        size_t cpu_budget_nodes = 1,
+        bool reorder = false,
+        bool force = false)
+    {
+        FourLevelStore::Config config;
+        config.gpu.budget_bytes = 0;           // no GPU in test env
+        config.cpu.budget_bytes = cpu_budget_nodes * D * sizeof(float);
+        config.reorder = reorder;
+        config.force = force;
+        config.minhash.num_hashes = 2;
+        config.minhash.random_seed = 42;
+        return config;
+    }
+};
+
+// =============================================================================
+// Build: Node classification by frequency
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_NodeClassification) {
+    auto samples = create_frequency_samples();
+    auto config = make_config(/*cpu_budget_nodes=*/1, /*reorder=*/false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // No GPU in test env: L1=0, all L1 budget redistributed to L2
+    EXPECT_EQ(result.l1_nodes, 0u);
+    // CPU budget fits 1 node: only node 0 (freq=5, highest)
+    EXPECT_EQ(result.l2_nodes, 1u);
+    EXPECT_FALSE(result.gpu_available);
+    EXPECT_EQ(result.total_batches, 5u);
+    EXPECT_GT(result.build_time_ms, -1);
+    EXPECT_FALSE(result.packed_slim_dir.empty());
+}
+
+// =============================================================================
+// Build: Larger CPU budget caches more nodes
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_LargerBudget) {
+    auto samples = create_frequency_samples("fls_big");
+    auto config = make_config(/*cpu_budget_nodes=*/3, /*reorder=*/false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // Budget for 3 nodes: top-3 by frequency are 0(5), 1(2), 2(2) or 3(2)
+    EXPECT_EQ(result.l1_nodes, 0u);
+    EXPECT_EQ(result.l2_nodes, 3u);
+}
+
+// =============================================================================
+// Build: Already exists -> error
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_AlreadyExistsError) {
+    auto samples = create_frequency_samples();
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // Second build without force should throw
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_sample"));
+    EXPECT_THROW(
+        FourLevelStore::build(
+            FeatureMatrix::open(fmat_path_),
+            RowMapping::open(rmap_path_),
+            samples2, config, db_folder_, "test_feat"),
+        std::runtime_error);
+}
+
+// =============================================================================
+// Build: Force overwrite succeeds
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_ForceOverwrite) {
+    auto samples = create_frequency_samples();
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // Second build with force should succeed
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_sample"));
+    auto config_force = make_config(1, false, /*force=*/true);
+
+    EXPECT_NO_THROW(
+        FourLevelStore::build(
+            FeatureMatrix::open(fmat_path_),
+            RowMapping::open(rmap_path_),
+            samples2, config_force, db_folder_, "test_feat"));
+}
+
+// =============================================================================
+// Build: GFLS metadata file written with correct values
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_MetadataFileCorrect) {
+    auto samples = create_frequency_samples("fls_meta");
+    auto config = make_config(1, false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto meta_path = gnn_dir_ / "test_feat_store.meta";
+    ASSERT_TRUE(fs::exists(meta_path));
+    EXPECT_EQ(fs::file_size(meta_path), StoreMetaHeader::SIZE);
+
+    // Read and validate
+    std::ifstream f(meta_path, std::ios::binary);
+    ASSERT_TRUE(f.is_open());
+    StoreMetaHeader meta{};
+    f.read(reinterpret_cast<char*>(&meta), sizeof(meta));
+    ASSERT_TRUE(f.good());
+
+    EXPECT_EQ(meta.magic, StoreMetaHeader::MAGIC);
+    EXPECT_EQ(meta.version, StoreMetaHeader::VERSION);
+    EXPECT_TRUE(meta.is_valid());
+    EXPECT_EQ(meta.l1_count, result.l1_nodes);
+    EXPECT_EQ(meta.l2_count, result.l2_nodes);
+    EXPECT_EQ(meta.feature_dim, D);
+    EXPECT_EQ(meta.get_dtype(), GnnDtype::FLOAT32);
+    EXPECT_EQ(meta.get_packed_slim_dir(), result.packed_slim_dir);
+}
+
+// =============================================================================
+// Build: Slim files are v2 (have OID table)
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_SlimFilesAreV2) {
+    auto samples = create_frequency_samples("fls_v2");
+    auto config = make_config(1, false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto slim_dir = fs::path(result.packed_slim_dir);
+    ASSERT_TRUE(fs::exists(slim_dir));
+
+    // Check batch 0
+    auto batch_path = slim_dir / "batch_000000.bin";
+    ASSERT_TRUE(fs::exists(batch_path));
+
+    std::ifstream f(batch_path, std::ios::binary);
+    PackedBatchHeader hdr{};
+    f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    ASSERT_TRUE(f.good());
+
+    EXPECT_EQ(hdr.magic, PackedBatchHeader::MAGIC);
+    EXPECT_EQ(hdr.version, 2u);
+    EXPECT_TRUE(hdr.has_oid_table());
+    EXPECT_EQ(hdr.feature_dim, D);
+    EXPECT_EQ(hdr.get_dtype(), GnnDtype::FLOAT32);
+}
+
+// =============================================================================
+// Build: Cache files are created
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_CacheFilesCreated) {
+    auto samples = create_frequency_samples("fls_cache");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    EXPECT_TRUE(fs::exists(gnn_dir_ / "test_feat_gpu_cache.bin"));
+    EXPECT_TRUE(fs::exists(gnn_dir_ / "test_feat_cpu_cache.bin"));
+    EXPECT_TRUE(fs::exists(gnn_dir_ / "test_feat_store.meta"));
+}
+
+// =============================================================================
+// Build with reorder: reordered files created
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_WithReorder) {
+    auto samples = create_frequency_samples("fls_reord");
+    auto config = make_config(1, /*reorder=*/true);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    EXPECT_TRUE(fs::exists(gnn_dir_ / "test_feat_reordered.fmat"));
+    EXPECT_TRUE(fs::exists(gnn_dir_ / "test_feat_reordered.rmap"));
+
+    // Reordered RowMapping must be a bijection
+    auto reord_rm = RowMapping::open(gnn_dir_ / "test_feat_reordered.rmap");
+    std::set<uint64_t> oid_set;
+    for (uint64_t i = 0; i < N; ++i) {
+        oid_set.insert(reord_rm.get(i).id);
+    }
+    EXPECT_EQ(oid_set.size(), N);
+}
+
+// =============================================================================
+// Runtime: Constructor loads from metadata
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Constructor_LoadsFromMeta) {
+    auto samples = create_frequency_samples("fls_load");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_load"));
+
+    // Should not throw
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+    EXPECT_EQ(store.feature_dim(), D);
+}
+
+// =============================================================================
+// Runtime: Constructor fails without metadata
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Constructor_NoMetadataThrows) {
+    auto samples = create_frequency_samples("fls_nometa");
+
+    EXPECT_THROW(
+        FourLevelStore store(db_folder_, "nonexistent", samples),
+        std::runtime_error);
+}
+
+// =============================================================================
+// S4 Property: load_batch_features matches original features for ALL batches
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4Property) {
+    auto samples = create_frequency_samples("fls_s4");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_s4"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    auto rm = RowMapping::open(rmap_path_);
+
+    // S4: for every node in every batch, features match original
+    for (uint64_t b = 0; b < 5; ++b) {
+        auto sample = samples2.read_sample(b);
+        auto tensor = store.load_batch_features(b);
+        ASSERT_EQ(tensor.size(0), static_cast<int64_t>(sample.all_unique_nodes.size()))
+            << "Batch " << b << " output size mismatch";
+        ASSERT_EQ(tensor.size(1), static_cast<int64_t>(D));
+
+        auto acc = tensor.accessor<float, 2>();
+        for (size_t i = 0; i < sample.all_unique_nodes.size(); ++i) {
+            auto oid = sample.all_unique_nodes[i];
+            auto row = rm.find(oid);
+            ASSERT_TRUE(row.has_value()) << "Batch " << b << " node " << i;
+            for (uint64_t d = 0; d < D; ++d) {
+                EXPECT_FLOAT_EQ(acc[i][d], expected_feature(*row, d))
+                    << "S4 violation: batch " << b << " node " << i
+                    << " (row " << *row << ") dim " << d;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// S4 Property with reorder: features still match after MinHash reordering
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4WithReorder) {
+    auto samples = create_frequency_samples("fls_s4r");
+    auto config = make_config(1, /*reorder=*/true);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_s4r"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    auto rm = RowMapping::open(rmap_path_);
+
+    for (uint64_t b = 0; b < 5; ++b) {
+        auto sample = samples2.read_sample(b);
+        auto tensor = store.load_batch_features(b);
+        auto acc = tensor.accessor<float, 2>();
+        for (size_t i = 0; i < sample.all_unique_nodes.size(); ++i) {
+            auto oid = sample.all_unique_nodes[i];
+            auto row = rm.find(oid);
+            ASSERT_TRUE(row.has_value());
+            for (uint64_t d = 0; d < D; ++d) {
+                EXPECT_FLOAT_EQ(acc[i][d], expected_feature(*row, d))
+                    << "S4+reorder violation: batch " << b << " node " << i
+                    << " dim " << d;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Stats: Counts are correct after load_batch_features
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Stats_CountsCorrect) {
+    auto samples = create_frequency_samples("fls_stats");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_stats"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    store.load_batch_features(0);
+    const auto& stats = store.get_stats();
+
+    // Batch 0: nodes {0, 1, 2}
+    // node 0 is in L2 (cached), nodes 1,2 are not cached
+    uint64_t total = stats.l1_hits.load() + stats.l2_hits.load()
+                   + stats.l3_reads.load() + stats.l4_reads.load();
+
+    auto sample = samples2.read_sample(0);
+    uint64_t expected_total = sample.all_unique_nodes.size();
+    EXPECT_EQ(total, expected_total)
+        << "Total hits+reads must equal batch node count";
+    EXPECT_EQ(stats.total_requests.load(), expected_total);
+
+    // At least 1 L2 hit (node 0)
+    EXPECT_GE(stats.l2_hits.load(), 1u);
+}
+
+// =============================================================================
+// Stats: reset clears all counters
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Stats_ResetClears) {
+    auto samples = create_frequency_samples("fls_rst");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_rst"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    store.load_batch_features(0);
+    store.reset_stats();
+
+    const auto& stats = store.get_stats();
+    EXPECT_EQ(stats.l1_hits.load(), 0u);
+    EXPECT_EQ(stats.l2_hits.load(), 0u);
+    EXPECT_EQ(stats.l3_reads.load(), 0u);
+    EXPECT_EQ(stats.l4_reads.load(), 0u);
+    EXPECT_EQ(stats.total_requests.load(), 0u);
+}
+
+// =============================================================================
+// Stats: Accumulate across multiple batches
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Stats_AccumulateAcrossBatches) {
+    auto samples = create_frequency_samples("fls_accum");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_accum"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    // Load all 5 batches
+    uint64_t total_nodes = 0;
+    for (uint64_t b = 0; b < 5; ++b) {
+        auto sample = samples2.read_sample(b);
+        total_nodes += sample.all_unique_nodes.size();
+        store.load_batch_features(b);
+    }
+
+    const auto& stats = store.get_stats();
+    EXPECT_EQ(stats.total_requests.load(), total_nodes);
+
+    uint64_t sum = stats.l1_hits.load() + stats.l2_hits.load()
+                 + stats.l3_reads.load() + stats.l4_reads.load();
+    EXPECT_EQ(sum, total_nodes);
+}
+
+// =============================================================================
+// load_features: L1->L2->L3 only (no L4)
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadFeatures_L1L2L3Only) {
+    auto samples = create_frequency_samples("fls_lf");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_lf"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    // Node 0 is in L2 cache: should get correct features
+    auto tensor = store.load_features({node_oids_[0]});
+    ASSERT_EQ(tensor.size(0), 1);
+    ASSERT_EQ(tensor.size(1), static_cast<int64_t>(D));
+
+    auto acc = tensor.accessor<float, 2>();
+    for (uint64_t d = 0; d < D; ++d) {
+        EXPECT_FLOAT_EQ(acc[0][d], expected_feature(0, d))
+            << "load_features node 0, dim " << d;
+    }
+}
+
+// =============================================================================
+// load_features: Empty request returns empty tensor
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadFeatures_EmptyRequest) {
+    auto samples = create_frequency_samples("fls_empty");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_empty"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    auto tensor = store.load_features({});
+    EXPECT_EQ(tensor.size(0), 0);
+    EXPECT_EQ(tensor.size(1), static_cast<int64_t>(D));
+}
+
+// =============================================================================
+// Build: Zero CPU budget -> all nodes go to L3/L4
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_ZeroBudget) {
+    auto samples = create_frequency_samples("fls_zero");
+    FourLevelStore::Config config;
+    config.gpu.budget_bytes = 0;
+    config.cpu.budget_bytes = 0;
+    config.reorder = false;
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    EXPECT_EQ(result.l1_nodes, 0u);
+    EXPECT_EQ(result.l2_nodes, 0u);
+    // All accessed nodes go to L3/L4
+    EXPECT_GT(result.l3_nodes + result.l4_nodes, 0u);
+}
+
+// =============================================================================
+// Build: Zero budget + S4 still holds
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_ZeroBudget_S4) {
+    auto samples = create_frequency_samples("fls_z4");
+    FourLevelStore::Config config;
+    config.gpu.budget_bytes = 0;
+    config.cpu.budget_bytes = 0;
+    config.reorder = false;
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_z4"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+    auto rm = RowMapping::open(rmap_path_);
+
+    for (uint64_t b = 0; b < 5; ++b) {
+        auto sample = samples2.read_sample(b);
+        auto tensor = store.load_batch_features(b);
+        auto acc = tensor.accessor<float, 2>();
+        for (size_t i = 0; i < sample.all_unique_nodes.size(); ++i) {
+            auto oid = sample.all_unique_nodes[i];
+            auto row = rm.find(oid);
+            ASSERT_TRUE(row.has_value());
+            for (uint64_t d = 0; d < D; ++d) {
+                EXPECT_FLOAT_EQ(acc[i][d], expected_feature(*row, d))
+                    << "Zero-budget S4: batch " << b << " node " << i;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Build: Large budget caches everything -> no L3/L4
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_LargeBudget_AllCached) {
+    auto samples = create_frequency_samples("fls_all");
+    auto config = make_config(/*cpu_budget_nodes=*/N, false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // Budget for N nodes: all accessed nodes fit in L2
+    // (no GPU -> L1=0, everything in L2)
+    EXPECT_EQ(result.l1_nodes, 0u);
+    // At most N nodes can be cached
+    EXPECT_GE(result.l2_nodes, 1u);
+}
+
+// =============================================================================
+// Single batch: All nodes in one batch
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, SingleBatch_S4) {
+    auto samples = create_samples("fls_single", {{0,1,2,3,4,5,6,7}});
+    auto config = make_config(2, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_single"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+    auto rm = RowMapping::open(rmap_path_);
+
+    auto tensor = store.load_batch_features(0);
+    ASSERT_EQ(tensor.size(0), static_cast<int64_t>(N));
+
+    auto acc = tensor.accessor<float, 2>();
+    for (uint64_t i = 0; i < N; ++i) {
+        auto oid = samples2.read_sample(0).all_unique_nodes[i];
+        auto row = rm.find(oid);
+        ASSERT_TRUE(row.has_value());
+        for (uint64_t d = 0; d < D; ++d) {
+            EXPECT_FLOAT_EQ(acc[i][d], expected_feature(*row, d))
+                << "Single batch S4: node " << i << " dim " << d;
+        }
+    }
 }
