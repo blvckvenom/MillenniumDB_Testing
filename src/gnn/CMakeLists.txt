@@ -104,6 +104,9 @@ add_library(mdb_gnn_core STATIC
 
     # Phase 3: Batch Materialization (L3 reorder + L4 packing)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_materialize_batches_procedure.cc
+
+    # Phase 3: Four-Level Feature Store build procedure (L1-L4)
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_feature_store_procedure.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
