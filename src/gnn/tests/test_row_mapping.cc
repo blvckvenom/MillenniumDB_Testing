@@ -214,7 +214,7 @@ TEST_F(RowMappingTest, LargeVerifyAll) {
 }
 
 // ===========================================================================
-// HashMap Lookup (O(1) find)
+// Sorted Index Lookup (O(log N) find)
 // ===========================================================================
 
 TEST_F(RowMappingTest, FindAllEntriesAfterOpen) {
@@ -328,7 +328,7 @@ TEST_F(RowMappingTest, FindPerformanceLargeMapping) {
     auto elapsed = std::chrono::steady_clock::now() - start;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 
-    // With O(1) this should take < 100ms. With O(N) it would take seconds.
+    // With O(log N) this should take < 100ms. With O(N) it would take seconds.
     EXPECT_LT(ms, 2000) << "find() took " << ms << "ms for 50K lookups on 100K entries — likely O(N)";
 }
 
@@ -358,6 +358,45 @@ TEST_F(RowMappingTest, FindBoundaryValues) {
     // Nearby values should miss
     EXPECT_FALSE(rm.find(ObjectId(1)).has_value());
     EXPECT_FALSE(rm.find(ObjectId(UINT64_MAX - 1)).has_value());
+}
+
+// ===========================================================================
+// Binary Search Lookup
+// ===========================================================================
+
+TEST(RowMappingBinarySearch, FindReturnsCorrectIndex) {
+    auto tmp = fs::temp_directory_path() / "test_rm_bsearch";
+    fs::create_directories(tmp);
+    auto path = tmp / "test.rmap";
+
+    std::vector<ObjectId> ids = {ObjectId(100), ObjectId(50), ObjectId(200), ObjectId(75)};
+    auto rm = RowMapping::create(path, ids);
+
+    EXPECT_EQ(rm.find(ObjectId(100)), 0u);
+    EXPECT_EQ(rm.find(ObjectId(50)),  1u);
+    EXPECT_EQ(rm.find(ObjectId(200)), 2u);
+    EXPECT_EQ(rm.find(ObjectId(75)),  3u);
+    EXPECT_EQ(rm.find(ObjectId(999)), std::nullopt);
+
+    fs::remove_all(tmp);
+}
+
+TEST(RowMappingBinarySearch, LargeScaleLookup) {
+    auto tmp = fs::temp_directory_path() / "test_rm_large";
+    fs::create_directories(tmp);
+    auto path = tmp / "test_large.rmap";
+
+    constexpr uint64_t N = 10000;
+    std::vector<ObjectId> ids(N);
+    for (uint64_t i = 0; i < N; ++i) ids[i] = ObjectId(i * 7 + 3);
+
+    auto rm = RowMapping::create(path, ids);
+    for (uint64_t i = 0; i < N; ++i) {
+        ASSERT_EQ(rm.find(ObjectId(i * 7 + 3)), i);
+    }
+    EXPECT_EQ(rm.find(ObjectId(0)), std::nullopt);
+
+    fs::remove_all(tmp);
 }
 
 // ===========================================================================

@@ -5,7 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <unordered_map>
+#include <algorithm>
 #include <vector>
 
 #include "graph_models/object_id.h"
@@ -19,14 +19,14 @@ namespace mdb::gnn {
  * Header: MAGIC(4) + VERSION(4) + count(8)
  *
  * Thread-safe for concurrent reads after construction. Both the mmap region
- * and the internal hash map (built lazily on first find()) are read-only
+ * and the internal sorted index (built lazily on first find()) are read-only
  * once initialized.
  *
  * Usage:
  *   auto rm = RowMapping::create("mapping.rmap", object_ids);
  *   auto rm = RowMapping::open("mapping.rmap");
  *   ObjectId oid = rm.get(row_index);
- *   auto idx = rm.find(some_oid);  // O(1) hash lookup
+ *   auto idx = rm.find(some_oid);  // O(log N) binary search lookup
  */
 class RowMapping {
 public:
@@ -45,7 +45,7 @@ public:
     /// Get the ObjectId at a given row index. O(1).
     ObjectId get(uint64_t row_index) const;
 
-    /// Hash map lookup for an ObjectId. Returns its row index if found. O(1).
+    /// Binary search lookup for an ObjectId. Returns its row index if found. O(log N).
     /// The index is built lazily on the first call (thread-safe via std::call_once).
     /// For duplicate ObjectIds, returns the first occurrence.
     std::optional<uint64_t> find(ObjectId target) const;
@@ -68,11 +68,11 @@ private:
     size_t   mmap_size_ = 0;
     uint64_t count_     = 0;
 
-    /// Lazy init flag for id_to_row_. Built on first find() via std::call_once.
+    /// Lazy init flag for sorted_index_. Built on first find() via std::call_once.
     mutable std::unique_ptr<std::once_flag> build_index_flag_ = std::make_unique<std::once_flag>();
 
-    /// ObjectId.id → first row index. Built lazily on first find().
-    mutable std::unordered_map<uint64_t, uint64_t> id_to_row_;
+    /// (oid.id, row_idx) pairs sorted by oid.id. Built lazily on first find().
+    mutable std::vector<std::pair<uint64_t, uint64_t>> sorted_index_;
 
     const ObjectId* data_ptr() const;
 };

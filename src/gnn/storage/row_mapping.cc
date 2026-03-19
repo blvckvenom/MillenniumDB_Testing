@@ -14,10 +14,10 @@ namespace mdb::gnn {
 static_assert(RowMapping::HEADER_SIZE % alignof(ObjectId) == 0,
               "HEADER_SIZE must be aligned to ObjectId alignment");
 
-// Fix 6: Guard noexcept move operations — if id_to_row_ or build_index_flag_
+// Guard noexcept move operations — if sorted_index_ or build_index_flag_
 // types change to non-nothrow-movable, this catches it at compile time.
-static_assert(std::is_nothrow_move_constructible_v<std::unordered_map<uint64_t, uint64_t>>,
-              "id_to_row_ must be nothrow-movable for RowMapping noexcept move operations");
+static_assert(std::is_nothrow_move_constructible_v<std::vector<std::pair<uint64_t, uint64_t>>>,
+              "sorted_index_ must be nothrow-movable for RowMapping noexcept move operations");
 static_assert(std::is_nothrow_move_constructible_v<std::unique_ptr<std::once_flag>>,
               "build_index_flag_ must be nothrow-movable for RowMapping noexcept move operations");
 
@@ -64,7 +64,7 @@ RowMapping::RowMapping(RowMapping&& other) noexcept
       mmap_size_(other.mmap_size_),
       count_(other.count_),
       build_index_flag_(std::move(other.build_index_flag_)),
-      id_to_row_(std::move(other.id_to_row_))
+      sorted_index_(std::move(other.sorted_index_))
 {
     other.mmap_ptr_  = nullptr;
     other.mmap_size_ = 0;
@@ -81,7 +81,7 @@ RowMapping& RowMapping::operator=(RowMapping&& other) noexcept {
         mmap_size_        = other.mmap_size_;
         count_            = other.count_;
         build_index_flag_ = std::move(other.build_index_flag_);
-        id_to_row_        = std::move(other.id_to_row_);
+        sorted_index_     = std::move(other.sorted_index_);
         other.mmap_ptr_  = nullptr;
         other.mmap_size_ = 0;
         other.count_     = 0;
@@ -254,8 +254,12 @@ std::optional<uint64_t> RowMapping::find(ObjectId target) const {
         throw std::runtime_error("RowMapping::find: not mapped");
     }
     std::call_once(*build_index_flag_, [this] { build_index(); });
-    auto it = id_to_row_.find(target.id);
-    if (it != id_to_row_.end()) {
+
+    auto it = std::lower_bound(sorted_index_.begin(), sorted_index_.end(),
+        std::make_pair(target.id, uint64_t(0)),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    if (it != sorted_index_.end() && it->first == target.id) {
         return it->second;
     }
     return std::nullopt;
@@ -264,12 +268,12 @@ std::optional<uint64_t> RowMapping::find(ObjectId target) const {
 // --- build_index() ---
 
 void RowMapping::build_index() const {
-    id_to_row_.reserve(count_);
+    sorted_index_.resize(count_);
     const ObjectId* arr = data_ptr();
-    // Insert in forward order; first occurrence wins (later duplicates ignored)
     for (uint64_t i = 0; i < count_; ++i) {
-        id_to_row_.emplace(arr[i].id, i);
+        sorted_index_[i] = {arr[i].id, i};
     }
+    std::sort(sorted_index_.begin(), sorted_index_.end());
 }
 
 } // namespace mdb::gnn
