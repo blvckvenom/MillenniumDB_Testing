@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "gnn/storage/row_mapping.h"
 #include "misc/logger.h"
 
 namespace mdb::gnn {
@@ -43,8 +44,18 @@ struct SampleStorage::Impl {
     // Index: batch_id -> (file_offset, data_size)
     std::vector<std::pair<uint64_t, uint64_t>> batch_index;
 
-    // Frequency tracking
+    // Frequency tracking — sparse fallback (when no RowMapping)
     std::unordered_map<uint64_t, uint64_t> node_frequencies;
+
+    // Dense frequency tracking (when RowMapping available during write)
+    const RowMapping* row_mapping_ = nullptr;  // non-owning, optional
+    std::vector<uint64_t> node_freq_dense;     // indexed by row_index
+    std::vector<bool> node_seen;               // bitset indexed by row_index
+    uint64_t dense_unique_count = 0;           // count of unique nodes (bitset path)
+
+    // Dense frequency cache (for read-mode loading of v2 files)
+    std::vector<uint64_t> dense_freq_cache_;
+    int freq_version_ = 0;  // 0=not loaded, 1=v1, 2=v2
 
     /// Index: split_type -> batch IDs (populated on load/write)
     std::unordered_map<int, std::vector<uint64_t>> split_index;
@@ -54,7 +65,7 @@ struct SampleStorage::Impl {
     uint64_t train_batches_written = 0;
     uint64_t validation_batches_written = 0;
     uint64_t test_batches_written = 0;
-    std::unordered_set<uint64_t> unique_nodes_seen;
+    std::unordered_set<uint64_t> unique_nodes_seen;  // sparse fallback
     uint64_t total_edges_written = 0;
 
     Impl() = default;
@@ -138,8 +149,23 @@ struct SampleStorage::Impl {
 
         // Track unique nodes and frequencies
         for (const auto& node : sample.all_unique_nodes) {
-            unique_nodes_seen.insert(node.id);
-            node_frequencies[node.id]++;
+            if (row_mapping_) {
+                // Dense path: O(log N) lookup per node, O(1) vector access
+                auto row = row_mapping_->find(node);
+                if (row.has_value() && *row < node_freq_dense.size()) {
+                    node_freq_dense[*row]++;
+                    if (!node_seen[*row]) {
+                        node_seen[*row] = true;
+                        dense_unique_count++;
+                    }
+                }
+                // Nodes not in RowMapping are silently skipped — they are
+                // outside the projected graph and have no feature row.
+            } else {
+                // Sparse fallback: hash-map based tracking
+                unique_nodes_seen.insert(node.id);
+                node_frequencies[node.id]++;
+            }
         }
 
         // Track edges
@@ -180,13 +206,24 @@ struct SampleStorage::Impl {
             throw std::runtime_error("Failed to create frequency file: " + freq_path.string());
         }
 
-        write_value(freq_out, FREQ_MAGIC);
-        write_value(freq_out, static_cast<uint32_t>(1));  // Version
-        write_value(freq_out, static_cast<uint64_t>(node_frequencies.size()));
-
-        for (const auto& [node_id, count] : node_frequencies) {
-            write_value(freq_out, node_id);
+        if (row_mapping_) {
+            // Dense format (v2): N consecutive uint64 counts indexed by row_index
+            write_value(freq_out, FREQ_MAGIC);
+            write_value(freq_out, static_cast<uint32_t>(2));  // Version 2
+            uint64_t count = node_freq_dense.size();
             write_value(freq_out, count);
+            freq_out.write(reinterpret_cast<const char*>(node_freq_dense.data()),
+                           count * sizeof(uint64_t));
+        } else {
+            // Sparse format (v1): [oid, count] pairs
+            write_value(freq_out, FREQ_MAGIC);
+            write_value(freq_out, static_cast<uint32_t>(1));  // Version 1
+            write_value(freq_out, static_cast<uint64_t>(node_frequencies.size()));
+
+            for (const auto& [node_id, count] : node_frequencies) {
+                write_value(freq_out, node_id);
+                write_value(freq_out, count);
+            }
         }
 
         // Update and save catalog
@@ -194,7 +231,7 @@ struct SampleStorage::Impl {
         catalog.train_batches = train_batches_written;
         catalog.validation_batches = validation_batches_written;
         catalog.test_batches = test_batches_written;
-        catalog.unique_nodes = unique_nodes_seen.size();
+        catalog.unique_nodes = row_mapping_ ? dense_unique_count : unique_nodes_seen.size();
         catalog.total_edges = total_edges_written;
 
         catalog.save(storage_path);
@@ -282,32 +319,91 @@ struct SampleStorage::Impl {
         return GraphSample::deserialize(data_in);
     }
 
-    std::unordered_map<uint64_t, uint64_t> load_frequencies() {
+    void load_frequencies_if_needed() {
+        if (freq_version_ != 0) {
+            return;  // Already loaded
+        }
+
+        // Check in-memory data from write mode before trying disk
         if (!node_frequencies.empty()) {
-            return node_frequencies;
+            // Sparse path was used during write
+            freq_version_ = 1;
+            return;
+        }
+        if (!node_freq_dense.empty()) {
+            // Dense path was used during write — copy to cache
+            dense_freq_cache_ = node_freq_dense;
+            freq_version_ = 2;
+            return;
+        }
+        if (!dense_freq_cache_.empty()) {
+            freq_version_ = 2;
+            return;
         }
 
         auto freq_path = storage_path / FREQUENCY_FILE;
         std::ifstream freq_in(freq_path, std::ios::binary);
         if (!freq_in) {
-            return {};
+            return;
         }
 
         uint32_t magic = read_value<uint32_t>(freq_in);
         if (magic != FREQ_MAGIC) {
-            return {};
+            return;
         }
 
-        read_value<uint32_t>(freq_in);  // Skip version
+        uint32_t version = read_value<uint32_t>(freq_in);
         uint64_t num_entries = read_value<uint64_t>(freq_in);
 
-        for (uint64_t i = 0; i < num_entries; ++i) {
-            uint64_t node_id = read_value<uint64_t>(freq_in);
-            uint64_t count = read_value<uint64_t>(freq_in);
-            node_frequencies[node_id] = count;
+        if (version == 2) {
+            // Dense format: N consecutive uint64 counts
+            dense_freq_cache_.resize(num_entries);
+            freq_in.read(reinterpret_cast<char*>(dense_freq_cache_.data()),
+                         num_entries * sizeof(uint64_t));
+            freq_version_ = 2;
+        } else {
+            // v1 sparse format: [oid, count] pairs
+            for (uint64_t i = 0; i < num_entries; ++i) {
+                uint64_t node_id = read_value<uint64_t>(freq_in);
+                uint64_t count = read_value<uint64_t>(freq_in);
+                node_frequencies[node_id] = count;
+            }
+            freq_version_ = 1;
+        }
+    }
+
+    /// Backward-compatible: returns hash map of oid->count.
+    /// For v2 files this requires a RowMapping to convert back to OIDs,
+    /// but the existing callers (get_node_frequencies, get_top_frequent_nodes)
+    /// don't pass one, so v2 files convert using the RowMapping pointer
+    /// only if one was provided at write time (still in memory).
+    std::unordered_map<uint64_t, uint64_t> load_frequencies() {
+        load_frequencies_if_needed();
+
+        if (freq_version_ == 1) {
+            return node_frequencies;
         }
 
-        return node_frequencies;
+        if (freq_version_ == 2 && row_mapping_) {
+            // Convert dense data back to sparse map using the RowMapping.
+            // Pick whichever dense vector is populated: dense_freq_cache_
+            // (loaded from disk) or node_freq_dense (from write mode).
+            const auto& dense = !dense_freq_cache_.empty()
+                ? dense_freq_cache_
+                : node_freq_dense;
+            std::unordered_map<uint64_t, uint64_t> result;
+            for (uint64_t i = 0; i < dense.size(); ++i) {
+                if (dense[i] > 0) {
+                    ObjectId oid = row_mapping_->get(i);
+                    result[oid.id] = dense[i];
+                }
+            }
+            return result;
+        }
+
+        // freq_version_==2 without RowMapping: cannot convert dense→sparse.
+        // Callers needing dense format should use get_dense_frequencies().
+        return {};
     }
 
     // =========================================================================
@@ -361,6 +457,30 @@ SampleStorage SampleStorage::create(
 
     SampleStorage storage;
     storage.impl_->init_write_mode(path, config);
+    return storage;
+}
+
+SampleStorage SampleStorage::create(
+    const std::filesystem::path& db_folder,
+    const SamplingConfig& config,
+    const RowMapping& row_mapping
+) {
+    auto path = get_storage_path(db_folder, config.sample_name);
+
+    if (std::filesystem::exists(path)) {
+        throw std::runtime_error("Sample storage already exists: " + path.string());
+    }
+
+    SampleStorage storage;
+    storage.impl_->row_mapping_ = &row_mapping;
+    storage.impl_->init_write_mode(path, config);
+
+    // Initialize dense tracking structures
+    uint64_t N = row_mapping.size();
+    storage.impl_->node_freq_dense.assign(N, 0);
+    storage.impl_->node_seen.assign(N, false);
+    storage.impl_->dense_unique_count = 0;
+
     return storage;
 }
 
@@ -445,6 +565,31 @@ bool SampleStorage::is_write_mode() const {
 
 std::unordered_map<uint64_t, uint64_t> SampleStorage::get_node_frequencies() {
     return impl_->load_frequencies();
+}
+
+std::vector<uint64_t> SampleStorage::get_dense_frequencies(const RowMapping& rm) {
+    impl_->load_frequencies_if_needed();
+
+    if (impl_->freq_version_ == 2) {
+        // Already dense — return directly
+        return impl_->dense_freq_cache_;
+    }
+
+    if (impl_->freq_version_ == 1) {
+        // Convert v1 (oid->count map) to dense vector via RowMapping
+        uint64_t N = rm.size();
+        std::vector<uint64_t> dense(N, 0);
+        for (const auto& [oid_id, count] : impl_->node_frequencies) {
+            auto row = rm.find(ObjectId(oid_id));
+            if (row.has_value() && *row < N) {
+                dense[*row] = count;
+            }
+        }
+        return dense;
+    }
+
+    // No frequency data loaded
+    return {};
 }
 
 std::vector<std::pair<ObjectId, uint64_t>> SampleStorage::get_top_frequent_nodes(size_t k) {

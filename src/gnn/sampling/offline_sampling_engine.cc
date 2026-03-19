@@ -87,6 +87,10 @@ struct OfflineSamplingEngine::Impl {
             }
 
             // Create storage
+            // TODO(FourLevelStore): When RowMapping is available from the projection
+            // context, pass it here to enable dense frequency tracking:
+            //   SampleStorage::create(db_folder, config, row_mapping)
+            // This would reduce RAM from ~9.5 GB to ~0.8 GB at 100M nodes.
             SampleStorage sample_storage = SampleStorage::create(db_folder, config);
 
             // Get seed split

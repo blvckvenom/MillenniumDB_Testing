@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "graph_models/object_id.h"
@@ -11,6 +12,10 @@
 #include "gnn/sampling/sampling_config.h"
 
 namespace mdb::gnn {
+
+// Forward declaration — full definition in gnn/storage/row_mapping.h.
+// Used by the dense frequency path; avoids adding a heavy include to this header.
+class RowMapping;
 
 /**
  * @brief Persistent storage for pre-computed GNN samples.
@@ -39,8 +44,12 @@ namespace mdb::gnn {
  * **batches.idx**: Magic (`INDX`), version (uint32), entry count (uint64),
  * then `[offset, size]` pairs (each uint64) — one per batch_id.
  *
- * **frequency.dat**: Magic (`FREQ`), version (uint32), entry count (uint64),
+ * **frequency.dat v1**: Magic (`FREQ`), version=1 (uint32), entry count (uint64),
  * then `[node_id, count]` pairs (each uint64).
+ *
+ * **frequency.dat v2** (dense): Magic (`FREQ`), version=2 (uint32),
+ * count=N (uint64), then N consecutive uint64 frequency values indexed
+ * by RowMapping row_index. Requires a RowMapping for interpretation.
  *
  * ## Usage
  *
@@ -88,6 +97,30 @@ public:
     static SampleStorage create(
         const std::filesystem::path& db_folder,
         const SamplingConfig& config
+    );
+
+    /**
+     * @brief Create new sample storage with RowMapping for dense tracking.
+     *
+     * When a RowMapping is provided, frequency counting uses a dense
+     * vector<uint64_t>[row_index] (8 bytes/node) instead of an
+     * unordered_map (approximately 50 bytes/node), and unique-node tracking uses a
+     * vector<bool> bitset (1 bit/node) instead of unordered_set
+     * (approximately 50 bytes/node). At 100M nodes this reduces RAM from 9.5 GB to under 1 GB.
+     *
+     * The RowMapping must outlive the SampleStorage write phase (until
+     * finalize() is called).
+     *
+     * @param db_folder Database root folder
+     * @param config Sampling configuration
+     * @param row_mapping RowMapping for ObjectId to row_index translation
+     * @return New SampleStorage in write mode with dense tracking enabled
+     * @throws std::runtime_error if storage already exists or creation fails
+     */
+    static SampleStorage create(
+        const std::filesystem::path& db_folder,
+        const SamplingConfig& config,
+        const RowMapping& row_mapping
     );
 
     /**
@@ -218,6 +251,23 @@ public:
      * @return Map of node_id -> access_count
      */
     std::unordered_map<uint64_t, uint64_t> get_node_frequencies();
+
+    /**
+     * @brief Get dense frequency vector indexed by RowMapping row_index.
+     *
+     * Returns a vector of size rm.size() where result[row_index] is the
+     * number of times that node appeared across all samples.
+     *
+     * Works with both file formats:
+     * - v2 (dense): Returns stored vector directly (zero-copy path).
+     * - v1 (sparse oid/count pairs): Converts on the fly via RowMapping.
+     *
+     * Primary consumer: FourLevelStore::build() for cache-tier assignment.
+     *
+     * @param rm RowMapping for ObjectId to row_index translation
+     * @return Dense frequency vector, empty if no frequency data available
+     */
+    std::vector<uint64_t> get_dense_frequencies(const RowMapping& rm);
 
     /**
      * @brief Get top-K most frequent nodes.
