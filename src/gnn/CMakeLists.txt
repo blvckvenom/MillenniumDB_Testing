@@ -64,6 +64,7 @@ add_library(mdb_gnn_core STATIC
     core/tensor_utils.cc
     core/memory_pool.cc
     core/sparse_ops.cc
+    core/feature_assembler.cc
 
     # GNN Tensor Storage (independent from MDB tensors)
     storage/inmemory_gnn_tensor_store.cc
@@ -178,6 +179,25 @@ if(GNN_CUDA_ENABLED)
         message(WARNING "CUDA Toolkit not found. Disabling CUDA support.")
         set(GNN_CUDA_ENABLED OFF)
     endif()
+endif()
+
+# ----------------------------------------------------------------------------
+# CUDA Feature Assembler (requires nvcc + CUDAToolkit)
+# ----------------------------------------------------------------------------
+if(GNN_CUDA_ENABLED AND CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    target_sources(mdb_gnn_core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/feature_assembler.cu
+    )
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/core/feature_assembler.cu
+        PROPERTIES LANGUAGE CUDA
+    )
+    target_compile_options(mdb_gnn_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -std=c++17>
+    )
+    target_compile_definitions(mdb_gnn_core PUBLIC ENABLE_CUDA_ASSEMBLER)
+    message(STATUS "CUDA Feature Assembler enabled")
 endif()
 
 # ----------------------------------------------------------------------------
@@ -342,6 +362,25 @@ if(BUILD_TESTING)
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
         add_test(NAME DirectIoTests COMMAND test_direct_io)
+
+        # Feature Assembler tests (CUDA kernel + LibTorch fallback)
+        add_executable(test_feature_assembler
+            tests/test_feature_assembler.cc
+        )
+        target_link_libraries(test_feature_assembler
+            GTest::gtest_main
+            mdb_gnn_core
+            ${TORCH_LIBRARIES}
+        )
+        set_target_properties(test_feature_assembler PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME FeatureAssemblerTests COMMAND test_feature_assembler)
+        if(EXISTS "${ASAN_SUPP_FILE}")
+            set_property(TEST FeatureAssemblerTests PROPERTY
+                ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+        endif()
 
         message(STATUS "GNN tests enabled")
     else()
