@@ -7,6 +7,7 @@
 
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/cpu_cache.h"
+#include "gnn/storage/gpu_cache.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/gnn_dtype.h"
 #include "gnn/storage/row_mapping.h"
@@ -434,4 +435,348 @@ TEST_F(FourLevelStoreTest, CpuCache_BadMagic) {
 TEST_F(FourLevelStoreTest, CpuCache_NonexistentFile) {
     auto cache_path = test_dir_ / "does_not_exist.bin";
     EXPECT_THROW(CpuCache cache(cache_path), std::runtime_error);
+}
+
+// =============================================================================
+// GpuCache Tests
+// =============================================================================
+
+// =============================================================================
+// GpuCache: Build and load empty cache
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_BuildAndLoad_Empty) {
+    auto cache_path = test_dir_ / "gpu_cache_empty.bin";
+    std::vector<ObjectId> nodes = {};
+    GpuCache::build(nodes, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+    EXPECT_EQ(cache.num_nodes(), 0u);
+    EXPECT_EQ(cache.memory_bytes(), 0u);
+    EXPECT_FALSE(cache.is_on_gpu());  // no data to put on GPU
+
+    // Lookup against empty cache: all misses
+    auto result = cache.lookup({node_oids_[0]});
+    EXPECT_EQ(result.hit_positions.size(), 0u);
+    EXPECT_EQ(result.miss_positions.size(), 1u);
+}
+
+// =============================================================================
+// GpuCache: Build with specific nodes, verify contains + lookup features
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_BuildWithNodes) {
+    auto cache_path = test_dir_ / "gpu_cache_nodes.bin";
+    std::vector<ObjectId> nodes = {node_oids_[3], node_oids_[5]};
+    GpuCache::build(nodes, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+    EXPECT_EQ(cache.num_nodes(), 2u);
+    EXPECT_EQ(cache.feature_dim(), D);
+    EXPECT_TRUE(cache.contains(node_oids_[3]));
+    EXPECT_TRUE(cache.contains(node_oids_[5]));
+    EXPECT_FALSE(cache.contains(node_oids_[0]));
+
+    // Lookup: 2 hits (3, 5) + 1 miss (0)
+    auto result = cache.lookup({node_oids_[3], node_oids_[0], node_oids_[5]});
+    EXPECT_EQ(result.hit_positions.size(), 2u);
+    EXPECT_EQ(result.miss_positions.size(), 1u);
+
+    // Hit positions (indices in input): 0(node3), 2(node5)
+    EXPECT_EQ(result.hit_positions[0], 0u);
+    EXPECT_EQ(result.hit_positions[1], 2u);
+    EXPECT_EQ(result.miss_positions[0], 1u);
+
+    // Verify features on CPU (even if tensor was on GPU)
+    auto cpu_features = result.features.cpu();
+    auto accessor = cpu_features.accessor<float, 2>();
+    // First hit: node 3 -> row 3 -> features [401, 402, 403, 404]
+    EXPECT_FLOAT_EQ(accessor[0][0], 401.0f);
+    EXPECT_FLOAT_EQ(accessor[0][1], 402.0f);
+    EXPECT_FLOAT_EQ(accessor[0][2], 403.0f);
+    EXPECT_FLOAT_EQ(accessor[0][3], 404.0f);
+    // Second hit: node 5 -> row 5 -> features [601, 602, 603, 604]
+    EXPECT_FLOAT_EQ(accessor[1][0], 601.0f);
+    EXPECT_FLOAT_EQ(accessor[1][1], 602.0f);
+    EXPECT_FLOAT_EQ(accessor[1][2], 603.0f);
+    EXPECT_FLOAT_EQ(accessor[1][3], 604.0f);
+}
+
+// =============================================================================
+// GpuCache: Zero nodes -> empty cache, still functional
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_ZeroNodes) {
+    auto cache_path = test_dir_ / "gpu_zero.bin";
+    GpuCache::build({}, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+    EXPECT_FALSE(cache.is_on_gpu());
+    EXPECT_EQ(cache.num_nodes(), 0u);
+    EXPECT_EQ(cache.feature_dim(), D);  // feature_dim preserved from header
+    EXPECT_EQ(cache.memory_bytes(), 0u);
+}
+
+// =============================================================================
+// GpuCache: All nodes cached — every lookup is a hit
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_AllNodes) {
+    auto cache_path = test_dir_ / "gpu_all.bin";
+    GpuCache::build(node_oids_, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+    EXPECT_EQ(cache.num_nodes(), N);
+    EXPECT_EQ(cache.feature_dim(), D);
+    EXPECT_GT(cache.memory_bytes(), 0u);
+
+    // All nodes should be found
+    for (uint64_t i = 0; i < N; ++i) {
+        EXPECT_TRUE(cache.contains(node_oids_[i])) << "node " << i;
+    }
+
+    // Lookup all nodes: all hits, no misses
+    auto result = cache.lookup(node_oids_);
+    EXPECT_EQ(result.hit_positions.size(), N);
+    EXPECT_EQ(result.miss_positions.size(), 0u);
+
+    // Verify every row
+    auto cpu_features = result.features.cpu();
+    auto accessor = cpu_features.accessor<float, 2>();
+    for (uint64_t r = 0; r < N; ++r) {
+        for (uint64_t c = 0; c < D; ++c) {
+            EXPECT_FLOAT_EQ(accessor[r][c], expected_feature(r, c))
+                << "node " << r << ", dim " << c;
+        }
+    }
+}
+
+// =============================================================================
+// GpuCache: Lookup all misses
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_LookupAllMisses) {
+    auto cache_path = test_dir_ / "gpu_partial.bin";
+    // Cache only nodes 0 and 1
+    std::vector<ObjectId> cached = {node_oids_[0], node_oids_[1]};
+    GpuCache::build(cached, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+
+    // Lookup nodes that are NOT in the cache
+    std::vector<ObjectId> query = {node_oids_[5], node_oids_[6], node_oids_[7]};
+    auto result = cache.lookup(query);
+    EXPECT_EQ(result.hit_positions.size(), 0u);
+    EXPECT_EQ(result.miss_positions.size(), 3u);
+    EXPECT_EQ(result.features.size(0), 0);
+    EXPECT_EQ(result.features.size(1), static_cast<int64_t>(D));
+}
+
+// =============================================================================
+// GpuCache: Lookup empty query
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_LookupEmptyQuery) {
+    auto cache_path = test_dir_ / "gpu_for_empty_q.bin";
+    std::vector<ObjectId> cached = {node_oids_[0]};
+    GpuCache::build(cached, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+
+    auto result = cache.lookup({});
+    EXPECT_EQ(result.hit_positions.size(), 0u);
+    EXPECT_EQ(result.miss_positions.size(), 0u);
+    EXPECT_EQ(result.features.size(0), 0);
+}
+
+// =============================================================================
+// GpuCache: Verify GNNC file format (header + OID table + data)
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_FileFormat) {
+    auto cache_path = test_dir_ / "gpu_format.bin";
+    std::vector<ObjectId> nodes = {node_oids_[2], node_oids_[4]};
+    GpuCache::build(nodes, *fm_, *rm_, cache_path);
+
+    // Expected file size: header(32) + OID table(2*8) + data(2*4*4)
+    size_t expected = CacheFileHeader::SIZE + 2 * sizeof(uint64_t) + 2 * D * sizeof(float);
+    EXPECT_EQ(fs::file_size(cache_path), expected);
+
+    // Reload and verify
+    GpuCache cache(cache_path);
+    EXPECT_EQ(cache.num_nodes(), 2u);
+    EXPECT_EQ(cache.feature_dim(), D);
+
+    auto result = cache.lookup({node_oids_[2], node_oids_[4]});
+    ASSERT_EQ(result.hit_positions.size(), 2u);
+    auto cpu = result.features.cpu();
+    auto acc = cpu.accessor<float, 2>();
+    // node 2 -> row 2 -> [301, 302, 303, 304]
+    EXPECT_FLOAT_EQ(acc[0][0], 301.0f);
+    EXPECT_FLOAT_EQ(acc[0][3], 304.0f);
+    // node 4 -> row 4 -> [501, 502, 503, 504]
+    EXPECT_FLOAT_EQ(acc[1][0], 501.0f);
+    EXPECT_FLOAT_EQ(acc[1][3], 504.0f);
+}
+
+// =============================================================================
+// GpuCache: memory_bytes matches expected tensor size
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_MemoryBytes) {
+    auto cache_path = test_dir_ / "gpu_mem.bin";
+    std::vector<ObjectId> nodes = {node_oids_[0], node_oids_[1], node_oids_[2]};
+    GpuCache::build(nodes, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+    // 3 nodes * 4 dims * 4 bytes (float32) = 48 bytes
+    EXPECT_EQ(cache.memory_bytes(), 3u * D * sizeof(float));
+}
+
+// =============================================================================
+// GpuCache: Lookup preserves input order (hit_positions are input indices)
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_LookupOrderPreserved) {
+    auto cache_path = test_dir_ / "gpu_order.bin";
+    // Cache nodes 1, 3, 5
+    std::vector<ObjectId> cached = {node_oids_[1], node_oids_[3], node_oids_[5]};
+    GpuCache::build(cached, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+
+    // Query in reverse order with a miss interleaved:
+    // input[0]=node5(hit), input[1]=node4(miss), input[2]=node3(hit), input[3]=node1(hit)
+    std::vector<ObjectId> query = {node_oids_[5], node_oids_[4], node_oids_[3], node_oids_[1]};
+    auto result = cache.lookup(query);
+
+    ASSERT_EQ(result.hit_positions.size(), 3u);
+    ASSERT_EQ(result.miss_positions.size(), 1u);
+
+    // Hit positions (indices in query): 0(node5), 2(node3), 3(node1)
+    EXPECT_EQ(result.hit_positions[0], 0u);
+    EXPECT_EQ(result.hit_positions[1], 2u);
+    EXPECT_EQ(result.hit_positions[2], 3u);
+    EXPECT_EQ(result.miss_positions[0], 1u);
+
+    // Features should be in hit order: [node5, node3, node1]
+    auto cpu = result.features.cpu();
+    auto acc = cpu.accessor<float, 2>();
+    EXPECT_FLOAT_EQ(acc[0][0], 601.0f);  // node 5
+    EXPECT_FLOAT_EQ(acc[1][0], 401.0f);  // node 3
+    EXPECT_FLOAT_EQ(acc[2][0], 201.0f);  // node 1
+}
+
+// =============================================================================
+// GpuCache: Duplicate ObjectIds in lookup request
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_DuplicateLookup) {
+    auto cache_path = test_dir_ / "gpu_dup.bin";
+    std::vector<ObjectId> nodes = {node_oids_[3]};
+    GpuCache::build(nodes, *fm_, *rm_, cache_path);
+
+    GpuCache cache(cache_path);
+
+    // Same node requested twice -> two hits
+    auto result = cache.lookup({node_oids_[3], node_oids_[3]});
+    ASSERT_EQ(result.hit_positions.size(), 2u);
+    EXPECT_EQ(result.hit_positions[0], 0u);
+    EXPECT_EQ(result.hit_positions[1], 1u);
+    EXPECT_EQ(result.miss_positions.size(), 0u);
+
+    auto cpu = result.features.cpu();
+    auto acc = cpu.accessor<float, 2>();
+    // Both hits return features for node 3 -> [401, 402, 403, 404]
+    for (int h = 0; h < 2; ++h) {
+        EXPECT_FLOAT_EQ(acc[h][0], 401.0f) << "hit " << h;
+        EXPECT_FLOAT_EQ(acc[h][1], 402.0f) << "hit " << h;
+        EXPECT_FLOAT_EQ(acc[h][2], 403.0f) << "hit " << h;
+        EXPECT_FLOAT_EQ(acc[h][3], 404.0f) << "hit " << h;
+    }
+}
+
+// =============================================================================
+// GpuCache: build() with ObjectId not in RowMapping throws
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_BuildMissingOid) {
+    auto cache_path = test_dir_ / "gpu_bad.bin";
+    ObjectId bad_oid(0xD4000000DEADBEEFULL);
+    std::vector<ObjectId> nodes = {node_oids_[0], bad_oid};
+
+    EXPECT_THROW(
+        GpuCache::build(nodes, *fm_, *rm_, cache_path),
+        std::runtime_error
+    );
+}
+
+// =============================================================================
+// GpuCache: Loading a truncated file throws
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_TruncatedFile) {
+    auto cache_path = test_dir_ / "gpu_trunc.bin";
+    GpuCache::build({node_oids_[0], node_oids_[1]}, *fm_, *rm_, cache_path);
+
+    // Truncate the file to just the header
+    fs::resize_file(cache_path, CacheFileHeader::SIZE);
+
+    EXPECT_THROW(GpuCache cache(cache_path), std::runtime_error);
+}
+
+// =============================================================================
+// GpuCache: Loading a file with bad magic throws
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_BadMagic) {
+    auto cache_path = test_dir_ / "gpu_badmagic.bin";
+
+    CacheFileHeader hdr = CacheFileHeader::make(1, D, GnnDtype::FLOAT32);
+    hdr.magic = 0xDEADDEAD;
+
+    std::ofstream f(cache_path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    f.close();
+
+    EXPECT_THROW(GpuCache cache(cache_path), std::runtime_error);
+}
+
+// =============================================================================
+// GpuCache: Loading a nonexistent file throws
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_NonexistentFile) {
+    auto cache_path = test_dir_ / "gpu_does_not_exist.bin";
+    EXPECT_THROW(GpuCache cache(cache_path), std::runtime_error);
+}
+
+// =============================================================================
+// GpuCache: GNNC file is interchangeable with CpuCache (same format)
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, GpuCache_InterchangeableWithCpuCache) {
+    auto cache_path = test_dir_ / "shared_cache.bin";
+    std::vector<ObjectId> nodes = {node_oids_[2], node_oids_[6]};
+
+    // Build using CpuCache::build, load with GpuCache
+    CpuCache::build(nodes, *fm_, *rm_, cache_path);
+
+    GpuCache gpu_cache(cache_path);
+    EXPECT_EQ(gpu_cache.num_nodes(), 2u);
+    EXPECT_EQ(gpu_cache.feature_dim(), D);
+    EXPECT_TRUE(gpu_cache.contains(node_oids_[2]));
+    EXPECT_TRUE(gpu_cache.contains(node_oids_[6]));
+
+    auto result = gpu_cache.lookup({node_oids_[2], node_oids_[6]});
+    ASSERT_EQ(result.hit_positions.size(), 2u);
+
+    auto cpu = result.features.cpu();
+    auto acc = cpu.accessor<float, 2>();
+    // node 2 -> [301, 302, 303, 304]
+    EXPECT_FLOAT_EQ(acc[0][0], 301.0f);
+    EXPECT_FLOAT_EQ(acc[0][3], 304.0f);
+    // node 6 -> [701, 702, 703, 704]
+    EXPECT_FLOAT_EQ(acc[1][0], 701.0f);
+    EXPECT_FLOAT_EQ(acc[1][3], 704.0f);
 }

@@ -63,6 +63,7 @@ add_library(mdb_gnn_core STATIC
     storage/packed_batch_store.cc
     storage/batch_materializer.cc
     storage/cpu_cache.cc
+    storage/gpu_cache.cc
 
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
