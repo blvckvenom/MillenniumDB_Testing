@@ -320,6 +320,15 @@ if(BUILD_TESTING)
         )
         add_test(NAME FourLevelStoreTests COMMAND test_four_level_store)
 
+        # Suppress known CUDA driver leak (cuInit 408 bytes) in ASan builds
+        set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+        if(EXISTS "${ASAN_SUPP_FILE}")
+            set_property(TEST FourLevelStoreTests PROPERTY
+                ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            set_property(TEST BatchMaterializerTests PROPERTY
+                ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+        endif()
+
         # DirectIoReader tests (O_DIRECT + io_uring, with pread fallback)
         add_executable(test_direct_io
             tests/test_direct_io.cc
