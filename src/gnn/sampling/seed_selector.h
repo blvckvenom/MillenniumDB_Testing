@@ -18,6 +18,8 @@ class ProjectionStorage;
 
 namespace mdb::gnn {
 
+class RowMapping;
+
 /**
  * @brief Result of seed selection and splitting.
  *
@@ -120,9 +122,17 @@ public:
      *
      * @param storage Reference to projection storage (must outlive selector)
      * @param config Sampling configuration with split ratios and batch size
+     * @param row_mapping Optional RowMapping for index-based seed storage.
+     *        When provided, seeds are stored as uint32_t row indices (4 bytes each)
+     *        instead of ObjectId values (8 bytes each), halving memory usage.
+     *        ObjectIds are recovered on demand via RowMapping::get().
+     *        Falls back to ObjectId storage if row_mapping is null or if the
+     *        mapping size exceeds UINT32_MAX.
      * @throws std::invalid_argument if config is invalid
      */
-    SeedSelector(GQL::ProjectionStorage& storage, const SamplingConfig& config);
+    explicit SeedSelector(GQL::ProjectionStorage& storage,
+                          const SamplingConfig& config,
+                          const RowMapping* row_mapping = nullptr);
 
     ~SeedSelector();
 
