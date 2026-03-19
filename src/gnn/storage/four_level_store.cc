@@ -10,8 +10,11 @@
 #include <fcntl.h>
 
 #include "gnn/common/posix_io.h"
+#include "gnn/core/feature_assembler.h"
 #include "gnn/storage/cache_file.h"
+#include "gnn/storage/direct_io_reader.h"
 #include "gnn/storage/feature_matrix.h"
+#include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
 #include "gnn/storage/packed_batch_store.h"
 #include "gnn/storage/row_mapping.h"
@@ -392,13 +395,29 @@ FourLevelStore::FourLevelStore(
         cpu_cache_ = std::make_unique<CpuCache>(cpu_path);
     }
 
-    // Load L3 (mmap fallback for now, DirectIoReader added in Task 14)
+    // Load L3: try DirectIoReader first (zero page cache via O_DIRECT),
+    // fall back to mmap FeatureMatrix if O_DIRECT is not supported
     if (fs::exists(reord_fmat)) {
-        l3_fm_.emplace(FeatureMatrix::open(reord_fmat));
+        try {
+            l3_reader_ = std::make_unique<DirectIoReader>(reord_fmat);
+            l3_header_size_ = FeatureMatrixHeader::SIZE;
+        } catch (...) {
+            // DirectIoReader failed (e.g., O_DIRECT not supported on tmpfs)
+            l3_reader_.reset();
+        }
+
+        if (!l3_reader_) {
+            // Mmap fallback
+            l3_mmap_fb_.emplace(FeatureMatrix::open(reord_fmat));
+        }
     }
     if (fs::exists(reord_rmap)) {
         reordered_rm_.emplace(RowMapping::open(reord_rmap));
     }
+
+    // Feature assembler (always created; dispatches to CUDA kernel or LibTorch
+    // index_copy_ internally depending on ENABLE_CUDA_ASSEMBLER + GPU availability)
+    assembler_ = std::make_unique<FeatureAssembler>(static_cast<int64_t>(feature_dim_));
 }
 
 // =============================================================================
@@ -452,13 +471,21 @@ torch::Tensor FourLevelStore::load_features(const std::vector<ObjectId>& oids) {
             }
         }
 
-        // Fallback to L3 (reordered FeatureMatrix via mmap)
-        if (l3_fm_.has_value() && reordered_rm_.has_value()) {
+        // Fallback to L3 (reordered FeatureMatrix)
+        if (reordered_rm_.has_value()) {
             auto row = reordered_rm_->find(oid);
             if (row.has_value()) {
-                std::memcpy(out_ptr + i * row_bytes,
-                            l3_fm_->row(*row),
-                            row_bytes);
+                if (l3_reader_) {
+                    // DirectIoReader path: read single row via O_DIRECT
+                    std::vector<uint64_t> single_row = {*row};
+                    auto result = l3_reader_->read_rows(single_row, row_bytes, l3_header_size_);
+                    std::memcpy(out_ptr + i * row_bytes, result.data.get(), row_bytes);
+                } else if (l3_mmap_fb_.has_value()) {
+                    // Mmap fallback path
+                    std::memcpy(out_ptr + i * row_bytes,
+                                l3_mmap_fb_->row(*row),
+                                row_bytes);
+                }
                 stats_.l3_reads++;
                 continue;
             }
@@ -533,69 +560,196 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         }
     }
 
-    // Step 2: Allocate output tensor [total, D] on CPU
-    auto output = torch::zeros(
-        {static_cast<int64_t>(total), static_cast<int64_t>(feature_dim_)},
-        torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
-    char* out_ptr = static_cast<char*>(output.data_ptr());
+    // Step 2: Partition nodes into L1/L2/L3/L4 buckets.
+    // Each bucket stores (output_position, source_data) for later assembly.
+    std::vector<uint32_t> l1_input_positions;    // positions in oids[] for L1 lookup
+    std::vector<ObjectId> l1_input_oids;
 
-    // Step 3: Partition and fill features from each level
+    std::vector<uint32_t> l2_positions;          // output positions resolved from L2
+    std::vector<uint32_t> l3_positions;          // output positions resolved from L3
+    std::vector<uint64_t> l3_row_indices;        // corresponding row indices in reordered FM
+
+    std::vector<uint32_t> l4_positions;          // output positions resolved from L4
+    std::vector<uint32_t> l4_slim_indices;       // index into slim_data for each L4 node
+
     for (uint32_t i = 0; i < total; ++i) {
         const auto& oid = oids[i];
 
         // Try L1 (GPU cache)
         if (gpu_cache_ && gpu_cache_->contains(oid)) {
-            auto lr = gpu_cache_->lookup({oid});
-            if (!lr.hit_positions.empty()) {
-                auto cpu_feats = lr.features.cpu().contiguous();
-                std::memcpy(out_ptr + i * row_bytes,
-                            cpu_feats.data_ptr(),
-                            row_bytes);
-                stats_.l1_hits++;
-                continue;
-            }
+            l1_input_positions.push_back(i);
+            l1_input_oids.push_back(oid);
+            stats_.l1_hits++;
+            continue;
         }
 
         // Try L2 (CPU cache)
         if (cpu_cache_ && cpu_cache_->contains(oid)) {
-            auto lr = cpu_cache_->lookup({oid});
-            if (!lr.hit_positions.empty()) {
-                std::memcpy(out_ptr + i * row_bytes,
-                            lr.features.data(),
-                            row_bytes);
-                stats_.l2_hits++;
-                continue;
-            }
+            l2_positions.push_back(i);
+            stats_.l2_hits++;
+            continue;
         }
 
-        // Try L4 (slim file data — check first since slim has exact data)
+        // Try L4 (slim file data -- check first since slim has exact data)
         auto slim_it = slim_oid_to_idx.find(oid.id);
         if (slim_it != slim_oid_to_idx.end()) {
             uint32_t idx = slim_it->second;
             size_t offset = static_cast<size_t>(idx) * row_bytes;
             if (offset + row_bytes <= slim_data.size()) {
-                std::memcpy(out_ptr + i * row_bytes,
-                            slim_data.data() + offset,
-                            row_bytes);
+                l4_positions.push_back(i);
+                l4_slim_indices.push_back(idx);
                 stats_.l4_reads++;
                 continue;
             }
         }
 
         // Fallback to L3 (reordered FeatureMatrix)
-        if (l3_fm_.has_value() && reordered_rm_.has_value()) {
+        if (reordered_rm_.has_value()) {
             auto row = reordered_rm_->find(oid);
             if (row.has_value()) {
-                std::memcpy(out_ptr + i * row_bytes,
-                            l3_fm_->row(*row),
-                            row_bytes);
+                l3_positions.push_back(i);
+                l3_row_indices.push_back(*row);
                 stats_.l3_reads++;
                 continue;
             }
         }
 
-        // Node not resolved — leave as zeros, count as L3 miss
+        // Node not resolved -- leave as zeros, count as L3 miss
         stats_.l3_reads++;
+    }
+
+    // Step 3: Batch-read L3 rows via DirectIoReader (zero page cache)
+    // or mmap fallback. Result is a contiguous buffer of l3_row_indices.size() rows.
+    std::vector<char> l3_buf;
+    if (!l3_row_indices.empty()) {
+        if (l3_reader_) {
+            auto result = l3_reader_->read_rows(l3_row_indices, row_bytes, l3_header_size_);
+            l3_buf.assign(result.data.get(), result.data.get() + result.size);
+        } else if (l3_mmap_fb_.has_value()) {
+            l3_buf.resize(l3_row_indices.size() * row_bytes);
+            l3_mmap_fb_->extract_rows(l3_row_indices, l3_buf.data());
+        }
+    }
+
+    // Step 4: Assemble output tensor.
+    // Use FeatureAssembler when dtype is FLOAT32 and GPU cache is present
+    // (assembler targets GPU output via CUDA kernel / index_copy_).
+    // Otherwise fall back to direct CPU memcpy.
+    //
+    // TODO: extend FeatureAssembler for float64 support.
+    bool use_assembler = (assembler_ != nullptr)
+                         && (dtype_ == GnnDtype::FLOAT32)
+                         && gpu_cache_
+                         && gpu_cache_->is_on_gpu();
+
+    if (use_assembler) {
+        // --- GPU-accelerated assembly path ---
+
+        // L1: batch lookup returns [K1_hits, D] tensor on GPU
+        torch::Tensor gpu_features;
+        std::vector<uint32_t> gpu_positions;
+        if (!l1_input_oids.empty()) {
+            auto lr = gpu_cache_->lookup(l1_input_oids);
+            gpu_features = lr.features;
+            // Map hit_positions (indices into l1_input_oids) back to output positions
+            gpu_positions.reserve(lr.hit_positions.size());
+            for (auto hp : lr.hit_positions) {
+                gpu_positions.push_back(l1_input_positions[hp]);
+            }
+        }
+
+        // Combine L2 + L3 + L4 CPU features into one contiguous float buffer
+        std::vector<float> cpu_combined;
+        std::vector<uint32_t> cpu_combined_positions;
+
+        size_t cpu_total = l2_positions.size() + l3_positions.size() + l4_positions.size();
+        cpu_combined.reserve(cpu_total * feature_dim_);
+        cpu_combined_positions.reserve(cpu_total);
+
+        // L2 features
+        if (!l2_positions.empty()) {
+            std::vector<ObjectId> l2_oids;
+            l2_oids.reserve(l2_positions.size());
+            for (auto pos : l2_positions) l2_oids.push_back(oids[pos]);
+            auto lr = cpu_cache_->lookup(l2_oids);
+            const float* l2_data = reinterpret_cast<const float*>(lr.features.data());
+            for (size_t h = 0; h < lr.hit_positions.size(); ++h) {
+                cpu_combined_positions.push_back(l2_positions[lr.hit_positions[h]]);
+                cpu_combined.insert(cpu_combined.end(),
+                                    l2_data + h * feature_dim_,
+                                    l2_data + (h + 1) * feature_dim_);
+            }
+        }
+
+        // L3 features (already in l3_buf, in order of l3_row_indices)
+        if (!l3_positions.empty() && !l3_buf.empty()) {
+            const float* l3_data = reinterpret_cast<const float*>(l3_buf.data());
+            for (size_t j = 0; j < l3_positions.size(); ++j) {
+                cpu_combined_positions.push_back(l3_positions[j]);
+                cpu_combined.insert(cpu_combined.end(),
+                                    l3_data + j * feature_dim_,
+                                    l3_data + (j + 1) * feature_dim_);
+            }
+        }
+
+        // L4 features (from slim_data)
+        if (!l4_positions.empty()) {
+            const float* slim_float = reinterpret_cast<const float*>(slim_data.data());
+            for (size_t j = 0; j < l4_positions.size(); ++j) {
+                cpu_combined_positions.push_back(l4_positions[j]);
+                uint32_t idx = l4_slim_indices[j];
+                cpu_combined.insert(cpu_combined.end(),
+                                    slim_float + idx * feature_dim_,
+                                    slim_float + (idx + 1) * feature_dim_);
+            }
+        }
+
+        return assembler_->assemble(
+            static_cast<int64_t>(total),
+            gpu_features, gpu_positions,
+            cpu_combined.data(),
+            static_cast<int64_t>(cpu_combined_positions.size()),
+            cpu_combined_positions
+        );
+    }
+
+    // --- CPU-only assembly path (no GPU, or non-float32 dtype) ---
+    auto output = torch::zeros(
+        {static_cast<int64_t>(total), static_cast<int64_t>(feature_dim_)},
+        torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
+    char* out_ptr = static_cast<char*>(output.data_ptr());
+
+    // L1 features (GPU cache -> CPU copy, one-by-one)
+    for (size_t k = 0; k < l1_input_oids.size(); ++k) {
+        auto lr = gpu_cache_->lookup({l1_input_oids[k]});
+        if (!lr.hit_positions.empty()) {
+            auto cpu_feats = lr.features.cpu().contiguous();
+            std::memcpy(out_ptr + l1_input_positions[k] * row_bytes,
+                        cpu_feats.data_ptr(), row_bytes);
+        }
+    }
+
+    // L2 features
+    for (auto pos : l2_positions) {
+        auto lr = cpu_cache_->lookup({oids[pos]});
+        if (!lr.hit_positions.empty()) {
+            std::memcpy(out_ptr + pos * row_bytes,
+                        lr.features.data(), row_bytes);
+        }
+    }
+
+    // L3 features (from batched read in l3_buf)
+    for (size_t j = 0; j < l3_positions.size(); ++j) {
+        std::memcpy(out_ptr + l3_positions[j] * row_bytes,
+                    l3_buf.data() + j * row_bytes, row_bytes);
+    }
+
+    // L4 features (from slim_data)
+    for (size_t j = 0; j < l4_positions.size(); ++j) {
+        uint32_t idx = l4_slim_indices[j];
+        size_t offset = static_cast<size_t>(idx) * row_bytes;
+        std::memcpy(out_ptr + l4_positions[j] * row_bytes,
+                    slim_data.data() + offset, row_bytes);
     }
 
     return output;

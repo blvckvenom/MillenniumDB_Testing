@@ -13,10 +13,13 @@
 
 #include <torch/torch.h>
 
+#include "gnn/core/feature_assembler.h"
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/cpu_cache.h"
+#include "gnn/storage/direct_io_reader.h"
 #include "gnn/storage/gpu_cache.h"
 #include "gnn/storage/feature_matrix.h"
+#include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
 #include "gnn/storage/packed_batch_store.h"
 #include "gnn/storage/row_mapping.h"
@@ -188,15 +191,21 @@ public:
 private:
     std::unique_ptr<GpuCache> gpu_cache_;
     std::unique_ptr<CpuCache> cpu_cache_;
-    // L3: reordered FeatureMatrix + RowMapping (mmap fallback for now).
-    // DirectIoReader added in Task 14.
-    std::optional<FeatureMatrix>    l3_fm_;
+
+    // L3: prefer DirectIoReader (zero page cache via O_DIRECT), fallback to mmap
+    std::unique_ptr<DirectIoReader> l3_reader_;     // io_uring + O_DIRECT
+    std::optional<FeatureMatrix>    l3_mmap_fb_;    // mmap fallback
     std::optional<RowMapping>       reordered_rm_;
+
+    // Assembly: prefer CUDA kernel, fallback to LibTorch index_copy_
+    std::unique_ptr<FeatureAssembler> assembler_;
+
     SampleStorage* samples_ = nullptr;
     std::string    packed_slim_dir_;
     uint64_t       feature_dim_ = 0;
     uint8_t        elem_size_   = 0;
     GnnDtype       dtype_       = GnnDtype::FLOAT32;
+    uint64_t       l3_header_size_ = FeatureMatrixHeader::SIZE; // data offset past header
     Stats          stats_;
 
     /// Map GnnDtype to torch scalar type.
