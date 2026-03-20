@@ -2,7 +2,7 @@
 # =============================================================================
 # GNN Pipeline E2E Test
 #
-# Tests the complete pipeline: import → project → sample → materialize → verify
+# Tests the complete pipeline: import → project → sample → materialize → feature store → verify
 # Uses the Cora dataset (2708 nodes, 1433 dims) with real embeddings.
 #
 # Usage:
@@ -254,6 +254,108 @@ if echo "$ERR_OUT2" | grep -qi "not found"; then
     pass "Error path: non-existent sample reports not found"
 else
     fail "Error path: unexpected output: $ERR_OUT2"
+fi
+
+# =============================================================================
+# Step 5e: Build feature store (FourLevelStore)
+# =============================================================================
+info "Step 5e: Build feature store (FourLevelStore)"
+
+# Build with no GPU (gpu_budget_mb=0) and 100MB CPU budget
+FS_OUT=$(query "CALL gnn_build_feature_store('e2e_sample', 'node_features', {gpu_budget_mb: 0, cpu_budget_mb: 100, reorder: 1, force: 0}) YIELD sampleName, featureName, l1Nodes, l2Nodes, l3Nodes, l4Nodes, gpuAvailable, buildTimeMs RETURN sampleName, featureName, l1Nodes, l2Nodes, l3Nodes, l4Nodes, gpuAvailable, buildTimeMs")
+
+FS_L1=$(echo "$FS_OUT" | tail -1 | cut -d',' -f3)
+FS_L2=$(echo "$FS_OUT" | tail -1 | cut -d',' -f4)
+FS_L3=$(echo "$FS_OUT" | tail -1 | cut -d',' -f5)
+FS_L4=$(echo "$FS_OUT" | tail -1 | cut -d',' -f6)
+
+# gpu_budget_mb=0 => L1 should be 0
+if [ "$FS_L1" = "0" ]; then
+    pass "FourLevelStore: L1 nodes = 0 (no GPU budget)"
+else
+    fail "FourLevelStore: expected L1=0, got $FS_L1"
+fi
+
+# L2 should be > 0 (100MB budget, 1433 dims * 4 bytes = 5732 bytes/row)
+if [ -n "$FS_L2" ] && [ "$FS_L2" -gt 0 ] 2>/dev/null; then
+    pass "FourLevelStore: L2 has $FS_L2 nodes"
+else
+    fail "FourLevelStore: L2 should have nodes, got $FS_L2"
+fi
+
+# Total classified nodes should be sensible
+FS_TOTAL=$((FS_L1 + FS_L2 + FS_L3 + FS_L4))
+if [ "$FS_TOTAL" -gt 0 ] 2>/dev/null; then
+    pass "FourLevelStore: $FS_TOTAL total classified nodes (L1=$FS_L1 L2=$FS_L2 L3=$FS_L3 L4=$FS_L4)"
+else
+    fail "FourLevelStore: no nodes classified"
+fi
+
+# Check output files exist
+if [ -f "$DB_DIR/gnn_features/node_features_cpu_cache.bin" ]; then
+    pass "FourLevelStore: cpu_cache.bin exists"
+else
+    fail "FourLevelStore: missing cpu_cache.bin"
+fi
+
+if [ -f "$DB_DIR/gnn_features/node_features_store.meta" ]; then
+    pass "FourLevelStore: store.meta exists"
+else
+    fail "FourLevelStore: missing store.meta"
+fi
+
+# Check GNNC magic on cpu_cache.bin (first 4 bytes)
+CPU_MAGIC=$(xxd -p -l 4 "$DB_DIR/gnn_features/node_features_cpu_cache.bin")
+if [ "$CPU_MAGIC" = "434e4e47" ] || [ "$CPU_MAGIC" = "474e4e43" ]; then
+    pass "FourLevelStore: cpu_cache.bin has GNNC magic ($CPU_MAGIC)"
+else
+    fail "FourLevelStore: cpu_cache.bin bad magic (expected GNNC, got $CPU_MAGIC)"
+fi
+
+# Check GFLS magic on store.meta
+META_MAGIC=$(xxd -p -l 4 "$DB_DIR/gnn_features/node_features_store.meta")
+if [ "$META_MAGIC" = "534c4647" ] || [ "$META_MAGIC" = "47464c53" ]; then
+    pass "FourLevelStore: store.meta has GFLS magic ($META_MAGIC)"
+else
+    fail "FourLevelStore: store.meta bad magic (expected GFLS, got $META_MAGIC)"
+fi
+
+# Check packed_slim directory exists and has batch files
+SLIM_DIR="$DB_DIR/samples/e2e_sample/packed_slim"
+if [ -d "$SLIM_DIR" ]; then
+    SLIM_COUNT=$(ls "$SLIM_DIR"/batch_*.bin 2>/dev/null | wc -l)
+    if [ "$SLIM_COUNT" -gt 0 ]; then
+        pass "FourLevelStore: packed_slim has $SLIM_COUNT batch files"
+    else
+        fail "FourLevelStore: packed_slim directory is empty"
+    fi
+else
+    # packed_slim might not exist if all nodes fit in L2
+    pass "FourLevelStore: packed_slim not created (all nodes may fit in L2 cache)"
+fi
+
+# =============================================================================
+# Step 5f: Error path — force=0 re-run should fail
+# =============================================================================
+info "Step 5f: Error path — force=0 re-run"
+
+FS_ERR=$(query "CALL gnn_build_feature_store('e2e_sample', 'node_features', {gpu_budget_mb: 0, cpu_budget_mb: 100}) YIELD sampleName RETURN sampleName" 2>&1)
+if echo "$FS_ERR" | grep -qi "already exist\|force"; then
+    pass "FourLevelStore: force=0 prevents overwrite"
+else
+    fail "FourLevelStore: force=0 should fail, got: $FS_ERR"
+fi
+
+# =============================================================================
+# Step 5g: Force overwrite
+# =============================================================================
+info "Step 5g: Force overwrite (force=1)"
+
+FS_FORCE=$(query "CALL gnn_build_feature_store('e2e_sample', 'node_features', {gpu_budget_mb: 0, cpu_budget_mb: 100, force: 1}) YIELD buildTimeMs RETURN buildTimeMs")
+if echo "$FS_FORCE" | grep -qE '[0-9]+'; then
+    pass "FourLevelStore: force=1 overwrite succeeded"
+else
+    fail "FourLevelStore: force=1 overwrite failed: $FS_FORCE"
 fi
 
 # =============================================================================

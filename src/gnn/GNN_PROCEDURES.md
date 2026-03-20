@@ -175,6 +175,61 @@ RETURN *
 
 ---
 
+### gnn_build_feature_store
+
+Build a four-level hierarchical feature store (DiskGNN-faithful). Classifies nodes
+by access frequency into L1 (GPU), L2 (CPU), L3 (shared), and L4 (unique) tiers,
+then writes cache files and slim packed batches.
+
+```gql
+CALL gnn_build_feature_store('sample_name', 'node_features', {
+    gpu_budget_mb: 0, cpu_budget_mb: 100, reorder: 1, force: 0
+})
+YIELD sampleName, featureName, l1Nodes, l2Nodes, l3Nodes, l4Nodes,
+      gpuAvailable, buildTimeMs
+RETURN *
+```
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| sampleName | STRING | yes | — | Existing sample set name |
+| featureName | STRING | yes | — | Registered feature name |
+| options | MAP | no | `{}` | See below |
+
+**Options:**
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| gpu_budget_mb | INT | 2048 | GPU memory budget in MB (0 = skip L1) |
+| cpu_budget_mb | INT | 4096 | CPU memory budget in MB |
+| reorder | BOOL | 1 | Use MinHash reordering for L3 |
+| force | BOOL | 0 | Overwrite existing feature store files |
+| strategy | STRING | 'SEGMENTED' | MinHash strategy ('SEGMENTED' or 'MULTIPASS_BOUNDED') |
+| numHashes | INT | 64 | Hash functions for MinHash |
+| segmentSize | INT | 50 | Batches per segment (SEGMENTED strategy) |
+
+**YIELD columns:**
+| Column | Type | Description |
+|--------|------|-------------|
+| sampleName | STRING | Echo of input sample name |
+| featureName | STRING | Echo of input feature name |
+| l1Nodes | INT | Nodes in GPU cache (L1) |
+| l2Nodes | INT | Nodes in CPU cache (L2) |
+| l3Nodes | INT | Shared nodes (L3, freq > 1) |
+| l4Nodes | INT | Unique nodes (L4, freq == 1) |
+| gpuAvailable | BOOL | Whether CUDA was available |
+| buildTimeMs | INT | Total build time in milliseconds |
+
+**Outputs on disk:**
+- `gnn_features/<name>_gpu_cache.bin` — L1 GPU cache (GNNC format)
+- `gnn_features/<name>_cpu_cache.bin` — L2 CPU cache (GNNC format)
+- `gnn_features/<name>_store.meta` — Store metadata (GFLS format)
+- `gnn_features/<name>_reordered.fmat` — L3 reordered FeatureMatrix (if reorder=1)
+- `gnn_features/<name>_reordered.rmap` — L3 reordered RowMapping (if reorder=1)
+- `samples/<sampleName>/packed_slim/batch_NNNNNN.bin` — L4 slim packed batches (GNNB v2)
+
+---
+
 ## Binary File Formats
 
 ### FeatureMatrix (.fmat)
@@ -201,6 +256,44 @@ Header: magic=0x51455246 ("FREQ"), version=1, count(u64). Each entry: node_oid(u
 Header: magic=0x48435442 ("BTCH"), version=1. Each blob: magic=0x4D534E47 ("GNSM"), version=2.
 See `src/gnn/sampling/graph_sample.cc` for GraphSample serialization layout.
 
-### PackedBatchStore (.bin per batch)
+### PackedBatchStore (.bin per batch) — GNNB v1
 `[Header: 32B][Data: N×D×dtype_size]`
 Header: magic=0x474E4E42 ("GNNB"), version=1, num_nodes(u64), feature_dim(u64), dtype(u8), reserved(7B).
+
+### PackedBatchStore v2 (.bin per batch) — GNNB v2
+`[Header: 32B][ObjectId table: N×8B][Data: N×D×dtype_size]`
+Same header as v1 but version=2. ObjectId table between header and data enables
+node identification without external index. Used by `packed_slim` files from
+`gnn_build_feature_store`. v1 files remain readable (v1 has no OID table).
+
+### Cache File (.bin) — GNNC Format
+Used for gpu_cache.bin and cpu_cache.bin.
+```
+Offset  Size       Field
+0       4B         magic: 0x474E4E43 ("GNNC")
+4       4B         version: uint32 = 1
+8       8B         num_nodes: uint64
+16      8B         feature_dim: uint64
+24      1B         dtype: uint8
+25      7B         reserved
+32      N×8B       ObjectId table
+32+N×8  N×D×dtype  Feature rows (contiguous)
+```
+
+### Store Metadata — GFLS Format
+Written by `gnn_build_feature_store`, read by FourLevelStore runtime constructor.
+```
+Offset  Size   Field
+0       4B     magic: 0x47464C53 ("GFLS")
+4       4B     version: uint32 = 1
+8       8B     l1_count: uint64
+16      8B     l2_count: uint64
+24      8B     l3_count: uint64
+32      8B     l4_count: uint64
+40      8B     feature_dim: uint64
+48      1B     dtype: uint8
+49      1B     gpu_available: uint8
+50      6B     reserved
+56      256B   packed_slim_dir (null-terminated path)
+```
+Total: 312 bytes.
