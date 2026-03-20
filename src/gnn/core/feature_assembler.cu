@@ -20,8 +20,8 @@ __global__ void assemble_kernel(
     float* __restrict__ output,           // [N, D] on GPU
     const float* __restrict__ gpu_data,   // [K1, D] on GPU (HBM)
     const float* __restrict__ cpu_data,   // CPU pinned (UVA)
-    const uint32_t* positions,            // [total_entries] output row indices
-    const uint32_t* source_indices,       // [total_entries] row index in source
+    const int32_t* positions,             // [total_entries] output row indices
+    const int32_t* source_indices,        // [total_entries] row index in source
     const uint8_t* source_level,          // 0=GPU, 1=CPU
     int64_t D,
     int64_t total_entries
@@ -105,15 +105,15 @@ torch::Tensor FeatureAssembler::assemble_cuda(
         output.data_ptr<float>(),
         gpu_data_ptr,
         cpu_data,
-        reinterpret_cast<const uint32_t*>(d_positions.data_ptr<int32_t>()),
-        reinterpret_cast<const uint32_t*>(d_src_indices.data_ptr<int32_t>()),
+        d_positions.data_ptr<int32_t>(),
+        d_src_indices.data_ptr<int32_t>(),
         d_levels.data_ptr<uint8_t>(),
         D,
         total_entries
     );
 
-    // Synchronize to ensure kernel completion before returning
-    cudaDeviceSynchronize();
+    // Synchronize default stream only (not all GPU work)
+    cudaStreamSynchronize(0);
 
     return output;
 }

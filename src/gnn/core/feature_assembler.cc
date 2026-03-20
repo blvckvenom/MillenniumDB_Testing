@@ -30,6 +30,22 @@ torch::Tensor FeatureAssembler::assemble_fallback(
     int64_t cpu_count,
     const std::vector<uint32_t>& cpu_positions)
 {
+    // Bounds-check positions against total_nodes (I6)
+    for (auto pos : gpu_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range(
+                "FeatureAssembler::assemble_fallback: gpu_position " +
+                std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+    for (auto pos : cpu_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range(
+                "FeatureAssembler::assemble_fallback: cpu_position " +
+                std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+
     // Determine output device: if gpu_features lives on CUDA, output there
     auto device = (gpu_features.defined() && gpu_features.is_cuda())
         ? torch::kCUDA : torch::kCPU;
@@ -84,18 +100,17 @@ torch::Tensor FeatureAssembler::assemble_simple(
 {
     const float* cpu_ptr = nullptr;
     int64_t cpu_count = 0;
+    torch::Tensor contig_holder;  // must outlive the assemble() call
 
     if (cpu_features.defined() && cpu_features.numel() > 0) {
         // Ensure contiguous CPU tensor for raw pointer access
-        auto contig = cpu_features.contiguous().to(torch::kCPU);
-        cpu_ptr = contig.data_ptr<float>();
-        cpu_count = contig.size(0);
-        return assemble(total_nodes, l1_features, l1_positions,
-                        cpu_ptr, cpu_count, cpu_positions);
+        contig_holder = cpu_features.contiguous().to(torch::kCPU);
+        cpu_ptr = contig_holder.data_ptr<float>();
+        cpu_count = contig_holder.size(0);
     }
 
     return assemble(total_nodes, l1_features, l1_positions,
-                    nullptr, 0, cpu_positions);
+                    cpu_ptr, cpu_count, cpu_positions);
 }
 
 // ============================================================================
@@ -110,6 +125,22 @@ torch::Tensor FeatureAssembler::assemble(
     int64_t cpu_count,
     const std::vector<uint32_t>& cpu_positions)
 {
+    // Bounds-check positions against total_nodes (I6)
+    for (auto pos : gpu_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range(
+                "FeatureAssembler::assemble: gpu_position " +
+                std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+    for (auto pos : cpu_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range(
+                "FeatureAssembler::assemble: cpu_position " +
+                std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+
 #ifdef ENABLE_CUDA_ASSEMBLER
     if (torch::cuda::is_available()) {
         return assemble_cuda(total_nodes, gpu_features, gpu_positions,
