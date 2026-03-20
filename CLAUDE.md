@@ -101,7 +101,7 @@ Tensors for GNN must not be related to existing tensor implementation. See `docs
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
-- **Compiler flags:** `-march=native` for CPU optimizations, `-fno-operator-names`
+- **Compiler flags:** `-march=native` for CPU optimizations
 - **Debug builds:** Include AddressSanitizer and UndefinedBehaviorSanitizer
 - **Release builds:** `-O3` optimization with optional IPO
 - **Profile builds:** Require `PROFILE=ON` flag and gperftools/tcmalloc
