@@ -165,12 +165,15 @@ void DirectIoReader::read_aligned_region(
     uint64_t aligned_off  = align_down(file_offset, block_align_);
     uint64_t skip         = file_offset - aligned_off;
     uint64_t end          = file_offset + wanted_bytes;
-    // Clamp to file size to avoid reading past EOF
+    // I7: Clamp to actual file size boundary, not the aligned file size.
+    // O_DIRECT requires aligned read sizes, so align_up to block boundary,
+    // but never exceed the file-size-aligned ceiling. For non-O_DIRECT reads
+    // that somehow reach here, clamp to exact file size.
     if (end > file_size_) end = file_size_;
     uint64_t aligned_end  = align_up(end, block_align_);
-    // Don't read past the file size (rounded up for alignment)
-    if (aligned_end > align_up(file_size_, block_align_)) {
-        aligned_end = align_up(file_size_, block_align_);
+    uint64_t aligned_fs   = align_up(file_size_, block_align_);
+    if (aligned_end > aligned_fs) {
+        aligned_end = aligned_fs;
     }
     uint64_t aligned_size = aligned_end - aligned_off;
 
@@ -328,6 +331,12 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
             uint64_t aligned_fs   = align_up(file_size_, block_align_);
             if (aligned_end > aligned_fs) aligned_end = aligned_fs;
             uint64_t aligned_size = aligned_end - aligned_off;
+
+            // C3: Overflow check before accumulating scratch_offset
+            if (scratch_offset > SIZE_MAX - aligned_size) {
+                throw std::overflow_error(
+                    "DirectIoReader: scratch buffer size overflow");
+            }
 
             io_ops.push_back({
                 aligned_off,

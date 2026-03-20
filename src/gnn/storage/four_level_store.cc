@@ -3,11 +3,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <vector>
 
 #include <fcntl.h>
+
+#ifdef GNN_CUDA_ENABLED
+#include <cuda_runtime.h>
+#endif
 
 #include "gnn/common/posix_io.h"
 #include "gnn/core/feature_assembler.h"
@@ -398,11 +403,27 @@ FourLevelStore::FourLevelStore(
     // Load L3: try DirectIoReader first (zero page cache via O_DIRECT),
     // fall back to mmap FeatureMatrix if O_DIRECT is not supported
     if (fs::exists(reord_fmat)) {
+        // I8: Read and validate actual header before opening reader
+        {
+            std::ifstream hdr_stream(reord_fmat, std::ios::binary);
+            if (hdr_stream.good()) {
+                FeatureMatrixHeader fmat_hdr{};
+                hdr_stream.read(reinterpret_cast<char*>(&fmat_hdr), sizeof(fmat_hdr));
+                if (hdr_stream.good() && fmat_hdr.is_valid()) {
+                    l3_header_size_ = FeatureMatrixHeader::SIZE;
+                    feature_dim_    = fmat_hdr.num_cols;
+                    elem_size_      = static_cast<uint8_t>(dtype_size(fmat_hdr.get_dtype()));
+                }
+            }
+        }
+
+        // I10: Only catch std::runtime_error (expected on tmpfs, NFS, etc.
+        // where O_DIRECT is unsupported). Fatal errors (std::bad_alloc,
+        // std::logic_error, etc.) must propagate.
         try {
             l3_reader_ = std::make_unique<DirectIoReader>(reord_fmat);
-            l3_header_size_ = FeatureMatrixHeader::SIZE;
-        } catch (...) {
-            // DirectIoReader failed (e.g., O_DIRECT not supported on tmpfs)
+        } catch (const std::runtime_error&) {
+            // O_DIRECT not available — fall back to mmap
             l3_reader_.reset();
         }
 
@@ -704,13 +725,39 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             }
         }
 
-        return assembler_->assemble(
+        // C2: Pin the CPU combined buffer for UVA access from the CUDA
+        // assembler kernel.  Unpinned heap memory forces the GPU to read
+        // through UVA at ~120 MB/s; pinned memory achieves ~12 GB/s.
+        const float* assembler_data = cpu_combined.data();
+        float* pinned_buf = nullptr;
+#ifdef GNN_CUDA_ENABLED
+        size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
+        if (cpu_combined_bytes > 0) {
+            if (cudaHostAlloc(reinterpret_cast<void**>(&pinned_buf),
+                              cpu_combined_bytes,
+                              cudaHostAllocDefault) == cudaSuccess) {
+                std::memcpy(pinned_buf, cpu_combined.data(), cpu_combined_bytes);
+                assembler_data = pinned_buf;
+            } else {
+                pinned_buf = nullptr;  // fallback to unpinned
+            }
+        }
+#endif
+
+        auto result_tensor = assembler_->assemble(
             static_cast<int64_t>(total),
             gpu_features, gpu_positions,
-            cpu_combined.data(),
+            assembler_data,
             static_cast<int64_t>(cpu_combined_positions.size()),
             cpu_combined_positions
         );
+
+#ifdef GNN_CUDA_ENABLED
+        if (pinned_buf) {
+            cudaFreeHost(pinned_buf);
+        }
+#endif
+        return result_tensor;
     }
 
     // --- CPU-only assembly path (no GPU, or non-float32 dtype) ---
