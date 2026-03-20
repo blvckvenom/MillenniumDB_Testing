@@ -339,6 +339,67 @@ TEST(FeatureAssemblerTest, ManyNodes) {
 // CUDA Path (only runs when CUDA is available)
 // =============================================================================
 
+// =============================================================================
+// Large Dimension Tiling (D=2048 exceeds typical CUDA block size of 256)
+// CUDA kernel should tile: for (feat = threadIdx.x; feat < D; feat += blockDim.x)
+// =============================================================================
+
+TEST(FeatureAssemblerTest, LargeDimensionTiling) {
+    constexpr int64_t N = 4, D = 2048;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::randn({2, D});
+    std::vector<uint32_t> gpu_pos = {0, 2};
+
+    std::vector<float> cpu_data(2 * D);
+    for (auto& v : cpu_data) v = 1.0f;
+    std::vector<uint32_t> cpu_pos = {1, 3};
+
+    auto output = assembler.assemble(N, gpu, gpu_pos, cpu_data.data(), 2, cpu_pos);
+    EXPECT_EQ(output.size(0), N);
+    EXPECT_EQ(output.size(1), D);
+
+    // Verify CPU rows are all 1.0
+    auto acc = output.accessor<float, 2>();
+    for (int d = 0; d < D; ++d) {
+        EXPECT_FLOAT_EQ(acc[1][d], 1.0f) << "CPU row 1, dim " << d;
+        EXPECT_FLOAT_EQ(acc[3][d], 1.0f) << "CPU row 3, dim " << d;
+    }
+
+    // Verify GPU rows match the random tensor
+    auto gpu_acc = gpu.accessor<float, 2>();
+    for (int d = 0; d < D; ++d) {
+        EXPECT_FLOAT_EQ(acc[0][d], gpu_acc[0][d]) << "GPU row 0, dim " << d;
+        EXPECT_FLOAT_EQ(acc[2][d], gpu_acc[1][d]) << "GPU row 2, dim " << d;
+    }
+}
+
+// =============================================================================
+// Position Bounds Validation (throws std::out_of_range)
+// =============================================================================
+
+TEST(FeatureAssemblerTest, GpuPositionOutOfBoundsThrows) {
+    FeatureAssembler assembler(4);
+    auto gpu = torch::randn({1, 4});
+    // Position 5 >= total_nodes 3 -> should throw
+    EXPECT_THROW(
+        assembler.assemble(3, gpu, {5}, nullptr, 0, {}),
+        std::out_of_range);
+}
+
+TEST(FeatureAssemblerTest, CpuPositionOutOfBoundsThrows) {
+    FeatureAssembler assembler(4);
+    float data[] = {1, 2, 3, 4};
+    // Position 5 >= total_nodes 2 -> should throw
+    EXPECT_THROW(
+        assembler.assemble(2, torch::empty({0, 4}), {}, data, 1, {5}),
+        std::out_of_range);
+}
+
+// =============================================================================
+// CUDA Path (only runs when CUDA is available)
+// =============================================================================
+
 #ifdef ENABLE_CUDA_ASSEMBLER
 TEST(FeatureAssemblerTest, CudaKernelMatchesFallback) {
     if (!torch::cuda::is_available()) {

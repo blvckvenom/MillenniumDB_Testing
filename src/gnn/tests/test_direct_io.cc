@@ -498,3 +498,48 @@ TEST_F(DirectIoReaderTest, ReadRowsWithLargeHeader) {
     auto* r1 = reinterpret_cast<const float*>(result.data.get() + ROW_BYTES);
     EXPECT_FLOAT_EQ(r1[0], 301.0f);  // row 2
 }
+
+// =============================================================================
+// Non-aligned row size matching Cora feature dimension
+// Cora: 1433 dims x 4 bytes = 5732 bytes per row (NOT aligned to 512 or 4096)
+// Tests O_DIRECT alignment handling with realistic feature matrix sizes
+// =============================================================================
+
+TEST_F(DirectIoReaderTest, NonAlignedRowSizeCora) {
+    constexpr uint64_t HEADER = 64;
+    constexpr uint64_t ROWS = 10;
+    constexpr uint64_t DIMS = 1433;
+    constexpr uint64_t ROW_BYTES = DIMS * sizeof(float);  // 5732 bytes
+
+    // Create file with known float patterns
+    std::vector<char> data(HEADER + ROWS * ROW_BYTES, 0);
+    for (uint64_t r = 0; r < ROWS; ++r) {
+        auto* row = reinterpret_cast<float*>(data.data() + HEADER + r * ROW_BYTES);
+        for (uint64_t c = 0; c < DIMS; ++c) {
+            row[c] = static_cast<float>((r + 1) * 1000 + c);
+        }
+    }
+    auto path = create_raw_file("cora.bin", data);
+
+    DirectIoReader reader(path);
+    auto result = reader.read_rows({0, 5, 9}, ROW_BYTES, HEADER);
+
+    ASSERT_EQ(result.num_rows, 3u);
+    ASSERT_EQ(result.size, 3u * ROW_BYTES);
+
+    // Row 0: (0+1)*1000 + dim
+    auto* r0 = reinterpret_cast<const float*>(result.data.get());
+    EXPECT_FLOAT_EQ(r0[0], 1000.0f);     // row 0, dim 0
+    EXPECT_FLOAT_EQ(r0[1432], 2432.0f);  // row 0, dim 1432
+
+    // Row 5: (5+1)*1000 + dim
+    auto* r5 = reinterpret_cast<const float*>(result.data.get() + ROW_BYTES);
+    EXPECT_FLOAT_EQ(r5[0], 6000.0f);     // row 5, dim 0
+    EXPECT_FLOAT_EQ(r5[716], 6716.0f);   // row 5, middle dim
+    EXPECT_FLOAT_EQ(r5[1432], 7432.0f);  // row 5, last dim
+
+    // Row 9: (9+1)*1000 + dim
+    auto* r9 = reinterpret_cast<const float*>(result.data.get() + 2 * ROW_BYTES);
+    EXPECT_FLOAT_EQ(r9[0], 10000.0f);    // row 9, dim 0
+    EXPECT_FLOAT_EQ(r9[1432], 11432.0f); // row 9, last dim
+}

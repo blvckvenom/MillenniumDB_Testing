@@ -1482,3 +1482,192 @@ TEST_F(FourLevelStoreCoordTest, SingleBatch_S4) {
         }
     }
 }
+
+// =============================================================================
+// S4 Property with FLOAT64 end-to-end
+// Catches dtype conversion bugs in the pipeline
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4WithFloat64) {
+    // Create FLOAT64 FeatureMatrix + RowMapping
+    auto fmat64_path = gnn_dir_ / "test_feat64.fmat";
+    auto rmap64_path = gnn_dir_ / "test_feat64.rmap";
+
+    std::vector<double> features64(N * D);
+    for (uint64_t r = 0; r < N; ++r)
+        for (uint64_t c = 0; c < D; ++c)
+            features64[r * D + c] = static_cast<double>((r + 1) * 1000 + (c + 1));
+
+    FeatureMatrix::create(fmat64_path, N, D, GnnDtype::FLOAT64, features64.data());
+    RowMapping::create(rmap64_path, node_oids_);
+
+    // Create samples for the FLOAT64 test
+    auto samples = create_frequency_samples("fls_f64");
+    auto config = make_config(/*cpu_budget_nodes=*/1, /*reorder=*/false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat64_path),
+        RowMapping::open(rmap64_path),
+        samples, config, db_folder_, "test_feat64");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_f64"));
+    FourLevelStore store(db_folder_, "test_feat64", samples2);
+
+    auto rm = RowMapping::open(rmap64_path);
+
+    // S4: for every node in every batch, features match original FLOAT64 values
+    for (uint64_t b = 0; b < 5; ++b) {
+        auto sample = samples2.read_sample(b);
+        auto tensor = store.load_batch_features(b);
+        ASSERT_EQ(tensor.size(0), static_cast<int64_t>(sample.all_unique_nodes.size()))
+            << "FLOAT64 batch " << b << " output size mismatch";
+        ASSERT_EQ(tensor.size(1), static_cast<int64_t>(D));
+
+        // Tensor dtype should be float64
+        EXPECT_EQ(tensor.scalar_type(), torch::kFloat64)
+            << "FLOAT64 S4: expected double tensor at batch " << b;
+
+        auto acc = tensor.accessor<double, 2>();
+        for (size_t i = 0; i < sample.all_unique_nodes.size(); ++i) {
+            auto oid = sample.all_unique_nodes[i];
+            auto row = rm.find(oid);
+            ASSERT_TRUE(row.has_value()) << "FLOAT64 batch " << b << " node " << i;
+            for (uint64_t d = 0; d < D; ++d) {
+                double expected = static_cast<double>((*row + 1) * 1000 + (d + 1));
+                EXPECT_DOUBLE_EQ(acc[i][d], expected)
+                    << "FLOAT64 S4 violation: batch " << b << " node " << i
+                    << " (row " << *row << ") dim " << d;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Large Feature Dimension D=2048
+// Tests CUDA kernel tiling (D > blockDim.x=256) and large row handling
+// =============================================================================
+
+TEST_F(FourLevelStoreTest, LargeFeatureDim_2048) {
+    static constexpr uint64_t BIG_D = 2048;
+    static constexpr uint64_t BIG_N = 8;
+
+    // Create 8-node FeatureMatrix with D=2048
+    std::vector<float> big_features(BIG_N * BIG_D);
+    for (uint64_t r = 0; r < BIG_N; ++r)
+        for (uint64_t c = 0; c < BIG_D; ++c)
+            big_features[r * BIG_D + c] = static_cast<float>(r * 10000 + c);
+
+    auto fmat_big_path = test_dir_ / "big.fmat";
+    auto rmap_big_path = test_dir_ / "big.rmap";
+
+    auto fm_big = FeatureMatrix::create(fmat_big_path, BIG_N, BIG_D, GnnDtype::FLOAT32,
+                                        big_features.data());
+    auto rm_big = RowMapping::create(rmap_big_path, node_oids_);
+
+    // Build CpuCache with 2 nodes
+    auto cpu_cache_path = test_dir_ / "big_cpu_cache.bin";
+    std::vector<ObjectId> cpu_nodes = {node_oids_[0], node_oids_[3]};
+    CpuCache::build(cpu_nodes, fm_big, rm_big, cpu_cache_path);
+
+    CpuCache cache(cpu_cache_path);
+    EXPECT_EQ(cache.num_nodes(), 2u);
+    EXPECT_EQ(cache.feature_dim(), BIG_D);
+    EXPECT_EQ(cache.memory_bytes(), 2u * BIG_D * sizeof(float));
+
+    // Verify correct features for node 0 (row 0)
+    auto result = cache.lookup({node_oids_[0]});
+    ASSERT_EQ(result.hit_positions.size(), 1u);
+    auto* data = reinterpret_cast<const float*>(result.features.data());
+    for (uint64_t c = 0; c < BIG_D; ++c) {
+        EXPECT_FLOAT_EQ(data[c], static_cast<float>(0 * 10000 + c))
+            << "Big D cache mismatch at dim " << c;
+    }
+
+    // Build GpuCache with 2 nodes
+    auto gpu_cache_path = test_dir_ / "big_gpu_cache.bin";
+    std::vector<ObjectId> gpu_nodes = {node_oids_[5], node_oids_[7]};
+    GpuCache::build(gpu_nodes, fm_big, rm_big, gpu_cache_path);
+
+    GpuCache gpu_cache(gpu_cache_path);
+    EXPECT_EQ(gpu_cache.num_nodes(), 2u);
+    EXPECT_EQ(gpu_cache.feature_dim(), BIG_D);
+
+    auto gpu_result = gpu_cache.lookup({node_oids_[5]});
+    ASSERT_EQ(gpu_result.hit_positions.size(), 1u);
+    auto cpu_tensor = gpu_result.features.cpu();
+    auto acc = cpu_tensor.accessor<float, 2>();
+    // Row 5: values 5*10000 + c
+    EXPECT_FLOAT_EQ(acc[0][0], 50000.0f);
+    EXPECT_FLOAT_EQ(acc[0][1023], 51023.0f);
+    EXPECT_FLOAT_EQ(acc[0][2047], 52047.0f);
+}
+
+// =============================================================================
+// Empty Sample Storage: 0 batches
+// Build should succeed with all counts = 0
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_EmptySampleStorage) {
+    // Create SampleStorage with 0 batches
+    auto samples = create_samples("fls_empty_samples", {});
+    auto config = make_config(1, false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    EXPECT_EQ(result.l1_nodes, 0u);
+    EXPECT_EQ(result.l2_nodes, 0u);
+    EXPECT_EQ(result.l3_nodes, 0u);
+    // With 0 batches, all N nodes have freq=0, classified as L4
+    EXPECT_EQ(result.l4_nodes, N);
+    EXPECT_EQ(result.total_batches, 0u);
+}
+
+// =============================================================================
+// Budget Boundary: exactly fits all N nodes
+// All nodes should go to L2, L3=0, L4=0
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_BudgetExactlyFitsAll) {
+    auto samples = create_frequency_samples("fls_exact");
+    // Set cpu_budget to exactly N * D * sizeof(float) — fits all 8 nodes
+    auto config = make_config(/*cpu_budget_nodes=*/N, /*reorder=*/false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // All accessed nodes should fit in L2 (no GPU available)
+    EXPECT_EQ(result.l1_nodes, 0u);
+    // All 8 unique nodes accessed across batches should be cached
+    EXPECT_EQ(result.l2_nodes, N);
+    // Nothing should spill to L3/L4
+    EXPECT_EQ(result.l3_nodes, 0u);
+    EXPECT_EQ(result.l4_nodes, 0u);
+
+    // S4 property should still hold
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_exact"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+    auto rm = RowMapping::open(rmap_path_);
+
+    for (uint64_t b = 0; b < 5; ++b) {
+        auto sample = samples2.read_sample(b);
+        auto tensor = store.load_batch_features(b);
+        auto acc = tensor.accessor<float, 2>();
+        for (size_t i = 0; i < sample.all_unique_nodes.size(); ++i) {
+            auto oid = sample.all_unique_nodes[i];
+            auto row = rm.find(oid);
+            ASSERT_TRUE(row.has_value());
+            for (uint64_t d = 0; d < D; ++d) {
+                EXPECT_FLOAT_EQ(acc[i][d], expected_feature(*row, d))
+                    << "Exact budget S4: batch " << b << " node " << i
+                    << " dim " << d;
+            }
+        }
+    }
+}
