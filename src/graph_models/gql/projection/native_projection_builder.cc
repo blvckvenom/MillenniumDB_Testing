@@ -93,11 +93,13 @@ NativeProjectionBuilder::NativeProjectionBuilder(
 bool EdgeAggregator::process_edge(ObjectId edge_id, std::optional<double> property_value) {
     count_++;
 
-    // First edge - always keep it as representative
+    // First edge - always keep it (added to batch)
     if (count_ == 1) {
+        first_edge_id_ = edge_id;
         representative_edge_id_ = edge_id;
 
         if (property_value.has_value()) {
+            has_value_ = true;
             sum_value_ = property_value.value();
             min_value_ = property_value.value();
             max_value_ = property_value.value();
@@ -116,24 +118,31 @@ bool EdgeAggregator::process_edge(ObjectId edge_id, std::optional<double> proper
             );
 
         case Aggregation::MIN:
-            if (property_value.has_value() && property_value.value() < min_value_) {
-                min_value_ = property_value.value();
-                representative_edge_id_ = edge_id;  // Update to edge with min value
+            if (property_value.has_value()) {
+                has_value_ = true;
+                if (property_value.value() < min_value_) {
+                    min_value_ = property_value.value();
+                    representative_edge_id_ = edge_id;
+                }
             }
-            return false;  // Aggregate away (don't add to batch)
+            return false;
 
         case Aggregation::MAX:
-            if (property_value.has_value() && property_value.value() > max_value_) {
-                max_value_ = property_value.value();
-                representative_edge_id_ = edge_id;  // Update to edge with max value
+            if (property_value.has_value()) {
+                has_value_ = true;
+                if (property_value.value() > max_value_) {
+                    max_value_ = property_value.value();
+                    representative_edge_id_ = edge_id;
+                }
             }
-            return false;  // Aggregate away
+            return false;
 
         case Aggregation::SUM:
             if (property_value.has_value()) {
+                has_value_ = true;
                 sum_value_ += property_value.value();
             }
-            return false;  // Aggregate away
+            return false;
 
         case Aggregation::COUNT:
             // Just count, no property needed
@@ -195,7 +204,17 @@ bool ParallelEdgeDetector::process_edge(
 // ============================================================================
 
 NativeProjectionBuilder::~NativeProjectionBuilder() {
-    // RAII cleanup - unique_ptrs automatically destroy resources
+    // Clean up orphaned projection if finalize() was never called (e.g., exception)
+    if (!finalized_) {
+        try {
+            auto& manager = ProjectionManager::get_instance();
+            if (manager.projection_exists(projection_name)) {
+                manager.drop_projection(projection_name);
+            }
+        } catch (...) {
+            // Destructor must not throw — silently ignore cleanup failures
+        }
+    }
 }
 
 // ============================================================================
@@ -278,7 +297,7 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
 
     // Step 1: Build type_id_map and check if streaming aggregation is needed
     std::unordered_map<std::string, ObjectId> type_id_map;
-    bool all_types_count_or_sum = true;  // Only use streaming if ALL types have COUNT/SUM
+    bool all_types_count = true;  // Only use streaming if ALL types have COUNT
     uint64_t estimated_edge_count = 0;
 
     for (const auto& type : types) {
@@ -291,11 +310,12 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
         ObjectId type_id(it->second | ObjectId::MASK_EDGE_LABEL);
         type_id_map[type] = type_id;
 
-        // Check aggregation mode - streaming requires ALL types to have COUNT/SUM
-        // If any type has SINGLE/MIN/MAX, we must use hash-based approach for those
+        // Check aggregation mode - streaming only supports COUNT correctly.
+        // SUM/MIN/MAX use the hash-based path which handles property exclusion
+        // and value storage properly for all modes.
         Aggregation type_aggregation = get_aggregation_for_type(type);
-        if (type_aggregation != Aggregation::COUNT && type_aggregation != Aggregation::SUM) {
-            all_types_count_or_sum = false;
+        if (type_aggregation != Aggregation::COUNT) {
+            all_types_count = false;
         }
 
         // Estimate edge count for this type (quick scan of label_edge index)
@@ -313,7 +333,7 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
     // Only use streaming if ALL types have COUNT/SUM aggregation.
     // If any type has SINGLE/MIN/MAX, we must use hash-based approach to process those correctly.
     // (Previously, mixed aggregation types would silently ignore SINGLE/MIN/MAX types)
-    if (all_types_count_or_sum && estimated_edge_count > STREAMING_AGGREGATION_THRESHOLD) {
+    if (all_types_count && estimated_edge_count > STREAMING_AGGREGATION_THRESHOLD) {
         std::cout << "[Builder] Using streaming aggregation for " << estimated_edge_count
                   << " edges (threshold: " << STREAMING_AGGREGATION_THRESHOLD << ")" << std::endl;
         scan_edges_with_streaming_aggregation(types, type_id_map);
@@ -417,12 +437,10 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
             }
 
             // Extract properties ONCE per logical edge (not duplicated for UNDIRECTED)
-            // For SUM/COUNT: exclude aggregation property - will be stored later with aggregated value
+            // For aggregation modes: exclude the aggregation property — it will be stored
+            // later with the aggregated value (SUM/MIN/MAX) or as _count (COUNT)
             if (!edge_property_keys.empty()) {
-                if ((type_aggregation == Aggregation::SUM || type_aggregation == Aggregation::COUNT)
-                    && !type_agg_property.empty()) {
-                    // Exclude the aggregation property to prevent storing original value
-                    // before the aggregated value is computed
+                if (type_aggregation != Aggregation::SINGLE && !type_agg_property.empty()) {
                     extract_edge_properties_excluding(edge_id, type_agg_property);
                 } else {
                     extract_edge_properties(edge_id);
@@ -432,20 +450,19 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
             // Store edge label (automatic - always included like Neo4j GDS)
             storage->add_edge_label(edge_id, type_id);
 
-            // Auto-flush when batch is full (for SINGLE/MIN/MAX modes)
-            bool can_batch = (type_aggregation == Aggregation::SINGLE ||
-                              type_aggregation == Aggregation::MIN ||
-                              type_aggregation == Aggregation::MAX);
-
-            if (can_batch && edge_batch.size() >= BATCH_SIZE) {
+            // Auto-flush when batch is full (SINGLE only).
+            // MIN/MAX/SUM/COUNT must NOT flush+clear here because their aggregated
+            // values are read after the full type scan at get_aggregated_property_values().
+            // Clearing the detector mid-scan would lose accumulated min/max/sum/count state.
+            if (type_aggregation == Aggregation::SINGLE && edge_batch.size() >= BATCH_SIZE) {
                 flush_edges();
-                detector->clear();  // Free memory after batch
+                detector->clear();
             }
         });
 
-        // STREAMING AGGREGATION: Process SUM/COUNT aggregates immediately after type scan.
+        // Store aggregated property values for all non-SINGLE modes after type scan.
         // This releases memory right away instead of holding all detectors until the end.
-        if (type_aggregation == Aggregation::SUM || type_aggregation == Aggregation::COUNT) {
+        if (type_aggregation != Aggregation::SINGLE) {
             // Get map of edge_id -> aggregated_value
             auto aggregated_values = detector->get_aggregated_property_values();
 
@@ -453,18 +470,20 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
             ObjectId property_key_id(0);
             std::string property_key_name = type_agg_property;
 
-            // For COUNT mode, use special "_count" property
+            // For COUNT mode, use synthetic "_count" property (same as streaming path)
             if (type_aggregation == Aggregation::COUNT) {
                 property_key_name = "_count";
-            }
-
-            // Look up property key in catalog
-            auto key_it = gql_model.catalog.edge_keys2id.find(property_key_name);
-            if (key_it != gql_model.catalog.edge_keys2id.end()) {
-                property_key_id = ObjectId(key_it->second | ObjectId::MASK_EDGE_KEY);
+                property_key_id = ObjectId(COUNT_KEY_SYNTHETIC_ID | ObjectId::MASK_EDGE_KEY);
+                storage->register_edge_key("_count", COUNT_KEY_SYNTHETIC_ID);
             } else {
-                std::cerr << "[Builder] Warning: Property key '" << property_key_name
-                          << "' not found in catalog. Aggregated values may not be stored correctly." << std::endl;
+                // Look up property key in catalog (SUM/MIN/MAX use existing properties)
+                auto key_it = gql_model.catalog.edge_keys2id.find(property_key_name);
+                if (key_it != gql_model.catalog.edge_keys2id.end()) {
+                    property_key_id = ObjectId(key_it->second | ObjectId::MASK_EDGE_KEY);
+                } else {
+                    std::cerr << "[Builder] Warning: Property key '" << property_key_name
+                              << "' not found in catalog. Aggregated values may not be stored correctly." << std::endl;
+                }
             }
 
             // Store aggregated value as property on each representative edge
@@ -489,6 +508,8 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
 }
 
 NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
+    finalized_ = true;
+
     // Final flush to ensure all data is written
     if (!node_batch.empty()) {
         flush_nodes();
@@ -1158,7 +1179,6 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
     // Create _count property key for COUNT aggregation
     // Since _count is a projection-specific property (not in original graph),
     // we use a synthetic key ID (1 | MASK_EDGE_KEY) reserved for aggregation
-    constexpr uint64_t COUNT_KEY_SYNTHETIC_ID = 1;
     ObjectId count_key_id(COUNT_KEY_SYNTHETIC_ID | ObjectId::MASK_EDGE_KEY);
     std::cout << "[StreamingAggregation] Using synthetic _count key ID: "
               << std::hex << count_key_id.id << std::dec << std::endl;

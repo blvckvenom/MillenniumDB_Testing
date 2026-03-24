@@ -374,11 +374,20 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
         break;
     }
     case GQL_OID::Type::NODE_KEY: {
-        os << gql_model.catalog.node_keys_str[unmasked_id];
+        if (unmasked_id < gql_model.catalog.node_keys_str.size()) {
+            os << gql_model.catalog.node_keys_str[unmasked_id];
+        } else {
+            os << "_node_key:" << unmasked_id;
+        }
         break;
     }
     case GQL_OID::Type::EDGE_KEY: {
-        os << gql_model.catalog.edge_keys_str[unmasked_id];
+        if (unmasked_id < gql_model.catalog.edge_keys_str.size()) {
+            os << gql_model.catalog.edge_keys_str[unmasked_id];
+        } else {
+            // Synthetic key ID (e.g., _count from projection aggregation)
+            os << "_edge_key:" << unmasked_id;
+        }
         break;
     }
     case GQL_OID::Type::LIST: {

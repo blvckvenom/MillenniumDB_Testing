@@ -71,6 +71,8 @@ public:
         , sum_value_(0.0)
         , min_value_(std::numeric_limits<double>::max())
         , max_value_(std::numeric_limits<double>::lowest())
+        , has_value_(false)
+        , first_edge_id_(0)
         , representative_edge_id_(0)
     {}
 
@@ -89,12 +91,22 @@ public:
     uint64_t get_count() const { return count_; }
 
     /**
-     * @brief Gets the representative edge ID to keep.
+     * @brief Returns true if at least one non-NULL property value was seen.
+     */
+    bool has_value() const { return has_value_; }
+
+    /**
+     * @brief Gets the first edge ID (the one actually stored in the projection batch).
+     */
+    ObjectId get_first_edge() const { return first_edge_id_; }
+
+    /**
+     * @brief Gets the representative edge ID (for MIN/MAX, may differ from first).
      */
     ObjectId get_representative_edge() const { return representative_edge_id_; }
 
     /**
-     * @brief Gets the aggregated property value (for SUM/MIN/MAX).
+     * @brief Gets the aggregated property value (for SUM/MIN/MAX/COUNT).
      */
     double get_aggregated_value() const;
 
@@ -104,6 +116,8 @@ private:
     double sum_value_;
     double min_value_;
     double max_value_;
+    bool has_value_;
+    ObjectId first_edge_id_;
     ObjectId representative_edge_id_;
 };
 
@@ -160,20 +174,24 @@ public:
      * Returns a map of representative edge_id -> aggregated value for edges that
      * need their properties updated with aggregated values.
      *
-     * @return Map of edge_id -> aggregated value (only for SUM/COUNT modes)
+     * @return Map of first_edge_id -> aggregated value (for SUM/COUNT/MIN/MAX modes)
      */
     std::unordered_map<uint64_t, double> get_aggregated_property_values() const {
         std::unordered_map<uint64_t, double> result;
 
-        // Only SUM and COUNT need property value storage
-        if (strategy_ != Aggregation::SUM && strategy_ != Aggregation::COUNT) {
+        // SINGLE doesn't produce aggregated values
+        if (strategy_ == Aggregation::SINGLE) {
             return result;
         }
 
         for (const auto& [key, aggregator] : edge_map_) {
-            ObjectId rep_edge = aggregator.get_representative_edge();
+            // COUNT always has a value; MIN/MAX/SUM only if a non-NULL property was seen
+            if (strategy_ != Aggregation::COUNT && !aggregator.has_value()) {
+                continue;  // Skip: all property values were NULL, sentinel would overflow int64_t
+            }
+            ObjectId first_edge = aggregator.get_first_edge();
             double agg_value = aggregator.get_aggregated_value();
-            result[rep_edge.id] = agg_value;
+            result[first_edge.id] = agg_value;
         }
 
         return result;
@@ -202,6 +220,11 @@ private:
 class NativeProjectionBuilder {
 public:
     static constexpr size_t BATCH_SIZE = 1000;
+
+    /// @brief Synthetic key ID for COUNT aggregation's _count property.
+    /// Real catalog key IDs start at 0 and grow. Value 1000 is safely above any
+    /// realistic edge property count while avoiding vector over-allocation in catalog.
+    static constexpr uint64_t COUNT_KEY_SYNTHETIC_ID = 1000;
 
     /// @brief Threshold for switching to external sort-aggregate (1M edges)
     /// Below this threshold, in-memory hash-based aggregation is used.
@@ -282,6 +305,7 @@ private:
     std::unique_ptr<ProjectionStorage> storage;
     std::unique_ptr<NativeScanner> scanner;
     Statistics stats;
+    bool finalized_ = false;
 
     // Property configuration (simple property lists)
     std::vector<std::string> node_property_keys;
