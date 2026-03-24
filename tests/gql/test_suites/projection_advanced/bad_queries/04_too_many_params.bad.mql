@@ -1,0 +1,3 @@
+CALL graph_project('adv_bad_04', 'Person', 'KNOWS', {}, 'extra')
+YIELD graphName
+RETURN graphName

@@ -58,6 +58,8 @@ TEST_SUITES: list[str] = [
     "call_procedure",
     "projection_native",
     "projection_properties",
+    "projection_comprehensive",
+    "projection_advanced",
     "list_exprs",
 ]
 

@@ -1,0 +1,3 @@
+CALL graph_project('bad_05', '', '')
+YIELD graphName
+RETURN graphName

@@ -1,0 +1,4 @@
+USE adv_21
+MATCH (n)-[e]->(m)
+RETURN n, e._count AS cnt, m
+ORDER BY cnt

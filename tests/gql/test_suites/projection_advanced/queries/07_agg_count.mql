@@ -1,0 +1,3 @@
+CALL graph_project('adv_07', 'Person', 'TRANSFER', {aggregation: 'COUNT'})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

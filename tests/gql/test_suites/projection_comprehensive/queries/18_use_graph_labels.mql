@@ -1,0 +1,3 @@
+USE comp_02
+MATCH (n:Person)-[e:KNOWS]->(m:Person)
+RETURN count(*) AS knows_count

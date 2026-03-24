@@ -1,0 +1,3 @@
+CALL graph_project('adv_09', 'Person', {KNOWS: {orientation: 'UNDIRECTED'}, FOLLOWS: {orientation: 'NATURAL'}})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount
