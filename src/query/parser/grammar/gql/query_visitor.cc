@@ -2807,14 +2807,14 @@ std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* c
         // Check for HOME_GRAPH keyword (may be parsed as objectExpressionPrimary due to ANTLR ordering)
         if (projection_name == "HOME_GRAPH" || projection_name == "HOME_PROPERTY_GRAPH") {
             // HOME_GRAPH clears the active projection (returns to main graph)
-            get_query_ctx().active_projection.clear();
+            get_query_ctx().clear_active_projection();
             return 0;
         }
 
         // Check for CURRENT_GRAPH keyword (may be parsed as objectExpressionPrimary)
         if (projection_name == "CURRENT_GRAPH" || projection_name == "CURRENT_PROPERTY_GRAPH") {
             // CURRENT_GRAPH maintains current context (clears active projection)
-            get_query_ctx().active_projection.clear();
+            get_query_ctx().clear_active_projection();
             return 0;
         }
 
@@ -2865,7 +2865,7 @@ std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* c
 
     // Handle CURRENT_GRAPH - clear any active projection
     if (ctx->currentGraph()) {
-        get_query_ctx().active_projection.clear();
+        get_query_ctx().clear_active_projection();
         return 0;
     }
 
@@ -2932,7 +2932,7 @@ std::any QueryVisitor::visitGraphReference(GQLParser::GraphReferenceContext* ctx
     } else if (ctx->homeGraph()) {
         // HOME_GRAPH refers to the main graph
         ref.is_home_graph = true;
-        get_query_ctx().active_projection.clear();
+        get_query_ctx().clear_active_projection();
         return 0;
     } else {
         throw QuerySemanticException("Invalid graph reference syntax");
