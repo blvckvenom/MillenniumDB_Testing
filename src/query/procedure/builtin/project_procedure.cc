@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
@@ -13,13 +13,60 @@
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "storage/dictionary/dictionary.h"
 #include "system/file_manager.h"
-//         uint64_t duration_ms;
-//     };
-//     class NativeProjectionBuilder;
-// }
 
 using namespace GQL;
 using namespace GQL::Procedures;
+
+// =============================================================================
+// Projection name validation (path traversal protection)
+// =============================================================================
+
+void ProjectProcedure::validate_projection_name(const std::string& name) {
+    if (name.empty()) {
+        throw std::runtime_error(
+            "Invalid projection name: name cannot be empty.\n"
+            "Provide a non-empty string as the first argument.\n"
+            "Example: CALL PROJECT('myProjection', ...)");
+    }
+    if (name.find_first_not_of(" \t\n\r") == std::string::npos) {
+        throw std::runtime_error(
+            "Invalid projection name: name cannot be whitespace only.\n"
+            "Provide a meaningful name for your projection.\n"
+            "Example: CALL PROJECT('myProjection', ...)");
+    }
+    if (name == "." || name == "..") {
+        throw std::runtime_error(
+            "Invalid projection name: '" + name + "' is not allowed.\n"
+            "Projection names cannot be '.' or '..'.");
+    }
+    for (char c : name) {
+        if (c == '/' || c == '\\' || c == '\0') {
+            throw std::runtime_error(
+                "Invalid projection name: '" + name + "' contains a path separator or null byte.\n"
+                "Projection names cannot contain '/', '\\', or null characters.");
+        }
+        if (static_cast<unsigned char>(c) < 0x20) {
+            throw std::runtime_error(
+                "Invalid projection name: '" + name + "' contains a control character.\n"
+                "Projection names cannot contain control characters (bytes < 0x20).");
+        }
+    }
+}
+
+// =============================================================================
+// Helper: deduplicate a string vector preserving insertion order
+// =============================================================================
+
+static void deduplicate(std::vector<std::string>& vec) {
+    std::unordered_set<std::string> seen;
+    auto it = std::remove_if(vec.begin(), vec.end(),
+        [&seen](const std::string& s) { return !seen.insert(s).second; });
+    vec.erase(it, vec.end());
+}
+
+// =============================================================================
+// Main execution
+// =============================================================================
 
 void ProjectProcedure::execute(ProcedureContext& ctx) {
     // Step 1: Validate parameter count
@@ -42,7 +89,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Step 2: Parse graphName
+    // Step 2: Parse and validate graphName
     std::string graph_name;
     try {
         graph_name = parse_graph_name(ctx);
@@ -50,49 +97,44 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid graphName parameter: " + std::string(e.what()) + "\n\n"
             "The first parameter must be a STRING containing the projection name.\n"
-            "Example: CALL PROJECT('myProjection', ...)"
-        );
+            "Example: CALL PROJECT('myProjection', ...)");
     }
+    validate_projection_name(graph_name);
 
-    // Validate graph name is not empty or whitespace-only
-    if (graph_name.empty()) {
-        throw std::runtime_error(
-            "Invalid projection name: name cannot be empty.\n"
-            "Provide a non-empty string as the first argument.\n"
-            "Example: CALL PROJECT('myProjection', ...)"
-        );
-    }
-    if (graph_name.find_first_not_of(" \t\n\r") == std::string::npos) {
-        throw std::runtime_error(
-            "Invalid projection name: name cannot be whitespace only.\n"
-            "Provide a meaningful name for your projection.\n"
-            "Example: CALL PROJECT('myProjection', ...)"
-        );
-    }
-
-    // Step 5: Parse optional config map for global defaults FIRST (needed for map parsing)
-    // Global defaults that can be overridden by per-type configuration
+    // Step 3: Parse optional config map ONCE (needed for global defaults)
     std::vector<std::string> global_node_properties;
     std::vector<std::string> global_edge_properties;
     Orientation global_orientation = Orientation::NATURAL;
     Aggregation global_aggregation = Aggregation::SINGLE;
     std::string global_aggregation_property;
 
+    // Keep config_holder alive so config_dict pointer remains valid
+    std::unique_ptr<Dictionary> config_holder;
+    DictionaryObject* config_dict = nullptr;
+
     if (ctx.arguments.size() >= 4) {
         ObjectId config_arg = ctx.get_argument(3);
         auto config_type = GQL_OID::get_type(config_arg);
 
         if (config_type == GQL_OID::Type::DICTIONARY) {
-            global_node_properties = parse_property_list_from_config(ctx, config_arg, "nodeProperties");
-            global_edge_properties = parse_property_list_from_config(ctx, config_arg, "relationshipProperties");
-            global_orientation = parse_orientation_from_config(ctx, config_arg);
-            global_aggregation = parse_aggregation_from_config(ctx, config_arg);
-            global_aggregation_property = parse_aggregation_property_from_config(
-                ctx, config_arg, global_edge_properties, global_aggregation);
+            config_holder = Common::Conversions::unpack_dictionary(config_arg);
+            config_dict = dynamic_cast<DictionaryObject*>(config_holder->dictionary.get());
+            if (!config_dict) {
+                throw std::runtime_error("Configuration parameter must be a dictionary/map");
+            }
         }
     }
 
-    // Step 3: Parse nodeProjection (supports STRING, LIST, or MAP)
+    if (config_dict) {
+        global_node_properties = parse_property_list_from_dict(config_dict, "nodeProperties");
+        global_edge_properties = parse_property_list_from_dict(config_dict, "relationshipProperties");
+        global_orientation = get_orientation_from_dict(config_dict, "orientation", Orientation::NATURAL);
+        global_aggregation = get_aggregation_from_dict(config_dict, "aggregation", Aggregation::SINGLE);
+        global_aggregation_property = resolve_aggregation_property(
+            config_dict, global_edge_properties, global_aggregation);
+    }
+
+    // Step 4: Parse nodeProjection (STRING, LIST, or MAP)
     NodeProjectionVariant node_projection_variant;
     try {
         node_projection_variant = parse_node_projection(ctx);
@@ -110,18 +152,17 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Step 4: Parse relationshipProjection (supports STRING, LIST, or MAP)
-    // For MAP syntax, we need to re-parse with global defaults
+    // Step 5: Parse relationshipProjection (STRING, LIST, or MAP)
     RelationshipProjectionVariant rel_projection_variant;
     try {
-        // Check if argument is a dictionary to apply global defaults
         ObjectId rel_arg = ctx.get_argument(2);
         auto rel_type = GQL_OID::get_type(rel_arg);
         if (rel_type == GQL_OID::Type::DICTIONARY) {
-            // Re-parse with global defaults
+            // Map syntax: parse with global defaults
             rel_projection_variant = parse_relationship_projection_map(
-                ctx, rel_arg, global_orientation, global_aggregation);
+                rel_arg, global_orientation, global_aggregation);
         } else {
+            // String or list syntax
             rel_projection_variant = parse_relationship_projection(ctx);
         }
     } catch (const std::exception& e) {
@@ -138,22 +179,17 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Extract node labels and properties from variant
+    // Step 6: Extract node labels and properties from variant
     std::vector<std::string> node_labels;
     std::vector<std::string> node_properties = global_node_properties;
-    std::unordered_map<std::string, PropertyConfig> node_property_configs;  // Phase 3
-    bool using_node_map = false;
+    std::unordered_map<std::string, PropertyConfig> node_property_configs;
 
     if (std::holds_alternative<std::vector<std::string>>(node_projection_variant)) {
-        // Simple list syntax - use global properties
         node_labels = std::get<std::vector<std::string>>(node_projection_variant);
     } else {
-        // Map syntax - extract labels and per-label properties
-        using_node_map = true;
         const auto& node_map = std::get<NodeProjectionMap>(node_projection_variant);
         for (const auto& [projected_label, config] : node_map) {
             node_labels.push_back(config.label);
-            // Collect all properties from this label config
             for (const auto& prop : config.simple_properties) {
                 if (std::find(node_properties.begin(), node_properties.end(), prop) == node_properties.end()) {
                     node_properties.push_back(prop);
@@ -164,52 +200,36 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
                 if (std::find(node_properties.begin(), node_properties.end(), source_prop) == node_properties.end()) {
                     node_properties.push_back(source_prop);
                 }
-                // Phase 3: Store property configuration for renaming/defaults
                 node_property_configs[prop_key] = prop_config;
-            }
-        }
-        if (!node_property_configs.empty()) {
-            for (const auto& [prop_name, prop_cfg] : node_property_configs) {
-                if (!prop_cfg.source_property.empty()) {
-                }
-                if (prop_cfg.default_value.has_value()) {
-                }
             }
         }
     }
 
-    // Extract relationship types and per-type configuration from variant
+    // Step 7: Extract relationship types and per-type configuration from variant
     std::vector<std::string> relationship_types;
     std::vector<std::string> edge_properties = global_edge_properties;
-    std::unordered_map<std::string, PropertyConfig> edge_property_configs;  // Phase 3
+    std::unordered_map<std::string, PropertyConfig> edge_property_configs;
     Orientation orientation = global_orientation;
     Aggregation aggregation = global_aggregation;
     std::string aggregation_property = global_aggregation_property;
-    bool using_rel_map = false;
 
-    // Per-type configuration maps (for Phase 2 builder integration)
     std::unordered_map<std::string, Orientation> type_orientations;
     std::unordered_map<std::string, Aggregation> type_aggregations;
     std::unordered_map<std::string, std::string> type_agg_properties;
 
     if (std::holds_alternative<std::vector<std::string>>(rel_projection_variant)) {
-        // Simple list syntax - use global config
         relationship_types = std::get<std::vector<std::string>>(rel_projection_variant);
     } else {
-        // Map syntax - extract types and per-type configuration
-        using_rel_map = true;
         const auto& rel_map = std::get<RelationshipProjectionMap>(rel_projection_variant);
         for (const auto& [projected_type, config] : rel_map) {
             relationship_types.push_back(config.type);
 
-            // Store per-type configuration
             type_orientations[config.type] = config.orientation;
             type_aggregations[config.type] = config.aggregation;
             if (!config.aggregation_property.empty()) {
                 type_agg_properties[config.type] = config.aggregation_property;
             }
 
-            // Collect all properties from this type config
             for (const auto& prop : config.simple_properties) {
                 if (std::find(edge_properties.begin(), edge_properties.end(), prop) == edge_properties.end()) {
                     edge_properties.push_back(prop);
@@ -220,114 +240,58 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
                 if (std::find(edge_properties.begin(), edge_properties.end(), source_prop) == edge_properties.end()) {
                     edge_properties.push_back(source_prop);
                 }
-                // Phase 3: Store property configuration for renaming/defaults
                 edge_property_configs[prop_key] = prop_config;
             }
         }
-
-        // Phase 3: Log edge property configs
-        if (!edge_property_configs.empty()) {
-            for (const auto& [prop_name, prop_cfg] : edge_property_configs) {
-                if (!prop_cfg.source_property.empty()) {
-                }
-                if (prop_cfg.default_value.has_value()) {
-                }
-            }
-        }
     }
 
-    // Step 6: Validate labels and types exist
+    // Step 8: Deduplicate labels and types (user may pass duplicates)
+    deduplicate(node_labels);
+    deduplicate(relationship_types);
+
+    // Step 9: Warn about missing labels/types (non-blocking)
     for (const auto& label : node_labels) {
-        validate_label_exists(label);
+        warn_missing_label(label);
     }
-
     for (const auto& type : relationship_types) {
-        validate_type_exists(type);
+        warn_missing_type(type);
     }
 
-    // Step 7: Execute native projection using NativeProjectionBuilder
-    for (size_t i = 0; i < node_labels.size(); i++) {
-    }
-    for (size_t i = 0; i < relationship_types.size(); i++) {
-    }
-
-    if (!node_properties.empty()) {
-        for (size_t i = 0; i < node_properties.size(); i++) {
-        }
-    }
-
-    if (!edge_properties.empty()) {
-        for (size_t i = 0; i < edge_properties.size(); i++) {
-        }
-    }
-
-    // Get db_folder from global file_manager
+    // Step 10: Build projection
     std::string db_folder = file_manager.get_file_path("");
-    // Remove trailing slash if present
     if (!db_folder.empty() && db_folder.back() == '/') {
         db_folder.pop_back();
     }
 
-    // Log orientation for debugging (global default for non-map syntax)
-    if (!using_rel_map) {
-        switch (orientation) {
-            case Orientation::NATURAL:
-                break;
-            case Orientation::REVERSE:
-                break;
-            case Orientation::UNDIRECTED:
-                break;
-        }
-
-        // Log aggregation for debugging
-        switch (aggregation) {
-            case Aggregation::SINGLE:
-                break;
-            case Aggregation::MIN:
-                if (!aggregation_property.empty()) {
-                }
-                break;
-            case Aggregation::MAX:
-                if (!aggregation_property.empty()) {
-                }
-                break;
-            case Aggregation::SUM:
-                if (!aggregation_property.empty()) {
-                }
-                break;
-            case Aggregation::COUNT:
-                break;
-        }
-    }
-
-    // Create builder with per-type configuration (Phase 2 complete)
-    // Pass per-type maps to builder - builder will use them for each type,
-    // falling back to global defaults for types not in the maps
     NativeProjectionBuilder builder(
         graph_name,
         db_folder,
         node_properties,
         edge_properties,
-        orientation,          // Global default orientation
-        aggregation,          // Global default aggregation
-        aggregation_property, // Global default aggregation property
-        type_orientations,    // Per-type orientation overrides
-        type_aggregations,    // Per-type aggregation overrides
-        type_agg_properties,  // Per-type aggregation property overrides
-        node_property_configs, // Phase 3: Per-property configuration for nodes
-        edge_property_configs  // Phase 3: Per-property configuration for edges
+        orientation,
+        aggregation,
+        aggregation_property,
+        type_orientations,
+        type_aggregations,
+        type_agg_properties,
+        node_property_configs,
+        edge_property_configs
     );
     builder.scan_nodes_by_labels(node_labels);
     builder.scan_edges_by_types(relationship_types);
     auto stats = builder.finalize();
 
-    // Step 8: Yield results
+    // Step 11: Yield results
     ctx.yield("graphName", ctx.create_string(graph_name));
     ctx.yield("nodeCount", ctx.create_int(static_cast<int64_t>(stats.node_count)));
     ctx.yield("relationshipCount", ctx.create_int(static_cast<int64_t>(stats.relationship_count)));
     ctx.yield("projectMillis", ctx.create_int(stats.duration_ms.count()));
     ctx.yield_row();
 }
+
+// =============================================================================
+// Argument parsing
+// =============================================================================
 
 std::string ProjectProcedure::parse_graph_name(ProcedureContext& ctx) {
     return ctx.get_string_argument(0);
@@ -337,7 +301,7 @@ NodeProjectionVariant ProjectProcedure::parse_node_projection(ProcedureContext& 
     ObjectId arg = ctx.get_argument(1);
     auto type = GQL_OID::get_type(arg);
 
-    // Case 1: String variant - single label (backward compatible)
+    // Case 1: String variant
     if (type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         type == GQL_OID::Type::STRING_SIMPLE_TMP)
@@ -347,30 +311,26 @@ NodeProjectionVariant ProjectProcedure::parse_node_projection(ProcedureContext& 
         if (label.empty()) {
             throw std::runtime_error(
                 "nodeProjection label cannot be an empty string. "
-                "Provide a valid node label or '*' for all labels."
-            );
+                "Provide a valid node label or '*' for all labels.");
         }
 
-        // Wildcard expansion: '*' expands to all node labels from catalog
         if (label == "*") {
             return std::vector<std::string>(
                 gql_model.catalog.node_labels_str.begin(),
-                gql_model.catalog.node_labels_str.end()
-            );
+                gql_model.catalog.node_labels_str.end());
         }
 
         return std::vector<std::string>{label};
     }
 
-    // Case 2: List variant - multiple labels (backward compatible)
+    // Case 2: List variant
     if (type == GQL_OID::Type::LIST) {
         std::vector<ObjectId> list_items = Conversions::unpack_list(arg);
 
         if (list_items.empty()) {
             throw std::runtime_error(
                 "nodeProjection list cannot be empty. "
-                "Please provide at least one node label."
-            );
+                "Please provide at least one node label.");
         }
 
         std::vector<std::string> labels;
@@ -387,36 +347,32 @@ NodeProjectionVariant ProjectProcedure::parse_node_projection(ProcedureContext& 
                 throw std::runtime_error(
                     "nodeProjection list element at index " + std::to_string(i) +
                     " is not a string (type: " + std::to_string(static_cast<int>(item_type)) + "). "
-                    "All list elements must be strings representing node labels."
-                );
+                    "All list elements must be strings representing node labels.");
             }
 
-            std::string label = Conversions::unpack_string(item_oid);
-            labels.push_back(label);
+            labels.push_back(Conversions::unpack_string(item_oid));
         }
 
         return labels;
     }
 
-    // Case 3: Map variant - Neo4j GDS extended syntax (NEW)
+    // Case 3: Map variant (Neo4j GDS syntax)
     if (type == GQL_OID::Type::DICTIONARY) {
-        return parse_node_projection_map(ctx, arg);
+        return parse_node_projection_map(arg);
     }
 
-    // Invalid type
     throw std::runtime_error(
         "nodeProjection must be STRING, LIST<STRING>, or MAP, got type: " +
         std::to_string(static_cast<int>(type)) + ". "
         "Provide either a single label string, a list of label strings, "
-        "or a map with per-label configuration."
-    );
+        "or a map with per-label configuration.");
 }
 
 RelationshipProjectionVariant ProjectProcedure::parse_relationship_projection(ProcedureContext& ctx) {
     ObjectId arg = ctx.get_argument(2);
     auto type = GQL_OID::get_type(arg);
 
-    // Case 1: String variant - single type (backward compatible)
+    // Case 1: String variant
     if (type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         type == GQL_OID::Type::STRING_SIMPLE_TMP)
@@ -426,30 +382,26 @@ RelationshipProjectionVariant ProjectProcedure::parse_relationship_projection(Pr
         if (rel_type.empty()) {
             throw std::runtime_error(
                 "relationshipProjection type cannot be an empty string. "
-                "Provide a valid relationship type or '*' for all types."
-            );
+                "Provide a valid relationship type or '*' for all types.");
         }
 
-        // Wildcard expansion: '*' expands to all relationship types from catalog
         if (rel_type == "*") {
             return std::vector<std::string>(
                 gql_model.catalog.edge_labels_str.begin(),
-                gql_model.catalog.edge_labels_str.end()
-            );
+                gql_model.catalog.edge_labels_str.end());
         }
 
         return std::vector<std::string>{rel_type};
     }
 
-    // Case 2: List variant - multiple types (backward compatible)
+    // Case 2: List variant
     if (type == GQL_OID::Type::LIST) {
         std::vector<ObjectId> list_items = Conversions::unpack_list(arg);
 
         if (list_items.empty()) {
             throw std::runtime_error(
                 "relationshipProjection list cannot be empty. "
-                "Please provide at least one relationship type."
-            );
+                "Please provide at least one relationship type.");
         }
 
         std::vector<std::string> types;
@@ -466,137 +418,100 @@ RelationshipProjectionVariant ProjectProcedure::parse_relationship_projection(Pr
                 throw std::runtime_error(
                     "relationshipProjection list element at index " + std::to_string(i) +
                     " is not a string (type: " + std::to_string(static_cast<int>(item_type)) + "). "
-                    "All list elements must be strings representing relationship types."
-                );
+                    "All list elements must be strings representing relationship types.");
             }
 
-            std::string rel_type = Conversions::unpack_string(item_oid);
-            types.push_back(rel_type);
+            types.push_back(Conversions::unpack_string(item_oid));
         }
 
         return types;
     }
 
-    // Case 3: Map variant - Neo4j GDS extended syntax (NEW)
-    // Note: Global defaults are parsed from config (argument 3) in execute()
-    // and applied when calling parse_relationship_projection_map()
+    // Case 3: Dictionary — should not reach here (handled in execute())
     if (type == GQL_OID::Type::DICTIONARY) {
-        // For map syntax, we need global defaults from config. Since we can't access them here directly,
-        // we'll return a special marker and handle it in execute().
-        // Actually, let's parse with defaults here and override in execute() if needed.
-        return parse_relationship_projection_map(ctx, arg, Orientation::NATURAL, Aggregation::SINGLE);
+        return parse_relationship_projection_map(arg, Orientation::NATURAL, Aggregation::SINGLE);
     }
 
-    // Invalid type
     throw std::runtime_error(
         "relationshipProjection must be STRING, LIST<STRING>, or MAP, got type: " +
         std::to_string(static_cast<int>(type)) + ". "
         "Provide either a single type string, a list of type strings, "
-        "or a map with per-type configuration."
-    );
+        "or a map with per-type configuration.");
 }
 
-void ProjectProcedure::validate_label_exists(const std::string& label) {
-    // Access the global GQLModel catalog
+// =============================================================================
+// Validation (non-blocking warnings)
+// =============================================================================
+
+void ProjectProcedure::warn_missing_label(const std::string& label) {
     auto it = gql_model.catalog.node_labels2id.find(label);
+    if (it != gql_model.catalog.node_labels2id.end()) {
+        return;
+    }
 
-    if (it == gql_model.catalog.node_labels2id.end()) {
-        // Label doesn't exist - emit warning (non-blocking)
-        // Decision: Use warnings instead of errors to allow dynamic label sets
-        std::cerr << "[WARNING] Node label '" << label << "' does not exist in database. "
-                  << "Projection will not include nodes with this label." << std::endl;
+    std::cerr << "[WARNING] Node label '" << label << "' does not exist in database. "
+              << "Projection will not include nodes with this label." << std::endl;
 
-        // Add available labels hint if catalog is not empty
-        if (!gql_model.catalog.node_labels_str.empty()) {
-            std::cerr << "[WARNING] Available labels: [";
-            for (size_t i = 0; i < gql_model.catalog.node_labels_str.size(); i++) {
-                if (i > 0) std::cerr << ", ";
-                std::cerr << "'" << gql_model.catalog.node_labels_str[i] << "'";
-            }
-            std::cerr << "]" << std::endl;
+    if (!gql_model.catalog.node_labels_str.empty()) {
+        std::cerr << "[WARNING] Available labels: [";
+        for (size_t i = 0; i < gql_model.catalog.node_labels_str.size(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << "'" << gql_model.catalog.node_labels_str[i] << "'";
         }
+        std::cerr << "]" << std::endl;
     }
 }
 
-void ProjectProcedure::validate_type_exists(const std::string& type) {
-    // Access the global GQLModel catalog
+void ProjectProcedure::warn_missing_type(const std::string& type) {
     auto it = gql_model.catalog.edge_labels2id.find(type);
+    if (it != gql_model.catalog.edge_labels2id.end()) {
+        return;
+    }
 
-    if (it == gql_model.catalog.edge_labels2id.end()) {
-        // Type doesn't exist - emit warning (non-blocking)
-        // Decision: Use warnings instead of errors to allow dynamic relationship sets
-        std::cerr << "[WARNING] Relationship type '" << type << "' does not exist in database. "
-                  << "Projection will not include edges with this type." << std::endl;
+    std::cerr << "[WARNING] Relationship type '" << type << "' does not exist in database. "
+              << "Projection will not include edges with this type." << std::endl;
 
-        // Add available types hint if catalog is not empty
-        if (!gql_model.catalog.edge_labels_str.empty()) {
-            std::cerr << "[WARNING] Available types: [";
-            for (size_t i = 0; i < gql_model.catalog.edge_labels_str.size(); i++) {
-                if (i > 0) std::cerr << ", ";
-                std::cerr << "'" << gql_model.catalog.edge_labels_str[i] << "'";
-            }
-            std::cerr << "]" << std::endl;
+    if (!gql_model.catalog.edge_labels_str.empty()) {
+        std::cerr << "[WARNING] Available types: [";
+        for (size_t i = 0; i < gql_model.catalog.edge_labels_str.size(); i++) {
+            if (i > 0) std::cerr << ", ";
+            std::cerr << "'" << gql_model.catalog.edge_labels_str[i] << "'";
         }
+        std::cerr << "]" << std::endl;
     }
 }
 
-std::vector<std::string> ProjectProcedure::parse_property_list_from_config(
-    ProcedureContext& ctx,
-    ObjectId config_map,
-    const std::string& key
-) {
+// =============================================================================
+// Config dict helpers (single-deserialization, nullptr-safe)
+// =============================================================================
 
-    // Unpack dictionary to get key-value pairs
-    std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_map);
+std::vector<std::string> ProjectProcedure::parse_property_list_from_dict(
+    DictionaryObject* dict, const std::string& key)
+{
+    if (!dict) return {};
 
-    // Cast to DictionaryObject to access keys map
-    auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
-    if (!dict_obj) {
-        throw std::runtime_error("Configuration parameter must be a dictionary/map");
-    }
-
-    // Find the key in the dictionary
-    ObjectId value;
     bool found = false;
-    for (const auto& [key_oid, val_item] : dict_obj->keys) {
-        // Unpack key and check if it matches
-        std::string key_str = Conversions::unpack_string(key_oid);
-        if (key_str == key) {
-            // Extract ObjectId from DictionaryLiteral
-            auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-            if (!lit) {
-                throw std::runtime_error("Configuration value for '" + key + "' must be a literal (string or list)");
-            }
-            value = lit->object_id;
-            found = true;
-            break;
-        }
-    }
+    ObjectId value = get_value_from_dict(dict, key, found);
+    if (!found) return {};
 
-    if (!found) {
-        // Key not present - return empty vector (properties not requested)
-        return {};
-    }
     auto value_type = GQL_OID::get_type(value);
 
-    // Case 1: String variant - single property
+    // Case 1: Single string
     if (value_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         value_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         value_type == GQL_OID::Type::STRING_SIMPLE_TMP)
     {
-        std::string prop_name = Conversions::unpack_string(value);
-        return {prop_name};
+        return {Conversions::unpack_string(value)};
     }
 
-    // Case 2: List variant - multiple properties
+    // Case 2: List of strings
     if (value_type == GQL_OID::Type::LIST) {
         std::vector<ObjectId> list_items = Conversions::unpack_list(value);
 
         if (list_items.empty()) {
             throw std::runtime_error(
                 "Configuration parameter '" + key + "' cannot be an empty list. "
-                "Please provide at least one property name or omit the parameter."
-            );
+                "Please provide at least one property name or omit the parameter.");
         }
 
         std::vector<std::string> properties;
@@ -613,246 +528,60 @@ std::vector<std::string> ProjectProcedure::parse_property_list_from_config(
                 throw std::runtime_error(
                     "Configuration parameter '" + key + "' list element at index " + std::to_string(i) +
                     " is not a string (type: " + std::to_string(static_cast<int>(item_type)) + "). "
-                    "All list elements must be strings representing property names."
-                );
+                    "All list elements must be strings representing property names.");
             }
 
-            std::string prop_name = Conversions::unpack_string(item_oid);
-            properties.push_back(prop_name);
+            properties.push_back(Conversions::unpack_string(item_oid));
         }
 
         return properties;
     }
 
-    // Case 3: Map variant - property configurations with renaming/defaults
+    // Case 3: Map of property configs — extract keys as property names
     if (value_type == GQL_OID::Type::DICTIONARY) {
         std::unique_ptr<Dictionary> prop_dict = Common::Conversions::unpack_dictionary(value);
-
-        // Cast to DictionaryObject to access keys map
         auto prop_dict_obj = dynamic_cast<DictionaryObject*>(prop_dict->dictionary.get());
         if (!prop_dict_obj) {
             throw std::runtime_error(
                 "Configuration parameter '" + key + "' map is invalid. "
-                "Provide a valid property configuration map."
-            );
+                "Provide a valid property configuration map.");
         }
 
         std::vector<std::string> properties;
         properties.reserve(prop_dict_obj->keys.size());
-
         for (const auto& [prop_alias_oid, config_item] : prop_dict_obj->keys) {
-            // Extract the property alias (key name in the map)
-            std::string prop_alias = Conversions::unpack_string(prop_alias_oid);
-            properties.push_back(prop_alias);
+            properties.push_back(Conversions::unpack_string(prop_alias_oid));
         }
-
         return properties;
     }
 
-    // Invalid type
     throw std::runtime_error(
         "Configuration parameter '" + key + "' must be STRING or LIST<STRING>, got type: " +
         std::to_string(static_cast<int>(value_type)) + ". "
-        "Provide either a single property name or a list of property names."
-    );
+        "Provide either a single property name or a list of property names.");
 }
 
-Orientation ProjectProcedure::parse_orientation_from_config(
-    ProcedureContext& ctx,
-    ObjectId config_map
-) {
-
-    // Unpack dictionary to get key-value pairs
-    std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_map);
-
-    // Cast to DictionaryObject to access keys map
-    auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
-    if (!dict_obj) {
-        throw std::runtime_error("Configuration parameter must be a dictionary/map");
-    }
-
-    // Find the 'orientation' key in the dictionary
-    ObjectId value;
-    bool found = false;
-    for (const auto& [key_oid, val_item] : dict_obj->keys) {
-        std::string key_str = Conversions::unpack_string(key_oid);
-        if (key_str == "orientation") {
-            // Extract ObjectId from DictionaryLiteral
-            auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-            if (!lit) {
-                throw std::runtime_error("Configuration value for 'orientation' must be a literal string");
-            }
-            value = lit->object_id;
-            found = true;
-            break;
-        }
-    }
-
-    if (!found) {
-        // Key not present - return default NATURAL
-        return Orientation::NATURAL;
-    }
-
-    // Value must be a string
-    auto value_type = GQL_OID::get_type(value);
-    if (value_type != GQL_OID::Type::STRING_SIMPLE_INLINE &&
-        value_type != GQL_OID::Type::STRING_SIMPLE_EXTERN &&
-        value_type != GQL_OID::Type::STRING_SIMPLE_TMP)
-    {
-        throw std::runtime_error(
-            "Configuration parameter 'orientation' must be a string ('NATURAL', 'REVERSE', or 'UNDIRECTED'), "
-            "got type: " + std::to_string(static_cast<int>(value_type))
-        );
-    }
-
-    // Extract and normalize string (case-insensitive)
-    std::string orientation_str = Conversions::unpack_string(value);
-
-    // Convert to uppercase for case-insensitive comparison
-    std::transform(orientation_str.begin(), orientation_str.end(),
-                   orientation_str.begin(), ::toupper);
-
-    if (orientation_str == "NATURAL") {
-        return Orientation::NATURAL;
-    } else if (orientation_str == "REVERSE") {
-        return Orientation::REVERSE;
-    } else if (orientation_str == "UNDIRECTED") {
-        return Orientation::UNDIRECTED;
-    } else {
-        throw std::runtime_error(
-            "Invalid orientation value: '" + orientation_str + "'. "
-            "Must be 'NATURAL', 'REVERSE', or 'UNDIRECTED' (case-insensitive).\n\n"
-            "Examples:\n"
-            "  CALL PROJECT('g', 'User', 'KNOWS', {orientation: 'NATURAL'})\n"
-            "  CALL PROJECT('g', 'User', 'KNOWS', {orientation: 'UNDIRECTED'})"
-        );
-    }
-}
-
-Aggregation ProjectProcedure::parse_aggregation_from_config(
-    ProcedureContext& ctx,
-    ObjectId config_map
-) {
-
-    // Unpack dictionary to get key-value pairs
-    std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_map);
-
-    // Cast to DictionaryObject to access keys map
-    auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
-    if (!dict_obj) {
-        throw std::runtime_error("Configuration parameter must be a dictionary/map");
-    }
-
-    // Find the 'aggregation' key in the dictionary
-    ObjectId value;
-    bool found = false;
-    for (const auto& [key_oid, val_item] : dict_obj->keys) {
-        std::string key_str = Conversions::unpack_string(key_oid);
-        if (key_str == "aggregation") {
-            // Extract ObjectId from DictionaryLiteral
-            auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-            if (!lit) {
-                throw std::runtime_error("Configuration value for 'aggregation' must be a literal string");
-            }
-            value = lit->object_id;
-            found = true;
-            break;
-        }
-    }
-
-    if (!found) {
-        // Key not present - return default SINGLE
-        return Aggregation::SINGLE;
-    }
-
-    // Value must be a string
-    auto value_type = GQL_OID::get_type(value);
-    if (value_type != GQL_OID::Type::STRING_SIMPLE_INLINE &&
-        value_type != GQL_OID::Type::STRING_SIMPLE_EXTERN &&
-        value_type != GQL_OID::Type::STRING_SIMPLE_TMP)
-    {
-        throw std::runtime_error(
-            "Configuration parameter 'aggregation' must be a string ('SINGLE', 'MIN', 'MAX', 'SUM', or 'COUNT'), "
-            "got type: " + std::to_string(static_cast<int>(value_type))
-        );
-    }
-
-    // Extract and normalize string (case-insensitive)
-    std::string aggregation_str = Conversions::unpack_string(value);
-
-    // Convert to uppercase for case-insensitive comparison
-    std::transform(aggregation_str.begin(), aggregation_str.end(),
-                   aggregation_str.begin(), ::toupper);
-
-    if (aggregation_str == "SINGLE") {
-        return Aggregation::SINGLE;
-    } else if (aggregation_str == "MIN") {
-        return Aggregation::MIN;
-    } else if (aggregation_str == "MAX") {
-        return Aggregation::MAX;
-    } else if (aggregation_str == "SUM") {
-        return Aggregation::SUM;
-    } else if (aggregation_str == "COUNT") {
-        return Aggregation::COUNT;
-    } else {
-        throw std::runtime_error(
-            "Invalid aggregation value: '" + aggregation_str + "'. "
-            "Must be 'SINGLE', 'MIN', 'MAX', 'SUM', or 'COUNT' (case-insensitive).\n\n"
-            "Examples:\n"
-            "  CALL PROJECT('g', 'User', 'KNOWS', {aggregation: 'SINGLE'})  -- Fail on duplicates\n"
-            "  CALL PROJECT('g', 'User', 'KNOWS', {aggregation: 'MIN'})     -- Keep minimum property\n"
-            "  CALL PROJECT('g', 'User', 'KNOWS', {aggregation: 'COUNT'})   -- Count parallel edges"
-        );
-    }
-}
-
-std::string ProjectProcedure::parse_aggregation_property_from_config(
-    ProcedureContext& ctx,
-    ObjectId config_map,
+std::string ProjectProcedure::resolve_aggregation_property(
+    DictionaryObject* dict,
     const std::vector<std::string>& edge_properties,
-    Aggregation aggregation
-) {
-
+    Aggregation aggregation)
+{
     // COUNT and SINGLE don't need a property
     if (aggregation == Aggregation::COUNT || aggregation == Aggregation::SINGLE) {
         return "";
     }
 
-    // For MIN/MAX/SUM, we need a property
-    // First, try to find explicit 'aggregationProperty' in config
-    std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_map);
-    auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
-    if (!dict_obj) {
-        throw std::runtime_error("Configuration parameter must be a dictionary/map");
-    }
-
-    // Look for 'aggregationProperty' key
-    for (const auto& [key_oid, val_item] : dict_obj->keys) {
-        std::string key_str = Conversions::unpack_string(key_oid);
-        if (key_str == "aggregationProperty") {
-            auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-            if (!lit) {
-                throw std::runtime_error("Configuration value for 'aggregationProperty' must be a string");
-            }
-
-            // Extract string value
-            auto value_type = GQL_OID::get_type(lit->object_id);
-            if (value_type != GQL_OID::Type::STRING_SIMPLE_INLINE &&
-                value_type != GQL_OID::Type::STRING_SIMPLE_EXTERN &&
-                value_type != GQL_OID::Type::STRING_SIMPLE_TMP)
-            {
-                throw std::runtime_error("Configuration parameter 'aggregationProperty' must be a string");
-            }
-
-            std::string property_name = Conversions::unpack_string(lit->object_id);
-            return property_name;
+    // Try explicit 'aggregationProperty' from config
+    if (dict) {
+        std::string explicit_prop = get_string_from_dict(dict, "aggregationProperty", "");
+        if (!explicit_prop.empty()) {
+            return explicit_prop;
         }
     }
 
-    // No explicit aggregationProperty - use first property from relationshipProperties
+    // Fall back to first edge property
     if (!edge_properties.empty()) {
-        std::string property_name = edge_properties[0];
-        return property_name;
+        return edge_properties[0];
     }
 
     // MIN/MAX/SUM requires a property but none specified
@@ -864,59 +593,18 @@ std::string ProjectProcedure::parse_aggregation_property_from_config(
         "Solutions:\n"
         "  1. Specify relationshipProperties: {aggregation: 'MIN', relationshipProperties: ['weight']}\n"
         "  2. Or specify aggregationProperty explicitly: {aggregation: 'MIN', aggregationProperty: 'weight'}\n"
-        "  3. Or use COUNT/SINGLE which don't need properties: {aggregation: 'COUNT'}"
-    );
+        "  3. Or use COUNT/SINGLE which don't need properties: {aggregation: 'COUNT'}");
 }
 
 // =============================================================================
-// Neo4j GDS Map Syntax Parsing Helpers (Phase 1)
+// Dictionary value extraction (nullptr-safe)
 // =============================================================================
 
-Orientation ProjectProcedure::parse_orientation_string(const std::string& orientation_str) {
-    std::string upper_str = orientation_str;
-    std::transform(upper_str.begin(), upper_str.end(), upper_str.begin(), ::toupper);
-
-    if (upper_str == "NATURAL") {
-        return Orientation::NATURAL;
-    } else if (upper_str == "REVERSE") {
-        return Orientation::REVERSE;
-    } else if (upper_str == "UNDIRECTED") {
-        return Orientation::UNDIRECTED;
-    } else {
-        throw std::runtime_error(
-            "Invalid orientation value: '" + orientation_str + "'. "
-            "Must be 'NATURAL', 'REVERSE', or 'UNDIRECTED' (case-insensitive)."
-        );
-    }
-}
-
-Aggregation ProjectProcedure::parse_aggregation_string(const std::string& aggregation_str) {
-    std::string upper_str = aggregation_str;
-    std::transform(upper_str.begin(), upper_str.end(), upper_str.begin(), ::toupper);
-
-    if (upper_str == "SINGLE" || upper_str == "NONE") {
-        return Aggregation::SINGLE;
-    } else if (upper_str == "MIN") {
-        return Aggregation::MIN;
-    } else if (upper_str == "MAX") {
-        return Aggregation::MAX;
-    } else if (upper_str == "SUM") {
-        return Aggregation::SUM;
-    } else if (upper_str == "COUNT") {
-        return Aggregation::COUNT;
-    } else {
-        throw std::runtime_error(
-            "Invalid aggregation value: '" + aggregation_str + "'. "
-            "Must be 'SINGLE', 'NONE', 'MIN', 'MAX', 'SUM', or 'COUNT' (case-insensitive)."
-        );
-    }
-}
-
-ObjectId ProjectProcedure::get_value_from_dict(void* dict_obj_ptr, const std::string& key, bool& found) {
-    auto dict_obj = static_cast<DictionaryObject*>(dict_obj_ptr);
+ObjectId ProjectProcedure::get_value_from_dict(DictionaryObject* dict, const std::string& key, bool& found) {
     found = false;
+    if (!dict) return ObjectId::get_null();
 
-    for (const auto& [key_oid, val_item] : dict_obj->keys) {
+    for (const auto& [key_oid, val_item] : dict->keys) {
         std::string key_str = Conversions::unpack_string(key_oid);
         if (key_str == key) {
             auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
@@ -924,14 +612,9 @@ ObjectId ProjectProcedure::get_value_from_dict(void* dict_obj_ptr, const std::st
                 found = true;
                 return lit->object_id;
             }
-            // If it's a nested dictionary, get the dictionary's ObjectId
             auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
             if (nested_dict) {
-                // For nested dictionaries, we need to return a marker that indicates this
-                // The caller should handle this case by checking the type
                 found = true;
-                // Return a temporary dictionary object ID - this requires special handling
-                // For now, we'll handle nested dicts differently
                 return ObjectId::get_null();
             }
             break;
@@ -941,17 +624,13 @@ ObjectId ProjectProcedure::get_value_from_dict(void* dict_obj_ptr, const std::st
 }
 
 std::string ProjectProcedure::get_string_from_dict(
-    ProcedureContext& ctx,
-    void* dict_obj_ptr,
-    const std::string& key,
-    const std::string& default_value
-) {
-    bool found = false;
-    ObjectId value = get_value_from_dict(dict_obj_ptr, key, found);
+    DictionaryObject* dict, const std::string& key, const std::string& default_value)
+{
+    if (!dict) return default_value;
 
-    if (!found) {
-        return default_value;
-    }
+    bool found = false;
+    ObjectId value = get_value_from_dict(dict, key, found);
+    if (!found) return default_value;
 
     auto value_type = GQL_OID::get_type(value);
     if (value_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
@@ -963,102 +642,81 @@ std::string ProjectProcedure::get_string_from_dict(
 
     throw std::runtime_error(
         "Configuration value for '" + key + "' must be a string, got type: " +
-        std::to_string(static_cast<int>(value_type))
-    );
+        std::to_string(static_cast<int>(value_type)));
 }
 
 Orientation ProjectProcedure::get_orientation_from_dict(
-    ProcedureContext& ctx,
-    void* dict_obj_ptr,
-    const std::string& key,
-    Orientation default_value
-) {
-    bool found = false;
-    ObjectId value = get_value_from_dict(dict_obj_ptr, key, found);
+    DictionaryObject* dict, const std::string& key, Orientation default_value)
+{
+    if (!dict) return default_value;
 
-    if (!found) {
-        return default_value;
-    }
+    bool found = false;
+    ObjectId value = get_value_from_dict(dict, key, found);
+    if (!found) return default_value;
 
     auto value_type = GQL_OID::get_type(value);
     if (value_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         value_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         value_type == GQL_OID::Type::STRING_SIMPLE_TMP)
     {
-        std::string orientation_str = Conversions::unpack_string(value);
-        return parse_orientation_string(orientation_str);
+        return parse_orientation_string(Conversions::unpack_string(value));
     }
 
     throw std::runtime_error(
         "Configuration value for '" + key + "' must be a string, got type: " +
-        std::to_string(static_cast<int>(value_type))
-    );
+        std::to_string(static_cast<int>(value_type)));
 }
 
 Aggregation ProjectProcedure::get_aggregation_from_dict(
-    ProcedureContext& ctx,
-    void* dict_obj_ptr,
-    const std::string& key,
-    Aggregation default_value
-) {
-    bool found = false;
-    ObjectId value = get_value_from_dict(dict_obj_ptr, key, found);
+    DictionaryObject* dict, const std::string& key, Aggregation default_value)
+{
+    if (!dict) return default_value;
 
-    if (!found) {
-        return default_value;
-    }
+    bool found = false;
+    ObjectId value = get_value_from_dict(dict, key, found);
+    if (!found) return default_value;
 
     auto value_type = GQL_OID::get_type(value);
     if (value_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         value_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         value_type == GQL_OID::Type::STRING_SIMPLE_TMP)
     {
-        std::string aggregation_str = Conversions::unpack_string(value);
-        return parse_aggregation_string(aggregation_str);
+        return parse_aggregation_string(Conversions::unpack_string(value));
     }
 
     throw std::runtime_error(
         "Configuration value for '" + key + "' must be a string, got type: " +
-        std::to_string(static_cast<int>(value_type))
-    );
+        std::to_string(static_cast<int>(value_type)));
 }
 
 std::optional<double> ProjectProcedure::get_optional_double_from_dict(
-    ProcedureContext& ctx,
-    void* dict_obj_ptr,
-    const std::string& key
-) {
-    bool found = false;
-    ObjectId value = get_value_from_dict(dict_obj_ptr, key, found);
+    DictionaryObject* dict, const std::string& key)
+{
+    if (!dict) return std::nullopt;
 
-    if (!found) {
-        return std::nullopt;
-    }
+    bool found = false;
+    ObjectId value = get_value_from_dict(dict, key, found);
+    if (!found) return std::nullopt;
 
     auto value_type = GQL_OID::get_type(value);
 
-    // Handle integer types (INT56_INLINE, INT64_EXTERN, INT64_TMP)
     if (value_type == GQL_OID::Type::INT56_INLINE ||
         value_type == GQL_OID::Type::INT64_EXTERN ||
         value_type == GQL_OID::Type::INT64_TMP)
     {
-        int64_t int_val = Common::Conversions::unpack_int(value);
-        return static_cast<double>(int_val);
+        return static_cast<double>(Common::Conversions::unpack_int(value));
     }
 
-    // Handle float types (FLOAT32)
     if (value_type == GQL_OID::Type::FLOAT32) {
         return static_cast<double>(Common::Conversions::unpack_float(value));
     }
 
-    // Handle double types (DOUBLE64_EXTERN, DOUBLE64_TMP)
     if (value_type == GQL_OID::Type::DOUBLE64_EXTERN ||
         value_type == GQL_OID::Type::DOUBLE64_TMP)
     {
         return Common::Conversions::unpack_double(value);
     }
 
-    // Handle decimal types (DECIMAL_INLINE, DECIMAL_EXTERN, DECIMAL_TMP)
     if (value_type == GQL_OID::Type::DECIMAL_INLINE ||
         value_type == GQL_OID::Type::DECIMAL_EXTERN ||
         value_type == GQL_OID::Type::DECIMAL_TMP)
@@ -1068,66 +726,87 @@ std::optional<double> ProjectProcedure::get_optional_double_from_dict(
 
     throw std::runtime_error(
         "Configuration value for '" + key + "' must be a numeric value, got type: " +
-        std::to_string(static_cast<int>(value_type))
-    );
+        std::to_string(static_cast<int>(value_type)));
 }
 
-PropertyConfig ProjectProcedure::parse_property_config(
-    ProcedureContext& ctx,
-    ObjectId config_oid,
-    const std::string& property_key
-) {
+// =============================================================================
+// String-to-enum converters
+// =============================================================================
+
+Orientation ProjectProcedure::parse_orientation_string(const std::string& orientation_str) {
+    std::string upper_str = orientation_str;
+    std::transform(upper_str.begin(), upper_str.end(), upper_str.begin(), ::toupper);
+
+    if (upper_str == "NATURAL")    return Orientation::NATURAL;
+    if (upper_str == "REVERSE")    return Orientation::REVERSE;
+    if (upper_str == "UNDIRECTED") return Orientation::UNDIRECTED;
+
+    throw std::runtime_error(
+        "Invalid orientation value: '" + orientation_str + "'. "
+        "Must be 'NATURAL', 'REVERSE', or 'UNDIRECTED' (case-insensitive).");
+}
+
+Aggregation ProjectProcedure::parse_aggregation_string(const std::string& aggregation_str) {
+    std::string upper_str = aggregation_str;
+    std::transform(upper_str.begin(), upper_str.end(), upper_str.begin(), ::toupper);
+
+    if (upper_str == "SINGLE" || upper_str == "NONE") return Aggregation::SINGLE;
+    if (upper_str == "MIN")   return Aggregation::MIN;
+    if (upper_str == "MAX")   return Aggregation::MAX;
+    if (upper_str == "SUM")   return Aggregation::SUM;
+    if (upper_str == "COUNT") return Aggregation::COUNT;
+
+    throw std::runtime_error(
+        "Invalid aggregation value: '" + aggregation_str + "'. "
+        "Must be 'SINGLE', 'NONE', 'MIN', 'MAX', 'SUM', or 'COUNT' (case-insensitive).");
+}
+
+// =============================================================================
+// Neo4j GDS map syntax parsing
+// =============================================================================
+
+PropertyConfig ProjectProcedure::parse_property_config(ObjectId config_oid, const std::string& property_key) {
     PropertyConfig config;
-    config.source_property = property_key;  // Default: same as key
+    config.source_property = property_key;
 
     auto config_type = GQL_OID::get_type(config_oid);
 
-    // If it's just a string, treat as simple property name (no config)
+    // Simple string: property name is the value
     if (config_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         config_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         config_type == GQL_OID::Type::STRING_SIMPLE_TMP)
     {
-        // Simple case: property name is the value
         config.source_property = Conversions::unpack_string(config_oid);
         return config;
     }
 
-    // Must be a dictionary with property configuration
     if (config_type != GQL_OID::Type::DICTIONARY) {
         throw std::runtime_error(
             "Property configuration for '" + property_key + "' must be a string or map, got type: " +
-            std::to_string(static_cast<int>(config_type))
-        );
+            std::to_string(static_cast<int>(config_type)));
     }
 
-    // Unpack the dictionary
     std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_oid);
     auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
     if (!dict_obj) {
         throw std::runtime_error("Failed to parse property configuration for '" + property_key + "'");
     }
 
-    // Extract 'property' key (source property name for renaming)
-    config.source_property = get_string_from_dict(ctx, dict_obj, "property", property_key);
-
-    // Extract 'defaultValue' key
-    config.default_value = get_optional_double_from_dict(ctx, dict_obj, "defaultValue");
-
-    // Extract 'aggregation' key (for per-property aggregation)
-    config.aggregation = get_aggregation_from_dict(ctx, dict_obj, "aggregation", Aggregation::SINGLE);
+    config.source_property = get_string_from_dict(dict_obj, "property", property_key);
+    config.default_value = get_optional_double_from_dict(dict_obj, "defaultValue");
+    config.aggregation = get_aggregation_from_dict(dict_obj, "aggregation", Aggregation::SINGLE);
 
     return config;
 }
 
 void ProjectProcedure::parse_properties_value(
-    ProcedureContext& ctx,
     ObjectId properties_oid,
     std::vector<std::string>& simple_properties,
-    std::unordered_map<std::string, PropertyConfig>& property_configs
-) {
+    std::unordered_map<std::string, PropertyConfig>& property_configs)
+{
     auto prop_type = GQL_OID::get_type(properties_oid);
 
-    // Case 1: Simple list of property names
+    // Case 1: List of property names
     if (prop_type == GQL_OID::Type::LIST) {
         std::vector<ObjectId> list_items = Conversions::unpack_list(properties_oid);
         for (const auto& item : list_items) {
@@ -1144,7 +823,7 @@ void ProjectProcedure::parse_properties_value(
         return;
     }
 
-    // Case 2: Single string property
+    // Case 2: Single string
     if (prop_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         prop_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         prop_type == GQL_OID::Type::STRING_SIMPLE_TMP)
@@ -1166,17 +845,14 @@ void ProjectProcedure::parse_properties_value(
 
             auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
             if (lit) {
-                // Value is a literal (string or nested dict in ObjectId form)
-                PropertyConfig prop_config = parse_property_config(ctx, lit->object_id, property_key);
-                property_configs[property_key] = prop_config;
+                property_configs[property_key] = parse_property_config(lit->object_id, property_key);
             } else {
-                // Value is a nested dictionary object directly
                 auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
                 if (nested_dict) {
                     PropertyConfig prop_config;
-                    prop_config.source_property = get_string_from_dict(ctx, nested_dict, "property", property_key);
-                    prop_config.default_value = get_optional_double_from_dict(ctx, nested_dict, "defaultValue");
-                    prop_config.aggregation = get_aggregation_from_dict(ctx, nested_dict, "aggregation", Aggregation::SINGLE);
+                    prop_config.source_property = get_string_from_dict(nested_dict, "property", property_key);
+                    prop_config.default_value = get_optional_double_from_dict(nested_dict, "defaultValue");
+                    prop_config.aggregation = get_aggregation_from_dict(nested_dict, "aggregation", Aggregation::SINGLE);
                     property_configs[property_key] = prop_config;
                 } else {
                     throw std::runtime_error("Invalid property configuration for '" + property_key + "'");
@@ -1188,21 +864,57 @@ void ProjectProcedure::parse_properties_value(
 
     throw std::runtime_error(
         "Properties must be a string, list, or map, got type: " +
-        std::to_string(static_cast<int>(prop_type))
-    );
+        std::to_string(static_cast<int>(prop_type)));
+}
+
+void ProjectProcedure::extract_nested_properties(
+    DictionaryObject* parent_dict,
+    std::vector<std::string>& simple_properties,
+    std::unordered_map<std::string, PropertyConfig>& property_configs)
+{
+    if (!parent_dict) return;
+
+    for (const auto& [key_oid, val_item] : parent_dict->keys) {
+        std::string key_str = Conversions::unpack_string(key_oid);
+        if (key_str != "properties") continue;
+
+        auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
+        if (nested_dict) {
+            for (const auto& [prop_key_oid, prop_val] : nested_dict->keys) {
+                std::string prop_key = Conversions::unpack_string(prop_key_oid);
+                auto prop_lit = dynamic_cast<DictionaryLiteral*>(prop_val.get());
+                if (prop_lit) {
+                    property_configs[prop_key] = parse_property_config(prop_lit->object_id, prop_key);
+                } else {
+                    auto prop_nested = dynamic_cast<DictionaryObject*>(prop_val.get());
+                    if (prop_nested) {
+                        PropertyConfig prop_config;
+                        prop_config.source_property = get_string_from_dict(prop_nested, "property", prop_key);
+                        prop_config.default_value = get_optional_double_from_dict(prop_nested, "defaultValue");
+                        prop_config.aggregation = get_aggregation_from_dict(prop_nested, "aggregation", Aggregation::SINGLE);
+                        property_configs[prop_key] = prop_config;
+                    }
+                }
+            }
+        } else {
+            auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
+            if (lit) {
+                parse_properties_value(lit->object_id, simple_properties, property_configs);
+            }
+        }
+        break;
+    }
 }
 
 NodeProjectionConfig ProjectProcedure::parse_single_node_config(
-    ProcedureContext& ctx,
-    ObjectId config_oid,
-    const std::string& projected_label
-) {
+    ObjectId config_oid, const std::string& projected_label)
+{
     NodeProjectionConfig config;
-    config.label = projected_label;  // Default: same as key
+    config.label = projected_label;
 
     auto config_type = GQL_OID::get_type(config_oid);
 
-    // If it's just a string, treat as simple label reference
+    // Simple string: label reference
     if (config_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         config_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         config_type == GQL_OID::Type::STRING_SIMPLE_TMP)
@@ -1211,83 +923,44 @@ NodeProjectionConfig ProjectProcedure::parse_single_node_config(
         return config;
     }
 
-    // Must be a dictionary with node configuration
     if (config_type != GQL_OID::Type::DICTIONARY) {
         throw std::runtime_error(
             "Node projection configuration for '" + projected_label + "' must be a string or map, got type: " +
-            std::to_string(static_cast<int>(config_type))
-        );
+            std::to_string(static_cast<int>(config_type)));
     }
 
-    // Unpack the dictionary
     std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_oid);
     auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
     if (!dict_obj) {
         throw std::runtime_error("Failed to parse node configuration for '" + projected_label + "'");
     }
 
-    // Extract 'label' key (source label, defaults to key)
-    config.label = get_string_from_dict(ctx, dict_obj, "label", projected_label);
+    config.label = get_string_from_dict(dict_obj, "label", projected_label);
 
-    // Extract 'properties' key
+    // Try ObjectId-based properties first
     bool properties_found = false;
     ObjectId properties_oid = get_value_from_dict(dict_obj, "properties", properties_found);
     if (properties_found && !properties_oid.is_null()) {
-        parse_properties_value(ctx, properties_oid, config.simple_properties, config.property_configs);
+        parse_properties_value(properties_oid, config.simple_properties, config.property_configs);
     } else {
-        // Check if properties is a nested dictionary object directly
-        for (const auto& [key_oid, val_item] : dict_obj->keys) {
-            std::string key_str = Conversions::unpack_string(key_oid);
-            if (key_str == "properties") {
-                auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
-                if (nested_dict) {
-                    // Parse as nested dictionary
-                    for (const auto& [prop_key_oid, prop_val] : nested_dict->keys) {
-                        std::string prop_key = Conversions::unpack_string(prop_key_oid);
-                        auto prop_lit = dynamic_cast<DictionaryLiteral*>(prop_val.get());
-                        if (prop_lit) {
-                            PropertyConfig prop_config = parse_property_config(ctx, prop_lit->object_id, prop_key);
-                            config.property_configs[prop_key] = prop_config;
-                        } else {
-                            auto prop_nested = dynamic_cast<DictionaryObject*>(prop_val.get());
-                            if (prop_nested) {
-                                PropertyConfig prop_config;
-                                prop_config.source_property = get_string_from_dict(ctx, prop_nested, "property", prop_key);
-                                prop_config.default_value = get_optional_double_from_dict(ctx, prop_nested, "defaultValue");
-                                prop_config.aggregation = get_aggregation_from_dict(ctx, prop_nested, "aggregation", Aggregation::SINGLE);
-                                config.property_configs[prop_key] = prop_config;
-                            }
-                        }
-                    }
-                } else {
-                    auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-                    if (lit) {
-                        parse_properties_value(ctx, lit->object_id, config.simple_properties, config.property_configs);
-                    }
-                }
-                break;
-            }
-        }
+        extract_nested_properties(dict_obj, config.simple_properties, config.property_configs);
     }
 
     return config;
 }
 
 RelationshipProjectionConfig ProjectProcedure::parse_single_relationship_config(
-    ProcedureContext& ctx,
-    ObjectId config_oid,
-    const std::string& projected_type,
-    Orientation global_orientation,
-    Aggregation global_aggregation
-) {
+    ObjectId config_oid, const std::string& projected_type,
+    Orientation global_orientation, Aggregation global_aggregation)
+{
     RelationshipProjectionConfig config;
-    config.type = projected_type;  // Default: same as key
-    config.orientation = global_orientation;  // Default from global
-    config.aggregation = global_aggregation;  // Default from global
+    config.type = projected_type;
+    config.orientation = global_orientation;
+    config.aggregation = global_aggregation;
 
     auto config_type = GQL_OID::get_type(config_oid);
 
-    // If it's just a string, treat as simple type reference
+    // Simple string: type reference
     if (config_type == GQL_OID::Type::STRING_SIMPLE_INLINE ||
         config_type == GQL_OID::Type::STRING_SIMPLE_EXTERN ||
         config_type == GQL_OID::Type::STRING_SIMPLE_TMP)
@@ -1296,75 +969,33 @@ RelationshipProjectionConfig ProjectProcedure::parse_single_relationship_config(
         return config;
     }
 
-    // Must be a dictionary with relationship configuration
     if (config_type != GQL_OID::Type::DICTIONARY) {
         throw std::runtime_error(
             "Relationship projection configuration for '" + projected_type + "' must be a string or map, got type: " +
-            std::to_string(static_cast<int>(config_type))
-        );
+            std::to_string(static_cast<int>(config_type)));
     }
 
-    // Unpack the dictionary
     std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(config_oid);
     auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
     if (!dict_obj) {
         throw std::runtime_error("Failed to parse relationship configuration for '" + projected_type + "'");
     }
 
-    // Extract 'type' key (source type, defaults to key)
-    config.type = get_string_from_dict(ctx, dict_obj, "type", projected_type);
+    config.type = get_string_from_dict(dict_obj, "type", projected_type);
+    config.orientation = get_orientation_from_dict(dict_obj, "orientation", global_orientation);
+    config.aggregation = get_aggregation_from_dict(dict_obj, "aggregation", global_aggregation);
+    config.aggregation_property = get_string_from_dict(dict_obj, "aggregationProperty", "");
 
-    // Extract 'orientation' key (per-type orientation, defaults to global)
-    config.orientation = get_orientation_from_dict(ctx, dict_obj, "orientation", global_orientation);
-
-    // Extract 'aggregation' key (per-type aggregation, defaults to global)
-    config.aggregation = get_aggregation_from_dict(ctx, dict_obj, "aggregation", global_aggregation);
-
-    // Extract 'aggregationProperty' key
-    config.aggregation_property = get_string_from_dict(ctx, dict_obj, "aggregationProperty", "");
-
-    // Extract 'properties' key
+    // Properties
     bool properties_found = false;
     ObjectId properties_oid = get_value_from_dict(dict_obj, "properties", properties_found);
     if (properties_found && !properties_oid.is_null()) {
-        parse_properties_value(ctx, properties_oid, config.simple_properties, config.property_configs);
+        parse_properties_value(properties_oid, config.simple_properties, config.property_configs);
     } else {
-        // Check if properties is a nested dictionary object directly
-        for (const auto& [key_oid, val_item] : dict_obj->keys) {
-            std::string key_str = Conversions::unpack_string(key_oid);
-            if (key_str == "properties") {
-                auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
-                if (nested_dict) {
-                    // Parse as nested dictionary
-                    for (const auto& [prop_key_oid, prop_val] : nested_dict->keys) {
-                        std::string prop_key = Conversions::unpack_string(prop_key_oid);
-                        auto prop_lit = dynamic_cast<DictionaryLiteral*>(prop_val.get());
-                        if (prop_lit) {
-                            PropertyConfig prop_config = parse_property_config(ctx, prop_lit->object_id, prop_key);
-                            config.property_configs[prop_key] = prop_config;
-                        } else {
-                            auto prop_nested = dynamic_cast<DictionaryObject*>(prop_val.get());
-                            if (prop_nested) {
-                                PropertyConfig prop_config;
-                                prop_config.source_property = get_string_from_dict(ctx, prop_nested, "property", prop_key);
-                                prop_config.default_value = get_optional_double_from_dict(ctx, prop_nested, "defaultValue");
-                                prop_config.aggregation = get_aggregation_from_dict(ctx, prop_nested, "aggregation", Aggregation::SINGLE);
-                                config.property_configs[prop_key] = prop_config;
-                            }
-                        }
-                    }
-                } else {
-                    auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
-                    if (lit) {
-                        parse_properties_value(ctx, lit->object_id, config.simple_properties, config.property_configs);
-                    }
-                }
-                break;
-            }
-        }
+        extract_nested_properties(dict_obj, config.simple_properties, config.property_configs);
     }
 
-    // If MIN/MAX/SUM and no aggregationProperty specified, use first property
+    // Auto-select aggregation property for MIN/MAX/SUM (deterministic: first simple, then sorted configs)
     if ((config.aggregation == Aggregation::MIN ||
          config.aggregation == Aggregation::MAX ||
          config.aggregation == Aggregation::SUM) &&
@@ -1373,52 +1004,41 @@ RelationshipProjectionConfig ProjectProcedure::parse_single_relationship_config(
         if (!config.simple_properties.empty()) {
             config.aggregation_property = config.simple_properties[0];
         } else if (!config.property_configs.empty()) {
-            config.aggregation_property = config.property_configs.begin()->first;
+            // Use lexicographically first key for deterministic behavior
+            std::string first_key;
+            for (const auto& [k, v] : config.property_configs) {
+                if (first_key.empty() || k < first_key) {
+                    first_key = k;
+                }
+            }
+            config.aggregation_property = first_key;
         }
     }
 
     return config;
 }
 
-NodeProjectionMap ProjectProcedure::parse_node_projection_map(ProcedureContext& ctx, ObjectId dict_oid) {
-
+NodeProjectionMap ProjectProcedure::parse_node_projection_map(ObjectId dict_oid) {
     NodeProjectionMap result;
 
-    // Unpack the outer dictionary
     std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(dict_oid);
     auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
     if (!dict_obj) {
         throw std::runtime_error("nodeProjection map must be a dictionary/map");
     }
 
-
-    // Iterate over each label in the map
     for (const auto& [key_oid, val_item] : dict_obj->keys) {
         std::string projected_label = Conversions::unpack_string(key_oid);
 
         auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
         if (lit) {
-            // Value is stored as ObjectId
-            NodeProjectionConfig config = parse_single_node_config(ctx, lit->object_id, projected_label);
-            result[projected_label] = config;
+            result[projected_label] = parse_single_node_config(lit->object_id, projected_label);
         } else {
-            // Value might be a nested DictionaryObject directly
             auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
             if (nested_dict) {
                 NodeProjectionConfig config;
-                config.label = get_string_from_dict(ctx, nested_dict, "label", projected_label);
-
-                // Handle properties
-                for (const auto& [inner_key_oid, inner_val] : nested_dict->keys) {
-                    std::string inner_key = Conversions::unpack_string(inner_key_oid);
-                    if (inner_key == "properties") {
-                        auto inner_lit = dynamic_cast<DictionaryLiteral*>(inner_val.get());
-                        if (inner_lit) {
-                            parse_properties_value(ctx, inner_lit->object_id, config.simple_properties, config.property_configs);
-                        }
-                    }
-                }
-
+                config.label = get_string_from_dict(nested_dict, "label", projected_label);
+                extract_nested_properties(nested_dict, config.simple_properties, config.property_configs);
                 result[projected_label] = config;
             } else {
                 throw std::runtime_error("Invalid node projection configuration for label '" + projected_label + "'");
@@ -1434,53 +1054,35 @@ NodeProjectionMap ProjectProcedure::parse_node_projection_map(ProcedureContext& 
 }
 
 RelationshipProjectionMap ProjectProcedure::parse_relationship_projection_map(
-    ProcedureContext& ctx,
-    ObjectId dict_oid,
-    Orientation global_orientation,
-    Aggregation global_aggregation
-) {
+    ObjectId dict_oid, Orientation global_orientation, Aggregation global_aggregation)
+{
     RelationshipProjectionMap result;
 
-    // Unpack the outer dictionary
     std::unique_ptr<Dictionary> dict = Common::Conversions::unpack_dictionary(dict_oid);
     auto dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
     if (!dict_obj) {
         throw std::runtime_error("relationshipProjection map must be a dictionary/map");
     }
 
-
-    // Iterate over each type in the map
     for (const auto& [key_oid, val_item] : dict_obj->keys) {
         std::string projected_type = Conversions::unpack_string(key_oid);
 
         auto lit = dynamic_cast<DictionaryLiteral*>(val_item.get());
         if (lit) {
-            // Value is stored as ObjectId
-            RelationshipProjectionConfig config = parse_single_relationship_config(
-                ctx, lit->object_id, projected_type, global_orientation, global_aggregation);
-            result[projected_type] = config;
+            result[projected_type] = parse_single_relationship_config(
+                lit->object_id, projected_type, global_orientation, global_aggregation);
         } else {
-            // Value might be a nested DictionaryObject directly
             auto nested_dict = dynamic_cast<DictionaryObject*>(val_item.get());
             if (nested_dict) {
                 RelationshipProjectionConfig config;
-                config.type = get_string_from_dict(ctx, nested_dict, "type", projected_type);
-                config.orientation = get_orientation_from_dict(ctx, nested_dict, "orientation", global_orientation);
-                config.aggregation = get_aggregation_from_dict(ctx, nested_dict, "aggregation", global_aggregation);
-                config.aggregation_property = get_string_from_dict(ctx, nested_dict, "aggregationProperty", "");
+                config.type = get_string_from_dict(nested_dict, "type", projected_type);
+                config.orientation = get_orientation_from_dict(nested_dict, "orientation", global_orientation);
+                config.aggregation = get_aggregation_from_dict(nested_dict, "aggregation", global_aggregation);
+                config.aggregation_property = get_string_from_dict(nested_dict, "aggregationProperty", "");
 
-                // Handle properties
-                for (const auto& [inner_key_oid, inner_val] : nested_dict->keys) {
-                    std::string inner_key = Conversions::unpack_string(inner_key_oid);
-                    if (inner_key == "properties") {
-                        auto inner_lit = dynamic_cast<DictionaryLiteral*>(inner_val.get());
-                        if (inner_lit) {
-                            parse_properties_value(ctx, inner_lit->object_id, config.simple_properties, config.property_configs);
-                        }
-                    }
-                }
+                extract_nested_properties(nested_dict, config.simple_properties, config.property_configs);
 
-                // If MIN/MAX/SUM and no aggregationProperty specified, use first property
+                // Auto-select aggregation property (deterministic)
                 if ((config.aggregation == Aggregation::MIN ||
                      config.aggregation == Aggregation::MAX ||
                      config.aggregation == Aggregation::SUM) &&
@@ -1489,7 +1091,13 @@ RelationshipProjectionMap ProjectProcedure::parse_relationship_projection_map(
                     if (!config.simple_properties.empty()) {
                         config.aggregation_property = config.simple_properties[0];
                     } else if (!config.property_configs.empty()) {
-                        config.aggregation_property = config.property_configs.begin()->first;
+                        std::string first_key;
+                        for (const auto& [k, v] : config.property_configs) {
+                            if (first_key.empty() || k < first_key) {
+                                first_key = k;
+                            }
+                        }
+                        config.aggregation_property = first_key;
                     }
                 }
 
