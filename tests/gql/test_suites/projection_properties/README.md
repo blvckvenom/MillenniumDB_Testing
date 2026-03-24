@@ -159,7 +159,7 @@ All 14 tests should PASS with the following characteristics:
 
 ### Property Not Accessible in Projection
 
-**Issue**: `USE GRAPH projection_name; MATCH (n) WHERE n.property = value` returns no results
+**Issue**: `USE projection_name; MATCH (n) WHERE n.property = value` returns no results
 - **Cause**: Property indexes not created (config parameter missing)
 - **Fix**: Ensure `nodeProperties` or `relationshipProperties` specified in `graph_project` call
 

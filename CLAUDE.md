@@ -163,14 +163,18 @@ The GNN pipeline roadmap is documented in `Partial_Idea/`:
 
 ## GQL Native Projection
 
-For GQL projection development, use the dedicated skill:
+**Implementation:** `src/graph_models/gql/projection/` (18 files)
+**Procedure:** `src/query/procedure/builtin/project_procedure.h/cc`
+**Documentation:** `docs/native_projection_review/` (7 documents) and `docs/MillenniumDB.wiki/GQL-Projections.md`
 
-**Skill:** `.claude/skills/gql-projection-dev/`
-- Implementation status, key files, quick commands
-- Syntax reference: `references/syntax-reference.md`
-- Validation patterns: `references/validation-patterns.md`
-
-**Implementation Location:** `src/graph_models/gql/projection/`
+Key capabilities:
+- `CALL graph_project(name, nodeProjection, relProjection [, config])` — creates disk-based subgraph projections
+- Supports STRING, LIST, MAP (Neo4j GDS) syntax for node/relationship projection
+- Orientation: NATURAL, REVERSE, UNDIRECTED (per-type overrides)
+- Aggregation: SINGLE, COUNT, SUM, MIN, MAX (per-type overrides)
+- Property configuration: renaming, defaults, per-property aggregation
+- Query via `USE projection_name` (no GRAPH keyword)
+- Tests: `tests/gql/test_suites/projection_native/`, `projection_properties/`, `projection_comprehensive/`, `projection_advanced/`
 
 ## Claude Code Configuration
 
