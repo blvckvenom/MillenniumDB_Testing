@@ -52,6 +52,10 @@
 #include "storage/index/record.h"
 #include "storage/page/page.h"
 
+#ifdef MDB_GPU_ENABLED
+#include "gpu/sort/gpu_sort.h"
+#endif
+
 namespace GQL {
 
 /**
@@ -162,6 +166,15 @@ public:
         return (total_records_ * RECORD_SIZE) <= buffer_size_;
     }
 
+    /// Mutable access to in-memory records (sort_and_stream may move them)
+    std::vector<Record<N>>& memory_records() { return memory_records_; }
+
+    /// Run file paths for spill files
+    const std::vector<std::string>& run_files() const { return run_files_; }
+
+    /// Record counts per run file
+    const std::vector<size_t>& run_record_counts() const { return run_record_counts_; }
+
     /**
      * @brief Streams sorted records to callback function.
      *
@@ -179,6 +192,23 @@ public:
             return;
         }
 
+#ifdef MDB_GPU_ENABLED
+        {
+            auto resources = mdb::gpu::detect_resources();
+            auto plan = mdb::gpu::plan_sort(total_records_, N, resources);
+
+            if (plan.strategy != mdb::gpu::SortStrategy::EXTERNAL_SORT) {
+                std::function<void(const Record<N>&)> gpu_callback =
+                    [&callback](const Record<N>& r) { callback(r); };
+                bool used = mdb::gpu::sort_and_stream<N>(
+                    memory_records_, run_files_, run_record_counts_,
+                    total_records_, gpu_callback, resources);
+                if (used) return;
+            }
+        }
+#endif
+
+        // Existing fallback unchanged
         if (fits_in_memory()) {
             stream_in_memory(std::forward<Callback>(callback));
         } else {
