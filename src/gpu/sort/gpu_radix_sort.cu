@@ -7,6 +7,7 @@
 #include "gpu/sort/gpu_radix_sort.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <numeric>
@@ -75,6 +76,15 @@ static bool gpu_radix_sort_impl(
     uint32_t*              h_sorted_indices  // [num_items] output
 ) {
     DeviceMemory dmem;
+
+    // CUB DeviceRadixSort takes int num_items; guard against silent overflow on
+    // large-VRAM GPUs (H100/H200 with 80+ GB) where the caller could legitimately
+    // pass more than INT_MAX records. Return false to trigger CPU fallback.
+    if (num_items > static_cast<uint64_t>(INT_MAX)) {
+        fprintf(stderr, "GPU sort: num_items %llu exceeds CUB int limit (%d)\n",
+                (unsigned long long)num_items, INT_MAX);
+        return false;
+    }
 
     // -----------------------------------------------------------------------
     // 1. Allocate device field arrays and upload
@@ -145,6 +155,9 @@ static bool gpu_radix_sort_impl(
                 d_fields[field_idx], d_vals_out, d_keys_in, num_items);
             CHECK_CUDA(cudaGetLastError());
 
+            // Both ops on default stream: kernel launch and D2D memcpy are serialized by CUDA.
+            // gather reads d_vals_out, memcpy reads d_vals_out — both reads, no race.
+
             // Sorted indices become the new values
             CHECK_CUDA(cudaMemcpy(d_vals_in, d_vals_out, field_bytes,
                                   cudaMemcpyDeviceToDevice));
@@ -177,13 +190,18 @@ bool execute_gpu_radix_sort(
     uint32_t                               num_passes
 ) {
     uint64_t num_items = all_records.size();
-    if (num_items == 0) {
-        return true;  // nothing to do
-    }
 
     // Clamp passes to record width
     if (num_passes > N) {
         num_passes = static_cast<uint32_t>(N);
+    }
+
+    if (num_items == 0 || num_passes == 0) {
+        // Nothing to sort — stream records as-is
+        for (const auto& rec : all_records) {
+            callback(rec);
+        }
+        return true;
     }
 
     // -----------------------------------------------------------------------
