@@ -1,6 +1,6 @@
 #include "gpu/resource_planner.h"
 #include <algorithm>
-#include <cmath>
+#include <cassert>
 
 namespace mdb::gpu {
 
@@ -10,6 +10,7 @@ SortPlan plan_sort(
     const SystemResources& resources,
     const PlannerConfig&   config
 ) {
+    assert(num_fields > 0 && "plan_sort requires at least 1 sort field");
     SortPlan plan;
     plan.num_passes = num_fields;
 

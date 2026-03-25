@@ -14,7 +14,7 @@ enum class SortStrategy {
 };
 
 struct SortPlan {
-    SortStrategy strategy;
+    SortStrategy strategy            = SortStrategy::EXTERNAL_SORT;
     size_t       gpu_memory_needed   = 0;
     size_t       cpu_memory_needed   = 0;
     uint32_t     num_chunks          = 0;
@@ -23,7 +23,6 @@ struct SortPlan {
 };
 
 struct PlannerConfig {
-    float    gpu_vram_safety  = 0.80f;
     float    cpu_ram_safety   = 0.70f;
     uint64_t min_records_gpu  = 500000;
     size_t   min_chunk_vram   = 256 * 1024 * 1024;
