@@ -13,8 +13,22 @@
 namespace mdb::gpu {
 
 // ---------------------------------------------------------------------------
-// Error-handling macro: returns false instead of calling exit()
+// Error-handling macros
 // ---------------------------------------------------------------------------
+// CHECK_CUDA_CLEAN: frees device memory via a cleanup lambda before returning.
+// Use inside filter_edges_gpu() where d_flags/d_num_selected/d_temp are live.
+#define CHECK_CUDA_CLEAN(call, cleanup_fn)                                    \
+    do {                                                                      \
+        cudaError_t err = (call);                                             \
+        if (err != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA Error: %s at %s:%d\n",                     \
+                    cudaGetErrorString(err), __FILE__, __LINE__);             \
+            cleanup_fn();                                                     \
+            return false;                                                     \
+        }                                                                     \
+    } while (0)
+
+// CHECK_CUDA: plain variant (no live allocations yet, used before any malloc)
 #define CHECK_CUDA(call)                                                      \
     do {                                                                      \
         cudaError_t err = (call);                                             \
@@ -69,10 +83,23 @@ bool filter_edges_gpu(
     }
 
     // -----------------------------------------------------------------------
+    // 0. RAII-style cleanup lambda: frees all intermediate device allocations.
+    //    Called on every error path via CHECK_CUDA_CLEAN and on the success path.
+    // -----------------------------------------------------------------------
+    uint8_t*  d_flags        = nullptr;
+    uint64_t* d_num_selected = nullptr;
+    void*     d_temp         = nullptr;
+
+    auto cleanup = [&]() {
+        if (d_flags)        { cudaFree(d_flags);        d_flags        = nullptr; }
+        if (d_num_selected) { cudaFree(d_num_selected); d_num_selected = nullptr; }
+        if (d_temp)         { cudaFree(d_temp);         d_temp         = nullptr; }
+    };
+
+    // -----------------------------------------------------------------------
     // 1. Allocate flags array and compute per-edge pass/fail
     // -----------------------------------------------------------------------
-    uint8_t* d_flags = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_flags, num_edges * sizeof(uint8_t)));
+    CHECK_CUDA_CLEAN(cudaMalloc(&d_flags, num_edges * sizeof(uint8_t)), cleanup);
 
     constexpr int block_size = 256;
     int grid_size = static_cast<int>(
@@ -83,62 +110,59 @@ bool filter_edges_gpu(
         d_from, d_to, d_edge,
         d_node_bitset, d_edge_bitset,
         d_flags, num_edges);
-    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA_CLEAN(cudaGetLastError(), cleanup);
 
     // -----------------------------------------------------------------------
     // 2. CUB DeviceSelect::Flagged — two-call pattern for each SoA column
     //    All three columns share the same flags; we compact each separately.
     // -----------------------------------------------------------------------
     // First: determine required temp storage size
-    void*  d_temp     = nullptr;
     size_t temp_bytes = 0;
 
     // d_num_selected_out lives on device
-    uint64_t* d_num_selected = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_num_selected, sizeof(uint64_t)));
+    CHECK_CUDA_CLEAN(cudaMalloc(&d_num_selected, sizeof(uint64_t)), cleanup);
 
     // Size query (nullptr for d_temp)
-    CHECK_CUDA(cub::DeviceSelect::Flagged(
+    CHECK_CUDA_CLEAN(cub::DeviceSelect::Flagged(
         d_temp, temp_bytes,
         d_from, d_flags, d_out_from, d_num_selected,
-        static_cast<int>(num_edges)));
+        static_cast<int>(num_edges)), cleanup);
 
-    CHECK_CUDA(cudaMalloc(&d_temp, temp_bytes));
+    CHECK_CUDA_CLEAN(cudaMalloc(&d_temp, temp_bytes), cleanup);
 
     // Compact from_vals
-    CHECK_CUDA(cub::DeviceSelect::Flagged(
+    CHECK_CUDA_CLEAN(cub::DeviceSelect::Flagged(
         d_temp, temp_bytes,
         d_from, d_flags, d_out_from, d_num_selected,
-        static_cast<int>(num_edges)));
+        static_cast<int>(num_edges)), cleanup);
 
     // Compact to_vals (reuse same temp; size is sufficient)
-    CHECK_CUDA(cub::DeviceSelect::Flagged(
+    CHECK_CUDA_CLEAN(cub::DeviceSelect::Flagged(
         d_temp, temp_bytes,
         d_to, d_flags, d_out_to, d_num_selected,
-        static_cast<int>(num_edges)));
+        static_cast<int>(num_edges)), cleanup);
 
     // Compact edge_vals
-    CHECK_CUDA(cub::DeviceSelect::Flagged(
+    CHECK_CUDA_CLEAN(cub::DeviceSelect::Flagged(
         d_temp, temp_bytes,
         d_edge, d_flags, d_out_edge, d_num_selected,
-        static_cast<int>(num_edges)));
+        static_cast<int>(num_edges)), cleanup);
 
     // -----------------------------------------------------------------------
     // 3. Copy back the number of surviving edges
     // -----------------------------------------------------------------------
-    CHECK_CUDA(cudaMemcpy(num_surviving, d_num_selected, sizeof(uint64_t),
-                          cudaMemcpyDeviceToHost));
+    CHECK_CUDA_CLEAN(cudaMemcpy(num_surviving, d_num_selected, sizeof(uint64_t),
+                                cudaMemcpyDeviceToHost), cleanup);
 
     // -----------------------------------------------------------------------
-    // 4. Cleanup
+    // 4. Cleanup (success path)
     // -----------------------------------------------------------------------
-    cudaFree(d_flags);
-    cudaFree(d_temp);
-    cudaFree(d_num_selected);
+    cleanup();
 
     return true;
 }
 
+#undef CHECK_CUDA_CLEAN
 #undef CHECK_CUDA
 
 } // namespace mdb::gpu
