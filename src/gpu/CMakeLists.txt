@@ -22,12 +22,9 @@ target_include_directories(mdb_gpu PUBLIC ${CMAKE_SOURCE_DIR}/src)
 # ----------------------------------------------------------------------------
 # Optional CUDA support
 # ----------------------------------------------------------------------------
-find_package(CUDAToolkit QUIET)
+# CUDAToolkit_FOUND and enable_language(CUDA) are handled at project scope
+# in the root CMakeLists.txt before add_subdirectory(src/gpu).
 if(CUDAToolkit_FOUND)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
     target_sources(mdb_gpu PRIVATE
         sort/gpu_radix_sort.cu
         ops/gpu_filter.cu
@@ -38,6 +35,8 @@ if(CUDAToolkit_FOUND)
 
     # Multi-architecture: Turing through Hopper + PTX forward-compat
     set_target_properties(mdb_gpu PROPERTIES
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "75;80;86;89;90"
     )
 
@@ -58,6 +57,7 @@ if(BUILD_TESTING)
             tests/test_gpu_sort.cc
             tests/test_gpu_ops.cc
         )
+        set_target_properties(test_gpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
         target_link_libraries(test_gpu mdb_gpu GTest::gtest_main)
         add_test(NAME GpuTests COMMAND test_gpu)
 

@@ -137,6 +137,7 @@ file(GLOB_RECURSE BIN_SRCS src/bin/*.cc)
 file(GLOB_RECURSE TEST_SRCS src/tests/*.cc)
 file(GLOB_RECURSE GNN_SRCS src/gnn/*.cc)
 file(GLOB GNN_PROCEDURE_SRCS src/query/procedure/builtin/gnn_*_procedure.cc)
+# .cu files are not matched by the src/*.cc glob, so only .cc exclusion is needed
 file(GLOB_RECURSE GPU_SRCS src/gpu/*.cc)
 # Remove unwanted files from common sources
 list(REMOVE_ITEM SRCS ${BIN_SRCS})
@@ -159,6 +160,13 @@ option(ENABLE_GNN "Enable GNN training module with LibTorch" OFF)
 # enable_testing() must be called before add_subdirectory(src/gnn) so that
 # add_test() calls in the GNN subdirectory are registered with ctest.
 enable_testing()
+
+# Optional: CUDA for GPU-accelerated sort
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    message(STATUS "Found CUDA Toolkit: ${CUDAToolkit_VERSION}")
+endif()
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/src/gpu)
 
