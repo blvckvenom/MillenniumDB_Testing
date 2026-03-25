@@ -24,8 +24,10 @@ static size_t parse_memavailable() {
     while (std::getline(meminfo, line)) {
         if (line.rfind("MemAvailable:", 0) == 0) {
             size_t kb = 0;
-            std::sscanf(line.c_str(), "MemAvailable: %zu kB", &kb);
-            return kb * 1024;
+            if (std::sscanf(line.c_str(), "MemAvailable: %zu kB", &kb) == 1) {
+                return kb * 1024;
+            }
+            return 0;
         }
     }
     return 0;
@@ -55,11 +57,14 @@ SystemResources detect_resources() {
 
             size_t free_bytes  = 0;
             size_t total_bytes = 0;
+            int prev_device    = 0;
+            cudaGetDevice(&prev_device);
             cudaSetDevice(0);
             if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
                 res.gpu.free_vram = static_cast<size_t>(
                     static_cast<double>(free_bytes) * VRAM_SAFETY_FACTOR);
             }
+            cudaSetDevice(prev_device);
         }
     }
 #endif
@@ -69,13 +74,18 @@ SystemResources detect_resources() {
 
 size_t refresh_gpu_free_vram() {
 #ifdef MDB_GPU_ENABLED
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    cudaSetDevice(0);
     size_t free_bytes  = 0;
     size_t total_bytes = 0;
-    cudaSetDevice(0);
+    size_t result      = 0;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
-        return static_cast<size_t>(
+        result = static_cast<size_t>(
             static_cast<double>(free_bytes) * VRAM_SAFETY_FACTOR);
     }
+    cudaSetDevice(prev_device);
+    return result;
 #endif
     return 0;
 }
