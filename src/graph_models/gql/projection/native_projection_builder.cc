@@ -84,6 +84,15 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     // Reserve batch buffer capacity for efficiency
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
+
+    // Build inverse catalog maps once for O(1) property key name lookup.
+    // Replaces per-property-per-node/edge O(K) linear scan through catalog maps.
+    for (const auto& [name, id] : gql_model.catalog.node_keys2id) {
+        node_key_id_to_name[id | ObjectId::MASK_NODE_KEY] = name;
+    }
+    for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
+        edge_key_id_to_name[id | ObjectId::MASK_EDGE_KEY] = name;
+    }
 }
 
 // ============================================================================
@@ -592,13 +601,11 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
             ObjectId key_id((*record)[1]);
             ObjectId value_id((*record)[2]);
 
-            // Look up the property name from catalog
+            // Look up the property name from inverse catalog map (O(1))
             std::string source_key_name;
-            for (const auto& [name, id] : gql_model.catalog.node_keys2id) {
-                if ((id | ObjectId::MASK_NODE_KEY) == key_id.id) {
-                    source_key_name = name;
-                    break;
-                }
+            auto nk_it = node_key_id_to_name.find(key_id.id);
+            if (nk_it != node_key_id_to_name.end()) {
+                source_key_name = nk_it->second;
             }
 
             // Check if any property config uses this source property
@@ -673,11 +680,9 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
         // If we have a filter list, check if this property is in it
         if (!node_property_keys.empty()) {
             std::string key_name;
-            for (const auto& [name, id] : gql_model.catalog.node_keys2id) {
-                if ((id | ObjectId::MASK_NODE_KEY) == key_id.id) {
-                    key_name = name;
-                    break;
-                }
+            auto nk_it = node_key_id_to_name.find(key_id.id);
+            if (nk_it != node_key_id_to_name.end()) {
+                key_name = nk_it->second;
             }
 
             if (std::find(node_property_keys.begin(), node_property_keys.end(), key_name) == node_property_keys.end()) {
@@ -716,13 +721,11 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
             ObjectId key_id((*record)[1]);
             ObjectId value_id((*record)[2]);
 
-            // Look up the property name from catalog
+            // Look up the property name from inverse catalog map (O(1))
             std::string source_key_name;
-            for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
-                if ((id | ObjectId::MASK_EDGE_KEY) == key_id.id) {
-                    source_key_name = name;
-                    break;
-                }
+            auto ek_it = edge_key_id_to_name.find(key_id.id);
+            if (ek_it != edge_key_id_to_name.end()) {
+                source_key_name = ek_it->second;
             }
 
             // Check if any property config uses this source property
@@ -797,11 +800,9 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
         // If we have a filter list, check if this property is in it
         if (!edge_property_keys.empty()) {
             std::string key_name;
-            for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
-                if ((id | ObjectId::MASK_EDGE_KEY) == key_id.id) {
-                    key_name = name;
-                    break;
-                }
+            auto ek_it = edge_key_id_to_name.find(key_id.id);
+            if (ek_it != edge_key_id_to_name.end()) {
+                key_name = ek_it->second;
             }
 
             if (std::find(edge_property_keys.begin(), edge_property_keys.end(), key_name) == edge_property_keys.end()) {
@@ -843,13 +844,11 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
             ObjectId key_id((*record)[1]);
             ObjectId value_id((*record)[2]);
 
-            // Look up the property name from catalog
+            // Look up the property name from inverse catalog map (O(1))
             std::string source_key_name;
-            for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
-                if ((id | ObjectId::MASK_EDGE_KEY) == key_id.id) {
-                    source_key_name = name;
-                    break;
-                }
+            auto ek_it = edge_key_id_to_name.find(key_id.id);
+            if (ek_it != edge_key_id_to_name.end()) {
+                source_key_name = ek_it->second;
             }
 
             // EXCLUSION CHECK: Skip the aggregation property
@@ -929,11 +928,9 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
         // If we have a filter list, check if this property is in it
         if (!edge_property_keys.empty()) {
             std::string key_name;
-            for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
-                if ((id | ObjectId::MASK_EDGE_KEY) == key_id.id) {
-                    key_name = name;
-                    break;
-                }
+            auto ek_it = edge_key_id_to_name.find(key_id.id);
+            if (ek_it != edge_key_id_to_name.end()) {
+                key_name = ek_it->second;
             }
 
             // EXCLUSION CHECK: Skip the aggregation property
@@ -949,11 +946,9 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
         } else {
             // No filter list - still need to check exclusion
             std::string key_name;
-            for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
-                if ((id | ObjectId::MASK_EDGE_KEY) == key_id.id) {
-                    key_name = name;
-                    break;
-                }
+            auto ek_it = edge_key_id_to_name.find(key_id.id);
+            if (ek_it != edge_key_id_to_name.end()) {
+                key_name = ek_it->second;
             }
 
             // EXCLUSION CHECK: Skip the aggregation property

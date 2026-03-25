@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "graph_models/gql/projection/edge_aggregation_record.h"
@@ -326,6 +327,11 @@ private:
     std::unordered_map<std::string, Orientation> per_type_orientations;
     std::unordered_map<std::string, Aggregation> per_type_aggregations;
     std::unordered_map<std::string, std::string> per_type_agg_properties;
+
+    // Inverse catalog maps: masked key ID -> property name (O(1) lookup)
+    // Built once in constructor, replaces O(K) linear scans in extract_*_properties()
+    std::unordered_map<uint64_t, std::string> node_key_id_to_name;
+    std::unordered_map<uint64_t, std::string> edge_key_id_to_name;
 
     std::chrono::steady_clock::time_point start_time;
 
