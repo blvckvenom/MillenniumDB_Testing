@@ -161,6 +161,26 @@ The GNN pipeline roadmap is documented in `Partial_Idea/`:
 **Neo4j Graph Data Science:**
 - Full Manual: `docs/external_references/NEO4J_USER_MANUAL_DOC/neo4j_graph_data_science_manual_.md`
 
+**NVIDIA CUDA Toolkit Documentation (68 PDFs, v13.2):**
+- Full collection: `docs/external_references/NVIDIA_CUDA_DOCS/` (104 MB)
+- Includes all CUDA libraries, architecture guides, tools, compiler docs
+
+**NVIDIA CCCL — CUDA Core Compute Libraries (CUB + Thrust + libcudacxx):**
+- PDFs with API reference: `docs/external_references/GNN_ESSENTIAL_DOCS/{CUB,Thrust,libcudacxx,cudax}.pdf`
+- HTML offline (with search): `docs/external_references/CCCL_DOCS/` (open `index.html`)
+- CUB: Device-wide primitives (DeviceRadixSort, DeviceReduce, DeviceScan, DeviceSelect), Block/Warp collectives
+- Thrust: High-level parallel algorithms (sort_by_key, exclusive_scan, reduce_by_key, transform, gather/scatter)
+- libcudacxx: CUDA C++ Standard Library (atomics, barriers, memory model, synchronization, math, mdspan)
+- Thrust uses CUB internally as GPU backend
+
+**GNN-Essential CUDA Documentation (22 PDFs, curated):**
+- Location: `docs/external_references/GNN_ESSENTIAL_DOCS/` (63 MB)
+- Core: cuda-programming-guide, CUDA Runtime/Driver API, Math API, Best Practices
+- GNN pillars: cuBLAS (matmul), cuSPARSE (SpMM), cuRAND (sampling), cuSOLVER
+- CCCL: CUB (757p), Thrust (714p), libcudacxx (769p), cudax (112p)
+- Profiling: Nsight Compute + Profiling Guide, Nsight Systems
+- I/O: GPUDirect RDMA, GPUDirect Storage API + Best Practices
+
 ## GQL Native Projection
 
 **Implementation:** `src/graph_models/gql/projection/` (18 files)
