@@ -8,6 +8,10 @@
 #include <execution>
 #endif
 
+#ifdef MDB_GPU_ENABLED
+#include "gpu/sort/gpu_radix_sort.cuh"
+#endif
+
 namespace mdb::gpu {
 
 namespace {
@@ -103,9 +107,16 @@ bool sort_and_stream(
             return execute_cpu_sort<N>(all_records, callback, /*use_parallel=*/true);
 
 #ifdef MDB_GPU_ENABLED
-        case SortStrategy::GPU_FULL:
+        case SortStrategy::GPU_FULL: {
+            bool ok = execute_gpu_radix_sort<N>(all_records, callback, plan.num_passes);
+            if (!ok) {
+                // GPU error — fall back to best CPU sort
+                return execute_cpu_sort<N>(all_records, callback, resources.has_tbb);
+            }
+            return true;
+        }
         case SortStrategy::GPU_CHUNKED:
-            // TODO: Task 5 will implement GPU paths
+            // TODO: Task 6 will implement chunked GPU sort with double buffering
             return execute_cpu_sort<N>(all_records, callback, resources.has_tbb);
 #else
         case SortStrategy::GPU_FULL:

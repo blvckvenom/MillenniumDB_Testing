@@ -128,6 +128,41 @@ TEST(GpuSortTest, CpuSequentialSortsCorrectly) {
     }
 }
 
+TEST(GpuSortTest, GpuFullSortsCorrectly) {
+    auto res = mdb::gpu::detect_resources();
+    if (!res.has_gpu) {
+        GTEST_SKIP() << "No GPU available";
+    }
+
+    std::mt19937 rng(42);
+    std::vector<Record<3>> records(1000000);  // 1M records
+    for (auto& r : records) {
+        r[0] = rng() % 100000;
+        r[1] = rng() % 100000;
+        r[2] = rng() % 1000000;
+    }
+
+    auto expected = records;
+    std::sort(expected.begin(), expected.end());
+
+    std::vector<Record<3>> result;
+    result.reserve(records.size());
+
+    mdb::gpu::PlannerConfig config;
+    config.min_records_gpu = 100;  // Low threshold to force GPU
+
+    bool ok = mdb::gpu::sort_and_stream<3>(
+        records, {}, {}, records.size(),
+        [&result](const Record<3>& r) { result.push_back(r); },
+        res, config);
+
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(result.size(), expected.size());
+    for (size_t i = 0; i < std::min(result.size(), expected.size()); i++) {
+        EXPECT_EQ(result[i], expected[i]) << "Mismatch at index " << i;
+    }
+}
+
 TEST(GpuSortTest, SortPreservesEdgeIdOrder) {
     // Records with same (from, to) must be ordered by edge_id
     std::vector<Record<3>> records = {
