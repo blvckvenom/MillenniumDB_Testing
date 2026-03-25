@@ -137,11 +137,13 @@ file(GLOB_RECURSE BIN_SRCS src/bin/*.cc)
 file(GLOB_RECURSE TEST_SRCS src/tests/*.cc)
 file(GLOB_RECURSE GNN_SRCS src/gnn/*.cc)
 file(GLOB GNN_PROCEDURE_SRCS src/query/procedure/builtin/gnn_*_procedure.cc)
+file(GLOB_RECURSE GPU_SRCS src/gpu/*.cc)
 # Remove unwanted files from common sources
 list(REMOVE_ITEM SRCS ${BIN_SRCS})
 list(REMOVE_ITEM SRCS ${TEST_SRCS})
 list(REMOVE_ITEM SRCS ${GNN_SRCS})
 list(REMOVE_ITEM SRCS ${GNN_PROCEDURE_SRCS})
+list(REMOVE_ITEM SRCS ${GPU_SRCS})
 
 message(STATUS "Build MillenniumDB's binaries")
 # Third party dependencies
@@ -157,6 +159,8 @@ option(ENABLE_GNN "Enable GNN training module with LibTorch" OFF)
 # enable_testing() must be called before add_subdirectory(src/gnn) so that
 # add_test() calls in the GNN subdirectory are registered with ctest.
 enable_testing()
+
+add_subdirectory(${CMAKE_SOURCE_DIR}/src/gpu)
 
 if(ENABLE_GNN)
     message(STATUS "GNN module enabled - looking for LibTorch...")
@@ -176,6 +180,7 @@ endif()
 
 # Define targets
 add_library(millenniumdb STATIC ${SRCS})
+target_link_libraries(millenniumdb PUBLIC mdb_gpu)
 target_compile_definitions(millenniumdb PUBLIC SERD_STATIC)
 set(BUILD_TARGETS
     mdb

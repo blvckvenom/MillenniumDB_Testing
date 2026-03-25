@@ -1,0 +1,68 @@
+# ============================================================================
+# GPU Module CMake Configuration
+# ============================================================================
+#
+# GPU-accelerated operations for MillenniumDB (sort, filter, transform).
+# CUDA is optional: when CUDAToolkit is not found, only CPU fallback code
+# is compiled and MDB_GPU_ENABLED is NOT defined.
+#
+# This module has zero MillenniumDB source dependencies.  It only links
+# CUDA::cudart (when available) and exposes MDB_GPU_ENABLED to consumers.
+# ============================================================================
+
+add_library(mdb_gpu STATIC
+    gpu_device.cc
+    resource_planner.cc
+    sort/gpu_sort.cc
+    sort/gpu_sort_fallback.cc
+)
+
+target_include_directories(mdb_gpu PUBLIC ${CMAKE_SOURCE_DIR}/src)
+
+# ----------------------------------------------------------------------------
+# Optional CUDA support
+# ----------------------------------------------------------------------------
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+    target_sources(mdb_gpu PRIVATE
+        sort/gpu_radix_sort.cu
+        ops/gpu_filter.cu
+        ops/gpu_transform.cu
+    )
+    target_link_libraries(mdb_gpu PRIVATE CUDA::cudart)
+    target_compile_definitions(mdb_gpu PUBLIC MDB_GPU_ENABLED)
+
+    # Multi-architecture: Turing through Hopper + PTX forward-compat
+    set_target_properties(mdb_gpu PROPERTIES
+        CUDA_ARCHITECTURES "75;80;86;89;90"
+    )
+
+    message(STATUS "GPU module: CUDA enabled (${CUDAToolkit_VERSION})")
+else()
+    message(STATUS "GPU module: CUDA not found, CPU-only fallback")
+endif()
+
+# ----------------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------------
+if(BUILD_TESTING)
+    find_package(GTest QUIET)
+
+    if(GTest_FOUND)
+        add_executable(test_gpu
+            tests/test_gpu_device.cc
+            tests/test_gpu_sort.cc
+            tests/test_gpu_ops.cc
+        )
+        target_link_libraries(test_gpu mdb_gpu GTest::gtest_main)
+        add_test(NAME GpuTests COMMAND test_gpu)
+
+        message(STATUS "GPU tests enabled")
+    else()
+        message(STATUS "GTest not found. GPU tests disabled.")
+    endif()
+endif()
