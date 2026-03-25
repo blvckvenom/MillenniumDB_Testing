@@ -157,4 +157,10 @@ template bool sort_and_stream<3>(
     std::function<void(const Record<3>&)>,
     const SystemResources&, const PlannerConfig&);
 
+template bool sort_and_stream<5>(
+    std::vector<Record<5>>&, const std::vector<std::string>&,
+    const std::vector<size_t>&, uint64_t,
+    std::function<void(const Record<5>&)>,
+    const SystemResources&, const PlannerConfig&);
+
 } // namespace mdb::gpu

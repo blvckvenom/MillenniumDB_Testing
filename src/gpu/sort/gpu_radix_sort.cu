@@ -522,6 +522,11 @@ template bool execute_gpu_radix_sort<3>(
     std::function<void(const Record<3>&)>&,
     uint32_t);
 
+template bool execute_gpu_radix_sort<5>(
+    std::vector<Record<5>>&,
+    std::function<void(const Record<5>&)>&,
+    uint32_t);
+
 template bool execute_gpu_chunked_sort<1>(
     std::vector<Record<1>>&,
     std::function<void(const Record<1>&)>&,
@@ -535,6 +540,11 @@ template bool execute_gpu_chunked_sort<2>(
 template bool execute_gpu_chunked_sort<3>(
     std::vector<Record<3>>&,
     std::function<void(const Record<3>&)>&,
+    uint32_t, uint32_t, uint32_t, const std::string&);
+
+template bool execute_gpu_chunked_sort<5>(
+    std::vector<Record<5>>&,
+    std::function<void(const Record<5>&)>&,
     uint32_t, uint32_t, uint32_t, const std::string&);
 
 } // namespace mdb::gpu

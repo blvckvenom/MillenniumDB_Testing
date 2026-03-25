@@ -55,7 +55,12 @@
 #include "graph_models/gql/projection/edge_aggregation_record.h"
 #include "graph_models/gql/projection/parallel_merge.h"
 #include "storage/async_io/async_io.h"
+#include "storage/index/record.h"
 #include "storage/page/page.h"
+
+#ifdef MDB_GPU_ENABLED
+#include "gpu/sort/gpu_sort.h"
+#endif
 
 namespace GQL {
 
@@ -182,6 +187,15 @@ public:
         return (total_records_ * RECORD_SIZE) <= buffer_size_;
     }
 
+    /// Mutable access to in-memory records
+    std::vector<EdgeAggregationRecord>& memory_records() { return memory_records_; }
+
+    /// Run file paths for spill files
+    const std::vector<std::string>& run_files() const { return run_files_; }
+
+    /// Record counts per run file
+    const std::vector<size_t>& run_record_counts() const { return run_record_counts_; }
+
     /**
      * @brief Enables parallel I/O mode for improved performance.
      *
@@ -235,6 +249,53 @@ public:
             return;
         }
 
+#ifdef MDB_GPU_ENABLED
+        {
+            // Verify binary compatibility: EdgeAggregationRecord (5 contiguous uint64_t)
+            // must match Record<5> (std::array<uint64_t, 5>) in size so that spill files
+            // written as EdgeAggregationRecords can be read as Record<5>.
+            static_assert(sizeof(EdgeAggregationRecord) == 5 * sizeof(uint64_t),
+                          "EdgeAggregationRecord must be 5 contiguous uint64_t for GPU sort");
+
+            auto resources = mdb::gpu::detect_resources();
+            // Use 5 for num_fields since we sort Record<5> (all fields).
+            // 5-pass sort is a valid refinement of the 3-field sort key:
+            // records with the same (from, to, type) group are still adjacent,
+            // just sub-sorted by edge_id and property_bits.
+            auto plan = mdb::gpu::plan_sort(total_records_, 5, resources);
+
+            if (plan.strategy != mdb::gpu::SortStrategy::EXTERNAL_SORT) {
+                // Convert EdgeAggregationRecord -> Record<5>
+                std::vector<Record<5>> record5_vec;
+                record5_vec.reserve(memory_records_.size());
+                for (auto& rec : memory_records_) {
+                    record5_vec.push_back(rec.to_array());
+                }
+                memory_records_.clear();
+
+                // Spill files are already binary-compatible: EdgeAggregationRecord
+                // fields are laid out as 5 contiguous uint64_t, matching Record<5>
+
+                std::function<void(const Record<5>&)> gpu_callback =
+                    [&callback](const Record<5>& r) {
+                        callback(EdgeAggregationRecord::from_array(r));
+                    };
+
+                bool used = mdb::gpu::sort_and_stream<5>(
+                    record5_vec, run_files_, run_record_counts_,
+                    total_records_, gpu_callback, resources);
+                if (used) return;
+
+                // GPU declined -- restore memory records for CPU fallback
+                memory_records_.reserve(record5_vec.size());
+                for (auto& r : record5_vec) {
+                    memory_records_.push_back(EdgeAggregationRecord::from_array(r));
+                }
+            }
+        }
+#endif
+
+        // Existing fallback unchanged
         if (fits_in_memory()) {
             stream_in_memory(std::forward<Callback>(callback));
         } else if (parallel_mode_) {
