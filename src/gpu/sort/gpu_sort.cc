@@ -1,6 +1,7 @@
 #include "gpu/sort/gpu_sort.h"
 
 #include <algorithm>
+#include <cassert>
 #include <fstream>
 
 #ifdef HAS_TBB
@@ -16,10 +17,18 @@ namespace {
 template<std::size_t N>
 void read_spill_file(const std::string& path, size_t count, std::vector<Record<N>>& out) {
     std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("gpu sort: cannot open spill file: " + path);
+    }
     size_t start = out.size();
     out.resize(start + count);
+    size_t expected_bytes = count * N * sizeof(uint64_t);
     file.read(reinterpret_cast<char*>(out.data() + start),
-              static_cast<std::streamsize>(count * N * sizeof(uint64_t)));
+              static_cast<std::streamsize>(expected_bytes));
+    if (static_cast<size_t>(file.gcount()) != expected_bytes) {
+        out.resize(start);  // roll back
+        throw std::runtime_error("gpu sort: truncated spill file: " + path);
+    }
 }
 
 /// Sort in-place and stream every record through the callback.
@@ -59,6 +68,13 @@ bool sort_and_stream(
     const SystemResources&                resources,
     const PlannerConfig&                  config
 ) {
+#ifndef NDEBUG
+    {
+        size_t computed_total = memory_records.size();
+        for (size_t c : spill_counts) computed_total += c;
+        assert(computed_total == total_records && "total_records mismatch with actual record counts");
+    }
+#endif
     auto plan = plan_sort(total_records, N, resources, config);
 
     // EXTERNAL_SORT: signal caller to use its own external merge-sort
@@ -89,8 +105,12 @@ bool sort_and_stream(
 #ifdef MDB_GPU_ENABLED
         case SortStrategy::GPU_FULL:
         case SortStrategy::GPU_CHUNKED:
-            // TODO: Task 5 will implement GPU radix-sort paths.
-            // For now, fall through to best available CPU sort.
+            // TODO: Task 5 will implement GPU paths
+            return execute_cpu_sort<N>(all_records, callback, resources.has_tbb);
+#else
+        case SortStrategy::GPU_FULL:
+        case SortStrategy::GPU_CHUNKED:
+            // CUDA not compiled in; fall back to best available CPU sort
             return execute_cpu_sort<N>(all_records, callback, resources.has_tbb);
 #endif
 
