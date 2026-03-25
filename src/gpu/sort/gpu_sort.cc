@@ -115,9 +115,16 @@ bool sort_and_stream(
             }
             return true;
         }
-        case SortStrategy::GPU_CHUNKED:
-            // TODO: Task 6 will implement chunked GPU sort with double buffering
-            return execute_cpu_sort<N>(all_records, callback, resources.has_tbb);
+        case SortStrategy::GPU_CHUNKED: {
+            bool ok = execute_gpu_chunked_sort<N>(
+                all_records, callback, plan.num_passes,
+                plan.num_chunks, plan.records_per_chunk);
+            if (!ok) {
+                // GPU error — fall back to best CPU sort
+                return execute_cpu_sort<N>(all_records, callback, resources.has_tbb);
+            }
+            return true;
+        }
 #else
         case SortStrategy::GPU_FULL:
         case SortStrategy::GPU_CHUNKED:

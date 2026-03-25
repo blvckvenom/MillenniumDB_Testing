@@ -191,3 +191,43 @@ TEST(GpuSortTest, SortPreservesEdgeIdOrder) {
     EXPECT_EQ(result[3], (Record<3>{5, 3, 102}));
     EXPECT_EQ(result[4], (Record<3>{5, 4, 50}));
 }
+
+TEST(GpuSortTest, GpuChunkedSortsCorrectly) {
+    auto res = mdb::gpu::detect_resources();
+    if (!res.has_gpu) {
+        GTEST_SKIP() << "No GPU available";
+    }
+
+    std::mt19937 rng(42);
+    std::vector<Record<3>> records(2000000);  // 2M records
+    for (auto& r : records) {
+        r[0] = rng() % 100000;
+        r[1] = rng() % 100000;
+        r[2] = rng() % 1000000;
+    }
+
+    auto expected = records;
+    std::sort(expected.begin(), expected.end());
+
+    std::vector<Record<3>> result;
+    result.reserve(records.size());
+
+    // Force GPU_CHUNKED by limiting VRAM to force multiple chunks
+    mdb::gpu::SystemResources fake_res = res;
+    fake_res.gpu.free_vram = 20 * 1024 * 1024;  // 20 MB forces many chunks
+
+    mdb::gpu::PlannerConfig config;
+    config.min_records_gpu = 100;
+    config.min_chunk_vram = 5 * 1024 * 1024;  // 5 MB min chunk
+
+    bool ok = mdb::gpu::sort_and_stream<3>(
+        records, {}, {}, records.size(),
+        [&result](const Record<3>& r) { result.push_back(r); },
+        fake_res, config);
+
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(result.size(), expected.size());
+    for (size_t i = 0; i < result.size(); i++) {
+        EXPECT_EQ(result[i], expected[i]) << "Mismatch at index " << i;
+    }
+}

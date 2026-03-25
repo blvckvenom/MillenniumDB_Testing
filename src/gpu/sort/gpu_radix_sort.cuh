@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace mdb::gpu {
@@ -29,6 +30,26 @@ bool execute_gpu_radix_sort(
     std::vector<Record<N>>&                all_records,
     std::function<void(const Record<N>&)>& callback,
     uint32_t                               num_passes
+);
+
+/// Chunked GPU sort for datasets exceeding VRAM.
+///
+/// Algorithm:
+///   1. Divide records into chunks that fit in VRAM
+///   2. Sort each chunk on GPU using multi-pass RadixSort
+///   3. Write each sorted chunk to a temporary file
+///   4. K-way merge on CPU using a min-heap priority queue
+///
+/// Returns true on success; false on any CUDA error (caller can fall back
+/// to CPU sort).  Temporary files are cleaned up on both success and failure.
+template<std::size_t N>
+bool execute_gpu_chunked_sort(
+    std::vector<Record<N>>&                all_records,
+    std::function<void(const Record<N>&)>& callback,
+    uint32_t                               num_passes,
+    uint32_t                               num_chunks,
+    uint32_t                               records_per_chunk,
+    const std::string&                     temp_dir = "/tmp"
 );
 
 } // namespace mdb::gpu

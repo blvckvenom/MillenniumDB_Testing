@@ -16,7 +16,7 @@ namespace mdb::gpu {
 /// Integrates with plan_sort() to choose the best strategy:
 ///   - CPU_SEQUENTIAL / CPU_PARALLEL: handled here
 ///   - GPU_FULL: CUB RadixSort on GPU (falls back to CPU on CUDA error)
-///   - GPU_CHUNKED: CPU fallback (Task 6 adds chunked GPU sort)
+///   - GPU_CHUNKED: chunked GPU sort + K-way CPU merge for data > VRAM
 ///   - EXTERNAL_SORT: returns false — caller must use ExternalRecordSort
 ///
 /// @param memory_records  Records already in memory (moved from, cleared after)
