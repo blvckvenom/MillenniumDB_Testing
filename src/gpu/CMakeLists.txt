@@ -19,6 +19,11 @@ add_library(mdb_gpu STATIC
 
 target_include_directories(mdb_gpu PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
+# Link TBB when available (HAS_TBB is defined globally by root CMakeLists.txt)
+if(TBB_FOUND)
+    target_link_libraries(mdb_gpu PUBLIC TBB::tbb)
+endif()
+
 # ----------------------------------------------------------------------------
 # Optional CUDA support
 # ----------------------------------------------------------------------------
