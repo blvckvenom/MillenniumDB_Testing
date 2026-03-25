@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 
@@ -279,7 +281,8 @@ bool write_sorted_chunk(const std::vector<Record<N>>& records, const std::string
     }
     out.write(reinterpret_cast<const char*>(records.data()),
               static_cast<std::streamsize>(records.size() * RECORD_BYTES<N>));
-    return out.good();
+    out.close();
+    return !out.fail();
 }
 
 /// Comparator for K-way merge min-heap: (record, run_index).
@@ -316,8 +319,9 @@ void refill_buffer(
 
 /// K-way merge of sorted chunk files via min-heap priority queue.
 /// Reads records in blocks (MERGE_BLOCK_RECORDS per refill) for I/O efficiency.
+/// Returns false if any chunk file cannot be opened.
 template<std::size_t N>
-void kway_merge(
+bool kway_merge(
     const std::vector<std::string>&        sorted_files,
     const std::vector<size_t>&             chunk_record_counts,
     std::function<void(const Record<N>&)>& callback
@@ -335,7 +339,7 @@ void kway_merge(
         if (!streams[i]) {
             fprintf(stderr, "GPU chunked sort: cannot open chunk file: %s\n",
                     sorted_files[i].c_str());
-            return;
+            return false;
         }
         remaining[i] = chunk_record_counts[i];
         buffers[i].reserve(MERGE_BLOCK_RECORDS);
@@ -387,6 +391,8 @@ void kway_merge(
     for (auto& s : streams) {
         s.close();
     }
+
+    return true;
 }
 
 } // anonymous namespace
@@ -412,6 +418,8 @@ bool execute_gpu_chunked_sort(
     std::filesystem::create_directories(temp_dir);
 
     for (uint32_t chunk = 0; chunk < num_chunks; chunk++) {
+        // chunk < num_chunks <= UINT32_MAX and records_per_chunk <= UINT32_MAX,
+        // so chunk * records_per_chunk <= (2^32-1)^2 which fits in uint64_t.
         uint64_t start = static_cast<uint64_t>(chunk) * records_per_chunk;
         uint64_t end   = std::min(start + static_cast<uint64_t>(records_per_chunk),
                                   static_cast<uint64_t>(all_records.size()));
@@ -439,9 +447,13 @@ bool execute_gpu_chunked_sort(
             return false;  // Caller will fall back to CPU
         }
 
-        // Write sorted chunk to temp file
-        std::string chunk_path = temp_dir + "/gpu_chunk_" + std::to_string(chunk);
+        // Write sorted chunk to temp file.
+        // getpid() in the name ensures no collision when multiple processes
+        // use the same temp_dir concurrently.
+        std::string chunk_path = temp_dir + "/gpu_chunk_"
+            + std::to_string(getpid()) + "_" + std::to_string(chunk);
         if (!write_sorted_chunk<N>(sorted_chunk, chunk_path)) {
+            std::filesystem::remove(chunk_path);  // remove any partial file
             for (const auto& path : sorted_chunk_files) {
                 std::filesystem::remove(path);
             }
@@ -456,27 +468,32 @@ bool execute_gpu_chunked_sort(
     all_records.shrink_to_fit();
 
     // K-way merge sorted chunk files
+    bool merge_ok = true;
     if (sorted_chunk_files.size() == 1) {
         // Single chunk — just read it back and stream
         std::ifstream in(sorted_chunk_files[0], std::ios::binary);
-        if (in) {
-            std::vector<Record<N>> buf(MERGE_BLOCK_RECORDS);
-            size_t remaining = chunk_record_counts[0];
-            while (remaining > 0) {
-                size_t to_read = std::min(remaining, MERGE_BLOCK_RECORDS);
-                buf.resize(to_read);
-                in.read(reinterpret_cast<char*>(buf.data()),
-                        static_cast<std::streamsize>(to_read * RECORD_BYTES<N>));
-                size_t got = static_cast<size_t>(in.gcount()) / RECORD_BYTES<N>;
-                for (size_t i = 0; i < got; i++) {
-                    callback(buf[i]);
-                }
-                remaining -= got;
-                if (got < to_read) break;
+        if (!in) {
+            fprintf(stderr, "GPU chunked sort: cannot open single-chunk file: %s\n",
+                    sorted_chunk_files[0].c_str());
+            std::filesystem::remove(sorted_chunk_files[0]);
+            return false;
+        }
+        std::vector<Record<N>> buf(MERGE_BLOCK_RECORDS);
+        size_t remaining = chunk_record_counts[0];
+        while (remaining > 0) {
+            size_t to_read = std::min(remaining, MERGE_BLOCK_RECORDS);
+            buf.resize(to_read);
+            in.read(reinterpret_cast<char*>(buf.data()),
+                    static_cast<std::streamsize>(to_read * RECORD_BYTES<N>));
+            size_t got = static_cast<size_t>(in.gcount()) / RECORD_BYTES<N>;
+            for (size_t i = 0; i < got; i++) {
+                callback(buf[i]);
             }
+            remaining -= got;
+            if (got < to_read) break;
         }
     } else {
-        kway_merge<N>(sorted_chunk_files, chunk_record_counts, callback);
+        merge_ok = kway_merge<N>(sorted_chunk_files, chunk_record_counts, callback);
     }
 
     // Cleanup temp files
@@ -484,7 +501,7 @@ bool execute_gpu_chunked_sort(
         std::filesystem::remove(path);
     }
 
-    return true;
+    return merge_ok;
 }
 
 // ---------------------------------------------------------------------------
