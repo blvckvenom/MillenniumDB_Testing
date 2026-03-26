@@ -1,7 +1,7 @@
 # GNN Training Pipeline — Design Specification
 
 **Date:** 2026-03-26
-**Status:** Draft
+**Status:** Reviewed
 **Scope:** Extension of `graph_project` for GNN data + Phase 4 Training Pipeline + Phase 5 GraphSAGE MEAN
 
 ---
@@ -106,31 +106,41 @@ The FeatureMatrix is NOT copied. `gnn_meta.bin` stores the **path** to the exist
 Within `NativeProjectionBuilder::scan_nodes_by_labels()`, which already visits each node and calls `extract_node_properties()`:
 
 ```
+Pre-scan setup:
+  Open RowMapping from gnn_features/ (needed for correct indexing)
+  Allocate labels_buffer[num_feature_rows] initialized to -1
+  Allocate splits_buffer[num_feature_rows] initialized to 255
+
 For each node (existing flow):
   1. storage->add_node(node_id)                           [EXISTING]
   2. extract_node_properties(node_id)                     [EXISTING]
 
   NEW — during extract_node_properties, when reading each property:
-  3. If key == labelProperty:
-       labels_buffer[node_index] = to_int64(value_id)
+  3. row_index = row_mapping.find(node_id)   // O(log N) lookup
+     If not found: skip GNN extraction (node has no features)
+
+  4. If key == labelProperty:
+       labels_buffer[row_index] = to_int64(value_id)
        unique_classes.insert(value)
 
-  4. If key == splitProperty:
-       splits_buffer[node_index] = parse_split(value_id)
+  5. If key == splitProperty:
+       splits_buffer[row_index] = parse_split(value_id)
        // "train"→0, "val"/"validation"→1, "test"→2, other→255
 
 In finalize():
-  5. If includeFeatures not empty:
+  6. If includeFeatures not empty:
        Verify FeatureMatrix exists in gnn_features/
        Verify num_rows >= projection nodeCount
-       Write gnn_meta.bin with paths
+       Write gnn_meta.bin (stores feature_name, not paths — see 6.1)
 
-  6. If labelProperty not empty:
-       Write labels.bin
+  7. If labelProperty not empty:
+       Write labels.bin (with version field)
 
-  7. If splitProperty not empty:
-       Write splits.bin
+  8. If splitProperty not empty:
+       Write splits.bin (with version field)
 ```
+
+**Critical: Indexing by RowMapping, not scan order.** The projection scans nodes grouped by label (all `:Paper` first, then `:Author`, etc.), which may not match the sequential ObjectId order used by the RowMapping. Using `row_mapping.find(node_id)` guarantees `labels_buffer[i]` corresponds to `FeatureMatrix[i]` regardless of scan order.
 
 ### 2.6 Validations
 
@@ -141,11 +151,30 @@ In finalize():
 | `labelProperty` exists on at least one node | After scan | Warning (not error) — nodes without label get -1 |
 | `splitProperty` values recognized | During scan | Warning for unrecognized values → 255 |
 
+Note: the row count validation checks size only, not row identity. It ensures the FeatureMatrix has enough rows for all projected nodes.
+
 ### 2.7 Node-to-row mapping
 
-The importer assigns `node_i → row_i` sequentially (import.cc lines 1244-1246). `labels.bin[i]` and `splits.bin[i]` use the same ordering as the RowMapping — `labels.bin[i]` = label of the node whose ObjectId is in `RowMapping[i]`.
+The importer assigns `node_i → row_i` sequentially (import.cc lines 1244-1246). Both `labels.bin` and `splits.bin` are indexed by **RowMapping row index**, not by scan order or ObjectId value.
 
-If the projection includes all nodes (as in ogbn-arxiv where all are `:Node`), the mapping is trivial: row i = node i.
+`labels.bin[i]` = label of the node whose ObjectId is in `RowMapping[i]`.
+`splits.bin[i]` = split of the node whose ObjectId is in `RowMapping[i]`.
+
+For single-label projections (ogbn-arxiv: all nodes are `:Node`), scan order happens to match RowMapping order. For multi-label projections, the `row_mapping.find()` lookup in step 3 ensures correctness regardless of scan order.
+
+### 2.8 Interaction with sampling splits
+
+When `splitProperty` is provided, the projection's `splits.bin` contains **predefined** train/val/test assignments (from the dataset). This conflicts with `gnn_offline_sample`'s ratio-based random splitting (`trainRatio: 0.7`, etc.).
+
+**Resolution:** `gnn_offline_sample` gains a new option `usePredefinedSplits: true`. When enabled:
+- The sampler reads `splits.bin` from the projection directory
+- `SeedSelector` uses the predefined splits instead of random ratio-based splitting
+- The `trainRatio`/`validationRatio`/`testRatio` parameters are ignored
+- Each `GraphSample` gets its `SplitType` from the node's predefined split
+
+When `usePredefinedSplits` is not set (default), behavior is unchanged — ratio-based random splitting as today.
+
+This requires modifying `SeedSelector` (~30 LOC) to accept an external split assignment vector. Added to the file inventory (Section 7.2).
 
 ---
 
@@ -236,12 +265,21 @@ public:
 
 `assemble(batch_id)` does:
 1. Read GraphSample from SampleStorage → node ObjectIds + edge indices per layer
-2. Collect all unique nodes in the computational subgraph
-3. Load features from FourLevelStore (or FeatureMatrix fallback)
-4. Build `edge_indices` tensors from GraphSample `src_indices`/`dst_indices`
-5. Gather labels for seed nodes via LabelStore + RowMapping
-6. Build `label_mask` = (labels != -1)
-7. Package into MiniBatch
+2. Collect all unique nodes in the computational subgraph → `all_unique_nodes` vector
+3. Build **global index map**: `oid_to_global[node_oid] = position in all_unique_nodes`
+4. Load features from FourLevelStore (or FeatureMatrix fallback) → `[N_batch, D]`
+5. **Remap edge indices** per layer:
+   - GraphSample stores `src_indices[i]` as index into `nodes_per_layer[k+1]` (layer-local)
+   - Convert: `global_src = oid_to_global[nodes_per_layer[k+1][src_indices[i]]]`
+   - Convert: `global_dst = oid_to_global[nodes_per_layer[k][dst_indices[i]]]`
+   - Build `edge_indices[k]` as tensor `[2, E_k]` with global indices
+6. Gather labels for seed nodes via LabelStore + RowMapping:
+   - `seed_row_indices[i] = row_mapping.find(nodes_per_layer[0][i])` → RowMapping index
+   - `labels = label_store.gather(seed_row_indices)` → `[num_seeds]` int64
+7. Build `label_mask` = (labels != -1)
+8. Package into MiniBatch
+
+**Edge index semantics:** In `edge_indices[k]`, row 0 = message source (layer k+1 nodes, further from seeds), row 1 = message destination (layer k nodes, closer to seeds). Messages flow from source toward seeds. The forward pass iterates k = num_layers-1 down to 0.
 
 ### 3.6 TrainingLoop
 
@@ -254,6 +292,7 @@ public:
         double weight_decay = 0.0;
         double tolerance = 1e-4;
         uint64_t patience = 5;
+        int64_t random_seed = -1;     // -1 = non-deterministic
         std::string output_dir;
     };
 
@@ -283,6 +322,7 @@ for epoch in 1..max_epochs:
     model.train()
     for batch_id in catalog.train_batch_ids:
         mini = assembler.assemble(batch_id)
+        optimizer.zero_grad()
         embeddings = model.forward(mini.features, mini.edge_indices)
         predictions = classifier(embeddings[0:num_seeds])
         loss = cross_entropy(predictions[label_mask], labels[label_mask])
@@ -411,7 +451,10 @@ YIELD modelName, ranEpochs, didConverge, bestValAccuracy,
 | `patience` | INT | 5 | Early stopping patience |
 | `tolerance` | FLOAT | 0.0001 | Loss convergence threshold |
 | `outputDir` | STRING | `'default'` | Subdirectory for model + embeddings |
+| `randomSeed` | INT | -1 | Random seed for reproducibility (-1 = non-deterministic) |
 | `exportEmbeddings` | BOOL | true | Generate embeddings.npy after training |
+
+**Device placement:** All tensors are placed on `torch::kCPU` initially. GPU training is a future extension. For Cora and ogbn-arxiv, CPU training is sufficient.
 
 ### 5.3 YIELD fields
 
@@ -457,6 +500,8 @@ projections/{projection_name}/gnn_output/{outputDir}/
 
 ### 6.1 gnn_meta.bin
 
+Stores only the **feature name** (not file paths). Readers reconstruct paths at read time via `db_folder + "/gnn_features/" + feature_name + ".fmat"`, consistent with how all existing GNN procedures locate features.
+
 ```
 Offset  Size  Field
 0       8     magic: "GNNM\0\0\0\0"
@@ -468,21 +513,21 @@ Offset  Size  Field
 33      1     has_splits: uint8 (0/1)
 34      2     reserved
 36      4     feature_name_len: uint32
-40      N     feature_name: char[N]
-40+N    4     fmat_path_len: uint32
-44+N    M     fmat_path: char[M] (relative path to .fmat)
-44+N+M  4     rmap_path_len: uint32
-48+N+M  P     rmap_path: char[P] (relative path to .rmap)
+40      N     feature_name: char[N] (e.g., "node_features")
 ```
+
+Total: 40 + N bytes (~55 bytes typical).
 
 ### 6.2 labels.bin
 
 ```
 Offset  Size    Field
 0       8       magic: "GNNL\0\0\0\0"
-8       8       num_nodes: uint64
-16      8       num_classes: uint64
-24      N×8     labels: int64[N]  (-1 = unlabeled)
+8       4       version: uint32 (1)
+12      4       reserved: uint32
+16      8       num_nodes: uint64
+24      8       num_classes: uint64
+32      N×8     labels: int64[N]  (-1 = unlabeled)
 ```
 
 ### 6.3 splits.bin
@@ -490,14 +535,17 @@ Offset  Size    Field
 ```
 Offset  Size    Field
 0       8       magic: "GNNS\0\0\0\0"
-8       8       num_nodes: uint64
-16      N×1     splits: uint8[N]  (0=TRAIN, 1=VAL, 2=TEST, 255=UNLABELED)
+8       4       version: uint32 (1)
+12      4       reserved: uint32
+16      8       num_nodes: uint64
+24      N×1     splits: uint8[N]  (0=TRAIN, 1=VAL, 2=TEST, 255=UNLABELED)
 ```
 
 ### 6.4 training_log.json
 
 ```json
 {
+  "version": 1,
   "model": "graphsage",
   "input_dim": 128,
   "hidden_dim": 256,
@@ -559,27 +607,32 @@ src/query/procedure/builtin/project_procedure.cc
 src/graph_models/gql/projection/native_projection_builder.h
 src/graph_models/gql/projection/native_projection_builder.cc
 src/graph_models/gql/gql_model.cc                            (register gnn_train)
+src/gnn/sampling/seed_selector.h                              (accept predefined splits)
+src/gnn/sampling/seed_selector.cc
 src/gnn/CMakeLists.txt                                        (add subdirectories)
 ```
 
-**Total: 5 modified files.**
+**Total: 7 modified files.**
 
 ### 7.3 LOC estimates
 
 | Component | Files | LOC | Complexity |
 |---|---|---|---|
 | graph_project extension | 3 modified + 1 new | ~180 | Low |
+| SeedSelector predefined splits | 2 modified | ~30 | Low |
 | LabelStore | 2 new | ~80 | Low |
 | SplitStore | 2 new | ~60 | Low |
 | GnnMeta | 1 new | ~80 | Low |
 | MiniBatch | 1 new | ~30 | Trivial |
-| BatchAssembler | 2 new | ~200 | Medium |
+| BatchAssembler | 2 new | ~300 | Medium-High |
 | TrainingLoop | 2 new | ~250 | Medium |
 | GraphSAGE Model | 2 new | ~150 | Medium |
 | NpyWriter | 2 new | ~80 | Low |
 | gnn_train procedure | 2 new | ~180 | Medium |
 | Tests | 5 new | ~400 | Medium |
-| **Total** | **22 new + 5 modified** | **~1,690** | |
+| **Total** | **22 new + 7 modified** | **~1,820** | |
+
+Note: BatchAssembler increased from 200 to 300 LOC due to the global index remapping logic (Section 3.5 step 3-5) and FourLevelStore fallback path.
 
 ---
 
