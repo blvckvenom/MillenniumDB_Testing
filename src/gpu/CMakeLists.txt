@@ -34,6 +34,7 @@ if(CUDAToolkit_FOUND)
         sort/gpu_radix_sort.cu
         ops/gpu_filter.cu
         ops/gpu_transform.cu
+        tests/benchmark_gpu_kernels.cu
     )
     target_link_libraries(mdb_gpu PRIVATE CUDA::cudart)
     target_compile_definitions(mdb_gpu PUBLIC MDB_GPU_ENABLED)

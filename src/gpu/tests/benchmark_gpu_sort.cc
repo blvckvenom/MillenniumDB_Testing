@@ -22,6 +22,23 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// GPU instrumented pipeline (defined in benchmark_gpu_kernels.cu)
+// ---------------------------------------------------------------------------
+#ifdef MDB_GPU_ENABLED
+namespace mdb::gpu::bench {
+struct GpuTimings {
+    float    h2d_ms;
+    float    sort_pass_ms[8];
+    float    d2h_ms;
+    uint32_t num_passes;
+    bool     success;
+};
+GpuTimings gpu_sort_instrumented(
+    const uint32_t* const*, uint32_t, uint64_t, uint32_t*);
+} // namespace mdb::gpu::bench
+#endif
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 static constexpr int WARMUP_ITERATIONS  = 1;
@@ -167,6 +184,155 @@ static void bench_cpu_parallel(uint64_t N,
 #endif
 
 // ---------------------------------------------------------------------------
+// GPU Full benchmark (per-phase timing)
+// ---------------------------------------------------------------------------
+#ifdef MDB_GPU_ENABLED
+static void bench_gpu_full(uint64_t N,
+                           const std::vector<Record<3>>& original,
+                           const std::vector<Record<3>>& reference) {
+    constexpr uint32_t NUM_FIELDS = 3;
+
+    auto res = mdb::gpu::detect_resources();
+    if (!res.has_gpu) {
+        std::fprintf(stderr, "GPU_FULL: skipped (no GPU)\n");
+        return;
+    }
+
+    // Check VRAM: need ~(NUM_FIELDS + 4) * N * 4 bytes + CUB temp
+    size_t estimated_vram = static_cast<size_t>(NUM_FIELDS + 4) * N * sizeof(uint32_t)
+                            + 64 * 1024 * 1024;  // 64 MB headroom for CUB temp
+    if (estimated_vram > res.gpu.free_vram) {
+        std::fprintf(stderr, "GPU_FULL: skipped N=%llu (need %.1f MB, have %.1f MB free)\n",
+                     static_cast<unsigned long long>(N),
+                     estimated_vram / 1e6,
+                     res.gpu.free_vram / 1e6);
+        return;
+    }
+
+    // CUB SortPairs takes int num_items
+    if (N > static_cast<uint64_t>(INT_MAX)) {
+        std::fprintf(stderr, "GPU_FULL: skipped N=%llu (exceeds CUB int limit)\n",
+                     static_cast<unsigned long long>(N));
+        return;
+    }
+
+    // Warmup
+    for (int w = 0; w < WARMUP_ITERATIONS; ++w) {
+        // AoS -> SoA
+        std::vector<std::vector<uint32_t>> h_fields(NUM_FIELDS);
+        for (uint32_t f = 0; f < NUM_FIELDS; f++) {
+            h_fields[f].resize(N);
+        }
+        for (uint64_t i = 0; i < N; i++) {
+            for (uint32_t f = 0; f < NUM_FIELDS; f++) {
+                h_fields[f][i] = static_cast<uint32_t>(original[i][f]);
+            }
+        }
+        std::vector<const uint32_t*> ptrs(NUM_FIELDS);
+        for (uint32_t f = 0; f < NUM_FIELDS; f++) ptrs[f] = h_fields[f].data();
+
+        std::vector<uint32_t> sorted_idx(N);
+        mdb::gpu::bench::gpu_sort_instrumented(
+            ptrs.data(), NUM_FIELDS, N, sorted_idx.data());
+    }
+
+    // Measure
+    std::vector<double> times_aos2soa;
+    std::vector<double> times_h2d;
+    std::vector<double> times_sort_total;
+    std::vector<std::vector<double>> times_sort_pass(NUM_FIELDS);
+    std::vector<double> times_d2h;
+    std::vector<double> times_scatter;
+    std::vector<double> times_total;
+
+    times_aos2soa.reserve(MEASURE_ITERATIONS);
+    times_h2d.reserve(MEASURE_ITERATIONS);
+    times_sort_total.reserve(MEASURE_ITERATIONS);
+    for (auto& v : times_sort_pass) v.reserve(MEASURE_ITERATIONS);
+    times_d2h.reserve(MEASURE_ITERATIONS);
+    times_scatter.reserve(MEASURE_ITERATIONS);
+    times_total.reserve(MEASURE_ITERATIONS);
+
+    for (int iter = 0; iter < MEASURE_ITERATIONS; ++iter) {
+        // Phase 1: AoS -> SoA (chrono, CPU operation)
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        std::vector<std::vector<uint32_t>> h_fields(NUM_FIELDS);
+        for (uint32_t f = 0; f < NUM_FIELDS; f++) {
+            h_fields[f].resize(N);
+        }
+        for (uint64_t i = 0; i < N; i++) {
+            for (uint32_t f = 0; f < NUM_FIELDS; f++) {
+                h_fields[f][i] = static_cast<uint32_t>(original[i][f]);
+            }
+        }
+        std::vector<const uint32_t*> ptrs(NUM_FIELDS);
+        for (uint32_t f = 0; f < NUM_FIELDS; f++) ptrs[f] = h_fields[f].data();
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double aos2soa_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        times_aos2soa.push_back(aos2soa_ms);
+
+        // Phase 2: GPU sort (cudaEvent timing inside)
+        std::vector<uint32_t> sorted_idx(N);
+        auto gpu_t = mdb::gpu::bench::gpu_sort_instrumented(
+            ptrs.data(), NUM_FIELDS, N, sorted_idx.data());
+
+        if (!gpu_t.success) {
+            std::fprintf(stderr, "ERROR: GPU_FULL sort failed for N=%llu iter=%d\n",
+                         static_cast<unsigned long long>(N), iter);
+            return;
+        }
+
+        times_h2d.push_back(gpu_t.h2d_ms);
+        double sort_sum = 0;
+        for (uint32_t p = 0; p < gpu_t.num_passes; p++) {
+            times_sort_pass[p].push_back(gpu_t.sort_pass_ms[p]);
+            sort_sum += gpu_t.sort_pass_ms[p];
+        }
+        times_sort_total.push_back(sort_sum);
+        times_d2h.push_back(gpu_t.d2h_ms);
+
+        // Phase 3: Scatter (chrono, CPU operation)
+        auto t2 = std::chrono::high_resolution_clock::now();
+
+        std::vector<Record<3>> result(N);
+        for (uint64_t i = 0; i < N; i++) {
+            result[i] = original[sorted_idx[i]];
+        }
+
+        auto t3 = std::chrono::high_resolution_clock::now();
+        double scatter_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        times_scatter.push_back(scatter_ms);
+
+        // Total = AoS2SoA + H2D + sort + D2H + scatter
+        double total = aos2soa_ms + gpu_t.h2d_ms + sort_sum
+                       + gpu_t.d2h_ms + scatter_ms;
+        times_total.push_back(total);
+
+        // Correctness check
+        if (result != reference) {
+            std::fprintf(stderr, "ERROR: GPU_FULL produced wrong result for N=%llu iter=%d\n",
+                         static_cast<unsigned long long>(N), iter);
+        }
+    }
+
+    // Emit per-phase CSV rows
+    emit_csv(N, "GPU_FULL", "total",     median(times_total),      MEASURE_ITERATIONS);
+    emit_csv(N, "GPU_FULL", "aos2soa",   median(times_aos2soa),    MEASURE_ITERATIONS);
+    emit_csv(N, "GPU_FULL", "h2d",       median(times_h2d),        MEASURE_ITERATIONS);
+    emit_csv(N, "GPU_FULL", "sort_total", median(times_sort_total), MEASURE_ITERATIONS);
+    for (uint32_t p = 0; p < NUM_FIELDS; p++) {
+        char label[32];
+        std::snprintf(label, sizeof(label), "sort_pass_%u", p);
+        emit_csv(N, "GPU_FULL", label, median(times_sort_pass[p]), MEASURE_ITERATIONS);
+    }
+    emit_csv(N, "GPU_FULL", "d2h",       median(times_d2h),        MEASURE_ITERATIONS);
+    emit_csv(N, "GPU_FULL", "scatter",   median(times_scatter),    MEASURE_ITERATIONS);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main() {
@@ -191,6 +357,11 @@ int main() {
         // CPU Parallel (TBB)
 #ifdef HAS_TBB
         bench_cpu_parallel(N, original, reference);
+#endif
+
+        // GPU Full (per-phase timing)
+#ifdef MDB_GPU_ENABLED
+        bench_gpu_full(N, original, reference);
 #endif
 
         std::fflush(stdout);
