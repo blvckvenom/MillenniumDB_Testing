@@ -121,14 +121,17 @@ static bool gpu_radix_sort_impl(
     CHECK_CUDA(cudaMalloc(&d_vals_in,  field_bytes));  dmem.track(d_vals_in);
     CHECK_CUDA(cudaMalloc(&d_vals_out, field_bytes));  dmem.track(d_vals_out);
 
-    // CUB temp storage size (two-call pattern with nullptr)
+    // Create DoubleBuffer wrappers — CUB can swap between them freely.
+    // This uses O(P) temp (~15-42 MB) instead of O(N) (~2N extra bytes)
+    // because CUB doesn't need internal copy buffers.
+    cub::DoubleBuffer<uint32_t> d_keys(d_keys_in, d_keys_out);
+    cub::DoubleBuffer<uint32_t> d_vals(d_vals_in, d_vals_out);
+
+    // CUB temp storage size (two-call pattern with nullptr, DoubleBuffer variant)
     void*  d_temp      = nullptr;
     size_t temp_bytes  = 0;
     CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-        d_temp, temp_bytes,
-        d_keys_in, d_keys_out,
-        d_vals_in, d_vals_out,
-        static_cast<int>(num_items)));
+        d_temp, temp_bytes, d_keys, d_vals, static_cast<int>(num_items)));
 
     CHECK_CUDA(cudaMalloc(&d_temp, temp_bytes));
     dmem.track(d_temp);
@@ -158,32 +161,31 @@ static bool gpu_radix_sort_impl(
             CHECK_CUDA(cudaMemcpy(d_vals_in, h_iota.data(), field_bytes,
                                   cudaMemcpyHostToDevice));
         } else {
-            // Subsequent passes: gather keys for current field by sorted indices
-            // The sorted indices from the previous pass are in d_vals_out
+            // Subsequent passes: gather keys for current field by sorted indices.
+            // d_vals.Current() points to wherever CUB left the sorted output.
             gather_keys_kernel<<<grid_size, block_size>>>(
-                d_fields[field_idx], d_vals_out, d_keys_in, num_items);
+                d_fields[field_idx], d_vals.Current(), d_keys_in, num_items);
             CHECK_CUDA(cudaGetLastError());
 
-            // Both ops on default stream: kernel launch and D2D memcpy are serialized by CUDA.
-            // gather reads d_vals_out, memcpy reads d_vals_out — both reads, no race.
-
-            // Sorted indices become the new values
-            CHECK_CUDA(cudaMemcpy(d_vals_in, d_vals_out, field_bytes,
+            // Copy sorted indices to d_vals_in for the next sort pass
+            CHECK_CUDA(cudaMemcpy(d_vals_in, d_vals.Current(), field_bytes,
                                   cudaMemcpyDeviceToDevice));
         }
 
-        // Sort pairs: keys_in -> keys_out, vals_in -> vals_out
+        // Reset DoubleBuffer selectors so input is always d_keys_in / d_vals_in
+        d_keys.selector = 0;  // Current() == d_keys_in
+        d_vals.selector = 0;  // Current() == d_vals_in
+
+        // Sort — CUB may swap Current() to either buffer
         CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-            d_temp, temp_bytes,
-            d_keys_in, d_keys_out,
-            d_vals_in, d_vals_out,
-            static_cast<int>(num_items)));
+            d_temp, temp_bytes, d_keys, d_vals, static_cast<int>(num_items)));
     }
 
     // -----------------------------------------------------------------------
     // 4. Download final sorted indices
     // -----------------------------------------------------------------------
-    CHECK_CUDA(cudaMemcpy(h_sorted_indices, d_vals_out, field_bytes,
+    // After all passes, sorted indices are at d_vals.Current()
+    CHECK_CUDA(cudaMemcpy(h_sorted_indices, d_vals.Current(), field_bytes,
                           cudaMemcpyDeviceToHost));
 
     return true;
