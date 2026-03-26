@@ -8,6 +8,7 @@
 
 #include "gpu/gpu_device.h"
 #include "gpu/resource_planner.h"
+#include "gpu/sort/gpu_sort.h"
 #include "storage/index/record.h"
 
 #include <algorithm>
@@ -330,6 +331,110 @@ static void bench_gpu_full(uint64_t N,
     emit_csv(N, "GPU_FULL", "d2h",       median(times_d2h),        MEASURE_ITERATIONS);
     emit_csv(N, "GPU_FULL", "scatter",   median(times_scatter),    MEASURE_ITERATIONS);
 }
+
+// ---------------------------------------------------------------------------
+// GPU Chunked benchmark (artificial VRAM limit forces GPU_CHUNKED strategy)
+// ---------------------------------------------------------------------------
+static void bench_gpu_chunked(uint64_t N,
+                               const std::vector<Record<3>>& original,
+                               const std::vector<Record<3>>& reference) {
+    // Only meaningful for large sizes — chunking overhead is noise below 10M
+    if (N < 10'000'000) {
+        return;
+    }
+
+    auto real_res = mdb::gpu::detect_resources();
+    if (!real_res.has_gpu) {
+        std::fprintf(stderr, "GPU_CHUNKED: skipped (no GPU)\n");
+        return;
+    }
+
+    // Build fake SystemResources with artificially small VRAM (20 MB)
+    // to force the planner into GPU_CHUNKED strategy.
+    mdb::gpu::SystemResources fake_res;
+    fake_res.has_gpu       = true;
+    fake_res.gpu           = real_res.gpu;          // keep real device info
+    fake_res.gpu.free_vram = 20ULL * 1024 * 1024;   // 20 MB
+    fake_res.ram_available = real_res.ram_available;
+    fake_res.has_tbb       = real_res.has_tbb;
+
+    // Planner config that accepts small chunks
+    mdb::gpu::PlannerConfig cfg;
+    cfg.min_records_gpu = 100;
+    cfg.min_chunk_vram  = 5ULL * 1024 * 1024;  // 5 MB
+
+    // Verify the planner actually picks GPU_CHUNKED
+    auto plan = mdb::gpu::plan_sort(N, 3, fake_res, cfg);
+    if (plan.strategy != mdb::gpu::SortStrategy::GPU_CHUNKED) {
+        std::fprintf(stderr, "GPU_CHUNKED: skipped N=%llu (planner chose strategy %d, not GPU_CHUNKED)\n",
+                     static_cast<unsigned long long>(N),
+                     static_cast<int>(plan.strategy));
+        return;
+    }
+
+    std::fprintf(stderr, "GPU_CHUNKED: N=%llu, %u chunks of %u records, %u passes\n",
+                 static_cast<unsigned long long>(N),
+                 plan.num_chunks, plan.records_per_chunk, plan.num_passes);
+
+    // Warmup
+    for (int w = 0; w < WARMUP_ITERATIONS; ++w) {
+        auto copy = original;
+        std::vector<Record<3>> result;
+        result.reserve(N);
+
+        std::vector<std::string> no_spills;
+        std::vector<size_t>     no_counts;
+
+        bool ok = mdb::gpu::sort_and_stream<3>(
+            copy, no_spills, no_counts, N,
+            [&](const Record<3>& rec) { result.push_back(rec); },
+            fake_res, cfg);
+
+        if (!ok) {
+            std::fprintf(stderr, "GPU_CHUNKED: warmup failed (returned false) for N=%llu\n",
+                         static_cast<unsigned long long>(N));
+            return;
+        }
+    }
+
+    // Measure
+    std::vector<double> times;
+    times.reserve(MEASURE_ITERATIONS);
+    for (int iter = 0; iter < MEASURE_ITERATIONS; ++iter) {
+        auto copy = original;
+        std::vector<Record<3>> result;
+        result.reserve(N);
+
+        std::vector<std::string> no_spills;
+        std::vector<size_t>     no_counts;
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        bool ok = mdb::gpu::sort_and_stream<3>(
+            copy, no_spills, no_counts, N,
+            [&](const Record<3>& rec) { result.push_back(rec); },
+            fake_res, cfg);
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        if (!ok) {
+            std::fprintf(stderr, "ERROR: GPU_CHUNKED sort returned false for N=%llu iter=%d\n",
+                         static_cast<unsigned long long>(N), iter);
+            return;
+        }
+
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        times.push_back(ms);
+
+        // Correctness check
+        if (result != reference) {
+            std::fprintf(stderr, "ERROR: GPU_CHUNKED produced wrong result for N=%llu iter=%d\n",
+                         static_cast<unsigned long long>(N), iter);
+        }
+    }
+
+    emit_csv(N, "GPU_CHUNKED", "total", median(times), MEASURE_ITERATIONS);
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -362,6 +467,11 @@ int main() {
         // GPU Full (per-phase timing)
 #ifdef MDB_GPU_ENABLED
         bench_gpu_full(N, original, reference);
+#endif
+
+        // GPU Chunked (artificial VRAM limit, >= 10M only)
+#ifdef MDB_GPU_ENABLED
+        bench_gpu_chunked(N, original, reference);
 #endif
 
         std::fflush(stdout);
