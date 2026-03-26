@@ -71,3 +71,10 @@ if(BUILD_TESTING)
         message(STATUS "GTest not found. GPU tests disabled.")
     endif()
 endif()
+
+# ----------------------------------------------------------------------------
+# Benchmark executable (manual run, not registered with ctest)
+# ----------------------------------------------------------------------------
+add_executable(benchmark_gpu_sort tests/benchmark_gpu_sort.cc)
+target_link_libraries(benchmark_gpu_sort mdb_gpu)
+set_target_properties(benchmark_gpu_sort PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
