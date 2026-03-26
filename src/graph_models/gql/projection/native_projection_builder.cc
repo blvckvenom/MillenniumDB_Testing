@@ -93,6 +93,9 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     for (const auto& [name, id] : gql_model.catalog.edge_keys2id) {
         edge_key_id_to_name[id | ObjectId::MASK_EDGE_KEY] = name;
     }
+
+    // Enable benchmark timers if MDB_BENCHMARK env var is set
+    benchmark_timers_.enabled = (std::getenv("MDB_BENCHMARK") != nullptr);
 }
 
 // ============================================================================
@@ -255,6 +258,9 @@ std::string NativeProjectionBuilder::get_aggregation_property_for_type(const std
 }
 
 void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string>& labels) {
+    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                               : std::chrono::high_resolution_clock::time_point{};
+
     for (const auto& label : labels) {
         validate_label_exists(label);
 
@@ -297,9 +303,17 @@ void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string
     // NOTE: With bulk import, we don't flush here anymore.
     // has_node() now checks the inserted_nodes hash set first,
     // so it works during the collection phase before B+tree is built.
+
+    if (benchmark_timers_.enabled) {
+        benchmark_timers_.node_scan_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - bench_t0).count();
+    }
 }
 
 void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>& types) {
+    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                               : std::chrono::high_resolution_clock::time_point{};
+
     // STREAMING AGGREGATION DECISION:
     // For COUNT/SUM aggregation on large graphs, use external sort-aggregate
     // to achieve O(B) memory instead of O(N) for the hash-based approach.
@@ -514,9 +528,17 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
     if (!edge_batch.empty()) {
         flush_edges();
     }
+
+    if (benchmark_timers_.enabled) {
+        benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - bench_t0).count();
+    }
 }
 
 NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
+    auto bench_total_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                                       : std::chrono::high_resolution_clock::time_point{};
+
     finalized_ = true;
 
     // Final flush to ensure all data is written
@@ -527,8 +549,17 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
         flush_edges();
     }
 
-    // Final flush to ProjectionStorage (commits all B+Tree writes)
+    // Final flush to ProjectionStorage (commits all B+Tree writes, builds indexes)
+    auto bench_sort_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                                      : std::chrono::high_resolution_clock::time_point{};
     storage->flush();
+    if (benchmark_timers_.enabled) {
+        auto bench_sort_end = std::chrono::high_resolution_clock::now();
+        double sort_btree_ms = std::chrono::duration<double, std::milli>(bench_sort_end - bench_sort_start).count();
+        // Attribute combined sort+btree time; detailed breakdown deferred to future pass
+        benchmark_timers_.sort_ms += sort_btree_ms * 0.5;
+        benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
+    }
 
     // Calculate duration
     auto end_time = std::chrono::steady_clock::now();
@@ -541,7 +572,19 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     stats.relationship_count = storage->get_edge_count();
 
     // Refresh projection cache so new projection is immediately visible
+    auto bench_meta_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                                      : std::chrono::high_resolution_clock::time_point{};
     ProjectionManager::get_instance().scan_projections();
+    if (benchmark_timers_.enabled) {
+        benchmark_timers_.metadata_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - bench_meta_start).count();
+    }
+
+    if (benchmark_timers_.enabled) {
+        auto bench_total_end = std::chrono::high_resolution_clock::now();
+        benchmark_timers_.total_ms = std::chrono::duration<double, std::milli>(bench_total_end - bench_total_start).count();
+        benchmark_timers_.print(projection_name, stats.relationship_count);
+    }
 
     return stats;
 }

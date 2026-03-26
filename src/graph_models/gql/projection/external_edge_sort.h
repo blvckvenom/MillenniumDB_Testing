@@ -250,7 +250,7 @@ public:
         }
 
 #ifdef MDB_GPU_ENABLED
-        {
+        if (!std::getenv("MDB_FORCE_CPU_SORT")) {
             // Verify binary compatibility: EdgeAggregationRecord (5 contiguous uint64_t)
             // must match Record<5> (std::array<uint64_t, 5>) in size so that spill files
             // written as EdgeAggregationRecords can be read as Record<5>.

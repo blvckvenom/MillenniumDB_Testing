@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -193,7 +194,7 @@ public:
         }
 
 #ifdef MDB_GPU_ENABLED
-        {
+        if (!std::getenv("MDB_FORCE_CPU_SORT")) {
             auto resources = mdb::gpu::detect_resources();
             auto plan = mdb::gpu::plan_sort(total_records_, N, resources);
 

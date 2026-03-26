@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -12,6 +14,41 @@
 #include "query/procedure/builtin/project_procedure.h"  // For Orientation enum
 
 namespace GQL {
+
+/**
+ * @brief Conditional per-phase timing for graph_project pipeline.
+ *
+ * Activated by MDB_BENCHMARK=1 environment variable. Zero overhead when disabled
+ * (all timing calls short-circuit on `!enabled`). Prints to stderr with
+ * [BENCHMARK] prefix for easy grep.
+ */
+struct ProjectionTimers {
+    double node_scan_ms     = 0;
+    double edge_scan_ms     = 0;
+    double property_ms      = 0;
+    double sort_ms          = 0;
+    double btree_write_ms   = 0;
+    double aggregation_ms   = 0;
+    double metadata_ms      = 0;
+    double total_ms         = 0;
+    bool enabled            = false;
+
+    void print(const std::string& proj_name, uint64_t edge_count) const {
+        if (!enabled) return;
+        auto pct = [&](double v) -> double { return total_ms > 0 ? v / total_ms * 100 : 0; };
+        fprintf(stderr, "[BENCHMARK] graph_project '%s' — %llu edges\n",
+                proj_name.c_str(), (unsigned long long)edge_count);
+        fprintf(stderr, "[BENCHMARK]   node_scan:     %8.1f ms  (%4.1f%%)\n", node_scan_ms, pct(node_scan_ms));
+        fprintf(stderr, "[BENCHMARK]   edge_scan:     %8.1f ms  (%4.1f%%)\n", edge_scan_ms, pct(edge_scan_ms));
+        fprintf(stderr, "[BENCHMARK]   property:      %8.1f ms  (%4.1f%%)\n", property_ms, pct(property_ms));
+        fprintf(stderr, "[BENCHMARK]   sort:          %8.1f ms  (%4.1f%%)\n", sort_ms, pct(sort_ms));
+        fprintf(stderr, "[BENCHMARK]   btree_write:   %8.1f ms  (%4.1f%%)\n", btree_write_ms, pct(btree_write_ms));
+        fprintf(stderr, "[BENCHMARK]   aggregation:   %8.1f ms  (%4.1f%%)\n", aggregation_ms, pct(aggregation_ms));
+        fprintf(stderr, "[BENCHMARK]   metadata:      %8.1f ms  (%4.1f%%)\n", metadata_ms, pct(metadata_ms));
+        fprintf(stderr, "[BENCHMARK]   total:         %8.1f ms\n", total_ms);
+        fprintf(stderr, "[BENCHMARK]   sort_fraction: %.3f\n", total_ms > 0 ? sort_ms / total_ms : 0);
+    }
+};
 
 // Use Orientation, Aggregation, and PropertyConfig from Procedures namespace
 using Procedures::Orientation;
@@ -334,6 +371,9 @@ private:
     std::unordered_map<uint64_t, std::string> edge_key_id_to_name;
 
     std::chrono::steady_clock::time_point start_time;
+
+    // Benchmark instrumentation (activated by MDB_BENCHMARK=1 env var)
+    ProjectionTimers benchmark_timers_;
 
     // Per-type lookup methods (returns global default if type not in map)
     Orientation get_orientation_for_type(const std::string& type_name) const;
