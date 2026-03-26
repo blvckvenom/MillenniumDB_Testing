@@ -192,6 +192,8 @@ SampleStorage─┘                    GraphSAGE Model
 
 BatchAssembler is the central point: it unites the four data sources into a `MiniBatch` struct that TrainingLoop consumes.
 
+**Note on SampleCatalog:** `SampleCatalog` is an existing component (from Phase 2, `src/gnn/sampling/sample_catalog.h`) that stores metadata about a sample set including `total_batches`, `train_batches`, `validation_batches`, `test_batches`, `projection_name`, `fanouts`, etc. The TrainingLoop uses `catalog.train_batches` and `catalog.validation_batches` to iterate over the correct batch IDs per split. These counts are set during `gnn_offline_sample` based on either ratio-based splitting or predefined splits (Section 2.8).
+
 ### 3.2 LabelStore
 
 Reads `labels.bin` from the projection directory. Mmap read-only, O(1) access.
@@ -347,10 +349,15 @@ for epoch in 1..max_epochs:
 
 ```
 If FourLevelStore exists:
-  features = store.load_batch_features(node_ids)    // fast, cached
+  features = store.load_batch_features(batch_id)    // takes batch_id, not node_ids
+  // Returns torch::Tensor [N_batch, D] in all_unique_nodes order
 
 If not (fallback):
-  features = feature_matrix.extract_rows(row_ids)   // slower, but works
+  // FeatureMatrix::extract_rows is void with pre-allocated buffer:
+  row_ids = translate ObjectIds → row indices via RowMapping
+  buffer = allocate(row_ids.size() * fm.row_bytes())
+  fm.extract_rows(row_ids, buffer.data())
+  features = torch::from_blob(buffer, {N, D}, kFloat32)
 ```
 
 This enables a minimal flow for rapid testing with Cora (skip steps 5+6).
@@ -366,16 +373,22 @@ One GraphSAGE MEAN layer:
 h_v^(k) = σ( W^(k) · CONCAT(h_v^(k-1), MEAN({h_u^(k-1) : u ∈ N(v)})) )
 ```
 
+Note: The spec uses the general GraphSAGE framework (Algorithm 1, lines 4-5: CONCAT(self, AGG(neighbors))) with MEAN as the aggregate function. This differs from the paper's "mean aggregator" (Equation 2) which includes the self node inside the mean, but is mathematically equivalent to PyG's SAGEConv formulation (`W_1*x_i + W_2*MEAN(x_j)`) and is the most widely used in practice.
+
 Using existing `scatter_sum` from `sparse_ops.h`:
 ```
 1. neighbor_features = x[src]                    // gather by edge source
 2. agg = scatter_sum(neighbor_features, dst, N)  // sum by destination
 3. degree = scatter_sum(ones, dst, N)            // count neighbors
-4. agg = agg / degree                            // mean = sum / count
-5. combined = concat(x, agg)                     // [N, 2*D_in]
-6. out = relu(linear(combined))                  // [N, D_out]
-7. out = l2_normalize(out)                       // unit norm
+4. degree = clamp_min(degree, 1)                 // guard against isolated nodes (degree 0)
+5. agg = agg / degree                            // mean = sum / count
+6. combined = concat(x, agg)                     // [N, 2*D_in]
+7. out = relu(linear(combined))                  // [N, D_out]
+8. out = dropout(out, p)                         // only during training, NOT on final layer
+9. if normalize: out = l2_normalize(out)         // optional, default off (PyG convention)
 ```
+
+Alternatively, step 2-5 can be replaced by the existing `scatter_mean` from `sparse_ops.h` which already handles the zero-degree case internally.
 
 ### 4.2 Model structure
 
@@ -416,7 +429,10 @@ For 2 layers, fanouts [15, 10]:
 |---|---|---|
 | `hiddenDim` | 256 | Hidden layer dimension |
 | `numLayers` | (inferred) | Equals length of sample fanouts |
-| `dropout` | 0.5 | Dropout between layers (training only) |
+| `dropout` | 0.5 | Dropout rate (training only) |
+| `normalize` | false | L2-normalize output of each layer (paper=true, PyG=false) |
+
+**Dropout placement:** Applied after ReLU activation for all SAGEConv layers except the final one. No dropout on classifier logits. This follows the standard PyG pattern (`ogbn_train.py`).
 
 ---
 
@@ -451,6 +467,7 @@ YIELD modelName, ranEpochs, didConverge, bestValAccuracy,
 | `patience` | INT | 5 | Early stopping patience |
 | `tolerance` | FLOAT | 0.0001 | Loss convergence threshold |
 | `outputDir` | STRING | `'default'` | Subdirectory for model + embeddings |
+| `normalize` | BOOL | false | L2-normalize layer outputs (paper=true, PyG=false) |
 | `randomSeed` | INT | -1 | Random seed for reproducibility (-1 = non-deterministic) |
 | `exportEmbeddings` | BOOL | true | Generate embeddings.npy after training |
 
@@ -464,8 +481,7 @@ YIELD modelName, ranEpochs, didConverge, bestValAccuracy,
 | `ranEpochs` | INT | Epochs executed |
 | `didConverge` | BOOL | Stopped by convergence or early stopping |
 | `bestValAccuracy` | FLOAT | Best validation accuracy |
-| `trainAccuracy` | FLOAT | Final training accuracy |
-| `testAccuracy` | FLOAT | Test accuracy (evaluated at end) |
+| `testAccuracy` | FLOAT | Test accuracy (evaluated at end, -1 if no labels) |
 | `trainSeconds` | FLOAT | Total training time |
 
 ### 5.4 Disk output
@@ -483,7 +499,9 @@ projections/{projection_name}/gnn_output/{outputDir}/
 ```
 1. Parse arguments
 2. Open SampleStorage → get projection_name from catalog
-3. Open GnnMeta, LabelStore, SplitStore from projection directory
+3. Open GnnMeta from projection directory
+   Open LabelStore IF labels.bin exists (otherwise unsupervised mode — no loss, no accuracy)
+   Open SplitStore IF splits.bin exists (otherwise all batches treated as TRAIN)
 4. Open FeatureMatrix + FourLevelStore (or fallback to FeatureMatrix only)
 5. Infer num_layers from sample fanouts
 6. Create GraphSAGEModel(input_dim, hidden_dim, num_classes, num_layers, dropout)
@@ -598,7 +616,7 @@ src/gnn/tests/
   test_training_loop.cc
 ```
 
-**Total: 22 new files.**
+**Total: 21 new files.**
 
 ### 7.2 Modified files
 
@@ -630,7 +648,7 @@ src/gnn/CMakeLists.txt                                        (add subdirectorie
 | NpyWriter | 2 new | ~80 | Low |
 | gnn_train procedure | 2 new | ~180 | Medium |
 | Tests | 5 new | ~400 | Medium |
-| **Total** | **22 new + 7 modified** | **~1,820** | |
+| **Total** | **21 new + 7 modified** | **~1,820** | |
 
 Note: BatchAssembler increased from 200 to 300 LOC due to the global index remapping logic (Section 3.5 step 3-5) and FourLevelStore fallback path.
 
@@ -691,8 +709,10 @@ CALL graph_project('arxiv', ':Node', ':CONNECTS', {
 YIELD graphName, nodeCount, featureDim, numClasses
 RETURN *
 
--- 4. Sample mini-batches
-CALL gnn_offline_sample('arxiv', 's1', [15, 10], {batchSize: 512})
+-- 4. Sample mini-batches (usePredefinedSplits respects the splits from step 3)
+CALL gnn_offline_sample('arxiv', 's1', [15, 10], {
+    batchSize: 512, usePredefinedSplits: true
+})
 YIELD totalBatches, uniqueNodes RETURN *
 
 -- 5. Materialize features (L3+L4)
@@ -725,7 +745,7 @@ CALL graph_project('cora', ':Paper', ':CITES', {
     orientation: 'UNDIRECTED', includeFeatures: 'node_features',
     labelProperty: 'label', splitProperty: 'split'
 })
-CALL gnn_offline_sample('cora', 's', [15, 10], {batchSize: 64})
+CALL gnn_offline_sample('cora', 's', [15, 10], {batchSize: 64, usePredefinedSplits: true})
 CALL gnn_train('s', 'node_features', {epochs: 20})
 YIELD bestValAccuracy, testAccuracy RETURN *
 ```
