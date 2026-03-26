@@ -4,6 +4,7 @@
 // membership, computes per-edge pass/fail flags and uses cub::DeviceSelect::Flagged
 // to compact surviving edges into contiguous output arrays.
 
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 
@@ -80,6 +81,15 @@ bool filter_edges_gpu(
     if (num_edges == 0) {
         *num_surviving = 0;
         return true;
+    }
+
+    // CUB DeviceSelect::Flagged takes int num_items in CUDA 12.0 API.
+    // Guard against overflow on graphs with >2B edges.
+    if (num_edges > static_cast<uint64_t>(INT_MAX)) {
+        fprintf(stderr, "GPU filter: num_edges %llu exceeds CUB int limit (%d)\n",
+                (unsigned long long)num_edges, INT_MAX);
+        *num_surviving = 0;
+        return false;
     }
 
     // -----------------------------------------------------------------------
