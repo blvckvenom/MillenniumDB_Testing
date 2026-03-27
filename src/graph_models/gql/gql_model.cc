@@ -23,6 +23,7 @@
 #include "query/procedure/builtin/gnn_hnsw_info_procedure.h"
 #include "query/procedure/builtin/gnn_materialize_batches_procedure.h"
 #include "query/procedure/builtin/gnn_build_feature_store_procedure.h"
+#include "query/procedure/builtin/gnn_train_procedure.h"
 #endif
 #include "query/query_context.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -68,6 +69,9 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
 
     // Register GNN four-level feature store procedure (L1-L4 build)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnBuildFeatureStoreProcedure>());
+
+    // Register GNN training procedure (GraphSAGE training loop)
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnTrainProcedure>());
 #endif
 
     return std::make_unique<ModelDestroyer>([]() { gql_model.~GQLModel(); });

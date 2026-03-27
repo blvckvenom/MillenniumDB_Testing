@@ -112,4 +112,44 @@ torch::Tensor GraphSAGEModel::forward(
     return classifier_->forward(seed_embeddings);   // [num_seeds, num_classes]
 }
 
+// ============================================================================
+// get_embeddings — same as forward() but returns hidden representations
+// ============================================================================
+
+torch::Tensor GraphSAGEModel::get_embeddings(
+    torch::Tensor x,
+    const std::vector<torch::Tensor>& edge_indices,
+    int64_t num_seeds)
+{
+    if ((int64_t)edge_indices.size() != config_.num_layers) {
+        throw std::invalid_argument(
+            "GraphSAGEModel::get_embeddings: edge_indices.size() must equal num_layers ("
+            + std::to_string(config_.num_layers) + "), got "
+            + std::to_string(edge_indices.size()));
+    }
+    if (num_seeds <= 0 || num_seeds > x.size(0)) {
+        throw std::invalid_argument(
+            "GraphSAGEModel::get_embeddings: num_seeds must be in [1, N], got "
+            + std::to_string(num_seeds));
+    }
+
+    // Identical message-passing to forward()
+    for (int k = (int)convs_.size() - 1; k >= 0; k--) {
+        x = sage_conv(x, edge_indices[k], convs_[k]);
+
+        if (k > 0) {
+            x = torch::relu(x);
+            if (is_training()) {
+                x = torch::dropout(x, config_.dropout, /*train=*/true);
+            }
+            if (config_.normalize) {
+                x = x / x.norm(2, /*dim=*/1, /*keepdim=*/true).clamp_min(1e-6);
+            }
+        }
+    }
+
+    // Return hidden-dim embeddings for seed nodes (skip the classifier)
+    return x.slice(/*dim=*/0, /*start=*/0, /*end=*/num_seeds);  // [num_seeds, hidden_dim]
+}
+
 } // namespace mdb::gnn

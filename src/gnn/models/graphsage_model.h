@@ -64,6 +64,23 @@ public:
         int64_t num_seeds
     );
 
+    /**
+     * @brief Run the GNN message-passing layers WITHOUT the final classifier.
+     *
+     * Same as forward() but returns the hidden-dim embeddings for seed nodes
+     * instead of logits.  Used for embedding export after training.
+     *
+     * @param x            Node features [N, input_dim]
+     * @param edge_indices Per-layer edge index tensors, length == num_layers
+     * @param num_seeds    Number of seed nodes (first rows of x after all passes)
+     * @return Embeddings [num_seeds, hidden_dim]
+     */
+    torch::Tensor get_embeddings(
+        torch::Tensor x,
+        const std::vector<torch::Tensor>& edge_indices,
+        int64_t num_seeds
+    );
+
     const GraphSAGEConfig& config() const { return config_; }
 
 private:
