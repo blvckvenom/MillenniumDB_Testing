@@ -6,9 +6,6 @@
 #include <stdexcept>
 #include <unordered_set>
 
-#include <filesystem>
-
-#include "gnn/storage/feature_matrix_header.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
@@ -16,8 +13,6 @@
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "storage/dictionary/dictionary.h"
 #include "system/file_manager.h"
-
-namespace fs = std::filesystem;
 
 using namespace GQL;
 using namespace GQL::Procedures;
@@ -325,25 +320,9 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("relationshipCount", ctx.create_int(static_cast<int64_t>(stats.relationship_count)));
     ctx.yield("projectMillis", ctx.create_int(stats.duration_ms.count()));
 
-    // GNN extension yields (0 when not requested, populated by builder in Task 11)
-    int64_t feature_dim = 0;
-    int64_t num_classes  = 0;
-    if (!include_features.empty()) {
-        auto fm_path = fs::path(db_folder) / "gnn_features" / (include_features + ".fmat");
-        if (fs::exists(fm_path)) {
-            // Read dimension from .fmat header (64 bytes, num_cols at offset 16)
-            std::FILE* f = std::fopen(fm_path.c_str(), "rb");
-            if (f) {
-                mdb::gnn::FeatureMatrixHeader hdr{};
-                if (std::fread(&hdr, sizeof(hdr), 1, f) == 1 && hdr.is_valid()) {
-                    feature_dim = static_cast<int64_t>(hdr.num_cols);
-                }
-                std::fclose(f);
-            }
-        }
-    }
-    ctx.yield("featureDim", ctx.create_int(feature_dim));
-    ctx.yield("numClasses", ctx.create_int(num_classes));
+    // GNN extension yields (populated by builder during finalize)
+    ctx.yield("featureDim", ctx.create_int(static_cast<int64_t>(stats.feature_dim)));
+    ctx.yield("numClasses", ctx.create_int(static_cast<int64_t>(stats.num_classes)));
 
     ctx.yield_row();
 }

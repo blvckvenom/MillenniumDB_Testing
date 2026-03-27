@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -16,6 +17,14 @@
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/streaming_aggregator.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
+
+#ifdef ENABLE_GNN
+#include "gnn/projection/gnn_meta.h"
+#include "gnn/storage/feature_matrix.h"
+#include "gnn/storage/row_mapping.h"
+#include "graph_models/gql/conversions.h"
+#include "graph_models/gql/gql_object_id.h"
+#endif
 
 using namespace GQL;
 
@@ -102,6 +111,35 @@ NativeProjectionBuilder::NativeProjectionBuilder(
 
     // Enable benchmark timers if MDB_BENCHMARK env var is set
     benchmark_timers_.enabled = (std::getenv("MDB_BENCHMARK") != nullptr);
+
+#ifdef ENABLE_GNN
+    // Load RowMapping and FeatureMatrix metadata for GNN label/split extraction.
+    // The RowMapping provides the ObjectId -> row_index mapping needed to index
+    // labels and splits by the same row order as the feature matrix.
+    if (!include_features_.empty()) {
+        namespace fs = std::filesystem;
+        auto rmap_path = fs::path(db_folder) / "gnn_features" / (include_features_ + ".rmap");
+        auto fmat_path = fs::path(db_folder) / "gnn_features" / (include_features_ + ".fmat");
+
+        if (fs::exists(rmap_path)) {
+            gnn_row_mapping_ = std::make_unique<mdb::gnn::RowMapping>(
+                mdb::gnn::RowMapping::open(rmap_path));
+        }
+        if (fs::exists(fmat_path)) {
+            auto fm = mdb::gnn::FeatureMatrix::open(fmat_path);
+            feature_dim_ = static_cast<uint32_t>(fm.num_cols());
+        }
+
+        if (gnn_row_mapping_) {
+            if (!label_property_.empty()) {
+                labels_buffer_.resize(gnn_row_mapping_->size(), -1);  // -1 = unlabeled
+            }
+            if (!split_property_.empty()) {
+                splits_buffer_.resize(gnn_row_mapping_->size(), 255);  // 255 = UNLABELED
+            }
+        }
+    }
+#endif
 }
 
 // ============================================================================
@@ -286,8 +324,12 @@ void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string
             node.node_id = node_id;
             node_batch.push_back(node);
 
-            // Extract properties if configured
-            if (!node_property_keys.empty()) {
+            // Extract properties if configured, or if GNN needs label/split data
+            bool need_properties = !node_property_keys.empty() || !node_prop_configs.empty();
+#ifdef ENABLE_GNN
+            need_properties = need_properties || (gnn_row_mapping_ != nullptr);
+#endif
+            if (need_properties) {
                 extract_node_properties(node_id);
             }
 
@@ -577,6 +619,78 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     stats.node_count = storage->get_node_count();
     stats.relationship_count = storage->get_edge_count();
 
+#ifdef ENABLE_GNN
+    // Write GNN metadata, labels, and splits to the projection directory.
+    // These files are consumed by gnn_train and indexed by the same RowMapping
+    // row order as the feature matrix.
+    if (!include_features_.empty() && gnn_row_mapping_) {
+        namespace fs = std::filesystem;
+        auto proj_dir = fs::path(db_folder) / "projections" / projection_name;
+
+        // Write gnn_meta.bin
+        mdb::gnn::GnnMeta meta;
+        meta.feature_name = include_features_;
+        meta.feature_dim  = feature_dim_;
+        meta.num_nodes    = gnn_row_mapping_->size();
+        meta.num_classes  = unique_classes_.size();
+        meta.has_labels   = !label_property_.empty();
+        meta.has_splits   = !split_property_.empty();
+        meta.write(proj_dir / "gnn_meta.bin");
+
+        // Populate stats for YIELD
+        stats.feature_dim = feature_dim_;
+        stats.num_classes = unique_classes_.size();
+
+        // Write labels.bin (format: magic(8) + version(4) + reserved(4) +
+        //   num_nodes(8) + num_classes(8) + int64[N])
+        if (!label_property_.empty() && !labels_buffer_.empty()) {
+            auto labels_path = proj_dir / "labels.bin";
+            std::ofstream lf(labels_path, std::ios::binary | std::ios::trunc);
+            if (!lf.is_open()) {
+                throw std::runtime_error("Cannot open " + labels_path.string() + " for writing");
+            }
+            const uint8_t label_magic[8] = {'G','N','N','L','\0','\0','\0','\0'};
+            uint32_t label_version  = 1;
+            uint32_t label_reserved = 0;
+            uint64_t label_num_nodes   = labels_buffer_.size();
+            uint64_t label_num_classes = unique_classes_.size();
+            lf.write(reinterpret_cast<const char*>(label_magic), 8);
+            lf.write(reinterpret_cast<const char*>(&label_version), 4);
+            lf.write(reinterpret_cast<const char*>(&label_reserved), 4);
+            lf.write(reinterpret_cast<const char*>(&label_num_nodes), 8);
+            lf.write(reinterpret_cast<const char*>(&label_num_classes), 8);
+            lf.write(reinterpret_cast<const char*>(labels_buffer_.data()),
+                     static_cast<std::streamsize>(labels_buffer_.size() * sizeof(int64_t)));
+            if (!lf) {
+                throw std::runtime_error("I/O error writing " + labels_path.string());
+            }
+        }
+
+        // Write splits.bin (format: magic(8) + version(4) + reserved(4) +
+        //   num_nodes(8) + uint8[N])
+        if (!split_property_.empty() && !splits_buffer_.empty()) {
+            auto splits_path = proj_dir / "splits.bin";
+            std::ofstream sf(splits_path, std::ios::binary | std::ios::trunc);
+            if (!sf.is_open()) {
+                throw std::runtime_error("Cannot open " + splits_path.string() + " for writing");
+            }
+            const uint8_t split_magic[8] = {'G','N','N','S','\0','\0','\0','\0'};
+            uint32_t split_version  = 1;
+            uint32_t split_reserved = 0;
+            uint64_t split_num_nodes = splits_buffer_.size();
+            sf.write(reinterpret_cast<const char*>(split_magic), 8);
+            sf.write(reinterpret_cast<const char*>(&split_version), 4);
+            sf.write(reinterpret_cast<const char*>(&split_reserved), 4);
+            sf.write(reinterpret_cast<const char*>(&split_num_nodes), 8);
+            sf.write(reinterpret_cast<const char*>(splits_buffer_.data()),
+                     static_cast<std::streamsize>(splits_buffer_.size() * sizeof(uint8_t)));
+            if (!sf) {
+                throw std::runtime_error("I/O error writing " + splits_path.string());
+            }
+        }
+    }
+#endif
+
     // Refresh projection cache so new projection is immediately visible
     auto bench_meta_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
                                                       : std::chrono::high_resolution_clock::time_point{};
@@ -627,6 +741,50 @@ void NativeProjectionBuilder::validate_type_exists(const std::string& type) {
     }
 }
 
+void NativeProjectionBuilder::try_extract_gnn_property(
+    ObjectId node_id, const std::string& key_name, ObjectId value_id)
+{
+#ifdef ENABLE_GNN
+    if (!gnn_row_mapping_) {
+        return;
+    }
+    auto row_opt = gnn_row_mapping_->find(node_id);
+    if (!row_opt.has_value()) {
+        return;  // Node not in RowMapping (not part of the feature matrix)
+    }
+    uint64_t row = *row_opt;
+
+    // Extract label value (integer property -> int64 label class)
+    if (!label_property_.empty() && key_name == label_property_) {
+        auto sub_type = GQL_OID::get_generic_sub_type(value_id);
+        if (sub_type == GQL_OID::GenericSubType::INTEGER) {
+            int64_t label_val = Common::Conversions::unpack_int(value_id);
+            labels_buffer_[row] = label_val;
+            unique_classes_.insert(label_val);
+        }
+    }
+
+    // Extract split value (string property -> uint8 split enum)
+    // Split encoding: 0=TRAIN, 1=VAL, 2=TEST, 255=UNLABELED
+    if (!split_property_.empty() && key_name == split_property_) {
+        auto generic_type = GQL_OID::get_generic_type(value_id);
+        if (generic_type == GQL_OID::GenericType::STRING) {
+            std::string split_str = Conversions::unpack_string(value_id);
+            uint8_t split_val = 255;  // UNLABELED
+            if (split_str == "train")           split_val = 0;
+            else if (split_str == "val")        split_val = 1;
+            else if (split_str == "validation") split_val = 1;
+            else if (split_str == "test")       split_val = 2;
+            splits_buffer_[row] = split_val;
+        }
+    }
+#else
+    (void)node_id;
+    (void)key_name;
+    (void)value_id;
+#endif
+}
+
 void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
     // Phase 3: Support property configurations with renaming and defaults
 
@@ -656,6 +814,9 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
             if (nk_it != node_key_id_to_name.end()) {
                 source_key_name = nk_it->second;
             }
+
+            // GNN: extract label/split values indexed by RowMapping position
+            try_extract_gnn_property(node_id, source_key_name, value_id);
 
             // Check if any property config uses this source property
             for (const auto& [projected_name, config] : node_prop_configs) {
@@ -726,14 +887,18 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
         ObjectId key_id((*record)[1]);
         ObjectId value_id((*record)[2]);
 
+        // Resolve property name from inverse catalog map (O(1))
+        std::string key_name;
+        auto nk_it = node_key_id_to_name.find(key_id.id);
+        if (nk_it != node_key_id_to_name.end()) {
+            key_name = nk_it->second;
+        }
+
+        // GNN: extract label/split values indexed by RowMapping position
+        try_extract_gnn_property(node_id, key_name, value_id);
+
         // If we have a filter list, check if this property is in it
         if (!node_property_keys.empty()) {
-            std::string key_name;
-            auto nk_it = node_key_id_to_name.find(key_id.id);
-            if (nk_it != node_key_id_to_name.end()) {
-                key_name = nk_it->second;
-            }
-
             if (std::find(node_property_keys.begin(), node_property_keys.end(), key_name) == node_property_keys.end()) {
                 record = it.next();
                 continue;  // Skip this property

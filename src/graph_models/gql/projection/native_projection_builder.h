@@ -6,12 +6,17 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "graph_models/gql/projection/edge_aggregation_record.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 #include "query/procedure/builtin/project_procedure.h"  // For Orientation enum
+
+#ifdef ENABLE_GNN
+#include "gnn/storage/row_mapping.h"
+#endif
 
 namespace GQL {
 
@@ -273,6 +278,8 @@ public:
         uint64_t node_count = 0;
         uint64_t relationship_count = 0;
         std::chrono::milliseconds duration_ms{0};
+        uint32_t feature_dim  = 0;   ///< GNN feature dimension (0 when GNN disabled)
+        uint64_t num_classes  = 0;   ///< GNN number of unique label classes (0 when GNN disabled)
     };
 
     /**
@@ -454,6 +461,18 @@ private:
         ObjectId edge_id,
         const std::string& property_key
     );
+
+    // GNN label/split extraction helper (called from both code paths in extract_node_properties)
+    void try_extract_gnn_property(ObjectId node_id, const std::string& key_name, ObjectId value_id);
+
+#ifdef ENABLE_GNN
+    // GNN data extraction state (only present when GNN module is enabled)
+    std::unique_ptr<mdb::gnn::RowMapping> gnn_row_mapping_;
+    std::vector<int64_t>  labels_buffer_;
+    std::vector<uint8_t>  splits_buffer_;
+    std::unordered_set<int64_t> unique_classes_;
+    uint32_t feature_dim_ = 0;
+#endif
 };
 
 } // namespace GQL
