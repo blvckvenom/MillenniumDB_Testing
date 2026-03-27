@@ -126,6 +126,7 @@ add_library(mdb_gnn_core STATIC
     # Phase 4: Training Pipeline
     training/label_store.cc
     training/split_store.cc
+    training/batch_assembler.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -406,6 +407,30 @@ if(BUILD_TESTING)
                 INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
             )
             add_test(NAME SplitStoreTests COMMAND test_split_store)
+        endif()
+
+        # BatchAssembler tests (Task 6: assemble MiniBatch from features+topology+labels)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_batch_assembler.cc")
+            add_executable(test_batch_assembler tests/test_batch_assembler.cc)
+            # Link gtest_main FIRST so its main() takes precedence over serdi's main()
+            # in the millenniumdb static library. SampleStorage needs Logger from millenniumdb.
+            target_link_libraries(test_batch_assembler
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_batch_assembler PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME BatchAssemblerTests COMMAND test_batch_assembler)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST BatchAssemblerTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
         endif()
 
         # GnnMeta tests (Task 1: metadata reader/writer)
