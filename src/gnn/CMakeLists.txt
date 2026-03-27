@@ -122,6 +122,9 @@ add_library(mdb_gnn_core STATIC
 
     # Phase 3: Four-Level Feature Store build procedure (L1-L4)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_feature_store_procedure.cc
+
+    # Phase 4: Training Pipeline
+    training/label_store.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -380,6 +383,28 @@ if(BUILD_TESTING)
         if(EXISTS "${ASAN_SUPP_FILE}")
             set_property(TEST FeatureAssemblerTests PROPERTY
                 ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+        endif()
+
+        # LabelStore tests (Phase 4: training labels)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_label_store.cc")
+            add_executable(test_label_store tests/test_label_store.cc)
+            target_link_libraries(test_label_store mdb_gnn_core GTest::gtest_main)
+            set_target_properties(test_label_store PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME LabelStoreTests COMMAND test_label_store)
+        endif()
+
+        # GnnMeta tests (Task 1: metadata reader/writer)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gnn_meta.cc")
+            add_executable(test_gnn_meta tests/test_gnn_meta.cc)
+            target_link_libraries(test_gnn_meta mdb_gnn_core GTest::gtest_main)
+            set_target_properties(test_gnn_meta PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME GnnMetaTests COMMAND test_gnn_meta)
         endif()
 
         message(STATUS "GNN tests enabled")
