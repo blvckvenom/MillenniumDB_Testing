@@ -127,6 +127,7 @@ add_library(mdb_gnn_core STATIC
     training/label_store.cc
     training/split_store.cc
     training/batch_assembler.cc
+    training/npy_writer.cc
 
     # Phase 4: GNN Models
     models/graphsage_model.cc
@@ -434,6 +435,17 @@ if(BUILD_TESTING)
                 set_property(TEST BatchAssemblerTests PROPERTY
                     ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
             endif()
+        endif()
+
+        # NpyWriter tests (Task 8: export tensors as .npy files)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_npy_writer.cc")
+            add_executable(test_npy_writer tests/test_npy_writer.cc)
+            target_link_libraries(test_npy_writer mdb_gnn_core GTest::gtest_main)
+            set_target_properties(test_npy_writer PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME NpyWriterTests COMMAND test_npy_writer)
         endif()
 
         # GnnMeta tests (Task 1: metadata reader/writer)
