@@ -131,6 +131,9 @@ add_library(mdb_gnn_core STATIC
 
     # Phase 4: GNN Models
     models/graphsage_model.cc
+
+    # Task 9: Training Loop
+    training/training_loop.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -446,6 +449,28 @@ if(BUILD_TESTING)
                 INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
             )
             add_test(NAME NpyWriterTests COMMAND test_npy_writer)
+        endif()
+
+        # TrainingLoop tests (Task 9: epoch iteration, early stopping, validation)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_training_loop.cc")
+            add_executable(test_training_loop tests/test_training_loop.cc)
+            target_link_libraries(test_training_loop
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_training_loop PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME TrainingLoopTests COMMAND test_training_loop)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST TrainingLoopTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
         endif()
 
         # GnnMeta tests (Task 1: metadata reader/writer)
