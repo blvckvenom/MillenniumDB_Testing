@@ -103,11 +103,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     double test_ratio = 0.15;
     uint64_t random_seed = SamplingConfig::DEFAULT_RANDOM_SEED;
     std::string orientation_str = "REVERSE";
+    bool use_predefined_splits = false;
 
     if (ctx.arguments.size() >= 4) {
         try {
             parse_options(ctx, 3, batch_size, train_ratio, val_ratio,
-                          test_ratio, random_seed, orientation_str);
+                          test_ratio, random_seed, orientation_str,
+                          use_predefined_splits);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -117,7 +119,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - validationRatio (FLOAT): Validation fraction (default: 0.15)\n"
                 "  - testRatio (FLOAT): Test fraction (default: 0.15)\n"
                 "  - randomSeed (INT): For reproducibility (default: 42)\n"
-                "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED (default: REVERSE)\n\n"
+                "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED (default: REVERSE)\n"
+                "  - usePredefinedSplits (BOOL): Use splits.bin from projection (default: false)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
                 "      batchSize: 512,\n"
@@ -191,6 +194,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.test_ratio = test_ratio;
     config.random_seed = random_seed;
     config.orientation = orientation;
+    config.use_predefined_splits = use_predefined_splits;
 
     // Validate config
     try {
@@ -298,7 +302,8 @@ void GnnOfflineSampleProcedure::parse_options(
     double& val_ratio,
     double& test_ratio,
     uint64_t& random_seed,
-    std::string& orientation
+    std::string& orientation,
+    bool& use_predefined_splits
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -334,13 +339,20 @@ void GnnOfflineSampleProcedure::parse_options(
         }
     }
 
-    // Validate ratios sum to 1.0
-    double total = train_ratio + val_ratio + test_ratio;
-    if (total < 0.999 || total > 1.001) {
-        throw std::runtime_error(
-            "trainRatio + validationRatio + testRatio must equal 1.0, got: " +
-            std::to_string(total)
-        );
+    // Parse usePredefinedSplits (before ratio validation)
+    if (auto v = opts.get_bool("usePredefinedSplits")) {
+        use_predefined_splits = *v;
+    }
+
+    // Validate ratios sum to 1.0 (only when not using predefined splits)
+    if (!use_predefined_splits) {
+        double total = train_ratio + val_ratio + test_ratio;
+        if (total < 0.999 || total > 1.001) {
+            throw std::runtime_error(
+                "trainRatio + validationRatio + testRatio must equal 1.0, got: " +
+                std::to_string(total)
+            );
+        }
     }
 
     // Parse randomSeed

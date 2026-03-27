@@ -2,12 +2,18 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 
 #include "gnn/projection/topology_accessor.h"
 #include "gnn/storage/row_mapping.h"
+#include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
+
+namespace fs = std::filesystem;
 
 namespace mdb::gnn {
 
@@ -103,10 +109,126 @@ struct SeedSelector::Impl {
     }
 
     /**
+     * @brief Read splits.bin from the projection directory and assign seeds.
+     *
+     * File format (matches SplitStore):
+     *   Offset  Size  Field
+     *    0       8    magic: "GNNS\0\0\0\0"
+     *    8       4    version: uint32 (1)
+     *   12       4    reserved: uint32 (0)
+     *   16       8    num_nodes: uint64
+     *   24      N*1   splits: uint8[N]  (0=TRAIN, 1=VAL, 2=TEST, 255=UNLABELED)
+     *
+     * We read the file directly (no torch dependency) to avoid header conflicts.
+     */
+    void compute_predefined_split() {
+        // Get projection directory
+        auto& manager = GQL::ProjectionManager::get_instance();
+        std::string proj_dir = manager.get_projection_dir(config.projection_name);
+
+        auto splits_path = fs::path(proj_dir) / "splits.bin";
+        if (!fs::exists(splits_path)) {
+            throw std::runtime_error(
+                "usePredefinedSplits is true but splits.bin not found at: " +
+                splits_path.string() + "\n"
+                "Ensure the projection was created with split data "
+                "(e.g., graph_project with splits configuration)."
+            );
+        }
+
+        // Require RowMapping for predefined splits (need row index lookup)
+        if (!row_mapping_) {
+            throw std::runtime_error(
+                "usePredefinedSplits requires a RowMapping but none was provided. "
+                "The projection may not have a row_mapping.rmap file."
+            );
+        }
+
+        std::ifstream sf(splits_path, std::ios::binary);
+        if (!sf.is_open()) {
+            throw std::runtime_error(
+                "Failed to open splits.bin at: " + splits_path.string()
+            );
+        }
+
+        // Read and validate header
+        static constexpr uint8_t EXPECTED_MAGIC[8] = {'G','N','N','S','\0','\0','\0','\0'};
+
+        uint8_t magic[8];
+        sf.read(reinterpret_cast<char*>(magic), 8);
+        if (!sf || std::memcmp(magic, EXPECTED_MAGIC, 8) != 0) {
+            throw std::runtime_error(
+                "Invalid splits.bin: bad magic header at " + splits_path.string()
+            );
+        }
+
+        uint32_t version = 0;
+        sf.read(reinterpret_cast<char*>(&version), 4);
+        if (!sf || version != 1) {
+            throw std::runtime_error(
+                "Unsupported splits.bin version: " + std::to_string(version) +
+                " (expected 1) at " + splits_path.string()
+            );
+        }
+
+        uint32_t reserved = 0;
+        sf.read(reinterpret_cast<char*>(&reserved), 4);
+
+        uint64_t num_nodes = 0;
+        sf.read(reinterpret_cast<char*>(&num_nodes), 8);
+        if (!sf) {
+            throw std::runtime_error(
+                "Failed to read splits.bin header at " + splits_path.string()
+            );
+        }
+
+        // Read split data
+        std::vector<uint8_t> split_data(num_nodes);
+        sf.read(reinterpret_cast<char*>(split_data.data()), num_nodes);
+        if (!sf) {
+            throw std::runtime_error(
+                "Failed to read split data from splits.bin (expected " +
+                std::to_string(num_nodes) + " bytes) at " + splits_path.string()
+            );
+        }
+
+        // Assign seeds to splits based on predefined values
+        auto assign_seeds = [&](const std::vector<ObjectId>& seeds) {
+            for (const auto& seed : seeds) {
+                auto row_opt = row_mapping_->find(seed);
+                if (!row_opt) {
+                    continue;  // Seed not in RowMapping, skip
+                }
+                if (*row_opt >= num_nodes) {
+                    continue;  // Row index out of bounds for split data, skip
+                }
+                uint8_t split_val = split_data[*row_opt];
+                switch (split_val) {
+                    case 0: split.train_seeds.push_back(seed);      break;  // TRAIN
+                    case 1: split.validation_seeds.push_back(seed);  break;  // VAL
+                    case 2: split.test_seeds.push_back(seed);        break;  // TEST
+                    default: break;  // UNLABELED (255) or unknown, skip
+                }
+            }
+        };
+
+        if (use_index_path_) {
+            // Convert all indices to ObjectIds, then assign
+            auto all_oids = indices_to_object_ids(seed_indices, 0, seed_indices.size());
+            assign_seeds(all_oids);
+        } else {
+            assign_seeds(all_seeds);
+        }
+    }
+
+    /**
      * @brief Split seeds into train/validation/test sets.
      *
      * Uses deterministic shuffle with config.random_seed for reproducibility.
      * Operates on either seed_indices (index path) or all_seeds (ObjectId path).
+     *
+     * When config.use_predefined_splits is true, reads splits.bin from the
+     * projection directory instead of random ratio-based splitting.
      */
     void compute_split() {
         if (split_computed) {
@@ -115,6 +237,13 @@ struct SeedSelector::Impl {
 
         // Ensure seeds are collected
         collect_all_seeds();
+
+        // Branch: predefined splits vs. ratio-based
+        if (config.use_predefined_splits) {
+            compute_predefined_split();
+            split_computed = true;
+            return;
+        }
 
         if (use_index_path_) {
             // Index path: shuffle uint32_t indices, then convert ranges to ObjectIds

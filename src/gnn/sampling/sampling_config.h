@@ -64,6 +64,18 @@ struct SamplingConfig {
     double val_ratio = 0.15;    ///< Fraction of seeds for validation (default: 15%)
     double test_ratio = 0.15;   ///< Fraction of seeds for testing (default: 15%)
 
+    /**
+     * @brief Use predefined splits from splits.bin instead of random ratio-based splitting.
+     *
+     * When true, the sampler reads splits.bin from the projection directory and
+     * assigns each seed node to train/val/test based on its stored split value
+     * (0=TRAIN, 1=VAL, 2=TEST, 255=UNLABELED/skipped).
+     * The trainRatio/validationRatio/testRatio fields are ignored.
+     *
+     * When false (default), ratio-based random splitting is used.
+     */
+    bool use_predefined_splits = false;
+
     // =========================================================================
     // Batching
     // =========================================================================
@@ -207,16 +219,19 @@ struct SamplingConfig {
             throw std::invalid_argument("batch_size must be > 0");
         }
 
-        double total_ratio = train_ratio + val_ratio + test_ratio;
-        if (total_ratio < 0.999 || total_ratio > 1.001) {
-            throw std::invalid_argument(
-                "train_ratio + val_ratio + test_ratio must equal 1.0 (got " +
-                std::to_string(total_ratio) + ")"
-            );
-        }
+        // Ratio validation only applies when not using predefined splits
+        if (!use_predefined_splits) {
+            double total_ratio = train_ratio + val_ratio + test_ratio;
+            if (total_ratio < 0.999 || total_ratio > 1.001) {
+                throw std::invalid_argument(
+                    "train_ratio + val_ratio + test_ratio must equal 1.0 (got " +
+                    std::to_string(total_ratio) + ")"
+                );
+            }
 
-        if (train_ratio < 0.0 || val_ratio < 0.0 || test_ratio < 0.0) {
-            throw std::invalid_argument("split ratios cannot be negative");
+            if (train_ratio < 0.0 || val_ratio < 0.0 || test_ratio < 0.0) {
+                throw std::invalid_argument("split ratios cannot be negative");
+            }
         }
     }
 

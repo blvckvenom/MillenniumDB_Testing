@@ -45,6 +45,7 @@ namespace Procedures {
  * | testRatio | FLOAT | 0.15 | Fraction for test set |
  * | randomSeed | INT | 42 | Seed for reproducibility |
  * | orientation | STRING | 'REVERSE' | Edge direction: NATURAL, REVERSE, UNDIRECTED |
+ * | usePredefinedSplits | BOOL | false | Use splits.bin from projection for train/val/test |
  *
  * ## Examples
  *
@@ -144,6 +145,7 @@ private:
      * @param[out] test_ratio Parsed test ratio
      * @param[out] random_seed Parsed random seed
      * @param[out] orientation Parsed orientation string
+     * @param[out] use_predefined_splits Whether to use splits.bin from projection
      */
     void parse_options(
         ProcedureContext& ctx,
@@ -153,7 +155,8 @@ private:
         double& val_ratio,
         double& test_ratio,
         uint64_t& random_seed,
-        std::string& orientation
+        std::string& orientation,
+        bool& use_predefined_splits
     );
 };
 
