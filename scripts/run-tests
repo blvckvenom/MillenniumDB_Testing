@@ -71,6 +71,9 @@ if [[ $CMD = "all" || $CMD = "gnn" ]]; then
     if [ -d "third_party/libtorch" ]; then
         printf "${BLUE}RUNNING GNN E2E TESTS${NC}\n"
         $TESTS/gnn_e2e_test.sh build/Debug || ERROR=true
+
+        printf "${BLUE}RUNNING GNN PROJECTION INTEGRATION TESTS${NC}\n"
+        $TESTS/gql/test_suites/projection_gnn/run_test.sh build/Debug || ERROR=true
     else
         printf "${BLUE}SKIPPING GNN E2E TESTS (LibTorch not found)${NC}\n"
     fi
