@@ -127,6 +127,9 @@ add_library(mdb_gnn_core STATIC
     training/label_store.cc
     training/split_store.cc
     training/batch_assembler.cc
+
+    # Phase 4: GNN Models
+    models/graphsage_model.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -443,6 +446,15 @@ if(BUILD_TESTING)
             )
             add_test(NAME GnnMetaTests COMMAND test_gnn_meta)
         endif()
+
+        # GraphSAGE MEAN model tests (Task 7)
+        add_executable(test_graphsage_model tests/test_graphsage_model.cc)
+        target_link_libraries(test_graphsage_model mdb_gnn_core GTest::gtest_main)
+        set_target_properties(test_graphsage_model PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME GraphSAGEModelTests COMMAND test_graphsage_model)
 
         message(STATUS "GNN tests enabled")
     else()
