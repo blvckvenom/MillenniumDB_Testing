@@ -125,6 +125,7 @@ add_library(mdb_gnn_core STATIC
 
     # Phase 4: Training Pipeline
     training/label_store.cc
+    training/split_store.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -394,6 +395,17 @@ if(BUILD_TESTING)
                 INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
             )
             add_test(NAME LabelStoreTests COMMAND test_label_store)
+        endif()
+
+        # SplitStore tests (Task 3: split assignments for training)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_split_store.cc")
+            add_executable(test_split_store tests/test_split_store.cc)
+            target_link_libraries(test_split_store mdb_gnn_core GTest::gtest_main)
+            set_target_properties(test_split_store PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME SplitStoreTests COMMAND test_split_store)
         endif()
 
         # GnnMeta tests (Task 1: metadata reader/writer)
