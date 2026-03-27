@@ -6,6 +6,9 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include <filesystem>
+
+#include "gnn/storage/feature_matrix_header.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
@@ -13,6 +16,8 @@
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "storage/dictionary/dictionary.h"
 #include "system/file_manager.h"
+
+namespace fs = std::filesystem;
 
 using namespace GQL;
 using namespace GQL::Procedures;
@@ -108,6 +113,11 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     Aggregation global_aggregation = Aggregation::SINGLE;
     std::string global_aggregation_property;
 
+    // GNN extension fields (optional, default to empty = disabled)
+    std::string include_features;
+    std::string label_property;
+    std::string split_property;
+
     // Keep config_holder alive so config_dict pointer remains valid
     std::unique_ptr<Dictionary> config_holder;
     DictionaryObject* config_dict = nullptr;
@@ -132,6 +142,31 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         global_aggregation = get_aggregation_from_dict(config_dict, "aggregation", Aggregation::SINGLE);
         global_aggregation_property = resolve_aggregation_property(
             config_dict, global_edge_properties, global_aggregation);
+
+        // GNN extension fields
+        include_features = get_string_from_dict(config_dict, "includeFeatures", "");
+        label_property   = get_string_from_dict(config_dict, "labelProperty", "");
+        split_property   = get_string_from_dict(config_dict, "splitProperty", "");
+    }
+
+    // Validate includeFeatures against catalog (must be a registered FeatureMatrix)
+    if (!include_features.empty()) {
+        const auto& names = gql_model.catalog.gnn_feature_names;
+        if (std::find(names.begin(), names.end(), include_features) == names.end()) {
+            std::string msg = "feature '" + include_features + "' not found.\n\n";
+            if (names.empty()) {
+                msg += "No features exist. Create one first with:\n"
+                       "  mdb import data.gql <db> --with-tensors features.npy";
+            } else {
+                msg += "Available features: [";
+                for (size_t i = 0; i < names.size(); i++) {
+                    if (i > 0) msg += ", ";
+                    msg += "'" + names[i] + "'";
+                }
+                msg += "]";
+            }
+            throw std::runtime_error(msg);
+        }
     }
 
     // Step 4: Parse nodeProjection (STRING, LIST, or MAP)
@@ -275,7 +310,10 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         type_aggregations,
         type_agg_properties,
         node_property_configs,
-        edge_property_configs
+        edge_property_configs,
+        include_features,
+        label_property,
+        split_property
     );
     builder.scan_nodes_by_labels(node_labels);
     builder.scan_edges_by_types(relationship_types);
@@ -286,6 +324,27 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("nodeCount", ctx.create_int(static_cast<int64_t>(stats.node_count)));
     ctx.yield("relationshipCount", ctx.create_int(static_cast<int64_t>(stats.relationship_count)));
     ctx.yield("projectMillis", ctx.create_int(stats.duration_ms.count()));
+
+    // GNN extension yields (0 when not requested, populated by builder in Task 11)
+    int64_t feature_dim = 0;
+    int64_t num_classes  = 0;
+    if (!include_features.empty()) {
+        auto fm_path = fs::path(db_folder) / "gnn_features" / (include_features + ".fmat");
+        if (fs::exists(fm_path)) {
+            // Read dimension from .fmat header (64 bytes, num_cols at offset 16)
+            std::FILE* f = std::fopen(fm_path.c_str(), "rb");
+            if (f) {
+                mdb::gnn::FeatureMatrixHeader hdr{};
+                if (std::fread(&hdr, sizeof(hdr), 1, f) == 1 && hdr.is_valid()) {
+                    feature_dim = static_cast<int64_t>(hdr.num_cols);
+                }
+                std::fclose(f);
+            }
+        }
+    }
+    ctx.yield("featureDim", ctx.create_int(feature_dim));
+    ctx.yield("numClasses", ctx.create_int(num_classes));
+
     ctx.yield_row();
 }
 

@@ -290,6 +290,9 @@ public:
      * @param type_agg_properties Per-type aggregation property overrides (type_name -> property_key)
      * @param node_property_configs Per-property configuration for nodes (projected_name -> PropertyConfig)
      * @param edge_property_configs Per-property configuration for edges (projected_name -> PropertyConfig)
+     * @param include_features GNN feature matrix name (empty = disabled)
+     * @param label_property GNN classification label property (empty = disabled)
+     * @param split_property GNN train/val/test split property (empty = disabled)
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -303,7 +306,10 @@ public:
         const std::unordered_map<std::string, Aggregation>& type_aggregations = {},
         const std::unordered_map<std::string, std::string>& type_agg_properties = {},
         const std::unordered_map<std::string, PropertyConfig>& node_property_configs = {},
-        const std::unordered_map<std::string, PropertyConfig>& edge_property_configs = {}
+        const std::unordered_map<std::string, PropertyConfig>& edge_property_configs = {},
+        const std::string& include_features = "",
+        const std::string& label_property = "",
+        const std::string& split_property = ""
     );
 
     ~NativeProjectionBuilder();
@@ -359,6 +365,11 @@ private:
     // Aggregation configuration (global defaults)
     Aggregation aggregation;
     std::string aggregation_property_key;  // Property to use for MIN/MAX/SUM aggregation
+
+    // GNN extension fields (stored for Task 11 extraction logic)
+    std::string include_features_;
+    std::string label_property_;
+    std::string split_property_;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
     std::unordered_map<std::string, Orientation> per_type_orientations;

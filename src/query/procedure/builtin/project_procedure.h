@@ -214,7 +214,11 @@ public:
             YieldField{"relationshipCount", YieldType::INT,
                 "Total number of relationships in the projection"},
             YieldField{"projectMillis", YieldType::INT,
-                "Time taken to create the projection (milliseconds)"}
+                "Time taken to create the projection (milliseconds)"},
+            YieldField{"featureDim", YieldType::INT,
+                "Feature vector dimension (0 if includeFeatures not set)"},
+            YieldField{"numClasses", YieldType::INT,
+                "Number of distinct classification classes (0 if labelProperty not set)"}
         };
     }
 

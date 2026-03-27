@@ -31,7 +31,10 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     const std::unordered_map<std::string, Aggregation>& type_aggregations,
     const std::unordered_map<std::string, std::string>& type_agg_properties,
     const std::unordered_map<std::string, PropertyConfig>& node_property_configs,
-    const std::unordered_map<std::string, PropertyConfig>& edge_property_configs
+    const std::unordered_map<std::string, PropertyConfig>& edge_property_configs,
+    const std::string& include_features,
+    const std::string& label_property,
+    const std::string& split_property
 )
     : projection_name(projection_name_)
     , db_folder(db_folder_)
@@ -42,6 +45,9 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     , orientation(orientation_)
     , aggregation(aggregation_)
     , aggregation_property_key(aggregation_property)
+    , include_features_(include_features)
+    , label_property_(label_property)
+    , split_property_(split_property)
     , per_type_orientations(type_orientations)
     , per_type_aggregations(type_aggregations)
     , per_type_agg_properties(type_agg_properties)
