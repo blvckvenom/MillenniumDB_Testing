@@ -106,9 +106,12 @@ RETURN *
 
 **Options:** `batchSize` (default 1024), `trainRatio` (default 0.7),
 `validationRatio` (default 0.15), `testRatio` (default 0.15),
-`randomSeed` (default 42), `orientation` ('NATURAL'|'REVERSE'|'UNDIRECTED', default 'REVERSE').
+`randomSeed` (default 42), `orientation` ('NATURAL'|'REVERSE'|'UNDIRECTED', default 'REVERSE'),
+`usePredefinedSplits` (BOOL, default false).
 
-Ratios must sum to 1.0 (tolerance ±0.001).
+Ratios must sum to 1.0 (tolerance ±0.001). When `usePredefinedSplits` is true,
+`trainRatio`/`validationRatio`/`testRatio` are ignored and splits are read from the
+`splits.bin` file produced by `graph_project` when `splitProperty` is configured.
 
 **YIELD columns:** `sampleName`, `projectionName`, `totalBatches`, `trainBatches`,
 `validationBatches`, `testBatches`, `uniqueNodes`, `computeMillis` (all STRING/INT).
@@ -227,6 +230,93 @@ RETURN *
 - `gnn_features/<name>_reordered.fmat` — L3 reordered FeatureMatrix (if reorder=1)
 - `gnn_features/<name>_reordered.rmap` — L3 reordered RowMapping (if reorder=1)
 - `samples/<sampleName>/packed_slim/batch_NNNNNN.bin` — L4 slim packed batches (GNNB v2)
+
+---
+
+## Training Procedures
+
+### gnn_train
+
+Train a GraphSAGE model on a pre-computed sample set. Requires a projection
+created with `includeFeatures`, `labelProperty`, and/or `splitProperty`.
+
+```gql
+CALL gnn_train('sample_name', 'node_features', {
+    model: 'graphsage', hiddenDim: 256, dropout: 0.5,
+    epochs: 50, lr: 0.01, patience: 5, tolerance: 0.0001,
+    normalize: false, randomSeed: 42,
+    outputDir: 'experiment_1', exportEmbeddings: true
+})
+YIELD modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds
+RETURN *
+```
+
+**Parameters:**
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| sampleName | STRING | yes | — | Existing sample set (from `gnn_offline_sample`) |
+| featureName | STRING | yes | — | Registered feature name (from `--with-tensors`) |
+| options | MAP | no | `{}` | See below |
+
+**Options:**
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| model | STRING | 'graphsage' | Model type (only 'graphsage' currently) |
+| hiddenDim | INT | 256 | Hidden layer dimension |
+| dropout | FLOAT | 0.5 | Dropout rate (training only) |
+| epochs | INT | 50 | Maximum training epochs |
+| lr | FLOAT | 0.01 | Learning rate (Adam optimizer) |
+| weightDecay | FLOAT | 0.0 | L2 regularization |
+| patience | INT | 5 | Epochs without improvement before early stopping |
+| tolerance | FLOAT | 0.0001 | Loss convergence threshold |
+| normalize | BOOL | false | L2-normalize layer outputs |
+| randomSeed | INT | -1 | Seed for reproducibility (-1 = non-deterministic) |
+| outputDir | STRING | 'default' | Subdirectory name for outputs |
+| exportEmbeddings | BOOL | true | Generate embeddings.npy after training |
+
+**YIELD columns:**
+| Column | Type | Description |
+|--------|------|-------------|
+| modelName | STRING | Model identifier |
+| ranEpochs | INT | Number of epochs executed |
+| didConverge | BOOL | Whether training converged or was early-stopped |
+| bestValAccuracy | FLOAT | Best validation accuracy observed |
+| testAccuracy | FLOAT | Test set accuracy (-1 if no labels) |
+| trainSeconds | FLOAT | Total training time in seconds |
+
+**Outputs on disk:**
+- `projections/{proj}/gnn_output/{outputDir}/model.pt` — Serialized model checkpoint
+- `projections/{proj}/gnn_output/{outputDir}/embeddings.npy` — [N, hidden_dim] float32
+- `projections/{proj}/gnn_output/{outputDir}/training_log.json` — Training metrics and config
+
+Requires `ENABLE_GNN=ON` at build time and LibTorch.
+
+---
+
+## graph_project GNN Extension
+
+The standard `graph_project` procedure (see `GQL-Projections.md`) accepts optional GNN
+configuration fields in its 4th parameter map. When set, the projection directory will
+contain additional binary files consumed by `gnn_offline_sample` and `gnn_train`.
+
+**GNN Configuration (optional, in the 4th parameter map):**
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| includeFeatures | STRING | '' | Name of registered FeatureMatrix to associate |
+| labelProperty | STRING | '' | Node property containing classification labels |
+| splitProperty | STRING | '' | Node property containing train/val/test splits |
+
+**Additional YIELD columns when GNN fields are set:**
+| Column | Type | Description |
+|--------|------|-------------|
+| featureDim | INT | Feature dimension (0 if not set) |
+| numClasses | INT | Number of unique classes found (0 if not set) |
+
+**Outputs on disk (in the projection directory):**
+- `gnn_meta.bin` — GNN metadata (feature name, label/split property names, featureDim, numClasses)
+- `labels.bin` — Per-node label array (present when `labelProperty` is set)
+- `splits.bin` — Per-node split assignment (present when `splitProperty` is set); consumed
+  by `gnn_offline_sample` when `usePredefinedSplits: true`
 
 ---
 
