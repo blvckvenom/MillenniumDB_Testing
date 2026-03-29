@@ -71,6 +71,20 @@ The test script automatically sets up Python venv, builds Debug, and runs integr
   - `executor/`: Iterator-based query execution (`binding_iter/`)
   - `optimizer/`: Query optimization
   - `rewriter/`: Query rewriting passes
+- **src/gpu/**: GPU-accelerated operations module (library: mdb_gpu)
+  - `gpu_device.h/cc`: Runtime GPU VRAM + CPU RAM detection
+  - `resource_planner.h/cc`: 5-strategy adaptive sort selection
+  - `sort/`: Multi-pass CUB RadixSort (DoubleBuffer), CPU fallback, chunked sort
+  - `ops/`: CUDA kernels (bitset filter, UNDIRECTED expand)
+  - Zero MillenniumDB dependencies; optional CUDA via `MDB_GPU_ENABLED`
+- **src/gnn/**: GNN training pipeline (library: mdb_gnn_core)
+  - `core/`: CUDA context, sparse ops (scatter_sum/mean/max), memory pool
+  - `storage/`: FeatureMatrix [N,D] mmap, RowMapping, PackedBatchStore, FourLevelStore
+  - `sampling/`: Offline k-hop sampling, SeedSelector, MinHash reorderer
+  - `projection/`: GnnProjectionAdapter, FeatureAccessor, TopologyAccessor, GnnMeta
+  - `training/`: LabelStore, SplitStore, BatchAssembler, TrainingLoop, NpyWriter
+  - `models/`: GraphSAGE MEAN (torch::nn::Module)
+  - Build: `ENABLE_GNN=OFF` by default, requires LibTorch
 - **src/import/**: Data importers for each model and format
 - **src/network/**: HTTP server and client protocol handling
 - **tests/**: Integration test suites (sparql/, mql/, gql/)
@@ -97,6 +111,9 @@ Iterator-based volcano model with binding iterators in `src/query/executor/bindi
 
 **Tensor Compatibility:**
 Tensors for GNN must not be related to existing tensor implementation. See `docs/MillenniumDB.wiki/Working-with-tensors.md`.
+
+**GNN Training Pipeline:**
+End-to-end GNN training within MillenniumDB. Flow: `graph_project` (with `includeFeatures`, `labelProperty`, `splitProperty`) → `gnn_offline_sample` (with optional `usePredefinedSplits`) → `gnn_materialize_batches` → `gnn_build_feature_store` → `gnn_train`. The `gnn_train` procedure creates a GraphSAGE model, trains via BatchAssembler + TrainingLoop, and exports model (.pt) + embeddings (.npy). All tensors on CPU; features loaded via FeatureMatrix fallback or FourLevelStore cache hierarchy.
 
 ## Development Notes
 
