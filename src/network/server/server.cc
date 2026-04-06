@@ -239,6 +239,11 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
 
 void Server::browser_listener(asio::io_context* browser_io_context, int port)
 {
+    // This runs in a detached thread. Never call FATAL_ERROR / std::exit() here —
+    // that would tear down static objects while worker threads are still running,
+    // causing "pure virtual method called" crashes. Log and return instead; the
+    // query server keeps running without the browser UI.
+
     asio::ip::tcp::acceptor acceptor(*browser_io_context);
     asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), port);
 
@@ -246,25 +251,30 @@ void Server::browser_listener(asio::io_context* browser_io_context, int port)
 
     acceptor.open(endpoint.protocol(), ec);
     if (ec) {
-        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        logger.error() << "Browser listener failed to open socket: " << ec.message();
+        return;
     }
 
     acceptor.set_option(asio::socket_base::reuse_address(true), ec);
     if (ec) {
-        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        logger.error() << "Browser listener failed to set socket options: " << ec.message();
+        return;
     }
 
     acceptor.bind(endpoint, ec);
     if (ec) {
         if (ec == boost::asio::error::address_in_use) {
-            FATAL_ERROR("Browser port ", endpoint.port(), " already in use, try using a different port");
+            logger.error() << "Browser port " << endpoint.port()
+                           << " already in use, browser interface disabled";
         } else {
-            FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+            logger.error() << "Browser listener failed to bind: " << ec.message();
         }
+        return;
     }
     acceptor.listen(asio::socket_base::max_listen_connections, ec);
     if (ec) {
-        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        logger.error() << "Browser listener failed to listen: " << ec.message();
+        return;
     }
 
     while (true) {
