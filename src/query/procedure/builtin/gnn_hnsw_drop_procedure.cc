@@ -47,6 +47,9 @@ void GnnHnswDropProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    // Persist catalog so the removal survives server restart
+    gql_model.catalog.save();
+
     // Step 4: Yield result
     ctx.yield("success", ctx.create_bool(true));
     ctx.yield_row();

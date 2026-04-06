@@ -310,6 +310,9 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     metadata.predicate = tensor_key;  // Use tensor key as predicate for tracking
     gql_model.catalog.hnsw_index_manager.load_hnsw_index(index_name, metadata);
 
+    // Persist catalog so the index survives server restart
+    gql_model.catalog.save();
+
     } catch (...) {
         // HNSWIndex::create() may have already created the on-disk directory.
         // Remove it so we don't leave orphaned files.
