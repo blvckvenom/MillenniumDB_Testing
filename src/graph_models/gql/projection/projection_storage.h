@@ -299,6 +299,9 @@ public:
      */
     std::optional<ObjectId> get_edge_property(ObjectId edge_id, ObjectId key_id) const;
 
+    /// @brief Returns the projection directory path (e.g., "test_db/projections/my_proj")
+    const std::string& get_projection_dir() const { return projection_dir; }
+
     /// @brief Returns total number of nodes in projection
     uint64_t get_node_count() const { return node_count; }
 
