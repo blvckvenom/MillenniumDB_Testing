@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -121,11 +122,16 @@ public:
      *
      * @param storage Reference to projection storage (must outlive engine)
      * @param config Sampling configuration
+     * @param db_folder Database root folder. Required when
+     *        config.use_predefined_splits=true so the engine can locate the
+     *        RowMapping at <db_folder>/gnn_features/<feature_name>.rmap.
+     *        Empty string disables predefined-splits support.
      * @throws std::invalid_argument if config is invalid
      */
     OfflineSamplingEngine(
         GQL::ProjectionStorage& storage,
-        const SamplingConfig& config
+        const SamplingConfig& config,
+        const std::filesystem::path& db_folder = {}
     );
 
     ~OfflineSamplingEngine();

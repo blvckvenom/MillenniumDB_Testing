@@ -1,12 +1,15 @@
 #include "gnn/sampling/offline_sampling_engine.h"
 
 #include <chrono>
+#include <filesystem>
 #include <stdexcept>
 
+#include "gnn/projection/gnn_meta.h"
 #include "gnn/sampling/basic_khop_sampler.h"
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/seed_selector.h"
 #include "gnn/sampling/sorted_batch_sampler.h"
+#include "gnn/storage/row_mapping.h"
 #include "graph_models/gql/projection/projection_storage.h"
 
 namespace mdb::gnn {
@@ -18,10 +21,12 @@ namespace mdb::gnn {
 struct OfflineSamplingEngine::Impl {
     GQL::ProjectionStorage& storage;
     SamplingConfig config;
+    std::filesystem::path db_folder;
 
     // Components
     std::unique_ptr<SeedSelector> seed_selector;
     std::unique_ptr<BasicKHopSampler> khop_sampler;
+    std::unique_ptr<RowMapping> row_mapping;  ///< Loaded lazily when use_predefined_splits=true
 
     // Callbacks and settings
     ProgressCallback progress_callback;
@@ -31,19 +36,54 @@ struct OfflineSamplingEngine::Impl {
     // State
     std::atomic<bool> cancel_requested{false};
 
-    Impl(GQL::ProjectionStorage& storage_, const SamplingConfig& config_)
+    Impl(GQL::ProjectionStorage& storage_,
+         const SamplingConfig& config_,
+         const std::filesystem::path& db_folder_)
         : storage(storage_)
         , config(config_)
+        , db_folder(db_folder_)
     {
         config.validate();
     }
 
     /**
      * @brief Initialize components lazily.
+     *
+     * When config.use_predefined_splits is true, loads the global RowMapping
+     * from <db_folder>/gnn_features/<feature_name>.rmap so the SeedSelector
+     * can index labels.bin/splits.bin written by graph_project. The
+     * feature_name is read from <proj_dir>/gnn_meta.bin.
      */
     void init_components() {
+        if (!row_mapping && config.use_predefined_splits && !db_folder.empty()) {
+            // Locate gnn_meta.bin in projection directory
+            auto proj_dir = std::filesystem::path(storage.get_projection_dir());
+            auto meta_path = proj_dir / "gnn_meta.bin";
+            if (!std::filesystem::exists(meta_path)) {
+                throw std::runtime_error(
+                    "usePredefinedSplits=true but gnn_meta.bin not found at: "
+                    + meta_path.string()
+                    + ". The projection must be created with labelProperty/splitProperty."
+                );
+            }
+            auto meta = GnnMeta::read(meta_path);
+            if (meta.feature_name.empty()) {
+                throw std::runtime_error(
+                    "gnn_meta.bin has empty feature_name; cannot locate RowMapping."
+                );
+            }
+            auto rmap_path = db_folder / "gnn_features" / (meta.feature_name + ".rmap");
+            if (!std::filesystem::exists(rmap_path)) {
+                throw std::runtime_error(
+                    "Feature RowMapping not found at: " + rmap_path.string()
+                    + " (referenced by " + meta_path.string() + ")"
+                );
+            }
+            row_mapping = std::make_unique<RowMapping>(RowMapping::open(rmap_path));
+        }
+
         if (!seed_selector) {
-            seed_selector = std::make_unique<SeedSelector>(storage, config);
+            seed_selector = std::make_unique<SeedSelector>(storage, config, row_mapping.get());
         }
         if (!khop_sampler) {
             khop_sampler = std::make_unique<BasicKHopSampler>(storage, config);
@@ -241,9 +281,10 @@ struct OfflineSamplingEngine::Impl {
 
 OfflineSamplingEngine::OfflineSamplingEngine(
     GQL::ProjectionStorage& storage,
-    const SamplingConfig& config
+    const SamplingConfig& config,
+    const std::filesystem::path& db_folder
 )
-    : impl_(std::make_unique<Impl>(storage, config))
+    : impl_(std::make_unique<Impl>(storage, config, db_folder))
 {
 }
 

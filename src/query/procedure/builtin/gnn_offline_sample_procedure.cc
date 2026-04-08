@@ -211,7 +211,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     storage.open();
 
     // Step 11: Create and run engine
-    OfflineSamplingEngine engine(storage, config);
+    // Pass db_folder so the engine can locate the global RowMapping when
+    // config.use_predefined_splits=true (needed to index labels.bin/splits.bin).
+    OfflineSamplingEngine engine(storage, config, db_folder);
     SamplingResult result = engine.run(db_folder);
 
     // Step 12: Handle result
