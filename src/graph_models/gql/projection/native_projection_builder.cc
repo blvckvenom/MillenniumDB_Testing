@@ -1313,8 +1313,11 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
                     }
                 }
 
-                // Apply orientation to determine storage order
-                uint64_t store_from, store_to;
+                // Apply orientation to determine storage order.
+                // Zero-init silences a GCC -Wmaybe-uninitialized false positive:
+                // the switch below is exhaustive over the Orientation enum class,
+                // but GCC does not perform enum-exhaustiveness analysis.
+                uint64_t store_from = 0, store_to = 0;
                 switch (type_orientation) {
                     case Orientation::NATURAL:
                         store_from = from_node.id;
