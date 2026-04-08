@@ -128,11 +128,16 @@ query() {
 }
 
 # =============================================================================
-# Step 3: Create projection
+# Step 3: Create projection (with GNN extension)
+#
+# Passes includeFeatures/labelProperty/splitProperty so graph_project also
+# writes gnn_meta.bin, labels.bin, splits.bin into the projection directory.
+# These files are required by gnn_offline_sample(usePredefinedSplits=true)
+# and by gnn_train.
 # =============================================================================
-info "Step 3: Create projection"
+info "Step 3: Create projection (with GNN config: features+labels+splits)"
 
-PROJ_OUT=$(query "CALL graph_project('e2e_proj', 'Paper', 'CITES') YIELD graphName, nodeCount, relationshipCount RETURN graphName, nodeCount, relationshipCount")
+PROJ_OUT=$(query "CALL graph_project('e2e_proj', 'Paper', 'CITES', {includeFeatures: 'node_features', labelProperty: 'label', splitProperty: 'split'}) YIELD graphName, nodeCount, relationshipCount, featureDim, numClasses RETURN graphName, nodeCount, relationshipCount, featureDim, numClasses")
 
 if echo "$PROJ_OUT" | grep -q "2708"; then
     pass "Projection: 2708 nodes"
@@ -140,26 +145,75 @@ else
     fail "Projection: unexpected output: $PROJ_OUT"
 fi
 
-# =============================================================================
-# Step 4: Offline sampling
-# =============================================================================
-info "Step 4: Offline sampling"
-
-SAMPLE_OUT=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_sample', [10, 5], {batchSize: 256, randomSeed: 42}) YIELD sampleName, totalBatches, uniqueNodes RETURN sampleName, totalBatches, uniqueNodes")
-
-TOTAL_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f2)
-UNIQUE_NODES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f3)
-
-if [ "$UNIQUE_NODES" = "2708" ]; then
-    pass "Sampling: all 2708 nodes covered"
+if echo "$PROJ_OUT" | grep -q ",1433,"; then
+    pass "Projection: featureDim = 1433"
 else
-    fail "Sampling: expected 2708 unique nodes, got $UNIQUE_NODES"
+    fail "Projection: featureDim != 1433: $PROJ_OUT"
 fi
 
-if [ -n "$TOTAL_BATCHES" ] && [ "$TOTAL_BATCHES" -gt 0 ] 2>/dev/null; then
-    pass "Sampling: $TOTAL_BATCHES batches created"
+if echo "$PROJ_OUT" | grep -qE ",7$"; then
+    pass "Projection: numClasses = 7"
 else
-    fail "Sampling: invalid batch count: $TOTAL_BATCHES"
+    fail "Projection: numClasses != 7: $PROJ_OUT"
+fi
+
+# Verify GNN binaries written by graph_project
+PROJ_DIR="$DB_DIR/projections/e2e_proj"
+for f in gnn_meta.bin labels.bin splits.bin; do
+    if [ -f "$PROJ_DIR/$f" ]; then
+        pass "Projection: $f generated"
+    else
+        fail "Projection: missing $f at $PROJ_DIR"
+    fi
+done
+
+# =============================================================================
+# Step 4: Offline sampling (Planetoid splits + UNDIRECTED)
+#
+# usePredefinedSplits=true makes the engine read splits.bin and produce
+# train/val/test batches that match the Planetoid 140/500/1000 partition.
+# orientation=UNDIRECTED is the standard convention for Cora-style citation
+# networks (PyG, DGL, OGB) — matches paper Shchur 2018 et al. setup.
+# =============================================================================
+info "Step 4: Offline sampling (Planetoid splits, UNDIRECTED)"
+
+SAMPLE_OUT=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_sample', [10, 5], {batchSize: 256, randomSeed: 42, usePredefinedSplits: true, orientation: 'UNDIRECTED'}) YIELD sampleName, totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes RETURN sampleName, totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes")
+
+TOTAL_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f2)
+TRAIN_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f3)
+VAL_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f4)
+TEST_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f5)
+UNIQUE_NODES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f6)
+
+# With Planetoid splits (140 train / 500 val / 1000 test) and batchSize=256:
+#   - 1 train batch  (140 < 256)
+#   - 2 val batches  (500 ≈ 256+244)
+#   - 4 test batches (1000 ≈ 4*256)
+#   - 7 total
+if [ "$TOTAL_BATCHES" = "7" ]; then
+    pass "Sampling: 7 total batches (Planetoid)"
+else
+    fail "Sampling: expected 7 total, got $TOTAL_BATCHES"
+fi
+if [ "$TRAIN_BATCHES" = "1" ]; then
+    pass "Sampling: 1 train batch (140 nodes)"
+else
+    fail "Sampling: expected 1 train batch, got $TRAIN_BATCHES"
+fi
+if [ "$VAL_BATCHES" = "2" ]; then
+    pass "Sampling: 2 validation batches (500 nodes)"
+else
+    fail "Sampling: expected 2 val batches, got $VAL_BATCHES"
+fi
+if [ "$TEST_BATCHES" = "4" ]; then
+    pass "Sampling: 4 test batches (1000 nodes)"
+else
+    fail "Sampling: expected 4 test batches, got $TEST_BATCHES"
+fi
+if [ -n "$UNIQUE_NODES" ] && [ "$UNIQUE_NODES" -gt 2000 ] 2>/dev/null; then
+    pass "Sampling: $UNIQUE_NODES unique nodes covered (2-hop expansion)"
+else
+    fail "Sampling: unexpected unique node count: $UNIQUE_NODES"
 fi
 
 # =============================================================================
@@ -363,10 +417,10 @@ fi
 # =============================================================================
 info "Step 6: Verify packed features match originals (S4 property)"
 
-# Stop server — Python verification reads files directly
-kill "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-unset SERVER_PID
+# NOTE: server stays alive for Step 7 (gnn_train). The Python verification
+# below reads files directly — that is safe because mdb flushes all writes
+# to disk after each procedure call. The cleanup() trap will kill the server
+# at the end of the script.
 
 VERIFY_OUT=$(python3 << PYEOF
 import struct, os, sys, numpy as np
@@ -529,6 +583,243 @@ while IFS='|' read -r status check detail; do
         fail "Verify $check: $detail"
     fi
 done <<< "$VERIFY_OUT"
+
+# =============================================================================
+# Step 7: Train GraphSAGE and verify accuracy
+#
+# Two configurations are supported via the GNN_TRAIN_CONFIG env var:
+#
+#   GNN_TRAIN_CONFIG=quick   (default)  ~2-3s training, threshold testAcc>=0.72
+#                            hidden=64, lr=0.01, dropout=0.5, wd=5e-4,
+#                            epochs=200, patience=20
+#
+#   GNN_TRAIN_CONFIG=paper              ~7s training, threshold testAcc>=0.75
+#                            hidden=128, lr=0.005, dropout=0.5, wd=5e-4,
+#                            epochs=500, patience=50
+#
+# Both configs train on the SAME sample (e2e_sample) with Planetoid splits
+# (140/500/1000) and UNDIRECTED orientation. Reference accuracy from Shchur
+# et al. 2018 ("Pitfalls of GNN Evaluation"): GS-mean on Cora reaches a
+# median of ~80% test accuracy with range 75-85% across 100 random splits
+# and 20 inits per split.
+#
+# The accuracy gap between quick and paper modes is the result of more
+# training time (more epochs, larger hidden dim) — not different splits or
+# implementation. Both modes are valid; quick is for CI, paper for thesis.
+# =============================================================================
+GNN_TRAIN_CONFIG="${GNN_TRAIN_CONFIG:-quick}"
+info "Step 7: Train GraphSAGE (config=$GNN_TRAIN_CONFIG)"
+
+if [ "$GNN_TRAIN_CONFIG" = "paper" ]; then
+    HIDDEN=128
+    LR=0.005
+    DROPOUT=0.5
+    WD=0.0005
+    EPOCHS=500
+    PATIENCE=50
+    MIN_TEST_ACC="0.75"
+    MIN_VAL_ACC="0.75"
+else
+    HIDDEN=64
+    LR=0.01
+    DROPOUT=0.5
+    WD=0.0005
+    EPOCHS=200
+    PATIENCE=20
+    MIN_TEST_ACC="0.72"
+    MIN_VAL_ACC="0.72"
+fi
+
+TRAIN_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: $EPOCHS, lr: $LR, weightDecay: $WD, patience: $PATIENCE, randomSeed: 42}) YIELD modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds RETURN modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds")
+
+# Parse YIELDs (skip header)
+TRAIN_LINE=$(echo "$TRAIN_OUT" | tail -1)
+T_MODEL=$(echo "$TRAIN_LINE"  | cut -d',' -f1 | tr -d '"')
+T_EPOCHS=$(echo "$TRAIN_LINE" | cut -d',' -f2)
+T_VAL=$(echo "$TRAIN_LINE"    | cut -d',' -f4)
+T_TEST=$(echo "$TRAIN_LINE"   | cut -d',' -f5)
+T_SEC=$(echo "$TRAIN_LINE"    | cut -d',' -f6)
+
+# Level 1: YIELD presence + values
+if [ "$T_MODEL" = "graphsage" ]; then
+    pass "Train: modelName=graphsage"
+else
+    fail "Train: modelName='$T_MODEL'"
+fi
+
+if [ -n "$T_EPOCHS" ] && [ "$T_EPOCHS" -gt 0 ] 2>/dev/null; then
+    pass "Train: ranEpochs=$T_EPOCHS (>0)"
+else
+    fail "Train: invalid ranEpochs '$T_EPOCHS'"
+fi
+
+# Compare floats with awk
+val_pass=$(awk -v v="$T_VAL" -v t="$MIN_VAL_ACC" 'BEGIN {print (v+0 >= t+0) ? "1":"0"}' 2>/dev/null)
+if [ "$val_pass" = "1" ]; then
+    pass "Train: bestValAccuracy=$T_VAL >= $MIN_VAL_ACC"
+else
+    fail "Train: bestValAccuracy=$T_VAL < $MIN_VAL_ACC (config=$GNN_TRAIN_CONFIG)"
+fi
+
+test_pass=$(awk -v v="$T_TEST" -v t="$MIN_TEST_ACC" 'BEGIN {print (v+0 >= t+0) ? "1":"0"}' 2>/dev/null)
+if [ "$test_pass" = "1" ]; then
+    pass "Train: testAccuracy=$T_TEST >= $MIN_TEST_ACC"
+else
+    fail "Train: testAccuracy=$T_TEST < $MIN_TEST_ACC (config=$GNN_TRAIN_CONFIG)"
+fi
+
+# Sanity bound: training shouldn't take more than 60s on CPU for Cora
+sec_pass=$(awk -v s="$T_SEC" 'BEGIN {print (s+0 < 60.0) ? "1":"0"}' 2>/dev/null)
+if [ "$sec_pass" = "1" ]; then
+    pass "Train: trainSeconds=$T_SEC < 60s"
+else
+    fail "Train: trainSeconds=$T_SEC too high (>60s)"
+fi
+
+# Level 2: artifact existence
+OUT_DIR="$DB_DIR/projections/e2e_proj/gnn_output/default"
+for art in model.pt embeddings.npy training_log.json; do
+    if [ -f "$OUT_DIR/$art" ] && [ -s "$OUT_DIR/$art" ]; then
+        SZ=$(stat -c%s "$OUT_DIR/$art" 2>/dev/null || stat -f%z "$OUT_DIR/$art")
+        pass "Train artifact: $art ($SZ bytes)"
+    else
+        fail "Train artifact missing or empty: $art"
+    fi
+done
+
+# Level 3: cross-validation between YIELDs and training_log.json
+TRAIN_LOG_VERIFY=$(python3 << PYEOF
+import json, numpy as np, sys
+
+LOG = "$OUT_DIR/training_log.json"
+EMB = "$OUT_DIR/embeddings.npy"
+META = "$DB_DIR/projections/e2e_proj/gnn_meta.bin"
+LBL = "$DB_DIR/projections/e2e_proj/labels.bin"
+SPL = "$DB_DIR/projections/e2e_proj/splits.bin"
+
+errors = 0
+
+# 1. training_log.json is parseable JSON
+try:
+    with open(LOG) as f:
+        log = json.load(f)
+    print("PASS|json_valid|training_log.json parseable")
+except Exception as e:
+    print(f"FAIL|json_valid|{e}")
+    sys.exit(1)
+
+# 2. hyperparameters match what we asked for
+hp = log["hyperparameters"]
+if hp["input_dim"] == 1433:
+    print(f"PASS|hp_input_dim|input_dim=1433")
+else:
+    print(f"FAIL|hp_input_dim|expected 1433 got {hp['input_dim']}")
+    errors += 1
+if hp["num_classes"] == 7:
+    print(f"PASS|hp_num_classes|num_classes=7")
+else:
+    print(f"FAIL|hp_num_classes|expected 7 got {hp['num_classes']}")
+    errors += 1
+if hp["hidden_dim"] == $HIDDEN:
+    print(f"PASS|hp_hidden_dim|hidden_dim=$HIDDEN")
+else:
+    print(f"FAIL|hp_hidden_dim|expected $HIDDEN got {hp['hidden_dim']}")
+    errors += 1
+if hp["num_layers"] == 2:
+    print(f"PASS|hp_num_layers|num_layers=2 (matches fanouts [10,5])")
+else:
+    print(f"FAIL|hp_num_layers|expected 2 got {hp['num_layers']}")
+    errors += 1
+
+# 3. losses are decreasing overall (start ~log(7)=1.95, end significantly lower)
+losses = log["epoch_losses"]
+import math
+expected_init = math.log(7)
+if 1.5 <= losses[0] <= 2.5:
+    print(f"PASS|init_loss|losses[0]={losses[0]:.3f} near log(7)={expected_init:.3f}")
+else:
+    print(f"FAIL|init_loss|losses[0]={losses[0]:.3f} far from log(7)={expected_init:.3f}")
+    errors += 1
+if losses[-1] < losses[0] * 0.7:
+    reduction = (1 - losses[-1]/losses[0])*100
+    print(f"PASS|loss_decrease|{reduction:.1f}% reduction ({losses[0]:.3f} -> {losses[-1]:.3f})")
+else:
+    print(f"FAIL|loss_decrease|insufficient ({losses[0]:.3f} -> {losses[-1]:.3f})")
+    errors += 1
+
+# 4. results in training_log match YIELD values
+log_test = log["results"]["test_accuracy"]
+yield_test = $T_TEST
+if abs(log_test - yield_test) < 1e-4:
+    print(f"PASS|yield_match|training_log test={log_test:.4f} == YIELD test={yield_test:.4f}")
+else:
+    print(f"FAIL|yield_match|log={log_test} yield={yield_test}")
+    errors += 1
+
+# 5. embeddings.npy shape and sanity
+# The exporter writes one row per seed across ALL batches:
+#   1 train batch (140) + 2 val batches (500) + 4 test batches (1000) = 1640 seeds
+emb = np.load(EMB)
+expected_seeds = 140 + 500 + 1000
+expected_shape = (expected_seeds, $HIDDEN)
+if emb.shape == expected_shape:
+    print(f"PASS|emb_shape|shape={emb.shape}")
+else:
+    print(f"FAIL|emb_shape|expected {expected_shape} got {emb.shape}")
+    errors += 1
+if np.isnan(emb).any() or np.isinf(emb).any():
+    print(f"FAIL|emb_finite|NaN or Inf detected")
+    errors += 1
+else:
+    print(f"PASS|emb_finite|no NaN/Inf, mean={emb.mean():.4f} std={emb.std():.4f}")
+
+# 6. labels.bin and splits.bin distribution sanity
+import struct
+with open(LBL,'rb') as f:
+    raw = f.read()
+labels_arr = np.frombuffer(raw[32:], dtype=np.int64)  # header is 32 bytes
+if len(labels_arr) == 2708:
+    classes = sorted(set(labels_arr.tolist()))
+    if classes == list(range(7)):
+        print(f"PASS|labels_classes|all 7 classes present in labels.bin")
+    else:
+        print(f"FAIL|labels_classes|got {classes}")
+        errors += 1
+else:
+    print(f"FAIL|labels_count|expected 2708 got {len(labels_arr)}")
+    errors += 1
+
+with open(SPL,'rb') as f:
+    raw = f.read()
+splits_arr = np.frombuffer(raw[24:], dtype=np.uint8)  # header is 24 bytes
+train_n  = int((splits_arr == 0).sum())
+val_n    = int((splits_arr == 1).sum())
+test_n   = int((splits_arr == 2).sum())
+unlab_n  = int((splits_arr == 255).sum())
+if (train_n, val_n, test_n) == (140, 500, 1000):
+    print(f"PASS|planetoid_splits|140/500/1000 train/val/test exact (Planetoid)")
+else:
+    print(f"FAIL|planetoid_splits|got {train_n}/{val_n}/{test_n}")
+    errors += 1
+if unlab_n == 1068:
+    print(f"PASS|unlabeled_count|1068 unlabeled (2708 - 1640)")
+else:
+    print(f"FAIL|unlabeled_count|got {unlab_n}")
+    errors += 1
+
+# Do NOT sys.exit() — bash counts PASS/FAIL via the loop below.
+# Exiting here would propagate to set -e and abort the script before
+# the output can be parsed.
+PYEOF
+)
+
+while IFS='|' read -r status check detail; do
+    if [ "$status" = "PASS" ]; then
+        pass "Train $check: $detail"
+    elif [ "$status" = "FAIL" ]; then
+        fail "Train $check: $detail"
+    fi
+done <<< "$TRAIN_LOG_VERIFY"
 
 # =============================================================================
 # Summary
