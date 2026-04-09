@@ -235,6 +235,54 @@ fi
 info "Expected split distribution: train~3, val~8, test~16 batches (batchSize=64)"
 
 # =============================================================================
+# Step 4a: gnn_materialize_batches — reorder (L3) + pack features (L4)
+#
+# Required because gnn_train mandates a pre-built FourLevelStore, and the
+# store build depends on materialized + reordered batches.
+# =============================================================================
+info "Step 4a: gnn_materialize_batches (reorder + pack)"
+
+MAT_RESULT=$(query "CALL gnn_materialize_batches('cora_s', 'node_features', {reorder: 1, numHashes: 2}) YIELD sampleName, totalBatches, reordered RETURN sampleName, totalBatches, reordered")
+MAT_DATA=$(echo "$MAT_RESULT" | tail -1)
+MAT_BATCHES=$(echo "$MAT_DATA" | cut -d',' -f2)
+MAT_REORDERED=$(echo "$MAT_DATA" | cut -d',' -f3)
+
+if [ "$MAT_BATCHES" = "$TOTAL_BATCHES" ]; then
+    pass "Materialize: $MAT_BATCHES batches match sampling"
+else
+    fail "Materialize: batch count mismatch (sampling=$TOTAL_BATCHES, materialize=$MAT_BATCHES)"
+fi
+
+if [ "$MAT_REORDERED" = "true" ]; then
+    pass "Materialize: L3 reordering performed"
+else
+    fail "Materialize: expected reordered=true, got $MAT_REORDERED"
+fi
+
+# =============================================================================
+# Step 4b: gnn_build_feature_store — build L1+L2 + re-pack L4 slim
+#
+# Required because gnn_train mandates a pre-built FourLevelStore.
+# =============================================================================
+info "Step 4b: gnn_build_feature_store (L1+L2+L3+L4)"
+
+FS_RESULT=$(query "CALL gnn_build_feature_store('cora_s', 'node_features', {gpu_budget_mb: 0, cpu_budget_mb: 100, reorder: 1, force: 0}) YIELD sampleName, l1Nodes, l2Nodes, l3Nodes, l4Nodes, buildTimeMs RETURN sampleName, l1Nodes, l2Nodes, l3Nodes, l4Nodes, buildTimeMs")
+FS_DATA=$(echo "$FS_RESULT" | tail -1)
+FS_L2=$(echo "$FS_DATA" | cut -d',' -f3)
+
+if [ -n "$FS_L2" ] && [ "$FS_L2" -gt 0 ] 2>/dev/null; then
+    pass "FourLevelStore: L2 populated ($FS_L2 nodes)"
+else
+    fail "FourLevelStore: expected L2 > 0, got '$FS_L2'"
+fi
+
+if [ -f "$DB_DIR/gnn_features/node_features_store.meta" ]; then
+    pass "FourLevelStore: store.meta created"
+else
+    fail "FourLevelStore: store.meta missing"
+fi
+
+# =============================================================================
 # Step 5: gnn_train (GraphSAGE MEAN, 128 hidden, 30 epochs)
 # =============================================================================
 info "Step 5: gnn_train (graphsage, hiddenDim=128, epochs=30, lr=0.01, seed=42)"

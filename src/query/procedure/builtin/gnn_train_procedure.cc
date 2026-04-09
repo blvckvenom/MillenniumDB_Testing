@@ -19,6 +19,7 @@
 #include "gnn/sampling/sample_catalog.h"
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/storage/feature_matrix.h"
+#include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
 #include "gnn/training/batch_assembler.h"
 #include "gnn/training/label_store.h"
@@ -38,6 +39,37 @@ namespace GQL::Procedures {
 // Helper: write training_log.json
 // =============================================================================
 
+// Snapshot of FourLevelStore::Stats values. The Stats struct itself uses
+// std::atomic so it cannot be copied; this POD is the safe transport.
+struct CacheStatsSnapshot {
+    uint64_t l1_hits        = 0;
+    uint64_t l2_hits        = 0;
+    uint64_t l3_reads       = 0;
+    uint64_t l4_reads       = 0;
+    uint64_t total_requests = 0;
+
+    static CacheStatsSnapshot from(const mdb::gnn::FourLevelStore::Stats& s) {
+        CacheStatsSnapshot snap;
+        snap.l1_hits        = s.l1_hits.load();
+        snap.l2_hits        = s.l2_hits.load();
+        snap.l3_reads       = s.l3_reads.load();
+        snap.l4_reads       = s.l4_reads.load();
+        snap.total_requests = s.total_requests.load();
+        return snap;
+    }
+
+    double l1_hit_ratio() const {
+        return total_requests > 0
+            ? static_cast<double>(l1_hits) / static_cast<double>(total_requests)
+            : 0.0;
+    }
+    double l2_hit_ratio() const {
+        return total_requests > 0
+            ? static_cast<double>(l2_hits) / static_cast<double>(total_requests)
+            : 0.0;
+    }
+};
+
 static void write_training_log(
     const fs::path&                          output_dir,
     const std::string&                       model_name,
@@ -48,7 +80,8 @@ static void write_training_log(
     const mdb::gnn::GraphSAGEConfig&         gnn_config,
     const mdb::gnn::TrainingLoop::Result&    result,
     double                                   test_accuracy,
-    bool                                     exported_embeddings)
+    bool                                     exported_embeddings,
+    const CacheStatsSnapshot&                cache_stats)
 {
     std::ofstream f(output_dir / "training_log.json");
     if (!f.is_open()) {
@@ -97,7 +130,21 @@ static void write_training_log(
     }
     f << "],\n";
 
-    f << "  \"exported_embeddings\": " << (exported_embeddings ? "true" : "false") << "\n";
+    f << "  \"exported_embeddings\": " << (exported_embeddings ? "true" : "false") << ",\n";
+
+    // FourLevelStore cache statistics — DiskGNN cache hierarchy diagnostics.
+    // l1_hit_ratio + l2_hit_ratio + (l3_reads + l4_reads) / total_requests = 1.0
+    // when every requested node was resolved (note that l3 also accumulates
+    // misses where the node was outside the projection — see four_level_store.cc).
+    f << "  \"cache_stats\": {\n";
+    f << "    \"l1_hits\": "        << cache_stats.l1_hits        << ",\n";
+    f << "    \"l2_hits\": "        << cache_stats.l2_hits        << ",\n";
+    f << "    \"l3_reads\": "       << cache_stats.l3_reads       << ",\n";
+    f << "    \"l4_reads\": "       << cache_stats.l4_reads       << ",\n";
+    f << "    \"total_requests\": " << cache_stats.total_requests << ",\n";
+    f << "    \"l1_hit_ratio\": "   << cache_stats.l1_hit_ratio() << ",\n";
+    f << "    \"l2_hit_ratio\": "   << cache_stats.l2_hit_ratio() << "\n";
+    f << "  }\n";
     f << "}\n";
 
     if (!f) {
@@ -331,6 +378,21 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error("RowMapping not found at: " + rmap_path.string());
     }
 
+    // Validate the FourLevelStore metadata exists. gnn_train is DiskGNN-faithful
+    // and requires the hierarchical feature store to be pre-built. There is no
+    // silent fallback to a plain mmap: if the store is missing, tell the user
+    // how to build it.
+    auto store_meta_path =
+        fs::path(db_folder) / "gnn_features" / (feature_name + "_store.meta");
+    if (!fs::exists(store_meta_path)) {
+        throw std::runtime_error(
+            "gnn_train requires a pre-built FourLevelStore (DiskGNN feature store).\n"
+            "Store metadata not found at: " + store_meta_path.string() + "\n"
+            "Run: CALL gnn_build_feature_store('" + sample_name + "', '"
+            + feature_name + "', {gpu_budget_mb: <N>, cpu_budget_mb: <M>})\n"
+            "before calling gnn_train.");
+    }
+
     // Validate sample exists
     auto storage_path = SampleStorage::get_storage_path(db_folder, sample_name);
     if (!fs::is_directory(storage_path)) {
@@ -350,8 +412,13 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
 
     // =========================================================================
     // Step 4: Open data sources
+    //
+    // The original FeatureMatrix is intentionally NOT opened here: features
+    // are served exclusively through FourLevelStore below, which reads from
+    // its own reordered .fmat / _cpu_cache.bin / packed_slim files. The
+    // RowMapping is still required because BatchAssembler uses it for label
+    // lookups (labels.bin is indexed by the ORIGINAL row indices).
     // =========================================================================
-    auto fm = FeatureMatrix::open(fmat_path);
     auto rm = RowMapping::open(rmap_path);
     auto samples = SampleStorage::open(storage_path);
     const auto& catalog = samples.get_catalog();
@@ -434,9 +501,15 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     fs::create_directories(output_dir);
 
     // =========================================================================
-    // Step 7: Create BatchAssembler (FeatureMatrix fallback mode)
+    // Step 7: Open FourLevelStore and create BatchAssembler in full mode
+    //
+    // FourLevelStore reads the hierarchical feature store built by
+    // gnn_build_feature_store: L1 (GPU) + L2 (CPU pinned) + L3 (disk reordered)
+    // + L4 (packed slim per-batch). Its stats counters let us verify that all
+    // four tiers are exercised during training — this is the DiskGNN contract.
     // =========================================================================
-    BatchAssembler assembler(fm, samples, labels.get(), splits.get(), rm);
+    mdb::gnn::FourLevelStore feature_store(db_folder, feature_name, samples);
+    BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
 
     // =========================================================================
     // Step 8: Run training
@@ -482,12 +555,22 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     }
 
     // =========================================================================
+    // Step 11.5: Snapshot FourLevelStore cache statistics
+    //
+    // Snapshot the atomic counters once after training/eval/export are done
+    // so the JSON log and the YIELD row report consistent values. This is
+    // the DiskGNN diagnostic surface — without it, the four-level cache
+    // hierarchy is invisible to the user.
+    // =========================================================================
+    auto cache_stats = CacheStatsSnapshot::from(feature_store.get_stats());
+
+    // =========================================================================
     // Step 12: Write training log
     // =========================================================================
     write_training_log(
         output_dir, model_type, sample_name, feature_name,
         projection_name, loop_config, gnn_config, result,
-        test_accuracy, did_export_emb);
+        test_accuracy, did_export_emb, cache_stats);
 
     // =========================================================================
     // Step 13: Yield results
@@ -498,6 +581,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("bestValAccuracy", ctx.create_float(static_cast<float>(result.best_val_accuracy)));
     ctx.yield("testAccuracy",    ctx.create_float(static_cast<float>(test_accuracy)));
     ctx.yield("trainSeconds",    ctx.create_float(static_cast<float>(result.train_seconds)));
+    ctx.yield("l1HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l1_hit_ratio())));
+    ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
+    ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
+    ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
     ctx.yield_row();
 }
 
