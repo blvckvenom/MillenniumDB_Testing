@@ -158,11 +158,10 @@ static void write_training_log(
 // =============================================================================
 
 static void export_embeddings(
-    mdb::gnn::GraphSAGEModel&  model,
-    mdb::gnn::BatchAssembler&  assembler,
+    mdb::gnn::GraphSAGEModel&      model,
+    mdb::gnn::BatchAssembler&      assembler,
     const mdb::gnn::SampleCatalog& catalog,
-    const mdb::gnn::RowMapping&    row_mapping,
-    const fs::path&            output_dir)
+    const fs::path&                output_dir)
 {
     torch::NoGradGuard no_grad;
     model.eval();
@@ -550,7 +549,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     bool did_export_emb = false;
     if (export_emb) {
-        export_embeddings(model, assembler, catalog, rm, output_dir);
+        export_embeddings(model, assembler, catalog, output_dir);
         did_export_emb = true;
     }
 
