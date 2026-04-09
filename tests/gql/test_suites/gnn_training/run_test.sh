@@ -189,7 +189,9 @@ info "Step 4: gnn_offline_sample with predefined splits (fanouts [10, 5])"
 
 SAMPLE_RESULT=$(query "CALL gnn_offline_sample('cora', 'cora_s', [10, 5], {
     batchSize: 64,
-    usePredefinedSplits: true
+    randomSeed: 42,
+    usePredefinedSplits: true,
+    orientation: 'UNDIRECTED'
 })
 YIELD sampleName, totalBatches, trainBatches, validationBatches, testBatches
 RETURN sampleName, totalBatches, trainBatches, validationBatches, testBatches")
@@ -266,10 +268,12 @@ fi
 
 echo "  Train result: $TRAIN_RESULT"
 
-# Parse CSV: header is first line, data is second
+# Parse CSV: header is first line, data is second.
+# CSV string fields are wrapped in literal double quotes — strip them when
+# comparing to bare strings.
 # Fields: modelName,ranEpochs,didConverge,bestValAccuracy,testAccuracy,trainSeconds
 TRAIN_DATA=$(echo "$TRAIN_RESULT" | tail -1)
-MODEL_NAME=$(echo "$TRAIN_DATA" | cut -d',' -f1)
+MODEL_NAME=$(echo "$TRAIN_DATA" | cut -d',' -f1 | tr -d '"')
 RAN_EPOCHS=$(echo "$TRAIN_DATA" | cut -d',' -f2)
 DID_CONVERGE=$(echo "$TRAIN_DATA" | cut -d',' -f3)
 BEST_VAL_ACC=$(echo "$TRAIN_DATA" | cut -d',' -f4)
@@ -359,10 +363,10 @@ fi
 if [ -f "$OUTPUT_DIR/training_log.json" ]; then
     pass "training_log.json exists"
 
-    LOG_CHECK=$(python3 << 'PYEOF'
-import json, sys
+    LOG_CHECK=$(LOG_PATH="$OUTPUT_DIR/training_log.json" python3 << 'PYEOF' 2>&1
+import json, os
 
-path = sys.argv[1] if len(sys.argv) > 1 else ""
+path = os.environ["LOG_PATH"]
 try:
     with open(path) as f:
         log = json.load(f)
@@ -396,7 +400,7 @@ try:
 except Exception as e:
     print(f"FAIL|{e}")
 PYEOF
-    "$OUTPUT_DIR/training_log.json" 2>&1)
+)
 
     if echo "$LOG_CHECK" | grep -q "^PASS"; then
         DETAIL=$(echo "$LOG_CHECK" | cut -d'|' -f2)
@@ -413,15 +417,15 @@ fi
 if [ -f "$OUTPUT_DIR/embeddings.npy" ]; then
     pass "embeddings.npy exists"
 
-    EMB_CHECK=$(python3 << 'PYEOF'
-import sys
+    EMB_CHECK=$(EMB_PATH="$OUTPUT_DIR/embeddings.npy" python3 << 'PYEOF' 2>&1
+import os, sys
 try:
     import numpy as np
 except ImportError:
     print("SKIP|numpy not available")
     sys.exit(0)
 
-path = sys.argv[1] if len(sys.argv) > 1 else ""
+path = os.environ["EMB_PATH"]
 try:
     emb = np.load(path)
 
@@ -444,7 +448,7 @@ try:
 except Exception as e:
     print(f"FAIL|{e}")
 PYEOF
-    "$OUTPUT_DIR/embeddings.npy" 2>&1)
+)
 
     if echo "$EMB_CHECK" | grep -q "^PASS"; then
         DETAIL=$(echo "$EMB_CHECK" | cut -d'|' -f2)
