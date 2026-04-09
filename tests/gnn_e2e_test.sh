@@ -585,6 +585,36 @@ while IFS='|' read -r status check detail; do
 done <<< "$VERIFY_OUT"
 
 # =============================================================================
+# Step 7.0: Verify gnn_train requires a pre-built FourLevelStore
+#
+# gnn_train MUST fail with a clear error message when the FourLevelStore
+# metadata (.meta) is missing. This contract is the reason the training
+# procedure is DiskGNN-faithful: there is no silent fallback to a plain
+# mmap FeatureMatrix that would bypass the L1/L2/L3/L4 cache hierarchy.
+# We temporarily move the .meta file out of the way, call gnn_train,
+# assert the error is explicit, and restore the file for Step 7.
+# =============================================================================
+info "Step 7.0: Verify gnn_train requires FourLevelStore (error path)"
+
+META_FILE="$DB_DIR/gnn_features/node_features_store.meta"
+if [ ! -f "$META_FILE" ]; then
+    fail "Step 7.0 precondition: $META_FILE not found (gnn_build_feature_store did not run)"
+else
+    mv "$META_FILE" "${META_FILE}.bak"
+
+    NOMETA_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', epochs: 1, randomSeed: 42}) YIELD testAccuracy RETURN testAccuracy" 2>&1)
+
+    # Restore .meta BEFORE asserting, so Step 7 can run even if assertion fails.
+    mv "${META_FILE}.bak" "$META_FILE"
+
+    if echo "$NOMETA_OUT" | grep -qiE "gnn_build_feature_store|store\.meta|FourLevelStore|feature store"; then
+        pass "gnn_train: reports clear error when store.meta is missing"
+    else
+        fail "gnn_train: expected error referencing FourLevelStore, got: $(echo "$NOMETA_OUT" | head -3 | tr '\n' ' ')"
+    fi
+fi
+
+# =============================================================================
 # Step 7: Train GraphSAGE and verify accuracy
 #
 # Two configurations are supported via the GNN_TRAIN_CONFIG env var:
@@ -630,7 +660,7 @@ else
     MIN_VAL_ACC="0.72"
 fi
 
-TRAIN_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: $EPOCHS, lr: $LR, weightDecay: $WD, patience: $PATIENCE, randomSeed: 42}) YIELD modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds RETURN modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds")
+TRAIN_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: $EPOCHS, lr: $LR, weightDecay: $WD, patience: $PATIENCE, randomSeed: 42}) YIELD modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds, l1HitRatio, l2HitRatio, l3Reads, l4Reads RETURN modelName, ranEpochs, didConverge, bestValAccuracy, testAccuracy, trainSeconds, l1HitRatio, l2HitRatio, l3Reads, l4Reads")
 
 # Parse YIELDs (skip header)
 TRAIN_LINE=$(echo "$TRAIN_OUT" | tail -1)
@@ -639,6 +669,10 @@ T_EPOCHS=$(echo "$TRAIN_LINE" | cut -d',' -f2)
 T_VAL=$(echo "$TRAIN_LINE"    | cut -d',' -f4)
 T_TEST=$(echo "$TRAIN_LINE"   | cut -d',' -f5)
 T_SEC=$(echo "$TRAIN_LINE"    | cut -d',' -f6)
+T_L1=$(echo "$TRAIN_LINE"     | cut -d',' -f7)
+T_L2=$(echo "$TRAIN_LINE"     | cut -d',' -f8)
+T_L3=$(echo "$TRAIN_LINE"     | cut -d',' -f9)
+T_L4=$(echo "$TRAIN_LINE"     | cut -d',' -f10)
 
 # Level 1: YIELD presence + values
 if [ "$T_MODEL" = "graphsage" ]; then
@@ -675,6 +709,26 @@ if [ "$sec_pass" = "1" ]; then
 else
     fail "Train: trainSeconds=$T_SEC too high (>60s)"
 fi
+
+# Level 1b: FourLevelStore cache stats (full mode only, should always be present
+# because gnn_train is mandated to use FourLevelStore). A missing YIELD field
+# returns the literal string "NULL" in the CSV output, so we must reject it
+# explicitly before running the numeric check (awk silently treats "NULL"+0 as 0).
+for name in l1HitRatio l2HitRatio l3Reads l4Reads; do
+    case $name in
+        l1HitRatio) v=$T_L1 ;;
+        l2HitRatio) v=$T_L2 ;;
+        l3Reads)    v=$T_L3 ;;
+        l4Reads)    v=$T_L4 ;;
+    esac
+    if [ -z "$v" ] || [ "$v" = "NULL" ]; then
+        fail "Train cache: $name missing from YIELD (got '$v')"
+    elif awk -v x="$v" 'BEGIN{exit !(x ~ /^[0-9.eE+-]+$/ && x+0 >= 0)}' 2>/dev/null; then
+        pass "Train cache: $name=$v (present, numeric, non-negative)"
+    else
+        fail "Train cache: $name non-numeric or negative: '$v'"
+    fi
+done
 
 # Level 2: artifact existence
 OUT_DIR="$DB_DIR/projections/e2e_proj/gnn_output/default"
@@ -805,6 +859,27 @@ if unlab_n == 1068:
     print(f"PASS|unlabeled_count|1068 unlabeled (2708 - 1640)")
 else:
     print(f"FAIL|unlabeled_count|got {unlab_n}")
+    errors += 1
+
+# 7. FourLevelStore cache stats in training_log.json
+# These must be present because gnn_train mandates full mode.
+if "cache_stats" in log:
+    cs = log["cache_stats"]
+    required = ["l1_hits", "l2_hits", "l3_reads", "l4_reads", "total_requests"]
+    missing = [k for k in required if k not in cs]
+    if not missing:
+        print(f"PASS|cache_stats_present|keys={sorted(cs.keys())}")
+        total = int(cs["total_requests"])
+        if total > 0:
+            print(f"PASS|cache_stats_active|total_requests={total} > 0")
+        else:
+            print(f"FAIL|cache_stats_active|total_requests=0 (store never queried)")
+            errors += 1
+    else:
+        print(f"FAIL|cache_stats_present|missing keys: {missing}")
+        errors += 1
+else:
+    print(f"FAIL|cache_stats_present|'cache_stats' section not in training_log.json")
     errors += 1
 
 # Do NOT sys.exit() — bash counts PASS/FAIL via the loop below.
