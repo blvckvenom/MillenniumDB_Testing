@@ -897,6 +897,82 @@ while IFS='|' read -r status check detail; do
 done <<< "$TRAIN_LOG_VERIFY"
 
 # =============================================================================
+# Step 8: CUDA FeatureAssembler path (gpu_budget > 0)
+#
+# Rebuilds the FourLevelStore with GPU budget so hot features land in L1
+# (GPU VRAM). This forces gnn_train to use assemble_cuda() — the DiskGNN
+# CUDA kernel that reads L1 from HBM and L2 via UVA in a single pass.
+#
+# For Cora (2708 nodes × 1433 dims × 4 bytes ≈ 15 MB), 100 MB GPU budget
+# fits the entire dataset in L1. Accuracy must match the CPU-only run.
+# =============================================================================
+info "Step 8: CUDA FeatureAssembler path (gpu_budget_mb=100)"
+
+# 8a: Rebuild feature store with GPU budget
+FS_GPU=$(query "CALL gnn_build_feature_store('e2e_sample', 'node_features', {gpu_budget_mb: 100, cpu_budget_mb: 100, reorder: 1, force: 1}) YIELD l1Nodes, l2Nodes, l3Nodes, l4Nodes, gpuAvailable RETURN l1Nodes, l2Nodes, l3Nodes, l4Nodes, gpuAvailable")
+
+GPU_L1=$(echo "$FS_GPU" | tail -1 | cut -d',' -f1)
+GPU_L2=$(echo "$FS_GPU" | tail -1 | cut -d',' -f2)
+GPU_AVAIL=$(echo "$FS_GPU" | tail -1 | cut -d',' -f5)
+
+if [ -n "$GPU_L1" ] && [ "$GPU_L1" -gt 0 ] 2>/dev/null; then
+    pass "CUDA store: L1 has $GPU_L1 nodes on GPU (L2=$GPU_L2)"
+else
+    if [ "$GPU_AVAIL" = "0" ] || [ "$GPU_AVAIL" = "false" ]; then
+        pass "CUDA store: GPU not available, skipping CUDA path checks (L1=$GPU_L1)"
+        # Jump to summary — no point testing CUDA path without a GPU
+        echo ""
+        echo "=============================="
+        if [ "$FAILED" -eq 0 ]; then
+            printf "${GREEN}ALL $TOTAL CHECKS PASSED${NC}\n"
+            exit 0
+        else
+            printf "${RED}$FAILED/$TOTAL CHECKS FAILED${NC}\n"
+            exit 1
+        fi
+    else
+        fail "CUDA store: expected L1>0 with gpu_budget_mb=100, got L1=$GPU_L1 (gpuAvail=$GPU_AVAIL)"
+    fi
+fi
+
+# 8b: Train with GPU-backed feature store
+CUDA_TRAIN=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: $EPOCHS, lr: $LR, weightDecay: $WD, patience: $PATIENCE, randomSeed: 42}) YIELD testAccuracy, l1HitRatio, l2HitRatio, l3Reads, l4Reads RETURN testAccuracy, l1HitRatio, l2HitRatio, l3Reads, l4Reads")
+
+CT_ACC=$(echo "$CUDA_TRAIN" | tail -1 | cut -d',' -f1)
+CT_L1R=$(echo "$CUDA_TRAIN" | tail -1 | cut -d',' -f2)
+CT_L2R=$(echo "$CUDA_TRAIN" | tail -1 | cut -d',' -f3)
+CT_L3=$(echo "$CUDA_TRAIN"  | tail -1 | cut -d',' -f4)
+CT_L4=$(echo "$CUDA_TRAIN"  | tail -1 | cut -d',' -f5)
+
+# 8c: Verify L1 was actually used (l1HitRatio > 0)
+l1_used=$(awk -v r="$CT_L1R" 'BEGIN {print (r+0 > 0) ? "1":"0"}' 2>/dev/null)
+if [ "$l1_used" = "1" ]; then
+    pass "CUDA train: l1HitRatio=$CT_L1R (CUDA kernel exercised)"
+else
+    fail "CUDA train: l1HitRatio=$CT_L1R — expected >0 with GPU budget"
+fi
+
+# 8d: Accuracy must meet the same threshold as CPU-only run
+cuda_acc_pass=$(awk -v a="$CT_ACC" -v t="$MIN_TEST_ACC" 'BEGIN {print (a+0 >= t+0) ? "1":"0"}' 2>/dev/null)
+if [ "$cuda_acc_pass" = "1" ]; then
+    pass "CUDA train: testAccuracy=$CT_ACC >= $MIN_TEST_ACC"
+else
+    fail "CUDA train: testAccuracy=$CT_ACC < $MIN_TEST_ACC"
+fi
+
+# 8e: Accuracy should be close to CPU-only run (±5pp tolerance for seed variation)
+acc_diff=$(awk -v a="$CT_ACC" -v b="$T_TEST" 'BEGIN {d=a-b; print (d<0?-d:d)}' 2>/dev/null)
+acc_close=$(awk -v d="$acc_diff" 'BEGIN {print (d+0 <= 0.05) ? "1":"0"}' 2>/dev/null)
+if [ "$acc_close" = "1" ]; then
+    pass "CUDA train: accuracy delta=${acc_diff} vs CPU-only (within 5pp)"
+else
+    fail "CUDA train: accuracy delta=${acc_diff} vs CPU-only (>5pp divergence)"
+fi
+
+# 8f: Log cache distribution
+info "  CUDA cache: l1Hit=$CT_L1R l2Hit=$CT_L2R l3=$CT_L3 l4=$CT_L4"
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
