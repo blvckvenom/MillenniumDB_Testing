@@ -898,14 +898,14 @@ protected:
         });
     }
 
-    /// Build config with no GPU and a specific CPU budget.
+    /// Build config with zero GPU budget and a specific CPU budget.
     FourLevelStore::Config make_config(
         size_t cpu_budget_nodes = 1,
         bool reorder = false,
         bool force = false)
     {
         FourLevelStore::Config config;
-        config.gpu.budget_bytes = 0;           // no GPU in test env
+        config.gpu.budget_bytes = 0;           // zero GPU budget (test exercises CPU path)
         config.cpu.budget_bytes = cpu_budget_nodes * D * sizeof(float);
         config.reorder = reorder;
         config.force = force;

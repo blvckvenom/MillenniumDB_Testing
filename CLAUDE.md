@@ -78,7 +78,7 @@ The test script automatically sets up Python venv, builds Debug, and runs integr
   - `ops/`: CUDA kernels (bitset filter, UNDIRECTED expand)
   - Zero MillenniumDB dependencies; optional CUDA via `MDB_GPU_ENABLED`
 - **src/gnn/**: GNN training pipeline (library: mdb_gnn_core)
-  - `core/`: CUDA context, sparse ops (scatter_sum/mean/max), memory pool
+  - `core/`: CUDA context, sparse ops (scatter_sum/mean/max), memory pool, FeatureAssembler (CUDA kernel + fallback)
   - `storage/`: FeatureMatrix [N,D] mmap, RowMapping, PackedBatchStore, FourLevelStore
   - `sampling/`: Offline k-hop sampling, SeedSelector, MinHash reorderer
   - `projection/`: GnnProjectionAdapter, FeatureAccessor, TopologyAccessor, GnnMeta
@@ -113,7 +113,7 @@ Iterator-based volcano model with binding iterators in `src/query/executor/bindi
 Tensors for GNN must not be related to existing tensor implementation. See `docs/MillenniumDB.wiki/Working-with-tensors.md`.
 
 **GNN Training Pipeline:**
-End-to-end GNN training within MillenniumDB. Flow: `graph_project` (with `includeFeatures`, `labelProperty`, `splitProperty`) → `gnn_offline_sample` (with optional `usePredefinedSplits`) → `gnn_materialize_batches` → `gnn_build_feature_store` → `gnn_train`. The `gnn_train` procedure creates a GraphSAGE model, trains via BatchAssembler + TrainingLoop, and exports model (.pt) + embeddings (.npy). All tensors on CPU; features loaded via FeatureMatrix fallback or FourLevelStore cache hierarchy.
+End-to-end GNN training within MillenniumDB. Flow: `graph_project` (with `includeFeatures`, `labelProperty`, `splitProperty`) → `gnn_offline_sample` (default orientation: UNDIRECTED, with optional `usePredefinedSplits`) → `gnn_materialize_batches` → `gnn_build_feature_store` → `gnn_train`. The `gnn_train` procedure requires a FourLevelStore (no fallback), creates a GraphSAGE model, trains via BatchAssembler + TrainingLoop, reports cache stats (l1/l2 hit ratios, l3/l4 reads), and exports model (.pt) + embeddings (.npy). Features loaded via FourLevelStore cache hierarchy (L1 GPU + L2 CPU pinned + L3 disk + L4 packed). FeatureAssembler dispatches to a CUDA kernel when gpu_features is on CUDA, otherwise uses LibTorch index_copy_ fallback. (Updated 2026-04-10)
 
 ## Development Notes
 
