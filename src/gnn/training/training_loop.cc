@@ -41,7 +41,20 @@ TrainingLoop::Result TrainingLoop::train()
         torch::manual_seed(static_cast<uint64_t>(config_.random_seed));
     }
 
-    // --- Optimizer -------------------------------------------------------
+    // --- Device detection ---------------------------------------------------
+    // Probe the first batch to discover whether the FeatureAssembler returns
+    // CUDA tensors (L1 cache in GPU VRAM) or CPU tensors. If CUDA, move
+    // the model so all parameters are on the same device as features.
+    torch::Device device(torch::kCPU);
+    {
+        MiniBatch probe = assembler_.assemble(0);
+        device = probe.features.device();
+    }
+    if (!device.is_cpu()) {
+        model_.to(device);
+    }
+
+    // --- Optimizer (created after model device placement) ----------------
     auto optimizer = torch::optim::Adam(
         model_.parameters(),
         torch::optim::AdamOptions(config_.learning_rate)
@@ -66,6 +79,16 @@ TrainingLoop::Result TrainingLoop::train()
 
         for (uint64_t bid = 0; bid < train_batches; ++bid) {
             MiniBatch mini = assembler_.assemble(bid);
+
+            // Move all batch tensors to the training device
+            if (!device.is_cpu()) {
+                mini.features = mini.features.to(device);
+                for (auto& ei : mini.edge_indices) {
+                    ei = ei.to(device);
+                }
+                mini.labels     = mini.labels.to(device);
+                mini.label_mask = mini.label_mask.to(device);
+            }
 
             optimizer.zero_grad();
 
@@ -173,6 +196,18 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
 
     for (uint64_t i = 0; i < count; ++i) {
         auto mini = assembler_.assemble(start_batch + i);
+
+        // Move all batch tensors to the model's device
+        auto dev = model_.parameters().begin()->device();
+        if (!dev.is_cpu()) {
+            mini.features = mini.features.to(dev);
+            for (auto& ei : mini.edge_indices) {
+                ei = ei.to(dev);
+            }
+            mini.labels     = mini.labels.to(dev);
+            mini.label_mask = mini.label_mask.to(dev);
+        }
+
         auto logits = model_.forward(
             mini.features,
             mini.edge_indices,

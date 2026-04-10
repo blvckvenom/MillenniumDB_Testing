@@ -169,8 +169,18 @@ static void export_embeddings(
     std::vector<torch::Tensor> all_embeddings;
     std::vector<int64_t>       all_node_ids;
 
+    auto model_device = model.parameters().begin()->device();
+
     for (uint64_t bid = 0; bid < catalog.total_batches; ++bid) {
         auto mini = assembler.assemble(bid);
+
+        // Move batch tensors to the model's device (supports GPU training)
+        if (!model_device.is_cpu()) {
+            mini.features = mini.features.to(model_device);
+            for (auto& ei : mini.edge_indices) {
+                ei = ei.to(model_device);
+            }
+        }
 
         // Get embeddings (hidden representation before classifier)
         auto emb = model.get_embeddings(

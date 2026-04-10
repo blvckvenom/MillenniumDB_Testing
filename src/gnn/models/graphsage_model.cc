@@ -48,8 +48,11 @@ torch::Tensor GraphSAGEModel::sage_conv(
     torch::Tensor edge_index,
     torch::nn::Linear& linear)
 {
-    auto src = edge_index[0];   // [E] — message sources
-    auto dst = edge_index[1];   // [E] — message destinations
+    // Move edge_index to the same device as features (enables GPU training
+    // when FeatureAssembler returns a CUDA tensor from L1 cache).
+    auto ei  = edge_index.to(x.device());
+    auto src = ei[0];            // [E] — message sources
+    auto dst = ei[1];            // [E] — message destinations
     int64_t N = x.size(0);
 
     // Gather neighbor features for each edge, then aggregate by destination.
