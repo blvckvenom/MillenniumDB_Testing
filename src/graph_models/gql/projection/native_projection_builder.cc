@@ -429,7 +429,11 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
         auto detector = std::make_unique<ParallelEdgeDetector>(type_aggregation);
 
         // Scan all edges with this type (OPTIMIZED: get endpoints in single pass)
-        scanner->scan_label_edge_with_endpoints(type_id, [this, &detector, type_id, type_orientation, type_aggregation, &type_agg_property](ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
+        scanner->scan_label_edge_with_endpoints(
+            type_id,
+            [this, &detector, type_id, type_orientation,
+             type_aggregation, &type_agg_property]
+            (ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
             // Filter: only include if both endpoints are in projection
             bool has_from = storage->has_node(from_node);
             bool has_to = storage->has_node(to_node);
@@ -552,8 +556,10 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
                 if (key_it != gql_model.catalog.edge_keys2id.end()) {
                     property_key_id = ObjectId(key_it->second | ObjectId::MASK_EDGE_KEY);
                 } else {
-                    std::cerr << "[Builder] Warning: Property key '" << property_key_name
-                              << "' not found in catalog. Aggregated values may not be stored correctly." << std::endl;
+                    std::cerr << "[Builder] Warning: Property key '"
+                              << property_key_name
+                              << "' not found in catalog. Aggregated values "
+                                 "may not be stored correctly." << std::endl;
                 }
             }
 
@@ -603,7 +609,8 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     storage->flush();
     if (benchmark_timers_.enabled) {
         auto bench_sort_end = std::chrono::high_resolution_clock::now();
-        double sort_btree_ms = std::chrono::duration<double, std::milli>(bench_sort_end - bench_sort_start).count();
+        double sort_btree_ms = std::chrono::duration<double, std::milli>(
+            bench_sort_end - bench_sort_start).count();
         // Attribute combined sort+btree time; detailed breakdown deferred to future pass
         benchmark_timers_.sort_ms += sort_btree_ms * 0.5;
         benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
@@ -702,7 +709,8 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
 
     if (benchmark_timers_.enabled) {
         auto bench_total_end = std::chrono::high_resolution_clock::now();
-        benchmark_timers_.total_ms = std::chrono::duration<double, std::milli>(bench_total_end - bench_total_start).count();
+        benchmark_timers_.total_ms = std::chrono::duration<double, std::milli>(
+            bench_total_end - bench_total_start).count();
         benchmark_timers_.print(projection_name, stats.relationship_count);
     }
 
@@ -820,7 +828,8 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
 
             // Check if any property config uses this source property
             for (const auto& [projected_name, config] : node_prop_configs) {
-                std::string config_source = config.source_property.empty() ? projected_name : config.source_property;
+                std::string config_source = config.source_property.empty()
+                    ? projected_name : config.source_property;
 
                 if (config_source == source_key_name) {
                     // Get or create projected key ObjectId
@@ -846,7 +855,8 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
 
         // Apply default values for missing properties
         for (const auto& [projected_name, config] : node_prop_configs) {
-            if (found_properties.find(projected_name) == found_properties.end() && config.default_value.has_value()) {
+            if (found_properties.find(projected_name) == found_properties.end()
+                && config.default_value.has_value()) {
                 // Property not found - apply default value
                 ObjectId projected_key_id(0);
                 auto proj_key_it = gql_model.catalog.node_keys2id.find(projected_name);
@@ -854,7 +864,8 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
                     projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_NODE_KEY);
                 } else {
                     // Try source property name
-                    std::string source_name = config.source_property.empty() ? projected_name : config.source_property;
+                    std::string source_name = config.source_property.empty()
+                        ? projected_name : config.source_property;
                     auto src_key_it = gql_model.catalog.node_keys2id.find(source_name);
                     if (src_key_it != gql_model.catalog.node_keys2id.end()) {
                         projected_key_id = ObjectId(src_key_it->second | ObjectId::MASK_NODE_KEY);
@@ -863,7 +874,8 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
 
                 if (projected_key_id.id != 0) {
                     // Create ObjectId from default value (double -> int64 for storage)
-                    ObjectId default_value_id = Common::Conversions::pack_double(config.default_value.value());
+                    ObjectId default_value_id =
+                        Common::Conversions::pack_double(config.default_value.value());
                     storage->add_node_property(node_id, projected_key_id, default_value_id);
                 }
             }
@@ -899,7 +911,8 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
 
         // If we have a filter list, check if this property is in it
         if (!node_property_keys.empty()) {
-            if (std::find(node_property_keys.begin(), node_property_keys.end(), key_name) == node_property_keys.end()) {
+            if (std::find(node_property_keys.begin(), node_property_keys.end(),
+              key_name) == node_property_keys.end()) {
                 record = it.next();
                 continue;  // Skip this property
             }
@@ -944,7 +957,8 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
 
             // Check if any property config uses this source property
             for (const auto& [projected_name, config] : edge_prop_configs) {
-                std::string config_source = config.source_property.empty() ? projected_name : config.source_property;
+                std::string config_source = config.source_property.empty()
+                    ? projected_name : config.source_property;
 
                 if (config_source == source_key_name) {
                     // Get or create projected key ObjectId
@@ -970,7 +984,8 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
 
         // Apply default values for missing properties
         for (const auto& [projected_name, config] : edge_prop_configs) {
-            if (found_properties.find(projected_name) == found_properties.end() && config.default_value.has_value()) {
+            if (found_properties.find(projected_name) == found_properties.end()
+                && config.default_value.has_value()) {
                 // Property not found - apply default value
                 ObjectId projected_key_id(0);
                 auto proj_key_it = gql_model.catalog.edge_keys2id.find(projected_name);
@@ -978,7 +993,8 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
                     projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_EDGE_KEY);
                 } else {
                     // Try source property name
-                    std::string source_name = config.source_property.empty() ? projected_name : config.source_property;
+                    std::string source_name = config.source_property.empty()
+                        ? projected_name : config.source_property;
                     auto src_key_it = gql_model.catalog.edge_keys2id.find(source_name);
                     if (src_key_it != gql_model.catalog.edge_keys2id.end()) {
                         projected_key_id = ObjectId(src_key_it->second | ObjectId::MASK_EDGE_KEY);
@@ -987,7 +1003,8 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
 
                 if (projected_key_id.id != 0) {
                     // Create ObjectId from default value (double -> int64 for storage)
-                    ObjectId default_value_id = Common::Conversions::pack_double(config.default_value.value());
+                    ObjectId default_value_id =
+                        Common::Conversions::pack_double(config.default_value.value());
                     storage->add_edge_property(edge_id, projected_key_id, default_value_id);
                 }
             }
@@ -1019,7 +1036,8 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
                 key_name = ek_it->second;
             }
 
-            if (std::find(edge_property_keys.begin(), edge_property_keys.end(), key_name) == edge_property_keys.end()) {
+            if (std::find(edge_property_keys.begin(), edge_property_keys.end(),
+              key_name) == edge_property_keys.end()) {
                 record = it.next();
                 continue;  // Skip this property
             }
@@ -1073,7 +1091,8 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
 
             // Check if any property config uses this source property
             for (const auto& [projected_name, config] : edge_prop_configs) {
-                std::string config_source = config.source_property.empty() ? projected_name : config.source_property;
+                std::string config_source = config.source_property.empty()
+                    ? projected_name : config.source_property;
 
                 if (config_source == source_key_name) {
                     ObjectId projected_key_id = key_id;
@@ -1097,18 +1116,21 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
         // Apply default values for missing properties (excluding the aggregation property)
         for (const auto& [projected_name, config] : edge_prop_configs) {
             // Skip the excluded property for defaults too
-            std::string config_source = config.source_property.empty() ? projected_name : config.source_property;
+            std::string config_source = config.source_property.empty()
+                    ? projected_name : config.source_property;
             if (config_source == exclude_property) {
                 continue;
             }
 
-            if (found_properties.find(projected_name) == found_properties.end() && config.default_value.has_value()) {
+            if (found_properties.find(projected_name) == found_properties.end()
+                && config.default_value.has_value()) {
                 ObjectId projected_key_id(0);
                 auto proj_key_it = gql_model.catalog.edge_keys2id.find(projected_name);
                 if (proj_key_it != gql_model.catalog.edge_keys2id.end()) {
                     projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_EDGE_KEY);
                 } else {
-                    std::string source_name = config.source_property.empty() ? projected_name : config.source_property;
+                    std::string source_name = config.source_property.empty()
+                        ? projected_name : config.source_property;
                     auto src_key_it = gql_model.catalog.edge_keys2id.find(source_name);
                     if (src_key_it != gql_model.catalog.edge_keys2id.end()) {
                         projected_key_id = ObjectId(src_key_it->second | ObjectId::MASK_EDGE_KEY);
@@ -1116,7 +1138,8 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
                 }
 
                 if (projected_key_id.id != 0) {
-                    ObjectId default_value_id = Common::Conversions::pack_double(config.default_value.value());
+                    ObjectId default_value_id =
+                        Common::Conversions::pack_double(config.default_value.value());
                     storage->add_edge_property(edge_id, projected_key_id, default_value_id);
                 }
             }
@@ -1153,7 +1176,8 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
                 continue;
             }
 
-            if (std::find(edge_property_keys.begin(), edge_property_keys.end(), key_name) == edge_property_keys.end()) {
+            if (std::find(edge_property_keys.begin(), edge_property_keys.end(),
+              key_name) == edge_property_keys.end()) {
                 record = it.next();
                 continue;
             }
