@@ -434,3 +434,4 @@ TEST(FeatureAssemblerTest, CudaKernelMatchesFallback) {
     EXPECT_LT(diff, 1e-5f);
 }
 #endif
+

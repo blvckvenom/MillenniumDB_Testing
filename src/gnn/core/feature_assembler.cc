@@ -142,7 +142,11 @@ torch::Tensor FeatureAssembler::assemble(
     }
 
 #ifdef ENABLE_CUDA_ASSEMBLER
-    if (torch::cuda::is_available()) {
+    // Only use the CUDA kernel when gpu_features is actually on CUDA.
+    // Passing a CPU tensor would give the kernel a host pointer that
+    // GPU threads cannot dereference (illegal memory access / SIGSEGV).
+    if (torch::cuda::is_available() &&
+        gpu_features.defined() && gpu_features.is_cuda()) {
         return assemble_cuda(total_nodes, gpu_features, gpu_positions,
                              cpu_data, cpu_count, cpu_positions);
     }
