@@ -44,7 +44,7 @@ namespace Procedures {
  * | validationRatio | FLOAT | 0.15 | Fraction for validation set |
  * | testRatio | FLOAT | 0.15 | Fraction for test set |
  * | randomSeed | INT | 42 | Seed for reproducibility |
- * | orientation | STRING | 'REVERSE' | Edge direction: NATURAL, REVERSE, UNDIRECTED |
+ * | orientation | STRING | 'UNDIRECTED' | Edge direction: NATURAL, REVERSE, UNDIRECTED |
  * | usePredefinedSplits | BOOL | false | Use splits.bin from projection for train/val/test |
  *
  * ## Examples
@@ -62,7 +62,7 @@ namespace Procedures {
  *       validationRatio: 0.1,
  *       testRatio: 0.1,
  *       randomSeed: 12345,
- *       orientation: 'REVERSE'
+ *       orientation: 'UNDIRECTED'
  *   })
  *   YIELD sampleName, totalBatches, uniqueNodes
  *   RETURN sampleName, totalBatches, uniqueNodes;

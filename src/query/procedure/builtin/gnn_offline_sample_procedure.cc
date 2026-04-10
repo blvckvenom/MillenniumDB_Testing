@@ -102,7 +102,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     double val_ratio = 0.15;
     double test_ratio = 0.15;
     uint64_t random_seed = SamplingConfig::DEFAULT_RANDOM_SEED;
-    std::string orientation_str = "REVERSE";
+    std::string orientation_str = "UNDIRECTED";
     bool use_predefined_splits = false;
 
     if (ctx.arguments.size() >= 4) {
@@ -119,7 +119,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - validationRatio (FLOAT): Validation fraction (default: 0.15)\n"
                 "  - testRatio (FLOAT): Test fraction (default: 0.15)\n"
                 "  - randomSeed (INT): For reproducibility (default: 42)\n"
-                "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED (default: REVERSE)\n"
+                "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED (default: UNDIRECTED)\n"
                 "  - usePredefinedSplits (BOOL): Use splits.bin from projection (default: false)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
@@ -165,7 +165,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 8: Parse orientation
-    EdgeOrientation orientation = EdgeOrientation::REVERSE;
+    EdgeOrientation orientation = EdgeOrientation::UNDIRECTED;
     std::string upper_orientation = orientation_str;
     std::transform(upper_orientation.begin(), upper_orientation.end(),
                    upper_orientation.begin(), ::toupper);
