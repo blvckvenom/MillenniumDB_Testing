@@ -928,11 +928,14 @@ TEST_F(FourLevelStoreCoordTest, Build_NodeClassification) {
         RowMapping::open(rmap_path_),
         samples, config, db_folder_, "test_feat");
 
-    // No GPU in test env: L1=0, all L1 budget redistributed to L2
+    // gpu.budget_bytes=0 so L1 is always empty, regardless of GPU presence.
     EXPECT_EQ(result.l1_nodes, 0u);
     // CPU budget fits 1 node: only node 0 (freq=5, highest)
     EXPECT_EQ(result.l2_nodes, 1u);
-    EXPECT_FALSE(result.gpu_available);
+    // gpu_available reflects actual CUDA detection (true on GPU machines,
+    // false on CPU-only CI). The L1=0 assertion above already validates
+    // that a zero GPU budget is respected regardless of hardware.
+    EXPECT_EQ(result.gpu_available, torch::cuda::is_available());
     EXPECT_EQ(result.total_batches, 5u);
     EXPECT_GT(result.build_time_ms, -1);
     EXPECT_FALSE(result.packed_slim_dir.empty());
