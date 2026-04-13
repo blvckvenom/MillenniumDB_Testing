@@ -209,7 +209,13 @@ std::string Conversions::to_lexical_str(ObjectId oid)
     case GQL_OID::Type::NODE_KEY:
     case GQL_OID::Type::EDGE_KEY:
     case GQL_OID::Type::LIST:
-    case GQL_OID::Type::DICTIONARY: {
+    case GQL_OID::Type::DICTIONARY:
+    case GQL_OID::Type::TENSOR_FLOAT_INLINED:
+    case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
+    case GQL_OID::Type::TENSOR_FLOAT_TMP:
+    case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
+    case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
+    case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
         return "";
     }
     }
@@ -478,6 +484,15 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
     }
     case GQL_OID::Type::NULL_ID: {
         os << "NULL";
+        break;
+    }
+    case GQL_OID::Type::TENSOR_FLOAT_INLINED:
+    case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
+    case GQL_OID::Type::TENSOR_FLOAT_TMP:
+    case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
+    case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
+    case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
+        os << "Tensor(" << (oid.id & ObjectId::VALUE_MASK) << ")";
         break;
     }
     }

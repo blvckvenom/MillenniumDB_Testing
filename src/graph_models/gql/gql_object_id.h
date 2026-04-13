@@ -61,6 +61,7 @@ enum class GenericType {
         KEY,
         LIST,
         DICTIONARY,
+        TENSOR,
         // GEOMETRY, ?
     };
 
@@ -90,6 +91,8 @@ enum class GenericType {
         KEY,
         LIST,
         DICTIONARY,
+        TENSOR_FLOAT,
+        TENSOR_DOUBLE,
         // POINT, ?
     };
 
@@ -142,6 +145,12 @@ enum class GenericType {
         EDGE_KEY,
         LIST,
         DICTIONARY,
+        TENSOR_FLOAT_INLINED,
+        TENSOR_FLOAT_EXTERN,
+        TENSOR_FLOAT_TMP,
+        TENSOR_DOUBLE_INLINED,
+        TENSOR_DOUBLE_EXTERN,
+        TENSOR_DOUBLE_TMP,
         // POINT, ?
     };
 
@@ -234,6 +243,19 @@ enum class GenericType {
         case (ObjectId::MASK_DT_DATETIMESTAMP >> 56):
             return Type::DATETIMESTAMP;
 
+        case ObjectId::MASK_TENSOR_FLOAT_INLINED >> 56:
+            return Type::TENSOR_FLOAT_INLINED;
+        case ObjectId::MASK_TENSOR_FLOAT_EXTERN >> 56:
+            return Type::TENSOR_FLOAT_EXTERN;
+        case ObjectId::MASK_TENSOR_FLOAT_TMP >> 56:
+            return Type::TENSOR_FLOAT_TMP;
+        case ObjectId::MASK_TENSOR_DOUBLE_INLINED >> 56:
+            return Type::TENSOR_DOUBLE_INLINED;
+        case ObjectId::MASK_TENSOR_DOUBLE_EXTERN >> 56:
+            return Type::TENSOR_DOUBLE_EXTERN;
+        case ObjectId::MASK_TENSOR_DOUBLE_TMP >> 56:
+            return Type::TENSOR_DOUBLE_TMP;
+
         default:
             assert(false);
             return Type::NULL_ID;
@@ -300,6 +322,14 @@ enum class GenericType {
                 return GenericSubType::PATH;
             case Type::DICTIONARY:
                 return GenericSubType::DICTIONARY;
+            case Type::TENSOR_FLOAT_INLINED:
+            case Type::TENSOR_FLOAT_EXTERN:
+            case Type::TENSOR_FLOAT_TMP:
+                return GenericSubType::TENSOR_FLOAT;
+            case Type::TENSOR_DOUBLE_INLINED:
+            case Type::TENSOR_DOUBLE_EXTERN:
+            case Type::TENSOR_DOUBLE_TMP:
+                return GenericSubType::TENSOR_DOUBLE;
             }
         assert(false);
         return GenericSubType::NULL_ID;
@@ -364,6 +394,13 @@ enum class GenericType {
                 return GenericType::PATH;
             case Type::DICTIONARY:
                 return GenericType::DICTIONARY;
+            case Type::TENSOR_FLOAT_INLINED:
+            case Type::TENSOR_FLOAT_EXTERN:
+            case Type::TENSOR_FLOAT_TMP:
+            case Type::TENSOR_DOUBLE_INLINED:
+            case Type::TENSOR_DOUBLE_EXTERN:
+            case Type::TENSOR_DOUBLE_TMP:
+                return GenericType::TENSOR;
             default:
                 assert(false);
                 return GenericType::NULL_ID;
