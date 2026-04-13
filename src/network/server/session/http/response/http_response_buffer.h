@@ -21,17 +21,26 @@ public:
 
     ~HttpResponseBuffer()
     {
-        if constexpr (std::is_same_v<stream_t, boost::asio::ip::tcp::socket>) {
-            if (stream.is_open()) {
-                flush();
-                stream.close();
+        // Destructors are implicitly noexcept — a throw from flush() during
+        // unwinding would call std::terminate. Swallow any flush failure here;
+        // the client socket is closed anyway.
+        try {
+            if constexpr (std::is_same_v<stream_t, boost::asio::ip::tcp::socket>) {
+                if (stream.is_open()) {
+                    flush();
+                    stream.close();
+                }
+            } else if constexpr (std::is_same_v<
+                                     stream_t,
+                                     boost::beast::ssl_stream<boost::asio::ip::tcp::socket>>)
+            {
+                if (stream.next_layer().is_open()) {
+                    flush();
+                    stream.next_layer().close();
+                }
             }
-        } else if constexpr (std::is_same_v<stream_t, boost::beast::ssl_stream<boost::asio::ip::tcp::socket>>)
-        {
-            if (stream.next_layer().is_open()) {
-                flush();
-                stream.next_layer().close();
-            }
+        } catch (...) {
+            // Best-effort cleanup only.
         }
     }
 

@@ -102,6 +102,7 @@ public:
     void visit(ExprLabels&) override;
     void visit(ExprProperties&) override;
     void visit(ExprIn&) override;
+    void visit(ExprCosineDistance&) override;
 
     void visit(ExprAggCountAll&) override;
     void visit(ExprAggCount&) override;
@@ -114,5 +115,6 @@ public:
     void visit(ExprAggCollect&) override;
     void visit(ExprAggPercentileCont&) override;
     void visit(ExprAggPercentileDisc&) override;
+    void visit(ExprAggProject&) override;
 };
 } // namespace GQL

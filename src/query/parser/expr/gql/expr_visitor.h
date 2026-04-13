@@ -60,6 +60,7 @@ class ExprCast;
 class ExprLabels;
 class ExprProperties;
 class ExprIn;
+class ExprCosineDistance;
 
 class ExprAggCountAll;
 class ExprAggCount;
@@ -72,6 +73,7 @@ class ExprAggStddevSamp;
 class ExprAggCollect;
 class ExprAggPercentileCont;
 class ExprAggPercentileDisc;
+class ExprAggProject;
 
 class ExprVisitor {
 public:
@@ -144,8 +146,10 @@ public:
     virtual void visit(GQL::ExprAggCollect&) = 0;
     virtual void visit(GQL::ExprAggPercentileCont&) = 0;
     virtual void visit(GQL::ExprAggPercentileDisc&) = 0;
+    virtual void visit(GQL::ExprAggProject&) = 0;
     virtual void visit(GQL::ExprLabels&) = 0;
     virtual void visit(GQL::ExprProperties&) = 0;
     virtual void visit(GQL::ExprIn&) = 0;
+    virtual void visit(GQL::ExprCosineDistance&) = 0;
 };
 } // namespace GQL

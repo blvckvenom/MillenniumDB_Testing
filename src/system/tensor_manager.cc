@@ -151,12 +151,20 @@ tensor::Tensor<T> TensorManager::get_tensor(ObjectId tensor_oid)
         const auto offset = tensor_id % BLOCK_SIZE;
         char* ptr = first_block.bytes + offset;
         const auto [size, num_bytes_read] = BytesEncoder::read_size(ptr);
+        // Advance ptr past the size prefix so memcpy reads the tensor payload,
+        // not the encoded size bytes followed by truncated payload.
+        // (Mirrors the static-buffer branch above.)
+        ptr += num_bytes_read;
 
         assert(size % sizeof(T) == 0 && "size must be multiple of sizeof(T)");
 
         res.resize(size / sizeof(T));
         buffer = reinterpret_cast<char*>(res.data());
 
+        // bytes_left: payload bytes remaining in this block after the size
+        // prefix. Must use `offset` (position within the block), not
+        // `tensor_id` (absolute file offset), to avoid size_t underflow for
+        // any tensor whose id is >= BLOCK_SIZE.
         const auto bytes_left = BLOCK_SIZE - (offset + num_bytes_read);
         const auto bytes_to_copy = std::min(bytes_left, size);
         std::memcpy(buffer, ptr, bytes_to_copy);
@@ -218,7 +226,11 @@ bool TensorManager::bytes_eq(const char* bytes, std::size_t num_bytes, uint64_t 
 
         ptr += num_bytes_read;
 
-        const auto bytes_left = BLOCK_SIZE - (tensor_id + num_bytes_read);
+        // bytes_left: bytes in this block after the size prefix. Must use
+        // `offset` (position within the block), not `tensor_id` (absolute
+        // file offset), or size_t underflow corrupts the comparison window
+        // for any tensor whose id is >= BLOCK_SIZE.
+        const auto bytes_left = BLOCK_SIZE - (offset + num_bytes_read);
 
         const auto bytes_to_cmp = std::min(bytes_left, size);
         const auto cmp = std::memcmp(bytes, ptr, bytes_to_cmp);

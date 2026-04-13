@@ -19,3 +19,4 @@
 #include "agg_percentile_cont_distinct.h" // IWYU pragma: export
 #include "agg_percentile_disc.h" // IWYU pragma: export
 #include "agg_percentile_disc_distinct.h" // IWYU pragma: export
+#include "agg_project.h" // IWYU pragma: export

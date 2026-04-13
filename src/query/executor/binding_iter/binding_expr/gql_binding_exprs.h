@@ -56,5 +56,6 @@
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_edge_labels.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_properties.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_in.h" // IWYU pragma: export
+#include "query/executor/binding_iter/binding_expr/gql/binding_expr_cosine_distance.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/binding_expr_term.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/binding_expr_var.h" // IWYU pragma: export

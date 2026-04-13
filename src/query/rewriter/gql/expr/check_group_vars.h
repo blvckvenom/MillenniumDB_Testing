@@ -25,6 +25,7 @@ public:
     void visit(ExprAggCollect&) override { }
     void visit(ExprAggPercentileCont&) override { }
     void visit(ExprAggPercentileDisc&) override { }
+    void visit(ExprAggProject&) override { }
     void visit(ExprTerm&) override { }
 
     void visit(ExprVar& expr) override
@@ -367,6 +368,12 @@ public:
     void visit(ExprCast& expr) override
     {
         expr.expr->accept_visitor(*this);
+    }
+
+    void visit(ExprCosineDistance& expr) override
+    {
+        expr.lhs->accept_visitor(*this);
+        expr.rhs->accept_visitor(*this);
     }
 };
 

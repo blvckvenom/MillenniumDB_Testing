@@ -58,6 +58,7 @@
 #include "query/parser/expr/gql/expr_labels.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_properties.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_in.h" // IWYU pragma: export
+#include "query/parser/expr/gql/expr_cosine_distance.h" // IWYU pragma: export
 #include "query/parser/expr/gql/agg/expr_agg_count_all.h" // IWYU pragma: export
 #include "query/parser/expr/gql/agg/expr_agg_count.h" // IWYU pragma: export
 #include "query/parser/expr/gql/agg/expr_agg_avg.h" // IWYU pragma: export
@@ -69,3 +70,4 @@
 #include "query/parser/expr/gql/agg/expr_agg_collect.h" // IWYU pragma: export
 #include "query/parser/expr/gql/agg/expr_agg_percentile_cont.h" // IWYU pragma: export
 #include "query/parser/expr/gql/agg/expr_agg_percentile_disc.h" // IWYU pragma: export
+#include "query/parser/expr/gql/agg/expr_agg_project.h" // IWYU pragma: export

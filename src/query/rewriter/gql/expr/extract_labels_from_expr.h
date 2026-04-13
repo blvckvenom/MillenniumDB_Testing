@@ -372,5 +372,15 @@ public:
     {
         tmp = expr.clone();
     }
+
+    void visit(GQL::ExprAggProject& expr)
+    {
+        tmp = expr.clone();
+    }
+
+    void visit(GQL::ExprCosineDistance& expr)
+    {
+        tmp = expr.clone();
+    }
 };
 } // namespace GQL

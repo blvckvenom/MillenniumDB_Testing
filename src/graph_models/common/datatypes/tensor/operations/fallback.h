@@ -222,6 +222,39 @@ struct computation {
         }
         return res;
     }
+
+    // Compute ||v||² (squared L2 norm)
+    static inline T norm_squared(const T* ptr, size_type n)
+    {
+        T res { 0.0 };
+        for (size_type i = 0; i < n; ++i) {
+            res += ptr[i] * ptr[i];
+        }
+        return res;
+    }
+
+    // Cosine distance using pre-computed norms: 1 - (a·b)/(sqrt(||a||²) × sqrt(||b||²))
+    // This avoids redundant norm computation when the query norm is known
+    static inline T cosine_distance_with_norms(
+        const T* lhs, T lhs_norm_sq,
+        const T* rhs, T rhs_norm_sq,
+        size_type n
+    )
+    {
+        // Only compute dot product (norms already known)
+        T ab { 0.0 };
+        for (size_type i = 0; i < n; ++i) {
+            ab += lhs[i] * rhs[i];
+        }
+
+        // Handle zero vectors (max distance)
+        if (lhs_norm_sq == T{0} || rhs_norm_sq == T{0}) {
+            return T{2.0};
+        }
+
+        const T similarity = ab / std::sqrt(lhs_norm_sq * rhs_norm_sq);
+        return T{1.0} - std::min(T{1.0}, std::max(T{-1.0}, similarity));
+    }
 };
 
 template<typename T>

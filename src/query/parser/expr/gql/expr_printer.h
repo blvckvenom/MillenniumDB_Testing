@@ -75,6 +75,7 @@ public:
     void visit(GQL::ExprLabels&) override;
     void visit(GQL::ExprProperties&) override;
     void visit(GQL::ExprIn&) override;
+    void visit(GQL::ExprCosineDistance&) override;
 
     void visit(GQL::ExprAggCountAll&) override;
     void visit(GQL::ExprAggCount&) override;
@@ -87,5 +88,6 @@ public:
     void visit(GQL::ExprAggCollect&) override;
     void visit(GQL::ExprAggPercentileCont&) override;
     void visit(GQL::ExprAggPercentileDisc&) override;
+    void visit(GQL::ExprAggProject&) override;
 };
 } // namespace GQL

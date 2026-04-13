@@ -467,6 +467,15 @@ void ExprPrinter::visit(ExprIn& expr)
     expr.rhs->accept_visitor(*this);
 }
 
+void ExprPrinter::visit(ExprCosineDistance& expr)
+{
+    os << "COSINEDISTANCE(";
+    expr.lhs->accept_visitor(*this);
+    os << ", ";
+    expr.rhs->accept_visitor(*this);
+    os << ")";
+}
+
 void ExprPrinter::visit(ExprAggCountAll&)
 {
     os << "COUNT(*)";
@@ -559,6 +568,13 @@ void ExprPrinter::visit(ExprProperty& expr)
 void ExprPrinter::visit(ExprTerm& expr)
 {
     os << expr.term;
+}
+
+void ExprPrinter::visit(ExprAggProject& expr)
+{
+    os << "PROJECT(";
+    expr.projection_name_expr->accept_visitor(*this);
+    os << ')';
 }
 
 } // namespace GQL

@@ -7,7 +7,9 @@
 
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
+#include "graph_models/gql/projection/projection_query_context.h"
 #include "graph_models/inliner.h"
+#include "query/query_context.h"
 #include "storage/index/lists/list_encoder.h"
 #include "system/path_manager.h"
 #include "system/string_manager.h"
@@ -198,6 +200,18 @@ std::string Conversions::to_lexical_str(ObjectId oid)
         Decimal decimal = unpack_decimal(oid);
         return decimal.to_string();
     }
+    case GQL_OID::Type::TENSOR_FLOAT_INLINED:
+    case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
+    case GQL_OID::Type::TENSOR_FLOAT_TMP: {
+        const auto tensor = unpack_tensor<float>(oid);
+        return tensor.to_string();
+    }
+    case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
+    case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
+    case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
+        const auto tensor = unpack_tensor<double>(oid);
+        return tensor.to_string();
+    }
     case GQL_OID::Type::NULL_ID:
     case GQL_OID::Type::NODE:
     case GQL_OID::Type::DIRECTED_EDGE:
@@ -254,6 +268,19 @@ ObjectId Conversions::pack_edge_label(const std::string& label)
 
 ObjectId Conversions::pack_node_property(const std::string& property)
 {
+    // Check projection-specific keys first (for synthetic properties)
+    // Guard: only access query context if it's been initialized
+    if (QueryContext::_query_ctx != nullptr) {
+        auto& ctx = get_query_ctx();
+        if (ctx.projection_ctx) {
+            auto it = ctx.projection_ctx->node_keys2id.find(property);
+            if (it != ctx.projection_ctx->node_keys2id.end()) {
+                return ObjectId(it->second | ObjectId::MASK_NODE_KEY);
+            }
+        }
+    }
+
+    // Fall back to main catalog
     if (gql_model.catalog.node_keys2id.count(property)) {
         uint64_t label_id = gql_model.catalog.node_keys2id[property];
         return ObjectId(label_id | ObjectId::MASK_NODE_KEY);
@@ -264,6 +291,19 @@ ObjectId Conversions::pack_node_property(const std::string& property)
 
 ObjectId Conversions::pack_edge_property(const std::string& property)
 {
+    // Check projection-specific keys first (for synthetic properties like _count)
+    // Guard: only access query context if it's been initialized
+    if (QueryContext::_query_ctx != nullptr) {
+        auto& ctx = get_query_ctx();
+        if (ctx.projection_ctx) {
+            auto it = ctx.projection_ctx->edge_keys2id.find(property);
+            if (it != ctx.projection_ctx->edge_keys2id.end()) {
+                return ObjectId(it->second | ObjectId::MASK_EDGE_KEY);
+            }
+        }
+    }
+
+    // Fall back to main catalog
     if (gql_model.catalog.edge_keys2id.count(property)) {
         uint64_t label_id = gql_model.catalog.edge_keys2id[property];
         return ObjectId(label_id | ObjectId::MASK_EDGE_KEY);
@@ -346,11 +386,20 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
         break;
     }
     case GQL_OID::Type::NODE_KEY: {
-        os << gql_model.catalog.node_keys_str[unmasked_id];
+        if (unmasked_id < gql_model.catalog.node_keys_str.size()) {
+            os << gql_model.catalog.node_keys_str[unmasked_id];
+        } else {
+            os << "_node_key:" << unmasked_id;
+        }
         break;
     }
     case GQL_OID::Type::EDGE_KEY: {
-        os << gql_model.catalog.edge_keys_str[unmasked_id];
+        if (unmasked_id < gql_model.catalog.edge_keys_str.size()) {
+            os << gql_model.catalog.edge_keys_str[unmasked_id];
+        } else {
+            // Synthetic key ID (e.g., _count from projection aggregation)
+            os << "_edge_key:" << unmasked_id;
+        }
         break;
     }
     case GQL_OID::Type::LIST: {
@@ -441,6 +490,20 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
     }
     case GQL_OID::Type::NULL_ID: {
         os << "NULL";
+        break;
+    }
+    case GQL_OID::Type::TENSOR_FLOAT_INLINED:
+    case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
+    case GQL_OID::Type::TENSOR_FLOAT_TMP: {
+        const auto tensor = unpack_tensor<float>(oid);
+        os << tensor.to_string();
+        break;
+    }
+    case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
+    case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
+    case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
+        const auto tensor = unpack_tensor<double>(oid);
+        os << tensor.to_string();
         break;
     }
     }

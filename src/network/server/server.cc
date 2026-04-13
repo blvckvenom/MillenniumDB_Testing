@@ -7,6 +7,7 @@
 
 #include <boost/beast.hpp>
 
+#include "misc/ablation_registry.h"
 #include "misc/fatal_error.h"
 #include "misc/logger.h"
 #include "network/server/listener.h"
@@ -17,6 +18,14 @@ using namespace MDBServer;
 using namespace boost;
 using tcp = asio::ip::tcp;
 namespace http = boost::beast::http;
+
+namespace {
+// Written from the SIGTERM/SIGINT handler and polled by execute_timeouts().
+// Mutating a plain bool from a signal handler is undefined behavior;
+// volatile std::sig_atomic_t is the only integer type std::signal
+// guarantees safe to write from a handler.
+volatile std::sig_atomic_t shutdown_signal_received = 0;
+} // namespace
 
 // Append an HTTP rel-path to a local filesystem path.
 // The returned path is normalized for the platform.
@@ -182,11 +191,15 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
             return;
         }
 
-        // if ENV MDB_BROWSER is set use that
-        char* env_browser = std::getenv("MDB_BROWSER");
+        // Resolved once instead of per request: the document root cannot change
+        // under a running server, and going through the registry puts the root the
+        // process actually served from into the same log as every other switch.
+        // Unlike its neighbours there, this one selects an interface and not a
+        // code path under measurement.
+        static const std::string browser_root
+            = Ablation::text("MDB_BROWSER", MDBServer::Protocol::DEFAULT_BROWSER_PATH);
 
-        std::string path = env_browser == nullptr ? MDBServer::Protocol::DEFAULT_BROWSER_PATH : env_browser;
-        path = path_cat(path, req.target());
+        std::string path = path_cat(browser_root, req.target());
         if (req.target().back() == '/')
             path.append("index.html");
 
@@ -239,6 +252,11 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
 
 void Server::browser_listener(asio::io_context* browser_io_context, int port)
 {
+    // This runs in a detached thread. Never call FATAL_ERROR / std::exit() here —
+    // that would tear down static objects while worker threads are still running,
+    // causing "pure virtual method called" crashes. Log and return instead; the
+    // query server keeps running without the browser UI.
+
     asio::ip::tcp::acceptor acceptor(*browser_io_context);
     asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), port);
 
@@ -246,25 +264,30 @@ void Server::browser_listener(asio::io_context* browser_io_context, int port)
 
     acceptor.open(endpoint.protocol(), ec);
     if (ec) {
-        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        logger.error() << "Browser listener failed to open socket: " << ec.message();
+        return;
     }
 
     acceptor.set_option(asio::socket_base::reuse_address(true), ec);
     if (ec) {
-        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        logger.error() << "Browser listener failed to set socket options: " << ec.message();
+        return;
     }
 
     acceptor.bind(endpoint, ec);
     if (ec) {
         if (ec == boost::asio::error::address_in_use) {
-            FATAL_ERROR("Browser port ", endpoint.port(), " already in use, try using a different port");
+            logger.error() << "Browser port " << endpoint.port()
+                           << " already in use, browser interface disabled";
         } else {
-            FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+            logger.error() << "Browser listener failed to bind: " << ec.message();
         }
+        return;
     }
     acceptor.listen(asio::socket_base::max_listen_connections, ec);
     if (ec) {
-        FATAL_ERROR("error while trying to start browser listener: ", ec.message());
+        logger.error() << "Browser listener failed to listen: " << ec.message();
+        return;
     }
 
     while (true) {
@@ -346,12 +369,12 @@ void Server::run(
 
 void Server::signal_shutdown_server(int)
 {
-    shutdown_server = true;
+    shutdown_signal_received = 1;
 }
 
 void Server::execute_timeouts()
 {
-    while (!shutdown_server) {
+    while (!shutdown_signal_received) {
         auto start = std::chrono::system_clock::now();
 
         while (std::chrono::system_clock::now() - start < std::chrono::milliseconds(1'000)) {
