@@ -499,6 +499,30 @@ if(BUILD_TESTING)
         )
         add_test(NAME GraphSAGEModelTests COMMAND test_graphsage_model)
 
+        # EmbeddingWriter tests (Task 8: Phase A/B logic in isolation)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_embedding_writer.cc")
+            add_executable(test_embedding_writer tests/test_embedding_writer.cc)
+            # Link gtest_main FIRST so its main() takes precedence over serdi's main()
+            # in the millenniumdb static library. SampleStorage needs Logger from millenniumdb.
+            target_link_libraries(test_embedding_writer
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_embedding_writer PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME EmbeddingWriterTests COMMAND test_embedding_writer)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST EmbeddingWriterTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
+        endif()
+
         message(STATUS "GNN tests enabled")
     else()
         message(STATUS "GTest not found. GNN tests disabled.")
