@@ -137,6 +137,9 @@ add_library(mdb_gnn_core STATIC
 
     # Task 9: Training Loop
     training/training_loop.cc
+
+    # Phase 6: Output / Embedding Writer
+    output/embedding_writer.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
