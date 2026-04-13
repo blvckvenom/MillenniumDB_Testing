@@ -915,25 +915,19 @@ GPU_L1=$(echo "$FS_GPU" | tail -1 | cut -d',' -f1)
 GPU_L2=$(echo "$FS_GPU" | tail -1 | cut -d',' -f2)
 GPU_AVAIL=$(echo "$FS_GPU" | tail -1 | cut -d',' -f5)
 
+SKIP_CUDA_CHECKS=0
 if [ -n "$GPU_L1" ] && [ "$GPU_L1" -gt 0 ] 2>/dev/null; then
     pass "CUDA store: L1 has $GPU_L1 nodes on GPU (L2=$GPU_L2)"
 else
     if [ "$GPU_AVAIL" = "0" ] || [ "$GPU_AVAIL" = "false" ]; then
         pass "CUDA store: GPU not available, skipping CUDA path checks (L1=$GPU_L1)"
-        # Jump to summary — no point testing CUDA path without a GPU
-        echo ""
-        echo "=============================="
-        if [ "$FAILED" -eq 0 ]; then
-            printf "${GREEN}ALL $TOTAL CHECKS PASSED${NC}\n"
-            exit 0
-        else
-            printf "${RED}$FAILED/$TOTAL CHECKS FAILED${NC}\n"
-            exit 1
-        fi
+        SKIP_CUDA_CHECKS=1
     else
         fail "CUDA store: expected L1>0 with gpu_budget_mb=100, got L1=$GPU_L1 (gpuAvail=$GPU_AVAIL)"
     fi
 fi
+
+if [ "$SKIP_CUDA_CHECKS" = "0" ]; then
 
 # 8b: Train with GPU-backed feature store
 CUDA_TRAIN=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: $EPOCHS, lr: $LR, weightDecay: $WD, patience: $PATIENCE, randomSeed: 42}) YIELD testAccuracy, l1HitRatio, l2HitRatio, l3Reads, l4Reads RETURN testAccuracy, l1HitRatio, l2HitRatio, l3Reads, l4Reads")
@@ -971,6 +965,100 @@ fi
 
 # 8f: Log cache distribution
 info "  CUDA cache: l1Hit=$CT_L1R l2Hit=$CT_L2R l3=$CT_L3 l4=$CT_L4"
+
+fi  # SKIP_CUDA_CHECKS
+
+# =============================================================================
+# Step 9: Write-back embeddings to projection + GQL query verification
+#
+# Trains with writeProperty='embedding', which triggers the EmbeddingWriter
+# to persist per-node embeddings as tensor properties in the projection.
+# After write-back, GQL queries verify that:
+#   (a) all 2708 nodes received an embedding
+#   (b) embeddings display as tensor arrays
+#   (c) cosineDistance between distinct nodes is in [0, 2]
+#   (d) cosineDistance of a node with itself is ~0
+# =============================================================================
+info "Step 9: EmbeddingWriter — write-back + GQL queries"
+
+# 9a: Rebuild feature store with CPU-only budget (Step 8 set GPU mode)
+FS_RESET=$(query "CALL gnn_build_feature_store('e2e_sample', 'node_features', {gpu_budget_mb: 0, cpu_budget_mb: 100, force: 1}) YIELD buildTimeMs RETURN buildTimeMs")
+
+WB_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {
+    model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT,
+    epochs: $EPOCHS, lr: $LR, weightDecay: $WD, patience: $PATIENCE,
+    randomSeed: 42, writeProperty: 'embedding'
+}) YIELD testAccuracy, nodesWritten, nodesInferred, inferenceMillis, writeMillis
+RETURN testAccuracy, nodesWritten, nodesInferred, inferenceMillis, writeMillis")
+
+# Parse output
+WB_LINE=$(echo "$WB_OUT" | tail -1)
+WB_ACC=$(echo "$WB_LINE" | cut -d',' -f1)
+WB_WRITTEN=$(echo "$WB_LINE" | cut -d',' -f2)
+WB_INFERRED=$(echo "$WB_LINE" | cut -d',' -f3)
+WB_INF_MS=$(echo "$WB_LINE" | cut -d',' -f4)
+WB_WRITE_MS=$(echo "$WB_LINE" | cut -d',' -f5)
+
+# Debug: show raw output on unexpected results
+if [ -z "$WB_WRITTEN" ] || [ "$WB_WRITTEN" = "NULL" ]; then
+    info "  DEBUG raw WB_OUT: $(echo "$WB_OUT" | head -5 | tr '\n' ' ')"
+fi
+
+# Check nodesWritten
+if [ "$WB_WRITTEN" = "2708" ]; then
+    pass "WriteBack: nodesWritten=$WB_WRITTEN (all Cora nodes)"
+else
+    fail "WriteBack: expected nodesWritten=2708, got $WB_WRITTEN"
+fi
+
+# Check nodesInferred > 0
+if [ -n "$WB_INFERRED" ] && [ "$WB_INFERRED" -gt 0 ] 2>/dev/null; then
+    pass "WriteBack: nodesInferred=$WB_INFERRED"
+else
+    fail "WriteBack: expected nodesInferred>0, got $WB_INFERRED"
+fi
+
+# Check writeMillis > 0
+wms_ok=$(awk -v w="$WB_WRITE_MS" 'BEGIN {print (w+0 > 0) ? "1":"0"}')
+if [ "$wms_ok" = "1" ]; then
+    pass "WriteBack: writeMillis=$WB_WRITE_MS"
+else
+    fail "WriteBack: writeMillis=$WB_WRITE_MS (expected >0)"
+fi
+
+# 9b: Query — all nodes have embedding property
+EMB_COUNT=$(query "USE e2e_proj MATCH (n) WHERE n.embedding IS NOT NULL RETURN count(n)" | tail -1)
+if [ "$EMB_COUNT" = "2708" ]; then
+    pass "GQL: all 2708 nodes have embedding"
+else
+    fail "GQL: expected 2708 embeddings, got $EMB_COUNT"
+fi
+
+# 9c: Embedding is a tensor (displays as array)
+EMB_SAMPLE=$(query "USE e2e_proj MATCH (n) RETURN n.embedding LIMIT 1" | tail -1)
+if echo "$EMB_SAMPLE" | grep -qE '^\[.*\]$'; then
+    pass "GQL: embedding displays as tensor array"
+else
+    fail "GQL: unexpected embedding format: $(echo "$EMB_SAMPLE" | head -c 80)"
+fi
+
+# 9d: cosineDistance between two different nodes
+DIST=$(query "USE e2e_proj MATCH (a:Paper), (b:Paper) WHERE a <> b RETURN cosineDistance(a.embedding, b.embedding) LIMIT 1" | tail -1)
+dist_ok=$(awk -v d="$DIST" 'BEGIN {print (d+0 >= 0 && d+0 <= 2.0) ? "1":"0"}')
+if [ "$dist_ok" = "1" ]; then
+    pass "GQL: cosineDistance=$DIST (in [0, 2])"
+else
+    fail "GQL: cosineDistance=$DIST (expected [0, 2])"
+fi
+
+# 9e: Self-similarity = 0
+SELF=$(query "USE e2e_proj MATCH (n) RETURN cosineDistance(n.embedding, n.embedding) LIMIT 1" | tail -1)
+self_ok=$(awk -v s="$SELF" 'BEGIN {print (s+0 < 1e-4) ? "1":"0"}')
+if [ "$self_ok" = "1" ]; then
+    pass "GQL: self-cosineDistance=$SELF (~0)"
+else
+    fail "GQL: self-cosineDistance=$SELF (expected ~0)"
+fi
 
 # =============================================================================
 # Summary
