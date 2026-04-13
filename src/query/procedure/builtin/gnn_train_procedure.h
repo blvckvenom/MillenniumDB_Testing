@@ -32,6 +32,14 @@ public:
             YieldField{"bestValAccuracy", YieldType::FLOAT,  "Best validation accuracy achieved"},
             YieldField{"testAccuracy",    YieldType::FLOAT,  "Test accuracy (-1.0 if no test split)"},
             YieldField{"trainSeconds",    YieldType::FLOAT,  "Total wall-clock training time in seconds"},
+            YieldField{"l1HitRatio",      YieldType::FLOAT,  "FourLevelStore L1 (GPU) cache hit ratio"},
+            YieldField{"l2HitRatio",      YieldType::FLOAT,  "FourLevelStore L2 (CPU pinned) cache hit ratio"},
+            YieldField{"l3Reads",         YieldType::INT,    "FourLevelStore L3 (disk reordered) read count"},
+            YieldField{"l4Reads",         YieldType::INT,    "FourLevelStore L4 (packed batch) read count"},
+            YieldField{"nodesWritten",    YieldType::INT,    "Nodes whose embeddings were written to projection (0 if writeProperty not set)"},
+            YieldField{"nodesInferred",   YieldType::INT,    "Non-seed nodes inferred during write-back (0 if writeProperty not set)"},
+            YieldField{"inferenceMillis", YieldType::FLOAT,  "Wall-clock time for non-seed inference in ms (0.0 if writeProperty not set)"},
+            YieldField{"writeMillis",     YieldType::FLOAT,  "Wall-clock time for projection writes in ms (0.0 if writeProperty not set)"},
         };
     }
 

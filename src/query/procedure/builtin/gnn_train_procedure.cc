@@ -15,6 +15,7 @@
 #include "query/procedure/procedure_context.h"
 
 #include "gnn/models/graphsage_model.h"
+#include "gnn/output/embedding_writer.h"
 #include "gnn/projection/gnn_meta.h"
 #include "gnn/sampling/sample_catalog.h"
 #include "gnn/sampling/sample_storage.h"
@@ -29,6 +30,7 @@
 #include "gnn/training/training_loop.h"
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/projection/projection_manager.h"
+#include "graph_models/gql/projection/projection_storage.h"
 #include "query/procedure/builtin/gnn_procedure_utils.h"
 
 namespace fs = std::filesystem;
@@ -307,6 +309,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     int64_t     random_seed      = -1;
     std::string output_dir_name  = "default";
     bool        export_emb       = true;
+    std::string write_property;              // writeProperty option (empty = no write-back)
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -361,6 +364,13 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         }
         if (auto v = opts.get_bool("exportEmbeddings")) {
             export_emb = *v;
+        }
+        if (auto v = opts.get_string("writeProperty")) {
+            write_property = *v;
+            if (write_property.empty()) {
+                throw std::runtime_error("writeProperty must be a non-empty string");
+            }
+            validate_safe_name(write_property, "writeProperty");
         }
     }
 
@@ -564,7 +574,47 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     }
 
     // =========================================================================
-    // Step 11.5: Snapshot FourLevelStore cache statistics
+    // Step 11.5: Write embeddings to projection (if writeProperty is set)
+    //
+    // Opens ProjectionStorage for the EmbeddingWriter which needs topology
+    // access (Phase B: on-the-fly k-hop inference for non-seed nodes) and
+    // property write access (Phase C: persist embeddings as tensor properties).
+    // Fanouts and orientation are taken from the SampleCatalog so that
+    // Phase B sampling is consistent with the original offline sampling.
+    // =========================================================================
+    uint64_t nodes_written  = 0;
+    uint64_t nodes_inferred = 0;
+    double   inference_ms   = 0.0;
+    double   write_ms       = 0.0;
+
+    if (!write_property.empty()) {
+        EmbeddingWriter::Config wconfig;
+        wconfig.property_name = write_property;
+        wconfig.fanouts       = catalog.fanouts;
+        wconfig.orientation   = EdgeOrientation::UNDIRECTED;
+
+        GQL::ProjectionStorage proj_storage(proj_dir, db_folder);
+        proj_storage.open();
+
+        EmbeddingWriter writer(
+            model,
+            assembler,
+            samples,
+            rm,
+            catalog,
+            proj_storage,
+            wconfig
+        );
+        auto wresult = writer.write_all();
+
+        nodes_written  = wresult.nodes_written;
+        nodes_inferred = wresult.nodes_inferred;
+        inference_ms   = wresult.inference_ms;
+        write_ms       = wresult.write_ms;
+    }
+
+    // =========================================================================
+    // Step 11.6: Snapshot FourLevelStore cache statistics
     //
     // Snapshot the atomic counters once after training/eval/export are done
     // so the JSON log and the YIELD row report consistent values. This is
@@ -594,6 +644,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
     ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
     ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
+    ctx.yield("nodesWritten",    ctx.create_int(static_cast<int64_t>(nodes_written)));
+    ctx.yield("nodesInferred",   ctx.create_int(static_cast<int64_t>(nodes_inferred)));
+    ctx.yield("inferenceMillis", ctx.create_float(static_cast<float>(inference_ms)));
+    ctx.yield("writeMillis",     ctx.create_float(static_cast<float>(write_ms)));
     ctx.yield_row();
 }
 
