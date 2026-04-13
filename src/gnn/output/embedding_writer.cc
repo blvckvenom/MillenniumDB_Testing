@@ -17,6 +17,7 @@
 
 #include <torch/torch.h>
 
+#include "gnn/storage/feature_matrix.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -189,6 +190,13 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
     std::vector<std::pair<uint64_t, torch::Tensor>> result;
     result.reserve(missing.size());
 
+    // Open FeatureMatrix for node-level feature loading.
+    // Cannot use the main assembler_ (FourLevelStore mode) because inference
+    // batches have no pre-packed files — load_batch_features(batch_id) would fail.
+    FeatureMatrix fm = FeatureMatrix::open(config_.feature_matrix_path);
+    BatchAssembler fm_assembler(fm, sample_storage_, nullptr, nullptr, row_mapping_);
+    auto inference_assembler = &fm_assembler;
+
     const uint64_t chunk_size = config_.batch_size > 0 ? config_.batch_size : 256;
     uint64_t batch_id_counter = catalog_.total_batches;  // avoid ID collision
 
@@ -215,8 +223,11 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
         // 2. Build GraphSample by k-hop sampling from the projection topology
         GraphSample sample = build_graph_sample(seed_oids, batch_id_counter++);
 
-        // 3. Assemble MiniBatch from the on-the-fly sample
-        MiniBatch mini = assembler_.assemble_from_sample(sample);
+        // 3. Assemble MiniBatch using FeatureMatrix mode (not FourLevelStore).
+        //    Inference batches have no pre-packed files in packed_slim, so
+        //    FourLevelStore::load_batch_features(batch_id) would fail.
+        //    Use a temporary BatchAssembler in FeatureMatrix fallback mode.
+        MiniBatch mini = inference_assembler->assemble_from_sample(sample);
 
         // 4. Move batch tensors to model device
         if (!device.is_cpu()) {
@@ -436,15 +447,9 @@ uint64_t EmbeddingWriter::write_to_projection(
     // empty B+Trees so we can insert into them.
     // -------------------------------------------------------------------------
 
-    if (projection_storage_.get_node_key_value_index() == nullptr
-        || projection_storage_.get_key_value_node_index() == nullptr)
-    {
-        throw std::runtime_error(
-            "EmbeddingWriter: projection '" + projection_storage_.get_projection_dir()
-            + "' was built without node property indexes (include_node_properties=false). "
-            "Recreate the projection with node properties enabled, or use "
-            "'includeFeatures' in graph_project config to ensure property indexes are created.");
-    }
+    // Ensure node property B+Trees exist — creates empty indexes if the
+    // projection was built without properties (e.g., STRING syntax).
+    projection_storage_.ensure_node_property_indexes();
 
     auto* nkv_index = projection_storage_.get_node_key_value_index();
     auto* kvn_index = projection_storage_.get_key_value_node_index();

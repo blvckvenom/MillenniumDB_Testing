@@ -195,6 +195,7 @@ void ProjectionStorage::open() {
         }
     }
 
+    // Edge property indexes
     if (std::filesystem::exists(proj_path / "edge_key_value.leaf")) {
         edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
         features.include_edge_properties = true;
@@ -202,6 +203,24 @@ void ProjectionStorage::open() {
         if (std::filesystem::exists(proj_path / "key_value_edge.leaf")) {
             key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
         }
+    }
+}
+
+void ProjectionStorage::ensure_node_property_indexes() {
+    std::filesystem::path proj_path(projection_dir);
+
+    if (!node_key_value_index) {
+        std::string base = rel_dir + "/node_key_value";
+        { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
+        { BPTDirWriter<3>  dw(base + ".dir"); }
+        node_key_value_index = std::make_unique<BPlusTree<3>>(base);
+        features.include_node_properties = true;
+    }
+    if (!key_value_node_index) {
+        std::string base = rel_dir + "/key_value_node";
+        { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
+        { BPTDirWriter<3>  dw(base + ".dir"); }
+        key_value_node_index = std::make_unique<BPlusTree<3>>(base);
     }
 }
 

@@ -368,6 +368,11 @@ public:
     /// @{
     BPlusTree<3>* get_node_key_value_index() { return node_key_value_index.get(); }  ///< Node properties (may be null)
     BPlusTree<3>* get_key_value_node_index() { return key_value_node_index.get(); }  ///< Property → nodes (may be null)
+
+    /// Create empty node property B+Tree indexes if they don't exist.
+    /// Called by EmbeddingWriter when the projection was built without
+    /// property indexes (STRING syntax in graph_project).
+    void ensure_node_property_indexes();
     BPlusTree<3>* get_edge_key_value_index() { return edge_key_value_index.get(); }  ///< Edge properties (may be null)
     BPlusTree<3>* get_key_value_edge_index() { return key_value_edge_index.get(); }  ///< Property → edges (may be null)
     /// @}

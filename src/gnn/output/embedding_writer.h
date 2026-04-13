@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -72,6 +73,7 @@ public:
         uint64_t                 batch_size = 256;  ///< Inference batch size (Phase B)
         std::vector<uint64_t>    fanouts;           ///< Sampling fanouts   (Phase B)
         EdgeOrientation          orientation = EdgeOrientation::UNDIRECTED;
+        std::filesystem::path    feature_matrix_path; ///< Path to .fmat for inference feature loading
     };
 
     // =========================================================================

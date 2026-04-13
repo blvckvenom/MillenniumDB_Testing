@@ -589,9 +589,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
 
     if (!write_property.empty()) {
         EmbeddingWriter::Config wconfig;
-        wconfig.property_name = write_property;
-        wconfig.fanouts       = catalog.fanouts;
-        wconfig.orientation   = EdgeOrientation::UNDIRECTED;
+        wconfig.property_name      = write_property;
+        wconfig.fanouts            = catalog.fanouts;
+        wconfig.orientation        = EdgeOrientation::UNDIRECTED;
+        wconfig.feature_matrix_path = fmat_path;
 
         GQL::ProjectionStorage proj_storage(proj_dir, db_folder);
         proj_storage.open();
