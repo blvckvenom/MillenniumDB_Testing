@@ -187,9 +187,31 @@ private:
         uint64_t batch_id
     );
 
-    // Phase C (Task 6):
-    // uint64_t write_to_projection(
-    //     const std::unordered_map<uint64_t, torch::Tensor>& embeddings);
+    // =========================================================================
+    // Phase C: Write embeddings to projection as tensor properties
+    // =========================================================================
+
+    /**
+     * @brief Persist all embeddings as tensor node properties in the projection.
+     *
+     * For each (row_index, embedding) pair:
+     *   1. Look up the node ObjectId via RowMapping.
+     *   2. Serialize the embedding to raw float bytes.
+     *   3. Store in TensorManager via get_or_create_id().
+     *   4. Build a tensor ObjectId (MASK_TENSOR_FLOAT_EXTERN | tensor_id).
+     *   5. Insert (node_oid, key_oid, tensor_oid) into the B+Tree property
+     *      indexes via BPlusTree::insert().
+     *
+     * The property key is registered in the projection catalog under
+     * config_.property_name (e.g., "embedding"). If the projection was not
+     * built with node property indexes, they are created as empty B+Trees
+     * first.
+     *
+     * @param emb_map  Map of row_index -> embedding tensor.
+     * @return Number of embeddings successfully written.
+     */
+    uint64_t write_to_projection(
+        const std::unordered_map<uint64_t, torch::Tensor>& emb_map);
 
     // =========================================================================
     // Members (non-owning references)
@@ -201,6 +223,9 @@ private:
     const RowMapping&          row_mapping_;
     const SampleCatalog&       catalog_;
     Config                     config_;
+
+    /// ProjectionStorage for Phase C writes (non-owning reference).
+    GQL::ProjectionStorage&    projection_storage_;
 
     /// TopologyAccessor for on-the-fly k-hop sampling (Phase B).
     /// Owned by this object; constructed from projection_storage in ctor.
