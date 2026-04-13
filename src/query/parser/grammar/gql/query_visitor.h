@@ -221,6 +221,9 @@ public:
     std::any visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFunctionContext* ctx) override;
     std::any visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFunctionContext* ctx) override;
 
+    // tensorFunction
+    std::any visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext* ctx) override;
+
     // stringFunction
     std::any visitGqlSubstringFunction(GQLParser::GqlSubstringFunctionContext* ctx) override;
     std::any visitGqlFoldStringFunction(GQLParser::GqlFoldStringFunctionContext* ctx) override;

@@ -60,6 +60,7 @@ class ExprCast;
 class ExprLabels;
 class ExprProperties;
 class ExprIn;
+class ExprCosineDistance;
 
 class ExprAggCountAll;
 class ExprAggCount;
@@ -149,5 +150,6 @@ public:
     virtual void visit(GQL::ExprLabels&) = 0;
     virtual void visit(GQL::ExprProperties&) = 0;
     virtual void visit(GQL::ExprIn&) = 0;
+    virtual void visit(GQL::ExprCosineDistance&) = 0;
 };
 } // namespace GQL

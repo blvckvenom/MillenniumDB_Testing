@@ -1023,6 +1023,8 @@ public:
 
     virtual std::any visitFunctionCall(GQLParser::FunctionCallContext *context) = 0;
 
+    virtual std::any visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext *context) = 0;
+
     virtual std::any visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFunctionContext *context) = 0;
 
     virtual std::any visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFunctionContext *context) = 0;

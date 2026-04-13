@@ -2023,6 +2023,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFunctionContext *ctx) override {
     return visitChildren(ctx);
   }

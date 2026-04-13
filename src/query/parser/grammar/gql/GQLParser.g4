@@ -2190,8 +2190,13 @@ functionCall
    | durationFunction
    | listFunction
    | stringFunction
+   | tensorFunction
    | labelsFunction
    | propertiesFunction
+   ;
+
+tensorFunction
+   : COSINEDISTANCE LEFT_PAREN functionParameter COMMA functionParameter RIGHT_PAREN     #gqlCosineDistanceFunction
    ;
 
 numericFunction

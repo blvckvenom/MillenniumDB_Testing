@@ -369,6 +369,12 @@ public:
     {
         expr.expr->accept_visitor(*this);
     }
+
+    void visit(ExprCosineDistance& expr) override
+    {
+        expr.lhs->accept_visitor(*this);
+        expr.rhs->accept_visitor(*this);
+    }
 };
 
 } // namespace GQL

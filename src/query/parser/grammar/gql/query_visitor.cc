@@ -1255,6 +1255,28 @@ std::any QueryVisitor::visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFu
     return 0;
 }
 
+std::any QueryVisitor::visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext* ctx)
+{
+    LOG_VISITOR
+    std::vector<std::unique_ptr<Expr>> expressions;
+    for (auto& fp : ctx->functionParameter()) {
+        if (auto unsignedLiteral = fp->unsignedLiteral()) {
+            visit(unsignedLiteral);
+        } else if (auto variable = fp->variable()) {
+            visit(variable);
+        } else if (auto propertyReference = fp->propertyReference()) {
+            visit(propertyReference);
+        } else if (auto functionCall = fp->functionCall()) {
+            visit(functionCall);
+        } else if (auto expression = fp->expression()) {
+            visit(expression);
+        }
+        expressions.push_back(std::move(current_expr));
+    }
+    current_expr = std::make_unique<ExprCosineDistance>(std::move(expressions[0]), std::move(expressions[1]));
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlSubstringFunction(GQLParser::GqlSubstringFunctionContext* ctx)
 {
     LOG_VISITOR

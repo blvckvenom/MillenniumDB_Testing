@@ -548,6 +548,16 @@ void ExprToBindingExpr::visit(ExprIn& expr)
     tmp = std::make_unique<BindingExprIn>(std::move(lhs_binding_expr), std::move(rhs_binding_expr));
 }
 
+void ExprToBindingExpr::visit(ExprCosineDistance& expr)
+{
+    expr.lhs->accept_visitor(*this);
+    auto lhs_binding_expr = std::move(tmp);
+    expr.rhs->accept_visitor(*this);
+    auto rhs_binding_expr = std::move(tmp);
+
+    tmp = std::make_unique<BindingExprCosineDistance>(std::move(lhs_binding_expr), std::move(rhs_binding_expr));
+}
+
 void ExprToBindingExpr::visit(ExprAggCountAll& expr)
 {
     check_and_make_aggregate<AggCountAll>(nullptr, expr.var);

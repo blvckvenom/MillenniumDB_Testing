@@ -420,5 +420,10 @@ public:
     {
         tmp = expr.clone();
     }
+
+    void visit(ExprCosineDistance& expr)
+    {
+        tmp = expr.clone();
+    }
 };
 } // namespace GQL

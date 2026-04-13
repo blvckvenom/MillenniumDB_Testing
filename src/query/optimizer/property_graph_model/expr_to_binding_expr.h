@@ -102,6 +102,7 @@ public:
     void visit(ExprLabels&) override;
     void visit(ExprProperties&) override;
     void visit(ExprIn&) override;
+    void visit(ExprCosineDistance&) override;
 
     void visit(ExprAggCountAll&) override;
     void visit(ExprAggCount&) override;

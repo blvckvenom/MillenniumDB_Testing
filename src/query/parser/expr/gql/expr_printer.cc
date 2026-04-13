@@ -467,6 +467,15 @@ void ExprPrinter::visit(ExprIn& expr)
     expr.rhs->accept_visitor(*this);
 }
 
+void ExprPrinter::visit(ExprCosineDistance& expr)
+{
+    os << "COSINEDISTANCE(";
+    expr.lhs->accept_visitor(*this);
+    os << ", ";
+    expr.rhs->accept_visitor(*this);
+    os << ")";
+}
+
 void ExprPrinter::visit(ExprAggCountAll&)
 {
     os << "COUNT(*)";
