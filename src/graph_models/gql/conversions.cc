@@ -200,6 +200,18 @@ std::string Conversions::to_lexical_str(ObjectId oid)
         Decimal decimal = unpack_decimal(oid);
         return decimal.to_string();
     }
+    case GQL_OID::Type::TENSOR_FLOAT_INLINED:
+    case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
+    case GQL_OID::Type::TENSOR_FLOAT_TMP: {
+        const auto tensor = unpack_tensor<float>(oid);
+        return tensor.to_string();
+    }
+    case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
+    case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
+    case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
+        const auto tensor = unpack_tensor<double>(oid);
+        return tensor.to_string();
+    }
     case GQL_OID::Type::NULL_ID:
     case GQL_OID::Type::NODE:
     case GQL_OID::Type::DIRECTED_EDGE:
@@ -209,13 +221,7 @@ std::string Conversions::to_lexical_str(ObjectId oid)
     case GQL_OID::Type::NODE_KEY:
     case GQL_OID::Type::EDGE_KEY:
     case GQL_OID::Type::LIST:
-    case GQL_OID::Type::DICTIONARY:
-    case GQL_OID::Type::TENSOR_FLOAT_INLINED:
-    case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
-    case GQL_OID::Type::TENSOR_FLOAT_TMP:
-    case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
-    case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
-    case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
+    case GQL_OID::Type::DICTIONARY: {
         return "";
     }
     }

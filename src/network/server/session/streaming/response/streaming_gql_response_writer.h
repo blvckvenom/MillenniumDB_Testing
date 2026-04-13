@@ -174,6 +174,20 @@ public:
             write_list(oid_list);
             break;
         }
+        case GQL_OID::Type::TENSOR_FLOAT_INLINED:
+        case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
+        case GQL_OID::Type::TENSOR_FLOAT_TMP: {
+            const auto tensor = Common::Conversions::unpack_tensor<float>(oid);
+            write_tensor<float>(tensor);
+            break;
+        }
+        case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
+        case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
+        case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
+            const auto tensor = Common::Conversions::unpack_tensor<double>(oid);
+            write_tensor<double>(tensor);
+            break;
+        }
         default: {
             throw std::logic_error(
                 "Unmanaged type in StreamingGQLResponseWriter::encode_object_id: "
