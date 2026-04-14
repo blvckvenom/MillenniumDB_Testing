@@ -2118,6 +2118,8 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         procedure_type = OpProcedure::ProcedureType::HELLO_WORLD;
     } else if (procedure_name_lowercased == "neighbors") {
         procedure_type = OpProcedure::ProcedureType::NEIGHBORS;
+    } else if (procedure_name_lowercased == "jaccard") {
+        procedure_type = OpProcedure::ProcedureType::JACCARD;
     } else {
         throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
     }
@@ -2133,6 +2135,12 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
     } else if (procedure_type == OpProcedure::ProcedureType::NEIGHBORS) {
         yield_vars.emplace_back(get_query_ctx().get_or_create_var("node"));
         yield_vars.emplace_back(get_query_ctx().get_or_create_var("neighbor"));
+        singleton_types[yield_vars[0]] = VarType::Node;
+        singleton_types[yield_vars[1]] = VarType::Node;
+    } else if (procedure_type == OpProcedure::ProcedureType::JACCARD) {
+        yield_vars.emplace_back(get_query_ctx().get_or_create_var("node1"));
+        yield_vars.emplace_back(get_query_ctx().get_or_create_var("node2"));
+        yield_vars.emplace_back(get_query_ctx().get_or_create_var("similarity"));
         singleton_types[yield_vars[0]] = VarType::Node;
         singleton_types[yield_vars[1]] = VarType::Node;
     }

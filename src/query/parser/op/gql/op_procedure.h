@@ -18,7 +18,8 @@ class OpProcedure : public Op {
 public:
     enum class ProcedureType : uint8_t {
         HELLO_WORLD, // primera función analítica de juguete
-        NEIGHBORS // devolver todos los vecinos de todos los nodos
+        NEIGHBORS, // devolver todos los vecinos de todos los nodos
+        JACCARD // devolver similaridad Jaccard entre pares de nodos
     };
     static std::string get_procedure_string(ProcedureType procedure_type)
     {
@@ -27,6 +28,8 @@ public:
             return "HELLO_WORLD";
         case ProcedureType::NEIGHBORS:
             return "NEIGHBORS";
+        case ProcedureType::JACCARD:
+            return "JACCARD";
         default:
             throw NotSupportedException(
                 "OpProcedure::get_procedure_string: Unhandled procedure type: "
@@ -41,6 +44,8 @@ public:
             return { "message" };
         case ProcedureType::NEIGHBORS:
             return { "node", "neighbor" };
+        case ProcedureType::JACCARD:
+            return { "node1", "node2", "similarity" };
         default:
             throw NotSupportedException(
                 "OpProcedure::get_procedure_available_yield_variable_names: Unhandled procedure type: "
