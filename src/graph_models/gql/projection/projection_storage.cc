@@ -955,9 +955,9 @@ size_t build_index_with_streaming_sort(
     // Finalize the buffer (flush any remaining memory to disk if spilled)
     buffer.finalize();
 
-    // Create external sorter with bounded memory (256 MB)
-    static constexpr size_t SORT_BUFFER_SIZE = 256 * 1024 * 1024;
-    ExternalRecordSort<N> sorter(sort_temp_dir, SORT_BUFFER_SIZE);
+    // Sort buffer sized adaptively from MemAvailable.
+    // See src/misc/available_ram.h and spec 2026-04-14.
+    ExternalRecordSort<N> sorter(sort_temp_dir);
 
     // Add spill files directly to sorter (no memory copy)
     const auto& spill_paths = buffer.get_spill_paths();
@@ -991,8 +991,9 @@ void ProjectionStorage::build_all_indexes_bulk() {
     // Each index is built by streaming sorted records directly to B+tree
     // leaf pages, with inline deduplication.
     //
-    // Memory model: O(256 MB) regardless of dataset size
-    //               ~256 MB for sort + one page for B+tree writing
+    // Memory model: O(adaptive buffer) = O(MemAvailable * 0.75),
+    //               with a 256 MB floor. See src/misc/available_ram.h.
+    //               ~adaptive MB for sort + one page for B+tree writing
     // =========================================================================
 
     // Create temp directory for sorted runs
