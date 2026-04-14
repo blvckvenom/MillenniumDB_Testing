@@ -22,6 +22,7 @@
 #include "query/executor/binding_iter/single_result_binding_iter.h"
 #include "query/executor/binding_iter/slice.h"
 #include "query/executor/binding_iter/procedure/hello_world.h"
+#include "query/executor/binding_iter/procedure/jaccard.h"
 #include "query/executor/binding_iter/procedure/neighbors.h"
 #include "query/optimizer/plan/join_order/greedy_optimizer.h"
 #include "query/optimizer/plan/join_order/selinger_optimizer.h"
@@ -599,6 +600,11 @@ void PathBindingIterConstructor::visit(OpProcedure& op_procedure)
         break;
     case OpProcedure::ProcedureType::NEIGHBORS:
         tmp_iter =  std::make_unique<Procedure::Neighbors>(
+            std::move(yield_vars)
+        );
+        break;
+    case OpProcedure::ProcedureType::JACCARD:
+        tmp_iter = std::make_unique<Procedure::Jaccard>(
             std::move(yield_vars)
         );
         break;
