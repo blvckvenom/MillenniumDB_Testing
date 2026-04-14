@@ -198,6 +198,7 @@ set(PROFILE_TARGETS
     profile-update
 )
 set(TEST_TARGETS
+    available_ram-test
     compare_datetime
     iri_prefixes-test
     # native_projection_builder_test  # DISABLED: needs API updates
