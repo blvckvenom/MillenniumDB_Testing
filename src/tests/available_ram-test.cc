@@ -162,6 +162,36 @@ bool test_core_adaptive_below_floor_clamps() {
     return false;
 }
 
+bool test_core_env_exact_value() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"4096",
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 4ULL * 1024 * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV);
+    return false;
+}
+
+bool test_core_env_below_floor_clamps() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"1",
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 256ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV);  // Still tagged ENV even after clamp.
+    return false;
+}
+
+bool test_core_env_whitespace_tolerated() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/0,
+        /*env_value=*/"1024 ",  // trailing space
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 1024ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV);
+    return false;
+}
+
 // ─── Harness ──────────────────────────────────────────────────────
 
 int main() {
@@ -175,6 +205,9 @@ int main() {
         {"test_core_floor_when_mem_zero",         &test_core_floor_when_mem_zero},
         {"test_core_adaptive_above_floor",        &test_core_adaptive_above_floor},
         {"test_core_adaptive_below_floor_clamps", &test_core_adaptive_below_floor_clamps},
+        {"test_core_env_exact_value",             &test_core_env_exact_value},
+        {"test_core_env_below_floor_clamps",      &test_core_env_below_floor_clamps},
+        {"test_core_env_whitespace_tolerated",    &test_core_env_whitespace_tolerated},
     };
 
     int failures = 0;
