@@ -54,6 +54,7 @@
 
 #include "graph_models/gql/projection/edge_aggregation_record.h"
 #include "graph_models/gql/projection/parallel_merge.h"
+#include "misc/available_ram.h"
 #include "storage/async_io/async_io.h"
 #include "storage/index/record.h"
 #include "storage/page/page.h"
@@ -126,21 +127,34 @@ public:
     /// @brief Records per buffer page
     static constexpr size_t RECORDS_PER_PAGE = Page::SIZE / RECORD_SIZE;
 
-    /// @brief Default merge buffer size (256 MB)
-    static constexpr size_t DEFAULT_BUFFER_SIZE = 256 * 1024 * 1024;
-
     /**
      * @brief Constructs external sorter.
      *
      * @param temp_dir Directory for temporary sorted files
-     * @param buffer_size Maximum memory for sort buffers (default 256 MB)
+     * @param buffer_size Maximum memory for sort buffers. Use 0 (default)
+     *                    to enable the adaptive calculation from
+     *                    /proc/meminfo MemAvailable. Any non-zero value is
+     *                    treated as an explicit override (e.g., tests).
      */
-    ExternalEdgeSort(const std::string& temp_dir, size_t buffer_size = DEFAULT_BUFFER_SIZE)
+    ExternalEdgeSort(const std::string& temp_dir, size_t buffer_size = 0)
         : temp_dir_(temp_dir)
-        , buffer_size_(buffer_size)
+        , buffer_size_(0)
         , block_size_(Page::SIZE * RECORD_SIZE)  // One page worth of records
         , total_records_(0)
     {
+        if (buffer_size == 0) {
+            AdaptiveBufferResult r = compute_adaptive_sort_buffer_result();
+            buffer_size_ = r.bytes;
+            const char* tag = (r.source == AdaptiveBufferResult::ADAPTIVE) ? "adaptive"
+                            : (r.source == AdaptiveBufferResult::ENV)      ? "env"
+                                                                           : "env_invalid";
+            std::cout << "[sort] buffer=" << (buffer_size_ / (1ULL << 20))
+                      << " MB (source=" << tag << ")\n";
+        } else {
+            buffer_size_ = buffer_size;
+            std::cout << "[sort] buffer=" << (buffer_size_ / (1ULL << 20))
+                      << " MB (source=explicit)\n";
+        }
         // Ensure temp directory exists
         std::filesystem::create_directories(temp_dir_);
     }
