@@ -192,6 +192,65 @@ bool test_core_env_whitespace_tolerated() {
     return false;
 }
 
+bool test_core_env_non_numeric_invalid() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"abc",
+        /*floor=*/256ULL * 1024 * 1024);
+    // Falls back to adaptive (12 GB) but tagged ENV_INVALID.
+    EXPECT_EQ(r.bytes, 12ULL * 1024 * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV_INVALID);
+    return false;
+}
+
+bool test_core_env_zero_invalid() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"0",
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 12ULL * 1024 * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV_INVALID);
+    return false;
+}
+
+bool test_core_env_negative_invalid() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"-100",
+        /*floor=*/256ULL * 1024 * 1024);
+    // strtoull on "-100" sets errno=ERANGE (on most libcs) or returns a huge
+    // wrapped value — both rejected by the `errno == 0` check.
+    EXPECT(r.source == AdaptiveBufferResult::ENV_INVALID);
+    return false;
+}
+
+bool test_core_env_overflow_invalid() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"99999999999999999999999999",
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV_INVALID);
+    return false;
+}
+
+bool test_core_env_trailing_garbage_invalid() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"1024abc",
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV_INVALID);
+    return false;
+}
+
+bool test_core_env_empty_invalid() {
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/"",
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV_INVALID);
+    return false;
+}
+
 // ─── Harness ──────────────────────────────────────────────────────
 
 int main() {
@@ -208,6 +267,12 @@ int main() {
         {"test_core_env_exact_value",             &test_core_env_exact_value},
         {"test_core_env_below_floor_clamps",      &test_core_env_below_floor_clamps},
         {"test_core_env_whitespace_tolerated",    &test_core_env_whitespace_tolerated},
+        {"test_core_env_non_numeric_invalid",     &test_core_env_non_numeric_invalid},
+        {"test_core_env_zero_invalid",            &test_core_env_zero_invalid},
+        {"test_core_env_negative_invalid",        &test_core_env_negative_invalid},
+        {"test_core_env_overflow_invalid",        &test_core_env_overflow_invalid},
+        {"test_core_env_trailing_garbage_invalid", &test_core_env_trailing_garbage_invalid},
+        {"test_core_env_empty_invalid",           &test_core_env_empty_invalid},
     };
 
     int failures = 0;

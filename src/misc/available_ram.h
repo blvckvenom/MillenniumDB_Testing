@@ -62,6 +62,12 @@ inline AdaptiveBufferResult compute_adaptive_sort_buffer_core(
 {
     // Path 1: env var override
     if (env_value != nullptr) {
+        // Reject leading sign (strtoull accepts '-' via wrap-around; '+' is
+        // technically valid but we force callers to pass bare positive ints).
+        const char* scan = env_value;
+        while (std::isspace(static_cast<unsigned char>(*scan))) ++scan;
+        bool sign_prefix = (*scan == '-' || *scan == '+');
+
         errno = 0;
         char* end = nullptr;
         unsigned long long mb = std::strtoull(env_value, &end, 10);
@@ -69,7 +75,8 @@ inline AdaptiveBufferResult compute_adaptive_sort_buffer_core(
                   && (*end == '\0' ||
                       std::isspace(static_cast<unsigned char>(*end)))
                   && (errno == 0)
-                  && (mb > 0);
+                  && (mb > 0)
+                  && !sign_prefix;
         if (valid) {
             uint64_t bytes64 = static_cast<uint64_t>(mb) * 1024ULL * 1024ULL;
             size_t bytes = (bytes64 > static_cast<uint64_t>(SIZE_MAX))
