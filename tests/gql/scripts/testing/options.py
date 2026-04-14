@@ -60,6 +60,7 @@ TEST_SUITES: list[str] = [
     "projection_properties",
     "projection_comprehensive",
     "projection_advanced",
+    "projection_adaptive_buffer",
     "list_exprs",
 ]
 
