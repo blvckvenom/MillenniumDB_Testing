@@ -1388,7 +1388,7 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
     // Phase 2: External sort by (from, to, type)
     std::cout << "[StreamingAggregation] Phase 2: External sort..." << std::endl;
 
-    ExternalEdgeSort sorter(temp_dir, 256 * 1024 * 1024);
+    ExternalEdgeSort sorter(temp_dir);
 
     // Enable parallel I/O mode for large datasets (>1M edges)
     // This uses async I/O with prefetching for 2-4× speedup
