@@ -110,3 +110,6 @@ third_party/boost_1_82
 /trie.dot.svg
 
 **/.DS_Store
+
+# local server output
+server.log
