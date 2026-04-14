@@ -251,6 +251,21 @@ bool test_core_env_empty_invalid() {
     return false;
 }
 
+bool test_public_wrapper_with_env() {
+    ScopedEnv env("MDB_SORT_BUFFER_MB", "512");
+    size_t result = compute_adaptive_sort_buffer();
+    EXPECT_EQ(result, 512ULL * 1024 * 1024);
+    return false;
+}
+
+bool test_public_wrapper_result_tag() {
+    ScopedEnv env("MDB_SORT_BUFFER_MB", "512");
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_result();
+    EXPECT_EQ(r.bytes, 512ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ENV);
+    return false;
+}
+
 // ─── Harness ──────────────────────────────────────────────────────
 
 int main() {
@@ -273,6 +288,8 @@ int main() {
         {"test_core_env_overflow_invalid",        &test_core_env_overflow_invalid},
         {"test_core_env_trailing_garbage_invalid", &test_core_env_trailing_garbage_invalid},
         {"test_core_env_empty_invalid",           &test_core_env_empty_invalid},
+        {"test_public_wrapper_with_env",          &test_public_wrapper_with_env},
+        {"test_public_wrapper_result_tag",        &test_public_wrapper_result_tag},
     };
 
     int failures = 0;
