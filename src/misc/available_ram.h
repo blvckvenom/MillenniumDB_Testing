@@ -58,9 +58,44 @@ inline uint64_t get_mem_available() {
 }
 
 inline AdaptiveBufferResult compute_adaptive_sort_buffer_core(
-    uint64_t /*mem_available*/, const char* /*env_value*/, size_t floor)
+    uint64_t mem_available, const char* env_value, size_t floor)
 {
-    return {floor, AdaptiveBufferResult::ADAPTIVE};
+    // Path 1: env var override
+    if (env_value != nullptr) {
+        errno = 0;
+        char* end = nullptr;
+        unsigned long long mb = std::strtoull(env_value, &end, 10);
+        bool valid = (end != env_value)
+                  && (*end == '\0' ||
+                      std::isspace(static_cast<unsigned char>(*end)))
+                  && (errno == 0)
+                  && (mb > 0);
+        if (valid) {
+            uint64_t bytes64 = static_cast<uint64_t>(mb) * 1024ULL * 1024ULL;
+            size_t bytes = (bytes64 > static_cast<uint64_t>(SIZE_MAX))
+                ? SIZE_MAX
+                : static_cast<size_t>(bytes64);
+            if (bytes < floor) bytes = floor;
+            return {bytes, AdaptiveBufferResult::ENV};
+        }
+        // Fall through to adaptive with ENV_INVALID tag
+    }
+
+    // Path 2: adaptive calculation
+    uint64_t adaptive64 = (mem_available > (UINT64_MAX / 3))
+        ? (mem_available / 4) * 3
+        : (mem_available * 3) / 4;
+    size_t adaptive = (adaptive64 > static_cast<uint64_t>(SIZE_MAX))
+        ? SIZE_MAX
+        : static_cast<size_t>(adaptive64);
+    if (adaptive < floor) adaptive = floor;
+
+    // Tag: ENV_INVALID if env var was present but rejected, else ADAPTIVE.
+    AdaptiveBufferResult::Source src =
+        (env_value != nullptr)
+            ? AdaptiveBufferResult::ENV_INVALID
+            : AdaptiveBufferResult::ADAPTIVE;
+    return {adaptive, src};
 }
 
 inline AdaptiveBufferResult compute_adaptive_sort_buffer_result(size_t floor) {

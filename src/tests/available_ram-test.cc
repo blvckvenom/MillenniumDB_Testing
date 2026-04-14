@@ -130,6 +130,38 @@ bool test_meminfo_units_respected() {
     return false;
 }
 
+bool test_core_floor_when_mem_zero() {
+    // When MemAvailable=0 (non-Linux / sandbox) and no env var,
+    // result must fall back to the floor.
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/0, /*env_value=*/nullptr, /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 256ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ADAPTIVE);
+    return false;
+}
+
+bool test_core_adaptive_above_floor() {
+    // 16 GB MemAvailable -> 12 GB buffer (75% of 16).
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/16ULL * 1024 * 1024 * 1024,
+        /*env_value=*/nullptr,
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 12ULL * 1024 * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ADAPTIVE);
+    return false;
+}
+
+bool test_core_adaptive_below_floor_clamps() {
+    // 300 MB MemAvailable -> 225 MB raw -> clamped to 256 MB floor.
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_core(
+        /*mem_available=*/300ULL * 1024 * 1024,
+        /*env_value=*/nullptr,
+        /*floor=*/256ULL * 1024 * 1024);
+    EXPECT_EQ(r.bytes, 256ULL * 1024 * 1024);
+    EXPECT(r.source == AdaptiveBufferResult::ADAPTIVE);
+    return false;
+}
+
 // ─── Harness ──────────────────────────────────────────────────────
 
 int main() {
@@ -140,6 +172,9 @@ int main() {
         {"test_meminfo_empty",            &test_meminfo_empty},
         {"test_meminfo_nonexistent",      &test_meminfo_nonexistent},
         {"test_meminfo_units_respected", &test_meminfo_units_respected},
+        {"test_core_floor_when_mem_zero",         &test_core_floor_when_mem_zero},
+        {"test_core_adaptive_above_floor",        &test_core_adaptive_above_floor},
+        {"test_core_adaptive_below_floor_clamps", &test_core_adaptive_below_floor_clamps},
     };
 
     int failures = 0;
