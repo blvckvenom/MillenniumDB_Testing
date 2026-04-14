@@ -494,11 +494,16 @@ std::ostream& Conversions::debug_print(std::ostream& os, ObjectId oid)
     }
     case GQL_OID::Type::TENSOR_FLOAT_INLINED:
     case GQL_OID::Type::TENSOR_FLOAT_EXTERN:
-    case GQL_OID::Type::TENSOR_FLOAT_TMP:
+    case GQL_OID::Type::TENSOR_FLOAT_TMP: {
+        const auto tensor = unpack_tensor<float>(oid);
+        os << tensor.to_string();
+        break;
+    }
     case GQL_OID::Type::TENSOR_DOUBLE_INLINED:
     case GQL_OID::Type::TENSOR_DOUBLE_EXTERN:
     case GQL_OID::Type::TENSOR_DOUBLE_TMP: {
-        os << "Tensor(" << (oid.id & ObjectId::VALUE_MASK) << ")";
+        const auto tensor = unpack_tensor<double>(oid);
+        os << tensor.to_string();
         break;
     }
     }
