@@ -34,9 +34,22 @@ inline AdaptiveBufferResult compute_adaptive_sort_buffer_result(
 inline size_t compute_adaptive_sort_buffer(
     size_t floor = DEFAULT_SORT_BUFFER_MIN);
 
-// Stub definitions (intentionally wrong; TDD will replace in Task 2 and Task 4)
+// Definitions
 
-inline uint64_t get_mem_available_from(const char* /*path*/) {
+inline uint64_t get_mem_available_from(const char* path) {
+    std::ifstream meminfo(path);
+    if (!meminfo.is_open()) return 0;
+
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        if (line.rfind("MemAvailable:", 0) == 0) {
+            size_t kb = 0;
+            if (std::sscanf(line.c_str(), "MemAvailable: %zu kB", &kb) == 1) {
+                return static_cast<uint64_t>(kb) * 1024;
+            }
+            return 0;
+        }
+    }
     return 0;
 }
 
