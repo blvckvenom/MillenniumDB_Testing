@@ -417,3 +417,58 @@ YIELD totalBatches RETURN *
 CALL gnn_train('s1', 'node_features', {hiddenDim: 256, epochs: 50, lr: 0.01})
 YIELD bestValAccuracy, testAccuracy RETURN *
 ```
+
+## Memory tuning
+
+`graph_project` sizes its sort buffer adaptively at runtime. On
+each B+tree index build, the system reads `/proc/meminfo` and
+chooses:
+
+    buffer = max(256 MB, MemAvailable × 3 / 4)
+
+This activates automatically on Linux and requires no
+configuration. On macOS, Windows, or any environment where
+`/proc/meminfo` is not readable, the buffer stays at the 256 MB
+floor.
+
+### Overriding
+
+Set `MDB_SORT_BUFFER_MB` to a positive integer (megabytes) to
+force an exact buffer size:
+
+```
+MDB_SORT_BUFFER_MB=4096 mdb-server data/mydb
+```
+
+This is useful for reproducible benchmarks or when the adaptive
+value is inappropriate for a specific workload. The 256 MB floor
+still applies — values below it are clamped up.
+
+### Containers and cgroups
+
+Inside Docker, Kubernetes, or similar container runtimes,
+`/proc/meminfo` typically reports the **host's** RAM rather than
+the container's cgroup memory limit. If you run MillenniumDB
+inside a container with a memory limit, set `MDB_SORT_BUFFER_MB`
+explicitly to a safe fraction of that limit; otherwise the sort
+buffer may exceed the container's budget and the process will be
+OOM-killed.
+
+### Diagnostics
+
+Each sort construction emits one line to stdout identifying the
+chosen size and its provenance:
+
+```
+[sort] buffer=9216 MB (source=adaptive)
+[sort] buffer=4096 MB (source=env)
+[sort] buffer=9216 MB (source=env_invalid)
+[sort] buffer=128 MB (source=explicit)
+```
+
+| Tag           | Meaning                                          |
+|---------------|--------------------------------------------------|
+| `adaptive`    | Default path — `MemAvailable × 3 / 4`            |
+| `env`         | `MDB_SORT_BUFFER_MB` was set and parsed OK       |
+| `env_invalid` | Env var set but unparseable — check for typos    |
+| `explicit`    | Called with explicit constructor arg (tests)     |
