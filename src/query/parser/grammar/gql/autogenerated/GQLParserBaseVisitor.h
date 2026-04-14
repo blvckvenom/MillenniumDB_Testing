@@ -1283,6 +1283,18 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlProjectFunction(GQLParser::GqlProjectFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitProjectionOptions(GQLParser::ProjectionOptionsContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitProjectionIncludeClause(GQLParser::ProjectionIncludeClauseContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGeneralSetFunctionType(GQLParser::GeneralSetFunctionTypeContext *ctx) override {
     return visitChildren(ctx);
   }

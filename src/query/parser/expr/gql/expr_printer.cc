@@ -554,4 +554,11 @@ void ExprPrinter::visit(ExprTerm& expr)
     os << expr.term;
 }
 
+void ExprPrinter::visit(ExprAggProject& expr)
+{
+    os << "PROJECT(";
+    expr.projection_name_expr->accept_visitor(*this);
+    os << ')';
+}
+
 } // namespace GQL

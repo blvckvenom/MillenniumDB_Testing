@@ -10,6 +10,7 @@
 #include "system/string_manager.h"
 #include "system/tmp_manager.h"
 #include "third_party/dragonbox/dragonbox_to_chars.h"
+#include "storage/index/lists/list_encoder.h"
 
 namespace MQL { namespace Conversions {
 using namespace Common::Conversions;
@@ -99,6 +100,31 @@ inline std::string unpack_named_node(ObjectId oid)
     }
 }
 
+    inline ObjectId pack_named_node(const std::string& str)
+    {
+        uint64_t oid;
+        if (str.size() <= ObjectId::NAMED_NODE_INLINE_BYTES) {
+            oid = Inliner::inline_string(str.c_str()) | ObjectId::MASK_NAMED_NODE_INLINED;
+        } else {
+            const auto str_id = string_manager.get_str_id(str);
+            if (str_id != ObjectId::MASK_NOT_FOUND) {
+                oid = ObjectId::MASK_NAMED_NODE_EXTERN | str_id;
+            } else {
+                oid = ObjectId::MASK_NAMED_NODE_TMP | tmp_manager.get_str_id(str);
+            }
+        }
+        return ObjectId(oid);
+    }
+
+    inline ObjectId pack_edge(uint64_t edge_id) {
+        return ObjectId(ObjectId::MASK_EDGE | edge_id);
+    }
+
+    inline ObjectId pack_anon_tmp(uint64_t anon_id)
+    {
+        return ObjectId(ObjectId::MASK_ANON_TMP | anon_id);
+    }
+
 inline DateTime unpack_datetime(ObjectId oid)
 {
     return DateTime(oid);
@@ -126,10 +152,23 @@ inline ObjectId pack_list(const std::vector<ObjectId>& list)
 
 inline void unpack_list(ObjectId list_id, std::vector<ObjectId>& out)
 {
-    auto& lists = tmp_manager.get_tmp_list();
-    assert((LIST_FILE_ID_MASK & list_id.id) >> 40 == lists.get_file_id());
+    switch (list_id.get_type()) {
+    case ObjectId::MASK_LIST:
+    case ObjectId::MASK_LIST_TMP: {
+        auto& lists = tmp_manager.get_tmp_list();
+        assert((LIST_FILE_ID_MASK & list_id.id) >> 40 == lists.get_file_id());
+        lists.get(out, list_id.id & LIST_OFFSET_MASK);
+        break;
+    }
+    case ObjectId::MASK_LIST_EXTERN: {
+        char* buffer = get_query_ctx().get_buffer1();
 
-    lists.get(out, list_id.id & LIST_OFFSET_MASK);
+        auto external_id = list_id.get_value();
+        string_manager.print_to_buffer(buffer, external_id);
+        out = ListEncoder::decode(buffer);
+        break;
+    }
+    }
 }
 
 inline std::vector<ObjectId> unpack_list(ObjectId list_id)

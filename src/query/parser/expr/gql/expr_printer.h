@@ -86,5 +86,6 @@ public:
     void visit(GQL::ExprAggCollect&) override;
     void visit(GQL::ExprAggPercentileCont&) override;
     void visit(GQL::ExprAggPercentileDisc&) override;
+    void visit(GQL::ExprAggProject&) override;
 };
 } // namespace GQL

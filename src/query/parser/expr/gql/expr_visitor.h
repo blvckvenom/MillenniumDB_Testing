@@ -71,6 +71,7 @@ class ExprAggStddevSamp;
 class ExprAggCollect;
 class ExprAggPercentileCont;
 class ExprAggPercentileDisc;
+class ExprAggProject;
 
 class ExprVisitor {
 public:
@@ -143,6 +144,7 @@ public:
     virtual void visit(GQL::ExprAggCollect&) = 0;
     virtual void visit(GQL::ExprAggPercentileCont&) = 0;
     virtual void visit(GQL::ExprAggPercentileDisc&) = 0;
+    virtual void visit(GQL::ExprAggProject&) = 0;
     virtual void visit(GQL::ExprLabels&) = 0;
     virtual void visit(GQL::ExprProperties&) = 0;
 };

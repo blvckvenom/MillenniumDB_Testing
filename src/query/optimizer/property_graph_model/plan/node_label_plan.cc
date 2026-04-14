@@ -51,7 +51,7 @@ std::unique_ptr<BindingIter> NodeLabelPlan::get_binding_iter() const
     if (node_assigned) {
         ranges[0] = ScanRange::get(node, node_assigned);
         ranges[1] = ScanRange::get(label, label_assigned);
-        return std::make_unique<IndexScan<2>>(*gql_model.node_label, std::move(ranges));
+        return std::make_unique<IndexScan<2>>(gql_model.get_node_label(), std::move(ranges));
     } else if (label_assigned) {
         ranges[0] = ScanRange::get(label, label_assigned);
         ranges[1] = ScanRange::get(node, node_assigned);
@@ -59,7 +59,7 @@ std::unique_ptr<BindingIter> NodeLabelPlan::get_binding_iter() const
     } else {
         ranges[0] = ScanRange::get(node, node_assigned);
         ranges[1] = ScanRange::get(label, label_assigned);
-        return std::make_unique<IndexScan<2>>(*gql_model.node_label, std::move(ranges));
+        return std::make_unique<IndexScan<2>>(gql_model.get_node_label(), std::move(ranges));
     }
 }
 

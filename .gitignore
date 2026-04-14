@@ -113,3 +113,5 @@ third_party/boost_1_82
 
 # local server output
 server.log
+# Test databases (temporary artifacts)
+/test_db/

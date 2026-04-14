@@ -40,7 +40,35 @@ public:
     GQLCatalog catalog;
 
     // necessary to be called before first usage
-    static std::unique_ptr<ModelDestroyer> init();
+    static std::unique_ptr<ModelDestroyer> init(const std::string& db_folder = "");
+
+    // Dynamic index selection helpers for USE GRAPH projection support
+    // These methods check if a projection is active and return the appropriate index
+
+    // Edge connectivity indexes (exist in both main graph and projections)
+    BPlusTree<3>& get_from_to_edge();
+    BPlusTree<3>& get_to_from_edge();
+
+    // Edge indexes with different orderings (NOT in projections)
+    BPlusTree<3>& get_edge_from_to();
+    BPlusTree<3>& get_n1_n2_edge();
+    BPlusTree<3>& get_edge_n1_n2();
+
+    // Self-loop indexes (NOT in projections)
+    BPlusTree<2>& get_equal_d_edge();
+    BPlusTree<2>& get_equal_u_edge();
+
+    // Label indexes (optional in projections if INCLUDE LABELS was used)
+    BPlusTree<2>& get_node_label();  // {node_id, label_id}
+    BPlusTree<2>& get_label_node();  // {label_id, node_id}
+    BPlusTree<2>& get_edge_label();  // {edge_id, label_id}
+    BPlusTree<2>& get_label_edge();  // {label_id, edge_id}
+
+    // Property indexes (optional in projections if INCLUDE PROPERTIES was used)
+    BPlusTree<3>& get_node_key_value();  // {node_id, key_id, value_id}
+    BPlusTree<3>& get_key_value_node();  // {key_id, value_id, node_id}
+    BPlusTree<3>& get_edge_key_value();  // {edge_id, key_id, value_id}
+    BPlusTree<3>& get_key_value_edge();  // {key_id, value_id, edge_id}
 
 private:
     GQLModel();

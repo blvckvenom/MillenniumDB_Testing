@@ -1,0 +1,37 @@
+<svg width="145pt" height="81pt" viewBox="0.00 0.00 144.52 81.20" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 77.2)">
+<polygon fill="white" stroke="none" points="-4,4 -4,-77.2 140.52,-77.2 140.52,4 -4,4"/>
+<!-- authorl -->
+<g id="node1" class="node">
+<title>authorl</title>
+<text text-anchor="middle" x="18" y="-64.2" font-family="Times,serif" font-size="10.00">Author</text>
+</g>
+<!-- bookl -->
+<g id="node2" class="node">
+<title>bookl</title>
+<text text-anchor="middle" x="97.2" y="-64.2" font-family="Times,serif" font-size="10.00">Book</text>
+</g>
+<!-- author_props -->
+<g id="node3" class="node">
+<title>author_props</title>
+<text text-anchor="middle" x="18" y="-12" font-family="Times,serif" font-size="8.00">name:John</text>
+<text text-anchor="middle" x="18" y="-2.4" font-family="Times,serif" font-size="8.00">born:1954</text>
+</g>
+<!-- books_props -->
+<g id="node4" class="node">
+<title>books_props</title>
+<text text-anchor="middle" x="97.2" y="-12" font-family="Times,serif" font-size="8.00">name:GQL for everyone</text>
+<text text-anchor="middle" x="97.2" y="-2.4" font-family="Times,serif" font-size="8.00">published:2023</text>
+</g>
+<!-- author -->
+<g id="node5" class="node">
+<title>author</title>
+<ellipse fill="lightgreen" stroke="black" cx="18" cy="-38.4" rx="18" ry="18"/>
+</g>
+<!-- book -->
+<g id="node6" class="node">
+<title>book</title>
+<ellipse fill="lightblue" stroke="black" cx="97.2" cy="-38.4" rx="18" ry="18"/>
+</g>
+</g>
+</svg>
