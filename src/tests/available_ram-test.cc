@@ -92,11 +92,54 @@ bool test_meminfo_normal() {
     return false;
 }
 
+bool test_meminfo_missing_line() {
+    std::string path = write_fixture("meminfo_missing.txt",
+        "MemTotal:     16777216 kB\n"
+        "MemFree:      1048576 kB\n");  // No MemAvailable line at all.
+
+    EXPECT_EQ(get_mem_available_from(path.c_str()), uint64_t{0});
+    return false;
+}
+
+bool test_meminfo_malformed() {
+    std::string path = write_fixture("meminfo_malformed.txt",
+        "MemAvailable: not_a_number kB\n");
+
+    EXPECT_EQ(get_mem_available_from(path.c_str()), uint64_t{0});
+    return false;
+}
+
+bool test_meminfo_empty() {
+    std::string path = write_fixture("meminfo_empty.txt", "");
+    EXPECT_EQ(get_mem_available_from(path.c_str()), uint64_t{0});
+    return false;
+}
+
+bool test_meminfo_nonexistent() {
+    EXPECT_EQ(get_mem_available_from("/nonexistent/path/meminfo"), uint64_t{0});
+    return false;
+}
+
+bool test_meminfo_units_respected() {
+    // MemAvailable is always reported in kB per /proc/meminfo convention;
+    // make sure we multiply by 1024 correctly, not misread as bytes.
+    std::string path = write_fixture("meminfo_kilo.txt",
+        "MemAvailable: 1 kB\n");
+
+    EXPECT_EQ(get_mem_available_from(path.c_str()), uint64_t{1024});
+    return false;
+}
+
 // ─── Harness ──────────────────────────────────────────────────────
 
 int main() {
     std::vector<std::pair<const char*, TestFunction*>> tests = {
-        {"test_meminfo_normal", &test_meminfo_normal},
+        {"test_meminfo_normal",           &test_meminfo_normal},
+        {"test_meminfo_missing_line",     &test_meminfo_missing_line},
+        {"test_meminfo_malformed",        &test_meminfo_malformed},
+        {"test_meminfo_empty",            &test_meminfo_empty},
+        {"test_meminfo_nonexistent",      &test_meminfo_nonexistent},
+        {"test_meminfo_units_respected", &test_meminfo_units_respected},
     };
 
     int failures = 0;
