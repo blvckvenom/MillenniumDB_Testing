@@ -214,7 +214,8 @@ Key capabilities:
 - Aggregation: SINGLE, COUNT, SUM, MIN, MAX (per-type overrides)
 - Property configuration: renaming, defaults, per-property aggregation
 - Query via `USE projection_name` (no GRAPH keyword)
-- Tests: `tests/gql/test_suites/projection_native/`, `projection_properties/`, `projection_comprehensive/`, `projection_advanced/`
+- Tests: `tests/gql/test_suites/projection_native/`, `projection_properties/`, `projection_comprehensive/`, `projection_advanced/`, `projection_adaptive_buffer/`
+- Sort buffer sizing: adaptive at runtime (`max(256 MB, MemAvailable * 3/4)`) via `src/misc/available_ram.h`, overridable with env var `MDB_SORT_BUFFER_MB=<integer_MB>`. See `docs/MillenniumDB.wiki/GQL-Projections.md` "Memory tuning" section. 23 unit tests in `src/tests/available_ram-test.cc`.
 
 ## Claude Code Configuration
 
