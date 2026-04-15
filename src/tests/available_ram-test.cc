@@ -266,6 +266,36 @@ bool test_public_wrapper_result_tag() {
     return false;
 }
 
+// Regression guard: the floor must always equal 256 MB, matching the
+// pre-adaptive hardcoded constant. If someone accidentally raises or
+// lowers this, the "no-regression" guarantee in §8.7 of the spec breaks.
+bool test_default_floor_is_exactly_256_MB() {
+    EXPECT_EQ(DEFAULT_SORT_BUFFER_MIN, 256ULL * 1024 * 1024);
+    return false;
+}
+
+// Regression guard: invocation with an unset env var in a clean
+// environment exercises the real /proc/meminfo read path end-to-end
+// on Linux. Verifies only that the result is >= floor (the specific
+// value depends on the host).
+bool test_real_env_returns_at_least_floor() {
+    ScopedEnv clear("MDB_SORT_BUFFER_MB", nullptr);
+    size_t result = compute_adaptive_sort_buffer();
+    EXPECT(result >= DEFAULT_SORT_BUFFER_MIN);
+    return false;
+}
+
+// Regression guard: the source=env tag persists even when the resolved
+// bytes are clamped to the floor (i.e., ENV wins semantically even if
+// numerically indistinguishable from adaptive fallback at the floor).
+bool test_env_tag_preserved_at_floor_clamp() {
+    ScopedEnv env("MDB_SORT_BUFFER_MB", "10");  // 10 MB, well below 256 MB floor
+    AdaptiveBufferResult r = compute_adaptive_sort_buffer_result();
+    EXPECT_EQ(r.bytes, DEFAULT_SORT_BUFFER_MIN);
+    EXPECT(r.source == AdaptiveBufferResult::ENV);
+    return false;
+}
+
 // ─── Harness ──────────────────────────────────────────────────────
 
 int main() {
@@ -290,6 +320,9 @@ int main() {
         {"test_core_env_empty_invalid",           &test_core_env_empty_invalid},
         {"test_public_wrapper_with_env",          &test_public_wrapper_with_env},
         {"test_public_wrapper_result_tag",        &test_public_wrapper_result_tag},
+        {"test_default_floor_is_exactly_256_MB",  &test_default_floor_is_exactly_256_MB},
+        {"test_real_env_returns_at_least_floor",  &test_real_env_returns_at_least_floor},
+        {"test_env_tag_preserved_at_floor_clamp", &test_env_tag_preserved_at_floor_clamp},
     };
 
     int failures = 0;
