@@ -70,7 +70,8 @@ namespace GQL {
  * ## Usage
  *
  * ```cpp
- * ExternalRecordSort<3> sorter(temp_dir, 256 * 1024 * 1024);
+ * ExternalRecordSort<3> sorter(temp_dir);  // adaptive default
+ * // or: ExternalRecordSort<3> sorter(temp_dir, 512 * 1024 * 1024);  // explicit override
  *
  * // Add spill files from StreamingRecordBuffer
  * sorter.add_run("path/to/spill_0", record_count_0);
