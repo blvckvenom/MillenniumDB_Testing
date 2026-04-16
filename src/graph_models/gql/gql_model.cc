@@ -6,6 +6,7 @@
 #include "misc/logger.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_query_context.h"
+#include "query/exceptions.h"
 #include "query/procedure/procedure_catalog.h"
 #include "query/procedure/builtin/project_procedure.h"
 #include "query/procedure/builtin/graph_exists_procedure.h"
@@ -106,7 +107,7 @@ BPlusTree<3>& GQLModel::get_from_to_edge() {
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
             logger.error() << "Projection context not loaded in get_from_to_edge()";
-            throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
+            throw QueryException("Projection context not loaded for '" + ctx.active_projection + "'");
         }
         return *ctx.projection_ctx->from_to_edge_index;
     }
@@ -117,7 +118,7 @@ BPlusTree<3>& GQLModel::get_to_from_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->to_from_edge_index) {
-            throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
+            throw QueryException("Projection context not loaded for '" + ctx.active_projection + "'");
         }
         return *ctx.projection_ctx->to_from_edge_index;
     }
@@ -128,7 +129,7 @@ BPlusTree<2>& GQLModel::get_node_label() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->node_label_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot use node labels with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include node label information.\n\n"
                 "Solutions:\n"
@@ -149,7 +150,7 @@ BPlusTree<2>& GQLModel::get_edge_label() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->edge_label_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot use edge labels with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include edge label information.\n\n"
                 "Solutions:\n"
@@ -170,7 +171,7 @@ BPlusTree<2>& GQLModel::get_label_node() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->label_node_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot use node labels with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include node label information.\n\n"
                 "Solutions:\n"
@@ -191,7 +192,7 @@ BPlusTree<2>& GQLModel::get_label_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->label_edge_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot use edge labels with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include edge label information.\n\n"
                 "Solutions:\n"
@@ -212,7 +213,7 @@ BPlusTree<3>& GQLModel::get_node_key_value() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->node_key_value_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot access node properties with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include node property information.\n\n"
                 "Solutions:\n"
@@ -233,7 +234,7 @@ BPlusTree<3>& GQLModel::get_edge_key_value() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->edge_key_value_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot access edge properties with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include edge property information.\n\n"
                 "Solutions:\n"
@@ -254,7 +255,7 @@ BPlusTree<3>& GQLModel::get_key_value_node() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->key_value_node_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot access node properties with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include node property information.\n\n"
                 "Solutions:\n"
@@ -275,7 +276,7 @@ BPlusTree<3>& GQLModel::get_key_value_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->key_value_edge_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Cannot access edge properties with projection '" + ctx.active_projection + "'.\n\n"
                 "Reason: This projection does not include edge property information.\n\n"
                 "Solutions:\n"
@@ -296,7 +297,7 @@ BPlusTree<3>& GQLModel::get_edge_from_to() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->edge_from_to_index) {
-            throw std::runtime_error(
+            throw QueryException(
                 "Edge-first index not available for projection '" + ctx.active_projection + "'.\n\n"
                 "This projection was created before edge-first indexes were added.\n\n"
                 "Solutions:\n"
@@ -313,7 +314,7 @@ BPlusTree<3>& GQLModel::get_edge_from_to() {
 BPlusTree<2>& GQLModel::get_equal_d_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
+        throw QueryException(
             "Self-loop queries are not supported in projections. "
             "Projection '" + ctx.active_projection + "' does not have specialized self-loop indexes. "
             "Query the main graph with CURRENT_GRAPH for self-loop patterns."
@@ -325,7 +326,7 @@ BPlusTree<2>& GQLModel::get_equal_d_edge() {
 BPlusTree<2>& GQLModel::get_equal_u_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
-        throw std::runtime_error(
+        throw QueryException(
             "Self-loop queries are not supported in projections. "
             "Projection '" + ctx.active_projection + "' does not have specialized self-loop indexes. "
             "Query the main graph with CURRENT_GRAPH for self-loop patterns."
@@ -338,7 +339,7 @@ BPlusTree<3>& GQLModel::get_n1_n2_edge() {
     auto& ctx = get_query_ctx();
     if (ctx.is_using_projection()) {
         if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
-            throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
+            throw QueryException("Projection context not loaded for '" + ctx.active_projection + "'");
         }
         // For projections, n1_n2_edge queries use the from_to_edge_index
         // The caller must handle undirected edges by checking both directions
@@ -354,7 +355,7 @@ BPlusTree<3>& GQLModel::get_edge_n1_n2() {
             // Fallback to from_to_edge_index for older projections without edge_n1_n2_index
             logger.debug() << "edge_n1_n2_index not available, falling back to from_to_edge_index";
             if (!ctx.projection_ctx || !ctx.projection_ctx->from_to_edge_index) {
-                throw std::runtime_error("Projection context not loaded for '" + ctx.active_projection + "'");
+                throw QueryException("Projection context not loaded for '" + ctx.active_projection + "'");
             }
             return *ctx.projection_ctx->from_to_edge_index;
         }
