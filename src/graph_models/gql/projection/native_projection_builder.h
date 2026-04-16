@@ -269,6 +269,11 @@ public:
     /// realistic edge property count while avoiding vector over-allocation in catalog.
     static constexpr uint64_t COUNT_KEY_SYNTHETIC_ID = 1000;
 
+    /// @brief Starting ID for synthetic keys allocated when a property is renamed
+    /// (e.g. {score: {property: 'rating'}}). Kept above COUNT_KEY_SYNTHETIC_ID to
+    /// avoid collisions; allocation is monotonic per-builder.
+    static constexpr uint64_t RENAME_KEY_SYNTHETIC_START = 2000;
+
     /// @brief Threshold for switching to external sort-aggregate (1M edges)
     /// Below this threshold, in-memory hash-based aggregation is used.
     /// Above this threshold, external sort-aggregate provides bounded memory.
@@ -387,6 +392,19 @@ private:
     // Built once in constructor, replaces O(K) linear scans in extract_*_properties()
     std::unordered_map<uint64_t, std::string> node_key_id_to_name;
     std::unordered_map<uint64_t, std::string> edge_key_id_to_name;
+
+    // Synthetic key IDs allocated for renamed/defaulted properties that have no
+    // counterpart in the main catalog. Keyed by projected property name.
+    std::unordered_map<std::string, uint64_t> synthetic_node_key_ids;
+    std::unordered_map<std::string, uint64_t> synthetic_edge_key_ids;
+    uint64_t next_synthetic_key_id = RENAME_KEY_SYNTHETIC_START;
+
+    // Allocates (or returns) a synthetic key id for a projected property name
+    // and registers it with the projection storage. Used when renaming produces
+    // a key absent from the main catalog, or when a default value must materialize
+    // under a projected name that doesn't exist on any source node.
+    uint64_t ensure_projected_node_key(const std::string& projected_name);
+    uint64_t ensure_projected_edge_key(const std::string& projected_name);
 
     std::chrono::steady_clock::time_point start_time;
 

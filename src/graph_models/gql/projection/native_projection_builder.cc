@@ -30,6 +30,57 @@
 
 using namespace GQL;
 
+uint64_t NativeProjectionBuilder::ensure_projected_node_key(const std::string& projected_name)
+{
+    // Prefer reusing a main-catalog id so the projection stays compatible with
+    // any code that reads through the shared key namespace.
+    auto cat_it = gql_model.catalog.node_keys2id.find(projected_name);
+    if (cat_it != gql_model.catalog.node_keys2id.end()) {
+        storage->register_node_key(projected_name, cat_it->second);
+        return cat_it->second;
+    }
+
+    auto it = synthetic_node_key_ids.find(projected_name);
+    if (it != synthetic_node_key_ids.end()) {
+        return it->second;
+    }
+
+    uint64_t new_id = next_synthetic_key_id++;
+    synthetic_node_key_ids[projected_name] = new_id;
+    storage->register_node_key(projected_name, new_id);
+    return new_id;
+}
+
+uint64_t NativeProjectionBuilder::ensure_projected_edge_key(const std::string& projected_name)
+{
+    auto cat_it = gql_model.catalog.edge_keys2id.find(projected_name);
+    if (cat_it != gql_model.catalog.edge_keys2id.end()) {
+        storage->register_edge_key(projected_name, cat_it->second);
+        return cat_it->second;
+    }
+
+    auto it = synthetic_edge_key_ids.find(projected_name);
+    if (it != synthetic_edge_key_ids.end()) {
+        return it->second;
+    }
+
+    uint64_t new_id = next_synthetic_key_id++;
+    synthetic_edge_key_ids[projected_name] = new_id;
+    storage->register_edge_key(projected_name, new_id);
+    return new_id;
+}
+
+// Persistently packs a double into the string_manager and returns an ObjectId
+// tagged MASK_DOUBLE_EXTERN. Avoids the tmp_manager fallback in the generic
+// pack_double helper, which is transient and produces invalid reads once the
+// session ends (the projection lives on disk across restarts).
+static ObjectId pack_double_persistent(double value)
+{
+    auto bytes = reinterpret_cast<const char*>(&value);
+    uint64_t bytes_id = string_manager.get_or_create(bytes, sizeof(double));
+    return ObjectId(ObjectId::MASK_DOUBLE_EXTERN | bytes_id);
+}
+
 NativeProjectionBuilder::NativeProjectionBuilder(
     const std::string& projection_name_,
     const std::string& db_folder_,
@@ -834,16 +885,16 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
                     ? projected_name : config.source_property;
 
                 if (config_source == source_key_name) {
-                    // Get or create projected key ObjectId
-                    ObjectId projected_key_id = key_id;  // Default: same as source
-
-                    if (!config.source_property.empty() && config.source_property != projected_name) {
-                        // Renaming: need to create/lookup new key
-                        auto proj_key_it = gql_model.catalog.node_keys2id.find(projected_name);
-                        if (proj_key_it != gql_model.catalog.node_keys2id.end()) {
-                            projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_NODE_KEY);
-                        }
-                        // If projected key doesn't exist in catalog, use source key
+                    // Resolve the destination key. When renaming (source != projected)
+                    // we need a key that represents the projected_name; allocate a
+                    // synthetic id if the main catalog doesn't know it, so readers
+                    // of n.<projected_name> find the value under the right key.
+                    ObjectId projected_key_id = key_id;  // Default: reuse source key
+                    if (!config.source_property.empty() &&
+                        config.source_property != projected_name)
+                    {
+                        uint64_t new_key = ensure_projected_node_key(projected_name);
+                        projected_key_id = ObjectId(new_key | ObjectId::MASK_NODE_KEY);
                     }
 
                     storage->add_node_property(node_id, projected_key_id, value_id);
@@ -859,25 +910,20 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
         for (const auto& [projected_name, config] : node_prop_configs) {
             if (found_properties.find(projected_name) == found_properties.end()
                 && config.default_value.has_value()) {
-                // Property not found - apply default value
-                ObjectId projected_key_id(0);
-                auto proj_key_it = gql_model.catalog.node_keys2id.find(projected_name);
-                if (proj_key_it != gql_model.catalog.node_keys2id.end()) {
-                    projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_NODE_KEY);
-                } else {
-                    // Try source property name
-                    std::string source_name = config.source_property.empty()
-                        ? projected_name : config.source_property;
-                    auto src_key_it = gql_model.catalog.node_keys2id.find(source_name);
-                    if (src_key_it != gql_model.catalog.node_keys2id.end()) {
-                        projected_key_id = ObjectId(src_key_it->second | ObjectId::MASK_NODE_KEY);
-                    }
-                }
+                // Property absent on this node — materialize under the projected name.
+                // ensure_projected_node_key guarantees the key exists in the projection,
+                // allocating a synthetic id if needed. Previously the code silently
+                // skipped the write when the name wasn't in the main catalog.
+                uint64_t key_id_raw = ensure_projected_node_key(projected_name);
+                ObjectId projected_key_id(key_id_raw | ObjectId::MASK_NODE_KEY);
 
-                if (projected_key_id.id != 0) {
-                    // Create ObjectId from default value (double -> int64 for storage)
+                {
+                    // Default materialization (always runs now that we always have a key).
+                    // Use the persistent variant: pack_double falls back to tmp_manager
+                    // whose ids don't survive across sessions — the projection is on
+                    // disk, so the value must live in string_manager.
                     ObjectId default_value_id =
-                        Common::Conversions::pack_double(config.default_value.value());
+                        pack_double_persistent(config.default_value.value());
                     storage->add_node_property(node_id, projected_key_id, default_value_id);
                 }
             }
@@ -963,16 +1009,12 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
                     ? projected_name : config.source_property;
 
                 if (config_source == source_key_name) {
-                    // Get or create projected key ObjectId
-                    ObjectId projected_key_id = key_id;  // Default: same as source
-
-                    if (!config.source_property.empty() && config.source_property != projected_name) {
-                        // Renaming: need to create/lookup new key
-                        auto proj_key_it = gql_model.catalog.edge_keys2id.find(projected_name);
-                        if (proj_key_it != gql_model.catalog.edge_keys2id.end()) {
-                            projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_EDGE_KEY);
-                        }
-                        // If projected key doesn't exist in catalog, use source key
+                    ObjectId projected_key_id = key_id;  // Default: reuse source key
+                    if (!config.source_property.empty() &&
+                        config.source_property != projected_name)
+                    {
+                        uint64_t new_key = ensure_projected_edge_key(projected_name);
+                        projected_key_id = ObjectId(new_key | ObjectId::MASK_EDGE_KEY);
                     }
 
                     storage->add_edge_property(edge_id, projected_key_id, value_id);
@@ -988,27 +1030,12 @@ void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
         for (const auto& [projected_name, config] : edge_prop_configs) {
             if (found_properties.find(projected_name) == found_properties.end()
                 && config.default_value.has_value()) {
-                // Property not found - apply default value
-                ObjectId projected_key_id(0);
-                auto proj_key_it = gql_model.catalog.edge_keys2id.find(projected_name);
-                if (proj_key_it != gql_model.catalog.edge_keys2id.end()) {
-                    projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_EDGE_KEY);
-                } else {
-                    // Try source property name
-                    std::string source_name = config.source_property.empty()
-                        ? projected_name : config.source_property;
-                    auto src_key_it = gql_model.catalog.edge_keys2id.find(source_name);
-                    if (src_key_it != gql_model.catalog.edge_keys2id.end()) {
-                        projected_key_id = ObjectId(src_key_it->second | ObjectId::MASK_EDGE_KEY);
-                    }
-                }
+                uint64_t key_id_raw = ensure_projected_edge_key(projected_name);
+                ObjectId projected_key_id(key_id_raw | ObjectId::MASK_EDGE_KEY);
 
-                if (projected_key_id.id != 0) {
-                    // Create ObjectId from default value (double -> int64 for storage)
-                    ObjectId default_value_id =
-                        Common::Conversions::pack_double(config.default_value.value());
-                    storage->add_edge_property(edge_id, projected_key_id, default_value_id);
-                }
+                ObjectId default_value_id =
+                    pack_double_persistent(config.default_value.value());
+                storage->add_edge_property(edge_id, projected_key_id, default_value_id);
             }
         }
         return;
@@ -1098,12 +1125,11 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
 
                 if (config_source == source_key_name) {
                     ObjectId projected_key_id = key_id;
-
-                    if (!config.source_property.empty() && config.source_property != projected_name) {
-                        auto proj_key_it = gql_model.catalog.edge_keys2id.find(projected_name);
-                        if (proj_key_it != gql_model.catalog.edge_keys2id.end()) {
-                            projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_EDGE_KEY);
-                        }
+                    if (!config.source_property.empty() &&
+                        config.source_property != projected_name)
+                    {
+                        uint64_t new_key = ensure_projected_edge_key(projected_name);
+                        projected_key_id = ObjectId(new_key | ObjectId::MASK_EDGE_KEY);
                     }
 
                     storage->add_edge_property(edge_id, projected_key_id, value_id);
@@ -1126,24 +1152,12 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
 
             if (found_properties.find(projected_name) == found_properties.end()
                 && config.default_value.has_value()) {
-                ObjectId projected_key_id(0);
-                auto proj_key_it = gql_model.catalog.edge_keys2id.find(projected_name);
-                if (proj_key_it != gql_model.catalog.edge_keys2id.end()) {
-                    projected_key_id = ObjectId(proj_key_it->second | ObjectId::MASK_EDGE_KEY);
-                } else {
-                    std::string source_name = config.source_property.empty()
-                        ? projected_name : config.source_property;
-                    auto src_key_it = gql_model.catalog.edge_keys2id.find(source_name);
-                    if (src_key_it != gql_model.catalog.edge_keys2id.end()) {
-                        projected_key_id = ObjectId(src_key_it->second | ObjectId::MASK_EDGE_KEY);
-                    }
-                }
+                uint64_t key_id_raw = ensure_projected_edge_key(projected_name);
+                ObjectId projected_key_id(key_id_raw | ObjectId::MASK_EDGE_KEY);
 
-                if (projected_key_id.id != 0) {
-                    ObjectId default_value_id =
-                        Common::Conversions::pack_double(config.default_value.value());
-                    storage->add_edge_property(edge_id, projected_key_id, default_value_id);
-                }
+                ObjectId default_value_id =
+                    pack_double_persistent(config.default_value.value());
+                storage->add_edge_property(edge_id, projected_key_id, default_value_id);
             }
         }
         return;
