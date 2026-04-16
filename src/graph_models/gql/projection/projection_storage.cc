@@ -712,6 +712,11 @@ void ProjectionStorage::save_catalog() {
     catalog.includes_node_properties = features.include_node_properties;
     catalog.includes_edge_properties = features.include_edge_properties;
 
+    // Persist the property name lists the caller asked for, so inspect-projection
+    // can show them after the fact. Empty = "all available" (builder convention).
+    catalog.included_node_properties = requested_node_properties;
+    catalog.included_edge_properties = requested_edge_properties;
+
     // Set v1.2 key mappings (for projection-specific properties like _count)
     for (const auto& [name, id] : node_keys2id_) {
         catalog.add_node_key(name, id);

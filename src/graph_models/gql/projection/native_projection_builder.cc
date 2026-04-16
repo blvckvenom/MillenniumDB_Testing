@@ -138,6 +138,27 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     storage = std::make_unique<ProjectionStorage>(proj_dir, db_folder, projection_name, features);
     storage->init();
 
+    // Surface the user-requested property name lists so `mdb inspect-projection`
+    // can report them. Build the union of the simple `relationshipProperties` /
+    // `nodeProperties` list and any per-property config names (renames + defaults),
+    // deduplicated, so renames like {score: {property: 'rating'}} still appear.
+    {
+        std::vector<std::string> req_nodes = node_property_keys;
+        for (const auto& [name, _cfg] : node_property_configs) {
+            if (std::find(req_nodes.begin(), req_nodes.end(), name) == req_nodes.end()) {
+                req_nodes.push_back(name);
+            }
+        }
+        std::vector<std::string> req_edges = edge_property_keys;
+        for (const auto& [name, _cfg] : edge_property_configs) {
+            if (std::find(req_edges.begin(), req_edges.end(), name) == req_edges.end()) {
+                req_edges.push_back(name);
+            }
+        }
+        storage->requested_node_properties = std::move(req_nodes);
+        storage->requested_edge_properties = std::move(req_edges);
+    }
+
     // Initialize native scanner with main graph indexes
     // Include edge_from_to and edge_n1_n2 for O(log n) edge endpoint lookup
     scanner = std::make_unique<NativeScanner>(

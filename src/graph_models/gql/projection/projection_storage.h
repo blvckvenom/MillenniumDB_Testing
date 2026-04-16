@@ -463,6 +463,15 @@ public:
     const BPlusTree<3>* get_key_value_edge_index() const { return key_value_edge_index.get(); }
     /// @}
 
+    /// @name Catalog metadata (populated by the builder before finalize)
+    /// @brief Free-form lists surfaced via `mdb inspect-projection`. Set by the
+    /// caller because ProjectionStorage doesn't know which property names were
+    /// "requested" (vs merely encountered).
+    /// @{
+    std::vector<std::string> requested_node_properties;
+    std::vector<std::string> requested_edge_properties;
+    /// @}
+
 private:
     /// @name Internal Batch Operations
     /// @{
