@@ -138,6 +138,14 @@ public:
     static TrainingState read_ckptmeta(const std::filesystem::path&);
 
 private:
+    // Private overload used by save_full / save_weights to control the SaveKind
+    // flag written to .ckptmeta. The public write_ckptmeta always writes Full.
+    static void write_ckptmeta_impl(
+        const std::filesystem::path& path,
+        const TrainingState&         state,
+        SaveKind                     kind
+    );
+
     static void fsync_directory(const std::filesystem::path& dir);
     static void cleanup_tmps(const std::filesystem::path& basename);
 };

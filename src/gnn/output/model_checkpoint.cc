@@ -28,6 +28,45 @@ inline void read_le(std::ifstream& f, T& v, const std::string& context) {
     }
 }
 
+// Peek only the magic + version + save_kind (first 16 bytes) without reading
+// the full payload. Used by load_full to branch on kind early.
+mdb::gnn::SaveKind peek_save_kind(const std::filesystem::path& meta_path) {
+    std::ifstream f(meta_path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error(
+            "ModelCheckpoint: cannot open " + meta_path.string());
+    }
+    uint8_t magic[8];
+    if (!f.read(reinterpret_cast<char*>(magic), 8)) {
+        throw std::runtime_error(
+            "ModelCheckpoint: cannot read magic from " + meta_path.string());
+    }
+    if (std::memcmp(magic, CKPTMETA_MAGIC, 8) != 0) {
+        throw std::runtime_error(
+            "ModelCheckpoint: invalid magic in " + meta_path.string());
+    }
+    uint32_t version = 0, kind_val = 0;
+    if (!f.read(reinterpret_cast<char*>(&version), 4)) {
+        throw std::runtime_error(
+            "ModelCheckpoint: truncated header (version) in " + meta_path.string());
+    }
+    if (!f.read(reinterpret_cast<char*>(&kind_val), 4)) {
+        throw std::runtime_error(
+            "ModelCheckpoint: truncated header (save_kind) in " + meta_path.string());
+    }
+    if (version != CKPTMETA_VERSION) {
+        throw std::runtime_error(
+            "ModelCheckpoint: unsupported checkpoint format version "
+            + std::to_string(version));
+    }
+    if (kind_val > 1) {
+        throw std::runtime_error(
+            "ModelCheckpoint: invalid save_kind " + std::to_string(kind_val)
+            + " in " + meta_path.string());
+    }
+    return static_cast<mdb::gnn::SaveKind>(kind_val);
+}
+
 } // anon
 
 namespace mdb::gnn {
@@ -79,6 +118,16 @@ void ModelCheckpoint::write_ckptmeta(
     const std::filesystem::path& path,
     const TrainingState&         s)
 {
+    // Public entry point: always writes SaveKind::Full.
+    // save_full / save_weights use write_ckptmeta_impl with the intended kind.
+    write_ckptmeta_impl(path, s, SaveKind::Full);
+}
+
+void ModelCheckpoint::write_ckptmeta_impl(
+    const std::filesystem::path& path,
+    const TrainingState&         s,
+    SaveKind                     kind)
+{
     std::filesystem::create_directories(path.parent_path());
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) {
@@ -90,10 +139,9 @@ void ModelCheckpoint::write_ckptmeta(
     f.write(reinterpret_cast<const char*>(CKPTMETA_MAGIC), 8);
     write_le(f, CKPTMETA_VERSION);
 
-    // save_kind default: Full (1). save_full / save_weights wrappers (Tasks 2.x)
-    // will override via a private overload. For the present task the low-level
-    // public entry point always writes Full.
-    uint32_t save_kind_val = static_cast<uint32_t>(SaveKind::Full);
+    // save_kind selected by caller (Full from public wrapper, WeightsOnly from
+    // save_weights).
+    uint32_t save_kind_val = static_cast<uint32_t>(kind);
     write_le(f, save_kind_val);
 
     // Fixed-size fields.  Offsets match the binary layout in the spec.
@@ -299,6 +347,11 @@ void ModelCheckpoint::save_full(
         // --- Write .ckptmeta (always SaveKind::Full via public wrapper) ---
         write_ckptmeta(meta_tmp, state);
 
+        // .pt first, then .ckptmeta: presence of .ckptmeta signals a
+        // fully-committed checkpoint to list_checkpoints() (Task 2.4).
+        // NOTE: if rename() fails between the two calls, the prior .ckptmeta
+        // becomes stale/missing — list_checkpoints treats this as invalid.
+        // Callers needing true rollback should save to a fresh basename.
         std::filesystem::rename(pt_tmp,   pt_path);
         std::filesystem::rename(meta_tmp, meta_path);
         fsync_directory(basename.parent_path());
@@ -328,6 +381,14 @@ TrainingState ModelCheckpoint::load_full(
             "ModelCheckpoint::load_full: " + pt_path + " not found");
     }
 
+    // Weights-only checkpoints lack optimizer state — cannot be used for
+    // training resume. load_weights is the correct API for inference reloads.
+    if (peek_save_kind(meta_path) != SaveKind::Full) {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_full: " + meta_path + " is weights-only. "
+            "Use load_weights or gnn_predict instead.");
+    }
+
     auto state = read_ckptmeta(meta_path);
 
     // --- Architecture validation ---
@@ -351,9 +412,107 @@ TrainingState ModelCheckpoint::load_full(
 
     // --- Load torch archive ---
     torch::serialize::InputArchive archive;
-    archive.load_from(pt_path);
+    try {
+        archive.load_from(pt_path);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("ModelCheckpoint::load_full: failed to load .pt: ") + e.what());
+    }
     model.load(archive);
     optimizer.load(archive);
+
+    return state;
+}
+
+void ModelCheckpoint::save_weights(
+    const GraphSAGEModel&       model,
+    const std::filesystem::path& basename,
+    TrainingState                state)
+{
+    std::filesystem::create_directories(basename.parent_path());
+    cleanup_tmps(basename);
+
+    // Weights-only checkpoints carry no loss history
+    state.epoch_losses.clear();
+
+    auto pt_path   = basename.string() + ".pt";
+    auto meta_path = basename.string() + ".ckptmeta";
+    auto pt_tmp    = pt_path   + ".tmp";
+    auto meta_tmp  = meta_path + ".tmp";
+
+    try {
+        {
+            torch::serialize::OutputArchive archive;
+            model.save(archive);           // ONLY weights — no optimizer
+            archive.save_to(pt_tmp);
+        }
+        write_ckptmeta_impl(meta_tmp, state, SaveKind::WeightsOnly);
+
+        // .pt first, then .ckptmeta: presence of .ckptmeta signals a
+        // fully-committed checkpoint to list_checkpoints() (Task 2.4).
+        // NOTE: if rename() fails between the two calls, the prior .ckptmeta
+        // becomes stale/missing — list_checkpoints treats this as invalid.
+        // Callers needing true rollback should save to a fresh basename.
+        std::filesystem::rename(pt_tmp,   pt_path);
+        std::filesystem::rename(meta_tmp, meta_path);
+        fsync_directory(basename.parent_path());
+    }
+    catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(pt_tmp,   ec);
+        std::filesystem::remove(meta_tmp, ec);
+        throw;
+    }
+}
+
+TrainingState ModelCheckpoint::load_weights(
+    GraphSAGEModel&               model,
+    const std::filesystem::path&  basename)
+{
+    auto pt_path   = basename.string() + ".pt";
+    auto meta_path = basename.string() + ".ckptmeta";
+
+    if (!std::filesystem::exists(meta_path)) {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_weights: " + meta_path + " not found");
+    }
+    if (!std::filesystem::exists(pt_path)) {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_weights: " + pt_path + " not found");
+    }
+
+    auto state = read_ckptmeta(meta_path);
+
+    // Architecture validation (same as load_full)
+    const auto& cfg = model.config();
+    if (state.input_dim   != cfg.input_dim   ||
+        state.hidden_dim  != cfg.hidden_dim  ||
+        state.num_classes != cfg.num_classes ||
+        state.num_layers  != cfg.num_layers)
+    {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_weights: architecture mismatch. "
+            "Checkpoint=(input=" + std::to_string(state.input_dim)
+            + ", hidden=" + std::to_string(state.hidden_dim)
+            + ", classes=" + std::to_string(state.num_classes)
+            + ", layers=" + std::to_string(state.num_layers) + ") vs "
+            "Model=(input=" + std::to_string(cfg.input_dim)
+            + ", hidden=" + std::to_string(cfg.hidden_dim)
+            + ", classes=" + std::to_string(cfg.num_classes)
+            + ", layers=" + std::to_string(cfg.num_layers) + ")");
+    }
+
+    // Load torch archive — only model weights are read. If the .pt was produced
+    // by save_full, the optimizer section is present but we ignore it.
+    torch::serialize::InputArchive archive;
+    try {
+        archive.load_from(pt_path);
+    } catch (const std::exception& e) {
+        // Wrap LibTorch c10::Error with ModelCheckpoint context
+        throw std::runtime_error(
+            std::string("ModelCheckpoint::load_weights: failed to load .pt: ") + e.what());
+    }
+    model.load(archive);
 
     return state;
 }
