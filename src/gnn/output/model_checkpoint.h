@@ -32,11 +32,11 @@ struct TrainingState {
     std::vector<double> epoch_losses;
 
     // Architecture validation (matches GraphSAGEConfig fields)
-    int32_t  input_dim          = 0;
-    int32_t  hidden_dim         = 0;
-    int32_t  num_classes        = 0;
-    int32_t  num_layers         = 0;
-    float    dropout            = 0.0f;
+    int64_t  input_dim          = 0;
+    int64_t  hidden_dim         = 0;
+    int64_t  num_classes        = 0;
+    int64_t  num_layers         = 0;
+    double   dropout            = 0.0;
     bool     normalize          = false;
 
     // Metadata
@@ -52,11 +52,11 @@ struct TrainingState {
 // (epoch_losses and gnn_meta_hash NOT populated — load_full/load_weights only)
 // ---------------------------------------------------------------------------
 struct CheckpointInfo {
-    std::filesystem::path basename;   // absolute path without extension
+    std::filesystem::path basename;   // resolved to absolute path via std::filesystem::absolute, no extension
     SaveKind    save_kind             = SaveKind::Full;
     uint64_t    epoch                 = 0;
     float       best_val_accuracy     = 0.0f;
-    uint64_t    creation_time_unix    = 0;
+    uint64_t    creation_time_unix    = 0;  // seconds since UNIX epoch
     std::string model_type;
     std::string projection_name;
     uint64_t    pt_bytes              = 0;
@@ -101,6 +101,10 @@ public:
     // =====================================================================
     // Discovery / lifecycle
     // =====================================================================
+    /// Enumerate checkpoints under `dir` (non-recursive, both .pt and
+    /// .ckptmeta must be present). `name_filter`: if set, only checkpoints
+    /// whose basename (filename without extension) equals this string are
+    /// returned. Results sorted by creation_time_unix descending.
     static std::vector<CheckpointInfo> list_checkpoints(
         const std::filesystem::path&      dir,
         std::optional<std::string>        name_filter = std::nullopt
@@ -108,6 +112,8 @@ public:
 
     static bool exists(const std::filesystem::path& basename);
 
+    /// Delete both <basename>.pt and <basename>.ckptmeta. Idempotent: missing
+    /// files are not an error. Throws only on filesystem permission errors.
     static void delete_checkpoint(const std::filesystem::path& basename);
 
     // =====================================================================
@@ -124,7 +130,9 @@ public:
     );
 
     // =====================================================================
-    // Low-level binary I/O — exposed for unit testing but not for external use
+    // Direct accessors for the .ckptmeta sidecar file. Used internally by
+    // load_full / load_weights and by tooling/tests that need to inspect a
+    // checkpoint without materializing the model weights.
     // =====================================================================
     static void          write_ckptmeta(const std::filesystem::path&, const TrainingState&);
     static TrainingState read_ckptmeta(const std::filesystem::path&);
