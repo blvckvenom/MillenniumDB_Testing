@@ -140,6 +140,7 @@ add_library(mdb_gnn_core STATIC
 
     # Phase 6: Output / Embedding Writer
     output/embedding_writer.cc
+    output/model_checkpoint.cc
 )
 
 target_include_directories(mdb_gnn_core PUBLIC
@@ -519,6 +520,30 @@ if(BUILD_TESTING)
             add_test(NAME EmbeddingWriterTests COMMAND test_embedding_writer)
             if(EXISTS "${ASAN_SUPP_FILE}")
                 set_property(TEST EmbeddingWriterTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
+        endif()
+
+        # Model Checkpoint tests (Phase 6 Sub-2: save/load/list/exists/delete)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_checkpoint.cc")
+            add_executable(test_model_checkpoint
+                tests/test_model_checkpoint.cc
+            )
+            target_link_libraries(test_model_checkpoint
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_model_checkpoint PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME ModelCheckpointTests COMMAND test_model_checkpoint)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST ModelCheckpointTests PROPERTY
                     ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
             endif()
         endif()
