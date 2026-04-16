@@ -220,10 +220,41 @@ bool EdgeAggregator::process_edge(ObjectId edge_id, std::optional<double> proper
     // Parallel edge detected - apply aggregation strategy
     switch (strategy_) {
         case Aggregation::SINGLE:
-            // Fail on duplicate edges (strict validation)
-            throw std::runtime_error(
-                "Parallel edges detected with aggregation strategy SINGLE. "
-                "Use aggregation: 'MIN', 'MAX', 'SUM', or 'COUNT' to handle parallel edges."
+            // SINGLE is strict by design: multiple edges between the same
+            // (from, to, type) triple are ambiguous. Instead of picking one
+            // silently (which loses data), we fail and ask the caller how
+            // they want to collapse parallels. Pick the strategy that matches
+            // your intent:
+            //
+            //   COUNT  — keep one edge with synthetic `_count` property
+            //   SUM    — keep one edge with `aggregationProperty` summed
+            //   MIN    — keep the edge with the smallest property value
+            //   MAX    — keep the edge with the largest property value
+            //
+            // Common fixes:
+            //   CALL graph_project('g', nodes, edges, {aggregation: 'COUNT'})
+            //   CALL graph_project('g', nodes, edges,
+            //       {aggregation: 'SUM', aggregationProperty: 'amount',
+            //        relationshipProperties: ['amount']})
+            //
+            // For mixed types use the per-type MAP form:
+            //   CALL graph_project('g', nodes,
+            //       {TYPE_A: {aggregation: 'COUNT'},
+            //        TYPE_B: {aggregation: 'SUM', aggregationProperty: 'x'}})
+            throw QueryException(
+                "Parallel edges detected but aggregation is SINGLE (the default).\n"
+                "SINGLE refuses to drop data silently — choose how to collapse parallels:\n"
+                "  aggregation: 'COUNT'  -> emit one edge with synthetic `_count`\n"
+                "  aggregation: 'SUM'    -> sum `aggregationProperty` across parallels\n"
+                "  aggregation: 'MIN'    -> keep edge with smallest property value\n"
+                "  aggregation: 'MAX'    -> keep edge with largest property value\n"
+                "\n"
+                "Example:\n"
+                "  CALL graph_project('g', nodes, edges, {aggregation: 'COUNT'})\n"
+                "\n"
+                "For wildcard ('*') you almost always want COUNT because the\n"
+                "projection will touch every edge type, including ones with parallels.\n"
+                "For per-type control use the MAP form on relationshipProjection."
             );
 
         case Aggregation::MIN:
