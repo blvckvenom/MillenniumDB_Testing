@@ -11,6 +11,8 @@
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
+#include "graph_models/gql/projection/projection_manager.h"
+#include "query/exceptions.h"
 #include "storage/dictionary/dictionary.h"
 #include "system/file_manager.h"
 
@@ -293,26 +295,42 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         db_folder.pop_back();
     }
 
-    NativeProjectionBuilder builder(
-        graph_name,
-        db_folder,
-        node_properties,
-        edge_properties,
-        orientation,
-        aggregation,
-        aggregation_property,
-        type_orientations,
-        type_aggregations,
-        type_agg_properties,
-        node_property_configs,
-        edge_property_configs,
-        include_features,
-        label_property,
-        split_property
-    );
-    builder.scan_nodes_by_labels(node_labels);
-    builder.scan_edges_by_types(relationship_types);
-    auto stats = builder.finalize();
+    // Rollback guard: if any step of the build fails, remove the
+    // half-written projection directory so the user can retry with the
+    // same name. Without this we leave zombie dirs that block re-creation.
+    NativeProjectionBuilder::Statistics stats;
+    try {
+        NativeProjectionBuilder builder(
+            graph_name,
+            db_folder,
+            node_properties,
+            edge_properties,
+            orientation,
+            aggregation,
+            aggregation_property,
+            type_orientations,
+            type_aggregations,
+            type_agg_properties,
+            node_property_configs,
+            edge_property_configs,
+            include_features,
+            label_property,
+            split_property
+        );
+        builder.scan_nodes_by_labels(node_labels);
+        builder.scan_edges_by_types(relationship_types);
+        stats = builder.finalize();
+    } catch (...) {
+        // Best-effort cleanup of partial state before re-throwing so the
+        // caller sees the original error (converted to HTTP 500 upstream).
+        try {
+            ProjectionManager::get_instance().drop_projection(graph_name);
+        } catch (...) {
+            // If cleanup itself fails, swallow — the user will need to
+            // inspect the projections directory manually.
+        }
+        throw;
+    }
 
     // Step 11: Yield results
     ctx.yield("graphName", ctx.create_string(graph_name));

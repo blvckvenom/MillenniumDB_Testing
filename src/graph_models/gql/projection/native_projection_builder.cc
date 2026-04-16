@@ -16,7 +16,9 @@
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/streaming_aggregator.h"
+#include "query/exceptions.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
+#include "system/string_manager.h"
 
 #ifdef ENABLE_GNN
 #include "gnn/projection/gnn_meta.h"
@@ -733,7 +735,7 @@ void NativeProjectionBuilder::flush_edges() {
 
 void NativeProjectionBuilder::validate_label_exists(const std::string& label) {
     if (gql_model.catalog.node_labels2id.find(label) == gql_model.catalog.node_labels2id.end()) {
-        throw std::runtime_error(
+        throw QueryException(
             "Node label '" + label + "' does not exist in the database.\n"
             "Hint: Labels are case-sensitive."
         );
@@ -742,7 +744,7 @@ void NativeProjectionBuilder::validate_label_exists(const std::string& label) {
 
 void NativeProjectionBuilder::validate_type_exists(const std::string& type) {
     if (gql_model.catalog.edge_labels2id.find(type) == gql_model.catalog.edge_labels2id.end()) {
-        throw std::runtime_error(
+        throw QueryException(
             "Relationship type '" + type + "' does not exist in the database.\n"
             "Hint: Types are case-sensitive."
         );

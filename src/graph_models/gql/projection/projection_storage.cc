@@ -121,7 +121,15 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
 }
 
 ProjectionStorage::~ProjectionStorage() {
-    flush();
+    // Destructors are implicitly noexcept — a throw from flush() during
+    // unwinding (e.g. builder aborted after an error and the projection
+    // directory was rolled back) would call std::terminate. Swallow any
+    // flush failure here; the caller's rollback handles cleanup.
+    try {
+        flush();
+    } catch (...) {
+        // Best-effort cleanup.
+    }
 }
 
 void ProjectionStorage::init() {
