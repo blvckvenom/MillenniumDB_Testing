@@ -207,9 +207,14 @@ std::unique_ptr<mdb::gnn::GraphSAGEModel> make_test_model(int64_t seed = 42) {
     return std::make_unique<mdb::gnn::GraphSAGEModel>(cfg);
 }
 
-// Helper: mutate the optimizer once so its buffers (m/v) become non-trivial
+// Helper: mutate the optimizer once so its buffers (m/v) become non-trivial.
+// Reseeds the global torch RNG so the generated input x (and any dropout
+// sampling inside forward) are deterministic — required for the I2 fold-in
+// check that compares parameters after a single step on two separately-loaded
+// models.
 void step_optimizer_once(mdb::gnn::GraphSAGEModel& model,
                          torch::optim::Adam& opt) {
+    torch::manual_seed(1234);
     opt.zero_grad();
     auto x     = torch::randn({3, 16});
     auto ei    = torch::tensor({{0, 1}, {1, 2}}, torch::kLong);
@@ -282,6 +287,15 @@ TEST_F(ModelCheckpointTest, SaveFullRoundTrip) {
     EXPECT_FLOAT_EQ(loaded.best_val_accuracy, state.best_val_accuracy);
     EXPECT_EQ(loaded.epoch_losses,      state.epoch_losses);
     EXPECT_EQ(loaded.projection_name,   state.projection_name);
+
+    // I2 fold-in: verify optimizer buffers (Adam m/v) were actually serialized.
+    // If state was silently reset to zero, the next step from m2+opt2 would
+    // diverge from the next step of m1+opt1 (which continues from the already-
+    // mutated Adam state). Running one identical gradient step on both and
+    // comparing params is the canonical check.
+    step_optimizer_once(*m1, opt1);
+    step_optimizer_once(*m2, opt2);
+    EXPECT_TRUE(params_allclose(*m1, *m2));
 }
 
 // ---------------------------------------------------------------------------
@@ -294,4 +308,60 @@ TEST_F(ModelCheckpointTest, LoadFullRejectsMissingFile) {
     EXPECT_THROW(
         mdb::gnn::ModelCheckpoint::load_full(*m1, opt1, test_dir_ / "no_such"),
         std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// SaveWeightsRoundTrip — save_weights / load_weights preserves params
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, SaveWeightsRoundTrip) {
+    auto m1 = make_test_model(42);
+    auto base  = test_dir_ / "weights_only";
+    auto state = state_from_model(*m1);
+    state.epoch_losses.clear();  // weights-only carries no loss history
+
+    mdb::gnn::ModelCheckpoint::save_weights(*m1, base, state);
+
+    auto m2 = make_test_model(99);
+    auto loaded = mdb::gnn::ModelCheckpoint::load_weights(*m2, base);
+
+    EXPECT_TRUE(params_allclose(*m1, *m2));
+    EXPECT_EQ(loaded.model_type,      "graphsage");
+    EXPECT_EQ(loaded.projection_name, state.projection_name);
+}
+
+// ---------------------------------------------------------------------------
+// LoadFullRejectsWeightsOnly — load_full on a weights-only checkpoint throws
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, LoadFullRejectsWeightsOnly) {
+    auto m1 = make_test_model(42);
+    auto base  = test_dir_ / "wo_ckpt";
+    auto state = state_from_model(*m1);
+
+    mdb::gnn::ModelCheckpoint::save_weights(*m1, base, state);
+
+    auto m2 = make_test_model(99);
+    torch::optim::Adam opt2(m2->parameters(), torch::optim::AdamOptions(0.01));
+
+    EXPECT_THROW(
+        mdb::gnn::ModelCheckpoint::load_full(*m2, opt2, base),
+        std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// LoadWeightsAcceptsFullCheckpoint — inverse direction works (ignores optim)
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, LoadWeightsAcceptsFullCheckpoint) {
+    auto m1 = make_test_model(42);
+    torch::optim::Adam opt1(m1->parameters(), torch::optim::AdamOptions(0.01));
+    step_optimizer_once(*m1, opt1);
+
+    auto base  = test_dir_ / "full_ckpt";
+    auto state = state_from_model(*m1);
+    mdb::gnn::ModelCheckpoint::save_full(*m1, opt1, base, state);
+
+    auto m2 = make_test_model(99);
+    auto loaded = mdb::gnn::ModelCheckpoint::load_weights(*m2, base);
+
+    EXPECT_TRUE(params_allclose(*m1, *m2));
+    EXPECT_EQ(loaded.projection_name, state.projection_name);
 }
