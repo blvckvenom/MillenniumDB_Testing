@@ -622,12 +622,9 @@ std::string ProjectProcedure::resolve_aggregation_property(
     const std::vector<std::string>& edge_properties,
     Aggregation aggregation)
 {
-    // COUNT and SINGLE don't need a property
-    if (aggregation == Aggregation::COUNT || aggregation == Aggregation::SINGLE) {
-        return "";
-    }
-
-    // Try explicit 'aggregationProperty' from config
+    // An explicit `aggregationProperty` must always be honored, even when the
+    // GLOBAL aggregation is COUNT/SINGLE — otherwise per-type SUM/MIN/MAX that
+    // inherit from this global value silently lose the property and read 0.
     if (dict) {
         std::string explicit_prop = get_string_from_dict(dict, "aggregationProperty", "");
         if (!explicit_prop.empty()) {
@@ -635,13 +632,23 @@ std::string ProjectProcedure::resolve_aggregation_property(
         }
     }
 
-    // Fall back to first edge property
-    if (!edge_properties.empty()) {
+    // Implicit fallback: first relationshipProperty (preserves prior behavior
+    // for the common "aggregation: 'SUM', relationshipProperties: ['x']" form).
+    if (!edge_properties.empty() && aggregation != Aggregation::COUNT &&
+        aggregation != Aggregation::SINGLE)
+    {
         return edge_properties[0];
     }
 
-    // MIN/MAX/SUM requires a property but none specified
-    throw std::runtime_error(
+    // For COUNT/SINGLE globals with no explicit property and no edge properties,
+    // leave the resolved property empty — the aggregator (COUNT needs no property,
+    // SINGLE fails on duplicates) won't use it.
+    if (aggregation == Aggregation::COUNT || aggregation == Aggregation::SINGLE) {
+        return "";
+    }
+
+    // MIN/MAX/SUM requires a property but none specified.
+    throw QueryException(
         "Aggregation strategy '" +
         std::string(aggregation == Aggregation::MIN ? "MIN" :
                     aggregation == Aggregation::MAX ? "MAX" : "SUM") +
