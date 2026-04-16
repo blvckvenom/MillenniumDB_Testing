@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include "gnn/output/model_checkpoint.h"
+#include "gnn/models/graphsage_model.h"
 #include "gnn/projection/gnn_meta.h"
 
 using ModelCheckpointTest = GnnStorageTest;
@@ -158,7 +159,7 @@ TEST_F(ModelCheckpointTest, CkptmetaRejectTruncated) {
     auto path = test_dir_ / "trunc.ckptmeta";
     mdb::gnn::ModelCheckpoint::write_ckptmeta(path, s);
 
-    // Truncate to 50 bytes (should be ~564)
+    // Truncate to 50 bytes (should be ~204)
     std::filesystem::resize_file(path, 50);
 
     EXPECT_THROW(mdb::gnn::ModelCheckpoint::read_ckptmeta(path),
@@ -189,4 +190,108 @@ TEST_F(ModelCheckpointTest, CkptmetaRejectEmpty) {
 
     EXPECT_THROW(mdb::gnn::ModelCheckpoint::read_ckptmeta(path),
                  std::runtime_error);
+}
+
+namespace {
+
+// Helper: create a small GraphSAGEModel with deterministic seed
+std::unique_ptr<mdb::gnn::GraphSAGEModel> make_test_model(int64_t seed = 42) {
+    torch::manual_seed(seed);
+    mdb::gnn::GraphSAGEConfig cfg;
+    cfg.input_dim   = 16;
+    cfg.hidden_dim  = 8;
+    cfg.num_classes = 4;
+    cfg.num_layers  = 2;
+    cfg.dropout     = 0.5;
+    cfg.normalize   = false;
+    return std::make_unique<mdb::gnn::GraphSAGEModel>(cfg);
+}
+
+// Helper: mutate the optimizer once so its buffers (m/v) become non-trivial
+void step_optimizer_once(mdb::gnn::GraphSAGEModel& model,
+                         torch::optim::Adam& opt) {
+    opt.zero_grad();
+    auto x     = torch::randn({3, 16});
+    auto ei    = torch::tensor({{0, 1}, {1, 2}}, torch::kLong);
+    auto ei2   = torch::tensor({{0, 1}, {1, 2}}, torch::kLong);
+    auto logits = model.forward(x, {ei, ei2}, 3);
+    auto loss   = logits.sum();
+    loss.backward();
+    opt.step();
+}
+
+mdb::gnn::TrainingState state_from_model(const mdb::gnn::GraphSAGEModel& m) {
+    mdb::gnn::TrainingState s;
+    s.epoch              = 5;
+    s.patience_counter   = 0;
+    s.best_val_accuracy  = 0.72f;
+    s.epoch_losses       = {1.0, 0.8, 0.7, 0.65, 0.6};
+    s.input_dim          = m.config().input_dim;
+    s.hidden_dim         = m.config().hidden_dim;
+    s.num_classes        = m.config().num_classes;
+    s.num_layers         = m.config().num_layers;
+    s.dropout            = m.config().dropout;
+    s.normalize          = m.config().normalize;
+    s.model_type         = "graphsage";
+    s.projection_name    = "test_projection";
+    for (size_t i = 0; i < s.gnn_meta_hash.size(); ++i) {
+        s.gnn_meta_hash[i] = static_cast<uint8_t>(i);
+    }
+    s.creation_time_unix       = 1735000000;
+    s.total_training_time_sec  = 1.5;
+    return s;
+}
+
+bool params_allclose(const mdb::gnn::GraphSAGEModel& a,
+                     const mdb::gnn::GraphSAGEModel& b,
+                     double rtol = 1e-6, double atol = 1e-6) {
+    auto pa = a.parameters();
+    auto pb = b.parameters();
+    if (pa.size() != pb.size()) return false;
+    for (size_t i = 0; i < pa.size(); ++i) {
+        if (!torch::allclose(pa[i], pb[i], rtol, atol)) return false;
+    }
+    return true;
+}
+
+} // anon
+
+// ---------------------------------------------------------------------------
+// SaveFullRoundTrip — save_full + load_full preserves weights + optim state
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, SaveFullRoundTrip) {
+    auto m1 = make_test_model(42);
+    torch::optim::Adam opt1(m1->parameters(), torch::optim::AdamOptions(0.01));
+    step_optimizer_once(*m1, opt1);
+
+    auto base = test_dir_ / "best_model";
+    auto state = state_from_model(*m1);
+    mdb::gnn::ModelCheckpoint::save_full(*m1, opt1, base, state);
+
+    ASSERT_TRUE(std::filesystem::exists(base.string() + ".pt"));
+    ASSERT_TRUE(std::filesystem::exists(base.string() + ".ckptmeta"));
+
+    auto m2 = make_test_model(99);  // different seed → different weights
+    torch::optim::Adam opt2(m2->parameters(), torch::optim::AdamOptions(0.01));
+
+    auto loaded = mdb::gnn::ModelCheckpoint::load_full(*m2, opt2, base);
+
+    EXPECT_TRUE(params_allclose(*m1, *m2));
+    EXPECT_EQ(loaded.epoch,             state.epoch);
+    EXPECT_EQ(loaded.patience_counter,  state.patience_counter);
+    EXPECT_FLOAT_EQ(loaded.best_val_accuracy, state.best_val_accuracy);
+    EXPECT_EQ(loaded.epoch_losses,      state.epoch_losses);
+    EXPECT_EQ(loaded.projection_name,   state.projection_name);
+}
+
+// ---------------------------------------------------------------------------
+// LoadFullRejectsMissingFile — load with non-existent basename throws
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, LoadFullRejectsMissingFile) {
+    auto m1 = make_test_model(42);
+    torch::optim::Adam opt1(m1->parameters(), torch::optim::AdamOptions(0.01));
+
+    EXPECT_THROW(
+        mdb::gnn::ModelCheckpoint::load_full(*m1, opt1, test_dir_ / "no_such"),
+        std::runtime_error);
 }
