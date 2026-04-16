@@ -74,6 +74,7 @@ std::array<uint8_t, 32> ModelCheckpoint::compute_gnn_meta_hash(
     return digest;
 }
 
+// Binary layout: docs/superpowers/plans/2026-04-16-model-checkpoint-plan.md (Task 1.3)
 void ModelCheckpoint::write_ckptmeta(
     const std::filesystem::path& path,
     const TrainingState&         s)
@@ -221,6 +222,140 @@ TrainingState ModelCheckpoint::read_ckptmeta(
     }
 
     return s;
+}
+
+} // namespace mdb::gnn
+
+// The following anonymous-namespace helper augments the file-level helpers
+// already declared in this translation unit.
+#include "gnn/models/graphsage_model.h"
+
+#include <unistd.h>      // fsync, close
+#include <fcntl.h>       // open, O_RDONLY
+#include <cerrno>
+#include <system_error>
+
+namespace {
+
+void fsync_dir_impl(const std::filesystem::path& dir) {
+    int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "ModelCheckpoint: cannot open directory for fsync: " + dir.string()
+            + " (errno=" + std::to_string(errno) + ")");
+    }
+    if (::fsync(fd) != 0) {
+        int e = errno;
+        ::close(fd);
+        throw std::runtime_error(
+            "ModelCheckpoint: fsync failed on " + dir.string()
+            + " (errno=" + std::to_string(e) + ")");
+    }
+    ::close(fd);
+}
+
+} // anon
+
+namespace mdb::gnn {
+
+void ModelCheckpoint::fsync_directory(const std::filesystem::path& dir) {
+    fsync_dir_impl(dir);
+}
+
+void ModelCheckpoint::cleanup_tmps(const std::filesystem::path& basename) {
+    std::error_code ec;
+    std::filesystem::remove(basename.string() + ".pt.tmp",        ec);
+    std::filesystem::remove(basename.string() + ".ckptmeta.tmp",  ec);
+}
+
+void ModelCheckpoint::save_full(
+    const GraphSAGEModel&       model,
+    const torch::optim::Adam&   optimizer,
+    const std::filesystem::path& basename,
+    TrainingState                state)
+{
+    std::filesystem::create_directories(basename.parent_path());
+    cleanup_tmps(basename);
+
+    auto pt_path   = basename.string() + ".pt";
+    auto meta_path = basename.string() + ".ckptmeta";
+    auto pt_tmp    = pt_path   + ".tmp";
+    auto meta_tmp  = meta_path + ".tmp";
+
+    try {
+        // --- Write .pt (model + optimizer) via torch archive ---
+        {
+            torch::serialize::OutputArchive archive;
+            model.save(archive);
+            // LibTorch's Optimizer::save takes a non-const archive but the
+            // optimizer itself is logically const for serialization. The
+            // const_cast expresses that this is a read-only access at the
+            // ModelCheckpoint API boundary, even though LibTorch's signature
+            // predates const-correctness on this path.
+            const_cast<torch::optim::Adam&>(optimizer).save(archive);
+            archive.save_to(pt_tmp);
+        }
+
+        // --- Write .ckptmeta (always SaveKind::Full via public wrapper) ---
+        write_ckptmeta(meta_tmp, state);
+
+        std::filesystem::rename(pt_tmp,   pt_path);
+        std::filesystem::rename(meta_tmp, meta_path);
+        fsync_directory(basename.parent_path());
+    }
+    catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(pt_tmp,   ec);
+        std::filesystem::remove(meta_tmp, ec);
+        throw;
+    }
+}
+
+TrainingState ModelCheckpoint::load_full(
+    GraphSAGEModel&               model,
+    torch::optim::Adam&           optimizer,
+    const std::filesystem::path&  basename)
+{
+    auto pt_path   = basename.string() + ".pt";
+    auto meta_path = basename.string() + ".ckptmeta";
+
+    if (!std::filesystem::exists(meta_path)) {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_full: " + meta_path + " not found");
+    }
+    if (!std::filesystem::exists(pt_path)) {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_full: " + pt_path + " not found");
+    }
+
+    auto state = read_ckptmeta(meta_path);
+
+    // --- Architecture validation ---
+    const auto& cfg = model.config();
+    if (state.input_dim   != cfg.input_dim   ||
+        state.hidden_dim  != cfg.hidden_dim  ||
+        state.num_classes != cfg.num_classes ||
+        state.num_layers  != cfg.num_layers)
+    {
+        throw std::runtime_error(
+            "ModelCheckpoint::load_full: architecture mismatch. "
+            "Checkpoint=(input=" + std::to_string(state.input_dim)
+            + ", hidden=" + std::to_string(state.hidden_dim)
+            + ", classes=" + std::to_string(state.num_classes)
+            + ", layers=" + std::to_string(state.num_layers) + ") vs "
+            "Model=(input=" + std::to_string(cfg.input_dim)
+            + ", hidden=" + std::to_string(cfg.hidden_dim)
+            + ", classes=" + std::to_string(cfg.num_classes)
+            + ", layers=" + std::to_string(cfg.num_layers) + ")");
+    }
+
+    // --- Load torch archive ---
+    torch::serialize::InputArchive archive;
+    archive.load_from(pt_path);
+    model.load(archive);
+    optimizer.load(archive);
+
+    return state;
 }
 
 } // namespace mdb::gnn
