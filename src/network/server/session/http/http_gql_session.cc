@@ -57,44 +57,63 @@ void HttpGQLSession<stream_t>::run(std::unique_ptr<HttpGQLSession> obj)
     // Without this line ConnectionException won't be caught properly
     response_ostream.exceptions(std::ifstream::failbit | std::ifstream::badbit);
 
-    auto request_type = GQL::RequestParser::get_request_type(obj->request.target());
+    // Top-level guard: boost::asio worker threads terminate the process if any
+    // exception escapes a handler. Any uncaught exception from the query pipeline
+    // below is converted into an HTTP 500 so the worker survives.
+    try {
+        auto request_type = GQL::RequestParser::get_request_type(obj->request.target());
 
-    if (request_type == Protocol::RequestType::HEALTH_CHECK) {
-        return send_ok(response_ostream);
-    }
-
-    if (request_type == Protocol::RequestType::AUTH) {
-        auto&& [user, pass] = Common::RequestParser::parse_auth(obj->request);
-        auto&& [auth_token, valid_until] = obj->server.create_auth_token(user, pass);
-        if (auth_token.empty()) {
-            return send_unauthorized(response_ostream);
-        } else {
-            return send_token_authorized(response_ostream, auth_token, valid_until);
-        }
-    }
-
-    auto auth_token = Common::RequestParser::get_auth(obj->request);
-
-    if (request_type == Protocol::RequestType::CANCEL) {
-        auto&& [worker_id, cancel_token] = Common::RequestParser::parse_cancel(obj->request);
-        auto cancel_res = obj->server.try_cancel(worker_id, cancel_token);
-        if (cancel_res) {
+        if (request_type == Protocol::RequestType::HEALTH_CHECK) {
             return send_ok(response_ostream);
-        } else {
-            return send_bad_request(response_ostream, "Not Canceled");
         }
-    }
 
-    auto&& [query, response_type] = GQL::RequestParser::parse_query(obj->request);
+        if (request_type == Protocol::RequestType::AUTH) {
+            auto&& [user, pass] = Common::RequestParser::parse_auth(obj->request);
+            auto&& [auth_token, valid_until] = obj->server.create_auth_token(user, pass);
+            if (auth_token.empty()) {
+                return send_unauthorized(response_ostream);
+            } else {
+                return send_token_authorized(response_ostream, auth_token, valid_until);
+            }
+        }
 
-    if (!obj->server.authorize(request_type, auth_token)) {
-        return send_unauthorized(response_ostream);
-    }
+        auto auth_token = Common::RequestParser::get_auth(obj->request);
 
-    if (request_type == Protocol::RequestType::UPDATE) {
-        obj->execute_update_query(query, response_ostream);
-    } else /* (request_type == Protocol::RequestType::QUERY) */ {
-        obj->execute_readonly_query(query, response_ostream, response_type);
+        if (request_type == Protocol::RequestType::CANCEL) {
+            auto&& [worker_id, cancel_token] = Common::RequestParser::parse_cancel(obj->request);
+            auto cancel_res = obj->server.try_cancel(worker_id, cancel_token);
+            if (cancel_res) {
+                return send_ok(response_ostream);
+            } else {
+                return send_bad_request(response_ostream, "Not Canceled");
+            }
+        }
+
+        auto&& [query, response_type] = GQL::RequestParser::parse_query(obj->request);
+
+        if (!obj->server.authorize(request_type, auth_token)) {
+            return send_unauthorized(response_ostream);
+        }
+
+        if (request_type == Protocol::RequestType::UPDATE) {
+            obj->execute_update_query(query, response_ostream);
+        } else /* (request_type == Protocol::RequestType::QUERY) */ {
+            obj->execute_readonly_query(query, response_ostream, response_type);
+        }
+    } catch (const std::exception& e) {
+        // Last-resort barrier. Any well-behaved query path handles its own errors,
+        // but we never let a raw exception reach the asio worker.
+        logger.error() << "Worker " << obj->worker << " uncaught exception in run(): " << e.what();
+        try {
+            send_internal_error(response_ostream, e.what());
+        } catch (...) {
+            // Response may already be partially sent; swallow to keep the worker alive.
+        }
+    } catch (...) {
+        logger.error() << "Worker " << obj->worker << " uncaught unknown exception in run()";
+        try {
+            send_internal_error(response_ostream, "Unknown server error");
+        } catch (...) { }
     }
 }
 
@@ -159,6 +178,17 @@ void HttpGQLSession<stream_t>::execute_readonly_query(
         std::string msg = e.what();
         logger.error() << "Worker " << worker << ": " << msg;
         return send_internal_error(os, msg);
+    } catch (const std::exception& e) {
+        // Catch-all for any uncaught std::exception during plan construction
+        // (e.g. raw std::runtime_error thrown from projection accessors or
+        // procedure setup). Without this, the exception escapes to the boost::asio
+        // worker and terminates the process.
+        std::string msg = e.what();
+        logger.error() << "Worker " << worker << " plan-time error: " << msg;
+        return send_internal_error(os, msg);
+    } catch (...) {
+        logger.error() << "Worker " << worker << " plan-time unknown exception";
+        return send_internal_error(os, "Unknown server error during plan construction");
     }
 
     if (physical_plan == nullptr) {
@@ -184,6 +214,16 @@ void HttpGQLSession<stream_t>::execute_readonly_query(
         // Handled in execute_readonly_query_plan
     } catch (const QueryExecutionException& e) {
         // Handled in execute_readonly_query_plan
+    } catch (const QueryException& e) {
+        // User-facing error raised during execution (e.g. procedure validated
+        // that a label doesn't exist). Mirror the plan-time behaviour: return
+        // HTTP 400 with the message. Only possible in the editable path —
+        // for non-editable we already streamed HTTP 200, so we just log.
+        std::string msg = e.what();
+        logger.error() << "Worker " << worker << " query error: " << msg;
+        if (needs_editable) {
+            send_bad_request(os, msg);
+        }
     } catch (const std::exception& e) {
         if (needs_editable) {
             // Procedure failed — the buffered stream absorbed the 200
