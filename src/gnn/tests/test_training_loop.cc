@@ -281,7 +281,12 @@ TEST_F(TrainingLoopTest, LossDecreases)
     loop_cfg.patience      = 100;    // effectively disabled
     loop_cfg.random_seed   = 42;
 
-    TrainingLoop loop(model, assembler, cat, loop_cfg);
+    torch::optim::Adam opt(
+        model.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop(model, assembler, cat, opt, loop_cfg);
     auto result = loop.train();
 
     ASSERT_GE(result.epoch_losses.size(), 2u)
@@ -337,7 +342,12 @@ TEST_F(TrainingLoopTest, ConvergenceStops)
     loop_cfg.patience      = 100;     // effectively disabled
     loop_cfg.random_seed   = 0;
 
-    TrainingLoop loop(model, assembler, cat, loop_cfg);
+    torch::optim::Adam opt(
+        model.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop(model, assembler, cat, opt, loop_cfg);
     auto result = loop.train();
 
     EXPECT_TRUE(result.converged)
@@ -393,14 +403,24 @@ TEST_F(TrainingLoopTest, RandomSeedReproducible)
     torch::manual_seed(1234);
     GraphSAGEModel model_a(cfg);
     BatchAssembler assembler_a(fm, storage_a, &ls, &ss, rm);
-    TrainingLoop loop_a(model_a, assembler_a, cat_a, loop_cfg);
+    torch::optim::Adam opt_a(
+        model_a.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop_a(model_a, assembler_a, cat_a, opt_a, loop_cfg);
     auto result_a = loop_a.train();
 
     // --- Run B (same seed, freshly constructed model) ---
     torch::manual_seed(1234);
     GraphSAGEModel model_b(cfg);
     BatchAssembler assembler_b(fm, storage_b, &ls, &ss, rm);
-    TrainingLoop loop_b(model_b, assembler_b, cat_b, loop_cfg);
+    torch::optim::Adam opt_b(
+        model_b.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop_b(model_b, assembler_b, cat_b, opt_b, loop_cfg);
     auto result_b = loop_b.train();
 
     ASSERT_EQ(result_a.epoch_losses.size(), result_b.epoch_losses.size())
@@ -450,7 +470,12 @@ TEST_F(TrainingLoopTest, EvaluateReturnsValidAccuracy)
     loop_cfg.patience      = 100;
     loop_cfg.random_seed   = 7;
 
-    TrainingLoop loop(model, assembler, cat, loop_cfg);
+    torch::optim::Adam opt(
+        model.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop(model, assembler, cat, opt, loop_cfg);
     loop.train();
 
     // Validation batch is at index train_batches (= 2)
@@ -491,8 +516,13 @@ TEST_F(TrainingLoopTest, ZeroValidationBatchesEvaluatesToZero)
     };
     GraphSAGEModel model(cfg);
 
-    TrainingLoop loop(model, assembler, cat,
-                      TrainingLoop::Config{.epochs = 1, .patience = 100});
+    TrainingLoop::Config zero_val_cfg{.epochs = 1, .patience = 100};
+    torch::optim::Adam opt(
+        model.parameters(),
+        torch::optim::AdamOptions(zero_val_cfg.learning_rate)
+            .weight_decay(zero_val_cfg.weight_decay)
+    );
+    TrainingLoop loop(model, assembler, cat, opt, zero_val_cfg);
 
     double acc = loop.evaluate(0, 0);
     EXPECT_DOUBLE_EQ(acc, 0.0);
@@ -540,7 +570,12 @@ TEST_F(TrainingLoopTest, PatienceStops)
     loop_cfg.patience      = 3;
     loop_cfg.random_seed   = 99;
 
-    TrainingLoop loop(model, assembler, cat, loop_cfg);
+    torch::optim::Adam opt(
+        model.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop(model, assembler, cat, opt, loop_cfg);
     auto result = loop.train();
 
     // With lr=0, val_accuracy is the same every epoch.

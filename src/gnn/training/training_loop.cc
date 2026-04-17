@@ -19,11 +19,12 @@ TrainingLoop::TrainingLoop(
     GraphSAGEModel&      model,
     BatchAssembler&      assembler,
     const SampleCatalog& catalog,
-    Config               config
-)
+    torch::optim::Adam&  optimizer,
+    Config               config)
     : model_(model)
     , assembler_(assembler)
     , catalog_(catalog)
+    , optimizer_(optimizer)
     , config_(std::move(config))
 {
 }
@@ -54,22 +55,29 @@ TrainingLoop::Result TrainingLoop::train()
         model_.to(device);
     }
 
-    // --- Optimizer (created after model device placement) ----------------
-    auto optimizer = torch::optim::Adam(
-        model_.parameters(),
-        torch::optim::AdamOptions(config_.learning_rate)
-            .weight_decay(config_.weight_decay)
-    );
+    // Optimizer is owned by the caller (accessible via optimizer_). Do NOT
+    // re-create it here — doing so would discard Adam momenta carried over
+    // from a resumed checkpoint.
+    auto& optimizer = optimizer_;
 
-    double   best_val_acc     = 0.0;
-    uint64_t patience_counter = 0;
+    // Seed from resume state (defaults to fresh training)
+    double   best_val_acc     = config_.start_best_val;
+    uint64_t patience_counter = config_.start_patience;
+
+    // Prepend seed_losses into result so epoch_losses history is contiguous
+    for (double l : config_.seed_losses) {
+        result.epoch_losses.push_back(l);
+    }
 
     const uint64_t train_batches = catalog_.train_batches;
     const uint64_t val_batches   = catalog_.validation_batches;
 
     auto wall_start = std::chrono::steady_clock::now();
 
-    for (uint64_t epoch = 0; epoch < config_.epochs; ++epoch) {
+    for (uint64_t epoch = config_.start_epoch;
+         epoch < config_.start_epoch + config_.epochs;
+         ++epoch)
+    {
 
         // === Training phase ===
         model_.train();
@@ -128,18 +136,15 @@ TrainingLoop::Result TrainingLoop::train()
         if (val_accuracy > best_val_acc) {
             best_val_acc = val_accuracy;
             patience_counter = 0;
-            if (!config_.output_dir.empty()) {
-                torch::serialize::OutputArchive archive;
-                model_.save(archive);
-                archive.save_to(config_.output_dir + "/checkpoint.pt");
-            }
+            // Checkpoint persistence is now the responsibility of the
+            // on_epoch_end callback (see AutoCheckpointer in Phase 3).
         } else {
             ++patience_counter;
             if (patience_counter >= config_.patience) {
                 // Stopped by patience — not a convergence stop
                 result.converged = false;
                 ++epoch;  // account for this epoch before break
-                result.ran_epochs = epoch;
+                result.ran_epochs = (epoch - config_.start_epoch) + 1;
                 result.best_val_accuracy = best_val_acc;
 
                 auto wall_end = std::chrono::steady_clock::now();
@@ -147,6 +152,17 @@ TrainingLoop::Result TrainingLoop::train()
                     wall_end - wall_start).count();
                 return result;
             }
+        }
+
+        // Fire per-epoch callback (e.g. AutoCheckpointer)
+        if (config_.on_epoch_end) {
+            config_.on_epoch_end(EpochEvent{
+                epoch,
+                avg_loss,
+                val_accuracy,
+                patience_counter,
+                (val_accuracy > best_val_acc - 1e-12)
+            });
         }
 
         // === Convergence check ===
@@ -157,7 +173,7 @@ TrainingLoop::Result TrainingLoop::train()
             );
             if (delta < config_.tolerance) {
                 result.converged  = true;
-                result.ran_epochs = epoch + 1;
+                result.ran_epochs = (epoch - config_.start_epoch) + 1;
                 result.best_val_accuracy = best_val_acc;
 
                 auto wall_end = std::chrono::steady_clock::now();

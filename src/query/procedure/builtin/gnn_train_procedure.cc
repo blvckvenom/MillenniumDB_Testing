@@ -542,7 +542,12 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.random_seed   = random_seed;
     loop_config.output_dir    = output_dir.string();
 
-    TrainingLoop loop(model, assembler, catalog, loop_config);
+    torch::optim::Adam optimizer(
+        model.parameters(),
+        torch::optim::AdamOptions(lr).weight_decay(weight_decay)
+    );
+
+    TrainingLoop loop(model, assembler, catalog, optimizer, loop_config);
     auto result = loop.train();
 
     // =========================================================================

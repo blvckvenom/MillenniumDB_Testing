@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -41,17 +42,35 @@ namespace mdb::gnn {
 class TrainingLoop {
 public:
     // =========================================================================
+    // EpochEvent — emitted once per epoch via on_epoch_end callback
+    // =========================================================================
+    struct EpochEvent {
+        uint64_t epoch;              ///< 0-indexed, absolute (includes resume offset)
+        double   train_loss;         ///< average training loss this epoch
+        double   val_accuracy;       ///< validation accuracy this epoch
+        uint64_t patience_counter;   ///< patience state AFTER this epoch
+        bool     is_best;            ///< val_accuracy > best_val_acc at this point
+    };
+
+    // =========================================================================
     // Configuration
     // =========================================================================
-
     struct Config {
+        // Existing fields — semantics unchanged
         uint64_t    epochs        = 50;
         double      learning_rate = 0.01;
         double      weight_decay  = 0.0;
         double      tolerance     = 1e-4;
         uint64_t    patience      = 5;
-        int64_t     random_seed   = -1;    ///< -1 = non-deterministic
-        std::string output_dir;            ///< directory for checkpoint.pt
+        int64_t     random_seed   = -1;     ///< -1 = non-deterministic
+        std::string output_dir;             ///< legacy: retained for existing tests
+
+        // NEW — optional (defaults = fresh training, no callback)
+        std::function<void(const EpochEvent&)> on_epoch_end;
+        uint64_t             start_epoch     = 0;
+        uint64_t             start_patience  = 0;
+        double               start_best_val  = 0.0;
+        std::vector<double>  seed_losses;
     };
 
     // =========================================================================
@@ -80,6 +99,7 @@ public:
         GraphSAGEModel&      model,
         BatchAssembler&      assembler,
         const SampleCatalog& catalog,
+        torch::optim::Adam&  optimizer,       ///< owned by caller
         Config               config
     );
 
@@ -120,6 +140,7 @@ private:
     GraphSAGEModel&      model_;
     BatchAssembler&      assembler_;
     const SampleCatalog& catalog_;
+    torch::optim::Adam&  optimizer_;
     Config               config_;
 };
 
