@@ -11,7 +11,8 @@
 
 namespace mdb::gnn {
 
-class GraphSAGEModel;  // forward decl — defined in gnn/models/graphsage_model.h
+class GraphSAGEModel;   // forward decl — defined in gnn/models/graphsage_model.h
+struct GraphSAGEConfig; // forward decl — defined in gnn/models/graphsage_model.h
 
 // ---------------------------------------------------------------------------
 // SaveKind — whether a checkpoint carries full training state or only weights
@@ -138,6 +139,15 @@ public:
     static TrainingState read_ckptmeta(const std::filesystem::path&);
 
 private:
+    // Internal helper: throws std::runtime_error with `method_name` prefix if
+    // the 4 architecture fields in `state` don't match `cfg`. Used by
+    // load_full, load_weights, and validate_compat.
+    static void check_arch_match(
+        const TrainingState&                 state,
+        const GraphSAGEConfig&               cfg,
+        const char*                          method_name
+    );
+
     // Private overload used by save_full / save_weights to control the SaveKind
     // flag written to .ckptmeta. The public write_ckptmeta always writes Full.
     static void write_ckptmeta_impl(

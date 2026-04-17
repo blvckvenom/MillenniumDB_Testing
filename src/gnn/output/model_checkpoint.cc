@@ -392,23 +392,7 @@ TrainingState ModelCheckpoint::load_full(
     auto state = read_ckptmeta(meta_path);
 
     // --- Architecture validation ---
-    const auto& cfg = model.config();
-    if (state.input_dim   != cfg.input_dim   ||
-        state.hidden_dim  != cfg.hidden_dim  ||
-        state.num_classes != cfg.num_classes ||
-        state.num_layers  != cfg.num_layers)
-    {
-        throw std::runtime_error(
-            "ModelCheckpoint::load_full: architecture mismatch. "
-            "Checkpoint=(input=" + std::to_string(state.input_dim)
-            + ", hidden=" + std::to_string(state.hidden_dim)
-            + ", classes=" + std::to_string(state.num_classes)
-            + ", layers=" + std::to_string(state.num_layers) + ") vs "
-            "Model=(input=" + std::to_string(cfg.input_dim)
-            + ", hidden=" + std::to_string(cfg.hidden_dim)
-            + ", classes=" + std::to_string(cfg.num_classes)
-            + ", layers=" + std::to_string(cfg.num_layers) + ")");
-    }
+    check_arch_match(state, model.config(), "load_full");
 
     // --- Load torch archive ---
     torch::serialize::InputArchive archive;
@@ -484,23 +468,7 @@ TrainingState ModelCheckpoint::load_weights(
     auto state = read_ckptmeta(meta_path);
 
     // Architecture validation (same as load_full)
-    const auto& cfg = model.config();
-    if (state.input_dim   != cfg.input_dim   ||
-        state.hidden_dim  != cfg.hidden_dim  ||
-        state.num_classes != cfg.num_classes ||
-        state.num_layers  != cfg.num_layers)
-    {
-        throw std::runtime_error(
-            "ModelCheckpoint::load_weights: architecture mismatch. "
-            "Checkpoint=(input=" + std::to_string(state.input_dim)
-            + ", hidden=" + std::to_string(state.hidden_dim)
-            + ", classes=" + std::to_string(state.num_classes)
-            + ", layers=" + std::to_string(state.num_layers) + ") vs "
-            "Model=(input=" + std::to_string(cfg.input_dim)
-            + ", hidden=" + std::to_string(cfg.hidden_dim)
-            + ", classes=" + std::to_string(cfg.num_classes)
-            + ", layers=" + std::to_string(cfg.num_layers) + ")");
-    }
+    check_arch_match(state, model.config(), "load_weights");
 
     // Load torch archive — only model weights are read. If the .pt was produced
     // by save_full, the optimizer section is present but we ignore it.
@@ -515,6 +483,50 @@ TrainingState ModelCheckpoint::load_weights(
     model.load(archive);
 
     return state;
+}
+
+void ModelCheckpoint::check_arch_match(
+    const TrainingState&       state,
+    const GraphSAGEConfig&     cfg,
+    const char*                method_name)
+{
+    if (state.input_dim   != cfg.input_dim   ||
+        state.hidden_dim  != cfg.hidden_dim  ||
+        state.num_classes != cfg.num_classes ||
+        state.num_layers  != cfg.num_layers)
+    {
+        throw std::runtime_error(
+            std::string("ModelCheckpoint::") + method_name + ": architecture mismatch. "
+            "Checkpoint=(input=" + std::to_string(state.input_dim)
+            + ", hidden=" + std::to_string(state.hidden_dim)
+            + ", classes=" + std::to_string(state.num_classes)
+            + ", layers=" + std::to_string(state.num_layers) + ") vs "
+            "Model=(input=" + std::to_string(cfg.input_dim)
+            + ", hidden=" + std::to_string(cfg.hidden_dim)
+            + ", classes=" + std::to_string(cfg.num_classes)
+            + ", layers=" + std::to_string(cfg.num_layers) + ")");
+    }
+}
+
+void ModelCheckpoint::validate_compat(
+    const TrainingState&          state,
+    const std::filesystem::path&  current_gnn_meta_path,
+    const std::string&            current_projection_name)
+{
+    if (state.projection_name != current_projection_name) {
+        throw std::runtime_error(
+            "ModelCheckpoint::validate_compat: checkpoint was trained on projection '"
+            + state.projection_name + "' but current is '"
+            + current_projection_name + "'. Cannot reuse across projections.");
+    }
+
+    auto current_hash = compute_gnn_meta_hash(current_gnn_meta_path);
+    if (current_hash != state.gnn_meta_hash) {
+        throw std::runtime_error(
+            "ModelCheckpoint::validate_compat: gnn_meta.bin hash mismatch. "
+            "The projection may have been regenerated with different features. "
+            "Recreate the projection with the original feature set, or train a new model.");
+    }
 }
 
 } // namespace mdb::gnn
