@@ -365,3 +365,70 @@ TEST_F(ModelCheckpointTest, LoadWeightsAcceptsFullCheckpoint) {
     EXPECT_TRUE(params_allclose(*m1, *m2));
     EXPECT_EQ(loaded.projection_name, state.projection_name);
 }
+
+// ---------------------------------------------------------------------------
+// ValidateCompatAccepts — identical state + projection → no throw
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ValidateCompatAccepts) {
+    mdb::gnn::GnnMeta m;
+    m.feature_name = "features";
+    m.feature_dim  = 16;
+    m.num_nodes    = 100;
+    m.num_classes  = 4;
+    auto meta_path = test_dir_ / "gnn_meta.bin";
+    m.write(meta_path);
+
+    mdb::gnn::TrainingState s;
+    s.projection_name = "cora";
+    s.gnn_meta_hash   = mdb::gnn::ModelCheckpoint::compute_gnn_meta_hash(meta_path);
+
+    EXPECT_NO_THROW(
+        mdb::gnn::ModelCheckpoint::validate_compat(s, meta_path, "cora"));
+}
+
+// ---------------------------------------------------------------------------
+// ValidateCompatProjectionMismatch — different projection name → throw
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ValidateCompatProjectionMismatch) {
+    mdb::gnn::GnnMeta m;
+    m.feature_name = "features";
+    m.feature_dim  = 16;
+    m.num_nodes    = 100;
+    m.num_classes  = 4;
+    auto meta_path = test_dir_ / "gnn_meta.bin";
+    m.write(meta_path);
+
+    mdb::gnn::TrainingState s;
+    s.projection_name = "cora";
+    s.gnn_meta_hash   = mdb::gnn::ModelCheckpoint::compute_gnn_meta_hash(meta_path);
+
+    EXPECT_THROW(
+        mdb::gnn::ModelCheckpoint::validate_compat(s, meta_path, "imdb"),
+        std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// ValidateCompatHashMismatch — gnn_meta.bin content changed → throw
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ValidateCompatHashMismatch) {
+    mdb::gnn::GnnMeta m1;
+    m1.feature_name = "v1";
+    m1.feature_dim  = 16;
+    m1.num_nodes    = 100;
+    m1.num_classes  = 4;
+    auto p1 = test_dir_ / "gnn_meta.bin";
+    m1.write(p1);
+
+    mdb::gnn::TrainingState s;
+    s.projection_name = "cora";
+    s.gnn_meta_hash   = mdb::gnn::ModelCheckpoint::compute_gnn_meta_hash(p1);
+
+    // Regenerate with different feature_name — hash differs
+    mdb::gnn::GnnMeta m2 = m1;
+    m2.feature_name = "v2";
+    m2.write(p1);
+
+    EXPECT_THROW(
+        mdb::gnn::ModelCheckpoint::validate_compat(s, p1, "cora"),
+        std::runtime_error);
+}
