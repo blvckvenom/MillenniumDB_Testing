@@ -41,9 +41,9 @@ public:
             YieldField{"nodesInferred",   YieldType::INT,    "Non-seed nodes inferred during write-back (0 if writeProperty not set)"},
             YieldField{"inferenceMillis", YieldType::FLOAT,  "Wall-clock time for non-seed inference in ms (0.0 if writeProperty not set)"},
             YieldField{"writeMillis",     YieldType::FLOAT,  "Wall-clock time for projection writes in ms (0.0 if writeProperty not set)"},
-            YieldField{"checkpointPath",      YieldType::STRING, "Absolute path (no extension) to best_model checkpoint; empty if disabled or no improvement"},
-            YieldField{"finalCheckpointPath", YieldType::STRING, "Absolute path to final_model checkpoint; empty if disabled"},
-            YieldField{"resumedFromEpoch",    YieldType::INT,    "Epoch resumed from (0 if fresh training)"},
+            YieldField{"bestCheckpointPath",  YieldType::STRING, "Absolute path (no extension) to best_model checkpoint; empty if disabled or no improvement"},
+            YieldField{"finalCheckpointPath", YieldType::STRING, "Absolute path (no extension) to final_model checkpoint; empty if disabled"},
+            YieldField{"resumedFromEpoch",    YieldType::INT,    "Epoch index from which training resumed (0 if fresh training)"},
         };
     }
 
