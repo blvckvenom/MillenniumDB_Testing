@@ -126,6 +126,9 @@ add_library(mdb_gnn_core STATIC
     # Phase 4: GNN Training procedure (GraphSAGE training orchestration)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_train_procedure.cc
 
+    # Phase 6: GNN Prediction procedure (load checkpoint + inference)
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_predict_procedure.cc
+
     # Phase 4: Training Pipeline
     training/label_store.cc
     training/split_store.cc
