@@ -15,7 +15,9 @@
 #include "query/procedure/procedure_context.h"
 
 #include "gnn/models/graphsage_model.h"
+#include "gnn/output/auto_checkpointer.h"
 #include "gnn/output/embedding_writer.h"
+#include "gnn/output/model_checkpoint.h"
 #include "gnn/projection/gnn_meta.h"
 #include "gnn/sampling/sample_catalog.h"
 #include "gnn/sampling/sample_storage.h"
@@ -554,6 +556,24 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.patience      = patience;
     loop_config.random_seed   = random_seed;
     loop_config.output_dir    = output_dir.string();
+
+    // =========================================================================
+    // Step 8a: Build base TrainingState (identifying fields) for checkpoints
+    // =========================================================================
+    mdb::gnn::TrainingState base_state;
+    base_state.input_dim          = gnn_config.input_dim;
+    base_state.hidden_dim         = gnn_config.hidden_dim;
+    base_state.num_classes        = gnn_config.num_classes;
+    base_state.num_layers         = gnn_config.num_layers;
+    base_state.dropout            = static_cast<float>(gnn_config.dropout);
+    base_state.normalize          = gnn_config.normalize;
+    base_state.model_type         = model_type;   // "graphsage"
+    base_state.projection_name    = projection_name;
+    base_state.gnn_meta_hash      = mdb::gnn::ModelCheckpoint::compute_gnn_meta_hash(meta_path);
+    base_state.creation_time_unix =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
 
     torch::optim::Adam optimizer(
         model.parameters(),
