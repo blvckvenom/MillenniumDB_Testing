@@ -580,8 +580,75 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         torch::optim::AdamOptions(lr).weight_decay(weight_decay)
     );
 
+    // =========================================================================
+    // Step 8b: Resume from checkpoint if requested
+    // =========================================================================
+    uint64_t resumed_from_epoch = 0;
+    if (!resume_from.empty()) {
+        fs::path resume_basename;
+        fs::path resume_input(resume_from);
+        if (resume_input.is_absolute()) {
+            resume_basename = resume_input;
+        } else {
+            resume_basename = output_dir / "checkpoints" / resume_from;
+        }
+
+        auto loaded = mdb::gnn::ModelCheckpoint::load_full(
+            model, optimizer, resume_basename);
+        mdb::gnn::ModelCheckpoint::validate_compat(
+            loaded, meta_path, projection_name);
+
+        loop_config.start_epoch     = loaded.epoch;
+        loop_config.start_patience  = loaded.patience_counter;
+        loop_config.start_best_val  = loaded.best_val_accuracy;
+        loop_config.seed_losses     = loaded.epoch_losses;
+        resumed_from_epoch          = loaded.epoch;
+
+        // Preserve original creation time + accumulate total time
+        base_state.creation_time_unix      = loaded.creation_time_unix;
+        base_state.total_training_time_sec = loaded.total_training_time_sec;
+    }
+
+    // =========================================================================
+    // Step 8c: Construct AutoCheckpointer and wire its callback
+    // =========================================================================
+    mdb::gnn::AutoCheckpointer::Policy ac_policy;
+    ac_policy.save_on_best_val = save_on_best_val;
+    ac_policy.save_final       = save_final;
+
+    auto ckpt_dir = output_dir / "checkpoints";
+    mdb::gnn::AutoCheckpointer autockpt(
+        model, optimizer, ckpt_dir, base_state, ac_policy);
+
+    loop_config.on_epoch_end = [&autockpt](const mdb::gnn::TrainingLoop::EpochEvent& e) {
+        autockpt.on_epoch_end(e);
+    };
+
     TrainingLoop loop(model, assembler, catalog, optimizer, loop_config);
     auto result = loop.train();
+
+    // =========================================================================
+    // Step 8d: Finalize checkpoint
+    // =========================================================================
+    mdb::gnn::TrainingState final_state  = base_state;
+    final_state.epoch                    = loop_config.start_epoch + result.ran_epochs;
+    final_state.patience_counter         = 0;  // exhausted / reset at end
+    final_state.best_val_accuracy        = static_cast<float>(result.best_val_accuracy);
+    final_state.epoch_losses             = result.epoch_losses;
+    final_state.total_training_time_sec  = base_state.total_training_time_sec + result.train_seconds;
+
+    autockpt.save_final(final_state);
+
+    std::string best_checkpoint_str;
+    if (save_on_best_val && autockpt.best_val_seen() > 0.0) {
+        best_checkpoint_str =
+            std::filesystem::absolute(ckpt_dir / ac_policy.best_basename).string();
+    }
+    std::string final_checkpoint_str;
+    if (save_final) {
+        final_checkpoint_str =
+            std::filesystem::absolute(ckpt_dir / ac_policy.final_basename).string();
+    }
 
     // =========================================================================
     // Step 9: Evaluate on test set
@@ -687,6 +754,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("nodesInferred",   ctx.create_int(static_cast<int64_t>(nodes_inferred)));
     ctx.yield("inferenceMillis", ctx.create_float(static_cast<float>(inference_ms)));
     ctx.yield("writeMillis",     ctx.create_float(static_cast<float>(write_ms)));
+    ctx.yield("bestCheckpointPath",  ctx.create_string(best_checkpoint_str));
+    ctx.yield("finalCheckpointPath", ctx.create_string(final_checkpoint_str));
+    ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
     ctx.yield_row();
 }
 
