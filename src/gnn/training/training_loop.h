@@ -29,9 +29,10 @@ namespace mdb::gnn {
  *      `config.patience` consecutive epochs.  Sets `Result::converged = false`
  *      and `Result::ran_epochs` reflects how many epochs actually ran.
  *
- * The best model checkpoint is written to
- * `config.output_dir + "/checkpoint.pt"` whenever validation accuracy
- * improves (only if `output_dir` is non-empty).
+ * Per-epoch checkpoint persistence is delegated to an optional `on_epoch_end`
+ * callback (see `Config::on_epoch_end` and `EpochEvent`). `TrainingLoop` no
+ * longer performs any direct file I/O. `config.output_dir` is retained for
+ * compatibility but is no longer consumed by this class.
  *
  * ## Batch layout contract (SampleCatalog)
  *

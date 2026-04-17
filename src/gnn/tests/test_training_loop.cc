@@ -559,14 +559,15 @@ TEST_F(TrainingLoopTest, PatienceStops)
     GraphSAGEModel model(cfg);
 
     // Use learning_rate=0 so weights never update and val_accuracy stays fixed.
-    // With patience=3 and tolerance=1e-9, the loop should stop at epoch 3
-    // (after patience consecutive non-improving epochs).
+    // With patience=3 and tolerance=0.0 (convergence gated by strict <), the
+    // loop must stop from patience exhaustion, not convergence: one
+    // improvement epoch sets best_val_acc, the next `patience` non-improving
+    // epochs trigger the stop, yielding ran_epochs == patience + 1.
     TrainingLoop::Config loop_cfg;
     loop_cfg.epochs        = 100;
     loop_cfg.learning_rate = 0.0;   // frozen weights → constant val accuracy
-    loop_cfg.tolerance     = 1e-9;  // tiny: loss won't converge with lr=0 and
-                                    //       two equal consecutive losses would
-                                    //       satisfy it, but we check patience first
+    loop_cfg.tolerance     = 0.0;   // convergence uses strict <, so |delta|<0
+                                    // is never true and patience must fire.
     loop_cfg.patience      = 3;
     loop_cfg.random_seed   = 99;
 
@@ -584,7 +585,7 @@ TEST_F(TrainingLoopTest, PatienceStops)
     // However: the first epoch can set best_val_acc, then the next `patience`
     // epochs trigger the stop.  So ran_epochs == 1 + patience.
     // Allow a small range in case the zero-lr run still satisfies tolerance.
-    EXPECT_LE(result.ran_epochs, loop_cfg.patience + 2)
+    EXPECT_EQ(result.ran_epochs, loop_cfg.patience + 1)
         << "Loop ran more epochs than expected with patience="
         << loop_cfg.patience;
 }

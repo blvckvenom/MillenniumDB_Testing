@@ -132,37 +132,44 @@ TrainingLoop::Result TrainingLoop::train()
         // === Validation phase ===
         double val_accuracy = evaluate(train_batches, val_batches);
 
-        // === Checkpoint if improved ===
-        if (val_accuracy > best_val_acc) {
+        // === Check if this epoch improved (BEFORE updating best_val_acc) ===
+        // Capture is_best with the same strict comparator used below to update
+        // best_val_acc, so callback consumers see a consistent "improved?" flag.
+        const bool is_best = (val_accuracy > best_val_acc);
+
+        if (is_best) {
             best_val_acc = val_accuracy;
             patience_counter = 0;
-            // Checkpoint persistence is now the responsibility of the
-            // on_epoch_end callback (see AutoCheckpointer in Phase 3).
+            // Checkpoint persistence is delegated to the on_epoch_end callback
+            // (see AutoCheckpointer in Phase 3).
         } else {
             ++patience_counter;
-            if (patience_counter >= config_.patience) {
-                // Stopped by patience — not a convergence stop
-                result.converged = false;
-                ++epoch;  // account for this epoch before break
-                result.ran_epochs = epoch - config_.start_epoch;
-                result.best_val_accuracy = best_val_acc;
-
-                auto wall_end = std::chrono::steady_clock::now();
-                result.train_seconds = std::chrono::duration<double>(
-                    wall_end - wall_start).count();
-                return result;
-            }
         }
 
-        // Fire per-epoch callback (e.g. AutoCheckpointer)
+        // Fire per-epoch callback BEFORE any early-return. Consumers observe
+        // every epoch including the final one that triggers patience-stop or
+        // convergence.
         if (config_.on_epoch_end) {
             config_.on_epoch_end(EpochEvent{
                 epoch,
                 avg_loss,
                 val_accuracy,
                 patience_counter,
-                (val_accuracy > best_val_acc - 1e-12)
+                is_best
             });
+        }
+
+        // === Patience check ===
+        if (!is_best && patience_counter >= config_.patience) {
+            result.converged = false;
+            ++epoch;  // account for this epoch before break
+            result.ran_epochs = epoch - config_.start_epoch;
+            result.best_val_accuracy = best_val_acc;
+
+            auto wall_end = std::chrono::steady_clock::now();
+            result.train_seconds = std::chrono::duration<double>(
+                wall_end - wall_start).count();
+            return result;
         }
 
         // === Convergence check ===
