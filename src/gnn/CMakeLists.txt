@@ -480,6 +480,28 @@ if(BUILD_TESTING)
             endif()
         endif()
 
+        # TrainingLoop resume / callback tests (Phase 6 Sub-2 Task 4.3)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_training_loop_resume.cc")
+            add_executable(test_training_loop_resume tests/test_training_loop_resume.cc)
+            target_link_libraries(test_training_loop_resume
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_training_loop_resume PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME TrainingLoopResumeTests COMMAND test_training_loop_resume)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST TrainingLoopResumeTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
+        endif()
+
         # GnnMeta tests (Task 1: metadata reader/writer)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gnn_meta.cc")
             add_executable(test_gnn_meta tests/test_gnn_meta.cc)
