@@ -2,6 +2,7 @@
 
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -527,6 +528,82 @@ void ModelCheckpoint::validate_compat(
             "The projection may have been regenerated with different features. "
             "Recreate the projection with the original feature set, or train a new model.");
     }
+}
+
+bool ModelCheckpoint::exists(const std::filesystem::path& basename)
+{
+    return std::filesystem::exists(basename.string() + ".pt")
+        && std::filesystem::exists(basename.string() + ".ckptmeta");
+}
+
+void ModelCheckpoint::delete_checkpoint(const std::filesystem::path& basename)
+{
+    // Delete both committed files AND any orphan .tmp siblings so a user-
+    // initiated delete is fully clean (Task 2.3 review fold-in).
+    auto remove_or_throw = [](const std::filesystem::path& p, const char* which) {
+        std::error_code ec;
+        std::filesystem::remove(p, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            throw std::runtime_error(
+                std::string("ModelCheckpoint::delete_checkpoint: failed to remove ")
+                + which + " (" + p.string() + "): " + ec.message());
+        }
+    };
+
+    remove_or_throw(basename.string() + ".pt",            ".pt");
+    remove_or_throw(basename.string() + ".ckptmeta",      ".ckptmeta");
+    remove_or_throw(basename.string() + ".pt.tmp",        ".pt.tmp");
+    remove_or_throw(basename.string() + ".ckptmeta.tmp",  ".ckptmeta.tmp");
+}
+
+std::vector<CheckpointInfo> ModelCheckpoint::list_checkpoints(
+    const std::filesystem::path&      dir,
+    std::optional<std::string>        name_filter)
+{
+    std::vector<CheckpointInfo> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
+        return out;
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        const auto& p = entry.path();
+        if (p.extension() != ".ckptmeta") continue;
+
+        auto basename = p;
+        basename.replace_extension();  // strip .ckptmeta
+        auto pt_path = basename.string() + ".pt";
+        if (!std::filesystem::exists(pt_path)) continue;  // orphan .ckptmeta
+
+        auto fname = basename.filename().string();
+        if (name_filter && *name_filter != fname) continue;
+
+        CheckpointInfo info;
+        info.basename = std::filesystem::absolute(basename);
+        try {
+            // peek_save_kind is in the file-scope anonymous namespace; unqualified
+            // name lookup from inside namespace mdb::gnn finds it at TU scope.
+            info.save_kind = peek_save_kind(p);
+            auto s = read_ckptmeta(p);
+            info.epoch               = s.epoch;
+            info.best_val_accuracy   = s.best_val_accuracy;
+            info.creation_time_unix  = s.creation_time_unix;
+            info.model_type          = s.model_type;
+            info.projection_name     = s.projection_name;
+            info.pt_bytes   = std::filesystem::file_size(pt_path);
+            info.meta_bytes = std::filesystem::file_size(p);
+        } catch (const std::exception&) {
+            continue;  // skip malformed files silently
+        }
+        out.push_back(std::move(info));
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const CheckpointInfo& a, const CheckpointInfo& b) {
+                  return a.creation_time_unix > b.creation_time_unix;
+              });
+    return out;
 }
 
 } // namespace mdb::gnn

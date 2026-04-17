@@ -141,7 +141,8 @@ public:
 private:
     // Internal helper: throws std::runtime_error with `method_name` prefix if
     // the 4 architecture fields in `state` don't match `cfg`. Used by
-    // load_full, load_weights, and validate_compat.
+    // load_full and load_weights; not used by validate_compat which
+    // runs before the model is instantiated (no GraphSAGEConfig in scope).
     static void check_arch_match(
         const TrainingState&                 state,
         const GraphSAGEConfig&               cfg,
