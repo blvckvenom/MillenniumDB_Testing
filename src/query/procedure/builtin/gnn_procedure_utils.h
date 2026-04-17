@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_object_id.h"
+#include "graph_models/gql/projection/projection_manager.h"
 #include "storage/dictionary/dictionary.h"
 #include "system/file_manager.h"
 
@@ -191,5 +193,22 @@ private:
     std::unique_ptr<Dictionary> dict_;
     DictionaryObject* dict_obj_ = nullptr;  // non-owning; owned by dict_
 };
+
+inline std::filesystem::path resolve_checkpoint_dir(
+    const std::string& projection_name,
+    std::optional<std::string> output_dir_name = std::nullopt)
+{
+    auto& pm = GQL::ProjectionManager::get_instance();
+    if (!pm.projection_exists(projection_name)) {
+        throw std::runtime_error(
+            "projection '" + projection_name + "' not found");
+    }
+    auto proj_dir = std::filesystem::path(pm.get_projection_dir(projection_name))
+                    / "gnn_output";
+    if (output_dir_name) {
+        proj_dir = proj_dir / *output_dir_name / "checkpoints";
+    }
+    return proj_dir;
+}
 
 } // namespace GQL::Procedures
