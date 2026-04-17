@@ -194,6 +194,16 @@ private:
     DictionaryObject* dict_obj_ = nullptr;  // non-owning; owned by dict_
 };
 
+/// Resolve the on-disk directory for GNN checkpoint discovery/management.
+///
+/// - If `output_dir_name` is nullopt, returns `<proj_dir>/gnn_output` (the root
+///   under which all per-run subdirs live).
+/// - If `output_dir_name` is set, returns `<proj_dir>/gnn_output/<name>/checkpoints`.
+///
+/// Throws if the projection does not exist. `output_dir_name`, when present,
+/// is validated via `validate_safe_name` so callers cannot escape the projection
+/// tree via `..` or absolute paths. The returned path is NOT guaranteed to exist —
+/// it is only resolved.
 inline std::filesystem::path resolve_checkpoint_dir(
     const std::string& projection_name,
     std::optional<std::string> output_dir_name = std::nullopt)
@@ -206,6 +216,7 @@ inline std::filesystem::path resolve_checkpoint_dir(
     auto proj_dir = std::filesystem::path(pm.get_projection_dir(projection_name))
                     / "gnn_output";
     if (output_dir_name) {
+        validate_safe_name(*output_dir_name, "outputDir");
         proj_dir = proj_dir / *output_dir_name / "checkpoints";
     }
     return proj_dir;
