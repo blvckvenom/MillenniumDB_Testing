@@ -565,7 +565,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     base_state.hidden_dim         = gnn_config.hidden_dim;
     base_state.num_classes        = gnn_config.num_classes;
     base_state.num_layers         = gnn_config.num_layers;
-    base_state.dropout            = static_cast<float>(gnn_config.dropout);
+    base_state.dropout            = gnn_config.dropout;
     base_state.normalize          = gnn_config.normalize;
     base_state.model_type         = model_type;   // "graphsage"
     base_state.projection_name    = projection_name;
