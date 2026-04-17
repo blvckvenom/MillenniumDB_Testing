@@ -432,3 +432,113 @@ TEST_F(ModelCheckpointTest, ValidateCompatHashMismatch) {
         mdb::gnn::ModelCheckpoint::validate_compat(s, p1, "cora"),
         std::runtime_error);
 }
+
+// ---------------------------------------------------------------------------
+// ListEmptyDir — non-existent dir → empty vector, no throw
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ListEmptyDir) {
+    auto v = mdb::gnn::ModelCheckpoint::list_checkpoints(test_dir_ / "no_such");
+    EXPECT_TRUE(v.empty());
+}
+
+// ---------------------------------------------------------------------------
+// ListIgnoresOrphans — a lone .pt without .ckptmeta is not listed
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ListIgnoresOrphans) {
+    // Create an orphan .pt file
+    std::ofstream(test_dir_ / "orphan.pt") << "fake torch data";
+
+    auto v = mdb::gnn::ModelCheckpoint::list_checkpoints(test_dir_);
+    EXPECT_TRUE(v.empty());
+}
+
+// ---------------------------------------------------------------------------
+// ListSortedByTimeDesc — newest checkpoint first
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ListSortedByTimeDesc) {
+    auto m   = make_test_model();
+    torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));
+
+    auto s1 = state_from_model(*m); s1.creation_time_unix = 1000;
+    auto s2 = state_from_model(*m); s2.creation_time_unix = 2000;
+    auto s3 = state_from_model(*m); s3.creation_time_unix = 3000;
+
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "c1", s1);
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "c2", s2);
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "c3", s3);
+
+    auto v = mdb::gnn::ModelCheckpoint::list_checkpoints(test_dir_);
+    ASSERT_EQ(v.size(), 3u);
+    EXPECT_EQ(v[0].creation_time_unix, 3000u);
+    EXPECT_EQ(v[1].creation_time_unix, 2000u);
+    EXPECT_EQ(v[2].creation_time_unix, 1000u);
+}
+
+// ---------------------------------------------------------------------------
+// ListNameFilter — filter returns 0 or 1 rows
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ListNameFilter) {
+    auto m   = make_test_model();
+    torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));
+    auto s = state_from_model(*m);
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "best_model",  s);
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "final_model", s);
+
+    auto v = mdb::gnn::ModelCheckpoint::list_checkpoints(test_dir_, "best_model");
+    ASSERT_EQ(v.size(), 1u);
+    EXPECT_EQ(v[0].basename.filename().string(), "best_model");
+
+    auto none = mdb::gnn::ModelCheckpoint::list_checkpoints(test_dir_, "nonexistent");
+    EXPECT_TRUE(none.empty());
+}
+
+// ---------------------------------------------------------------------------
+// ExistsTrueFalse
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ExistsTrueFalse) {
+    auto m   = make_test_model();
+    torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));
+    auto s = state_from_model(*m);
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "present", s);
+
+    EXPECT_TRUE (mdb::gnn::ModelCheckpoint::exists(test_dir_ / "present"));
+    EXPECT_FALSE(mdb::gnn::ModelCheckpoint::exists(test_dir_ / "absent"));
+}
+
+// ---------------------------------------------------------------------------
+// DeleteIdempotent — delete of missing is no-op; delete of present removes both files
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, DeleteIdempotent) {
+    // No throw when neither file exists
+    EXPECT_NO_THROW(
+        mdb::gnn::ModelCheckpoint::delete_checkpoint(test_dir_ / "ghost"));
+
+    // Now create one and delete it
+    auto m   = make_test_model();
+    torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));
+    auto s = state_from_model(*m);
+    mdb::gnn::ModelCheckpoint::save_full(*m, opt, test_dir_ / "doomed", s);
+
+    mdb::gnn::ModelCheckpoint::delete_checkpoint(test_dir_ / "doomed");
+    EXPECT_FALSE(std::filesystem::exists(test_dir_ / "doomed.pt"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir_ / "doomed.ckptmeta"));
+
+    // Second call is idempotent
+    EXPECT_NO_THROW(
+        mdb::gnn::ModelCheckpoint::delete_checkpoint(test_dir_ / "doomed"));
+}
+
+// ---------------------------------------------------------------------------
+// ValidateCompatMissingMetaFile — fold-in from Task 2.3 review
+// compute_gnn_meta_hash throws cleanly when the file is absent
+// ---------------------------------------------------------------------------
+TEST_F(ModelCheckpointTest, ValidateCompatMissingMetaFile) {
+    mdb::gnn::TrainingState s;
+    s.projection_name = "cora";
+    // s.gnn_meta_hash left all-zero (default)
+
+    EXPECT_THROW(
+        mdb::gnn::ModelCheckpoint::validate_compat(
+            s, test_dir_ / "does_not_exist.bin", "cora"),
+        std::runtime_error);
+}
