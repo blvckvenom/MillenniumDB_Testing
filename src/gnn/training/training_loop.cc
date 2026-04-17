@@ -144,7 +144,7 @@ TrainingLoop::Result TrainingLoop::train()
                 // Stopped by patience — not a convergence stop
                 result.converged = false;
                 ++epoch;  // account for this epoch before break
-                result.ran_epochs = (epoch - config_.start_epoch) + 1;
+                result.ran_epochs = epoch - config_.start_epoch;
                 result.best_val_accuracy = best_val_acc;
 
                 auto wall_end = std::chrono::steady_clock::now();
