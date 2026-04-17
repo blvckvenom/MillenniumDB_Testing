@@ -310,6 +310,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     std::string output_dir_name  = "default";
     bool        export_emb       = true;
     std::string write_property;              // writeProperty option (empty = no write-back)
+    std::string resume_from;       // empty = fresh training
+    bool        save_on_best_val = true;
+    bool        save_final       = true;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -371,6 +374,16 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                 throw std::runtime_error("writeProperty must be a non-empty string");
             }
             validate_safe_name(write_property, "writeProperty");
+        }
+        if (auto v = opts.get_string("resumeFrom")) {
+            resume_from = *v;
+            // Empty string is allowed (= fresh training); non-empty paths validated at load time
+        }
+        if (auto v = opts.get_bool("saveOnBestVal")) {
+            save_on_best_val = *v;
+        }
+        if (auto v = opts.get_bool("saveFinal")) {
+            save_final = *v;
         }
     }
 
