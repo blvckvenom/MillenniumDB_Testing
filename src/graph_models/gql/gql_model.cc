@@ -28,6 +28,7 @@
 #include "query/procedure/builtin/gnn_predict_procedure.h"
 #include "query/procedure/builtin/gnn_list_checkpoints_procedure.h"
 #include "query/procedure/builtin/gnn_checkpoint_exists_procedure.h"
+#include "query/procedure/builtin/gnn_checkpoint_delete_procedure.h"
 #endif
 #include "query/query_context.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -85,6 +86,9 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
 
     // Register GNN checkpoint existence-check procedure
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnCheckpointExistsProcedure>());
+
+    // Register GNN checkpoint delete procedure
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnCheckpointDeleteProcedure>());
 #endif
 
     return std::make_unique<ModelDestroyer>([]() { gql_model.~GQLModel(); });
