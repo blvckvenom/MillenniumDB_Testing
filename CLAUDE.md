@@ -118,6 +118,13 @@ End-to-end GNN training within MillenniumDB. Flow: `graph_project` (with `includ
 **Phase 6 — Queryable Embeddings:**
 After `gnn_train(..., writeProperty: 'embedding')`, embeddings are queryable via GQL: `USE proj MATCH (n) RETURN n.embedding` shows the tensor values, `cosineDistance(a.embedding, b.embedding)` computes similarity. Requires tensor type support in GQL (6 MASK_TENSOR types in GQL_OID) and the `cosineDistance` built-in function (justified by ISO/IEC 39075 §4.12.2 as implementation extension).
 
+**Phase 6 Sub-2 — Model Checkpoints (Completed 2026-04-17):**
+`gnn_train` saves atomic two-file checkpoints (`.pt` + `.ckptmeta`) to `<proj_dir>/gnn_output/<outputDir>/checkpoints/`. Both `best_model` (overwritten on each strict val-accuracy improvement) and `final_model` (written once at end) are produced; either can be disabled via `saveOnBestVal: false` / `saveFinal: false`. Pass `resumeFrom: 'best_model'` (relative, resolved against `<outputDir>/checkpoints/`) or an absolute path to `gnn_train` to continue training with preserved Adam optimizer state (`m`/`v` momenta), patience counter, best-val tracker, and full loss history. Three new YIELDs: `bestCheckpointPath`, `finalCheckpointPath`, `resumedFromEpoch`.
+
+Four new GQL procedures: `gnn_predict(sample, feature, ckptName [, opts])` runs inference from a saved checkpoint (optionally writing embeddings back via `writeProperty`); `gnn_list_checkpoints(projection [, outputDir [, name]])` enumerates checkpoints sorted by creation time; `gnn_checkpoint_exists(projection, outputDir, name)` returns a boolean; `gnn_checkpoint_delete(projection, outputDir, name)` removes both files idempotently. Validation at load time enforces architecture dims (input/hidden/classes/layers), projection_name match, and SHA-256 hash of `gnn_meta.bin` — rejecting cross-projection or stale-data resumes with clear errors.
+
+Implementation: `src/gnn/output/model_checkpoint.{h,cc}` (stateless utility: save_full/save_weights/load_*/validate_compat/list/exists/delete) + `src/gnn/output/auto_checkpointer.{h,cc}` (stateful policy observer wired into `TrainingLoop::Config::on_epoch_end`). Checkpoints use `GNNCKPT\0` magic, atomic write via `.tmp` → fsync → rename → fsync-dir sequence. See `docs/superpowers/specs/2026-04-16-model-checkpoint-design.md` for full design rationale. Validated by unit tests (23 ModelCheckpoint + 8 AutoCheckpointer + 8 TrainingLoop resume), E2E Step 10 (12 checks), and invariant tests in gnn_training suite (bit-identical predict reproducibility + resume parity within 0.03 testAcc delta).
+
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
