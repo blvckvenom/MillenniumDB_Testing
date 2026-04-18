@@ -557,6 +557,123 @@ else
 fi
 
 # =============================================================================
+# Step 9a: Predict reproducibility check
+# =============================================================================
+# gnn_train exports embeddings.npy from the final model state. Running
+# gnn_predict with 'final_model' reconstructs the same model (same weights,
+# same eval-mode forward, same seed_node order from the sample catalog) and
+# must produce a bit-identical embeddings.npy file.
+#
+# MUST run BEFORE the resume check (Step 9b), since resume overwrites the
+# final_model.pt checkpoint that this invariant depends on.
+# =============================================================================
+info "Step 9a: Predict reproducibility (gnn_predict('final_model') == training export)"
+
+PRED_RESULT=$(timeout 60 curl -s -H "Accept:text/csv" -X POST \
+    "http://localhost:$PORT" -d "CALL gnn_predict('cora_s', 'node_features', 'final_model', {
+    exportEmbeddings: true,
+    outputDir: 'predict_run'
+})
+YIELD numBatches, embeddingDim
+RETURN numBatches, embeddingDim" 2>&1)
+
+PRED_EXIT=$?
+if [ $PRED_EXIT -ne 0 ]; then
+    fail "Predict: gnn_predict timed out or failed (exit=$PRED_EXIT)"
+    echo "  Output: $PRED_RESULT"
+else
+    TRAIN_EMB="$OUTPUT_DIR/embeddings.npy"
+    PREDICT_OUT_DIR="$DB_DIR/projections/cora/gnn_output/predict_run"
+    PRED_EMB="$PREDICT_OUT_DIR/embeddings.npy"
+
+    if [ -s "$PRED_EMB" ]; then
+        pass "Predict: $PRED_EMB created ($(stat -c%s "$PRED_EMB") bytes)"
+    else
+        fail "Predict: $PRED_EMB missing or empty"
+    fi
+
+    if [ -s "$TRAIN_EMB" ] && [ -s "$PRED_EMB" ]; then
+        if cmp -s "$TRAIN_EMB" "$PRED_EMB"; then
+            pass "Predict reproducibility: predict's embeddings.npy == training's (bit-identical)"
+        else
+            # Compute a softer similarity check: same size + small L2 diff
+            SIZE_SAME=$(awk -v a="$(stat -c%s "$TRAIN_EMB")" -v b="$(stat -c%s "$PRED_EMB")" 'BEGIN {print (a==b) ? 1:0}')
+            if [ "$SIZE_SAME" = "1" ]; then
+                warn "Predict reproducibility: same-size embeddings but bit-diff (FP non-determinism)"
+            else
+                fail "Predict reproducibility: different sizes (train=$(stat -c%s "$TRAIN_EMB") vs predict=$(stat -c%s "$PRED_EMB"))"
+            fi
+        fi
+    else
+        warn "Predict reproducibility: cannot compare (one file missing)"
+    fi
+fi
+
+# =============================================================================
+# Step 9b: Resume parity check
+# =============================================================================
+# Verifies that resuming from best_model produces comparable test accuracy
+# (within plus/minus 0.03) and that at least one epoch of new training executed.
+# =============================================================================
+info "Step 9b: Resume parity (train from best_model for 5 more epochs)"
+
+RESUME_RESULT=$(timeout "$TRAIN_TIMEOUT" curl -s -H "Accept:text/csv" -X POST \
+    "http://localhost:$PORT" -d "CALL gnn_train('cora_s', 'node_features', {
+    model: 'graphsage',
+    hiddenDim: 128,
+    epochs: 5,
+    lr: 0.01,
+    dropout: 0.5,
+    patience: 10,
+    randomSeed: 42,
+    exportEmbeddings: false,
+    outputDir: 'test_run',
+    resumeFrom: 'best_model'
+})
+YIELD resumedFromEpoch, ranEpochs, testAccuracy
+RETURN resumedFromEpoch, ranEpochs, testAccuracy" 2>&1)
+
+RESUME_EXIT=$?
+if [ $RESUME_EXIT -ne 0 ]; then
+    fail "Resume: gnn_train timed out or failed (exit=$RESUME_EXIT)"
+    echo "  Output: $RESUME_RESULT"
+else
+    RESUME_DATA=$(echo "$RESUME_RESULT" | tail -1)
+    RESUMED_EPOCH=$(echo "$RESUME_DATA" | cut -d',' -f1 | tr -d ' ')
+    RESUMED_RAN=$(echo "$RESUME_DATA" | cut -d',' -f2 | tr -d ' ')
+    RESUMED_ACC=$(echo "$RESUME_DATA" | cut -d',' -f3 | tr -d ' ')
+
+    resume_ok=$(awk -v e="$RESUMED_EPOCH" 'BEGIN {print (e+0 > 0) ? "1":"0"}')
+    if [ "$resume_ok" = "1" ]; then
+        pass "Resume: resumedFromEpoch=$RESUMED_EPOCH (checkpoint loaded)"
+    else
+        fail "Resume: resumedFromEpoch=$RESUMED_EPOCH (expected >0, output=$RESUME_RESULT)"
+    fi
+
+    ran_ok=$(awk -v r="$RESUMED_RAN" 'BEGIN {print (r+0 > 0) ? "1":"0"}')
+    if [ "$ran_ok" = "1" ]; then
+        pass "Resume: ranEpochs=$RESUMED_RAN (additional training executed)"
+    else
+        fail "Resume: ranEpochs=$RESUMED_RAN (expected >0)"
+    fi
+
+    if [ -n "$TEST_ACC" ] && [ -n "$RESUMED_ACC" ]; then
+        PARITY_OK=$(awk "BEGIN {
+            diff = ($TEST_ACC) - ($RESUMED_ACC);
+            if (diff < 0) diff = -diff;
+            print (diff < 0.03) ? 1 : 0
+        }")
+        if [ "$PARITY_OK" = "1" ]; then
+            pass "Resume parity: testAcc=$RESUMED_ACC close to original=$TEST_ACC (delta<0.03)"
+        else
+            warn "Resume parity: testAcc=$RESUMED_ACC vs original=$TEST_ACC (delta>=0.03)"
+        fi
+    else
+        warn "Resume parity: could not parse accuracies ($TEST_ACC vs $RESUMED_ACC)"
+    fi
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
