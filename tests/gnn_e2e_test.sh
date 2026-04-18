@@ -1061,6 +1061,100 @@ else
 fi
 
 # =============================================================================
+# Step 10: Model Checkpoint — save/resume/predict/list/delete
+# =============================================================================
+info "Step 10: Model Checkpoint (save/resume/predict/list/delete)"
+
+CKPT_DIR="$DB_DIR/projections/e2e_proj/gnn_output/default/checkpoints"
+
+# 10.1: final_model.pt exists and has non-zero size
+if [ -s "$CKPT_DIR/final_model.pt" ]; then
+    pass "Ckpt: final_model.pt exists ($(stat -c%s "$CKPT_DIR/final_model.pt") bytes)"
+else
+    fail "Ckpt: final_model.pt missing or empty"
+fi
+
+# 10.2: final_model.ckptmeta starts with GNNCKPT magic
+if head -c 8 "$CKPT_DIR/final_model.ckptmeta" 2>/dev/null | grep -q 'GNNCKPT'; then
+    pass "Ckpt: final_model.ckptmeta has GNNCKPT magic"
+else
+    fail "Ckpt: final_model.ckptmeta magic byte check failed"
+fi
+
+# 10.3: best_model.pt exists (training had at least one val improvement)
+if [ -s "$CKPT_DIR/best_model.pt" ]; then
+    pass "Ckpt: best_model.pt exists ($(stat -c%s "$CKPT_DIR/best_model.pt") bytes)"
+else
+    fail "Ckpt: best_model.pt missing or empty"
+fi
+
+# 10.4: gnn_list_checkpoints reports both checkpoints
+LIST_OUT=$(query "CALL gnn_list_checkpoints('e2e_proj', 'default') YIELD basename RETURN basename")
+if echo "$LIST_OUT" | grep -q 'best_model'; then
+    pass "Ckpt: gnn_list_checkpoints yields best_model"
+else
+    fail "Ckpt: gnn_list_checkpoints missing best_model (got: $LIST_OUT)"
+fi
+if echo "$LIST_OUT" | grep -q 'final_model'; then
+    pass "Ckpt: gnn_list_checkpoints yields final_model"
+else
+    fail "Ckpt: gnn_list_checkpoints missing final_model (got: $LIST_OUT)"
+fi
+
+# 10.5: gnn_checkpoint_exists returns true for an existing checkpoint
+EXISTS_OUT=$(query "CALL gnn_checkpoint_exists('e2e_proj', 'default', 'best_model') YIELD exists RETURN exists")
+if echo "$EXISTS_OUT" | grep -q 'true'; then
+    pass "Ckpt: gnn_checkpoint_exists returns true for best_model"
+else
+    fail "Ckpt: gnn_checkpoint_exists expected true (got: $EXISTS_OUT)"
+fi
+
+# 10.6: Resume from best_model reports resumedFromEpoch > 0
+# Must pass matching architecture (hiddenDim) so the checkpoint loader does not
+# reject the resume with an architecture-mismatch error.
+RESUME_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: 2, lr: $LR, weightDecay: $WD, patience: $PATIENCE, outputDir: 'default', resumeFrom: 'best_model', randomSeed: 42}) YIELD resumedFromEpoch, ranEpochs RETURN resumedFromEpoch, ranEpochs")
+RESUME_LINE=$(echo "$RESUME_OUT" | tail -1)
+RESUMED_EPOCH=$(echo "$RESUME_LINE" | cut -d',' -f1 | tr -d ' ')
+resume_ok=$(awk -v e="$RESUMED_EPOCH" 'BEGIN {print (e+0 > 0) ? "1":"0"}')
+if [ "$resume_ok" = "1" ]; then
+    pass "Ckpt: resumedFromEpoch=$RESUMED_EPOCH (>0)"
+else
+    fail "Ckpt: resume failed (resumedFromEpoch=$RESUMED_EPOCH, output=$RESUME_OUT)"
+fi
+
+# 10.7: gnn_predict with best_model reports embeddingDim > 0
+PRED_OUT=$(query "CALL gnn_predict('e2e_sample', 'node_features', 'best_model') YIELD embeddingDim RETURN embeddingDim")
+PRED_LINE=$(echo "$PRED_OUT" | tail -1)
+PRED_DIM=$(echo "$PRED_LINE" | tr -d ' ')
+pred_ok=$(awk -v d="$PRED_DIM" 'BEGIN {print (d+0 > 0) ? "1":"0"}')
+if [ "$pred_ok" = "1" ]; then
+    pass "Ckpt: gnn_predict embeddingDim=$PRED_DIM (>0)"
+else
+    fail "Ckpt: gnn_predict embeddingDim invalid (got: $PRED_OUT)"
+fi
+
+# 10.8: gnn_checkpoint_delete removes both .pt and .ckptmeta
+query "CALL gnn_checkpoint_delete('e2e_proj', 'default', 'final_model') YIELD deleted RETURN deleted" > /dev/null
+if [ ! -e "$CKPT_DIR/final_model.pt" ]; then
+    pass "Ckpt: final_model.pt removed after delete"
+else
+    fail "Ckpt: final_model.pt still present after delete"
+fi
+if [ ! -e "$CKPT_DIR/final_model.ckptmeta" ]; then
+    pass "Ckpt: final_model.ckptmeta removed after delete"
+else
+    fail "Ckpt: final_model.ckptmeta still present after delete"
+fi
+
+# 10.9: gnn_checkpoint_exists returns false after delete (round-trip)
+EXISTS_AFTER=$(query "CALL gnn_checkpoint_exists('e2e_proj', 'default', 'final_model') YIELD exists RETURN exists")
+if echo "$EXISTS_AFTER" | grep -q 'false'; then
+    pass "Ckpt: gnn_checkpoint_exists=false after delete"
+else
+    fail "Ckpt: gnn_checkpoint_exists expected false after delete (got: $EXISTS_AFTER)"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
