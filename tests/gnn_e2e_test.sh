@@ -1115,11 +1115,18 @@ fi
 RESUME_OUT=$(query "CALL gnn_train('e2e_sample', 'node_features', {model: 'graphsage', hiddenDim: $HIDDEN, dropout: $DROPOUT, epochs: 2, lr: $LR, weightDecay: $WD, patience: $PATIENCE, outputDir: 'default', resumeFrom: 'best_model', randomSeed: 42}) YIELD resumedFromEpoch, ranEpochs RETURN resumedFromEpoch, ranEpochs")
 RESUME_LINE=$(echo "$RESUME_OUT" | tail -1)
 RESUMED_EPOCH=$(echo "$RESUME_LINE" | cut -d',' -f1 | tr -d ' ')
+RESUMED_RAN=$(echo "$RESUME_LINE" | cut -d',' -f2 | tr -d ' ')
 resume_ok=$(awk -v e="$RESUMED_EPOCH" 'BEGIN {print (e+0 > 0) ? "1":"0"}')
 if [ "$resume_ok" = "1" ]; then
     pass "Ckpt: resumedFromEpoch=$RESUMED_EPOCH (>0)"
 else
     fail "Ckpt: resume failed (resumedFromEpoch=$RESUMED_EPOCH, output=$RESUME_OUT)"
+fi
+ran_ok=$(awk -v r="$RESUMED_RAN" 'BEGIN {print (r+0 > 0) ? "1":"0"}')
+if [ "$ran_ok" = "1" ]; then
+    pass "Ckpt: resumed ranEpochs=$RESUMED_RAN (>0, resume actually trained)"
+else
+    fail "Ckpt: resumed run ranEpochs=$RESUMED_RAN (expected >0, output=$RESUME_OUT)"
 fi
 
 # 10.7: gnn_predict with best_model reports embeddingDim > 0
