@@ -19,6 +19,7 @@ void GnnCheckpointExistsProcedure::execute(ProcedureContext& ctx) {
     auto projection_name = ctx.get_string_argument(0);
     auto output_dir_name = ctx.get_string_argument(1);
     auto name            = ctx.get_string_argument(2);
+    validate_safe_name(name, "name");
 
     auto ckpt_dir = resolve_checkpoint_dir(projection_name, output_dir_name);
     auto basename = fs::absolute(ckpt_dir / name);
