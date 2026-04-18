@@ -129,6 +129,9 @@ add_library(mdb_gnn_core STATIC
     # Phase 6: GNN Prediction procedure (load checkpoint + inference)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_predict_procedure.cc
 
+    # Phase 6: GNN checkpoint listing procedure
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_list_checkpoints_procedure.cc
+
     # Phase 4: Training Pipeline
     training/label_store.cc
     training/split_store.cc
