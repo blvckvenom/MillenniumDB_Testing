@@ -135,6 +135,12 @@ public:
         CpuCache::Config cpu;
         bool   reorder = true;
         bool   force   = false;
+        // After build() succeeds, delete the non-slim packed/ directory left
+        // over by materialize_batches. This scratch is never read at runtime
+        // (training reads packed_slim/) and on large graphs wastes tens of
+        // GBs. Default true; set to false only for debugging or backward
+        // compatibility with a training path that still reads packed/.
+        bool   cleanup_materialize_scratch = true;
         MinHashReorderer::Config minhash;
     };
 

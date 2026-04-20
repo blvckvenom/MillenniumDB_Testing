@@ -337,6 +337,29 @@ FourLevelStore::BuildResult FourLevelStore::build(
         throw;
     }
 
+    // --- Step 6: Cleanup materialize_batches scratch ---
+    // The non-slim packed/ directory is scratch intermediate: it was written
+    // by gnn_materialize_batches but is NEVER read at runtime (training reads
+    // packed_slim/ instead). On large graphs it can occupy tens of GBs.
+    // Delete it here unless the caller opted out via Config::cleanup_materialize_scratch=false.
+    if (config.cleanup_materialize_scratch) {
+        auto packed_scratch = fs::path(sample_dir) / "packed";
+        if (fs::exists(packed_scratch)) {
+            std::error_code cleanup_ec;
+            auto removed_count = fs::remove_all(packed_scratch, cleanup_ec);
+            if (cleanup_ec) {
+                // Non-fatal: log via cerr but don't abort the build.
+                std::cerr << "FourLevelStore::build: warning, failed to cleanup "
+                          << packed_scratch.string() << ": " << cleanup_ec.message()
+                          << " (you can remove it manually)\n";
+            } else if (removed_count > 0) {
+                std::cout << "  [cleanup] removed " << (removed_count - 1)
+                          << " files from materialize_batches scratch dir "
+                          << packed_scratch.string() << "\n";
+            }
+        }
+    }
+
     auto total_end = std::chrono::high_resolution_clock::now();
     result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         total_end - total_start).count();

@@ -83,6 +83,11 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_bool("force")) {
             config.force = *v;
         }
+        // cleanupIntermediate: delete the non-slim packed/ from materialize_batches
+        // after build succeeds. Default true. Set false only for debugging.
+        if (auto v = opts.get_bool("cleanupIntermediate")) {
+            config.cleanup_materialize_scratch = *v;
+        }
         if (auto v = opts.get_string("strategy")) {
             std::string s = *v;
             std::transform(s.begin(), s.end(), s.begin(), ::toupper);
