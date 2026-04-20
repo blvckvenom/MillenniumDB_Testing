@@ -24,6 +24,18 @@ if(TBB_FOUND)
     target_link_libraries(mdb_gpu PUBLIC TBB::tbb)
 endif()
 
+# Link LZ4 when available so gpu_sort can decompress SpillCodec-encoded
+# spill files (produced by StreamingRecordBuffer). HAS_LZ4 and the LZ4
+# paths are set globally by root CMakeLists.txt. mdb_gpu duplicates the
+# minimal SpillCodec reader logic locally (see src/gpu/sort/gpu_sort.cc
+# read_spill_file) so it can decompress without depending on
+# graph_models/gql/projection/spill_codec.{h,cc} — preserving the "zero
+# MillenniumDB dependencies" rule declared at the top of this file.
+if(LZ4_LIBRARY AND LZ4_INCLUDE_DIR)
+    target_include_directories(mdb_gpu PUBLIC ${LZ4_INCLUDE_DIR})
+    target_link_libraries(mdb_gpu PUBLIC ${LZ4_LIBRARY})
+endif()
+
 # ----------------------------------------------------------------------------
 # Optional CUDA support
 # ----------------------------------------------------------------------------

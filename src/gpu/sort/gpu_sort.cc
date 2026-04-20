@@ -2,10 +2,17 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <vector>
 
 #ifdef HAS_TBB
 #include <execution>
+#endif
+
+#ifdef HAS_LZ4
+#include <lz4frame.h>
 #endif
 
 #ifdef MDB_GPU_ENABLED
@@ -16,23 +23,160 @@ namespace mdb::gpu {
 
 namespace {
 
+// -----------------------------------------------------------------------------
+// Spill file reader compatible with SpillCodec format.
+//
+// Spills produced by StreamingRecordBuffer may be compressed with LZ4 and
+// carry an 8-byte header (magic 'GSPL' + version + compression_type +
+// reserved). Legacy headerless spills are still supported via magic-byte
+// detection. This reader is a LIGHTWEIGHT DUPLICATE of the read half of
+// src/graph_models/gql/projection/spill_codec.{h,cc}; kept independent so
+// the mdb_gpu library stays isolated from graph_models (per the "zero
+// MillenniumDB dependencies" rule documented in src/gpu/CMakeLists.txt and
+// CLAUDE.md).
+//
+// If the SpillCodec format ever evolves, update BOTH this copy and the
+// canonical implementation. The unit tests in spill_codec_test.cc guard
+// round-trip fidelity; a future test should also round-trip through this
+// reader to detect divergence early.
+// -----------------------------------------------------------------------------
+
+constexpr uint32_t SPILL_MAGIC       = 0x4C505347u; // 'GSPL' little-endian
+constexpr uint8_t  SPILL_VERSION     = 1u;
+constexpr size_t   SPILL_HEADER_SIZE = 8u;
+constexpr uint8_t  SPILL_COMP_NONE   = 0u;
+constexpr uint8_t  SPILL_COMP_LZ4    = 1u;
+
 /// Read a binary spill file into the tail of `out`.
-/// Each record is N contiguous uint64_t values (raw, no header).
+/// Each record is N contiguous uint64_t values, either raw (legacy /
+/// header compression=NONE) or LZ4-compressed behind an 8-byte header.
 template<std::size_t N>
 void read_spill_file(const std::string& path, size_t count, std::vector<Record<N>>& out) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         throw std::runtime_error("gpu sort: cannot open spill file: " + path);
     }
-    size_t start = out.size();
-    out.resize(start + count);
-    size_t expected_bytes = count * N * sizeof(uint64_t);
-    file.read(reinterpret_cast<char*>(out.data() + start),
-              static_cast<std::streamsize>(expected_bytes));
-    if (static_cast<size_t>(file.gcount()) != expected_bytes) {
-        out.resize(start);  // roll back
-        throw std::runtime_error("gpu sort: truncated spill file: " + path);
+
+    // Detect SpillCodec header. A legacy file has no magic; fall through to
+    // the raw read path without seeking past the first bytes.
+    uint8_t hdr[SPILL_HEADER_SIZE];
+    file.read(reinterpret_cast<char*>(hdr), SPILL_HEADER_SIZE);
+    const std::streamsize hgot = file.gcount();
+
+    bool    header_ok  = false;
+    uint8_t compression = SPILL_COMP_NONE;
+
+    if (hgot == static_cast<std::streamsize>(SPILL_HEADER_SIZE)) {
+        const uint32_t magic = static_cast<uint32_t>(hdr[0])
+                             | (static_cast<uint32_t>(hdr[1]) << 8)
+                             | (static_cast<uint32_t>(hdr[2]) << 16)
+                             | (static_cast<uint32_t>(hdr[3]) << 24);
+        const uint8_t ver = hdr[4];
+        const uint8_t ct  = hdr[5];
+        if (magic == SPILL_MAGIC && ver == SPILL_VERSION
+            && (ct == SPILL_COMP_NONE || ct == SPILL_COMP_LZ4))
+        {
+            header_ok   = true;
+            compression = ct;
+        }
     }
+
+    if (!header_ok) {
+        // Legacy or corrupt header: rewind and treat as raw.
+        file.clear();
+        file.seekg(0, std::ios::beg);
+        if (!file) {
+            throw std::runtime_error("gpu sort: cannot rewind spill file: " + path);
+        }
+    }
+
+    const size_t start           = out.size();
+    const size_t expected_bytes  = count * N * sizeof(uint64_t);
+    out.resize(start + count);
+    uint8_t* dst = reinterpret_cast<uint8_t*>(out.data() + start);
+
+    if (compression == SPILL_COMP_NONE) {
+        file.read(reinterpret_cast<char*>(dst),
+                  static_cast<std::streamsize>(expected_bytes));
+        if (static_cast<size_t>(file.gcount()) != expected_bytes) {
+            out.resize(start); // roll back
+            throw std::runtime_error("gpu sort: truncated spill file: " + path);
+        }
+        return;
+    }
+
+    // LZ4-compressed path.
+#ifdef HAS_LZ4
+    LZ4F_dctx*       ctx = nullptr;
+    LZ4F_errorCode_t err = LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION);
+    if (LZ4F_isError(err)) {
+        out.resize(start);
+        throw std::runtime_error(
+            std::string("gpu sort: LZ4F_createDecompressionContext failed: ") +
+            LZ4F_getErrorName(err));
+    }
+
+    constexpr size_t IN_BUF_SIZE = 64 * 1024;
+    std::vector<uint8_t> in_buf(IN_BUF_SIZE);
+    size_t               total_out = 0;
+    bool                 eof_reached = false;
+
+    while (total_out < expected_bytes) {
+        file.read(reinterpret_cast<char*>(in_buf.data()),
+                  static_cast<std::streamsize>(in_buf.size()));
+        std::streamsize got = file.gcount();
+        if (got <= 0) {
+            eof_reached = true;
+            got = 0;
+        }
+
+        size_t src_pos = 0;
+        const size_t src_end = static_cast<size_t>(got);
+        do {
+            size_t src_size = src_end - src_pos;
+            size_t dst_size = expected_bytes - total_out;
+            size_t hint = LZ4F_decompress(ctx,
+                                          dst + total_out, &dst_size,
+                                          in_buf.data() + src_pos, &src_size,
+                                          nullptr);
+            if (LZ4F_isError(hint)) {
+                LZ4F_freeDecompressionContext(ctx);
+                out.resize(start);
+                throw std::runtime_error(
+                    std::string("gpu sort: LZ4F_decompress failed: ") +
+                    LZ4F_getErrorName(hint));
+            }
+            src_pos   += src_size;
+            total_out += dst_size;
+
+            if (dst_size == 0 && src_size == 0) {
+                // No forward progress; break to avoid infinite loop.
+                break;
+            }
+            if (hint == 0 && total_out == expected_bytes) {
+                // Frame complete and we have everything we asked for.
+                break;
+            }
+        } while (src_pos < src_end && total_out < expected_bytes);
+
+        if (eof_reached) break;
+    }
+
+    LZ4F_freeDecompressionContext(ctx);
+
+    if (total_out != expected_bytes) {
+        out.resize(start);
+        throw std::runtime_error(
+            "gpu sort: LZ4 decompress truncated (got " + std::to_string(total_out)
+            + " of " + std::to_string(expected_bytes) + " bytes) in " + path);
+    }
+#else
+    // Compressed spill encountered but the build lacks LZ4 support.
+    out.resize(start);
+    throw std::runtime_error(
+        "gpu sort: encountered LZ4-compressed spill but this build has no LZ4 "
+        "support (rebuild with liblz4-dev). File: " + path);
+#endif
 }
 
 /// Sort in-place and stream every record through the callback.
