@@ -82,6 +82,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 0 — OS detection + persistent log directory
+# ---------------------------------------------------------------------------
+log_step "Step 0: OS detection + log directory"
+
+# Detect Linux distribution + version; some package names vary per release
+# (notably openjdk-21 is not in Ubuntu 22.04 by default, only 24.04+).
+OS_ID="unknown"
+OS_VERSION_ID="unknown"
+if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION_ID="${VERSION_ID:-unknown}"
+fi
+
+case "${OS_ID}:${OS_VERSION_ID}" in
+    ubuntu:24.*|ubuntu:25.*|pop:24.*|pop:25.*|debian:13|debian:trixie|debian:sid)
+        JDK_PKG="openjdk-21-jdk"
+        ;;
+    ubuntu:22.*|ubuntu:23.*|pop:22.*|pop:23.*|debian:12|debian:bookworm)
+        JDK_PKG="openjdk-17-jdk"
+        ;;
+    *)
+        JDK_PKG="default-jdk"
+        log_warn "Unrecognized OS (${OS_ID} ${OS_VERSION_ID}); falling back to default-jdk"
+        ;;
+esac
+log_ok "OS: ${OS_ID} ${OS_VERSION_ID}, JDK package: ${JDK_PKG}"
+
+# Central log directory — cmake configure/build outputs tee here for post-
+# mortem when the script is long-running and stdout is scrolled past.
+LOG_DIR="/tmp/mdb-onboard-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$LOG_DIR"
+log_ok "Log dir: $LOG_DIR"
+
+# ---------------------------------------------------------------------------
 # Step 1 — Detect GPU and resolve stack versions
 # ---------------------------------------------------------------------------
 log_step "Step 1: GPU detection"
@@ -157,7 +193,7 @@ if [ "$RESUME" -eq 0 ]; then
         libssl-dev libncurses-dev less
         python3 python3-venv python3-pip
         libicu-dev libtbb-dev liburing-dev
-        openjdk-21-jdk zsh unzip wget curl ca-certificates
+        "$JDK_PKG" zsh unzip wget curl ca-certificates
         clangd nodejs npm
         pciutils build-essential
     )
@@ -173,6 +209,29 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$ENABLE_GPU" -eq 1 ] && [ "$SKIP_DRIVER" -eq 0 ] && [ "$RESUME" -eq 0 ]; then
     log_step "Step 3: NVIDIA driver + CUDA Toolkit $CUDA_VER_SHORT"
+
+    # Secure Boot + NVIDIA DKMS is the #1 cause of "driver installs OK but
+    # nvidia-smi fails post-reboot" on fresh UEFI workstations. Warn loudly
+    # — the user must either disable SB in UEFI, or enroll the MOK key when
+    # the driver install prompts for a passphrase (MokManager screen on
+    # next boot). Without one of those, the kernel refuses to load the
+    # unsigned nvidia.ko and every CUDA call fails silently.
+    if command -v mokutil >/dev/null 2>&1; then
+        SB_STATE="$(mokutil --sb-state 2>/dev/null | head -1 || echo unknown)"
+        if echo "$SB_STATE" | grep -qi enabled; then
+            log_warn "Secure Boot is ENABLED."
+            log_warn "  NVIDIA DKMS will build the module but not sign it."
+            log_warn "  After reboot, nvidia-smi may fail until you:"
+            log_warn "    a) disable Secure Boot in UEFI firmware, OR"
+            log_warn "    b) enroll the MOK key — when dpkg asks for a passphrase"
+            log_warn "       during driver install, remember it; on next boot"
+            log_warn "       MokManager appears and you enroll it with that passphrase."
+        else
+            log_ok "Secure Boot: $SB_STATE"
+        fi
+    else
+        log_info "mokutil not installed; cannot check Secure Boot state"
+    fi
 
     DRIVER_OK=0
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -q >/dev/null 2>&1; then
@@ -391,8 +450,11 @@ if [ "$ENABLE_GPU" -eq 0 ]; then
     CMAKE_FLAGS+=(-D CMAKE_DISABLE_FIND_PACKAGE_CUDAToolkit=ON)
 fi
 
-cmake -B build/Release "${CMAKE_FLAGS[@]}"
-cmake --build build/Release -j "$(nproc)"
+# Tee cmake output: visible live AND persisted to $LOG_DIR for post-hoc
+# review. `set -o pipefail` (line 23) makes the pipeline fail if cmake
+# fails, so tee doesn't swallow compiler errors.
+cmake -B build/Release "${CMAKE_FLAGS[@]}" 2>&1 | tee "$LOG_DIR/cmake-configure.log"
+cmake --build build/Release -j "$(nproc)" 2>&1 | tee "$LOG_DIR/cmake-build.log"
 
 # Generate compile_commands.json symlink for clangd/cclsp
 ln -sf build/Release/compile_commands.json "$MDB_HOME/compile_commands.json"
