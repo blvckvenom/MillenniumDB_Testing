@@ -235,6 +235,7 @@ set(TEST_TARGETS
     # project_procedure_test  # DISABLED: needs ProcedureContext updates
     projection_storage_test
     projection_features_test
+    spill_codec_test
     # property_projection_test  # DISABLED: needs pre-imported test database
     regular_path_expr_to_rpq_dfa
     scsu-test
