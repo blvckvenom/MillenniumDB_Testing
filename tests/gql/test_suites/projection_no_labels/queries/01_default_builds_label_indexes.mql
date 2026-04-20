@@ -1,0 +1,7 @@
+// Baseline: config map present but WITHOUT includeLabelIndexes key.
+// Expected behavior (unchanged from pre-change): label indexes are built,
+// and a label-based query on the projection uses them. This guards against
+// accidentally flipping the default to false.
+CALL graph_project('proj_default', 'User', 'KNOWS', {orientation: 'NATURAL'})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

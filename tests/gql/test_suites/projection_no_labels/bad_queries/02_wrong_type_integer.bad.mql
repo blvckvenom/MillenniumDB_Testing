@@ -1,0 +1,8 @@
+// Type-checking contract: includeLabelIndexes must be a BOOL. Passing
+// an integer (or any non-boolean) must throw runtime_error at parse time
+// with the message "Configuration value for 'includeLabelIndexes' must be
+// a boolean". Protects against user typos and silent acceptance of wrong
+// types that would otherwise default to truthy (e.g. a naive C++ cast).
+CALL graph_project('bad_int', 'User', 'KNOWS', {includeLabelIndexes: 1})
+YIELD graphName
+RETURN graphName

@@ -1,0 +1,8 @@
+// Uses proj_no_labels from test 03. Edge traversal without type filter uses
+// the from_to_edge B+Tree (Record<3>), which is one of the 5 "required"
+// indexes - always built regardless of includeLabelIndexes. This confirms
+// that GNN sampling (which traverses edges without filtering by type)
+// remains fully functional on label-free projections.
+USE proj_no_labels
+MATCH (n)-[e]->(m)
+RETURN count(*) AS total_edges
