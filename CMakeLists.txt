@@ -101,6 +101,35 @@ else()
     message(STATUS "macOS detected - using preadv fallback for async I/O")
 endif()
 
+# ============================================================================
+# Optional: LZ4 for transparent spill file compression
+# ============================================================================
+# LZ4 compresses external-sort spill files during projection build.
+# Sorted uint64 tuples (graph edges) achieve 3-5× ratio in practice,
+# cutting peak disk on billion-scale projections (papers100M, MAG240M).
+# Decompression is faster than memcpy so reads stay I/O-bound — compression
+# is effectively free. Transparent: does not affect B+Tree layout, query
+# paths, or persisted projection data.
+#
+# Install on Ubuntu/Debian: sudo apt install liblz4-dev
+#
+# See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md §3.B
+# ============================================================================
+set(LZ4_LIBS "")
+find_library(LZ4_LIBRARY NAMES lz4)
+find_path(LZ4_INCLUDE_DIR lz4frame.h)
+
+if(LZ4_LIBRARY AND LZ4_INCLUDE_DIR)
+    message(STATUS "Found LZ4: ${LZ4_LIBRARY}")
+    message(STATUS "  Transparent spill compression enabled (3-5× disk savings)")
+    add_definitions(-DHAS_LZ4)
+    include_directories(${LZ4_INCLUDE_DIR})
+    set(LZ4_LIBS ${LZ4_LIBRARY})
+else()
+    message(STATUS "LZ4 not found - spill files will be written uncompressed")
+    message(STATUS "  Install liblz4-dev for 3-5× smaller spill files")
+endif()
+
 # Define the compiler flags
 set(CMAKE_CXX_FLAGS "-Wall -Wextra -pedantic -Wno-deprecated -pthread -march=native -funroll-loops")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g3 -fsanitize=undefined,address -fno-omit-frame-pointer")
@@ -226,6 +255,7 @@ foreach(target ${BUILD_TARGETS})
         ${NCURSES}
         ${ASYNC_IO_LIBS}
         ${TBB_LIBS}
+        ${LZ4_LIBS}
     )
     # Link GNN module and LibTorch when enabled
     if(ENABLE_GNN)
@@ -246,6 +276,7 @@ foreach(target ${TEST_TARGETS})
         ${ICU_LIBRARIES}
         ${ASYNC_IO_LIBS}
         ${TBB_LIBS}
+        ${LZ4_LIBS}
     )
     # Link GNN module and LibTorch when enabled
     if(ENABLE_GNN)
