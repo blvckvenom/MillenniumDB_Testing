@@ -139,6 +139,32 @@ execute_root_batch() {
         return 0
     fi
 
+    # Explicit warning so the user knows the password prompt coming up
+    # expects the ADMINISTRATOR's password, not their own. Critical in
+    # shared workstations where the user running the script has no sudo
+    # and an admin is physically present to authenticate.
+    local cmd_count
+    cmd_count="$(grep -cE '^# --- ' "$ROOT_BATCH_FILE")"
+    echo ""
+    echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}${BOLD}  ADMINISTRATOR PASSWORD REQUIRED${NC}"
+    echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  A GUI authentication dialog is about to appear on screen."
+    echo "  It asks for the ADMINISTRATOR's password — NOT ${USER:-the"
+    echo "  current user}'s password."
+    echo ""
+    echo "  If you are NOT the administrator of this workstation:"
+    echo "    - hand the keyboard to whoever is, OR"
+    echo "    - ask them to type their password in the dialog now."
+    echo ""
+    echo "  The one prompt covers $cmd_count root operations listed above."
+    echo "  After authentication, admin is NOT needed again for the rest"
+    echo "  of the onboarding run."
+    echo ""
+    echo -e "${YELLOW}  ⏳ Waiting for password...${NC}"
+    echo ""
+
     # Real execution. tee stdout+stderr to a log file alongside the batch
     # so we can read what happened after the fact (e.g. if admin closed the
     # terminal window early).
