@@ -16,8 +16,14 @@
 #   scripts/onboard.sh --skip-driver    # assume NVIDIA driver + CUDA are already installed
 #   scripts/onboard.sh --skip-tests     # don't run ./scripts/run-tests at the end
 #   scripts/onboard.sh --resume         # skip apt+driver phase (for use after reboot)
+#   scripts/onboard.sh --dry-run        # show root commands that WOULD run, skip pkexec
 #
 # Idempotent: every step checks its own completion marker and skips if already done.
+#
+# Privilege model:
+#   All root-requiring commands are accumulated into a single batch script and
+#   invoked with ONE pkexec call (ONE admin password prompt for the whole run).
+#   Use --dry-run to preview the batch contents without authenticating.
 # ============================================================================
 
 set -euo pipefail
@@ -29,6 +35,7 @@ GPU_CHOICE="auto"
 SKIP_DRIVER=0
 SKIP_TESTS=0
 RESUME=0
+DRY_RUN=0
 for arg in "$@"; do
     case "$arg" in
         --gpu=*)        GPU_CHOICE="${arg#*=}" ;;
@@ -36,8 +43,9 @@ for arg in "$@"; do
         --skip-driver)  SKIP_DRIVER=1 ;;
         --skip-tests)   SKIP_TESTS=1 ;;
         --resume)       RESUME=1 ;;
+        --dry-run)      DRY_RUN=1 ;;
         -h|--help)
-            grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | head -25
+            grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | head -30
             exit 0
             ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
@@ -60,6 +68,83 @@ log_warn()  { echo -e "  ${YELLOW}⚠${NC} $*"; }
 log_err()   { echo -e "  ${RED}✗${NC} $*" >&2; }
 log_info()  { echo -e "  ${BLUE}ℹ${NC} $*"; }
 die()       { log_err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Root-command batching
+# ---------------------------------------------------------------------------
+# All root-requiring commands go into a single batch script that is invoked
+# once with pkexec/sudo. Admin types their password a single time regardless
+# of how many individual apt/install/symlink operations the script needs.
+#
+# Each queue_root call appends a command + a human-readable log marker to
+# the batch file. execute_root_batch then invokes the batch under $PRIV.
+# If the batch file is empty (nothing was queued), execute_root_batch is a
+# no-op — so on --resume or idempotent re-runs where all root work is
+# already done, no prompt is shown.
+# ---------------------------------------------------------------------------
+
+ROOT_BATCH_FILE=""  # Populated by init_root_batch after LOG_DIR exists.
+
+init_root_batch() {
+    ROOT_BATCH_FILE="$LOG_DIR/root-phase.sh"
+    cat > "$ROOT_BATCH_FILE" << 'BATCH_HDR'
+#!/usr/bin/env bash
+# Auto-generated batch script. Runs under pkexec/sudo as root.
+# Each command is prefixed by a ">>> <label>" echo for traceability.
+set -euo pipefail
+echo "=== MillenniumDB root batch starting (uid=$(id -u), $(date)) ==="
+BATCH_HDR
+    chmod +x "$ROOT_BATCH_FILE"
+}
+
+# queue_root "<human label>" -- <shell command...>
+# The command is stored verbatim; $LOG_DIR and $MDB_HOME are resolved
+# by the parent shell, so the batch file contains absolute paths.
+queue_root() {
+    local label="$1"; shift
+    {
+        echo ""
+        echo "# --- $label ---"
+        printf 'echo ">>> %s"\n' "$label"
+        printf '%s\n' "$*"
+    } >> "$ROOT_BATCH_FILE"
+}
+
+execute_root_batch() {
+    local label="${1:-pre-reboot root phase}"
+
+    # Empty batch (only the header stub) → nothing queued → no prompt needed.
+    # Header is ~4 lines; any queue_root adds at least 4 more lines.
+    if [ ! -f "$ROOT_BATCH_FILE" ] || [ "$(wc -l < "$ROOT_BATCH_FILE")" -le 6 ]; then
+        log_info "No root commands queued — skipping pkexec prompt"
+        return 0
+    fi
+
+    log_step "Root batch: $label"
+    log_info "The following commands will run as root under ONE pkexec prompt:"
+    grep -E '^# --- ' "$ROOT_BATCH_FILE" | sed 's/^# --- /    - /; s/ ---$//'
+    log_info "Full batch script: $ROOT_BATCH_FILE"
+    log_info "Admin can inspect it before typing the password."
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_warn "[DRY RUN] Skipping '$PRIV bash $ROOT_BATCH_FILE'"
+        log_warn "[DRY RUN] Full batch contents below:"
+        echo "───────────────── batch script begin ─────────────────"
+        cat "$ROOT_BATCH_FILE"
+        echo "────────────────── batch script end ──────────────────"
+        return 0
+    fi
+
+    # Real execution. tee stdout+stderr to a log file alongside the batch
+    # so we can read what happened after the fact (e.g. if admin closed the
+    # terminal window early).
+    local batch_log="${ROOT_BATCH_FILE}.log"
+    if $PRIV bash "$ROOT_BATCH_FILE" 2>&1 | tee "$batch_log"; then
+        log_ok "Root batch completed (log: $batch_log)"
+    else
+        die "Root batch failed — see $batch_log for details"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -116,6 +201,14 @@ log_ok "OS: ${OS_ID} ${OS_VERSION_ID}, JDK package: ${JDK_PKG}"
 LOG_DIR="/tmp/mdb-onboard-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$LOG_DIR"
 log_ok "Log dir: $LOG_DIR"
+
+# Initialize the root-commands batch file. queue_root appends to it from
+# Steps 2, 3, 7; execute_root_batch runs the whole thing at the end of the
+# root-needing phase.
+init_root_batch
+log_ok "Root batch file initialized: $ROOT_BATCH_FILE"
+
+[ "$DRY_RUN" -eq 1 ] && log_warn "DRY RUN mode: no pkexec/sudo will be invoked"
 
 # ---------------------------------------------------------------------------
 # Step 1 — Detect GPU and resolve stack versions
@@ -187,7 +280,7 @@ log_ok "Stack selected: GPU=$GPU_CHOICE, LibTorch=$LIBTORCH_EXPECTED, CUDA=${CUD
 # Step 2 — APT packages
 # ---------------------------------------------------------------------------
 if [ "$RESUME" -eq 0 ]; then
-    log_step "Step 2: APT system packages"
+    log_step "Step 2: APT system packages (queued)"
     APT_PKGS=(
         git g++ cmake make pkg-config
         libssl-dev libncurses-dev less
@@ -197,9 +290,10 @@ if [ "$RESUME" -eq 0 ]; then
         clangd nodejs npm
         pciutils build-essential
     )
-    $PRIV apt-get update
-    $PRIV apt-get install -y "${APT_PKGS[@]}"
-    log_ok "APT packages installed"
+    queue_root "apt-get update" "apt-get update"
+    queue_root "apt-get install ${#APT_PKGS[@]} packages (git, g++, cmake, $JDK_PKG, ...)" \
+        "apt-get install -y ${APT_PKGS[*]}"
+    log_ok "APT commands queued for root batch"
 else
     log_info "Skipping APT phase (--resume)"
 fi
@@ -233,11 +327,15 @@ if [ "$ENABLE_GPU" -eq 1 ] && [ "$SKIP_DRIVER" -eq 0 ] && [ "$RESUME" -eq 0 ]; t
         log_info "mokutil not installed; cannot check Secure Boot state"
     fi
 
+    # Flag: will be set to 1 if we're installing a driver this run. The
+    # reboot checkpoint at the end of the script fires only when this is 1.
+    NEEDS_REBOOT=0
+
+    # --- Driver check + queue ---
     DRIVER_OK=0
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -q >/dev/null 2>&1; then
         CURRENT_DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
         log_info "Current driver: $CURRENT_DRIVER"
-        # Compare major version against required (570 for 5070, 550 for 4070)
         REQUIRED_MAJOR="${DRIVER_PKG##*-}"
         CURRENT_MAJOR="${CURRENT_DRIVER%%.*}"
         if [ "$CURRENT_MAJOR" -ge "$REQUIRED_MAJOR" ]; then
@@ -247,41 +345,87 @@ if [ "$ENABLE_GPU" -eq 1 ] && [ "$SKIP_DRIVER" -eq 0 ] && [ "$RESUME" -eq 0 ]; t
     fi
 
     if [ "$DRIVER_OK" -eq 0 ]; then
-        log_info "Installing $DRIVER_PKG (reboot required after this step)"
-        $PRIV apt-get install -y "$DRIVER_PKG" nvidia-utils-"${DRIVER_PKG##*-}"
-        log_warn "Driver installed. REBOOT and re-run: $0 --resume --gpu=$GPU_CHOICE"
-        touch "$MDB_HOME/.onboard_needs_reboot"
-        exit 0
+        log_info "Queueing $DRIVER_PKG for install (reboot will be required)"
+        queue_root "install NVIDIA driver $DRIVER_PKG" \
+            "apt-get install -y $DRIVER_PKG nvidia-utils-${DRIVER_PKG##*-}"
+        NEEDS_REBOOT=1
     fi
 
-    if [ -f "$MDB_HOME/.onboard_needs_reboot" ]; then
-        rm "$MDB_HOME/.onboard_needs_reboot"
-    fi
-
-    # CUDA Toolkit check
+    # --- CUDA Toolkit pre-download (as user, no root) + queue install ---
     CUDA_INSTALL_DIR="/usr/local/cuda-$CUDA_VER_SHORT"
     if [ -d "$CUDA_INSTALL_DIR" ] && [ -x "$CUDA_INSTALL_DIR/bin/nvcc" ]; then
         log_ok "CUDA Toolkit $CUDA_VER_SHORT already installed at $CUDA_INSTALL_DIR"
     else
-        log_info "Downloading CUDA Toolkit $CUDA_VER installer"
-        cd /tmp
         CUDA_RUN="$(basename "$CUDA_RUN_URL")"
-        [ -f "$CUDA_RUN" ] || wget -q --show-progress "$CUDA_RUN_URL"
-        log_info "Installing CUDA Toolkit (silent, toolkit-only, no driver)"
-        $PRIV sh "$CUDA_RUN" --toolkit --silent --override --no-opengl-libs
-        cd "$MDB_HOME"
-        log_ok "CUDA Toolkit $CUDA_VER_SHORT installed"
+        CUDA_RUN_PATH="/tmp/$CUDA_RUN"
+        if [ ! -f "$CUDA_RUN_PATH" ]; then
+            log_info "Downloading CUDA Toolkit $CUDA_VER installer (as user)"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log_warn "[DRY RUN] Would wget $CUDA_RUN_URL to $CUDA_RUN_PATH"
+            else
+                cd /tmp
+                wget -q --show-progress "$CUDA_RUN_URL"
+                cd "$MDB_HOME"
+            fi
+        else
+            log_ok "CUDA installer already cached at $CUDA_RUN_PATH"
+        fi
+        log_info "Queueing CUDA Toolkit install (toolkit-only, no driver, silent)"
+        queue_root "install CUDA Toolkit $CUDA_VER_SHORT from $CUDA_RUN_PATH" \
+            "sh $CUDA_RUN_PATH --toolkit --silent --no-opengl-libs"
     fi
 
-    # Symlink /usr/local/cuda -> /usr/local/cuda-X.Y
-    if [ ! -L /usr/local/cuda ] || [ "$(readlink /usr/local/cuda)" != "cuda-$CUDA_VER_SHORT" ]; then
-        $PRIV ln -sfn "cuda-$CUDA_VER_SHORT" /usr/local/cuda
-        log_ok "Symlinked /usr/local/cuda -> cuda-$CUDA_VER_SHORT"
-    fi
+    # --- CUDA symlink queue (idempotent on execution) ---
+    # We queue unconditionally; the batched shell re-checks and no-ops if
+    # the symlink already points where we want. Cheap, always correct.
+    queue_root "symlink /usr/local/cuda -> cuda-$CUDA_VER_SHORT" \
+        "ln -sfn cuda-$CUDA_VER_SHORT /usr/local/cuda"
+
 elif [ "$ENABLE_GPU" -eq 0 ]; then
     log_info "Skipping GPU stack (--no-gpu or no NVIDIA detected)"
+    NEEDS_REBOOT=0
 else
-    log_info "Skipping driver install (--skip-driver or --resume)"
+    log_info "Skipping driver/CUDA queueing (--skip-driver or --resume)"
+    NEEDS_REBOOT=0
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3b — ANTLR4 jar queue (root-owned, grouped with Step 3 for batching)
+# ---------------------------------------------------------------------------
+# Moved here from the old Step 7 position so that ALL root-requiring
+# operations queue BEFORE the execute_root_batch call below. That keeps
+# the contract "queue everything, then one pkexec prompt, then user ops".
+log_step "Step 3b: ANTLR4 jar (optional, for grammar regeneration)"
+ANTLR_JAR="/usr/local/lib/antlr-4.13.1-complete.jar"
+ANTLR_URL="https://www.antlr.org/download/antlr-4.13.1-complete.jar"
+if [ -f "$ANTLR_JAR" ]; then
+    log_ok "ANTLR4 jar present at $ANTLR_JAR"
+else
+    log_info "Queueing ANTLR 4.13.1 jar download for root batch"
+    queue_root "download ANTLR 4.13.1 jar to $ANTLR_JAR" \
+        "mkdir -p $(dirname "$ANTLR_JAR") && curl -fsSL -o $ANTLR_JAR $ANTLR_URL"
+fi
+
+# ---------------------------------------------------------------------------
+# Root batch execution — the ONE pkexec prompt for the whole onboarding.
+# After this, no more root operations are needed; remaining steps (Boost,
+# LibTorch, venvs, build, tests) all run as the invoking user.
+# ---------------------------------------------------------------------------
+execute_root_batch "Install APT packages + NVIDIA driver + CUDA Toolkit + ANTLR jar"
+
+# In DRY-RUN mode, stop here. The subsequent user-phase steps (Boost,
+# LibTorch, venvs, cmake build) perform filesystem mutations on the
+# user's home directory — they are NOT wrapped under DRY_RUN and would
+# execute for real. Exit early so a dry-run preview is side-effect-free.
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo ""
+    log_step "DRY RUN summary"
+    log_info "Root phase: previewed above (one pkexec prompt, batch contents shown)."
+    log_info "Remaining steps (Boost, LibTorch, venvs, cmake build, tests) would"
+    log_info "run as \$USER without further privilege prompts; they are skipped"
+    log_info "here to avoid any filesystem mutations."
+    log_ok  "DRY RUN complete. No system changes were made."
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -367,19 +511,9 @@ else
 fi
 cd "$MDB_HOME"
 
-# ---------------------------------------------------------------------------
-# Step 7 — ANTLR4 jar (only needed to regenerate parsers; optional)
-# ---------------------------------------------------------------------------
-log_step "Step 7: ANTLR4 jar (optional, for grammar regeneration)"
-ANTLR_JAR="/usr/local/lib/antlr-4.13.1-complete.jar"
-if [ -f "$ANTLR_JAR" ]; then
-    log_ok "ANTLR4 jar present at $ANTLR_JAR"
-else
-    $PRIV curl -fsSL -o "$ANTLR_JAR" \
-        https://www.antlr.org/download/antlr-4.13.1-complete.jar \
-        && log_ok "ANTLR4 jar installed" \
-        || log_warn "Failed to install ANTLR jar (skipping — only needed if you edit .g4 grammars)"
-fi
+# Step 7 (ANTLR jar queueing) was moved up into Step 3b so that all root
+# operations queue before execute_root_batch. The root batch + DRY-RUN exit
+# now live directly after Step 3b. Nothing to do at this position.
 
 # ---------------------------------------------------------------------------
 # Step 8 — Python test venvs
@@ -468,6 +602,42 @@ fi
 # ---------------------------------------------------------------------------
 # Step 11 — Validate GNN environment + run tests
 # ---------------------------------------------------------------------------
+# If the driver was freshly installed this run, the kernel module is NOT
+# yet loaded. nvidia-smi will fail and CUDA tests will segfault. Skip
+# validation + tests here, emit reboot checkpoint, and exit 0. The user
+# reboots and re-runs with --resume to reach this point again with
+# NEEDS_REBOOT=0, which then runs the tests.
+if [ "${NEEDS_REBOOT:-0}" -eq 1 ]; then
+    touch "$MDB_HOME/.onboard_needs_reboot"
+    echo ""
+    echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}${BOLD}  Build complete, REBOOT REQUIRED before tests${NC}"
+    echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  The NVIDIA driver was freshly installed. It requires a reboot"
+    echo "  to load the kernel module before tests can exercise the GPU."
+    echo ""
+    echo "  Next steps:"
+    echo "    sudo reboot"
+    echo "    # after login:"
+    echo "    cd $MDB_HOME && ./scripts/onboard.sh --resume --gpu=$GPU_CHOICE"
+    echo ""
+    if command -v mokutil >/dev/null 2>&1 && \
+       mokutil --sb-state 2>/dev/null | head -1 | grep -qi enabled; then
+        echo -e "${YELLOW}  NOTE: Secure Boot is enabled. During this boot, the MokManager"
+        echo -e "        screen may appear asking to enroll the MOK key. Use the"
+        echo -e "        passphrase you set during driver install.${NC}"
+        echo ""
+    fi
+    exit 0
+fi
+
+# Consume the reboot marker if we're resuming after a driver install.
+if [ -f "$MDB_HOME/.onboard_needs_reboot" ]; then
+    rm -f "$MDB_HOME/.onboard_needs_reboot"
+    log_ok "Reboot marker consumed — driver should now be loaded"
+fi
+
 log_step "Step 11: Validation"
 if [ -x "$MDB_HOME/scripts/validate-gnn-environment.sh" ]; then
     bash "$MDB_HOME/scripts/validate-gnn-environment.sh" || \
@@ -492,6 +662,7 @@ echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "  Binary:   $MDB_HOME/build/Release/bin/mdb help"
 echo "  Stack:    LibTorch=$LIBTORCH_EXPECTED, GPU=$GPU_CHOICE"
+echo "  Logs:     $LOG_DIR/"
 echo ""
 echo "  Next steps:"
 echo "    source ~/.bashrc               # reload env in new shells"
