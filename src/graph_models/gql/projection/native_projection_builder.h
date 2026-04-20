@@ -305,6 +305,16 @@ public:
      * @param include_features GNN feature matrix name (empty = disabled)
      * @param label_property GNN classification label property (empty = disabled)
      * @param split_property GNN train/val/test split property (empty = disabled)
+     * @param include_label_indexes If true (default, matches Neo4j GDS), builds
+     *        node_label + label_node + edge_label + label_edge B+Tree indexes
+     *        so `MATCH (n:Label)` queries on the projection use O(log n)
+     *        lookups. Set to false to skip those 4 indexes when the workload
+     *        doesn't query by label (e.g. pure GNN training), saving
+     *        significant disk (~50 GB peak on papers100M) and build time.
+     *        Queries that require labels on a projection built with
+     *        include_label_indexes=false will throw QueryException with a
+     *        message suggesting re-creation.
+     *        See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md §3.A.
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -321,7 +331,8 @@ public:
         const std::unordered_map<std::string, PropertyConfig>& edge_property_configs = {},
         const std::string& include_features = "",
         const std::string& label_property = "",
-        const std::string& split_property = ""
+        const std::string& split_property = "",
+        bool include_label_indexes = true
     );
 
     ~NativeProjectionBuilder();
@@ -382,6 +393,11 @@ private:
     std::string include_features_;
     std::string label_property_;
     std::string split_property_;
+
+    // Opt-in flag (default true) controlling whether label indexes are built.
+    // Kept as a builder member so the decision propagates to features
+    // initialization in ctor body without re-reading the constructor arg.
+    bool include_label_indexes_ = true;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
     std::unordered_map<std::string, Orientation> per_type_orientations;

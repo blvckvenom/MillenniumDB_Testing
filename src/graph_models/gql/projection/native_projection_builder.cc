@@ -96,7 +96,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     const std::unordered_map<std::string, PropertyConfig>& edge_property_configs,
     const std::string& include_features,
     const std::string& label_property,
-    const std::string& split_property
+    const std::string& split_property,
+    bool include_label_indexes
 )
     : projection_name(projection_name_)
     , db_folder(db_folder_)
@@ -110,6 +111,7 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     , include_features_(include_features)
     , label_property_(label_property)
     , split_property_(split_property)
+    , include_label_indexes_(include_label_indexes)
     , per_type_orientations(type_orientations)
     , per_type_aggregations(type_aggregations)
     , per_type_agg_properties(type_agg_properties)
@@ -131,8 +133,12 @@ NativeProjectionBuilder::NativeProjectionBuilder(
         }
     }
     features.include_edge_properties = !edge_property_keys.empty() || has_count_aggregation;
-    features.include_node_labels = true;  // Always include node labels (automatic, like Neo4j GDS)
-    features.include_edge_labels = true;  // Always include edge labels (automatic, like Neo4j GDS)
+    // Default (Neo4j-GDS parity) is to always build node+edge label indexes.
+    // The opt-out (`includeLabelIndexes: false` in graph_project config) skips
+    // those 4 indexes when the workload has no `MATCH (n:Label)` queries
+    // — e.g. pure GNN training on the projection. See analysis doc §3.A.
+    features.include_node_labels = include_label_indexes_;
+    features.include_edge_labels = include_label_indexes_;
 
     // Initialize projection storage with features
     storage = std::make_unique<ProjectionStorage>(proj_dir, db_folder, projection_name, features);

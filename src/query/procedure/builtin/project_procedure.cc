@@ -115,6 +115,12 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     std::string label_property;
     std::string split_property;
 
+    // Disk-cost opt-out: when false, the projection skips the four label
+    // B+Tree indexes (node_label, label_node, edge_label, label_edge).
+    // Default true preserves Neo4j-GDS parity and existing behavior. See
+    // analysis doc §3.A for the rationale and safety analysis.
+    bool include_label_indexes = true;
+
     // Keep config_holder alive so config_dict pointer remains valid
     std::unique_ptr<Dictionary> config_holder;
     DictionaryObject* config_dict = nullptr;
@@ -144,6 +150,23 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         include_features = get_string_from_dict(config_dict, "includeFeatures", "");
         label_property   = get_string_from_dict(config_dict, "labelProperty", "");
         split_property   = get_string_from_dict(config_dict, "splitProperty", "");
+
+        // Disk-cost opt-out. The key is parsed inline because it is the only
+        // boolean option currently supported by graph_project() and adding a
+        // reusable helper is not yet justified by a second caller.
+        {
+            bool found = false;
+            ObjectId v = get_value_from_dict(config_dict, "includeLabelIndexes", found);
+            if (found) {
+                auto t = GQL_OID::get_type(v);
+                if (t != GQL_OID::Type::BOOL) {
+                    throw std::runtime_error(
+                        "Configuration value for 'includeLabelIndexes' must be a boolean "
+                        "(true or false).");
+                }
+                include_label_indexes = Common::Conversions::unpack_bool(v);
+            }
+        }
     }
 
     // Validate includeFeatures against catalog (must be a registered FeatureMatrix)
@@ -315,7 +338,8 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             edge_property_configs,
             include_features,
             label_property,
-            split_property
+            split_property,
+            include_label_indexes
         );
         builder.scan_nodes_by_labels(node_labels);
         builder.scan_edges_by_types(relationship_types);
