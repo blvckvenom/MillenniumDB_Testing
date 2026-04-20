@@ -1224,52 +1224,85 @@ void ProjectionStorage::initialize_streaming_buffers() {
     // This enables building projections of arbitrary size with bounded memory.
     //
     // Total memory budget: ~512 MB for all buffers (vs 12-14 GB for vectors)
+    //
+    // Spill path override:
+    //   If the env var MDB_PROJECTION_SPILL_DIR is set, spill files are
+    //   written under <env>/<projection_name>/tmp_* instead of inside the
+    //   projection directory. This lets operators redirect spill I/O to a
+    //   different volume (HDD archive, tmpfs, separate SSD) when the DB
+    //   volume is disk-constrained, without affecting where the final B+Tree
+    //   indexes and catalog live. Spills are ephemeral so no persistent data
+    //   leaves the projection dir. See analysis doc §3.C.
     // =========================================================================
+
+    std::string spill_base = projection_dir;
+    if (const char* env_dir = std::getenv("MDB_PROJECTION_SPILL_DIR")) {
+        if (env_dir[0] != '\0') {
+            // Derive a subdir named after the projection so concurrent
+            // projection builds don't collide. Extracting the trailing path
+            // component of projection_dir (e.g. "papers100M_proj" from
+            // "data/dbs/gql/papers100M/projections/papers100M_proj").
+            std::filesystem::path pd(projection_dir);
+            std::string subname = pd.filename().string();
+            if (subname.empty()) {
+                subname = "projection";
+            }
+            spill_base = std::string(env_dir) + "/" + subname;
+            std::error_code ec;
+            std::filesystem::create_directories(spill_base, ec);
+            if (ec) {
+                throw std::runtime_error(
+                    "MDB_PROJECTION_SPILL_DIR='" + std::string(env_dir) +
+                    "': cannot create spill directory '" + spill_base +
+                    "': " + ec.message());
+            }
+        }
+    }
 
     // Required index buffers (always created)
     node_records_buffer_ = std::make_unique<StreamingRecordBuffer<1>>(
-        projection_dir + "/tmp_nodes", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_nodes", STREAMING_BUFFER_THRESHOLD);
 
     from_to_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_from_to", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_from_to", STREAMING_BUFFER_THRESHOLD);
 
     to_from_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_to_from", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_to_from", STREAMING_BUFFER_THRESHOLD);
 
     direction_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
-        projection_dir + "/tmp_direction", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_direction", STREAMING_BUFFER_THRESHOLD);
 
     edge_from_to_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_edge_from_to", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_edge_from_to", STREAMING_BUFFER_THRESHOLD);
 
     edge_n1_n2_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_edge_n1_n2", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_edge_n1_n2", STREAMING_BUFFER_THRESHOLD);
 
     // Optional label index buffers (always created for simplicity, but may remain empty)
     node_label_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
-        projection_dir + "/tmp_node_label", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_node_label", STREAMING_BUFFER_THRESHOLD);
 
     label_node_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
-        projection_dir + "/tmp_label_node", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_label_node", STREAMING_BUFFER_THRESHOLD);
 
     edge_label_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
-        projection_dir + "/tmp_edge_label", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_edge_label", STREAMING_BUFFER_THRESHOLD);
 
     label_edge_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
-        projection_dir + "/tmp_label_edge", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_label_edge", STREAMING_BUFFER_THRESHOLD);
 
     // Optional property index buffers (always created for simplicity, but may remain empty)
     node_key_value_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_node_kv", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_node_kv", STREAMING_BUFFER_THRESHOLD);
 
     key_value_node_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_kv_node", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_kv_node", STREAMING_BUFFER_THRESHOLD);
 
     edge_key_value_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_edge_kv", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_edge_kv", STREAMING_BUFFER_THRESHOLD);
 
     key_value_edge_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
-        projection_dir + "/tmp_kv_edge", STREAMING_BUFFER_THRESHOLD);
+        spill_base + "/tmp_kv_edge", STREAMING_BUFFER_THRESHOLD);
 }
 
 } // namespace GQL
