@@ -9,6 +9,9 @@ bin/*
 tags
 cscope.out
 
+# VS Code workspace files (contain user-local folder paths)
+*.code-workspace
+
 ### C++ ###
 # Prerequisites
 *.d
