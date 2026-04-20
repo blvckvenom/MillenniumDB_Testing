@@ -429,8 +429,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
     log_info "run as \$USER without further privilege prompts; they are skipped"
     log_info "here to avoid any filesystem mutations."
     if [ -n "$DOWNLOAD_DATASETS" ]; then
-        log_info "After build+tests, would pre-stage OGB datasets: $DOWNLOAD_DATASETS"
-        log_info "  (raw download only; no convert, no import)"
+        log_info "After build, would pre-stage OGB datasets: $DOWNLOAD_DATASETS"
+        log_info "  (raw download only; happens BEFORE the reboot checkpoint"
+        log_info "   so datasets finish even if a driver-install reboot is pending)"
     fi
     log_ok  "DRY RUN complete. No system changes were made."
     exit 0
@@ -608,6 +609,34 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Pre-stage OGB raw datasets BEFORE the reboot checkpoint.
+# ---------------------------------------------------------------------------
+# This runs before the NEEDS_REBOOT branch deliberately: if the driver was
+# freshly installed and a reboot is imminent, we still want the 50 GB
+# papers100M download to happen NOW (it is unrelated to the GPU driver
+# and takes 1-2 hours). That way the user can reboot, --resume for tests,
+# and have the dataset already on disk when they sit down to experiment.
+#
+# download-dataset.sh is idempotent (checks raw/data.npz exists) so on
+# --resume this re-invocation is a cheap no-op.
+if [ -n "$DOWNLOAD_DATASETS" ]; then
+    log_step "Pre-staging OGB datasets: $DOWNLOAD_DATASETS"
+    log_info "Raw download only — no conversion, no import, no venv."
+    log_info "Use stream_convert_ogb.py + 'mdb import' when ready to experiment."
+    IFS=',' read -r -a _DATASET_ARR <<< "$DOWNLOAD_DATASETS"
+    for _ds in "${_DATASET_ARR[@]}"; do
+        _ds_trimmed="$(echo "$_ds" | xargs)"   # strip whitespace
+        [ -z "$_ds_trimmed" ] && continue
+        log_info "Dataset: $_ds_trimmed"
+        if bash "$MDB_HOME/scripts/download-dataset.sh" "$_ds_trimmed"; then
+            log_ok "Dataset $_ds_trimmed staged"
+        else
+            log_warn "Dataset $_ds_trimmed failed — re-run: scripts/download-dataset.sh $_ds_trimmed"
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Step 11 — Validate GNN environment + run tests
 # ---------------------------------------------------------------------------
 # If the driver was freshly installed this run, the kernel module is NOT
@@ -624,6 +653,11 @@ if [ "${NEEDS_REBOOT:-0}" -eq 1 ]; then
     echo ""
     echo "  The NVIDIA driver was freshly installed. It requires a reboot"
     echo "  to load the kernel module before tests can exercise the GPU."
+    if [ -n "$DOWNLOAD_DATASETS" ]; then
+        echo ""
+        echo "  Good news: the dataset(s) [$DOWNLOAD_DATASETS] already finished"
+        echo "  downloading before this checkpoint — they are ready on disk."
+    fi
     echo ""
     echo "  Next steps:"
     echo "    sudo reboot"
@@ -680,27 +714,6 @@ if [ "$ENABLE_GPU" -eq 1 ]; then
     echo "    ./scripts/verify_gnn_integration.sh   # GNN pipeline smoke test"
 fi
 echo ""
-
-# ---------------------------------------------------------------------------
-# Optional: pre-stage OGB raw datasets (download-only; no convert, no import).
-# Runs here at the very end so a dataset download failure does not block the
-# tool-install pipeline. Each dataset is attempted independently — a failure
-# on one does not stop later ones. The user can re-run download-dataset.sh
-# manually to retry.
-# ---------------------------------------------------------------------------
-if [ -n "$DOWNLOAD_DATASETS" ]; then
-    log_step "Pre-staging OGB datasets: $DOWNLOAD_DATASETS"
-    log_info "Raw download only — no conversion, no import, no venv."
-    log_info "Use stream_convert_ogb.py + 'mdb import' when ready to experiment."
-    IFS=',' read -r -a _DATASET_ARR <<< "$DOWNLOAD_DATASETS"
-    for _ds in "${_DATASET_ARR[@]}"; do
-        _ds_trimmed="$(echo "$_ds" | xargs)"   # strip whitespace
-        [ -z "$_ds_trimmed" ] && continue
-        log_info "Dataset: $_ds_trimmed"
-        if bash "$MDB_HOME/scripts/download-dataset.sh" "$_ds_trimmed"; then
-            log_ok "Dataset $_ds_trimmed staged"
-        else
-            log_warn "Dataset $_ds_trimmed failed — re-run: scripts/download-dataset.sh $_ds_trimmed"
-        fi
-    done
-fi
+# Dataset pre-staging hook is now executed earlier, before the NEEDS_REBOOT
+# branch, so datasets download even in the path where the script exits for
+# a driver-reboot checkpoint.
