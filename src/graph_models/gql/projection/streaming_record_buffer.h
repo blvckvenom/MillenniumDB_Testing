@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "graph_models/gql/projection/spill_codec.h"
 #include "storage/index/record.h"
 #include "storage/page/page.h"
 
@@ -79,6 +80,7 @@ public:
         , current_spill_file_(0)
         , iter_memory_pos_(0)
         , iter_file_pos_(0)
+        , compression_(resolve_default_spill_compression())
     {
         // Reserve memory buffer capacity
         memory_buffer_.reserve(max_records_in_memory_);
@@ -306,21 +308,22 @@ public:
 private:
     /**
      * @brief Spills current memory buffer to a temporary file.
+     *
+     * Uses SpillWriter which writes an 8-byte header + optionally-compressed
+     * payload. Compression is resolved from env at construction (default LZ4
+     * when HAS_LZ4 is compiled in). Readers auto-detect the format; legacy
+     * headerless files remain readable. See spill_codec.h for rationale.
      */
     void spill_to_disk() {
         if (memory_buffer_.empty()) return;
 
-        std::string spill_path = temp_file_prefix_ + "_spill_" + std::to_string(spill_file_count_);
-        std::ofstream out(spill_path, std::ios::binary);
+        std::string spill_path =
+            temp_file_prefix_ + "_spill_" + std::to_string(spill_file_count_);
 
-        if (!out) {
-            throw std::runtime_error("Failed to create spill file: " + spill_path);
-        }
-
-        // Write records as raw bytes
-        out.write(reinterpret_cast<const char*>(memory_buffer_.data()),
-                  memory_buffer_.size() * N * sizeof(uint64_t));
-        out.close();
+        SpillWriter writer(spill_path, compression_);
+        writer.write(memory_buffer_.data(),
+                     memory_buffer_.size() * N * sizeof(uint64_t));
+        writer.finalize();
 
         spill_files_.push_back(spill_path);
         records_per_spill_.push_back(memory_buffer_.size());
@@ -331,16 +334,15 @@ private:
 
     /**
      * @brief Opens a spill file for reading.
+     *
+     * Replaces the raw ifstream with SpillReader, which auto-detects
+     * compression from the 8-byte header and transparently decompresses.
+     * Legacy headerless files are handled by SpillReader's fallback path.
      */
     void open_spill_file_for_reading(size_t index) {
-        if (current_input_stream_.is_open()) {
-            current_input_stream_.close();
-        }
-
-        current_input_stream_.open(spill_files_[index], std::ios::binary);
-        if (!current_input_stream_) {
-            throw std::runtime_error("Failed to open spill file for reading: " + spill_files_[index]);
-        }
+        // Previous reader (if any) is destroyed by unique_ptr reset, freeing
+        // its LZ4 decompression context and file handle.
+        current_reader_ = std::make_unique<SpillReader>(spill_files_[index]);
 
         current_spill_records_remaining_ = records_per_spill_[index];
         file_read_buffer_.clear();
@@ -349,14 +351,17 @@ private:
 
     /**
      * @brief Reads the next chunk of records from current spill file.
+     *
+     * Loops the underlying SpillReader::read() because it may return short
+     * reads at internal buffer boundaries (especially relevant for LZ4
+     * streaming decomp). We only return a short buffer when the file is
+     * actually exhausted.
      */
     void read_next_chunk() {
         file_read_buffer_.clear();
         iter_file_pos_ = 0;
 
-        // Try to read from current file
         while (current_spill_records_remaining_ == 0) {
-            // Move to next spill file
             current_spill_file_++;
             if (current_spill_file_ >= spill_file_count_) {
                 return;  // No more data
@@ -364,16 +369,21 @@ private:
             open_spill_file_for_reading(current_spill_file_);
         }
 
-        // Read up to RECORDS_PER_PAGE records
         size_t to_read = std::min(current_spill_records_remaining_, RECORDS_PER_PAGE);
         file_read_buffer_.resize(to_read);
 
-        current_input_stream_.read(
-            reinterpret_cast<char*>(file_read_buffer_.data()),
-            to_read * N * sizeof(uint64_t)
-        );
+        const size_t record_bytes = N * sizeof(uint64_t);
+        const size_t bytes_wanted = to_read * record_bytes;
+        size_t       bytes_got    = 0;
+        auto*        dst = reinterpret_cast<uint8_t*>(file_read_buffer_.data());
 
-        size_t actually_read = current_input_stream_.gcount() / (N * sizeof(uint64_t));
+        while (bytes_got < bytes_wanted && !current_reader_->eof()) {
+            size_t n = current_reader_->read(dst + bytes_got, bytes_wanted - bytes_got);
+            if (n == 0) break;
+            bytes_got += n;
+        }
+
+        size_t actually_read = bytes_got / record_bytes;
         file_read_buffer_.resize(actually_read);
         current_spill_records_remaining_ -= actually_read;
     }
@@ -382,9 +392,9 @@ private:
      * @brief Removes all temporary files.
      */
     void cleanup_temp_files() {
-        if (current_input_stream_.is_open()) {
-            current_input_stream_.close();
-        }
+        // Release current SpillReader (closes its underlying file handle and
+        // frees the LZ4 decompression context if any) before unlinking paths.
+        current_reader_.reset();
 
         for (const auto& path : spill_files_) {
             std::filesystem::remove(path);
@@ -413,9 +423,20 @@ private:
     size_t current_spill_file_;
     size_t iter_memory_pos_;
     size_t iter_file_pos_;
-    std::ifstream current_input_stream_;
+    // Replaces ifstream — SpillReader handles both compressed (LZ4) and
+    // legacy raw spills, auto-detected from the file header. Per-spill
+    // lifetime via unique_ptr so each open_spill_file_for_reading() gets a
+    // fresh decompressor without leaking LZ4F_dctx between files.
+    std::unique_ptr<SpillReader> current_reader_;
     std::vector<Record<N>> file_read_buffer_;
     size_t current_spill_records_remaining_ = 0;
+
+    // Compression policy for NEW spills produced by this buffer. Initialized
+    // from MDB_SPILL_COMPRESSION env (default LZ4 when HAS_LZ4) in the ctor.
+    // Kept per-buffer (not static) to allow tests to mix policies in the
+    // same process; concurrent buffers sharing a process will all observe
+    // the same env value unless explicitly configured otherwise.
+    SpillCompression compression_;
 };
 
 } // namespace GQL

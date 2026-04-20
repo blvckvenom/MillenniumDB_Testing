@@ -50,6 +50,7 @@
 #include <execution>
 #endif
 
+#include "graph_models/gql/projection/spill_codec.h"
 #include "misc/available_ram.h"
 #include "storage/index/record.h"
 #include "storage/page/page.h"
@@ -556,23 +557,45 @@ private:
     /**
      * @brief Reads a file into a vector of records.
      */
+    // Reads a StreamingRecordBuffer spill file into the tail of `vec`.
+    //
+    // Uses SpillReader so the function is transparent to compression:
+    //   * new compressed spills (LZ4, post-2026-04-20) — read via LZ4 stream
+    //   * legacy headerless spills (pre-change)         — fall-through raw read
+    //
+    // Looping is required because SpillReader::read() may return short reads
+    // at decompression block boundaries (in particular for LZ4). We stop
+    // only when EOF is reached or we've filled the requested record_count.
+    //
+    // INVARIANT: the caller must pass record_count equal to the count
+    // originally written by StreamingRecordBuffer (tracked in
+    // records_per_spill_). This is not inferable from compressed file size.
     void read_file_to_vector(
         const std::string& path,
         size_t record_count,
         std::vector<Record<N>>& vec
     ) {
-        std::ifstream stream(path, std::ios::binary);
-        if (!stream) {
-            throw std::runtime_error("Failed to open file for reading: " + path);
-        }
+        if (record_count == 0) return;
 
         size_t start_size = vec.size();
         vec.resize(start_size + record_count);
+        uint8_t* dst = reinterpret_cast<uint8_t*>(vec.data() + start_size);
+        const size_t wanted_bytes = record_count * RECORD_SIZE;
 
-        stream.read(
-            reinterpret_cast<char*>(vec.data() + start_size),
-            record_count * RECORD_SIZE
-        );
+        SpillReader reader(path);
+        size_t got = 0;
+        while (got < wanted_bytes && !reader.eof()) {
+            size_t n = reader.read(dst + got, wanted_bytes - got);
+            if (n == 0) break;
+            got += n;
+        }
+
+        if (got != wanted_bytes) {
+            throw std::runtime_error(
+                "read_file_to_vector: short read from '" + path +
+                "' (got " + std::to_string(got) +
+                " bytes, expected " + std::to_string(wanted_bytes) + ")");
+        }
     }
 
     /**
