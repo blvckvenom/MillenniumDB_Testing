@@ -120,7 +120,11 @@ TODO/*
 Tesis/
 
 # Documentación e investigaciones (locales)
-/docs/
+# /docs/* (glob on children, not the dir itself) lets us re-include the wiki below.
+/docs/*
+# Exception: the wiki is the single public documentation folder tracked in git
+!docs/MillenniumDB.wiki/
+!docs/MillenniumDB.wiki/**
 
 # Ideas y borradores locales
 /Partial_Idea/
@@ -157,3 +161,8 @@ scripts/gnn_datasets/ogb_data/
 
 # Downloaded dataset cache (regenerable via scripts/)
 data/example/gql/.cache/
+
+# Local-only documentation (kept outside of wiki)
+docs/superpowers/
+docs/GUIA_NAVEGACION.md
+docs/README.md
