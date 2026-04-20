@@ -17,6 +17,8 @@
 #   scripts/onboard.sh --skip-tests     # don't run ./scripts/run-tests at the end
 #   scripts/onboard.sh --resume         # skip apt+driver phase (for use after reboot)
 #   scripts/onboard.sh --dry-run        # show root commands that WOULD run, skip pkexec
+#   scripts/onboard.sh --download-dataset=papers100M       # raw OGB download at end
+#   scripts/onboard.sh --download-dataset=arxiv,products   # multiple datasets
 #
 # Idempotent: every step checks its own completion marker and skips if already done.
 #
@@ -36,16 +38,18 @@ SKIP_DRIVER=0
 SKIP_TESTS=0
 RESUME=0
 DRY_RUN=0
+DOWNLOAD_DATASETS=""   # comma-separated names, empty = no dataset pre-staging
 for arg in "$@"; do
     case "$arg" in
-        --gpu=*)        GPU_CHOICE="${arg#*=}" ;;
-        --no-gpu)       GPU_CHOICE="none" ;;
-        --skip-driver)  SKIP_DRIVER=1 ;;
-        --skip-tests)   SKIP_TESTS=1 ;;
-        --resume)       RESUME=1 ;;
-        --dry-run)      DRY_RUN=1 ;;
+        --gpu=*)                GPU_CHOICE="${arg#*=}" ;;
+        --no-gpu)               GPU_CHOICE="none" ;;
+        --skip-driver)          SKIP_DRIVER=1 ;;
+        --skip-tests)           SKIP_TESTS=1 ;;
+        --resume)               RESUME=1 ;;
+        --dry-run)              DRY_RUN=1 ;;
+        --download-dataset=*)   DOWNLOAD_DATASETS="${arg#*=}" ;;
         -h|--help)
-            grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | head -30
+            grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | head -35
             exit 0
             ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
@@ -424,6 +428,10 @@ if [ "$DRY_RUN" -eq 1 ]; then
     log_info "Remaining steps (Boost, LibTorch, venvs, cmake build, tests) would"
     log_info "run as \$USER without further privilege prompts; they are skipped"
     log_info "here to avoid any filesystem mutations."
+    if [ -n "$DOWNLOAD_DATASETS" ]; then
+        log_info "After build+tests, would pre-stage OGB datasets: $DOWNLOAD_DATASETS"
+        log_info "  (raw download only; no convert, no import)"
+    fi
     log_ok  "DRY RUN complete. No system changes were made."
     exit 0
 fi
@@ -672,3 +680,27 @@ if [ "$ENABLE_GPU" -eq 1 ]; then
     echo "    ./scripts/verify_gnn_integration.sh   # GNN pipeline smoke test"
 fi
 echo ""
+
+# ---------------------------------------------------------------------------
+# Optional: pre-stage OGB raw datasets (download-only; no convert, no import).
+# Runs here at the very end so a dataset download failure does not block the
+# tool-install pipeline. Each dataset is attempted independently — a failure
+# on one does not stop later ones. The user can re-run download-dataset.sh
+# manually to retry.
+# ---------------------------------------------------------------------------
+if [ -n "$DOWNLOAD_DATASETS" ]; then
+    log_step "Pre-staging OGB datasets: $DOWNLOAD_DATASETS"
+    log_info "Raw download only — no conversion, no import, no venv."
+    log_info "Use stream_convert_ogb.py + 'mdb import' when ready to experiment."
+    IFS=',' read -r -a _DATASET_ARR <<< "$DOWNLOAD_DATASETS"
+    for _ds in "${_DATASET_ARR[@]}"; do
+        _ds_trimmed="$(echo "$_ds" | xargs)"   # strip whitespace
+        [ -z "$_ds_trimmed" ] && continue
+        log_info "Dataset: $_ds_trimmed"
+        if bash "$MDB_HOME/scripts/download-dataset.sh" "$_ds_trimmed"; then
+            log_ok "Dataset $_ds_trimmed staged"
+        else
+            log_warn "Dataset $_ds_trimmed failed — re-run: scripts/download-dataset.sh $_ds_trimmed"
+        fi
+    done
+fi
