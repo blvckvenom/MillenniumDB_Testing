@@ -1,6 +1,7 @@
 #include "import.h"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 
 #ifdef ENABLE_GNN
@@ -1121,140 +1122,74 @@ inline void OnDiskImport::process_pending(
 void OnDiskImport::import_node_tensors() {
     std::cout << "Loading node embeddings from: " << tensor_file_ << "\n";
 
-    // Validate the NPY file first
-    std::string validation_error;
-    if (!NpyLoader::validate(tensor_file_, validation_error)) {
-        FATAL_ERROR("Invalid tensor file: ", validation_error);
+    // Memmap the .npy so we never materialize the full array in RAM — papers100M
+    // features alone are 53 GiB, which OOMs std::vector on commodity hardware.
+    std::string err;
+    auto mm = NpyLoader::load_memmapped(tensor_file_, err);
+    if (!mm.valid()) {
+        FATAL_ERROR("Failed to memmap tensor file '", tensor_file_, "': ", err);
     }
 
-    // BUG #3 FIX: Read dtype from header instead of trial-and-error
-    int dtype_itemsize = NpyLoader::get_dtype_itemsize(tensor_file_);
-    if (dtype_itemsize == 0) {
-        FATAL_ERROR("Cannot determine dtype of tensor file: ", tensor_file_,
-                    ". Expected float32 or float64.");
-    }
-    bool is_float64 = (dtype_itemsize == 8);
-
-    // Load tensor data using the correct dtype directly
-    NpyMetadata metadata;
-    std::vector<float> data;
-    std::vector<double> data_f64;
-
-    if (is_float64) {
-        data_f64 = NpyLoader::load_float64(tensor_file_, metadata);
-        if (data_f64.empty()) {
-            FATAL_ERROR("Failed to load float64 tensor file: ", tensor_file_);
-        }
-    } else {
-        data = NpyLoader::load_float32(tensor_file_, metadata);
-        if (data.empty()) {
-            FATAL_ERROR("Failed to load float32 tensor file: ", tensor_file_);
-        }
-    }
-
-    // Validate dimensions
-    if (metadata.shape.size() != 2) {
+    const auto& meta = mm.metadata();
+    if (meta.shape.size() != 2) {
         FATAL_ERROR("Expected 2D tensor (num_nodes, feature_dim), got ",
-                    metadata.shape.size(), "D");
+                    meta.shape.size(), "D");
     }
 
-    uint64_t num_nodes = metadata.shape[0];
-    uint64_t feature_dim = metadata.shape[1];
+    const uint64_t num_nodes   = meta.shape[0];
+    const uint64_t feature_dim = meta.shape[1];
+    const bool     is_float64  = meta.is_float64;
+    const size_t   item_bytes  = is_float64 ? sizeof(double) : sizeof(float);
+    const size_t   row_bytes   = feature_dim * item_bytes;
 
-    // Check for overflow before computing expected_size
     if (feature_dim > 0 && num_nodes > UINT64_MAX / feature_dim) {
         FATAL_ERROR("Tensor dimensions overflow: ", num_nodes, " x ", feature_dim);
     }
-
-    // BUG #5 FIX: Validate shape matches actual data size
-    uint64_t expected_size = num_nodes * feature_dim;
-    uint64_t actual_size = is_float64 ? data_f64.size() : data.size();
-    if (expected_size != actual_size) {
-        FATAL_ERROR("Tensor shape mismatch: shape says ", num_nodes, " x ", feature_dim,
-                    " = ", expected_size, " elements, but data has ", actual_size,
-                    " elements. File may be truncated or corrupted.");
-    }
-
-    // Validate node count matches
     if (num_nodes != catalog.nodes_count) {
         FATAL_ERROR("Tensor has ", num_nodes, " rows but graph has ",
                     catalog.nodes_count, " nodes. They must match.");
     }
 
-    // Check for integer overflow
-    if (num_nodes > SIZE_MAX / feature_dim / (is_float64 ? sizeof(double) : sizeof(float))) {
-        FATAL_ERROR("Tensor dimensions would cause overflow");
-    }
-
     std::cout << "  Shape: " << num_nodes << " x " << feature_dim << "\n";
     std::cout << "  Dtype: " << (is_float64 ? "float64" : "float32") << "\n";
-    std::cout << "  Order: " << (metadata.fortran_order ? "Fortran" : "C") << "\n";
+    std::cout << "  Order: C (row-major)\n";
 
-    // Convert Fortran order to C order if needed
-    // Fortran order stores data column-by-column, C order stores row-by-row
-    // For a 2D matrix [rows, cols]: F[i,j] = data[j*rows + i], C[i,j] = data[i*cols + j]
-    if (metadata.fortran_order) {
-        std::cout << "  Converting Fortran order to C order...\n";
-        if (is_float64) {
-            std::vector<double> c_order_data(data_f64.size());
-            for (uint64_t row = 0; row < num_nodes; ++row) {
-                for (uint64_t col = 0; col < feature_dim; ++col) {
-                    c_order_data[row * feature_dim + col] = data_f64[col * num_nodes + row];
-                }
-            }
-            // BUG #1 FIX: Free original immediately before assigning new data
-            { std::vector<double>().swap(data_f64); }
-            data_f64 = std::move(c_order_data);
-        } else {
-            std::vector<float> c_order_data(data.size());
-            for (uint64_t row = 0; row < num_nodes; ++row) {
-                for (uint64_t col = 0; col < feature_dim; ++col) {
-                    c_order_data[row * feature_dim + col] = data[col * num_nodes + row];
-                }
-            }
-            // BUG #1 FIX: Free original immediately before assigning new data
-            { std::vector<float>().swap(data); }
-            data = std::move(c_order_data);
-        }
-    }
-
-    // Create GNN features directory
     namespace fs = std::filesystem;
     auto gnn_features_dir = fs::path(db_folder) / "gnn_features";
     fs::create_directories(gnn_features_dir);
 
-    // Write FeatureMatrix (.fmat) and RowMapping (.rmap)
     auto fmat_path = gnn_features_dir / "node_features.fmat";
     auto rmap_path = gnn_features_dir / "node_features.rmap";
     auto gnn_dtype = is_float64 ? mdb::gnn::GnnDtype::FLOAT64 : mdb::gnn::GnnDtype::FLOAT32;
 
-    try {
-        if (is_float64) {
-            mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data_f64.data());
-            { std::vector<double>().swap(data_f64); }
-        } else {
-            mdb::gnn::FeatureMatrix::create(fmat_path, num_nodes, feature_dim, gnn_dtype, data.data());
-            { std::vector<float>().swap(data); }
-        }
+    const char* src_bytes = static_cast<const char*>(mm.data());
 
-        // Write RowMapping (.rmap) — maps row index → node ObjectId
-        // Nodes are assigned sequential ObjectIds during import: i | MASK_NODE
+    try {
+        // Stream rows from the mmapped source into the .fmat output. Peak extra
+        // RAM in this callback is one row (~512 B for papers100M at 128 dims);
+        // the OS pages the mmap in on demand and discards clean pages under
+        // pressure, so total resident set stays bounded.
+        mdb::gnn::FeatureMatrix::create_streaming(
+            fmat_path, num_nodes, feature_dim, gnn_dtype,
+            [src_bytes, row_bytes](uint64_t row_id, void* dest, uint64_t dest_bytes) {
+                std::memcpy(dest, src_bytes + row_id * row_bytes, dest_bytes);
+            }
+        );
+
+        // Write RowMapping (.rmap): sequential-ObjectId identity map.
         std::vector<ObjectId> node_oids;
         node_oids.reserve(num_nodes);
         for (uint64_t i = 0; i < num_nodes; ++i) {
             node_oids.push_back(ObjectId(i | ObjectId::MASK_NODE));
         }
         mdb::gnn::RowMapping::create(rmap_path, node_oids);
-        { std::vector<ObjectId>().swap(node_oids); }
     } catch (...) {
-        // Best-effort cleanup of partial files
         std::error_code ec;
         fs::remove(fmat_path, ec);
         fs::remove(rmap_path, ec);
         throw;
     }
 
-    // Register feature in catalog (dimensions stored in .fmat header)
     catalog.register_gnn_feature("node_features");
 
     std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim

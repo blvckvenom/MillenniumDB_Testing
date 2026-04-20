@@ -8,6 +8,7 @@
  * Supports float32 and float64 arrays in C-order or Fortran-order.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -21,6 +22,41 @@ struct NpyMetadata {
     std::vector<uint64_t> shape;  // e.g., {169343, 128} for node embeddings
     bool is_float64;              // true = float64 (double), false = float32 (float)
     bool fortran_order;           // true = column-major, false = row-major (C-order)
+};
+
+/**
+ * @brief RAII handle for a memory-mapped .npy file.
+ *
+ * Owns an mmap region that covers the full .npy file. The `data` pointer
+ * indexes past the header into the raw array bytes, suitable for C-order
+ * row reads at `data + row_id * row_bytes`. Destructor calls munmap().
+ *
+ * Moves transfer ownership; copies are disabled.
+ */
+class NpyMemmap {
+public:
+    NpyMemmap() = default;
+    ~NpyMemmap();
+
+    NpyMemmap(NpyMemmap&& other) noexcept;
+    NpyMemmap& operator=(NpyMemmap&& other) noexcept;
+
+    NpyMemmap(const NpyMemmap&) = delete;
+    NpyMemmap& operator=(const NpyMemmap&) = delete;
+
+    const void*  data()       const { return data_; }
+    std::size_t  data_bytes() const { return data_bytes_; }
+    const NpyMetadata& metadata() const { return metadata_; }
+    bool valid() const { return data_ != nullptr; }
+
+private:
+    friend class NpyLoader;
+
+    void*       mmap_ptr_   = nullptr;
+    std::size_t mmap_size_  = 0;
+    const void* data_       = nullptr;  // points into mmap_ptr_ past the header
+    std::size_t data_bytes_ = 0;
+    NpyMetadata metadata_{};
 };
 
 /**
@@ -90,6 +126,23 @@ public:
      * @return File size, or 0 if file doesn't exist
      */
     static size_t get_file_size(const std::string& path);
+
+    /**
+     * @brief Memory-map a .npy file for streaming access without loading to RAM.
+     *
+     * Use this for large tensor files (e.g., papers100M features = 53 GiB)
+     * where allocating a std::vector of the full array would OOM on commodity
+     * hardware. The returned handle lets callers read individual rows via
+     * `mm.data() + row_id * row_bytes` without materializing the full array.
+     *
+     * Fortran-order files are rejected: transposing requires a full read,
+     * which defeats the purpose of mmap-streaming. Convert to C-order first.
+     *
+     * @param path Path to .npy file
+     * @param error_out Error message on failure (empty on success)
+     * @return NpyMemmap; check `.valid()` — invalid when error_out is set
+     */
+    static NpyMemmap load_memmapped(const std::string& path, std::string& error_out);
 };
 
 } // namespace Import
