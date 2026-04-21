@@ -70,7 +70,9 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
     initialize_streaming_buffers();
 }
 
-ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const std::string& db_folder, const std::string& projection_name_)
+ProjectionStorage::ProjectionStorage(const std::string& projection_dir_,
+                                     const std::string& db_folder,
+                                     const std::string& projection_name_)
     : projection_dir(projection_dir_), projection_name(projection_name_)
 {
     // Calculate relative path from db_folder
@@ -95,8 +97,13 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
     initialize_streaming_buffers();
 }
 
-ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const std::string& db_folder, const std::string& projection_name_, const Features& features_)
-    : projection_dir(projection_dir_), projection_name(projection_name_), features(features_)
+ProjectionStorage::ProjectionStorage(const std::string& projection_dir_,
+                                     const std::string& db_folder,
+                                     const std::string& projection_name_,
+                                     const Features& features_)
+    : projection_dir(projection_dir_),
+      projection_name(projection_name_),
+      features(features_)
 {
     // Calculate relative path from db_folder
     if (projection_dir.find(db_folder) == 0) {
