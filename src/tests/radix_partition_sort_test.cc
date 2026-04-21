@@ -116,8 +116,29 @@ TEST(RadixPartitionSort, Phase2EachPartitionIsSorted) {
     }
 }
 
-// --- Test 4: Concatenation is globally sorted ---
-TEST(RadixPartitionSort, ConcatenationIsGloballySorted) {
+// --- Test 4: Concatenation is globally sorted (SUPERSEDED by Task 13) ---
+//
+// This test was written during TDD RED (Task 4) when the Phase 3 output
+// format was not yet designed. At that time the plan assumed `sort_and_write`
+// would leave `.sorted_part_N.bin` files as its final output, and the test
+// asserted that concatenating them produced a globally-sorted stream.
+//
+// The real Phase 3 (Task 10, commit 3669282b) writes the records into
+// BPTLeafWriter / BPTDirWriter (`.leaf` / `.dir` B+Tree pages) and REMOVES
+// the intermediate `.sorted_part_*.bin` files as post-phase cleanup — they
+// are scratch artifacts, not API output. So the original assertion cannot
+// succeed: `actual` is always empty because the files it tries to read are
+// gone by the time Phase 3 returns.
+//
+// The invariant this test was meant to capture ("global sort order after
+// radix concatenation") is preserved — it is validated end-to-end by
+// scripts/test_projection_radix.sh on cora_gnn, which performs a
+// byte-identical `cmp` of the B+Tree `.leaf`/`.dir` files produced by
+// RADIX against the CLASSIC backend. See Task 13 in the plan.
+//
+// Disabled via gtest convention to keep the test visible in reports
+// without counting as a failure.
+TEST(RadixPartitionSort, DISABLED_ConcatenationIsGloballySorted) {
     wipe_scratch();
     GQL::RadixPartitionSort<3>::Config cfg;
     cfg.scratch_dir = kScratchBase;
