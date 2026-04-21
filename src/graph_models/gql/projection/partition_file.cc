@@ -35,14 +35,19 @@ void PartitionFile<N>::append(const Record<N>& r) {
 
 template<std::size_t N>
 void PartitionFile<N>::flush() {
-    if (buffer_.empty()) return;
-    std::size_t n = std::fwrite(buffer_.data(), sizeof(Record<N>),
-                                 buffer_.size(), fp_);
-    if (n != buffer_.size()) {
-        throw std::runtime_error("PartitionFile: short write to " + path_);
+    if (!buffer_.empty()) {
+        std::size_t n = std::fwrite(buffer_.data(), sizeof(Record<N>),
+                                     buffer_.size(), fp_);
+        if (n != buffer_.size()) {
+            throw std::runtime_error("PartitionFile: short write to " + path_);
+        }
+        bytes_written_ += n * sizeof(Record<N>);
+        buffer_.clear();
     }
-    bytes_written_ += n * sizeof(Record<N>);
-    buffer_.clear();
+    // Push libc stdio buffer to the kernel so callers that read the file
+    // while the writer is still alive (e.g. ParallelScanPartitioner's
+    // collect_merged_partition_paths) see the full contents.
+    if (fp_) std::fflush(fp_);
 }
 
 template<std::size_t N>
