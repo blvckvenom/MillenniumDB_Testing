@@ -54,8 +54,14 @@ public:
     ~RadixPartitionSort();
 
     // No copy, no move (holds open file handles and scratch state).
+    // Moves are explicitly deleted — a user-declared dtor + deleted copy ops
+    // already suppress implicit move generation, but stating the invariant
+    // at the language level blinds it against later dtor/copy refactors that
+    // could silently re-enable moves and break the file-handle ownership.
     RadixPartitionSort(const RadixPartitionSort&)            = delete;
     RadixPartitionSort& operator=(const RadixPartitionSort&) = delete;
+    RadixPartitionSort(RadixPartitionSort&&)                 = delete;
+    RadixPartitionSort& operator=(RadixPartitionSort&&)      = delete;
 
     /// Phase 1. Partitions the input stream into `scratch_dir` files.
     /// @return number of partitions actually used (post adaptive clamp).
