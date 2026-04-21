@@ -5,8 +5,16 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <thread>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
@@ -106,23 +114,137 @@ template<std::size_t N>
 std::size_t RadixPartitionSort<N>::sort_and_write(
     const std::string& output_base_path)
 {
-    // Stub — implemented in Task 8+.
-    (void)output_base_path;
-    return 0;
+    std::size_t total_written = 0;
+
+    std::size_t num_workers = compute_num_workers(
+        std::thread::hardware_concurrency(),
+        (config_.num_scan_threads > 0)
+            ? config_.num_scan_threads
+            : std::thread::hardware_concurrency() / 2,
+        4ULL * 1024 * 1024 * 1024,  // 4 GB default memory budget
+        config_.worker_memory_budget,
+        config_.num_workers);
+    (void)num_workers;  // passed to TBB via default arena; grain 1 already set
+
+    // Dispatch partitions across workers via tbb::parallel_for.
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, num_partitions_, 1),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                std::string sorted_path = output_base_path +
+                    ".sorted_part_" + std::to_string(p) + ".bin";
+                // Decide in-memory vs external.
+                std::uintmax_t sz = fs::file_size(partition_paths_[p]);
+                if (sz <= config_.worker_memory_budget) {
+                    sort_partition_in_memory(p, sorted_path);
+                } else {
+                    sort_partition_external(p, sorted_path);
+                }
+                // Release free heap pages to the kernel between sorts.
+#if defined(__GLIBC__)
+                malloc_trim(0);
+#endif
+            }
+        });
+
+    // Count written records by reading each sorted file's size.
+    for (std::size_t p = 0; p < num_partitions_; ++p) {
+        std::string sorted_path = output_base_path +
+            ".sorted_part_" + std::to_string(p) + ".bin";
+        if (fs::exists(sorted_path)) {
+            total_written += fs::file_size(sorted_path) / sizeof(Record<N>);
+        }
+    }
+    return total_written;
 }
 
 template<std::size_t N>
 void RadixPartitionSort<N>::sort_partition_in_memory(
     std::size_t partition_idx, const std::string& sorted_output_path)
 {
-    (void)partition_idx; (void)sorted_output_path;  // Task 8.
+    std::vector<Record<N>> buffer;
+    typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
+    Record<N> r{};
+    while (reader.next(r)) {
+        buffer.push_back(r);
+    }
+    std::sort(buffer.begin(), buffer.end());
+    std::ofstream out(sorted_output_path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(buffer.data()),
+              buffer.size() * sizeof(Record<N>));
 }
 
 template<std::size_t N>
 void RadixPartitionSort<N>::sort_partition_external(
     std::size_t partition_idx, const std::string& sorted_output_path)
 {
-    (void)partition_idx; (void)sorted_output_path;  // Task 9.
+    // Defensive path: partition exceeds worker_memory_budget. Chunk-sort
+    // to intermediate "run" files, then K-way merge.
+    std::vector<Record<N>> chunk;
+    std::size_t chunk_cap = config_.worker_memory_budget / sizeof(Record<N>) / 2;
+    if (chunk_cap == 0) chunk_cap = 1;  // minimum: handle tiny worker_memory_budget in tests
+    chunk.reserve(chunk_cap);
+
+    std::vector<std::string> run_paths;
+    {
+        typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
+        Record<N> r{};
+        std::size_t run_idx = 0;
+        while (reader.next(r)) {
+            chunk.push_back(r);
+            if (chunk.size() >= chunk_cap) {
+                std::sort(chunk.begin(), chunk.end());
+                std::string run_path = sorted_output_path + ".run_" + std::to_string(run_idx++);
+                std::ofstream run_out(run_path, std::ios::binary);
+                run_out.write(reinterpret_cast<const char*>(chunk.data()),
+                              chunk.size() * sizeof(Record<N>));
+                run_paths.push_back(run_path);
+                chunk.clear();
+            }
+        }
+        if (!chunk.empty()) {
+            std::sort(chunk.begin(), chunk.end());
+            std::string run_path = sorted_output_path + ".run_" + std::to_string(run_idx++);
+            std::ofstream run_out(run_path, std::ios::binary);
+            run_out.write(reinterpret_cast<const char*>(chunk.data()),
+                          chunk.size() * sizeof(Record<N>));
+            run_paths.push_back(run_path);
+        }
+    }
+
+    // K-way merge the runs into sorted_output_path. Use unique_ptr to avoid
+    // relying on Reader being movable (Reader owns a FILE* with non-trivial dtor).
+    std::vector<std::unique_ptr<typename PartitionFile<N>::Reader>> readers;
+    readers.reserve(run_paths.size());
+    for (auto& p : run_paths) {
+        readers.emplace_back(std::make_unique<typename PartitionFile<N>::Reader>(p));
+    }
+
+    std::vector<std::optional<Record<N>>> fronts(run_paths.size());
+    for (std::size_t i = 0; i < run_paths.size(); ++i) {
+        Record<N> rr{};
+        if (readers[i]->next(rr)) fronts[i] = rr;
+    }
+
+    std::ofstream out(sorted_output_path, std::ios::binary);
+    while (true) {
+        std::size_t min_idx = SIZE_MAX;
+        for (std::size_t i = 0; i < fronts.size(); ++i) {
+            if (!fronts[i].has_value()) continue;
+            if (min_idx == SIZE_MAX || *fronts[i] < *fronts[min_idx]) {
+                min_idx = i;
+            }
+        }
+        if (min_idx == SIZE_MAX) break;
+        out.write(reinterpret_cast<const char*>(&(*fronts[min_idx])),
+                  sizeof(Record<N>));
+        Record<N> rr{};
+        if (readers[min_idx]->next(rr)) fronts[min_idx] = rr;
+        else fronts[min_idx].reset();
+    }
+
+    readers.clear();  // close files before removing
+    for (auto& p : run_paths) fs::remove(p);
 }
 
 template class RadixPartitionSort<1>;
