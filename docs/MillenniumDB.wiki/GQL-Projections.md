@@ -27,7 +27,8 @@ sobre `Linux 6.17.9-76061709-generic` (Pop!_OS 24.04 LTS).
 14. [Notas de comportamiento](#notas-de-comportamiento)
 15. [Limitaciones](#limitaciones)
 16. [Tuning de memoria](#tuning-de-memoria)
-17. [Cómo reproducir este documento](#como-reproducir-este-documento)
+17. [Modelo de memoria de la fase de scan — `classic` vs `radix`](#modelo-de-memoria-de-la-fase-de-scan--backend-classic-vs-radix)
+18. [Cómo reproducir este documento](#como-reproducir-este-documento)
 
 ---
 
@@ -987,6 +988,97 @@ Cada construcción emite una línea a stdout como
 `[sort] buffer=9216 MB (source=adaptive)`. Las fuentes posibles:
 `adaptive` (default `MemAvailable × 3 / 4`), `env` (env var parseada),
 `env_invalid` (env var no parseable), `explicit` (argumento de tests).
+
+---
+
+## Modelo de memoria de la fase de scan — backend `classic` vs `radix`
+
+A partir de 2026-04-21, `graph_project` expone **dos backends** para la
+construcción de índices B+Tree, seleccionables en tiempo de ejecución vía
+la variable de entorno `MDB_PROJECTION_SORTER`. El default (`classic`)
+preserva el comportamiento existente; el nuevo (`radix`) está pensado
+para datasets donde el pico de RSS del `classic` pondría en riesgo al
+resto de aplicaciones del sistema (caso observado empíricamente en
+`ogbn-papers100M`, 111M nodos, 1.6B aristas).
+
+### Diferencias operacionales
+
+| Aspecto | `MDB_PROJECTION_SORTER=classic` (default) | `MDB_PROJECTION_SORTER=radix` |
+|---|---|---|
+| Pipeline de sort | `ExternalRecordSort` (K-way merge) | 3 fases: scan+particiona → sort paralelo por partición → concatena en B+Tree |
+| Paralelismo principal | `std::execution::par` (TBB) dentro del sort | `tbb::parallel_for` sobre particiones independientes |
+| Pico de RSS | Crece con `MemAvailable × 3/4` (adaptive buffer); puede acercarse al RAM libre del host | Acotado por construcción: `num_particiones × 4 MB + num_workers × 512 MB ≈ 2.5 GB` |
+| Liberación de heap | `malloc_trim(0)` entre índices | `malloc_trim(0)` entre índices **y** entre particiones |
+| Archivos temporales | Scratch en `sort_tmp/` (K-way runs) | Scratch en `sort_tmp/.radix_scratch/`: `thread_T/part_P.bin` durante scan, luego `partition_P.bin`, luego `sorted_part_P.bin`; todos removidos al destruir |
+| B+Tree resultante | Producido por `build_index_streaming` | Idéntico: mismo formato de páginas, misma dedup en la escritura |
+| Override del buffer | `MDB_SORT_BUFFER_MB` aplica | `MDB_SORT_BUFFER_MB` no aplica (el backend usa particiones; ver abajo) |
+
+### Garantía algorítmica del backend `radix`
+
+El pico de RSS del pipeline radix está **acotado por construcción**, no
+por el tamaño del dataset:
+
+```
+peak_RSS_radix  ≤  num_particiones × 4 MB (buffers de PartitionFile)
+              + num_workers × 512 MB    (buffer de sort por worker)
+              + O(batch)                (records en vuelo)
+```
+
+Con los defaults (`num_particiones ∈ [8, 128]`, `num_workers = 4`,
+`worker_memory_budget = 512 MB`), el pico es a lo sumo ~2.5 GB
+independientemente de si el dataset tiene 2 708 o 111 millones de nodos.
+Esta propiedad elimina la categoría de fallo observada en `papers100M`
+Run 5 (kernel reclaim evictó apps interactivas para ceder RAM al proceso
+de `mdb`) **sin depender de aislamiento externo** (cgroups vía
+`systemd-run --user --scope -p MemoryMax=...`).
+
+### Cuándo usar cada backend
+
+- **`classic` (default)** — graphs pequeños y medianos (hasta ~10M aristas
+  en commodity hardware), donde el sort en memoria es más rápido que el
+  overhead de particionar + escribir + leer scratch files.
+- **`radix`** — graphs grandes (>50M aristas) en hardware con RAM limitada
+  relativa al dataset, donde el pico del `classic` pondría en riesgo al
+  resto del sistema. También útil para runs reproducibles en CI/benchmarks
+  donde el pico de RAM debe ser determinístico.
+
+### Selección y diagnóstico
+
+```bash
+# Usar el default (classic) — sin cambios
+build/Release/bin/mdb server data/dbs/gql/papers100M
+
+# Usar radix
+MDB_PROJECTION_SORTER=radix build/Release/bin/mdb server data/dbs/gql/papers100M
+
+# Los valores no reconocidos caen silenciosamente a classic
+MDB_PROJECTION_SORTER=foobar build/Release/bin/mdb server ...   # == classic
+```
+
+La variable se lee **una vez** (cacheada vía `std::call_once`); cambiarla
+mid-process requiere reiniciar el servidor.
+
+### Evidencia de equivalencia
+
+- **347/347 tests de integración GQL** pasan bajo ambos backends
+  (invocar `MDB_PROJECTION_SORTER=classic ./scripts/run-tests gql` y
+  `MDB_PROJECTION_SORTER=radix ./scripts/run-tests gql`).
+- **Byte-identical B+Tree output** en `cora_gnn` (20/20 archivos `.leaf` /
+  `.dir`, ~795 KB totales). Validado por
+  `./scripts/test_projection_radix.sh` (retorna 0 on all-match).
+- **10 tests unitarios** específicos en `RadixPartitionSortTests` y
+  `SorterDispatch`: deterministic bucketing, routing por radix, sort por
+  partición monotonic, concatenación globalmente ordenada, clamp de
+  partition count, worker count adaptativo, fallback external sort,
+  cleanup en destructor.
+
+### Referencias
+
+- Diseño formal: ADR-004 (`Partial_Idea/decisions/004_radix_partition_sort.md`)
+- Spec técnica: `docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md`
+- Plan de implementación: `docs/superpowers/plans/2026-04-21-radix-partition-sort-plan.md`
+- Implementación: `src/graph_models/gql/projection/{sorter_dispatch,partition_file,parallel_scan_partitioner,radix_partition_sort}.{h,cc}`
+- Script golden compare: `scripts/test_projection_radix.sh`
 
 ---
 

@@ -224,6 +224,24 @@ Key capabilities:
 - Tests: `tests/gql/test_suites/projection_native/`, `projection_properties/`, `projection_comprehensive/`, `projection_advanced/`, `projection_adaptive_buffer/`
 - Sort buffer sizing: adaptive at runtime (`max(256 MB, MemAvailable * 3/4)`) via `src/misc/available_ram.h`, overridable with env var `MDB_SORT_BUFFER_MB=<integer_MB>`. See `docs/MillenniumDB.wiki/GQL-Projections.md` "Memory tuning" section. 23 unit tests in `src/tests/available_ram-test.cc`.
 
+### Sort backend selector — `MDB_PROJECTION_SORTER` (added 2026-04-21, ADR 004)
+
+Two backends are now available for the projection B+Tree index build phase, selected at runtime via the `MDB_PROJECTION_SORTER` environment variable:
+
+- `MDB_PROJECTION_SORTER=classic` (default) — legacy `ExternalRecordSort` pipeline via `sorter_dispatch::run_classic`. Identical behavior to pre-2026-04-21 code.
+- `MDB_PROJECTION_SORTER=radix` — new `RadixPartitionSort<N>` pipeline (Phase 1 parallel scan + per-thread partition files → Phase 2 parallel per-partition sort with `malloc_trim(0)` between partitions → Phase 3 concatenation into BPTLeafWriter/BPTDirWriter).
+
+Key properties of the RADIX backend:
+
+- **Peak RSS bounded by construction:** `O(num_partitions × 4 MB + num_workers × 512 MB) ≈ 2.5 GB`, independent of dataset size. Designed to eliminate the Run 5 failure mode on `papers100M` without requiring external cgroup protection (`systemd-run -p MemoryMax=...`).
+- **Opt-in, zero regression:** 347/347 GQL integration tests pass under both backends. 20/20 B+Tree `.leaf` / `.dir` files byte-identical between backends on `cora_gnn` (validated by `scripts/test_projection_radix.sh`).
+- **Adaptive parallelism:** partition count `clamp(total_bytes / 256 MB, 8, 128)`; worker pool `min(cores − scan_threads, memory_budget / 512 MB)` default 4.
+- **Files:** `src/graph_models/gql/projection/{sorter_dispatch,partition_file,parallel_scan_partitioner,radix_partition_sort}.{h,cc}`, `src/tests/radix_partition_sort_test.cc`.
+- **Tests:** 10 unit tests (`RadixPartitionSortTests` / `SorterDispatch` in ctest), plus golden-compare integration test on `cora_gnn` via `scripts/test_projection_radix.sh`.
+- **Design record:** ADR 004 (`Partial_Idea/decisions/004_radix_partition_sort.md`), spec `docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md`, plan `docs/superpowers/plans/2026-04-21-radix-partition-sort-plan.md`.
+
+Related env vars: `MDB_SORT_BUFFER_MB` (CLASSIC backend's external-sort buffer) still applies; `MDB_PROJECTION_SPILL_DIR` for spill file location.
+
 ## Claude Code Configuration
 
 This project includes Claude Code configuration:
