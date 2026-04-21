@@ -13,6 +13,14 @@
 #include <execution>
 #endif
 
+// malloc_trim(0) is a glibc extension that forces heap pages accumulated
+// via sbrk() back to the kernel. Used between index sort passes to prevent
+// monotonic RSS growth across the 10 B+Tree builds of a large projection.
+// Silently no-op on non-glibc platforms.
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "external_record_sort.h"
 #include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -975,27 +983,40 @@ size_t build_index_with_streaming_sort(
     // Finalize the buffer (flush any remaining memory to disk if spilled)
     buffer.finalize();
 
-    // Sort buffer sized adaptively from MemAvailable.
-    // See src/misc/available_ram.h and spec 2026-04-14.
-    ExternalRecordSort<N> sorter(sort_temp_dir);
+    size_t count;
+    {
+        // Inner scope ensures `sorter` (and any large std::vector buffers it
+        // owned during Phase 1 in-memory sort / Phase 2 K-way merge) destructs
+        // before we call malloc_trim below. Without the scope, the sorter
+        // would stay alive until function exit, AFTER the trim call.
+        ExternalRecordSort<N> sorter(sort_temp_dir);
 
-    // Add spill files directly to sorter (no memory copy)
-    const auto& spill_paths = buffer.get_spill_paths();
-    const auto& spill_counts = buffer.get_spill_counts();
-    for (size_t i = 0; i < spill_paths.size(); ++i) {
-        sorter.add_run(spill_paths[i], spill_counts[i]);
-    }
+        // Add spill files directly to sorter (no memory copy)
+        const auto& spill_paths = buffer.get_spill_paths();
+        const auto& spill_counts = buffer.get_spill_counts();
+        for (size_t i = 0; i < spill_paths.size(); ++i) {
+            sorter.add_run(spill_paths[i], spill_counts[i]);
+        }
 
-    // Add in-memory records (moved, not copied)
-    if (buffer.memory_buffer_size() > 0) {
-        sorter.add_memory_records(buffer.take_memory_buffer());
-    }
+        // Add in-memory records (moved, not copied)
+        if (buffer.memory_buffer_size() > 0) {
+            sorter.add_memory_records(buffer.take_memory_buffer());
+        }
 
-    // Build index with streaming sort
-    size_t count = build_func(sorter, index_path);
+        // Build index with streaming sort
+        count = build_func(sorter, index_path);
+    } // sorter destructs here, releasing std::vector storage it owned.
 
     // Clear buffer (removes spill files)
     buffer.clear();
+
+    // Release retained heap pages to the kernel so the NEXT index build starts
+    // from a low RSS baseline. Without this, glibc keeps freed chunks in its
+    // free-lists; a 10-index projection on 100M+ nodes can pile multiple GB
+    // of inaccessible heap before hitting the virtual-memory ceiling.
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 
     return count;
 }
