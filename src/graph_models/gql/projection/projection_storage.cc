@@ -13,15 +13,8 @@
 #include <execution>
 #endif
 
-// malloc_trim(0) is a glibc extension that forces heap pages accumulated
-// via sbrk() back to the kernel. Used between index sort passes to prevent
-// monotonic RSS growth across the 10 B+Tree builds of a large projection.
-// Silently no-op on non-glibc platforms.
-#if defined(__GLIBC__)
-#include <malloc.h>
-#endif
-
 #include "external_record_sort.h"
+#include "graph_models/gql/projection/sorter_dispatch.h"
 #include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
@@ -991,60 +984,6 @@ template size_t ProjectionStorage::build_index_streaming<1>(ExternalRecordSort<1
 template size_t ProjectionStorage::build_index_streaming<2>(ExternalRecordSort<2>&, const std::string&);
 template size_t ProjectionStorage::build_index_streaming<3>(ExternalRecordSort<3>&, const std::string&);
 
-// Helper function for streaming index build (C++17 compatible)
-// Defined in anonymous namespace to limit scope
-namespace {
-
-template<std::size_t N>
-size_t build_index_with_streaming_sort(
-    StreamingRecordBuffer<N>& buffer,
-    const std::string& sort_temp_dir,
-    const std::string& index_path,
-    std::function<size_t(ExternalRecordSort<N>&, const std::string&)> build_func
-) {
-    // Finalize the buffer (flush any remaining memory to disk if spilled)
-    buffer.finalize();
-
-    size_t count;
-    {
-        // Inner scope ensures `sorter` (and any large std::vector buffers it
-        // owned during Phase 1 in-memory sort / Phase 2 K-way merge) destructs
-        // before we call malloc_trim below. Without the scope, the sorter
-        // would stay alive until function exit, AFTER the trim call.
-        ExternalRecordSort<N> sorter(sort_temp_dir);
-
-        // Add spill files directly to sorter (no memory copy)
-        const auto& spill_paths = buffer.get_spill_paths();
-        const auto& spill_counts = buffer.get_spill_counts();
-        for (size_t i = 0; i < spill_paths.size(); ++i) {
-            sorter.add_run(spill_paths[i], spill_counts[i]);
-        }
-
-        // Add in-memory records (moved, not copied)
-        if (buffer.memory_buffer_size() > 0) {
-            sorter.add_memory_records(buffer.take_memory_buffer());
-        }
-
-        // Build index with streaming sort
-        count = build_func(sorter, index_path);
-    } // sorter destructs here, releasing std::vector storage it owned.
-
-    // Clear buffer (removes spill files)
-    buffer.clear();
-
-    // Release retained heap pages to the kernel so the NEXT index build starts
-    // from a low RSS baseline. Without this, glibc keeps freed chunks in its
-    // free-lists; a 10-index projection on 100M+ nodes can pile multiple GB
-    // of inaccessible heap before hitting the virtual-memory ceiling.
-#if defined(__GLIBC__)
-    malloc_trim(0);
-#endif
-
-    return count;
-}
-
-} // anonymous namespace
-
 void ProjectionStorage::build_all_indexes_bulk() {
     // =========================================================================
     // STREAMING BULK IMPORT: Build indexes with bounded memory
@@ -1068,63 +1007,69 @@ void ProjectionStorage::build_all_indexes_bulk() {
     // =========================================================================
 
     // 1. Nodes index (Record<1>: node_id)
-    node_count = build_index_with_streaming_sort<1>(
+    node_count = GQL::sort_and_build_index<1>(
         *node_records_buffer_,
-        sort_temp_dir,
         projection_dir + "/nodes",
+        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
         [this](ExternalRecordSort<1>& sorter, const std::string& path) {
             return build_index_streaming<1>(sorter, path);
-        }
+        },
+        sort_temp_dir
     );
 
     // 2. From→To edge index (Record<3>: from, to, edge_id)
-    build_index_with_streaming_sort<3>(
+    GQL::sort_and_build_index<3>(
         *from_to_records_buffer_,
-        sort_temp_dir,
         projection_dir + "/from_to_edge",
+        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
-        }
+        },
+        sort_temp_dir
     );
 
     // 3. To→From edge index (Record<3>: to, from, edge_id)
-    build_index_with_streaming_sort<3>(
+    GQL::sort_and_build_index<3>(
         *to_from_records_buffer_,
-        sort_temp_dir,
         projection_dir + "/to_from_edge",
+        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
-        }
+        },
+        sort_temp_dir
     );
 
     // 4. Edge direction index (Record<2>: edge_id, is_directed)
-    build_index_with_streaming_sort<2>(
+    GQL::sort_and_build_index<2>(
         *direction_records_buffer_,
-        sort_temp_dir,
         projection_dir + "/edge_direction",
+        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
-        }
+        },
+        sort_temp_dir
     );
 
     // 5. Edge→From→To index for directed edges (Record<3>: edge_id, from, to)
-    build_index_with_streaming_sort<3>(
+    GQL::sort_and_build_index<3>(
         *edge_from_to_records_buffer_,
-        sort_temp_dir,
         projection_dir + "/edge_from_to",
+        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
-        }
+        },
+        sort_temp_dir
     );
 
     // 6. Edge→N1→N2 index for undirected edges (Record<3>: edge_id, n1, n2)
-    build_index_with_streaming_sort<3>(
+    GQL::sort_and_build_index<3>(
         *edge_n1_n2_records_buffer_,
-        sort_temp_dir,
         projection_dir + "/edge_n1_n2",
+        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
-        }
+        },
+        sort_temp_dir
     );
 
     // =========================================================================
@@ -1133,45 +1078,49 @@ void ProjectionStorage::build_all_indexes_bulk() {
 
     if (features.include_node_labels && node_label_records_buffer_) {
         // Node→Label index (Record<2>: node_id, label_id)
-        build_index_with_streaming_sort<2>(
+        GQL::sort_and_build_index<2>(
             *node_label_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/node_label",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<2>& sorter, const std::string& path) {
                 return build_index_streaming<2>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
 
         // Label→Node index (Record<2>: label_id, node_id)
-        build_index_with_streaming_sort<2>(
+        GQL::sort_and_build_index<2>(
             *label_node_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/label_node",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<2>& sorter, const std::string& path) {
                 return build_index_streaming<2>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
     }
 
     if (features.include_edge_labels && edge_label_records_buffer_) {
         // Edge→Label index (Record<2>: edge_id, label_id)
-        build_index_with_streaming_sort<2>(
+        GQL::sort_and_build_index<2>(
             *edge_label_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/edge_label",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<2>& sorter, const std::string& path) {
                 return build_index_streaming<2>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
 
         // Label→Edge index (Record<2>: label_id, edge_id)
-        build_index_with_streaming_sort<2>(
+        GQL::sort_and_build_index<2>(
             *label_edge_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/label_edge",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<2>& sorter, const std::string& path) {
                 return build_index_streaming<2>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
     }
 
@@ -1181,45 +1130,49 @@ void ProjectionStorage::build_all_indexes_bulk() {
 
     if (features.include_node_properties && node_key_value_records_buffer_) {
         // Node→Key→Value index (Record<3>: node_id, key_id, value_id)
-        build_index_with_streaming_sort<3>(
+        GQL::sort_and_build_index<3>(
             *node_key_value_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/node_key_value",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<3>& sorter, const std::string& path) {
                 return build_index_streaming<3>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
 
         // Key→Value→Node index (Record<3>: key_id, value_id, node_id)
-        build_index_with_streaming_sort<3>(
+        GQL::sort_and_build_index<3>(
             *key_value_node_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/key_value_node",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<3>& sorter, const std::string& path) {
                 return build_index_streaming<3>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
     }
 
     if (features.include_edge_properties && edge_key_value_records_buffer_) {
         // Edge→Key→Value index (Record<3>: edge_id, key_id, value_id)
-        build_index_with_streaming_sort<3>(
+        GQL::sort_and_build_index<3>(
             *edge_key_value_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/edge_key_value",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<3>& sorter, const std::string& path) {
                 return build_index_streaming<3>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
 
         // Key→Value→Edge index (Record<3>: key_id, value_id, edge_id)
-        build_index_with_streaming_sort<3>(
+        GQL::sort_and_build_index<3>(
             *key_value_edge_records_buffer_,
-            sort_temp_dir,
             projection_dir + "/key_value_edge",
+            /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
             [this](ExternalRecordSort<3>& sorter, const std::string& path) {
                 return build_index_streaming<3>(sorter, path);
-            }
+            },
+            sort_temp_dir
         );
     }
 
