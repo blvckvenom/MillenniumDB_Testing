@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
-#include <functional>
 #include <stdexcept>
 
 // Parallel execution for std::sort (requires TBB on GCC/Clang)
