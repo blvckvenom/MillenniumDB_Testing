@@ -1,0 +1,76 @@
+// src/graph_models/gql/projection/partition_file.cc
+#include "graph_models/gql/projection/partition_file.h"
+
+#include <cstring>
+#include <stdexcept>
+
+namespace GQL {
+
+template<std::size_t N>
+PartitionFile<N>::PartitionFile(const std::string& path, std::size_t buffer_bytes)
+    : path_(path),
+      buffer_capacity_(buffer_bytes / sizeof(Record<N>))
+{
+    fp_ = std::fopen(path_.c_str(), "wb");
+    if (!fp_) {
+        throw std::runtime_error("PartitionFile: cannot open " + path_);
+    }
+    buffer_.reserve(buffer_capacity_);
+}
+
+template<std::size_t N>
+PartitionFile<N>::~PartitionFile() {
+    try { flush(); } catch (...) {}
+    if (fp_) std::fclose(fp_);
+}
+
+template<std::size_t N>
+void PartitionFile<N>::append(const Record<N>& r) {
+    buffer_.push_back(r);
+    record_count_++;
+    if (buffer_.size() >= buffer_capacity_) {
+        flush();
+    }
+}
+
+template<std::size_t N>
+void PartitionFile<N>::flush() {
+    if (buffer_.empty()) return;
+    std::size_t n = std::fwrite(buffer_.data(), sizeof(Record<N>),
+                                 buffer_.size(), fp_);
+    if (n != buffer_.size()) {
+        throw std::runtime_error("PartitionFile: short write to " + path_);
+    }
+    bytes_written_ += n * sizeof(Record<N>);
+    buffer_.clear();
+}
+
+template<std::size_t N>
+PartitionFile<N>::Reader::Reader(const std::string& path) {
+    fp_ = std::fopen(path.c_str(), "rb");
+    if (!fp_) {
+        eof_ = true;  // absent file == empty partition
+    }
+}
+
+template<std::size_t N>
+PartitionFile<N>::Reader::~Reader() {
+    if (fp_) std::fclose(fp_);
+}
+
+template<std::size_t N>
+bool PartitionFile<N>::Reader::next(Record<N>& out) {
+    if (eof_ || !fp_) return false;
+    std::size_t n = std::fread(&out, sizeof(Record<N>), 1, fp_);
+    if (n != 1) {
+        eof_ = true;
+        return false;
+    }
+    return true;
+}
+
+template class PartitionFile<1>;
+template class PartitionFile<2>;
+template class PartitionFile<3>;
+
+}  // namespace GQL
