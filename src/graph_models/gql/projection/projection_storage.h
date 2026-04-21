@@ -5,7 +5,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "graph_models/gql/projection/bloom_filter.h"
@@ -443,6 +442,25 @@ public:
     void resize_bloom_filter(size_t expected_edges, double fpr = BLOOM_FILTER_FPR);
     /// @}
 
+    /// @name Node-scan Lifecycle
+    /// @{
+
+    /**
+     * @brief Finalize the scan-phase node set.
+     *
+     * MUST be called after the node scan phase completes and before any
+     * `has_node()` call during edge scan. Sorts `collected_nodes_` and
+     * removes duplicates in place, releasing excess capacity.
+     *
+     * Idempotent: a second call returns immediately.
+     *
+     * Complexity: O(N log N) for the sort (one-time, not per-insert).
+     * After this call `has_node()` runs in O(log N) instead of
+     * O(N) linear scan.
+     */
+    void finalize_node_scan();
+    /// @}
+
     /// @name Const Index Accessors
     /// @brief Read-only versions for const-correct access.
     /// @{
@@ -560,7 +578,27 @@ private:
 
     /// @name Duplicate Detection
     /// @{
-    std::unordered_set<uint64_t> inserted_nodes;  ///< Tracks inserted node IDs
+
+    /**
+     * @brief Sorted-vector tracker for inserted node IDs during scan.
+     *
+     * Replaces an earlier std::unordered_set<uint64_t>, whose per-entry
+     * overhead (~48 B on libstdc++) was dominating scan-phase RSS on
+     * 100M+ node graphs (see
+     * `docs/superpowers/thesis_analysis/2026-04-20-node-bloom-scan-memory-design.md`).
+     *
+     * Protocol:
+     *   - `add_node` appends unconditionally (no per-call dedup check).
+     *   - `finalize_node_scan` sorts + `std::unique`s and flips
+     *     `collected_nodes_sorted_` to true.
+     *   - `has_node` does `std::binary_search` when sorted, and a
+     *     linear-scan fallback otherwise (defensive — the builder is
+     *     required to call `finalize_node_scan` before edge scan).
+     *
+     * Memory: ~8 B per unique node (vs ~48 B for the hash set).
+     */
+    std::vector<uint64_t> collected_nodes_;
+    bool                  collected_nodes_sorted_ = false;
 
     /**
      * @brief Bloom filter for memory-efficient edge deduplication.

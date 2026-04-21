@@ -459,9 +459,14 @@ void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string
         flush_nodes();
     }
 
-    // NOTE: With bulk import, we don't flush here anymore.
-    // has_node() now checks the inserted_nodes hash set first,
-    // so it works during the collection phase before B+tree is built.
+    // Finalise the scan-phase node tracker: sorts `collected_nodes_` and
+    // collapses duplicates (see ProjectionStorage::finalize_node_scan). This
+    // transitions has_node() from a linear-scan fallback to O(log N) binary
+    // search, which is the contract scan_edges_by_types relies on for
+    // filtering edge endpoints. Called here (rather than at the caller) so
+    // every invocation path — procedure, tests, embedding writer — gets the
+    // invariant for free.
+    storage->finalize_node_scan();
 
     if (benchmark_timers_.enabled) {
         benchmark_timers_.node_scan_ms += std::chrono::duration<double, std::milli>(

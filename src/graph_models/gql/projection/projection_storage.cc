@@ -66,7 +66,7 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
     }
 
     // Pre-allocate for better performance
-    inserted_nodes.reserve(INITIAL_CAPACITY);
+    collected_nodes_.reserve(INITIAL_CAPACITY);
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
 
@@ -94,7 +94,7 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_,
     }
 
     // Pre-allocate for better performance
-    inserted_nodes.reserve(INITIAL_CAPACITY);
+    collected_nodes_.reserve(INITIAL_CAPACITY);
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
 
@@ -124,7 +124,7 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_,
     }
 
     // Pre-allocate for better performance
-    inserted_nodes.reserve(INITIAL_CAPACITY);
+    collected_nodes_.reserve(INITIAL_CAPACITY);
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
 
@@ -248,16 +248,16 @@ void ProjectionStorage::ensure_node_property_indexes() {
 }
 
 void ProjectionStorage::add_node(const ProjectedNode& node) {
-    uint64_t node_id_val = node.node_id.id;
+    // Append unconditionally. finalize_node_scan() collapses duplicates with
+    // std::sort + std::unique once the node scan completes, trading a 48 B/entry
+    // hash set (previous impl) for an 8 B/entry sorted vector. Callers that
+    // truly require per-insert dedup semantics must use has_node() before
+    // add_node(); existing flows (single- and multi-label scan) tolerate
+    // duplicates because node scan callbacks are the only producer.
+    collected_nodes_.push_back(node.node_id.id);
+    collected_nodes_sorted_ = false;  // appended unsorted → invalidates invariant
 
-    // Check if already inserted
-    if (inserted_nodes.find(node_id_val) != inserted_nodes.end()) {
-        return;
-    }
-
-    // Add to batch
     node_batch.push_back(node);
-    inserted_nodes.insert(node_id_val);
 
     // Flush batch if it reaches threshold
     if (node_batch.size() >= BATCH_SIZE) {
@@ -383,9 +383,18 @@ void ProjectionStorage::add_edge_property(ObjectId edge_id, ObjectId key_id, Obj
 }
 
 bool ProjectionStorage::has_node(ObjectId node_id) const {
-    // BULK IMPORT: First check the in-memory hash set (for collection phase)
-    // This allows has_node() to work before the B+tree is built.
-    if (inserted_nodes.find(node_id.id) != inserted_nodes.end()) {
+    // In-memory scan-phase check against the sorted-vector dedup tracker.
+    // Expected path: finalize_node_scan() was called at scan→scan transition,
+    // so we can use O(log N) binary search. The pre-finalize fallback is
+    // defensive (e.g. unit tests that query mid-scan) and correctness-
+    // preserving.
+    if (collected_nodes_sorted_) {
+        if (std::binary_search(collected_nodes_.begin(), collected_nodes_.end(),
+                               node_id.id)) {
+            return true;
+        }
+    } else if (std::find(collected_nodes_.begin(), collected_nodes_.end(),
+                         node_id.id) != collected_nodes_.end()) {
         return true;
     }
 
@@ -537,6 +546,19 @@ void ProjectionStorage::resize_bloom_filter(size_t expected_edges, double fpr) {
     // Memory scales linearly: ~10 bits per edge for 1% FPR
     // Example: 61M edges → ~76 MB, 100M edges → ~125 MB
     edge_bloom_filter_ = std::make_unique<BloomFilter>(expected_edges, fpr);
+}
+
+void ProjectionStorage::finalize_node_scan() {
+    if (collected_nodes_sorted_) {
+        return;  // Idempotent: second call is a no-op.
+    }
+    std::sort(collected_nodes_.begin(), collected_nodes_.end());
+    collected_nodes_.erase(std::unique(collected_nodes_.begin(),
+                                       collected_nodes_.end()),
+                           collected_nodes_.end());
+    // Release any excess capacity from multi-label over-collection.
+    collected_nodes_.shrink_to_fit();
+    collected_nodes_sorted_ = true;
 }
 
 std::vector<ObjectId> ProjectionStorage::get_all_node_ids() const {
