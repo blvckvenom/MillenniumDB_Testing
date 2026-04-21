@@ -316,7 +316,13 @@ if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/p
     set_target_properties(radix_partition_sort_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
     )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves.
     target_link_libraries(radix_partition_sort_test
+        GTest::gtest_main
+        GTest::gtest
         millenniumdb
         antlr4_cpp_runtime
         ${FS}
@@ -326,8 +332,6 @@ if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/p
         ${ASYNC_IO_LIBS}
         ${TBB_LIBS}
         ${LZ4_LIBS}
-        GTest::gtest
-        GTest::gtest_main
     )
     add_test(
         NAME RadixPartitionSortTests
