@@ -290,6 +290,48 @@ foreach(target ${TEST_TARGETS})
     )
 endforeach(target)
 
+# ============================================================================
+# Radix-Partition Sort unit tests (TDD RED at this commit)
+# ============================================================================
+# Registered here (not in a per-directory src/tests/CMakeLists.txt) to match
+# the existing project layout where test targets live in the top-level file.
+#
+# The test executable currently fails to link because RadixPartitionSort<N>
+# has no backing .cc (added in Tasks 6-11) and partition_file.h does not
+# exist yet (added in Task 5). This is the expected TDD RED state; the main
+# `mdb` target is unaffected because radix_partition_sort.h is only included
+# from this test file.
+# ============================================================================
+find_package(GTest QUIET)
+if(GTest_FOUND)
+    add_executable(radix_partition_sort_test
+        ${CMAKE_SOURCE_DIR}/src/tests/radix_partition_sort_test.cc
+    )
+    set_target_properties(radix_partition_sort_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(radix_partition_sort_test
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_test(
+        NAME RadixPartitionSortTests
+        COMMAND $<TARGET_FILE:radix_partition_sort_test>
+        WORKING_DIRECTORY tests
+    )
+else()
+    message(STATUS "GTest not found - radix_partition_sort_test disabled")
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
