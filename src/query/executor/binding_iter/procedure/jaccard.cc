@@ -30,7 +30,7 @@ void Jaccard::_reset()
     std::array<uint64_t, 3> min_ids = { 0, 0, 0 };
     std::array<uint64_t, 3> max_ids = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
 
-    auto edge_iter = gql_model.n1_n2_edge->get_range(
+    auto edge_iter = gql_model.get_n1_n2_edge().get_range(
         &get_query_ctx().thread_info.interruption_requested,
         min_ids,
         max_ids
