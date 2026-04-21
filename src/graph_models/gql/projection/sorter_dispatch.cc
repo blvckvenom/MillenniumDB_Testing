@@ -10,6 +10,7 @@
 #include "graph_models/gql/projection/sorter_dispatch.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <string>
 
@@ -18,6 +19,7 @@
 #endif
 
 #include "graph_models/gql/projection/external_record_sort.h"
+#include "graph_models/gql/projection/radix_partition_sort.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
 
 namespace GQL {
@@ -116,19 +118,48 @@ std::size_t sort_and_build_index(
     const BuildFromSorterFn<N>&  build_from_sorter,
     const std::string&           sort_temp_dir
 ) {
-    (void)estimated_count;  // Unused in CLASSIC; RADIX wires this in Task 12.
-
     switch (get_sorter_backend()) {
         case SorterBackend::CLASSIC: {
+            (void)estimated_count;  // Unused in CLASSIC.
             return run_classic<N>(
                 input_stream, index_base_path, build_from_sorter, sort_temp_dir);
         }
         case SorterBackend::RADIX: {
-            // Wired in Task 12. For M1, fall through to CLASSIC so the
-            // facade is a pure no-op behavioral change regardless of the
-            // env-var value.
-            return run_classic<N>(
-                input_stream, index_base_path, build_from_sorter, sort_temp_dir);
+            // RADIX backend pipeline (Tasks 5-11):
+            //   Phase 1: scan + partition by top-bits of record[0]
+            //   Phase 2: parallel per-partition sort (in-memory or external fallback)
+            //   Phase 3: concatenate sorted partitions into BPTLeafWriter/BPTDirWriter
+            // The `build_from_sorter` callback is unused here because RADIX's own
+            // write_btree_from_sorted_partitions<N> performs the B+Tree write
+            // directly (mirroring the page-level process_block pattern used by
+            // ProjectionStorage::build_index_streaming). The resulting .leaf /
+            // .dir files are bit-identical to the CLASSIC backend's output on
+            // the same input (validated by Task 13's golden-compare script).
+            (void)build_from_sorter;
+
+            typename RadixPartitionSort<N>::Config cfg;
+            cfg.scratch_dir =
+                (std::filesystem::path(sort_temp_dir) / ".radix_scratch").string();
+            // Reuse sort_temp_dir's subdirectory so each projection has its own
+            // scratch area — build_all_indexes_bulk passes the same
+            // sort_temp_dir across all 14 index builds, but `.radix_scratch`
+            // is recreated per call (ctor creates it; dtor removes it), so
+            // there is no cross-call collision.
+
+            RadixPartitionSort<N> sorter(cfg);
+            sorter.scan_and_partition(input_stream, estimated_count);
+
+            // Mirror the post-sort cleanup the CLASSIC path does:
+            //   - input_stream.clear() releases buffer state (including spill
+            //     files) so subsequent index builds start from a fresh state;
+            //   - malloc_trim(0) releases glibc-retained heap between index
+            //     builds to bound RSS growth across the 14 index sequence.
+            std::size_t written = sorter.sort_and_write(index_base_path);
+            input_stream.clear();
+#if defined(__GLIBC__)
+            malloc_trim(0);
+#endif
+            return written;
         }
     }
     return 0;  // unreachable
