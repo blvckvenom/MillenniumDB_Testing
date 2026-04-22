@@ -489,6 +489,32 @@ public:
     void reset_sort_scratch_();
 
     /**
+     * @brief Begin a serialized edge scan pass for a single index.
+     *
+     * Sets serial_write_mask_ so that flush_edge_batch() only populates
+     * the streaming buffer(s) belonging to `which`. Also clears the edge
+     * bloom filter so the fresh per-pass scan emits all edges regardless
+     * of what prior passes added to the filter.
+     *
+     * Must be called before scan_edges_impl_serialized_() for the pass
+     * and paired with end_serial_edge_pass_() after build_one_index().
+     * Spill files left by any previous pass's non-target buffers are
+     * cleared here, bounding peak disk to O(max single pass).
+     *
+     * @param which Single-bit ProjectionIndex identifying the target index.
+     */
+    void begin_serial_edge_pass_(ProjectionIndex which);
+
+    /**
+     * @brief End a serialized edge scan pass.
+     *
+     * Clears serial_write_mask_ (reverts flush_edge_batch() to ALL-buffer
+     * mode) ready for the next pass or for any post-serialized operation
+     * that expects classic write semantics.
+     */
+    void end_serial_edge_pass_();
+
+    /**
      * @brief Open all B+Tree index readers after the index files have been built.
      *
      * Spec #2 Phase 4 — called by both build_all_indexes_bulk() (CLASSIC path)
@@ -700,6 +726,25 @@ private:
      * 1% is a good balance: ~10 bits per element.
      */
     static constexpr double BLOOM_FILTER_FPR = 0.01;
+    /// @}
+
+    /// @name Serialized-mode edge-write mask
+    /// @{
+    /**
+     * @brief Bitmask controlling which edge streaming buffers flush_edge_batch()
+     * populates during the SERIAL scan pipeline (Spec #2).
+     *
+     * 0 (default) = CLASSIC mode: write to all applicable buffers.
+     * Non-zero    = SERIAL mode: only write to buffers whose ProjectionIndex
+     *               bit is set in the mask. Used by
+     *               ProjectionStorage::begin_serial_edge_pass_() to bound peak
+     *               scratch disk to O(max single pass) on large datasets
+     *               (papers100M disk fix — see projection_storage.cc).
+     *
+     * Also gates the edge bloom filter: when the mask is active the bloom check
+     * is skipped so each fresh per-pass scan emits all edges independently.
+     */
+    uint32_t serial_write_mask_ = 0;
     /// @}
 
     /// @name Write Buffers

@@ -2297,9 +2297,15 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // drain_pending_batches() before each build ensures the streaming buffer
     // is fully populated (same correctness argument as Phase A above).
     for (auto idx : edge_phase) {
+        // Arm the per-pass write mask BEFORE the scan so flush_edge_batch()
+        // only populates the target buffer.  Also clears the bloom filter and
+        // any stale spill files from previous passes (disk-bound fix for
+        // papers100M ENOSPC — see ProjectionStorage::begin_serial_edge_pass_).
+        storage->begin_serial_edge_pass_(idx);
         scan_edges_impl_serialized_(stored_types_, idx, filter.get());
         storage->drain_pending_batches();
         storage->build_one_index(idx);
+        storage->end_serial_edge_pass_();
         storage->reset_sort_scratch_();
 #if defined(__GLIBC__)
         malloc_trim(0);

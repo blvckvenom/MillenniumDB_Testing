@@ -484,6 +484,14 @@ void ProjectionStorage::flush_edge_batch() {
     // STREAMING BUFFER: Collect records with automatic disk spill.
     // NO B+tree insertions here - all indexes are built in bulk during finalize().
     // Memory bounded: spills to disk when threshold exceeded.
+    //
+    // When serial_write_mask_ is non-zero (SERIAL scan mode, set by
+    // begin_serial_edge_pass_), only write to the buffer(s) whose
+    // ProjectionIndex bit is set.  This bounds peak scratch disk to
+    // O(max single-pass spill) instead of O(5 × full-edge-set) on
+    // large datasets (papers100M disk fix — see begin_serial_edge_pass_).
+    const bool serial_mode = (serial_write_mask_ != 0);
+    const uint32_t mask    = serial_write_mask_;
 
     for (const auto& edge : edge_batch) {
         uint64_t from_id = edge.from_node.id;
@@ -491,42 +499,64 @@ void ProjectionStorage::flush_edge_batch() {
         uint64_t edge_id = edge.edge_id.id;
 
         // Collect from->to record
-        Record<3> from_to_record;
-        from_to_record[0] = from_id;
-        from_to_record[1] = to_id;
-        from_to_record[2] = edge_id;
-        from_to_records_buffer_->push_back(from_to_record);
-
-        // Collect to->from record
-        Record<3> to_from_record;
-        to_from_record[0] = to_id;
-        to_from_record[1] = from_id;
-        to_from_record[2] = edge_id;
-        to_from_records_buffer_->push_back(to_from_record);
-
-        // Collect direction record
-        Record<2> direction_record;
-        direction_record[0] = edge_id;
-        direction_record[1] = edge.is_directed ? 1 : 0;
-        direction_records_buffer_->push_back(direction_record);
-
-        // Collect edge-first records (for edge-bound query patterns)
-        Record<3> edge_first_record;
-        edge_first_record[0] = edge_id;
-        edge_first_record[1] = from_id;
-        edge_first_record[2] = to_id;
-        if (edge.is_directed) {
-            edge_from_to_records_buffer_->push_back(edge_first_record);
-        } else {
-            edge_n1_n2_records_buffer_->push_back(edge_first_record);
+        if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::FROM_TO_EDGE))) {
+            Record<3> from_to_record;
+            from_to_record[0] = from_id;
+            from_to_record[1] = to_id;
+            from_to_record[2] = edge_id;
+            from_to_records_buffer_->push_back(from_to_record);
         }
 
-        // Update counts
-        edge_count++;
-        if (edge.is_directed) {
-            directed_edge_count++;
-        } else {
-            undirected_edge_count++;
+        // Collect to->from record
+        if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::TO_FROM_EDGE))) {
+            Record<3> to_from_record;
+            to_from_record[0] = to_id;
+            to_from_record[1] = from_id;
+            to_from_record[2] = edge_id;
+            to_from_records_buffer_->push_back(to_from_record);
+        }
+
+        // Collect direction record
+        if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::EDGE_DIRECTION))) {
+            Record<2> direction_record;
+            direction_record[0] = edge_id;
+            direction_record[1] = edge.is_directed ? 1 : 0;
+            direction_records_buffer_->push_back(direction_record);
+        }
+
+        // Collect edge-first records (for edge-bound query patterns)
+        if (!serial_mode || (mask & (static_cast<uint32_t>(ProjectionIndex::EDGE_FROM_TO)
+                                    | static_cast<uint32_t>(ProjectionIndex::EDGE_N1_N2)))) {
+            Record<3> edge_first_record;
+            edge_first_record[0] = edge_id;
+            edge_first_record[1] = from_id;
+            edge_first_record[2] = to_id;
+            if (edge.is_directed) {
+                if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::EDGE_FROM_TO))) {
+                    edge_from_to_records_buffer_->push_back(edge_first_record);
+                }
+            } else {
+                if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::EDGE_N1_N2))) {
+                    edge_n1_n2_records_buffer_->push_back(edge_first_record);
+                }
+            }
+        }
+
+        // Update counts once per unique edge processed.
+        // In SERIAL mode each core edge pass re-scans the same edges;
+        // only count on the canonical FROM_TO_EDGE pass (the first pass
+        // in the edge phase) to avoid multiplying edge_count by 5.
+        // In CLASSIC mode (serial_mode=false) always count.
+        const bool count_this_pass =
+            !serial_mode ||
+            (mask & static_cast<uint32_t>(ProjectionIndex::FROM_TO_EDGE));
+        if (count_this_pass) {
+            edge_count++;
+            if (edge.is_directed) {
+                directed_edge_count++;
+            } else {
+                undirected_edge_count++;
+            }
         }
     }
 
@@ -1226,6 +1256,62 @@ void ProjectionStorage::reset_sort_scratch_() {
     std::filesystem::create_directories(projection_dir + "/sort_tmp");
     // NOTE: .radix_scratch (Spec #1) is managed by RadixPartitionSort's
     // destructor; we don't need to touch it here.
+}
+
+void ProjectionStorage::begin_serial_edge_pass_(ProjectionIndex which) {
+    // -----------------------------------------------------------------------
+    // Disk-bound fix for papers100M Run 7 (SERIAL+RADIX ENOSPC).
+    //
+    // Root cause: flush_edge_batch() distributes every edge to ALL 5 edge
+    // streaming buffers simultaneously. In the old design, pass 1
+    // (FROM_TO_EDGE) filled all 5 buffers in one scan, with passes 2-5
+    // each consuming their pre-filled buffer. On papers100M (1.6B edges ×
+    // 24 bytes × 4 non-target buffers ≈ 153 GB of spill files) the disk
+    // filled before RadixPartitionSort could write partition files for the
+    // first edge-index pass, producing the "short write to part_7.bin"
+    // ENOSPC error.
+    //
+    // Fix (per-pass mask):
+    //   serial_write_mask_ restricts flush_edge_batch() to only write to
+    //   the buffer(s) corresponding to the current target index. Every pass
+    //   independently re-scans the source edges for its own buffer only.
+    //   The edge bloom filter is also cleared so the fresh per-pass scan
+    //   emits all edges regardless of what prior passes added (the
+    //   EdgeFilter from Phase B handles structural dedup; the bloom is
+    //   redundant in SERIAL mode).
+    //
+    //   Non-target buffers that may have accumulated spill data from the
+    //   immediately preceding pass are explicitly cleared here to reclaim
+    //   disk.  (The target buffer itself is cleared by sort_and_build_index
+    //   via input_stream.clear() after the B+Tree is written.)
+    //
+    // Bounded disk: O(max single-pass spill) at all times.
+    // Correctness:  each pass has a fresh bloom + fresh target buffer.
+    // -----------------------------------------------------------------------
+
+    // Clear any residual spill files from non-target buffers.
+    auto clear_if = [](auto& buf) { if (buf) buf->clear(); };
+    clear_if(from_to_records_buffer_);
+    clear_if(to_from_records_buffer_);
+    clear_if(direction_records_buffer_);
+    clear_if(edge_from_to_records_buffer_);
+    clear_if(edge_n1_n2_records_buffer_);
+    clear_if(edge_label_records_buffer_);
+    clear_if(label_edge_records_buffer_);
+    clear_if(edge_key_value_records_buffer_);
+    clear_if(key_value_edge_records_buffer_);
+
+    // Reset bloom so each pass sees all edges fresh.
+    if (edge_bloom_filter_) edge_bloom_filter_->clear();
+
+    // Arm the write mask: flush_edge_batch() will skip all other buffers.
+    serial_write_mask_ = static_cast<uint32_t>(which);
+}
+
+void ProjectionStorage::end_serial_edge_pass_() {
+    // Disarm the write mask so that any post-serialized code (e.g., classic
+    // path, label/property passes) uses the full all-buffer write path.
+    serial_write_mask_ = 0;
 }
 
 void ProjectionStorage::build_all_indexes_bulk() {
