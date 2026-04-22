@@ -1,8 +1,10 @@
 // src/tests/serial_scan_test.cc
 #include <gtest/gtest.h>
+#include <filesystem>
 #include <stdexcept>
 #include "graph_models/gql/projection/edge_keep_bitmap.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
+#include "graph_models/gql/projection/projection_storage.h"
 
 TEST(EdgeKeepBitmap, SetAndQuery) {
     GQL::EdgeKeepBitmap bm;
@@ -106,11 +108,28 @@ TEST(BuildOneIndex, DispatcherCompilesForAllEnumerators) {
                  "ProjectionIndex enumerators (verified by code review).";
 }
 
-TEST(BuildOneIndex, MultiBitArgumentDocumented) {
-    // The default: clause in the switch throws std::invalid_argument
-    // on multi-bit values (ALL_NODE, ALL_EDGE, ALL) and on NONE.
-    // A functional test requires a constructed ProjectionStorage and
-    // is covered by the 347 GQL suite (Task 12) under SERIAL_SCAN=1.
-    SUCCEED() << "build_one_index throws std::invalid_argument on "
-                 "multi-bit or NONE ProjectionIndex values.";
+TEST(BuildOneIndex, ThrowsOnMultiBitMasks) {
+    // Post-Task-4 decomposition made this invariant testable in isolation
+    // for the first time. The default: branch in build_one_index throws
+    // before touching any streaming buffer, so this test exercises the
+    // throw path without needing a fully-populated projection.
+    //
+    // Uses the 2-arg ProjectionStorage constructor (no projection_name),
+    // which causes save_catalog() to early-return on destruction — keeping
+    // the test self-contained with no catalog files left behind.
+    namespace fs = std::filesystem;
+    auto tmp_dir = fs::temp_directory_path() / "build_one_index_throw_test";
+    fs::create_directories(tmp_dir);
+
+    GQL::ProjectionStorage storage(tmp_dir.string(), tmp_dir.string());
+
+    using PI = GQL::ProjectionIndex;
+    EXPECT_THROW(storage.build_one_index(PI::NONE),     std::invalid_argument);
+    EXPECT_THROW(storage.build_one_index(PI::ALL_NODE), std::invalid_argument);
+    EXPECT_THROW(storage.build_one_index(PI::ALL_EDGE), std::invalid_argument);
+    EXPECT_THROW(storage.build_one_index(PI::ALL),      std::invalid_argument);
+
+    // Best-effort cleanup of spill-file skeleton the constructor created.
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
 }

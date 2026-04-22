@@ -1317,7 +1317,8 @@ void ProjectionStorage::build_one_index(ProjectionIndex which) {
         case ProjectionIndex::KEY_VALUE_EDGE:  build_key_value_edge_index_(); break;
         default:
             throw std::invalid_argument(
-                "build_one_index: must be a single-bit ProjectionIndex value");
+                "build_one_index: must be a single-bit ProjectionIndex value (got 0x" +
+                std::to_string(static_cast<uint32_t>(which)) + ")");
     }
 }
 
