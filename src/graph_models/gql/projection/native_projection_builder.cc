@@ -1688,6 +1688,18 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
 // edge filter's has_node() (Phase B) depends on. If we finalized on every
 // pass, subsequent passes would mutate the node set the edge filter has
 // already consulted.
+//
+// TODO(task10-gnn): The emit_properties gate here only consults the
+// target_mask. In GNN-only configs (includeFeatures + labelProperty +
+// splitProperty with no explicit nodeProperties), classic's
+// extract_node_properties is called for its side effect of populating
+// labels_buffer_ / splits_buffer_ via try_extract_gnn_property, even
+// though no property records get emitted. For that to work under
+// SERIALIZED mode, Task 10's enabled_indexes_() MUST push
+// NODE_KEY_VALUE / KEY_VALUE_NODE into the pass list when
+// gnn_row_mapping_ != nullptr, regardless of
+// features.include_node_properties. Otherwise GNN training with
+// SERIAL_SCAN=1 trains on unlabeled data.
 // ============================================================================
 
 void NativeProjectionBuilder::scan_nodes_impl_serialized_(
