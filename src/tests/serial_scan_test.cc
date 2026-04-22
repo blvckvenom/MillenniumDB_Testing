@@ -74,3 +74,22 @@ TEST(ProjectionIndex, SingleBitDetection) {
     EXPECT_TRUE(GQL::has_flag(PI::EDGE_DIRECTION, PI::EDGE_DIRECTION));
     EXPECT_FALSE(GQL::has_flag(PI::EDGE_DIRECTION, PI::EDGE_LABEL));
 }
+
+TEST(ScanMode, NullEnvReturnsClassic) {
+    using SM = GQL::NativeProjectionBuilder::ScanMode;
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test(nullptr), SM::CLASSIC);
+}
+
+TEST(ScanMode, TruthyValuesEnableSerial) {
+    using SM = GQL::NativeProjectionBuilder::ScanMode;
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test("1"), SM::SERIALIZED);
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test("true"), SM::SERIALIZED);
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test("yes"), SM::SERIALIZED);
+}
+
+TEST(ScanMode, UnknownValuesFallbackToClassic) {
+    using SM = GQL::NativeProjectionBuilder::ScanMode;
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test("0"), SM::CLASSIC);
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test("garbage"), SM::CLASSIC);
+    EXPECT_EQ(GQL::detail::init_scan_mode_for_test(""), SM::CLASSIC);
+}

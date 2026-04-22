@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 #include "graph_models/gql/gql_model.h"
@@ -29,6 +31,48 @@
 #endif
 
 using namespace GQL;
+
+// ============================================================================
+// ScanMode selector (Spec #2): MDB_PROJECTION_SERIAL_SCAN env-var parsing.
+//
+// Parallel to MDB_PROJECTION_SORTER from Spec #1. The production path
+// (get_scan_mode) caches the result for the process lifetime via a C++11
+// magic static so downstream callers pay zero overhead after the first
+// invocation.
+//
+// The detail::init_scan_mode_for_test helper exposes the same parse rules
+// without the cache so unit tests can cover truthy / unknown / null inputs
+// deterministically.
+// ============================================================================
+namespace {
+NativeProjectionBuilder::ScanMode init_scan_mode() {
+    const char* env = std::getenv("MDB_PROJECTION_SERIAL_SCAN");
+    if (env == nullptr) return NativeProjectionBuilder::ScanMode::CLASSIC;
+    std::string v(env);
+    if (v == "1" || v == "true" || v == "yes") {
+        return NativeProjectionBuilder::ScanMode::SERIALIZED;
+    }
+    return NativeProjectionBuilder::ScanMode::CLASSIC;
+}
+} // namespace
+
+NativeProjectionBuilder::ScanMode NativeProjectionBuilder::get_scan_mode() {
+    static const ScanMode cached = init_scan_mode();
+    return cached;
+}
+
+namespace GQL {
+namespace detail {
+NativeProjectionBuilder::ScanMode init_scan_mode_for_test(const char* env_val) {
+    if (env_val == nullptr) return NativeProjectionBuilder::ScanMode::CLASSIC;
+    std::string v(env_val);
+    if (v == "1" || v == "true" || v == "yes") {
+        return NativeProjectionBuilder::ScanMode::SERIALIZED;
+    }
+    return NativeProjectionBuilder::ScanMode::CLASSIC;
+}
+} // namespace detail
+} // namespace GQL
 
 uint64_t NativeProjectionBuilder::ensure_projected_node_key(const std::string& projected_name)
 {

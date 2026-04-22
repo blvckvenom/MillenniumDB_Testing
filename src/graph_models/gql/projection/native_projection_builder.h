@@ -319,6 +319,21 @@ private:
  */
 class NativeProjectionBuilder {
 public:
+    /**
+     * @brief Scan-pipeline selection for the projection build (Spec #2).
+     *
+     * CLASSIC (default)   — legacy pipeline: every scan pass emits to every
+     *                       buffer simultaneously. Identical behavior to
+     *                       pre-Spec-#2 code.
+     * SERIALIZED          — new pipeline: one scan pass per target B+Tree,
+     *                       each pass emits only to a single-index mask.
+     *
+     * Selected at process start via the MDB_PROJECTION_SERIAL_SCAN env var
+     * ("1" / "true" / "yes" => SERIALIZED, anything else => CLASSIC) and
+     * cached for the process lifetime via get_scan_mode().
+     */
+    enum class ScanMode { CLASSIC, SERIALIZED };
+
     static constexpr size_t BATCH_SIZE = 1000;
 
     /// @brief Synthetic key ID for COUNT aggregation's _count property.
@@ -424,6 +439,16 @@ public:
     const Statistics& get_statistics() const { return stats; }
 
 private:
+    /**
+     * @brief Reads MDB_PROJECTION_SERIAL_SCAN env var once per process.
+     *
+     * Thread-safe via C++11 magic statics. Values "1"/"true"/"yes" enable
+     * SERIALIZED; anything else (including unset) falls back to CLASSIC.
+     * Parallel to MDB_PROJECTION_SORTER from Spec #1 — same env-var-opt-in
+     * discipline, same process-lifetime caching.
+     */
+    static ScanMode get_scan_mode();
+
     std::string projection_name;
     std::string db_folder;
     std::unique_ptr<ProjectionStorage> storage;
@@ -565,5 +590,22 @@ private:
     uint32_t feature_dim_ = 0;
 #endif
 };
+
+namespace detail {
+    /**
+     * @brief Test-only helper that re-runs the MDB_PROJECTION_SERIAL_SCAN
+     *        parser against an explicit env-var value, bypassing the
+     *        process-lifetime cache in NativeProjectionBuilder::get_scan_mode().
+     *
+     * The production path uses a C++11 magic static that is set once per
+     * process on first call, so per-test env-var variations cannot be
+     * exercised through it. This helper shares the exact same parse logic
+     * and returns the identical enum, making it safe to use for coverage
+     * of truthy / unknown / null inputs.
+     *
+     * @param env_val nullable C-string as returned by std::getenv.
+     */
+    NativeProjectionBuilder::ScanMode init_scan_mode_for_test(const char* env_val);
+}
 
 } // namespace GQL
