@@ -605,6 +605,7 @@ void PathBindingIterConstructor::visit(OpProcedure& op_procedure)
         break;
     case OpProcedure::ProcedureType::JACCARD:
         tmp_iter = std::make_unique<Procedure::Jaccard>(
+            std::move(argument_binding_exprs),
             std::move(yield_vars)
         );
         break;
