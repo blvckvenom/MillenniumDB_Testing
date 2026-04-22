@@ -457,6 +457,28 @@ std::string NativeProjectionBuilder::get_aggregation_property_for_type(const std
 }
 
 void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string>& labels) {
+    if (get_scan_mode() == ScanMode::SERIALIZED) {
+        // Defer actual scan: store inputs for finalize_serialized_ (Task 10)
+        // to replay via the 14-pass pipeline.
+        stored_labels_ = labels;
+        scan_inputs_captured_ = true;
+        return;
+    }
+    scan_nodes_impl_classic_(labels);
+}
+
+void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>& types) {
+    if (get_scan_mode() == ScanMode::SERIALIZED) {
+        // Defer actual scan: store inputs for finalize_serialized_ (Task 10)
+        // to replay via the 14-pass pipeline.
+        stored_types_ = types;
+        scan_inputs_captured_ = true;
+        return;
+    }
+    scan_edges_impl_classic_(types);
+}
+
+void NativeProjectionBuilder::scan_nodes_impl_classic_(const std::vector<std::string>& labels) {
     auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
 
@@ -518,7 +540,7 @@ void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string
     }
 }
 
-void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>& types) {
+void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::string>& types) {
     auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
 

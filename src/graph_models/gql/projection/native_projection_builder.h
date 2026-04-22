@@ -120,6 +120,12 @@ using Procedures::PropertyConfig;
 // Forward declaration (NativeScanner implemented by another agent)
 class NativeScanner;
 
+// Forward declaration for the serialized-scan pipeline (Spec #2).
+// EdgeKeepBitmap lives in edge_keep_bitmap.h; forward-declaring here keeps
+// the header free of that include so only the .cc compilation units that
+// actually touch the bitmap pay the cost.
+class EdgeKeepBitmap;
+
 /**
  * @brief Hash key for detecting parallel edges (multigraph support).
  *
@@ -448,6 +454,29 @@ private:
      * discipline, same process-lifetime caching.
      */
     static ScanMode get_scan_mode();
+
+    // Classic single-pass scan implementations (current behavior, extracted
+    // verbatim from scan_nodes_by_labels / scan_edges_by_types). Called
+    // from the public API when ScanMode == CLASSIC (default).
+    void scan_nodes_impl_classic_(const std::vector<std::string>& labels);
+    void scan_edges_impl_classic_(const std::vector<std::string>& types);
+
+    // Serialized multi-pass scan implementations (Spec #2). Each call
+    // emits records ONLY to buffers matching target_mask. Called in a
+    // loop by finalize_serialized_ with single-bit masks.
+    // Implementations land in Tasks 7 (nodes) and 9 (edges).
+    void scan_nodes_impl_serialized_(const std::vector<std::string>& labels,
+                                     ProjectionIndex target_mask);
+    void scan_edges_impl_serialized_(const std::vector<std::string>& types,
+                                     ProjectionIndex target_mask,
+                                     const EdgeKeepBitmap* filter);
+
+    // Input state captured from the public scan_* methods for later
+    // replay in finalize_serialized_ (Task 10). scan_inputs_captured_
+    // prevents double-capture.
+    std::vector<std::string> stored_labels_;
+    std::vector<std::string> stored_types_;
+    bool scan_inputs_captured_ = false;
 
     std::string projection_name;
     std::string db_folder;
