@@ -346,6 +346,10 @@ if [ "$RESUME" -eq 0 ]; then
         libssl-dev libncurses-dev less
         python3 python3-venv python3-pip
         libicu-dev libtbb-dev liburing-dev
+        liblz4-dev          # Spec #1 spill-file compression (3-5× disk savings)
+        libgtest-dev        # Required by custom test targets
+                            # (serial_scan_test, radix_partition_sort_test).
+                            # Without this CMakeLists.txt silently skips them.
         "$JDK_PKG" zsh unzip wget curl ca-certificates
         clangd nodejs npm
         pciutils build-essential
