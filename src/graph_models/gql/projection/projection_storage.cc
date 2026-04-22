@@ -1261,8 +1261,27 @@ void ProjectionStorage::build_all_indexes_bulk() {
     build_edge_key_value_index_();
     build_key_value_edge_index_();
 
-    // PHASE 4: Cleanup + open indexes for reading (unchanged)
-    std::filesystem::remove_all(sort_temp_dir);
+    // PHASE 4: Cleanup + open indexes for reading.
+    // Delegated to open_all_bplustree_readers_() so the SERIALIZED path
+    // (finalize_serialized_) can call the same Phase 4 after its piecemeal
+    // build passes without duplicating the reader-open logic (Spec #2, Task 11).
+    open_all_bplustree_readers_();
+}
+
+// Spec #2, Task 11 — Phase 4 extracted from build_all_indexes_bulk().
+//
+// Opens all B+Tree index readers after the .leaf/.dir files have been built.
+// Removes the sort_tmp scratch directory as a final cleanup step.
+//
+// Called by:
+//   - build_all_indexes_bulk() (CLASSIC path) after all 14 sort+build calls.
+//   - NativeProjectionBuilder::finalize_serialized_() (SERIALIZED path) after
+//     the last Phase C build_one_index() call, before save_catalog() runs.
+void ProjectionStorage::open_all_bplustree_readers_() {
+    // Remove sort_tmp scratch directory (created by build_*_index_ helpers
+    // and also by reset_sort_scratch_ between serialized passes).
+    // best-effort: if already removed, remove_all is a no-op.
+    std::filesystem::remove_all(projection_dir + "/sort_tmp");
 
     // Open required indexes
     nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");

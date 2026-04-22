@@ -784,6 +784,41 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
 
     finalized_ = true;
 
+    // Spec #2 Task 11: dispatch to the serialized orchestrator when
+    // MDB_PROJECTION_SERIAL_SCAN=1 and the public scan_*_by_* wrappers
+    // captured inputs (scan_inputs_captured_ = true).
+    //
+    // finalize_serialized_() runs the full Phase A/B/C pipeline:
+    //   Phase A — 5 node-index passes (scan + sort + build + reset each)
+    //   Phase B — one edge-filter bitmap pass (no record emission)
+    //   Phase C — 9 edge-index passes (scan + sort + build + reset each)
+    //   Phase 4 — opens all BPlusTree readers via open_all_bplustree_readers_()
+    //
+    // After it returns the 14 .leaf/.dir index files exist on disk AND their
+    // reader unique_ptrs are open inside ProjectionStorage.  The
+    // storage->flush() call below will then find has_records == false (all
+    // streaming buffers were drained by the per-pass build_one_index() calls)
+    // and skip build_all_indexes_bulk() — preventing any double-sort.
+    // save_catalog() inside flush() still runs, writing the catalog file.
+    //
+    // Under CLASSIC (default, SERIAL_SCAN unset or 0): scan_inputs_captured_
+    // is false, so this block is a no-op.  The classic path continues below
+    // unchanged: flush_nodes/flush_edges fill streaming buffers, then
+    // storage->flush() → build_all_indexes_bulk() does sort+build+Phase 4.
+    if (get_scan_mode() == ScanMode::SERIALIZED && scan_inputs_captured_) {
+        auto bench_sort_start = benchmark_timers_.enabled
+            ? std::chrono::high_resolution_clock::now()
+            : std::chrono::high_resolution_clock::time_point{};
+        finalize_serialized_();
+        if (benchmark_timers_.enabled) {
+            auto bench_sort_end = std::chrono::high_resolution_clock::now();
+            double sort_btree_ms = std::chrono::duration<double, std::milli>(
+                bench_sort_end - bench_sort_start).count();
+            benchmark_timers_.sort_ms     += sort_btree_ms * 0.5;
+            benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
+        }
+    }
+
     // Final flush to ensure all data is written
     if (!node_batch.empty()) {
         flush_nodes();
@@ -1837,17 +1872,45 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
     // Pass 2 — scan all edges of each type, setting the bit for the ones
     // that survive the has_node() filter. No batch emission, no aggregation,
     // no property extraction: this phase is purely a filter pre-computation.
+    //
+    // SINGLE-mode parallel edge detection (Spec §3 D8 / Task 11 fix):
+    // When aggregation for a type is SINGLE, a ParallelEdgeDetector is run
+    // concurrently with the filter-set step.  If any parallel edge is found,
+    // the same QueryException that the classic path would throw is raised here,
+    // ensuring that bad queries (e.g., SINGLE on a graph with parallel edges)
+    // are rejected identically under both paths.  No extra scan pass needed:
+    // we piggyback on the existing has_node() endpoint scan.
     for (const auto& type : types) {
         ObjectId type_id = type_id_map[type];
+        Aggregation type_agg = get_aggregation_for_type(type);
+        // For SINGLE aggregation: create a detector to find parallels and throw.
+        // For non-SINGLE: has_non_single_aggregation_() in finalize_serialized_()
+        // already fell back to classic before we reached here, so we never see
+        // COUNT/SUM/MIN/MAX in this loop.
+        std::unique_ptr<ParallelEdgeDetector> detector;
+        if (type_agg == Aggregation::SINGLE) {
+            detector = std::make_unique<ParallelEdgeDetector>(Aggregation::SINGLE);
+        }
         scanner->scan_label_edge_with_endpoints(
             type_id,
-            [this, &filter](ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
+            [this, &filter, &detector, type_id](
+                ObjectId edge_id, ObjectId from_node, ObjectId to_node)
+            {
                 const bool has_from = storage->has_node(from_node);
                 const bool has_to   = storage->has_node(to_node);
                 if (has_from && has_to) {
                     // Pass the FULL ObjectId; EdgeFilter routes by the
                     // top-byte type tag and keys by the 56-bit counter.
                     filter->set_kept(edge_id);
+
+                    // Parallel edge detection for SINGLE mode: process_edge()
+                    // throws QueryException on the second occurrence of any
+                    // (from, to, type) triple — identical to classic path.
+                    if (detector) {
+                        detector->process_edge(
+                            from_node.id, to_node.id, type_id.id,
+                            edge_id, std::nullopt);
+                    }
                 }
             });
     }
@@ -2198,4 +2261,12 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // filter unique_ptr releases EdgeFilter here; malloc_trim on the next
     // pass (or the caller's subsequent finalize() bookkeeping) returns the
     // heap pages to the kernel.
+
+    // ---- Phase 4: open B+Tree readers ----
+    // Spec #2 Task 11: after all piecemeal build passes, open every
+    // .leaf/.dir reader so the projection is queryable.  Under CLASSIC,
+    // build_all_indexes_bulk() calls open_all_bplustree_readers_() itself;
+    // under SERIALIZED we must do it here because build_all_indexes_bulk()
+    // is bypassed (its backing buffers are all empty after Phase A/B/C).
+    storage->open_all_bplustree_readers_();
 }

@@ -471,6 +471,23 @@ public:
      * O(max single index) instead of O(sum all indexes).
      */
     void reset_sort_scratch_();
+
+    /**
+     * @brief Open all B+Tree index readers after the index files have been built.
+     *
+     * Spec #2 Phase 4 — called by both build_all_indexes_bulk() (CLASSIC path)
+     * and NativeProjectionBuilder::finalize_serialized_() (SERIALIZED path).
+     *
+     * Under CLASSIC, build_all_indexes_bulk() builds all 14 indexes and then
+     * calls this method to open the resulting .leaf/.dir files.
+     *
+     * Under SERIALIZED, finalize_serialized_() builds each index piecemeal
+     * (one per scan pass) and calls this method after the last pass, so the
+     * projection is ready for use immediately after finalize() returns.
+     *
+     * Also removes the sort_tmp scratch directory as a final cleanup step.
+     */
+    void open_all_bplustree_readers_();
     /// @}
 
     /// @name Node-scan Lifecycle
