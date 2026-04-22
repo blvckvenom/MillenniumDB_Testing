@@ -14,7 +14,7 @@
 #include <unordered_set>
 
 #include "graph_models/gql/gql_model.h"
-#include "graph_models/gql/projection/edge_keep_bitmap.h"
+#include "graph_models/gql/projection/edge_filter.h"
 #include "graph_models/gql/projection/external_edge_sort.h"
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_manager.h"
@@ -1774,19 +1774,27 @@ void NativeProjectionBuilder::scan_nodes_impl_serialized_(
 //
 // Single full edge scan that evaluates has_node() on both endpoints for every
 // edge of the requested types, recording the outcome bit-by-bit in an
-// EdgeKeepBitmap keyed by edge_id.id. No record emission happens here — the
-// bitmap is the sole output, consumed read-only by Phase C's 9 edge-index
-// passes (scan_edges_impl_serialized_) so that has_node() work is paid once
-// instead of 9×.
+// EdgeFilter (a composite of two EdgeKeepBitmap instances, directed +
+// undirected, keyed by the 56-bit counter portion of the ObjectId). No record
+// emission happens here — the filter is the sole output, consumed read-only
+// by Phase C's 9 edge-index passes (scan_edges_impl_serialized_) so that
+// has_node() work is paid once instead of 9×.
 //
-// Invariant I2 (spec §6): bitmap is finalized before return, so Phase C's
+// Keying by counter (not the full tagged edge_id.id) is REQUIRED: GQL edge
+// ObjectIds carry an 8-bit type prefix (MASK_DIRECTED_EDGE = 0xE0.., or
+// MASK_UNDIRECTED_EDGE = 0xE4..), making the raw id ~1.6e19. Using that as
+// a vector<bool> index would std::bad_alloc on the first edge. EdgeFilter
+// strips the prefix via ObjectId::VALUE_MASK and routes the kept-bit into
+// the correct per-orientation bitmap internally.
+//
+// Invariant I2 (spec §6): filter is finalized before return, so Phase C's
 // consumers see an immutable snapshot and can read concurrently without
 // synchronization if they later go parallel.
 // ============================================================================
-std::unique_ptr<EdgeKeepBitmap>
+std::unique_ptr<EdgeFilter>
 NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>& types)
 {
-    auto bitmap = std::make_unique<EdgeKeepBitmap>();
+    auto filter = std::make_unique<EdgeFilter>();
 
     // Pass 1 — resolve type_ids + estimate total edge count. Mirrors
     // scan_edges_impl_classic_'s catalog-lookup sequence to keep error
@@ -1805,20 +1813,20 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
         total_estimate += scanner->count_edges_by_type(type_id);
     }
 
-    // Pre-size the bitmap so the typical case avoids repeated std::vector
-    // resizes inside the hot scan loop. set_kept() still handles growth
-    // if an edge_id lands above the estimate (e.g. sparse id space).
-    bitmap->reserve(total_estimate);
-
-    // Resize ProjectionStorage's Bloom filter using the same total estimate.
-    // scan_edges_impl_classic_ does this on its own fast path (see
-    // classic impl comment "Resize Bloom filter based on estimated edge
-    // count"), and Phase C's per-index edge passes rely on has_edge()
-    // probes in the property-emission branches of scan_edges_impl_serialized_,
-    // so we must mirror the sizing here.
+    // Resize ProjectionStorage's Bloom filter using the total estimate.
+    // scan_edges_impl_classic_ does this on its own fast path (see classic
+    // impl comment "Resize Bloom filter based on estimated edge count"),
+    // and Phase C's per-index edge passes rely on has_edge() probes in the
+    // property-emission branches of scan_edges_impl_serialized_, so we must
+    // mirror the sizing here.
     if (total_estimate > 0) {
         storage->resize_bloom_filter(total_estimate);
     }
+
+    // We do NOT pre-reserve per-orientation capacity in the filter: we
+    // don't know the directed/undirected split without an extra scan, and
+    // EdgeKeepBitmap::set_kept auto-grows cheaply (amortized O(1)) for both
+    // bitmaps independently.
 
     // Pass 2 — scan all edges of each type, setting the bit for the ones
     // that survive the has_node() filter. No batch emission, no aggregation,
@@ -1827,15 +1835,17 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
         ObjectId type_id = type_id_map[type];
         scanner->scan_label_edge_with_endpoints(
             type_id,
-            [this, &bitmap](ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
-                bool has_from = storage->has_node(from_node);
-                bool has_to   = storage->has_node(to_node);
+            [this, &filter](ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
+                const bool has_from = storage->has_node(from_node);
+                const bool has_to   = storage->has_node(to_node);
                 if (has_from && has_to) {
-                    bitmap->set_kept(edge_id.id);
+                    // Pass the FULL ObjectId; EdgeFilter routes by the
+                    // top-byte type tag and keys by the 56-bit counter.
+                    filter->set_kept(edge_id);
                 }
             });
     }
 
-    bitmap->finalize();
-    return bitmap;
+    filter->finalize();
+    return filter;
 }

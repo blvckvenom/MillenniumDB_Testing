@@ -353,7 +353,9 @@ endif()
 # ============================================================================
 # Serial scan pipeline unit tests (Spec #2, TDD-gated)
 # ============================================================================
-if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_keep_bitmap.h")
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_keep_bitmap.h" AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_filter.h")
     add_executable(serial_scan_test
         ${CMAKE_SOURCE_DIR}/src/tests/serial_scan_test.cc
     )

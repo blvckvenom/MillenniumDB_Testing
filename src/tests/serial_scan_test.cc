@@ -1,10 +1,13 @@
 // src/tests/serial_scan_test.cc
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <filesystem>
 #include <stdexcept>
+#include "graph_models/gql/projection/edge_filter.h"
 #include "graph_models/gql/projection/edge_keep_bitmap.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/projection_storage.h"
+#include "graph_models/object_id.h"
 
 TEST(EdgeKeepBitmap, SetAndQuery) {
     GQL::EdgeKeepBitmap bm;
@@ -132,4 +135,70 @@ TEST(BuildOneIndex, ThrowsOnMultiBitMasks) {
     // Best-effort cleanup of spill-file skeleton the constructor created.
     std::error_code ec;
     fs::remove_all(tmp_dir, ec);
+}
+
+// =======================================================================
+// EdgeFilter tests (Spec #2 C1 fix)
+//
+// EdgeFilter routes kept-bits into per-orientation EdgeKeepBitmaps keyed
+// by the 56-bit counter portion of the ObjectId (ObjectId::VALUE_MASK).
+// This keeps memory at ~1 bit per kept counter instead of attempting to
+// resize a std::vector<bool> to the raw tagged edge_id (~1.6e19), which
+// would std::bad_alloc on the first edge.
+//
+// ObjectId lives in the global namespace (see src/graph_models/object_id.h).
+// Its constructor takes a plain uint64_t, and MASK_DIRECTED_EDGE /
+// MASK_UNDIRECTED_EDGE are static constexpr uint64_t members, so we
+// can OR them with a counter to synthesize tagged edge ids the same way
+// the import pipeline does.
+// =======================================================================
+
+static ObjectId make_directed_edge(uint64_t counter) {
+    return ObjectId(ObjectId::MASK_DIRECTED_EDGE | counter);
+}
+static ObjectId make_undirected_edge(uint64_t counter) {
+    return ObjectId(ObjectId::MASK_UNDIRECTED_EDGE | counter);
+}
+
+TEST(EdgeFilter, RoutesDirectedAndUndirectedIndependently) {
+    GQL::EdgeFilter f;
+    f.set_kept(make_directed_edge(5));
+    f.set_kept(make_undirected_edge(5));
+    f.finalize();
+    EXPECT_TRUE(f.is_kept(make_directed_edge(5)));
+    EXPECT_TRUE(f.is_kept(make_undirected_edge(5)));
+
+    // Counter 5 in one orientation must NOT imply counter 5 in the other.
+    GQL::EdgeFilter g;
+    g.set_kept(make_directed_edge(5));
+    g.finalize();
+    EXPECT_TRUE(g.is_kept(make_directed_edge(5)));
+    EXPECT_FALSE(g.is_kept(make_undirected_edge(5)));
+}
+
+TEST(EdgeFilter, LargeCountersStayBoundedInMemory) {
+    GQL::EdgeFilter f;
+    constexpr uint64_t k = 1ULL << 24;  // 16M counter
+    f.set_kept(make_directed_edge(k));
+    f.finalize();
+    EXPECT_TRUE(f.is_kept(make_directed_edge(k)));
+    // Memory must be bounded by the counter value, not by the raw 0xE0... tag.
+    // (1<<24 bits / 8 = 2 MB. Budget 10 MB for safety.)
+    EXPECT_LT(f.bytes_allocated(), 10ULL * 1024 * 1024);
+}
+
+TEST(EdgeFilter, WriteAfterFinalizeThrows) {
+    GQL::EdgeFilter f;
+    f.set_kept(make_directed_edge(1));
+    f.finalize();
+    EXPECT_THROW(f.set_kept(make_directed_edge(2)), std::logic_error);
+}
+
+TEST(EdgeFilter, UnsetCountersReportNotKept) {
+    GQL::EdgeFilter f;
+    f.set_kept(make_directed_edge(10));
+    f.finalize();
+    EXPECT_TRUE(f.is_kept(make_directed_edge(10)));
+    EXPECT_FALSE(f.is_kept(make_directed_edge(11)));
+    EXPECT_FALSE(f.is_kept(make_undirected_edge(10)));
 }

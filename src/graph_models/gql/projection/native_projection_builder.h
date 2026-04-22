@@ -121,10 +121,15 @@ using Procedures::PropertyConfig;
 class NativeScanner;
 
 // Forward declaration for the serialized-scan pipeline (Spec #2).
-// EdgeKeepBitmap lives in edge_keep_bitmap.h; forward-declaring here keeps
+// EdgeFilter lives in edge_filter.h; forward-declaring here keeps
 // the header free of that include so only the .cc compilation units that
-// actually touch the bitmap pay the cost.
-class EdgeKeepBitmap;
+// actually touch the filter pay the cost.
+// EdgeFilter holds two EdgeKeepBitmap instances (directed / undirected) and
+// routes set_kept / is_kept calls by the ObjectId's top-byte type tag,
+// keying each bitmap by the 56-bit counter portion (ObjectId::VALUE_MASK),
+// not the raw edge_id. This avoids the ~2e9 GB resize that would occur if
+// the full tagged id were used as an index.
+class EdgeFilter;
 
 /**
  * @brief Hash key for detecting parallel edges (multigraph support).
@@ -469,16 +474,24 @@ private:
                                      ProjectionIndex target_mask);
     void scan_edges_impl_serialized_(const std::vector<std::string>& types,
                                      ProjectionIndex target_mask,
-                                     const EdgeKeepBitmap* filter);
+                                     const EdgeFilter* filter);
 
     /**
-     * @brief Serialized mode Phase B: precompute the edge-keep bitmap.
+     * @brief Serialized mode Phase B: precompute the edge-keep filter.
      *
      * Runs a single full scan over all edges of the given @p types,
      * evaluates the has_node() filter on both endpoints, and records the
-     * outcome as a bit per edge in a fresh EdgeKeepBitmap keyed by
-     * edge_id.id. No record emissions happen here — the bitmap is the
-     * sole side-effect.
+     * outcome as a bit per edge counter in a fresh EdgeFilter. No record
+     * emissions happen here — the filter is the sole side-effect.
+     *
+     * EdgeFilter holds two EdgeKeepBitmap instances (directed / undirected)
+     * keyed by the 56-bit counter portion of the ObjectId (lower bits,
+     * obtained via ObjectId::VALUE_MASK), NOT the raw tagged edge_id.id.
+     * GQL edge ObjectIds carry an 8-bit type prefix (MASK_DIRECTED_EDGE =
+     * 0xE0.. or MASK_UNDIRECTED_EDGE = 0xE4..) that would make the raw id
+     * value ~1.6e19, causing std::bad_alloc on the first resize. The counter
+     * portion is a dense index starting from 0 per orientation, keeping peak
+     * RSS at ~200 MB for papers100M (1.6B directed edges).
      *
      * Consumed read-only by Phase C's 9 edge-index passes
      * (scan_edges_impl_serialized_ with different target masks), so the
@@ -491,17 +504,19 @@ private:
      * contract so downstream has_edge() probes keep their <1% false
      * positive target on large graphs.
      *
-     * Memory: 1 bit per edge_id. Papers100M (1.6B edges) ≈ 200 MB.
+     * Memory: ~1 bit per edge counter per orientation.
+     * Papers100M (1.6B directed CITES edges): ~200 MB directed bitmap,
+     * ~0 MB undirected bitmap.
      *
-     * Spec: §4 Phase B, §6 invariant I2 (bitmap is write-once).
+     * Spec: §4 Phase B, §6 invariant I2 (filter is write-once).
      *
      * @param types Relationship type names to scan (same set accepted
      *        by scan_edges_by_types / scan_edges_impl_classic_).
-     * @return Owning pointer to the finalized bitmap (Phase C consumes
+     * @return Owning pointer to the finalized filter (Phase C consumes
      *         it via raw pointer).
      * @throws std::runtime_error if any type is absent from the catalog.
      */
-    std::unique_ptr<EdgeKeepBitmap> precompute_edge_filter_(
+    std::unique_ptr<EdgeFilter> precompute_edge_filter_(
         const std::vector<std::string>& types);
 
     // Input state captured from the public scan_* methods for later
