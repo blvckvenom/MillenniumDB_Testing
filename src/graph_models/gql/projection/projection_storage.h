@@ -23,6 +23,11 @@ class ExternalRecordSort;
 
 class ProjectionCatalog;
 
+// Forward declaration; full definition in native_projection_builder.h.
+// Included via .cc to avoid circular include with native_projection_builder
+// (which depends on ProjectionStorage).
+enum class ProjectionIndex : uint32_t;
+
 /**
  * @brief Data structure representing an edge in a graph projection.
  *
@@ -440,6 +445,23 @@ public:
      * @param fpr False positive rate (default: 0.01 = 1%)
      */
     void resize_bloom_filter(size_t expected_edges, double fpr = BLOOM_FILTER_FPR);
+    /// @}
+
+    /// @name Serialized Scan Pipeline (Spec #2)
+    /// @{
+
+    /**
+     * @brief Build a SINGLE projection index (for serialized scan pipeline).
+     *
+     * Used by NativeProjectionBuilder::finalize_serialized_() between scan
+     * passes. Does NOT create BPlusTree reader instances — the caller
+     * opens them via build_all_indexes_bulk's Phase 4 or its equivalent.
+     *
+     * @param which Exactly one single-bit ProjectionIndex value.
+     * @throws std::invalid_argument on a multi-bit ProjectionIndex value
+     *         (NONE, ALL_NODE, ALL_EDGE, ALL, or any unknown combination).
+     */
+    void build_one_index(ProjectionIndex which);
     /// @}
 
     /// @name Node-scan Lifecycle

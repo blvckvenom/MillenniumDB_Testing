@@ -13,6 +13,7 @@
 #endif
 
 #include "external_record_sort.h"
+#include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
 #include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -1289,6 +1290,34 @@ void ProjectionStorage::build_all_indexes_bulk() {
     if (features.include_edge_properties) {
         edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
         key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
+    }
+}
+
+// Dispatcher for the serialized scan pipeline (Spec #2, Task 5).
+// Routes a single-bit ProjectionIndex value to the corresponding
+// private build_<name>_index_() helper. The default: clause catches
+// NONE, ALL_NODE, ALL_EDGE, ALL, and any unknown bit pattern, enforcing
+// single-bit-only semantics. Callers (Task 10's finalize_serialized_)
+// iterate over single-bit enumerators via enabled_indexes_().
+void ProjectionStorage::build_one_index(ProjectionIndex which) {
+    switch (which) {
+        case ProjectionIndex::NODES:           build_nodes_index_();          break;
+        case ProjectionIndex::NODE_LABEL:      build_node_label_index_();     break;
+        case ProjectionIndex::LABEL_NODE:      build_label_node_index_();     break;
+        case ProjectionIndex::NODE_KEY_VALUE:  build_node_key_value_index_(); break;
+        case ProjectionIndex::KEY_VALUE_NODE:  build_key_value_node_index_(); break;
+        case ProjectionIndex::FROM_TO_EDGE:    build_from_to_edge_index_();   break;
+        case ProjectionIndex::TO_FROM_EDGE:    build_to_from_edge_index_();   break;
+        case ProjectionIndex::EDGE_DIRECTION:  build_edge_direction_index_(); break;
+        case ProjectionIndex::EDGE_FROM_TO:    build_edge_from_to_index_();   break;
+        case ProjectionIndex::EDGE_N1_N2:      build_edge_n1_n2_index_();     break;
+        case ProjectionIndex::EDGE_LABEL:      build_edge_label_index_();     break;
+        case ProjectionIndex::LABEL_EDGE:      build_label_edge_index_();     break;
+        case ProjectionIndex::EDGE_KEY_VALUE:  build_edge_key_value_index_(); break;
+        case ProjectionIndex::KEY_VALUE_EDGE:  build_key_value_edge_index_(); break;
+        default:
+            throw std::invalid_argument(
+                "build_one_index: must be a single-bit ProjectionIndex value");
     }
 }
 

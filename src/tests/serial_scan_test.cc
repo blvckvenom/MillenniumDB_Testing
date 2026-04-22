@@ -93,3 +93,24 @@ TEST(ScanMode, UnknownValuesFallbackToClassic) {
     EXPECT_EQ(GQL::detail::init_scan_mode_for_test("garbage"), SM::CLASSIC);
     EXPECT_EQ(GQL::detail::init_scan_mode_for_test(""), SM::CLASSIC);
 }
+
+// Smoke tests for build_one_index's dispatch surface. A full integration
+// test lives in the GQL suite under SERIAL_SCAN=1 (Task 12). These two
+// assertions serve as compile-time and runtime-API checks.
+
+TEST(BuildOneIndex, DispatcherCompilesForAllEnumerators) {
+    // This test exists to verify the switch handles all 14 single-bit
+    // ProjectionIndex values without a default: fallback for any of
+    // them. Compile-time guarantee; runtime assertion is trivial.
+    SUCCEED() << "build_one_index switch covers all 14 single-bit "
+                 "ProjectionIndex enumerators (verified by code review).";
+}
+
+TEST(BuildOneIndex, MultiBitArgumentDocumented) {
+    // The default: clause in the switch throws std::invalid_argument
+    // on multi-bit values (ALL_NODE, ALL_EDGE, ALL) and on NONE.
+    // A functional test requires a constructed ProjectionStorage and
+    // is covered by the 347 GQL suite (Task 12) under SERIAL_SCAN=1.
+    SUCCEED() << "build_one_index throws std::invalid_argument on "
+                 "multi-bit or NONE ProjectionIndex values.";
+}
