@@ -1,1 +1,11 @@
+# Canonical conversion path (stream_convert_ogb.py, convert_cora_to_mdb.py)
+# only needs numpy. The rest cover download_gnn_datasets.py's fallback paths:
+#   - tqdm: progress bars (has a minimal fallback class if missing)
+#   - requests: Cora LINQS download when not using onboard's wget pre-stage
+# ogb and torch are NOT listed; they are only needed for the
+# download_gnn_datasets.py OGB conversion path, which is redundant with the
+# canonical onboard download-dataset.sh + stream_convert_ogb.py pipeline.
+# Install them manually if you specifically want download_gnn_datasets.py.
 numpy
+tqdm
+requests
