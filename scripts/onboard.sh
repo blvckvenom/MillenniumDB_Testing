@@ -17,8 +17,16 @@
 #   scripts/onboard.sh --skip-tests     # don't run ./scripts/run-tests at the end
 #   scripts/onboard.sh --resume         # skip apt+driver phase (for use after reboot)
 #   scripts/onboard.sh --dry-run        # show root commands that WOULD run, skip pkexec
-#   scripts/onboard.sh --download-dataset=papers100M       # raw OGB download at end
+#   scripts/onboard.sh --download-dataset=papers100M       # narrow OGB download
 #   scripts/onboard.sh --download-dataset=arxiv,products   # multiple datasets
+#   scripts/onboard.sh --download-dataset=                 # skip OGB downloads
+#   scripts/onboard.sh --skip-cora                         # skip Cora LINQS tgz
+#
+# Dataset pre-staging (default behavior):
+#   Raw downloads all 5 OGB benchmarks + Cora raw for thesis work. Total
+#   ~52 GB on disk. No conversion, no import — raw source zips/tarballs
+#   only, ready for stream_convert_ogb.py + 'mdb import' at experiment
+#   time. Override with --download-dataset=list or --skip-cora to narrow.
 #
 # Idempotent: every step checks its own completion marker and skips if already done.
 #
@@ -26,6 +34,20 @@
 #   All root-requiring commands are accumulated into a single batch script and
 #   invoked with ONE pkexec call (ONE admin password prompt for the whole run).
 #   Use --dry-run to preview the batch contents without authenticating.
+#
+# Prerequisites (one-time, BEFORE this script can run):
+#   1. Ubuntu 22.04+/24.04+ or Pop!_OS 22.04+ installed (admin did this).
+#   2. git installed — NOT in Ubuntu minimal install by default:
+#         sudo apt update && sudo apt install -y git
+#      On Ubuntu Desktop "normal installation" git usually comes preinstalled.
+#   3. This repo cloned — requires git + network:
+#         git clone --branch feature-GNN <fork-url>
+#         cd MillenniumDB_Testing
+#   4. (Recommended) Secure Boot disabled in UEFI firmware to avoid the MOK
+#      enrollment dance post-reboot. The script warns if SB is enabled.
+#
+# Everything else (CUDA, driver, Boost, LibTorch, Python deps, build) is
+# installed automatically by this script.
 # ============================================================================
 
 set -euo pipefail
@@ -38,7 +60,14 @@ SKIP_DRIVER=0
 SKIP_TESTS=0
 RESUME=0
 DRY_RUN=0
-DOWNLOAD_DATASETS=""   # comma-separated names, empty = no dataset pre-staging
+# comma-separated OGB dataset names to pre-stage raw (no conversion, no
+# import). Default downloads all 5 OGB benchmarks for thesis work
+# (~52 GB total on disk). Override with --download-dataset=arxiv,products
+# to narrow, or --download-dataset= (empty) to skip entirely. Cora (5 MB,
+# LINQS source) is handled separately below and downloads unless
+# --skip-cora is passed.
+DOWNLOAD_DATASETS="arxiv,products,mag,papers100M,proteins"
+SKIP_CORA=0
 for arg in "$@"; do
     case "$arg" in
         --gpu=*)                GPU_CHOICE="${arg#*=}" ;;
@@ -48,8 +77,9 @@ for arg in "$@"; do
         --resume)               RESUME=1 ;;
         --dry-run)              DRY_RUN=1 ;;
         --download-dataset=*)   DOWNLOAD_DATASETS="${arg#*=}" ;;
+        --skip-cora)            SKIP_CORA=1 ;;
         -h|--help)
-            grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | head -35
+            grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | head -50
             exit 0
             ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
@@ -574,6 +604,10 @@ setup_venv() {
 }
 setup_venv "$MDB_HOME/tests"
 setup_venv "$MDB_HOME/tests_Proj_GNN"
+# numpy venv for dataset conversion scripts (stream_convert_ogb.py etc.).
+# Without this, running stream_convert_ogb.py with system python3 fails
+# with "ModuleNotFoundError: No module named 'numpy'".
+setup_venv "$MDB_HOME/scripts/gnn_datasets"
 
 # ---------------------------------------------------------------------------
 # Step 9 — Environment variables for current shell and ~/.bashrc
@@ -660,6 +694,31 @@ if [ -n "$DOWNLOAD_DATASETS" ]; then
             log_warn "Dataset $_ds_trimmed failed — re-run: scripts/download-dataset.sh $_ds_trimmed"
         fi
     done
+fi
+
+# ---------------------------------------------------------------------------
+# Pre-stage Cora raw (LINQS source, 5 MB). Separate from OGB because Cora's
+# upstream format (tgz with .content + .cites text files) differs from
+# OGB's (zip with data.npz). Skipped with --skip-cora.
+#
+# Idempotent: downloads to $MDB_HOME/cora_data/raw/cora.tgz and skips if
+# already present. Conversion to GQL format happens separately via
+# scripts/gnn_datasets/download_gnn_datasets.py --dataset cora.
+# ---------------------------------------------------------------------------
+if [ "$SKIP_CORA" -eq 0 ]; then
+    log_step "Pre-staging Cora raw (LINQS, 5 MB)"
+    CORA_URL="https://linqs-data.soe.ucsc.edu/public/lbc/cora.tgz"
+    CORA_DIR="$MDB_HOME/cora_data/raw"
+    mkdir -p "$CORA_DIR"
+    if [ -f "$CORA_DIR/cora.tgz" ] && [ -s "$CORA_DIR/cora.tgz" ]; then
+        log_ok "Cora raw already present at $CORA_DIR/cora.tgz"
+    else
+        if wget -q --show-progress -O "$CORA_DIR/cora.tgz" "$CORA_URL"; then
+            log_ok "Cora raw downloaded to $CORA_DIR/cora.tgz"
+        else
+            log_warn "Cora download failed — re-run: wget -O $CORA_DIR/cora.tgz $CORA_URL"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------
