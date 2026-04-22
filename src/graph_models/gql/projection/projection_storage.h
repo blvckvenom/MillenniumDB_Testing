@@ -486,6 +486,10 @@ public:
      * projection is ready for use immediately after finalize() returns.
      *
      * Also removes the sort_tmp scratch directory as a final cleanup step.
+     *
+     * @note Safe to call on already-open readers — reassignment of the
+     *       unique_ptr members destroys any existing BPlusTree instance
+     *       (closing its file handles) before the new one is constructed.
      */
     void open_all_bplustree_readers_();
     /// @}

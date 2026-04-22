@@ -827,17 +827,31 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
         flush_edges();
     }
 
-    // Final flush to ProjectionStorage (commits all B+Tree writes, builds indexes)
-    auto bench_sort_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                                      : std::chrono::high_resolution_clock::time_point{};
-    storage->flush();
-    if (benchmark_timers_.enabled) {
-        auto bench_sort_end = std::chrono::high_resolution_clock::now();
-        double sort_btree_ms = std::chrono::duration<double, std::milli>(
-            bench_sort_end - bench_sort_start).count();
-        // Attribute combined sort+btree time; detailed breakdown deferred to future pass
-        benchmark_timers_.sort_ms += sort_btree_ms * 0.5;
-        benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
+    // Final flush to ProjectionStorage (commits all B+Tree writes, builds indexes).
+    // Under SERIALIZED + captured, flush() is essentially just save_catalog()
+    // (all streaming buffers were drained by finalize_serialized_()'s per-pass
+    // build_one_index() calls).  Skip timer attribution in that case so the
+    // save_catalog() wall time doesn't inflate sort_ms / btree_write_ms in the
+    // Tasks 14/15 benchmark CSVs — those buckets should reflect only sort +
+    // index-build work, both of which are already captured by the dispatch block
+    // above (finalize_serialized_() timing).
+    const bool serialized_flush_is_noop =
+        (get_scan_mode() == ScanMode::SERIALIZED && scan_inputs_captured_);
+    if (serialized_flush_is_noop) {
+        storage->flush();
+    } else {
+        auto bench_sort_start = benchmark_timers_.enabled
+            ? std::chrono::high_resolution_clock::now()
+            : std::chrono::high_resolution_clock::time_point{};
+        storage->flush();
+        if (benchmark_timers_.enabled) {
+            auto bench_sort_end = std::chrono::high_resolution_clock::now();
+            double sort_btree_ms = std::chrono::duration<double, std::milli>(
+                bench_sort_end - bench_sort_start).count();
+            // Attribute combined sort+btree time; detailed breakdown deferred to future pass
+            benchmark_timers_.sort_ms     += sort_btree_ms * 0.5;
+            benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
+        }
     }
 
     // Calculate duration
