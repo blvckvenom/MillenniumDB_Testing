@@ -43,3 +43,12 @@ TEST(EdgeKeepBitmap, SizeReflectsHighestIndex) {
     bm.set_kept(7);
     EXPECT_GE(bm.size(), 8u);  // 0..7
 }
+
+TEST(EdgeKeepBitmap, FinalizeIsIdempotent) {
+    GQL::EdgeKeepBitmap bm;
+    bm.set_kept(3);
+    bm.finalize();
+    bm.finalize();  // second call is a no-op
+    EXPECT_TRUE(bm.is_kept(3));
+    EXPECT_THROW(bm.set_kept(100), std::logic_error);
+}

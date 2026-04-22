@@ -18,11 +18,24 @@ namespace GQL {
  *
  * Memory: 1 bit per edge_id. For papers100M (1.6B edges): ~200 MB.
  * Grows automatically on out-of-range set_kept.
+ *
+ * Thread-safety: after finalize(), concurrent is_kept() calls from
+ * multiple threads are safe. Pre-finalize, the class is not
+ * thread-safe — writers must synchronize externally.
  */
 class EdgeKeepBitmap {
 public:
     EdgeKeepBitmap() = default;
 
+    /**
+     * @brief Ensures capacity for at least @p max_edge_id elements.
+     *
+     * @note Unlike std::vector::reserve, this grows size() (not just
+     *       capacity), zero-initializing new bits. Equivalent to
+     *       std::vector::resize(max_edge_id, false). Safe to call
+     *       before any set_kept() to avoid repeated resizes when the
+     *       max edge_id is known.
+     */
     void reserve(std::size_t max_edge_id) {
         if (max_edge_id > kept_.size()) kept_.resize(max_edge_id);
     }
