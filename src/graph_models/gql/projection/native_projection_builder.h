@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -19,6 +20,50 @@
 #endif
 
 namespace GQL {
+
+/**
+ * @brief Bitmask enum identifying which projection B+Tree index is being
+ *        populated during a scan pass. Used by the serialized scan pipeline
+ *        (Spec #2) to gate record emissions in scan callbacks.
+ *
+ * The 14 indexes correspond to the 6 core + 8 feature-gated B+Trees built
+ * by ProjectionStorage::build_all_indexes_bulk. In CLASSIC mode the
+ * default ALL mask preserves exact current behavior (all buffers emit).
+ * In SERIALIZED mode, each scan pass uses a single-bit mask.
+ */
+enum class ProjectionIndex : uint32_t {
+    NONE            = 0,
+    NODES           = 1u << 0,
+    NODE_LABEL      = 1u << 1,
+    LABEL_NODE      = 1u << 2,
+    NODE_KEY_VALUE  = 1u << 3,
+    KEY_VALUE_NODE  = 1u << 4,
+    FROM_TO_EDGE    = 1u << 5,
+    TO_FROM_EDGE    = 1u << 6,
+    EDGE_DIRECTION  = 1u << 7,
+    EDGE_FROM_TO    = 1u << 8,
+    EDGE_N1_N2      = 1u << 9,
+    EDGE_LABEL      = 1u << 10,
+    LABEL_EDGE      = 1u << 11,
+    EDGE_KEY_VALUE  = 1u << 12,
+    KEY_VALUE_EDGE  = 1u << 13,
+    ALL_NODE        = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4),
+    ALL_EDGE        = (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) |
+                      (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13),
+    ALL             = 0x3FFFu,
+};
+
+constexpr ProjectionIndex operator|(ProjectionIndex a, ProjectionIndex b) {
+    return static_cast<ProjectionIndex>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+constexpr ProjectionIndex operator&(ProjectionIndex a, ProjectionIndex b) {
+    return static_cast<ProjectionIndex>(
+        static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+constexpr bool has_flag(ProjectionIndex mask, ProjectionIndex bit) {
+    return (static_cast<uint32_t>(mask) & static_cast<uint32_t>(bit)) != 0;
+}
 
 /**
  * @brief Conditional per-phase timing for graph_project pipeline.

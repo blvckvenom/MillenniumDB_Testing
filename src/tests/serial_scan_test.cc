@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <stdexcept>
 #include "graph_models/gql/projection/edge_keep_bitmap.h"
+#include "graph_models/gql/projection/native_projection_builder.h"
 
 TEST(EdgeKeepBitmap, SetAndQuery) {
     GQL::EdgeKeepBitmap bm;
@@ -51,4 +52,25 @@ TEST(EdgeKeepBitmap, FinalizeIsIdempotent) {
     bm.finalize();  // second call is a no-op
     EXPECT_TRUE(bm.is_kept(3));
     EXPECT_THROW(bm.set_kept(100), std::logic_error);
+}
+
+TEST(ProjectionIndex, BitmaskOperations) {
+    using PI = GQL::ProjectionIndex;
+    EXPECT_TRUE(GQL::has_flag(PI::ALL_NODE, PI::NODES));
+    EXPECT_FALSE(GQL::has_flag(PI::ALL_NODE, PI::FROM_TO_EDGE));
+    auto combined = PI::NODES | PI::NODE_LABEL;
+    EXPECT_EQ(static_cast<uint32_t>(combined), 0x3u);
+    EXPECT_EQ(PI::ALL & PI::ALL_NODE, PI::ALL_NODE);
+}
+
+TEST(ProjectionIndex, AllIsUnionOfNodeAndEdge) {
+    using PI = GQL::ProjectionIndex;
+    EXPECT_EQ(static_cast<uint32_t>(PI::ALL), 0x3FFFu);  // 14 bits set
+    EXPECT_EQ(PI::ALL_NODE | PI::ALL_EDGE, PI::ALL);
+}
+
+TEST(ProjectionIndex, SingleBitDetection) {
+    using PI = GQL::ProjectionIndex;
+    EXPECT_TRUE(GQL::has_flag(PI::EDGE_DIRECTION, PI::EDGE_DIRECTION));
+    EXPECT_FALSE(GQL::has_flag(PI::EDGE_DIRECTION, PI::EDGE_LABEL));
 }
