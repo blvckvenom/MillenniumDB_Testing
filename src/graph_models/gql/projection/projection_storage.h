@@ -696,6 +696,11 @@ private:
     // StreamingRecordBuffer via GQL::sort_and_build_index (Spec #1 facade).
     // Called by build_all_indexes_bulk() in CLASSIC mode and by
     // build_one_index(ProjectionIndex) in SERIALIZED mode (Task 5).
+
+    // Builds the nodes B+Tree. Side effect: updates the class-scope
+    // node_count member (consumed by catalog finalization and by any
+    // future build_one_index(NODES) caller from Task 5's dispatcher).
+    // This is the only per-index method that mutates non-local state.
     void build_nodes_index_();
     void build_node_label_index_();
     void build_label_node_index_();
@@ -711,8 +716,9 @@ private:
     void build_edge_key_value_index_();
     void build_key_value_edge_index_();
 
-    // Remove + recreate sort scratch directory between serialized passes.
-    void clear_sort_scratch_();
+    // Reset (remove + recreate empty) sort scratch directory between
+    // serialized passes.
+    void reset_sort_scratch_();
 
     /**
      * @brief Build a single B+tree index using bulk import.

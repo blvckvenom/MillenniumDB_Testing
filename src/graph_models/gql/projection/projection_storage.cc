@@ -1213,7 +1213,7 @@ void ProjectionStorage::build_key_value_edge_index_() {
     );
 }
 
-void ProjectionStorage::clear_sort_scratch_() {
+void ProjectionStorage::reset_sort_scratch_() {
     std::error_code ec;
     std::filesystem::remove_all(projection_dir + "/sort_tmp", ec);
     // Best-effort cleanup; recreate empty dir for the next pass.
