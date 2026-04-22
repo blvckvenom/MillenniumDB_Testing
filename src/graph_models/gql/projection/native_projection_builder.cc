@@ -171,7 +171,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
 
     // Configure features based on property lists
     ProjectionStorage::Features features;
-    features.include_node_properties = !node_property_keys.empty();
+    features.include_node_properties = !node_property_keys.empty()
+                                     || !node_prop_configs.empty();
     // Enable edge properties if explicitly requested OR if COUNT aggregation will create _count
     bool has_count_aggregation = (aggregation == Aggregation::COUNT);
     for (const auto& [type, agg] : type_aggregations) {
@@ -180,7 +181,9 @@ NativeProjectionBuilder::NativeProjectionBuilder(
             break;
         }
     }
-    features.include_edge_properties = !edge_property_keys.empty() || has_count_aggregation;
+    features.include_edge_properties = !edge_property_keys.empty()
+                                     || !edge_prop_configs.empty()
+                                     || has_count_aggregation;
     // Default (Neo4j-GDS parity) is to always build node+edge label indexes.
     // The opt-out (`includeLabelIndexes: false` in graph_project config) skips
     // those 4 indexes when the workload has no `MATCH (n:Label)` queries
@@ -2112,6 +2115,11 @@ std::vector<ProjectionIndex> NativeProjectionBuilder::enabled_indexes_() const {
 }
 
 bool NativeProjectionBuilder::has_non_single_aggregation_() const {
+    // Global aggregation setting applies when stored_types_ is empty
+    // (e.g., projection with no edge types but aggregation: COUNT set).
+    if (aggregation != Aggregation::SINGLE) {
+        return true;
+    }
     for (const auto& type : stored_types_) {
         if (get_aggregation_for_type(type) != Aggregation::SINGLE) {
             return true;
