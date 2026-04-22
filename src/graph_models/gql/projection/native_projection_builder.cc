@@ -2242,8 +2242,16 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // NODES pass runs first and calls finalize_node_scan() (spec §6 I1).
     // Subsequent label/property passes scan the same label_node index
     // but emit only to their target buffers.
+    //
+    // drain_pending_batches() flushes storage's internal BATCH_SIZE=250 node/edge
+    // batches into the streaming record buffers before build_one_index() reads
+    // them. Without it, up to 249 records can remain un-flushed when the index
+    // build runs, causing those records to be omitted from the B+Tree and later
+    // re-processed by the flush() call, which overwrites the correct index with
+    // a partial dataset (Spec #2 §4 correctness fix — I4 golden compare guard).
     for (auto idx : node_phase) {
         scan_nodes_impl_serialized_(stored_labels_, idx);
+        storage->drain_pending_batches();
         storage->build_one_index(idx);
         storage->reset_sort_scratch_();
 #if defined(__GLIBC__)
@@ -2263,8 +2271,11 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // Each pass calls scan_edges_impl_serialized_ with a single-bit mask;
     // the EdgeFilter (Phase B) replaces per-edge has_node() lookups with
     // O(1) bitmap probes (spec §6 I2: filter is immutable after finalize()).
+    // drain_pending_batches() before each build ensures the streaming buffer
+    // is fully populated (same correctness argument as Phase A above).
     for (auto idx : edge_phase) {
         scan_edges_impl_serialized_(stored_types_, idx, filter.get());
+        storage->drain_pending_batches();
         storage->build_one_index(idx);
         storage->reset_sort_scratch_();
 #if defined(__GLIBC__)

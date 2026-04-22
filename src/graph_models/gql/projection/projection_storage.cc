@@ -425,6 +425,11 @@ bool ProjectionStorage::has_edge(ObjectId from, ObjectId to) const {
     return iter.next() != nullptr;
 }
 
+void ProjectionStorage::drain_pending_batches() {
+    flush_node_batch();
+    flush_edge_batch();
+}
+
 void ProjectionStorage::flush() {
     // Flush any pending batched writes to streaming buffers
     flush_node_batch();

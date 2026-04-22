@@ -329,6 +329,22 @@ public:
      */
     void flush();
 
+    /**
+     * @brief Drains internal node/edge batches into the streaming record buffers.
+     *
+     * Called by NativeProjectionBuilder::finalize_serialized_() before each
+     * build_one_index() pass to ensure all records emitted by scan callbacks
+     * have been flushed from the internal BATCH_SIZE=250 storage batches into
+     * the StreamingRecordBuffers that build_one_index() reads from.
+     *
+     * Without this, up to (BATCH_SIZE-1)=249 node records and a similar number
+     * of edge records can remain in the internal batches when build_one_index()
+     * runs, causing those records to be omitted from the serialized B+Tree build
+     * and later re-processed by the fallback flush() call — overwriting the
+     * correctly-built index with a partial dataset (Spec #2 §4 correctness fix).
+     */
+    void drain_pending_batches();
+
     /// @name Inspection Methods
     /// @{
 
