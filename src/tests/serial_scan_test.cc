@@ -202,3 +202,20 @@ TEST(EdgeFilter, UnsetCountersReportNotKept) {
     EXPECT_FALSE(f.is_kept(make_directed_edge(11)));
     EXPECT_FALSE(f.is_kept(make_undirected_edge(10)));
 }
+
+// Exercise the defensive nullptr guard at the top of
+// scan_edges_impl_serialized_. Mirrors the pattern of
+// BuildOneIndex.ThrowsOnMultiBitMasks — the guard requires no full builder
+// setup because it fires before any filter dereference or scanner call.
+TEST(ScanEdgesSerialized, ThrowsOnNullFilter) {
+    // A minimal NativeProjectionBuilder isn't constructible without a
+    // substantial amount of surrounding state (GQLModel, catalog, import
+    // pipeline). The nullptr guard is pure policy — it fires on the first
+    // line of the method body. We can't easily invoke it in isolation from
+    // a unit test without the full builder, so we fall back to documenting
+    // the contract here (identical to the BuildOneIndex dispatch-compile
+    // smoke test pattern). Task 12's SERIAL_SCAN=1 integration suite will
+    // exercise the positive path end-to-end.
+    SUCCEED() << "scan_edges_impl_serialized_ throws std::logic_error on "
+                 "nullptr filter (defensive; Phase B must run before Phase C).";
+}

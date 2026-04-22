@@ -1914,6 +1914,7 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
 
     std::unordered_map<std::string, ObjectId> type_id_map;
     for (const auto& type : types) {
+        validate_type_exists(type);
         auto it = gql_model.catalog.edge_labels2id.find(type);
         if (it == gql_model.catalog.edge_labels2id.end()) {
             throw std::runtime_error("Type '" + type + "' not found in catalog");
@@ -1970,6 +1971,9 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
                 }
             }
 
+            // Edges carry no GNN side-effects (labels/splits live on nodes — see the
+            // TODO(task10-gnn) block in scan_nodes_impl_serialized_), so the
+            // empty-key guard is a safe short-circuit here that it is NOT for nodes.
             if (emit_edge_properties && !edge_property_keys.empty()) {
                 extract_edge_properties(edge_id);
             }
