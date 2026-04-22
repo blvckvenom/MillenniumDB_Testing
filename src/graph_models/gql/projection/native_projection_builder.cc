@@ -14,6 +14,7 @@
 #include <unordered_set>
 
 #include "graph_models/gql/gql_model.h"
+#include "graph_models/gql/projection/edge_keep_bitmap.h"
 #include "graph_models/gql/projection/external_edge_sort.h"
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_manager.h"
@@ -1766,4 +1767,75 @@ void NativeProjectionBuilder::scan_nodes_impl_serialized_(
         benchmark_timers_.node_scan_ms += std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - bench_t0).count();
     }
+}
+
+// ============================================================================
+// Serialized scan Phase B: precompute_edge_filter_ (Spec #2 §4 Phase B).
+//
+// Single full edge scan that evaluates has_node() on both endpoints for every
+// edge of the requested types, recording the outcome bit-by-bit in an
+// EdgeKeepBitmap keyed by edge_id.id. No record emission happens here — the
+// bitmap is the sole output, consumed read-only by Phase C's 9 edge-index
+// passes (scan_edges_impl_serialized_) so that has_node() work is paid once
+// instead of 9×.
+//
+// Invariant I2 (spec §6): bitmap is finalized before return, so Phase C's
+// consumers see an immutable snapshot and can read concurrently without
+// synchronization if they later go parallel.
+// ============================================================================
+std::unique_ptr<EdgeKeepBitmap>
+NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>& types)
+{
+    auto bitmap = std::make_unique<EdgeKeepBitmap>();
+
+    // Pass 1 — resolve type_ids + estimate total edge count. Mirrors
+    // scan_edges_impl_classic_'s catalog-lookup sequence to keep error
+    // messages identical.
+    uint64_t total_estimate = 0;
+    std::unordered_map<std::string, ObjectId> type_id_map;
+    for (const auto& type : types) {
+        validate_type_exists(type);
+
+        auto it = gql_model.catalog.edge_labels2id.find(type);
+        if (it == gql_model.catalog.edge_labels2id.end()) {
+            throw std::runtime_error("Type '" + type + "' not found in catalog");
+        }
+        ObjectId type_id(it->second | ObjectId::MASK_EDGE_LABEL);
+        type_id_map[type] = type_id;
+        total_estimate += scanner->count_edges_by_type(type_id);
+    }
+
+    // Pre-size the bitmap so the typical case avoids repeated std::vector
+    // resizes inside the hot scan loop. set_kept() still handles growth
+    // if an edge_id lands above the estimate (e.g. sparse id space).
+    bitmap->reserve(total_estimate);
+
+    // Resize ProjectionStorage's Bloom filter using the same total estimate.
+    // scan_edges_impl_classic_ does this on its own fast path (see
+    // classic impl comment "Resize Bloom filter based on estimated edge
+    // count"), and Phase C's per-index edge passes rely on has_edge()
+    // probes in the property-emission branches of scan_edges_impl_serialized_,
+    // so we must mirror the sizing here.
+    if (total_estimate > 0) {
+        storage->resize_bloom_filter(total_estimate);
+    }
+
+    // Pass 2 — scan all edges of each type, setting the bit for the ones
+    // that survive the has_node() filter. No batch emission, no aggregation,
+    // no property extraction: this phase is purely a filter pre-computation.
+    for (const auto& type : types) {
+        ObjectId type_id = type_id_map[type];
+        scanner->scan_label_edge_with_endpoints(
+            type_id,
+            [this, &bitmap](ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
+                bool has_from = storage->has_node(from_node);
+                bool has_to   = storage->has_node(to_node);
+                if (has_from && has_to) {
+                    bitmap->set_kept(edge_id.id);
+                }
+            });
+    }
+
+    bitmap->finalize();
+    return bitmap;
 }

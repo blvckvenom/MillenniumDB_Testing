@@ -471,6 +471,39 @@ private:
                                      ProjectionIndex target_mask,
                                      const EdgeKeepBitmap* filter);
 
+    /**
+     * @brief Serialized mode Phase B: precompute the edge-keep bitmap.
+     *
+     * Runs a single full scan over all edges of the given @p types,
+     * evaluates the has_node() filter on both endpoints, and records the
+     * outcome as a bit per edge in a fresh EdgeKeepBitmap keyed by
+     * edge_id.id. No record emissions happen here — the bitmap is the
+     * sole side-effect.
+     *
+     * Consumed read-only by Phase C's 9 edge-index passes
+     * (scan_edges_impl_serialized_ with different target masks), so the
+     * has_node() + ParallelEdgeDetector work is paid once instead of
+     * 9×. Called exactly once by finalize_serialized_ (Task 10) after
+     * Phase A has populated ProjectionStorage::collected_nodes_.
+     *
+     * Also resizes ProjectionStorage's Bloom filter based on the total
+     * estimated edge count, matching scan_edges_impl_classic_'s
+     * contract so downstream has_edge() probes keep their <1% false
+     * positive target on large graphs.
+     *
+     * Memory: 1 bit per edge_id. Papers100M (1.6B edges) ≈ 200 MB.
+     *
+     * Spec: §4 Phase B, §6 invariant I2 (bitmap is write-once).
+     *
+     * @param types Relationship type names to scan (same set accepted
+     *        by scan_edges_by_types / scan_edges_impl_classic_).
+     * @return Owning pointer to the finalized bitmap (Phase C consumes
+     *         it via raw pointer).
+     * @throws std::runtime_error if any type is absent from the catalog.
+     */
+    std::unique_ptr<EdgeKeepBitmap> precompute_edge_filter_(
+        const std::vector<std::string>& types);
+
     // Input state captured from the public scan_* methods for later
     // replay in finalize_serialized_ (Task 10). scan_inputs_captured_
     // prevents double-capture.
