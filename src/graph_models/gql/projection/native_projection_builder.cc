@@ -1849,3 +1849,147 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
     filter->finalize();
     return filter;
 }
+
+// ============================================================================
+// Serialized scan Phase C: scan_edges_impl_serialized_ (Spec #2 §4 Phase C).
+//
+// Mirror of scan_edges_impl_classic_ for the SERIALIZED pipeline. Task 10's
+// orchestrator (finalize_serialized_) calls this once per edge-related index
+// — typically with a single-bit target_mask — so each B+Tree pass does one
+// sequential scan of the label_edge index without redundantly re-running
+// ParallelEdgeDetector or has_node() lookups.
+//
+// The EdgeFilter produced by precompute_edge_filter_ (Phase B) is consumed
+// here read-only: filter->is_kept(edge_id) is an O(1) bitmap probe that
+// replaces the classic path's per-edge has_node(from) + has_node(to) pair.
+//
+// Aggregation modes (SUM/MIN/MAX/COUNT) are NOT handled here: Spec §3 D8
+// keeps classic as the gate-keeping path for aggregation; finalize_serialized_
+// routes those graphs to finalize_classic_ before this code is ever reached.
+// Only SINGLE mode reaches this function.
+//
+// Invariant I1 (spec §6): Phase B must complete before any Phase C call.
+//   → Enforced by the nullptr guard below (Task 10's orchestrator holds the
+//     unique_ptr and passes a raw pointer here only after Phase B returns).
+// Invariant I2 (spec §6): filter is immutable after finalize() — safe to read
+//   concurrently if Task 10 later parallelises the per-index passes.
+// ============================================================================
+void NativeProjectionBuilder::scan_edges_impl_serialized_(
+    const std::vector<std::string>& types,
+    ProjectionIndex target_mask,
+    const EdgeFilter* filter)
+{
+    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                              : std::chrono::high_resolution_clock::time_point{};
+
+    if (filter == nullptr) {
+        throw std::logic_error(
+            "scan_edges_impl_serialized_ requires non-null filter "
+            "(precompute_edge_filter_ must run first)");
+    }
+
+    // Mask-gated emission booleans. In SERIALIZED mode each call receives
+    // a single-bit target_mask, so typically only one emit_* is true —
+    // except for the two label indexes (EDGE_LABEL / LABEL_EDGE) and the
+    // two property indexes (EDGE_KEY_VALUE / KEY_VALUE_EDGE) which share
+    // the underlying emission: when either single-bit is passed, both the
+    // label buffer write (or property extraction) runs. Task 10's
+    // orchestrator dispatches each pass independently; build_one_index
+    // then picks the correct B+Tree to sort-and-write.
+    const bool emit_from_to         = has_flag(target_mask, ProjectionIndex::FROM_TO_EDGE);
+    const bool emit_to_from         = has_flag(target_mask, ProjectionIndex::TO_FROM_EDGE);
+    const bool emit_edge_direction  = has_flag(target_mask, ProjectionIndex::EDGE_DIRECTION);
+    const bool emit_edge_from_to    = has_flag(target_mask, ProjectionIndex::EDGE_FROM_TO);
+    const bool emit_edge_n1_n2      = has_flag(target_mask, ProjectionIndex::EDGE_N1_N2);
+    const bool emit_edge_label      = has_flag(target_mask, ProjectionIndex::EDGE_LABEL) ||
+                                      has_flag(target_mask, ProjectionIndex::LABEL_EDGE);
+    const bool emit_edge_properties = has_flag(target_mask, ProjectionIndex::EDGE_KEY_VALUE) ||
+                                      has_flag(target_mask, ProjectionIndex::KEY_VALUE_EDGE);
+
+    // "any edge buffer" covers the 5 core edge-record buffers that share
+    // the `edge_batch` flush lifecycle (FROM_TO_EDGE, TO_FROM_EDGE,
+    // EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2).
+    const bool emit_any_edge_buffer = emit_from_to || emit_to_from || emit_edge_direction ||
+                                      emit_edge_from_to || emit_edge_n1_n2;
+
+    std::unordered_map<std::string, ObjectId> type_id_map;
+    for (const auto& type : types) {
+        auto it = gql_model.catalog.edge_labels2id.find(type);
+        if (it == gql_model.catalog.edge_labels2id.end()) {
+            throw std::runtime_error("Type '" + type + "' not found in catalog");
+        }
+        type_id_map[type] = ObjectId(it->second | ObjectId::MASK_EDGE_LABEL);
+    }
+
+    for (const auto& type : types) {
+        Orientation type_orientation = get_orientation_for_type(type);
+        ObjectId type_id = type_id_map[type];
+
+        scanner->scan_label_edge_with_endpoints(type_id,
+            [this, filter, type_id, type_orientation,
+             emit_any_edge_buffer, emit_edge_label, emit_edge_properties]
+            (ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
+            if (!filter->is_kept(edge_id)) return;  // O(1) bitmap lookup
+
+            if (emit_any_edge_buffer) {
+                switch (type_orientation) {
+                    case Orientation::NATURAL: {
+                        ProjectedEdge edge;
+                        edge.from_node = from_node;
+                        edge.to_node   = to_node;
+                        edge.edge_id   = edge_id;
+                        uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
+                        edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
+                        edge_batch.push_back(edge);
+                        break;
+                    }
+                    case Orientation::REVERSE: {
+                        ProjectedEdge edge;
+                        edge.from_node = to_node;
+                        edge.to_node   = from_node;
+                        edge.edge_id   = edge_id;
+                        uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
+                        edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
+                        edge_batch.push_back(edge);
+                        break;
+                    }
+                    case Orientation::UNDIRECTED: {
+                        ProjectedEdge edge;
+                        if (from_node.id <= to_node.id) {
+                            edge.from_node = from_node;
+                            edge.to_node   = to_node;
+                        } else {
+                            edge.from_node = to_node;
+                            edge.to_node   = from_node;
+                        }
+                        edge.edge_id     = edge_id;
+                        edge.is_directed = false;
+                        edge_batch.push_back(edge);
+                        break;
+                    }
+                }
+            }
+
+            if (emit_edge_properties && !edge_property_keys.empty()) {
+                extract_edge_properties(edge_id);
+            }
+
+            if (emit_edge_label) {
+                storage->add_edge_label(edge_id, type_id);
+            }
+
+            if (emit_any_edge_buffer && edge_batch.size() >= BATCH_SIZE) {
+                flush_edges();
+            }
+        });
+    }
+
+    if (emit_any_edge_buffer && !edge_batch.empty()) {
+        flush_edges();
+    }
+
+    if (benchmark_timers_.enabled) {
+        benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - bench_t0).count();
+    }
+}
