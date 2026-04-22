@@ -691,6 +691,29 @@ private:
      */
     void build_all_indexes_bulk();
 
+    // Per-index build methods (extracted from build_all_indexes_bulk).
+    // Each builds exactly one B+Tree .leaf/.dir file from its backing
+    // StreamingRecordBuffer via GQL::sort_and_build_index (Spec #1 facade).
+    // Called by build_all_indexes_bulk() in CLASSIC mode and by
+    // build_one_index(ProjectionIndex) in SERIALIZED mode (Task 5).
+    void build_nodes_index_();
+    void build_node_label_index_();
+    void build_label_node_index_();
+    void build_node_key_value_index_();
+    void build_key_value_node_index_();
+    void build_from_to_edge_index_();
+    void build_to_from_edge_index_();
+    void build_edge_direction_index_();
+    void build_edge_from_to_index_();
+    void build_edge_n1_n2_index_();
+    void build_edge_label_index_();
+    void build_label_edge_index_();
+    void build_edge_key_value_index_();
+    void build_key_value_edge_index_();
+
+    // Remove + recreate sort scratch directory between serialized passes.
+    void clear_sort_scratch_();
+
     /**
      * @brief Build a single B+tree index using bulk import.
      *
