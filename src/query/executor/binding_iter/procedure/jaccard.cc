@@ -82,11 +82,13 @@ void Jaccard::_reset()
                                         ? 0.0
                                         : static_cast<double>(intersection_size) / static_cast<double>(union_size);
 
-            results.emplace_back(
-                ObjectId(nodes[i]),
-                ObjectId(nodes[j]),
-                GQL::Conversions::pack_double(similarity)
-            );
+            if (similarity >= similarity_cutoff) {
+                results.emplace_back(
+                    ObjectId(nodes[i]),
+                    ObjectId(nodes[j]),
+                    GQL::Conversions::pack_double(similarity)
+                );
+            }
         }
     }
 }
