@@ -65,6 +65,18 @@ constexpr bool has_flag(ProjectionIndex mask, ProjectionIndex bit) {
     return (static_cast<uint32_t>(mask) & static_cast<uint32_t>(bit)) != 0;
 }
 
+// Compile-time drift guard: ensures the numerically-computed ALL_NODE /
+// ALL_EDGE / ALL presets stay consistent with the single-bit enumerators.
+// If a future committer adds a 15th bit (e.g., EDGE_N2_N1 = 1u << 14)
+// without updating ALL_EDGE and ALL, these static_asserts fire during
+// compilation, not at runtime.
+static_assert(
+    ProjectionIndex::ALL == (ProjectionIndex::ALL_NODE | ProjectionIndex::ALL_EDGE),
+    "ProjectionIndex::ALL must equal ALL_NODE | ALL_EDGE");
+static_assert(
+    static_cast<uint32_t>(ProjectionIndex::ALL) == 0x3FFFu,
+    "ProjectionIndex::ALL must equal 0x3FFF (14 single-bit projection indexes)");
+
 /**
  * @brief Conditional per-phase timing for graph_project pipeline.
  *
