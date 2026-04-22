@@ -8,6 +8,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1996,4 +1999,195 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
         benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - bench_t0).count();
     }
+}
+
+// ============================================================================
+// Task 10: enabled_indexes_(), has_non_single_aggregation_(),
+// finalize_serialized_() — Spec #2 §4 full pipeline orchestrator.
+//
+// enabled_indexes_() computes the ordered list of single-bit ProjectionIndex
+// values to iterate in Phase A (node indexes) and Phase C (edge indexes).
+// The order within each phase is fixed by spec §4:
+//   Phase A: NODES → NODE_LABEL → LABEL_NODE → NODE_KEY_VALUE → KEY_VALUE_NODE
+//   Phase C: FROM_TO_EDGE → TO_FROM_EDGE → EDGE_DIRECTION → EDGE_FROM_TO →
+//             EDGE_N1_N2 → EDGE_LABEL → LABEL_EDGE → EDGE_KEY_VALUE →
+//             KEY_VALUE_EDGE
+// Only indexes that are actually configured (include_label_indexes_ /
+// node_property_keys / edge_property_keys) are emitted — this is what bounds
+// peak scratch disk to O(max single index) instead of O(sum all indexes).
+//
+// GNN disjunct (Task 7 code-review finding, see TODO(task10-gnn)):
+//   classic's extract_node_properties populates labels_buffer_ / splits_buffer_
+//   via try_extract_gnn_property as a side-effect, even when node_property_keys
+//   is empty. Under SERIALIZED, property extraction only fires during
+//   NODE_KEY_VALUE / KEY_VALUE_NODE passes. So we MUST push those two indexes
+//   whenever gnn_row_mapping_ != nullptr, regardless of whether node
+//   properties were explicitly configured. Failure to do so causes Cora's
+//   testAccuracy to drop from 0.7900 to random under SERIAL_SCAN=1.
+//
+// has_non_single_aggregation_() implements spec §3 D8: aggregation state
+//   (COUNT/SUM/MIN/MAX maps) would be too large to persist across 9 edge-index
+//   passes, so graphs with any non-SINGLE aggregation fall back to the classic
+//   single-pass path with a stderr warning.
+//
+// finalize_serialized_() orchestrates:
+//   Phase A: node-index passes (scan_nodes_impl_serialized_ + build_one_index
+//            + reset_sort_scratch_ + malloc_trim per index)
+//   Phase B: single full edge scan → EdgeFilter bitmap
+//            (precompute_edge_filter_)
+//   Phase C: edge-index passes (scan_edges_impl_serialized_ + build_one_index
+//            + reset_sort_scratch_ + malloc_trim per index)
+// ============================================================================
+
+std::vector<ProjectionIndex> NativeProjectionBuilder::enabled_indexes_() const {
+    std::vector<ProjectionIndex> out;
+
+    // Phase A: nodes first (CRITICAL — finalize_node_scan populates
+    // collected_nodes_ that Phase B's has_node() depends on, spec §6 I1).
+    // Label and property indexes follow in a fixed order.
+    out.push_back(ProjectionIndex::NODES);
+
+    if (include_label_indexes_) {
+        out.push_back(ProjectionIndex::NODE_LABEL);
+        out.push_back(ProjectionIndex::LABEL_NODE);
+    }
+
+    // Determine whether node-property passes are needed.
+    // Uses the same conditions as scan_nodes_impl_classic_ (line 506):
+    //   !node_property_keys.empty() || !node_prop_configs.empty()
+    // PLUS the GNN disjunct: classic's extract_node_properties has a GNN
+    // side-effect (populating labels_buffer_ / splits_buffer_ via
+    // try_extract_gnn_property) that fires even when node_property_keys is
+    // empty. Under SERIALIZED, property extraction only runs during
+    // NODE_KEY_VALUE / KEY_VALUE_NODE passes — so we MUST include them
+    // whenever GNN is active, regardless of features.include_node_properties.
+    // Without this, Cora's testAccuracy drops from 0.7900 to random
+    // (Task 7 code-review finding, see TODO(task10-gnn) in
+    // scan_nodes_impl_serialized_).
+    bool needs_node_properties = !node_property_keys.empty() || !node_prop_configs.empty();
+#ifdef ENABLE_GNN
+    needs_node_properties = needs_node_properties || (gnn_row_mapping_ != nullptr);
+#endif
+    if (needs_node_properties) {
+        out.push_back(ProjectionIndex::NODE_KEY_VALUE);
+        out.push_back(ProjectionIndex::KEY_VALUE_NODE);
+    }
+
+    // Phase C: core 5 edge indexes (always required), then optional
+    // label and property indexes.
+    out.push_back(ProjectionIndex::FROM_TO_EDGE);
+    out.push_back(ProjectionIndex::TO_FROM_EDGE);
+    out.push_back(ProjectionIndex::EDGE_DIRECTION);
+    out.push_back(ProjectionIndex::EDGE_FROM_TO);
+    out.push_back(ProjectionIndex::EDGE_N1_N2);
+
+    if (include_label_indexes_) {
+        out.push_back(ProjectionIndex::EDGE_LABEL);
+        out.push_back(ProjectionIndex::LABEL_EDGE);
+    }
+
+    // Determine whether edge-property passes are needed.
+    // Mirrors the constructor's has_count_aggregation logic (lines 173-180):
+    //   !edge_property_keys.empty()  ||  !edge_prop_configs.empty()
+    //   || global COUNT aggregation
+    //   || any per-type COUNT aggregation (synthetic _count key)
+    bool needs_edge_properties = !edge_property_keys.empty() || !edge_prop_configs.empty();
+    if (!needs_edge_properties && aggregation == Aggregation::COUNT) {
+        needs_edge_properties = true;
+    }
+    if (!needs_edge_properties) {
+        for (const auto& [t, agg] : per_type_aggregations) {
+            if (agg == Aggregation::COUNT) {
+                needs_edge_properties = true;
+                break;
+            }
+        }
+    }
+    if (needs_edge_properties) {
+        out.push_back(ProjectionIndex::EDGE_KEY_VALUE);
+        out.push_back(ProjectionIndex::KEY_VALUE_EDGE);
+    }
+
+    return out;
+}
+
+bool NativeProjectionBuilder::has_non_single_aggregation_() const {
+    for (const auto& type : stored_types_) {
+        if (get_aggregation_for_type(type) != Aggregation::SINGLE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void NativeProjectionBuilder::finalize_serialized_() {
+    if (!scan_inputs_captured_) {
+        throw std::logic_error(
+            "finalize_serialized_: no scan inputs captured - "
+            "scan_nodes_by_labels + scan_edges_by_types must be called first");
+    }
+
+    // Spec §3 D8: aggregation modes (COUNT/SUM/MIN/MAX) require the classic
+    // path because aggregation state would be too large to persist across 9
+    // edge-index passes. Warn and fall through to the classic impls.
+    if (has_non_single_aggregation_()) {
+        std::cerr << "[Projection] SERIAL_SCAN disabled for this projection: "
+                     "aggregation mode (COUNT/SUM/MIN/MAX) requires the "
+                     "classic path. Falling back to classic scan."
+                  << std::endl;
+        scan_nodes_impl_classic_(stored_labels_);
+        scan_edges_impl_classic_(stored_types_);
+        return;
+    }
+
+    auto all_idx = enabled_indexes_();
+
+    // Split into node phase (Phase A) + edge phase (Phase C) via bitmask.
+    std::vector<ProjectionIndex> node_phase;
+    std::vector<ProjectionIndex> edge_phase;
+    for (auto idx : all_idx) {
+        if (has_flag(ProjectionIndex::ALL_NODE, idx)) {
+            node_phase.push_back(idx);
+        } else {
+            edge_phase.push_back(idx);
+        }
+    }
+
+    // ---- Phase A: node indexes — one scan + build + reset per index ----
+    // NODES pass runs first and calls finalize_node_scan() (spec §6 I1).
+    // Subsequent label/property passes scan the same label_node index
+    // but emit only to their target buffers.
+    for (auto idx : node_phase) {
+        scan_nodes_impl_serialized_(stored_labels_, idx);
+        storage->build_one_index(idx);
+        storage->reset_sort_scratch_();
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+    }
+
+    // ---- Phase B: precompute edge-keep filter (single full edge scan) ----
+    // precompute_edge_filter_ walks every edge of stored_types_, evaluates
+    // has_node() on both endpoints (O(log N) after Phase A's finalize_node_scan),
+    // and records the outcome bit-by-bit. No record emission; the filter is
+    // the sole output. Also resizes the Bloom filter to match the estimated
+    // edge count (matching scan_edges_impl_classic_'s contract).
+    auto filter = precompute_edge_filter_(stored_types_);
+
+    // ---- Phase C: edge indexes — one scan + build + reset per index ----
+    // Each pass calls scan_edges_impl_serialized_ with a single-bit mask;
+    // the EdgeFilter (Phase B) replaces per-edge has_node() lookups with
+    // O(1) bitmap probes (spec §6 I2: filter is immutable after finalize()).
+    for (auto idx : edge_phase) {
+        scan_edges_impl_serialized_(stored_types_, idx, filter.get());
+        storage->build_one_index(idx);
+        storage->reset_sort_scratch_();
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+    }
+
+    // filter unique_ptr releases EdgeFilter here; malloc_trim on the next
+    // pass (or the caller's subsequent finalize() bookkeeping) returns the
+    // heap pages to the kernel.
 }

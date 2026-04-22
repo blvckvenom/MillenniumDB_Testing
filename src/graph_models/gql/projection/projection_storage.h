@@ -462,6 +462,15 @@ public:
      *         (NONE, ALL_NODE, ALL_EDGE, ALL, or any unknown combination).
      */
     void build_one_index(ProjectionIndex which);
+
+    /**
+     * @brief Reset (remove + recreate empty) the sort scratch directory.
+     *
+     * Called by NativeProjectionBuilder::finalize_serialized_() between
+     * serialized scan passes so peak scratch disk stays bounded to
+     * O(max single index) instead of O(sum all indexes).
+     */
+    void reset_sort_scratch_();
     /// @}
 
     /// @name Node-scan Lifecycle
@@ -737,10 +746,6 @@ private:
     void build_label_edge_index_();
     void build_edge_key_value_index_();
     void build_key_value_edge_index_();
-
-    // Reset (remove + recreate empty) sort scratch directory between
-    // serialized passes.
-    void reset_sort_scratch_();
 
     /**
      * @brief Build a single B+tree index using bulk import.

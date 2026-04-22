@@ -519,6 +519,43 @@ private:
     std::unique_ptr<EdgeFilter> precompute_edge_filter_(
         const std::vector<std::string>& types);
 
+    /**
+     * @brief Spec #2 orchestrator: executes Phase A + B + C when ScanMode is
+     *        SERIALIZED. Called by finalize() (wired in Task 11) after the
+     *        public scan_*_by_* methods have captured inputs into stored_labels_
+     *        / stored_types_.
+     *
+     * Falls back to the classic single-pass path when has_non_single_
+     * aggregation_() returns true (spec §3 D8) because aggregation state
+     * would be too large to persist across 9 edge-index passes.
+     */
+    void finalize_serialized_();
+
+    /**
+     * @brief Compute the ordered list of ProjectionIndex single-bit values to
+     *        iterate during Phase A + Phase C, based on features flags.
+     *
+     * Node phase (NODES + optional label/property indexes) is emitted
+     * first, followed by edge phase (core 5 + optional label/property).
+     *
+     * IMPORTANT: under ENABLE_GNN, pushes NODE_KEY_VALUE + KEY_VALUE_NODE
+     * whenever gnn_row_mapping_ is non-null, even if no node properties are
+     * configured. This preserves classic's GNN label/split extraction
+     * side-effect via try_extract_gnn_property (see
+     * scan_nodes_impl_serialized_'s TODO(task10-gnn)).
+     */
+    std::vector<ProjectionIndex> enabled_indexes_() const;
+
+    /**
+     * @brief Returns true if any type in stored_types_ uses an aggregation
+     *        mode other than SINGLE.
+     *
+     * Serialized mode falls back to classic in that case (spec §3 D8).
+     * Aggregation state (COUNT/SUM/MIN/MAX maps) is too large to persist
+     * across 9 edge-index passes.
+     */
+    bool has_non_single_aggregation_() const;
+
     // Input state captured from the public scan_* methods for later
     // replay in finalize_serialized_ (Task 10). scan_inputs_captured_
     // prevents double-capture.
