@@ -85,7 +85,7 @@ private:
     // Both constants are defined in object_id.h. We compare the full
     // top-byte (via SUB_TYPE_MASK) against the undirected constant; anything
     // else is treated as directed.
-    static bool is_undirected_(ObjectId id) noexcept {
+    static constexpr bool is_undirected_(ObjectId id) noexcept {
         return (id.id & ObjectId::SUB_TYPE_MASK) == ObjectId::MASK_UNDIRECTED_EDGE;
     }
 };
