@@ -1673,3 +1673,85 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
     // Cleanup temp directory
     std::filesystem::remove_all(temp_dir);
 }
+
+// ============================================================================
+// Serialized scan implementations (Spec #2).
+//
+// Serialized equivalents of scan_nodes_impl_classic_ / scan_edges_impl_classic_
+// that gate each storage emission on a target ProjectionIndex bitmask. These
+// are invoked once per node-related index (5 passes) by finalize_serialized_
+// (Task 10), so the main scan loop runs five times over the same labels.
+//
+// Critical invariant (see spec §6, I1): finalize_node_scan() MUST be called
+// EXACTLY ONCE across all node-phase passes — specifically during the NODES
+// pass — because it populates ProjectionStorage::collected_nodes_ which the
+// edge filter's has_node() (Phase B) depends on. If we finalized on every
+// pass, subsequent passes would mutate the node set the edge filter has
+// already consulted.
+// ============================================================================
+
+void NativeProjectionBuilder::scan_nodes_impl_serialized_(
+    const std::vector<std::string>& labels,
+    ProjectionIndex target_mask)
+{
+    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                               : std::chrono::high_resolution_clock::time_point{};
+
+    // NODES               -> emit to node_batch (main nodes index).
+    // NODE_LABEL/LABEL_NODE -> emit to node<->label pairs via storage.
+    // NODE_KEY_VALUE/KEY_VALUE_NODE -> extract node properties.
+    const bool emit_nodes      = has_flag(target_mask, ProjectionIndex::NODES);
+    const bool emit_node_label = has_flag(target_mask, ProjectionIndex::NODE_LABEL) ||
+                                 has_flag(target_mask, ProjectionIndex::LABEL_NODE);
+    const bool emit_properties = has_flag(target_mask, ProjectionIndex::NODE_KEY_VALUE) ||
+                                 has_flag(target_mask, ProjectionIndex::KEY_VALUE_NODE);
+
+    for (const auto& label : labels) {
+        validate_label_exists(label);
+
+        auto it = gql_model.catalog.node_labels2id.find(label);
+        if (it == gql_model.catalog.node_labels2id.end()) {
+            throw std::runtime_error(
+                "Label '" + label + "' not found in catalog"
+            );
+        }
+        ObjectId label_id(it->second | ObjectId::MASK_NODE_LABEL);
+
+        scanner->scan_label_node(label_id,
+            [this, label_id, emit_nodes, emit_node_label, emit_properties](ObjectId node_id) {
+                if (emit_nodes) {
+                    ProjectedNode node;
+                    node.node_id = node_id;
+                    node_batch.push_back(node);
+                    if (node_batch.size() >= BATCH_SIZE) {
+                        flush_nodes();
+                    }
+                }
+                if (emit_properties) {
+                    extract_node_properties(node_id);
+                }
+                if (emit_node_label) {
+                    storage->add_node_label(node_id, label_id);
+                }
+            });
+    }
+
+    if (emit_nodes && !node_batch.empty()) {
+        flush_nodes();
+    }
+
+    // Finalise the scan-phase node tracker ONLY on the NODES pass, so
+    // collected_nodes_ is populated exactly once. Other passes
+    // (NODE_LABEL, LABEL_NODE, NODE_KEY_VALUE, KEY_VALUE_NODE) read node
+    // ids via scan_label_node without mutating collected_nodes_ — the
+    // edge filter in Phase B/C depends on this single-finalise invariant
+    // (has_node() binary-search contract for scan_edges_by_types).
+    if (emit_nodes) {
+        storage->finalize_node_scan();
+    }
+
+    if (benchmark_timers_.enabled) {
+        benchmark_timers_.node_scan_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - bench_t0).count();
+    }
+}
