@@ -2,17 +2,24 @@
 
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <map>
 #include <set>
 
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
+#include "query/exceptions.h"
 
 using namespace Procedure;
 
-Jaccard::Jaccard(std::vector<VarId>&& yield_vars_) :
+Jaccard::Jaccard(
+    std::vector<std::unique_ptr<BindingExpr>>&& argument_binding_exprs_,
+    std::vector<VarId>&& yield_vars_
+) :
+    argument_binding_exprs { std::move(argument_binding_exprs_) },
     yield_vars { std::move(yield_vars_) }
 {
+    assert(argument_binding_exprs.size() <= 1);
     assert(yield_vars.size() == 3);
 }
 
@@ -26,6 +33,7 @@ void Jaccard::_reset()
 {
     results.clear();
     cursor = 0;
+    eval_arguments();
 
     std::array<uint64_t, 3> min_ids = { 0, 0, 0 };
     std::array<uint64_t, 3> max_ids = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
@@ -80,6 +88,30 @@ void Jaccard::_reset()
                 GQL::Conversions::pack_double(similarity)
             );
         }
+    }
+}
+
+void Jaccard::eval_arguments()
+{
+    similarity_cutoff = 0.0;
+    if (argument_binding_exprs.empty()) {
+        return;
+    }
+
+    const ObjectId cutoff_oid = argument_binding_exprs[0]->eval(*parent_binding);
+    switch (cutoff_oid.get_sub_type()) {
+    case ObjectId::MASK_INT:
+    case ObjectId::MASK_DECIMAL:
+    case ObjectId::MASK_FLOAT:
+    case ObjectId::MASK_DOUBLE:
+        similarity_cutoff = GQL::Conversions::to_double(cutoff_oid);
+        break;
+    default:
+        throw QueryExecutionException("CALL jaccard(similarityCutoff): similarityCutoff must be numeric");
+    }
+
+    if (!std::isfinite(similarity_cutoff) || similarity_cutoff < 0.0 || similarity_cutoff > 1.0) {
+        throw QueryExecutionException("CALL jaccard(similarityCutoff): similarityCutoff must be in range [0, 1]");
     }
 }
 
