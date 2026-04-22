@@ -2210,8 +2210,23 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
     }
 
-    // TODO: procesar argumentos
     current_call_argument_exprs.clear();
+    if (named_procedure_call->procedureArgumentList()) {
+        if (procedure_type != OpProcedure::ProcedureType::JACCARD) {
+            throw QueryException(
+                "CALL statement procedure \"" + procedure_name
+                + "\" does not support arguments yet"
+            );
+        }
+        for (auto* procedure_argument_ctx : named_procedure_call->procedureArgumentList()->procedureArgument()) {
+            visit(procedure_argument_ctx->expression());
+            current_call_argument_exprs.emplace_back(std::move(current_expr));
+        }
+        if (current_call_argument_exprs.size() > 1) {
+            throw QueryException("CALL jaccard(...) expects at most one argument: similarityCutoff");
+        }
+    }
+
     // TODO: procesar YIELD
     current_call_yield_var2alias.clear();
 
