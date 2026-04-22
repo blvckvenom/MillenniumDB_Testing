@@ -495,8 +495,10 @@ private:
      *
      * Consumed read-only by Phase C's 9 edge-index passes
      * (scan_edges_impl_serialized_ with different target masks), so the
-     * has_node() + ParallelEdgeDetector work is paid once instead of
-     * 9×. Called exactly once by finalize_serialized_ (Task 10) after
+     * has_node() work is paid once instead of 9×. ParallelEdgeDetector
+     * is NOT run here — it lives in scan_edges_impl_serialized_ (first
+     * FROM_TO_EDGE pass) with per-batch clear() to keep memory bounded.
+     * Called exactly once by finalize_serialized_ (Task 10) after
      * Phase A has populated ProjectionStorage::collected_nodes_.
      *
      * Also resizes ProjectionStorage's Bloom filter based on the total

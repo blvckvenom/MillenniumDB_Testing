@@ -1887,27 +1887,17 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
     // that survive the has_node() filter. No batch emission, no aggregation,
     // no property extraction: this phase is purely a filter pre-computation.
     //
-    // SINGLE-mode parallel edge detection (Spec §3 D8 / Task 11 fix):
-    // When aggregation for a type is SINGLE, a ParallelEdgeDetector is run
-    // concurrently with the filter-set step.  If any parallel edge is found,
-    // the same QueryException that the classic path would throw is raised here,
-    // ensuring that bad queries (e.g., SINGLE on a graph with parallel edges)
-    // are rejected identically under both paths.  No extra scan pass needed:
-    // we piggyback on the existing has_node() endpoint scan.
+    // NOTE: ParallelEdgeDetector is NOT run here.  A detector that is never
+    // cleared grows to hold ALL kept edges (~138 bytes per entry), which
+    // caused 25 GB RSS on papers100M (Run 7 PSI-abort).  Detection instead
+    // runs in scan_edges_impl_serialized_ on the first Phase C pass
+    // (FROM_TO_EDGE), mirroring the per-batch clear() pattern of the classic
+    // path (scan_edges_impl_classic_, line 723).
     for (const auto& type : types) {
         ObjectId type_id = type_id_map[type];
-        Aggregation type_agg = get_aggregation_for_type(type);
-        // For SINGLE aggregation: create a detector to find parallels and throw.
-        // For non-SINGLE: has_non_single_aggregation_() in finalize_serialized_()
-        // already fell back to classic before we reached here, so we never see
-        // COUNT/SUM/MIN/MAX in this loop.
-        std::unique_ptr<ParallelEdgeDetector> detector;
-        if (type_agg == Aggregation::SINGLE) {
-            detector = std::make_unique<ParallelEdgeDetector>(Aggregation::SINGLE);
-        }
         scanner->scan_label_edge_with_endpoints(
             type_id,
-            [this, &filter, &detector, type_id](
+            [this, &filter](
                 ObjectId edge_id, ObjectId from_node, ObjectId to_node)
             {
                 const bool has_from = storage->has_node(from_node);
@@ -1916,15 +1906,6 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
                     // Pass the FULL ObjectId; EdgeFilter routes by the
                     // top-byte type tag and keys by the 56-bit counter.
                     filter->set_kept(edge_id);
-
-                    // Parallel edge detection for SINGLE mode: process_edge()
-                    // throws QueryException on the second occurrence of any
-                    // (from, to, type) triple — identical to classic path.
-                    if (detector) {
-                        detector->process_edge(
-                            from_node.id, to_node.id, type_id.id,
-                            edge_id, std::nullopt);
-                    }
                 }
             });
     }
@@ -1995,6 +1976,16 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
     const bool emit_any_edge_buffer = emit_from_to || emit_to_from || emit_edge_direction ||
                                       emit_edge_from_to || emit_edge_n1_n2;
 
+    // SINGLE-mode parallel edge detection (Spec §3 D8):
+    // Run the ParallelEdgeDetector only on the first Phase C pass (FROM_TO_EDGE).
+    // Gating on FROM_TO_EDGE avoids running detection 9× (once per edge index)
+    // while still throwing the same QueryException before any B+Tree build begins.
+    // The per-batch clear() mirrors classic's pattern (scan_edges_impl_classic_,
+    // line 723): after each BATCH_SIZE flush the map is cleared, keeping peak RSS
+    // bounded at ~132 KB regardless of graph size.  This replaces the unbounded
+    // Phase B detector that caused 25 GB RSS on papers100M (Run 7 PSI-abort).
+    const bool run_detection = has_flag(target_mask, ProjectionIndex::FROM_TO_EDGE);
+
     std::unordered_map<std::string, ObjectId> type_id_map;
     for (const auto& type : types) {
         validate_type_exists(type);
@@ -2009,11 +2000,29 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
         Orientation type_orientation = get_orientation_for_type(type);
         ObjectId type_id = type_id_map[type];
 
+        // Create a per-type detector when running detection on this pass.
+        // finalize_serialized_ only reaches Phase C when all types are SINGLE
+        // (has_non_single_aggregation_ guard), so Aggregation::SINGLE is correct.
+        std::unique_ptr<ParallelEdgeDetector> detector;
+        if (run_detection) {
+            detector = std::make_unique<ParallelEdgeDetector>(Aggregation::SINGLE);
+        }
+
         scanner->scan_label_edge_with_endpoints(type_id,
             [this, filter, type_id, type_orientation,
-             emit_any_edge_buffer, emit_edge_label, emit_edge_properties]
+             emit_any_edge_buffer, emit_edge_label, emit_edge_properties,
+             &detector]
             (ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
             if (!filter->is_kept(edge_id)) return;  // O(1) bitmap lookup
+
+            // Parallel edge detection for SINGLE mode: process_edge() throws
+            // QueryException on the second occurrence of any (from, to, type)
+            // triple — identical to classic path.
+            if (detector) {
+                detector->process_edge(
+                    from_node.id, to_node.id, type_id.id,
+                    edge_id, std::nullopt);
+            }
 
             if (emit_any_edge_buffer) {
                 switch (type_orientation) {
@@ -2065,10 +2074,24 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
                 storage->add_edge_label(edge_id, type_id);
             }
 
+            // Auto-flush and clear detector when batch is full.
+            // For SINGLE mode, clearing mid-scan is safe because there is no
+            // aggregation state to preserve (unlike MIN/MAX/SUM/COUNT).
+            // This bounds the detector map to ~132 KB (BATCH_SIZE=250 entries)
+            // regardless of graph size — matching classic's per-batch clear
+            // (scan_edges_impl_classic_, line 723).
             if (emit_any_edge_buffer && edge_batch.size() >= BATCH_SIZE) {
                 flush_edges();
+                if (detector) {
+                    detector->clear();
+                }
             }
         });
+
+        // Clear detector after each type to release memory promptly.
+        if (detector) {
+            detector->clear();
+        }
     }
 
     if (emit_any_edge_buffer && !edge_batch.empty()) {
