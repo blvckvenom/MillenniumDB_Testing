@@ -344,6 +344,41 @@ else()
     message(STATUS "partition_file.h not present yet (Task 5 pending) - radix_partition_sort_test registration deferred")
 endif()
 
+# ============================================================================
+# Serial scan pipeline unit tests (Spec #2, TDD-gated)
+# ============================================================================
+if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_keep_bitmap.h")
+    add_executable(serial_scan_test
+        ${CMAKE_SOURCE_DIR}/src/tests/serial_scan_test.cc
+    )
+    set_target_properties(serial_scan_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as
+    # radix_partition_sort_test above.
+    target_link_libraries(serial_scan_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    add_test(
+        NAME SerialScanTests
+        COMMAND $<TARGET_FILE:serial_scan_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
