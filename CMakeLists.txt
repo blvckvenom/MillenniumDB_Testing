@@ -333,6 +333,12 @@ if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/p
         ${TBB_LIBS}
         ${LZ4_LIBS}
     )
+    # Match the ENABLE_GNN-conditional link done by the TEST_TARGETS foreach
+    # above — libmillenniumdb.a references vtables defined in mdb_gnn_core
+    # when ENABLE_GNN=ON, so this test target would fail to link otherwise.
+    if(ENABLE_GNN)
+        target_link_libraries(radix_partition_sort_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
     add_test(
         NAME RadixPartitionSortTests
         COMMAND $<TARGET_FILE:radix_partition_sort_test>
@@ -372,6 +378,12 @@ if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/e
         ${TBB_LIBS}
         ${LZ4_LIBS}
     )
+    # Match the ENABLE_GNN-conditional link done by the TEST_TARGETS foreach
+    # above — libmillenniumdb.a references vtables defined in mdb_gnn_core
+    # when ENABLE_GNN=ON, so this test target would fail to link otherwise.
+    if(ENABLE_GNN)
+        target_link_libraries(serial_scan_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
     add_test(
         NAME SerialScanTests
         COMMAND $<TARGET_FILE:serial_scan_test>
