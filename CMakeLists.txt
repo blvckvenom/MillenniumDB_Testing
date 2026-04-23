@@ -478,6 +478,49 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# TopologySnapshot CSR file format unit tests (Spec #4-B T4.3)
+# ============================================================================
+# Registers topology_snapshot_format_test when GTest is available and the
+# corresponding header exists. Mirrors the EXISTS-gated registration
+# precedent of radix_partition_sort_test / serial_scan_test / index_set_test
+# so that the test only wires in after its source lands.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot.h")
+    add_executable(topology_snapshot_format_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_snapshot_format_test.cc
+    )
+    set_target_properties(topology_snapshot_format_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as
+    # radix_partition_sort_test / serial_scan_test / index_set_test above.
+    target_link_libraries(topology_snapshot_format_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_snapshot_format_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySnapshotFormatTests
+        COMMAND $<TARGET_FILE:topology_snapshot_format_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
