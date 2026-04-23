@@ -218,7 +218,9 @@ public:
             YieldField{"featureDim", YieldType::INT,
                 "Feature vector dimension (0 if includeFeatures not set)"},
             YieldField{"numClasses", YieldType::INT,
-                "Number of distinct classification classes (0 if labelProperty not set)"}
+                "Number of distinct classification classes (0 if labelProperty not set)"},
+            YieldField{"topologySnapshotBytes", YieldType::INT,
+                "Total bytes of CSR topology sidecar files (0 if buildTopologySnapshot not set)"}
         };
     }
 

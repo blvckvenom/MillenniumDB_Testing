@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_set>
@@ -123,6 +125,12 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     bool include_label_indexes = true;
     GQL::IndexSet index_set = GQL::IndexSet::ALL;
 
+    // Spec #4-B T4.8 — opt-in CSR topology sidecar generation. Default
+    // false so existing projections remain byte-identical on disk and
+    // pre-Spec-#4-B callers see zero behavior change. The flag is parsed
+    // below from the config map; non-bool values raise QueryException.
+    bool build_topology_snapshot = false;
+
     // Keep config_holder alive so config_dict pointer remains valid
     std::unique_ptr<Dictionary> config_holder;
     DictionaryObject* config_dict = nullptr;
@@ -176,6 +184,25 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
                         "(true or false).");
                 }
                 include_label_indexes = Common::Conversions::unpack_bool(v);
+            }
+        }
+
+        // Spec #4-B T4.8 — `buildTopologySnapshot`. Parsed inline in the same
+        // style as `includeLabelIndexes`. Non-bool types are rejected up front
+        // with a clear QueryException so mis-typed values never silently fall
+        // through to the default.
+        {
+            bool found = false;
+            ObjectId v = get_value_from_dict(
+                config_dict, "buildTopologySnapshot", found);
+            if (found) {
+                auto t = GQL_OID::get_type(v);
+                if (t != GQL_OID::Type::BOOL) {
+                    throw QueryException(
+                        "Configuration value for 'buildTopologySnapshot' must "
+                        "be a boolean (true or false).");
+                }
+                build_topology_snapshot = Common::Conversions::unpack_bool(v);
             }
         }
     }
@@ -351,7 +378,8 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             label_property,
             split_property,
             include_label_indexes,
-            index_set
+            index_set,
+            build_topology_snapshot
         );
         builder.scan_nodes_by_labels(node_labels);
         builder.scan_edges_by_types(relationship_types);
@@ -377,6 +405,36 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // GNN extension yields (populated by builder during finalize)
     ctx.yield("featureDim", ctx.create_int(static_cast<int64_t>(stats.feature_dim)));
     ctx.yield("numClasses", ctx.create_int(static_cast<int64_t>(stats.num_classes)));
+
+    // Spec #4-B T4.8 — `topologySnapshotBytes`. Sum of the two CSR sidecar
+    // files actually produced by the builder. Reports 0 when the flag was
+    // false, when neither direction was eligible (IndexSet lacked both edge
+    // indexes), or when stat'ing the files fails for any reason (we never
+    // let stat errors surface to the client — the projection itself is the
+    // real build product).
+    int64_t snapshot_bytes = 0;
+    try {
+        std::string proj_dir = db_folder + "/projections/" + graph_name;
+        std::filesystem::path fwd = std::filesystem::path(proj_dir) / "topology_fwd.csr";
+        std::filesystem::path rev = std::filesystem::path(proj_dir) / "topology_rev.csr";
+        std::error_code ec;
+        if (std::filesystem::exists(fwd, ec)) {
+            auto sz = std::filesystem::file_size(fwd, ec);
+            if (!ec) {
+                snapshot_bytes += static_cast<int64_t>(sz);
+            }
+        }
+        if (std::filesystem::exists(rev, ec)) {
+            auto sz = std::filesystem::file_size(rev, ec);
+            if (!ec) {
+                snapshot_bytes += static_cast<int64_t>(sz);
+            }
+        }
+    } catch (...) {
+        // Defensive: any filesystem exception leaves snapshot_bytes at 0.
+        snapshot_bytes = 0;
+    }
+    ctx.yield("topologySnapshotBytes", ctx.create_int(snapshot_bytes));
 
     ctx.yield_row();
 }
