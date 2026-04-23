@@ -252,6 +252,7 @@ valores por tipo (forma MAP en `relationshipProjection`) sobrescriben estos.
 | `includeFeatures` | STRING | `''` | Nombre de una FeatureMatrix registrada (requiere ENABLE_GNN) |
 | `labelProperty` | STRING | `''` | Propiedad entera con el label de clasificación (requiere ENABLE_GNN) |
 | `splitProperty` | STRING | `''` | Propiedad con `"train"`/`"val"`/`"validation"`/`"test"` |
+| `indexSet` | STRING | `'ALL'` | Preset que controla qué índices B+Tree se materializan (ver "Index set selection" más abajo) |
 
 Ejemplo combinando varias claves:
 
@@ -1150,3 +1151,90 @@ sobre el dataset correspondiente.
 Los `projectMillis` variarán con el hardware; los counts (`nodeCount`,
 `relationshipCount`, `featureDim`, `numClasses`) deberían coincidir
 bit a bit con los mostrados en cada bloque `Resultado real`.
+
+---
+
+## Index set selection — `indexSet` (added 2026-04-23)
+
+Por defecto, `graph_project` materializa **10 índices B+Tree** (más hasta
+4 índices de propiedad cuando se configuran) para soportar cualquier
+patrón de query GQL. En cargas GNN solo se usan 2 de los 10, por lo
+que los otros 8 son overhead puro. El parámetro `indexSet` controla
+qué preset de índices se construye.
+
+### Presets
+
+| Preset | Índices materializados | Uso típico |
+|--------|------------------------|-----------|
+| `'ALL'` (default) | `nodes`, `node_label`, `label_node`, `from_to_edge`, `to_from_edge`, `edge_from_to`, `edge_direction`, `edge_n1_n2`, `edge_label`, `label_edge` | Queries GQL arbitrarias, analytics |
+| `'GNN_MINIMAL'` | `nodes`, `node_label`, `label_node`, `from_to_edge`, `to_from_edge` | GNN training, k-hop sampling |
+| `'READONLY_TRAVERSAL'` | `GNN_MINIMAL` + `edge_label`, `label_edge` | Traversal filtrado por label, sin lookup de edge-id |
+
+Los índices de propiedad (`node_key_value`, `key_value_node`,
+`edge_key_value`, `key_value_edge`) NO están controlados por `indexSet`:
+se construyen condicionalmente según las propiedades solicitadas en
+`nodeProjection`/`relationshipProjection` — independientes del preset.
+
+### Ejemplo
+
+```gql
+CALL graph_project('paper_gnn', 'Paper', 'CITES', {
+  orientation: 'NATURAL',
+  indexSet: 'GNN_MINIMAL',
+  includeFeatures: 'node_features',
+  labelProperty: 'label',
+  splitProperty: 'split'
+}) YIELD graphName, nodeCount, relationshipCount RETURN *;
+```
+
+### Query patterns por preset
+
+| Query pattern | ALL | READONLY | GNN_MINIMAL |
+|--------------|:---:|:--------:|:-----------:|
+| `MATCH (a)-[r]->(b)` (traversal directa) | ✓ | ✓ | ✓ |
+| `MATCH (a)-[r:TYPE]->(b)` (filtrada por label) | ✓ | ✓ | ✗ |
+| `MATCH (a)-[r]->(b) WHERE id(r) = X` (lookup por edge-id) | ✓ | ✗ | ✗ |
+| `MATCH (a)-[r]-(b)` (UNDIRECTED explícito) | ✓ | ✗ | ✗ |
+| GNN `gnn_offline_sample` + `gnn_train` | ✓ | ✓ | ✓ |
+| Node label access (`n.label`) | ✓ | ✓ | ✓ |
+
+Cuando se intenta una query que necesita un índice no materializado,
+MillenniumDB eleva una `QueryException` clara indicando qué índice falta
+y qué preset lo incluye. Por ejemplo, sobre una proyección `GNN_MINIMAL`:
+
+```
+QueryException: Cannot execute query - index 'edge_from_to' is not
+materialized for projection 'paper_gnn' (indexSet='GNN_MINIMAL').
+To enable this query, rebuild the projection with indexSet='ALL'.
+```
+
+### Reducciones empíricas (ogbn-products, 62 M aristas)
+
+| Preset | Disco | Wall clock | Reducción disco | Reducción wall-clock |
+|--------|------:|-----------:|:---------------:|:--------------------:|
+| ALL | 7.24 GB | 493 s | (baseline) | (baseline) |
+| GNN_MINIMAL | 2.95 GB | 213 s | **-61%** | **-57%** |
+| READONLY_TRAVERSAL | 4.86 GB | 281 s | -36% | -43% |
+
+Medido bajo `MDB_PROJECTION_SERIAL_SCAN=1 MDB_PROJECTION_SORTER=radix`.
+Los números escalan proporcionalmente a grafos más grandes como
+papers100M (con tope asintótico al 5/9 de índices eliminados).
+
+### Cuándo elegir cada preset
+
+- **ALL**: default razonable para proyecciones multi-uso o cuando no
+  se conoce a priori la carga futura.
+- **GNN_MINIMAL**: el 95% de las cargas GNN (sampling, training,
+  inferencia batch). Si en el futuro necesitas otro patrón de query,
+  reconstruyes la proyección con un preset más amplio.
+- **READONLY_TRAVERSAL**: proyecciones de lectura con queries
+  label-filtradas (e.g. `MATCH (n:Paper)-[:CITES]->(m)`) que NO requieren
+  lookup por edge-id.
+
+### Cambiar de preset
+
+Los presets son fijos al momento de creación; están persistidos en
+la metadata de la proyección (catalog v1.4). Para cambiar el preset,
+`drop_projection` y recrea con el nuevo valor. Las proyecciones
+pre-Spec-#3 (catalog v1.3) se leen como si fueran `ALL` para preservar
+compatibilidad total hacia atrás.
