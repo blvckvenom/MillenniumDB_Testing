@@ -19,6 +19,7 @@
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/projection/edge_filter.h"
 #include "graph_models/gql/projection/external_edge_sort.h"
+#include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/streaming_aggregator.h"
@@ -145,7 +146,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     const std::string& include_features,
     const std::string& label_property,
     const std::string& split_property,
-    bool include_label_indexes
+    bool include_label_indexes,
+    IndexSet index_set
 )
     : projection_name(projection_name_)
     , db_folder(db_folder_)
@@ -160,6 +162,7 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     , label_property_(label_property)
     , split_property_(split_property)
     , include_label_indexes_(include_label_indexes)
+    , index_set_(index_set)
     , per_type_orientations(type_orientations)
     , per_type_aggregations(type_aggregations)
     , per_type_agg_properties(type_agg_properties)
@@ -271,6 +274,10 @@ NativeProjectionBuilder::NativeProjectionBuilder(
         }
     }
 #endif
+}
+
+IndexSet NativeProjectionBuilder::get_index_set() const noexcept {
+    return index_set_;
 }
 
 // ============================================================================

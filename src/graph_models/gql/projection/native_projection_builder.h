@@ -15,6 +15,8 @@
 #include "graph_models/object_id.h"
 #include "query/procedure/builtin/project_procedure.h"  // For Orientation enum
 
+namespace GQL { enum class IndexSet : uint8_t; }  // fwd: defined in index_set.h
+
 #ifdef ENABLE_GNN
 #include "gnn/storage/row_mapping.h"
 #endif
@@ -398,6 +400,12 @@ public:
      *        include_label_indexes=false will throw QueryException with a
      *        message suggesting re-creation.
      *        See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md §3.A.
+     * @param index_set User-selected preset controlling which B+Tree indexes
+     *        will be materialized at build time (Spec #3). Defaults to
+     *        IndexSet::ALL which preserves prior behavior. The value is
+     *        stored on the builder for later consumption by T3.6 (catalog
+     *        serialization) and T3.7/T3.8 (build-phase gating). Does NOT
+     *        yet affect the indexes produced by this constructor.
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -415,7 +423,8 @@ public:
         const std::string& include_features = "",
         const std::string& label_property = "",
         const std::string& split_property = "",
-        bool include_label_indexes = true
+        bool include_label_indexes = true,
+        IndexSet index_set = static_cast<IndexSet>(0)  // IndexSet::ALL (fwd-declared)
     );
 
     ~NativeProjectionBuilder();
@@ -448,6 +457,18 @@ public:
      * @brief Gets current statistics (for progress tracking).
      */
     const Statistics& get_statistics() const { return stats; }
+
+    /**
+     * @brief Returns the IndexSet preset stored on the builder (Spec #3 T3.5).
+     *
+     * Reflects the value wired in by graph_project's `indexSet` config key
+     * (or IndexSet::ALL when the key is absent / the legacy positional
+     * constructor is used). Exposed for testability of T3.4 parsing; the
+     * build pipeline itself does not yet consume this value (that work lands
+     * in T3.7 + T3.8). Defined out-of-line in the .cc so this header can
+     * keep IndexSet as a forward declaration.
+     */
+    IndexSet get_index_set() const noexcept;
 
 private:
     /**
@@ -596,6 +617,13 @@ private:
     // Kept as a builder member so the decision propagates to features
     // initialization in ctor body without re-reading the constructor arg.
     bool include_label_indexes_ = true;
+
+    // Spec #3 T3.5: user-selected index preset. Stored here so later tasks
+    // (T3.6 catalog serialization, T3.7 + T3.8 build-phase gating) can
+    // consume it without re-plumbing the constructor. Default is ALL; the
+    // actual default-initialization lives in the ctor to keep the
+    // forward-declared enum viable as a class member.
+    IndexSet index_set_;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
     std::unordered_map<std::string, Orientation> per_type_orientations;

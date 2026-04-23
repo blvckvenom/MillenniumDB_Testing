@@ -10,6 +10,7 @@
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/gql_object_id.h"
+#include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "query/exceptions.h"
@@ -120,6 +121,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // Default true preserves Neo4j-GDS parity and existing behavior. See
     // analysis doc §3.A for the rationale and safety analysis.
     bool include_label_indexes = true;
+    GQL::IndexSet index_set = GQL::IndexSet::ALL;
 
     // Keep config_holder alive so config_dict pointer remains valid
     std::unique_ptr<Dictionary> config_holder;
@@ -150,6 +152,15 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         include_features = get_string_from_dict(config_dict, "includeFeatures", "");
         label_property   = get_string_from_dict(config_dict, "labelProperty", "");
         split_property   = get_string_from_dict(config_dict, "splitProperty", "");
+
+        // Spec #3: user-selectable index set preset. Defaults to "ALL" which
+        // preserves the pre-Spec-#3 behavior of materializing every index.
+        // Invalid values raise QueryException from parse_index_set().
+        {
+            std::string index_set_str =
+                get_string_from_dict(config_dict, "indexSet", "ALL");
+            index_set = GQL::parse_index_set(index_set_str);
+        }
 
         // Disk-cost opt-out. The key is parsed inline because it is the only
         // boolean option currently supported by graph_project() and adding a
@@ -339,7 +350,8 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             include_features,
             label_property,
             split_property,
-            include_label_indexes
+            include_label_indexes,
+            index_set
         );
         builder.scan_nodes_by_labels(node_labels);
         builder.scan_edges_by_types(relationship_types);
