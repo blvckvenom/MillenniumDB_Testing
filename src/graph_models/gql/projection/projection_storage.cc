@@ -13,6 +13,7 @@
 #endif
 
 #include "external_record_sort.h"
+#include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
 #include "projection_catalog.h"
@@ -789,6 +790,12 @@ void ProjectionStorage::save_catalog() {
     for (const auto& [name, id] : edge_keys2id_) {
         catalog.add_edge_key(name, id);
     }
+
+    // Persist the v1.4 IndexSet preset. The default ordinal (0 = ALL) is set
+    // both here and on the catalog field, so a builder that never sets the
+    // preset still produces a well-formed v1.4 catalog equivalent to the
+    // pre-Spec #3 "everything materialized" behavior.
+    catalog.index_set = requested_index_set;
 
     // Save to disk
     catalog.save();

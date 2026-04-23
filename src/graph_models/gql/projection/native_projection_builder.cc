@@ -219,6 +219,12 @@ NativeProjectionBuilder::NativeProjectionBuilder(
         storage->requested_edge_properties = std::move(req_edges);
     }
 
+    // Surface the IndexSet preset so ProjectionStorage can persist it in the
+    // v1.4 catalog. T3.6 is the serialization-only half; T3.9 will consume
+    // the persisted value to raise descriptive errors when a query needs an
+    // index that wasn't materialized (e.g., EDGE_LABEL under GNN_MINIMAL).
+    storage->requested_index_set = index_set_;
+
     // Initialize native scanner with main graph indexes
     // Include edge_from_to and edge_n1_n2 for O(log n) edge endpoint lookup
     scanner = std::make_unique<NativeScanner>(

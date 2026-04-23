@@ -9,6 +9,12 @@
 
 namespace GQL {
 
+// Forward-declared to avoid pulling in native_projection_builder.h (and its
+// transitive dependencies) through every catalog consumer. The full enum is
+// defined in graph_models/gql/projection/index_set.h; projection_catalog.cc
+// includes it directly. The underlying type must match the real definition.
+enum class IndexSet : uint8_t;
+
 /**
  * @brief Persistent metadata catalog for graph projections.
  *
@@ -36,6 +42,7 @@ namespace GQL {
  * | 1.1 | Added optional labels/properties support |
  * | 1.2 | Added property key mappings (index-based, DEPRECATED) |
  * | 1.3 | Fixed key mappings to persist actual IDs (not indices) |
+ * | 1.4 | Added IndexSet preset byte (Spec #3 T3.6) |
  *
  * @see ProjectionStorage for the actual index storage
  * @see ProjectionManager for projection lifecycle management
@@ -45,7 +52,7 @@ public:
     /// @name Format Constants
     /// @{
     static constexpr uint8_t MAJOR_VERSION = 1;    ///< Catalog format major version
-    static constexpr uint8_t MINOR_VERSION = 3;    ///< Minor version (1.3 fixes key ID persistence)
+    static constexpr uint8_t MINOR_VERSION = 4;    ///< Minor version (1.4 adds IndexSet preset byte)
     static constexpr uint8_t magic_number[] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};  ///< File type identifier
     static constexpr uint8_t MODEL_ID = 255;       ///< Special ID distinguishing from GQL/RDF catalogs
     /// @}
@@ -146,6 +153,16 @@ public:
     /// @{
     uint64_t distinct_node_labels = 0;  ///< Number of unique node labels
     uint64_t distinct_edge_labels = 0;  ///< Number of unique edge labels
+    /// @}
+
+    /// @name Index Materialization (v1.4+)
+    /// @brief Preset chosen at build time controlling which B+Tree indexes
+    /// were materialized. Consumed by the query layer (T3.9) to raise a
+    /// descriptive error when a query requires an index that wasn't built.
+    /// For v1.3 and earlier catalogs, the reader defaults this to IndexSet::ALL
+    /// (the historical behavior before Spec #3).
+    /// @{
+    IndexSet index_set = static_cast<IndexSet>(0);  ///< IndexSet::ALL (fwd-declared)
     /// @}
 
     /// @name Debug Information

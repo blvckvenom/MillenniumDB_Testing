@@ -1,6 +1,8 @@
 #include <iostream>
 #include <filesystem>
+#include <fstream>
 
+#include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
@@ -235,6 +237,164 @@ int main() {
             }
             std::cout << " OK" << std::endl;
         } // storage and catalog destruct here, before drop
+
+        // ================================================================
+        // Catalog v1.4 IndexSet persistence tests (Spec #3 T3.6)
+        // ================================================================
+        // These guard the round-trip of the new IndexSet byte appended to
+        // the catalog in v1.4, and the backwards-compat path for v1.3
+        // catalogs (which must default to IndexSet::ALL).
+
+        // Each sub-test uses its own throwaway directory so a prior save
+        // doesn't bleed its catalog bytes into the next round-trip probe.
+        auto make_tmp_proj_dir = [](const std::string& tag) {
+            auto base = std::filesystem::temp_directory_path()
+                      / ("mdb_t3_6_" + tag);
+            std::filesystem::remove_all(base);
+            std::filesystem::create_directories(base);
+            return base.string();
+        };
+
+        // Test 15: CatalogV4RoundtripAll — default ALL round-trips as ALL
+        std::cout << "Test 15: CatalogV4RoundtripAll...";
+        {
+            std::string dir = make_tmp_proj_dir("v4_all");
+            {
+                GQL::ProjectionCatalog cat(dir);
+                cat.projection_name = "t_all";
+                cat.index_set = GQL::IndexSet::ALL;
+                cat.save();
+            }
+            GQL::ProjectionCatalog read_back(dir);
+            // Constructor loads if file exists.
+            if (read_back.index_set != GQL::IndexSet::ALL) {
+                std::cerr << "FAIL Test 15: expected IndexSet::ALL" << std::endl;
+                return 1;
+            }
+            std::filesystem::remove_all(dir);
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 16: CatalogV4RoundtripGnnMinimal — GNN_MINIMAL round-trips
+        std::cout << "Test 16: CatalogV4RoundtripGnnMinimal...";
+        {
+            std::string dir = make_tmp_proj_dir("v4_gnn_min");
+            {
+                GQL::ProjectionCatalog cat(dir);
+                cat.projection_name = "t_gnn_min";
+                cat.index_set = GQL::IndexSet::GNN_MINIMAL;
+                cat.save();
+            }
+            GQL::ProjectionCatalog read_back(dir);
+            if (read_back.index_set != GQL::IndexSet::GNN_MINIMAL) {
+                std::cerr << "FAIL Test 16: expected IndexSet::GNN_MINIMAL got ordinal "
+                          << static_cast<int>(read_back.index_set) << std::endl;
+                return 1;
+            }
+            std::filesystem::remove_all(dir);
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 17: CatalogV4RoundtripReadonlyTraversal — READONLY_TRAVERSAL
+        std::cout << "Test 17: CatalogV4RoundtripReadonlyTraversal...";
+        {
+            std::string dir = make_tmp_proj_dir("v4_readonly");
+            {
+                GQL::ProjectionCatalog cat(dir);
+                cat.projection_name = "t_readonly";
+                cat.index_set = GQL::IndexSet::READONLY_TRAVERSAL;
+                cat.save();
+            }
+            GQL::ProjectionCatalog read_back(dir);
+            if (read_back.index_set != GQL::IndexSet::READONLY_TRAVERSAL) {
+                std::cerr << "FAIL Test 17: expected IndexSet::READONLY_TRAVERSAL got ordinal "
+                          << static_cast<int>(read_back.index_set) << std::endl;
+                return 1;
+            }
+            std::filesystem::remove_all(dir);
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 18: CatalogV3ReadAsAll — hand-crafted v1.3 byte buffer reads
+        // as IndexSet::ALL. This is the core backwards-compat guarantee: a
+        // catalog whose minor version byte is 3 must never attempt to read
+        // an IndexSet byte that isn't there, and must default to ALL.
+        std::cout << "Test 18: CatalogV3ReadAsAll...";
+        {
+            std::string dir = make_tmp_proj_dir("v3_compat");
+
+            // Synthesize a minimal v1.3 catalog by hand. We do this by first
+            // saving a v1.4 catalog, then rewriting its version byte to 3
+            // and truncating the trailing IndexSet byte. This is more robust
+            // than hand-constructing the full binary layout (which depends
+            // on the full field list) and still exercises the code path we
+            // care about: version==3 ⇒ skip IndexSet read ⇒ default ALL.
+            {
+                GQL::ProjectionCatalog cat(dir);
+                cat.projection_name = "t_v3_compat";
+                cat.index_set = GQL::IndexSet::GNN_MINIMAL;  // would be wrong if read
+                cat.save();
+            }
+            auto catalog_path = std::filesystem::path(dir) / "catalog.dat";
+            auto total_size = std::filesystem::file_size(catalog_path);
+            // Truncate the trailing IndexSet byte (1 byte at end of v1.4).
+            std::filesystem::resize_file(catalog_path, total_size - 1);
+            // Rewrite minor version byte from 4 to 3 (at offset 12:
+            // 6 magic + 3 mdb_ver + 1 model_id + 1 major_ver).
+            {
+                std::fstream f(catalog_path, std::ios::in | std::ios::out
+                                           | std::ios::binary);
+                f.seekp(12);
+                char three = 3;
+                f.write(&three, 1);
+                f.close();
+            }
+
+            GQL::ProjectionCatalog read_back(dir);
+            if (read_back.index_set != GQL::IndexSet::ALL) {
+                std::cerr << "FAIL Test 18: v3 catalog must default to IndexSet::ALL, got "
+                          << static_cast<int>(read_back.index_set) << std::endl;
+                return 1;
+            }
+            std::filesystem::remove_all(dir);
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 19: CatalogV4TruncatedAtIndexSetByte — v1.4 header but the
+        // trailing IndexSet byte is missing. Expected behavior: read_uint8
+        // hits EOF and throws std::runtime_error("Error reading uint8..."),
+        // which the ProjectionCatalog constructor propagates out. This test
+        // pins that contract — graceful degradation (defaulting silently)
+        // would hide corrupt catalogs, so the read path should fail loudly.
+        std::cout << "Test 19: CatalogV4TruncatedAtIndexSetByte...";
+        {
+            std::string dir = make_tmp_proj_dir("v4_trunc");
+            {
+                GQL::ProjectionCatalog cat(dir);
+                cat.projection_name = "t_v4_trunc";
+                cat.index_set = GQL::IndexSet::GNN_MINIMAL;
+                cat.save();
+            }
+            auto catalog_path = std::filesystem::path(dir) / "catalog.dat";
+            auto total_size = std::filesystem::file_size(catalog_path);
+            // Drop the last byte (the v1.4 IndexSet byte) WITHOUT downgrading
+            // the version. Reader should throw when it tries to read past EOF.
+            std::filesystem::resize_file(catalog_path, total_size - 1);
+
+            bool threw = false;
+            try {
+                GQL::ProjectionCatalog read_back(dir);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            if (!threw) {
+                std::cerr << "FAIL Test 19: expected exception on truncated v4 catalog"
+                          << std::endl;
+                return 1;
+            }
+            std::filesystem::remove_all(dir);
+        }
+        std::cout << " OK" << std::endl;
 
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";

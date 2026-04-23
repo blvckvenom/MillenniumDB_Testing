@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <stdexcept>
 
+#include "graph_models/gql/projection/index_set.h"
+
 namespace fs = std::filesystem;
 
 namespace GQL {
@@ -139,6 +141,20 @@ void ProjectionCatalog::load() {
         }
     }
 
+    // v1.4 field: IndexSet preset byte. For v1.3 and earlier catalogs we
+    // default to IndexSet::ALL (full materialization, the behavior shipped
+    // before Spec #3). Writing this AFTER the key mappings keeps the v1.4
+    // format a strict append to v1.3.
+    if (minor_ver >= 4) {
+        uint8_t raw = read_uint8(file);
+        // We intentionally do NOT validate the byte here — project_index_mask_for()
+        // in index_set.h handles the "out-of-range" case with an assert in debug
+        // and IndexSet::NONE mask in release, which is the documented drift path.
+        index_set = static_cast<IndexSet>(raw);
+    } else {
+        index_set = IndexSet::ALL;
+    }
+
     file.close();
 }
 
@@ -208,6 +224,12 @@ void ProjectionCatalog::save() {
         write_uint64(file, id);
         write_string(file, name);
     }
+
+    // Write v1.4 field: IndexSet preset byte. Must stay after v1.3 key
+    // mappings so v1.3 readers don't attempt to interpret this byte as a
+    // uint32 count. v1.3 readers stop reading after the edge key mappings
+    // loop, which is why appending here preserves read-side compatibility.
+    write_uint8(file, static_cast<uint8_t>(index_set));
 
     // Ensure data is flushed to OS buffer before close
     file.flush();

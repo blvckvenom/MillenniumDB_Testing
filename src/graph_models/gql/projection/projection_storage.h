@@ -28,6 +28,10 @@ class ProjectionCatalog;
 // (which depends on ProjectionStorage).
 enum class ProjectionIndex : uint32_t;
 
+// Forward-declared; full definition in graph_models/gql/projection/index_set.h.
+// Set on ProjectionStorage before finalize, then persisted via save_catalog().
+enum class IndexSet : uint8_t;
+
 /**
  * @brief Data structure representing an edge in a graph projection.
  *
@@ -582,6 +586,15 @@ public:
     /// @{
     std::vector<std::string> requested_node_properties;
     std::vector<std::string> requested_edge_properties;
+    /// @brief IndexSet preset picked at build time. Persisted in catalog v1.4
+    /// so the reader knows which B+Tree indexes were materialized. Default is
+    /// IndexSet::ALL (ordinal 0); set by NativeProjectionBuilder before
+    /// finalize. Stored here rather than in Features because Features only
+    /// covers the four optional label/property index pairs, while IndexSet
+    /// also gates required indexes like NODES or FROM_TO_EDGE.
+    /// @}
+    /// @{
+    IndexSet requested_index_set = static_cast<IndexSet>(0);
     /// @}
 
 private:
