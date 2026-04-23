@@ -597,6 +597,14 @@ public:
     IndexSet requested_index_set = static_cast<IndexSet>(0);
     /// @}
 
+    /// @brief Returns the IndexSet preset this projection was built under.
+    ///
+    /// Populated at build time by NativeProjectionBuilder and restored at
+    /// read time from the catalog via ProjectionStorage::open(). Consumed
+    /// by the query-layer error diagnostic (Spec #3 T3.9) to report the
+    /// active preset when a missing index is accessed.
+    IndexSet get_index_set() const { return requested_index_set; }
+
 private:
     /// @name Internal Batch Operations
     /// @{

@@ -439,6 +439,45 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# Missing-index query-layer diagnostic unit tests (Spec #3 T3.9)
+# ============================================================================
+# Registers projection_missing_index_test when GTest is available and the
+# corresponding source exists. Validates the `projection_index_name` /
+# `minimum_preset_for` helpers added to index_set.{h,cc} in T3.9, plus the
+# format of the QueryException message produced by GQLModel getters when a
+# query hits an index elided by the active IndexSet preset.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_missing_index_test.cc")
+    add_executable(projection_missing_index_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_missing_index_test.cc
+    )
+    set_target_properties(projection_missing_index_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(projection_missing_index_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_missing_index_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME ProjectionMissingIndexTests
+        COMMAND $<TARGET_FILE:projection_missing_index_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})

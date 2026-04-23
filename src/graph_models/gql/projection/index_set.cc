@@ -72,4 +72,62 @@ const char* index_set_name(IndexSet preset) noexcept {
     return "UNKNOWN";
 }
 
+const char* projection_index_name(ProjectionIndex which) noexcept {
+    // Names intentionally mirror the .leaf file naming from
+    // ProjectionStorage::open_all_bplustree_readers_() so error
+    // messages refer to the exact on-disk artifact the caller would
+    // expect to find in `<proj_dir>/<name>.leaf`.
+    switch (which) {
+    case ProjectionIndex::NODES:          return "nodes";
+    case ProjectionIndex::NODE_LABEL:     return "node_label";
+    case ProjectionIndex::LABEL_NODE:     return "label_node";
+    case ProjectionIndex::NODE_KEY_VALUE: return "node_key_value";
+    case ProjectionIndex::KEY_VALUE_NODE: return "key_value_node";
+    case ProjectionIndex::FROM_TO_EDGE:   return "from_to_edge";
+    case ProjectionIndex::TO_FROM_EDGE:   return "to_from_edge";
+    case ProjectionIndex::EDGE_DIRECTION: return "edge_direction";
+    case ProjectionIndex::EDGE_FROM_TO:   return "edge_from_to";
+    case ProjectionIndex::EDGE_N1_N2:     return "edge_n1_n2";
+    case ProjectionIndex::EDGE_LABEL:     return "edge_label";
+    case ProjectionIndex::LABEL_EDGE:     return "label_edge";
+    case ProjectionIndex::EDGE_KEY_VALUE: return "edge_key_value";
+    case ProjectionIndex::KEY_VALUE_EDGE: return "key_value_edge";
+    // Composite masks have no .leaf file → not mappable to a single name.
+    case ProjectionIndex::NONE:
+    case ProjectionIndex::ALL_NODE:
+    case ProjectionIndex::ALL_EDGE:
+    case ProjectionIndex::ALL:
+        break;
+    }
+    assert(false && "projection_index_name: must be a single-bit ProjectionIndex");
+    return "UNKNOWN";
+}
+
+IndexSet minimum_preset_for(ProjectionIndex which) noexcept {
+    // Walk the presets from most-restrictive to least-restrictive and
+    // return the first one whose bitmask contains `which`. Ordering
+    // matches IndexSet enum numerics: 1 (GNN_MINIMAL) < 2 (READONLY_TRAVERSAL)
+    // < 0 (ALL), but ALL's ordinal 0 is historical (default preset); the
+    // hierarchy we actually want for "minimum" is
+    //   GNN_MINIMAL (5 bits) ⊂ READONLY_TRAVERSAL (7 bits) ⊂ ALL (14 bits).
+    const ProjectionIndex gnn = project_index_mask_for(IndexSet::GNN_MINIMAL);
+    if (has_flag(gnn, which)) {
+        return IndexSet::GNN_MINIMAL;
+    }
+    const ProjectionIndex ro = project_index_mask_for(IndexSet::READONLY_TRAVERSAL);
+    if (has_flag(ro, which)) {
+        return IndexSet::READONLY_TRAVERSAL;
+    }
+    const ProjectionIndex all = project_index_mask_for(IndexSet::ALL);
+    if (has_flag(all, which)) {
+        return IndexSet::ALL;
+    }
+    // Not a single-bit value contained in any preset — out-of-range cast or
+    // composite mask. ALL is a safe conservative fallback (still correct, and
+    // never hides the bug in a way that would silently materialize *more*
+    // indexes than any preset provides). Assert in debug.
+    assert(false && "minimum_preset_for: value not contained in any IndexSet preset");
+    return IndexSet::ALL;
+}
+
 } // namespace GQL

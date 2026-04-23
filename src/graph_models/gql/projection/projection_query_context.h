@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
@@ -53,6 +54,13 @@ class ProjectionQueryContext {
 public:
     std::string projection_name;                   ///< Name of active projection
     std::unique_ptr<ProjectionStorage> storage;    ///< Owned storage instance
+
+    /// @brief IndexSet preset this projection was built under.
+    ///
+    /// Cached at construction time from the opened storage / catalog. Consumed
+    /// by GQLModel::get_*() getters (Spec #3 T3.9) to name the active preset
+    /// when diagnosing a missing-index access.
+    IndexSet index_set = static_cast<IndexSet>(0);  // IndexSet::ALL default
 
     /// @name Required Index Pointers
     /// @brief Always non-null after successful construction.
@@ -133,6 +141,11 @@ public:
         ProjectionCatalog catalog(proj_dir);
         node_keys2id = catalog.node_keys2id;
         edge_keys2id = catalog.edge_keys2id;
+
+        // Cache IndexSet preset — consumed by GQLModel getters (Spec #3 T3.9).
+        // Prefer the storage's value (restored from catalog by open()); fall
+        // back to a fresh catalog read if storage couldn't open the catalog.
+        index_set = storage->get_index_set();
     }
 
     ~ProjectionQueryContext() = default;

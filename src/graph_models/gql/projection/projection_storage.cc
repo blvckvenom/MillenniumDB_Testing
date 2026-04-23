@@ -166,6 +166,12 @@ void ProjectionStorage::open() {
         edge_count = catalog.edge_count;
         directed_edge_count = catalog.directed_edge_count;
         undirected_edge_count = catalog.undirected_edge_count;
+
+        // Restore IndexSet preset so the query-layer diagnostic (T3.9) can
+        // name the preset this projection was built under when a missing
+        // index is accessed. Older catalogs (pre-v1.4) default to ALL via
+        // ProjectionCatalog::load(), so this is safe for all versions.
+        requested_index_set = catalog.index_set;
     }
 
     // Open required indexes (always present)

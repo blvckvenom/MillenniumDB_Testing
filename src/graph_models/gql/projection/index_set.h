@@ -76,4 +76,44 @@ IndexSet parse_index_set(const std::string& s);
  */
 const char* index_set_name(IndexSet preset) noexcept;
 
+/**
+ * @brief Returns the canonical string name for a single-bit ProjectionIndex
+ *        value, matching the on-disk .leaf file naming (e.g. "edge_label"
+ *        for ProjectionIndex::EDGE_LABEL, "from_to_edge" for FROM_TO_EDGE).
+ *
+ * Used by the query-layer error diagnostic (Spec #3 T3.9) to name the
+ * missing index in QueryException messages. Only accepts single-bit
+ * values — composite masks (NONE, ALL_NODE, ALL_EDGE, ALL) return
+ * "UNKNOWN" because they cannot be mapped to a unique .leaf file.
+ *
+ * For out-of-range casts, asserts in debug builds and returns "UNKNOWN"
+ * in release.
+ */
+const char* projection_index_name(ProjectionIndex which) noexcept;
+
+/**
+ * @brief Returns the LOWEST (most restrictive) IndexSet preset whose
+ *        bitmask contains the given single-bit ProjectionIndex.
+ *
+ * Used by T3.9's query-layer diagnostic to suggest the minimum rebuild
+ * required to unblock a query. For example:
+ *   EDGE_LABEL, LABEL_EDGE              -> READONLY_TRAVERSAL
+ *   NODES, FROM_TO_EDGE, TO_FROM_EDGE,
+ *   NODE_LABEL, LABEL_NODE              -> GNN_MINIMAL
+ *   EDGE_DIRECTION, EDGE_FROM_TO,
+ *   EDGE_N1_N2                          -> ALL (no lower preset contains)
+ *   NODE_KEY_VALUE, KEY_VALUE_NODE,
+ *   EDGE_KEY_VALUE, KEY_VALUE_EDGE      -> ALL (property indexes are
+ *                                               gated by Features flags,
+ *                                               not IndexSet — callers
+ *                                               still need ALL + the
+ *                                               appropriate includeProperties
+ *                                               config; see Spec #3 §3.4)
+ *
+ * For composite masks or out-of-range casts, asserts in debug builds and
+ * returns IndexSet::ALL in release (safe fallback: ALL always contains
+ * every single-bit index so is a correct — if conservative — suggestion).
+ */
+IndexSet minimum_preset_for(ProjectionIndex which) noexcept;
+
 } // namespace GQL
