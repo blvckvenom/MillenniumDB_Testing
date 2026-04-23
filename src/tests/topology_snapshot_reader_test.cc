@@ -492,13 +492,14 @@ TEST_F(TopologySnapshotReaderTest, ConcurrentReadersNoCorruption) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 13 — The T4.5 verify_source_sha256() stub returns true unconditionally.
-// Pin that so that T4.10 (which replaces this body) has an observable
-// transition point: this test will need to be updated / moved to the real
-// SHA-256 suite when T4.10 lands.
+// Test 13 — Producer/consumer SHA-256 invariant (T4.10).
+// The writer stamps SHA-256(source.leaf) into the header; the reader
+// recomputes the same digest and must accept it. This is the matching
+// half of the staleness gate, paired with the two negative tests below.
 // ---------------------------------------------------------------------------
-TEST_F(TopologySnapshotReaderTest, VerifySourceSha256StubReturnsTrue) {
-    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "stub-payload");
+TEST_F(TopologySnapshotReaderTest, VerifySourceSha256MatchesHeader) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "sha-match-payload");
 
     TopologySnapshotWriter writer(
         dir_, TopologySnapshotWriter::Direction::FORWARD,
@@ -512,10 +513,87 @@ TEST_F(TopologySnapshotReaderTest, VerifySourceSha256StubReturnsTrue) {
         dir_, TopologySnapshotReader::Direction::FORWARD);
     ASSERT_TRUE(reader.has_data());
 
-    // Stub: returns true regardless of the path argument, including paths
-    // that don't exist. T4.10 replaces this with a real streaming hash.
+    // Matching content → matching hash.
     EXPECT_TRUE(reader.verify_source_sha256(dir_ / "from_to_edge.leaf"));
-    EXPECT_TRUE(reader.verify_source_sha256("/nonexistent/path.leaf"));
+
+    // Conservative failure modes: path absent or unreadable → false
+    // (treated as mismatch). No throw.
+    EXPECT_FALSE(reader.verify_source_sha256("/nonexistent/path.leaf"));
+}
+
+// ---------------------------------------------------------------------------
+// Test 13b — Mutating a single byte of the source `.leaf` after finalize
+// invalidates the embedded digest; the next open() falls back to B+Tree
+// (has_data()==false), matching the §3.4 fallback contract.
+// ---------------------------------------------------------------------------
+TEST_F(TopologySnapshotReaderTest, MutatedSourceLeafTriggersFallback) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "pristine-source-leaf-contents");
+
+    TopologySnapshotWriter writer(
+        dir_, TopologySnapshotWriter::Direction::FORWARD,
+        /*num_nodes=*/2,
+        /*degrees=*/{1, 1},
+        /*include_edge_ids=*/false);
+    writer.append_edge(oid(0), oid(1), ObjectId());
+    writer.append_edge(oid(1), oid(0), ObjectId());
+    writer.finalize();
+
+    // Baseline: the fresh sidecar + unmutated source open cleanly.
+    auto baseline = TopologySnapshotReader::open(
+        dir_, TopologySnapshotReader::Direction::FORWARD);
+    ASSERT_TRUE(baseline.has_data());
+
+    // Flip a single byte in the source .leaf. The CSR header still
+    // stores the *original* digest, so recomputation must diverge.
+    const auto source_path = dir_ / "from_to_edge.leaf";
+    {
+        std::fstream f(source_path,
+                       std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(f.good());
+        f.seekp(0, std::ios::beg);
+        char first = 0;
+        f.read(&first, 1);
+        first = static_cast<char>(first ^ 0xFF);
+        f.seekp(0, std::ios::beg);
+        f.write(&first, 1);
+        ASSERT_TRUE(f.good());
+    }
+
+    // New reader over the same (still-valid) .csr must now see a
+    // mismatched digest and fall back — has_data()==false.
+    auto after_mutation = TopologySnapshotReader::open(
+        dir_, TopologySnapshotReader::Direction::FORWARD);
+    EXPECT_FALSE(after_mutation.has_data());
+    EXPECT_EQ(after_mutation.num_nodes(), 0u);
+    EXPECT_EQ(after_mutation.num_edges(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Test 13c — Deleting the source `.leaf` means the reader cannot verify
+// the digest at all; conservative policy is fall back, not trust.
+// ---------------------------------------------------------------------------
+TEST_F(TopologySnapshotReaderTest, MissingSourceLeafTriggersFallback) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "will-be-deleted");
+
+    TopologySnapshotWriter writer(
+        dir_, TopologySnapshotWriter::Direction::FORWARD,
+        /*num_nodes=*/2,
+        /*degrees=*/{1, 1},
+        /*include_edge_ids=*/false);
+    writer.append_edge(oid(0), oid(1), ObjectId());
+    writer.append_edge(oid(1), oid(0), ObjectId());
+    writer.finalize();
+
+    // Remove the source .leaf — the sidecar now has no verifiable origin.
+    std::error_code ec;
+    std::filesystem::remove(dir_ / "from_to_edge.leaf", ec);
+    ASSERT_FALSE(ec);
+
+    auto reader = TopologySnapshotReader::open(
+        dir_, TopologySnapshotReader::Direction::FORWARD);
+    EXPECT_FALSE(reader.has_data());
 }
 
 // ---------------------------------------------------------------------------

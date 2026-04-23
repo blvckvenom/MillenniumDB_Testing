@@ -21,8 +21,9 @@
 // throw / no return-code on open.
 //
 // Staleness (SHA-256 of the source `.leaf`) is validated separately by
-// `verify_source_sha256()` — in T4.5 this stub returns true. The real
-// streaming SHA-256 comparison lands in T4.10.
+// `verify_source_sha256()`. As of T4.10, `open()` runs the verification
+// after structural validation and collapses a mismatch into the same
+// has_data()==false fallback path used for the "sidecar absent" case.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
 //                 §3.4 (fallback-first arch), §4.3 (C++ surface),
@@ -125,11 +126,13 @@ public:
     const TopologySnapshotHeader& header() const noexcept { return header_; }
 
     /// Staleness check vs the source `.leaf` file.
-    /// T4.5 STUB — returns `true` unconditionally. T4.10 replaces this body
-    /// with a streaming SHA-256 over `source_leaf_path` compared against the
-    /// header's `source_sha256` field. The surface is stable so that the
-    /// reader can be wired into `TopologyAccessor` (T4.7) without waiting
-    /// for T4.10.
+    /// Streams SHA-256 over `source_leaf_path` with a 64 KiB buffer
+    /// (same chunking as the writer) and returns true iff the digest
+    /// matches `header().source_sha256`. Returns false when the reader
+    /// has no data, the source path is unreadable, or any OpenSSL step
+    /// fails — conservative: unverifiable → untrusted. `open()` invokes
+    /// this automatically and falls back on mismatch; callers only need
+    /// to use it directly for after-the-fact rehashing (e.g. tests).
     bool verify_source_sha256(const std::filesystem::path& source_leaf_path) const;
 
 private:

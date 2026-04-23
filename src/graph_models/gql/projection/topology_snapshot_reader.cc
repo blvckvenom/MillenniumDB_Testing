@@ -5,12 +5,17 @@
 #include <sys/stat.h>    // fstat
 #include <unistd.h>      // close
 
+#include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#include <openssl/evp.h>
 
 namespace GQL::Projection {
 
@@ -23,6 +28,69 @@ const char* output_basename_for(TopologySnapshotReader::Direction d) {
     case TopologySnapshotReader::Direction::REVERSE: return "topology_rev.csr";
     }
     return "topology_fwd.csr";  // unreachable; keeps compiler happy
+}
+
+// Source `.leaf` basename for each direction (§3.7). Mirrors the matching
+// helper in topology_snapshot_writer.cc so producer and consumer agree on
+// *which* file's bytes feed the SHA-256 — keeps the producer/consumer hash
+// chain symmetric.
+const char* source_basename_for(TopologySnapshotReader::Direction d) {
+    switch (d) {
+    case TopologySnapshotReader::Direction::FORWARD: return "from_to_edge.leaf";
+    case TopologySnapshotReader::Direction::REVERSE: return "to_from_edge.leaf";
+    }
+    return "from_to_edge.leaf";  // unreachable
+}
+
+// Stream SHA-256 over `path` using EVP with a 64 KiB buffer. Duplicated
+// from topology_snapshot_writer.cc rather than exported from that
+// translation unit — the writer header deliberately does not expose its
+// OpenSSL helpers, and duplicating ~35 lines here is cheaper than
+// widening the writer's public surface just for the reader.
+//
+// Returns true + fills `out` on success. Returns false on any I/O,
+// allocation, or digest-API failure — the caller treats that as a
+// mismatch (conservative: an unverifiable sidecar must not be trusted).
+bool compute_sha256_64k(const std::filesystem::path& path,
+                        std::array<uint8_t, 32>&     out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        return false;
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    // Same buffer size as topology_snapshot_writer.cc's sha256_of_file —
+    // producer and consumer hash over identical chunking so the digests
+    // are byte-identical for identical file contents.
+    constexpr std::size_t BUF = 64 * 1024;
+    std::array<char, BUF> buf{};
+    while (f.read(buf.data(), BUF) || f.gcount() > 0) {
+        if (EVP_DigestUpdate(ctx, buf.data(),
+                             static_cast<std::size_t>(f.gcount())) != 1) {
+            EVP_MD_CTX_free(ctx);
+            return false;
+        }
+    }
+    if (f.bad()) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    unsigned int len = 0;
+    if (EVP_DigestFinal_ex(ctx, out.data(), &len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+    EVP_MD_CTX_free(ctx);
+    return len == 32;
 }
 
 // Single-line diagnostic, keyed by the full path so log scrubbers can filter.
@@ -211,7 +279,8 @@ TopologySnapshotReader TopologySnapshotReader::open(
         }
     }
 
-    // All checks passed — commit to the reader.
+    // All structural checks passed — provisionally commit to the reader
+    // so verify_source_sha256() can see header_ and has_data_ = true.
     reader.header_    = header;
     reader.map_base_  = map_base;
     reader.file_size_ = file_size;
@@ -227,6 +296,23 @@ TopologySnapshotReader TopologySnapshotReader::open(
                         + sizeof(uint64_t) * M)
         : nullptr;
     reader.has_data_ = true;
+
+    // Step 9 — staleness gate (§3.3 / T4.10). Re-hash the source `.leaf`
+    // and compare against the digest the writer embedded in the header.
+    // On mismatch (or any I/O / OpenSSL failure) emit a one-line warning
+    // and fall back to B+Tree by wiping this reader's state, so the
+    // caller sees has_data() == false — identical to the "file absent"
+    // contract. Missing source file or unreadable source both collapse
+    // to "mismatch" via compute_sha256_64k() returning false.
+    const std::filesystem::path source_leaf_path =
+        projection_dir / source_basename_for(dir);
+    if (!reader.verify_source_sha256(source_leaf_path)) {
+        warn(path,
+             "source SHA-256 mismatch for " + source_leaf_path.string()
+             + ", falling back to B+Tree");
+        reader.release_resources_();
+        return reader;
+    }
     return reader;
 }
 
@@ -348,16 +434,25 @@ ConstU64Span TopologySnapshotReader::edge_ids(uint64_t node_idx) const {
 }
 
 // ---------------------------------------------------------------------------
-// verify_source_sha256 — T4.5 stub; T4.10 wires in the streaming SHA-256.
+// verify_source_sha256 — streaming SHA-256 staleness gate (§3.3, T4.10).
 // ---------------------------------------------------------------------------
+//
+// Returns true iff `source_leaf_path` hashes byte-for-byte to the digest
+// embedded in the CSR header at write time. Any failure mode (reader has
+// no data, source file absent, I/O error, OpenSSL context allocation)
+// returns false and is treated by callers as equivalent to a mismatch —
+// conservative by design: an unverifiable sidecar must not be trusted.
 
 bool TopologySnapshotReader::verify_source_sha256(
     const std::filesystem::path& source_leaf_path) const {
-    // Intentionally unused in T4.5 — T4.10 replaces this body with an
-    // EVP_DigestUpdate streaming pass over source_leaf_path, compared
-    // against header_.source_sha256.
-    (void)source_leaf_path;
-    return true;
+    if (!has_data_) {
+        return false;  // nothing to verify against
+    }
+    std::array<uint8_t, 32> actual{};
+    if (!compute_sha256_64k(source_leaf_path, actual)) {
+        return false;
+    }
+    return std::memcmp(actual.data(), header_.source_sha256, 32) == 0;
 }
 
 }  // namespace GQL::Projection
