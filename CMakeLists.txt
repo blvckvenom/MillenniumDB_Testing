@@ -393,6 +393,52 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# IndexSet unit tests (Spec #3 T3.3)
+# ============================================================================
+# Registers the index_set_test target when GTest is available and the
+# corresponding header exists. Mirrors the EXISTS-gated registration
+# precedent of radix_partition_sort_test / serial_scan_test so that the
+# test only wires in after its sources land.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/index_set.h")
+    add_executable(index_set_test
+        ${CMAKE_SOURCE_DIR}/src/tests/index_set_test.cc
+    )
+    set_target_properties(index_set_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as
+    # radix_partition_sort_test / serial_scan_test above.
+    target_link_libraries(index_set_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    # Match the ENABLE_GNN-conditional link done by the TEST_TARGETS foreach
+    # above — libmillenniumdb.a references vtables defined in mdb_gnn_core
+    # when ENABLE_GNN=ON, so this test target would fail to link otherwise.
+    if(ENABLE_GNN)
+        target_link_libraries(index_set_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME IndexSetTests
+        COMMAND $<TARGET_FILE:index_set_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
