@@ -562,6 +562,47 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# TopologySnapshot CSR reader unit tests (Spec #4-B T4.5)
+# ============================================================================
+# Same EXISTS-gated registration pattern as topology_snapshot_writer_test.
+# The reader depends on the T4.3 header plus the new .cc — gate on both.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot_reader.cc")
+    add_executable(topology_snapshot_reader_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_snapshot_reader_test.cc
+    )
+    set_target_properties(topology_snapshot_reader_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as the
+    # writer_test registration above.
+    target_link_libraries(topology_snapshot_reader_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_snapshot_reader_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySnapshotReaderTests
+        COMMAND $<TARGET_FILE:topology_snapshot_reader_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
