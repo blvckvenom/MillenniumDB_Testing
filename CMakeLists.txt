@@ -603,6 +603,42 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# NativeProjectionBuilder × TopologySnapshot integration test (Spec #4-B T4.6)
+# ============================================================================
+# EXISTS-gated so the target is only configured once the integration source
+# lands. Shares the GTest linking recipe with the other projection tests.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/native_projection_builder_topology_snapshot_test.cc")
+    add_executable(native_projection_builder_topology_snapshot_test
+        ${CMAKE_SOURCE_DIR}/src/tests/native_projection_builder_topology_snapshot_test.cc
+    )
+    set_target_properties(native_projection_builder_topology_snapshot_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(native_projection_builder_topology_snapshot_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(native_projection_builder_topology_snapshot_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME NativeProjectionBuilderTopologySnapshotTests
+        COMMAND $<TARGET_FILE:native_projection_builder_topology_snapshot_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})

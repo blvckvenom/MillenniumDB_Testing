@@ -23,6 +23,7 @@
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/streaming_aggregator.h"
+#include "graph_models/gql/projection/topology_snapshot_writer.h"
 #include "query/exceptions.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "system/string_manager.h"
@@ -147,7 +148,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     const std::string& label_property,
     const std::string& split_property,
     bool include_label_indexes,
-    IndexSet index_set
+    IndexSet index_set,
+    bool build_topology_snapshot
 )
     : projection_name(projection_name_)
     , db_folder(db_folder_)
@@ -163,6 +165,7 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     , split_property_(split_property)
     , include_label_indexes_(include_label_indexes)
     , index_set_(index_set)
+    , build_topology_snapshot_(build_topology_snapshot)
     , per_type_orientations(type_orientations)
     , per_type_aggregations(type_aggregations)
     , per_type_agg_properties(type_agg_properties)
@@ -948,6 +951,13 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
         }
     }
 #endif
+
+    // Spec #4-B T4.6: after the B+Tree .leaf / .dir files are fully written
+    // and fsync'd by storage->flush(), emit CSR sidecars when requested.
+    // build_topology_snapshots_() short-circuits when the opt-in flag is off
+    // and never throws (failures are logged and swallowed to keep the
+    // projection valid).
+    build_topology_snapshots_();
 
     // Refresh projection cache so new projection is immediately visible
     auto bench_meta_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
@@ -2371,3 +2381,224 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // is bypassed (its backing buffers are all empty after Phase A/B/C).
     storage->open_all_bplustree_readers_();
 }
+
+// ============================================================================
+// Spec #4-B T4.6 — CSR topology sidecar emission
+// ============================================================================
+//
+// build_topology_snapshots_() orchestrates per-direction emission gated by
+// the active IndexSet mask. Called from finalize() after storage->flush()
+// so the B+Tree `.leaf` / `.dir` files exist on disk and the BPT readers
+// held by ProjectionStorage point at them.
+//
+// Per-direction failures are logged and swallowed: the projection stays
+// valid, and the user can retry through the T4.9 post-hoc procedure.
+
+void NativeProjectionBuilder::build_topology_snapshots_() {
+    if (!build_topology_snapshot_) {
+        return;
+    }
+
+    const ProjectionIndex active_mask = project_index_mask_for(index_set_);
+    const bool fwd_ok = has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE);
+    const bool rev_ok = has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE);
+
+    if (!fwd_ok && !rev_ok) {
+        std::cerr << "[Projection] buildTopologySnapshot requested but IndexSet "
+                     "lacks both FROM_TO_EDGE and TO_FROM_EDGE — skipping sidecar "
+                     "generation for projection '" << projection_name << "'."
+                  << std::endl;
+        return;
+    }
+
+    if (fwd_ok) {
+        BPlusTree<3>* fwd_bpt = storage->get_from_to_edge_index();
+        if (fwd_bpt == nullptr) {
+            std::cerr << "[Projection] buildTopologySnapshot: from_to_edge B+Tree "
+                         "not open for projection '" << projection_name
+                      << "' — skipping topology_fwd.csr." << std::endl;
+        } else {
+            try {
+                build_one_topology_snapshot_(/*direction=*/0, fwd_bpt);
+            } catch (const std::exception& e) {
+                std::cerr << "[Projection] failed to build topology_fwd.csr for '"
+                          << projection_name << "': " << e.what() << std::endl;
+            }
+        }
+    } else {
+        std::cerr << "[Projection] buildTopologySnapshot: FROM_TO_EDGE not in "
+                     "active IndexSet — skipping topology_fwd.csr." << std::endl;
+    }
+
+    if (rev_ok) {
+        BPlusTree<3>* rev_bpt = storage->get_to_from_edge_index();
+        if (rev_bpt == nullptr) {
+            std::cerr << "[Projection] buildTopologySnapshot: to_from_edge B+Tree "
+                         "not open for projection '" << projection_name
+                      << "' — skipping topology_rev.csr." << std::endl;
+        } else {
+            try {
+                build_one_topology_snapshot_(/*direction=*/1, rev_bpt);
+            } catch (const std::exception& e) {
+                std::cerr << "[Projection] failed to build topology_rev.csr for '"
+                          << projection_name << "': " << e.what() << std::endl;
+            }
+        }
+    } else {
+        std::cerr << "[Projection] buildTopologySnapshot: TO_FROM_EDGE not in "
+                     "active IndexSet — skipping topology_rev.csr." << std::endl;
+    }
+}
+
+void NativeProjectionBuilder::build_one_topology_snapshot_(
+    int   direction,
+    void* edge_bpt_opaque)
+{
+    using Projection::TopologySnapshotWriter;
+
+    auto* edge_bpt = static_cast<BPlusTree<3>*>(edge_bpt_opaque);
+    if (edge_bpt == nullptr) {
+        throw std::runtime_error("null B+Tree passed to build_one_topology_snapshot_");
+    }
+
+    const TopologySnapshotWriter::Direction dir =
+        (direction == 0) ? TopologySnapshotWriter::Direction::FORWARD
+                         : TopologySnapshotWriter::Direction::REVERSE;
+
+    const uint64_t num_nodes = storage->get_node_count();
+    const std::filesystem::path proj_dir = storage->get_projection_dir();
+
+    // Pass 1: per-source degree histogram.
+    // The B+Tree key layout for both from_to_edge (src, dst, edge_id) and
+    // to_from_edge (dst, src, edge_id) places the node whose adjacency the
+    // CSR is keyed by at index 0, matching TopologySnapshotWriter's contract.
+    std::vector<uint64_t> degrees(num_nodes, 0);
+    bool interrupt = false;
+    Record<3> min_rec = {0, 0, 0};
+    Record<3> max_rec = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+
+    {
+        auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
+        const Record<3>* rec = nullptr;
+        while ((rec = iter.next()) != nullptr) {
+            uint64_t src_idx = (*rec)[0];
+            if (src_idx < num_nodes) {
+                ++degrees[src_idx];
+            }
+            // Out-of-range src is silently skipped: the B+Tree is the source
+            // of truth, but defensive lower-bound avoids a buffer overrun if
+            // node_count / tree are ever out of sync.
+        }
+    }
+
+    // Pass 2: stream edges in src-monotonic order into the writer. BptIter
+    // walks in key order, which for both directions starts with the key-0
+    // component ascending — the exact monotonicity contract append_edge()
+    // enforces.
+    TopologySnapshotWriter writer(
+        proj_dir,
+        dir,
+        num_nodes,
+        std::move(degrees),
+        /*include_edge_ids=*/true);
+
+    {
+        auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
+        const Record<3>* rec = nullptr;
+        while ((rec = iter.next()) != nullptr) {
+            writer.append_edge(
+                ObjectId{(*rec)[0]},
+                ObjectId{(*rec)[1]},
+                ObjectId{(*rec)[2]});
+        }
+    }
+
+    writer.finalize();
+}
+
+// ----------------------------------------------------------------------------
+// Test-only helper (Spec #4-B T4.6) — shares the BPT-scan + writer body of
+// build_one_topology_snapshot_ so the gtest exercises the real code path.
+// Deliberately surfaces exceptions (the production method swallows them to
+// keep the projection valid).
+// ----------------------------------------------------------------------------
+
+namespace GQL {
+namespace detail {
+
+namespace {
+
+void build_one_snapshot_for_test(
+    ProjectionStorage& storage,
+    Projection::TopologySnapshotWriter::Direction dir)
+{
+    using Projection::TopologySnapshotWriter;
+
+    BPlusTree<3>* edge_bpt = (dir == TopologySnapshotWriter::Direction::FORWARD)
+        ? storage.get_from_to_edge_index()
+        : storage.get_to_from_edge_index();
+
+    if (edge_bpt == nullptr) {
+        throw std::runtime_error(
+            "build_topology_snapshots_for_test: requested direction's "
+            "B+Tree index is not open on this ProjectionStorage");
+    }
+
+    const uint64_t num_nodes = storage.get_node_count();
+    const std::filesystem::path proj_dir = storage.get_projection_dir();
+
+    std::vector<uint64_t> degrees(num_nodes, 0);
+    bool interrupt = false;
+    Record<3> min_rec = {0, 0, 0};
+    Record<3> max_rec = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+
+    {
+        auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
+        const Record<3>* rec = nullptr;
+        while ((rec = iter.next()) != nullptr) {
+            uint64_t src_idx = (*rec)[0];
+            if (src_idx < num_nodes) {
+                ++degrees[src_idx];
+            }
+        }
+    }
+
+    TopologySnapshotWriter writer(
+        proj_dir,
+        dir,
+        num_nodes,
+        std::move(degrees),
+        /*include_edge_ids=*/true);
+
+    {
+        auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
+        const Record<3>* rec = nullptr;
+        while ((rec = iter.next()) != nullptr) {
+            writer.append_edge(
+                ObjectId{(*rec)[0]},
+                ObjectId{(*rec)[1]},
+                ObjectId{(*rec)[2]});
+        }
+    }
+
+    writer.finalize();
+}
+
+}  // namespace
+
+void build_topology_snapshots_for_test(
+    ProjectionStorage& storage,
+    bool build_forward,
+    bool build_reverse)
+{
+    using Projection::TopologySnapshotWriter;
+    if (build_forward) {
+        build_one_snapshot_for_test(storage, TopologySnapshotWriter::Direction::FORWARD);
+    }
+    if (build_reverse) {
+        build_one_snapshot_for_test(storage, TopologySnapshotWriter::Direction::REVERSE);
+    }
+}
+
+}  // namespace detail
+}  // namespace GQL

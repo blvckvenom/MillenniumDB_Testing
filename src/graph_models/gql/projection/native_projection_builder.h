@@ -406,6 +406,20 @@ public:
      *        stored on the builder for later consumption by T3.6 (catalog
      *        serialization) and T3.7/T3.8 (build-phase gating). Does NOT
      *        yet affect the indexes produced by this constructor.
+     * @param build_topology_snapshot Spec #4-B T4.6 — when true, emit
+     *        `topology_fwd.csr` and/or `topology_rev.csr` sidecar files
+     *        alongside the projection's B+Tree files after the normal
+     *        `finalize_serialized_()` / flush step completes. Each direction
+     *        is emitted only when the corresponding edge index
+     *        (FROM_TO_EDGE / TO_FROM_EDGE) is present in the active
+     *        IndexSet mask; otherwise the direction is skipped with a single
+     *        warning line. Errors during sidecar generation are non-fatal:
+     *        the projection remains valid and the user can retry via the
+     *        post-hoc procedure (T4.9). Default is false to preserve the
+     *        zero-regression contract for pre-Spec-#4-B callers. The GQL
+     *        surface (config key + YIELD field) is wired in T4.8; this
+     *        constructor parameter is the builder-level hook the test suite
+     *        drives directly.
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -424,7 +438,8 @@ public:
         const std::string& label_property = "",
         const std::string& split_property = "",
         bool include_label_indexes = true,
-        IndexSet index_set = static_cast<IndexSet>(0)  // IndexSet::ALL (fwd-declared)
+        IndexSet index_set = static_cast<IndexSet>(0),  // IndexSet::ALL (fwd-declared)
+        bool build_topology_snapshot = false
     );
 
     ~NativeProjectionBuilder();
@@ -469,6 +484,16 @@ public:
      * keep IndexSet as a forward declaration.
      */
     IndexSet get_index_set() const noexcept;
+
+    /**
+     * @brief Returns whether the builder will emit CSR topology sidecars
+     *        after finalize (Spec #4-B T4.6).
+     *
+     * Mirrors the `build_topology_snapshot` constructor argument. A true
+     * value is advisory: the builder still skips the emission for any
+     * direction whose edge index is not in the active IndexSet mask.
+     */
+    bool get_build_topology_snapshot() const noexcept { return build_topology_snapshot_; }
 
 private:
     /**
@@ -555,6 +580,39 @@ private:
     void finalize_serialized_();
 
     /**
+     * @brief Spec #4-B T4.6 — emit CSR topology sidecar files for the
+     *        projection when requested.
+     *
+     * No-op when `build_topology_snapshot_` is false. Otherwise, for each
+     * of the two directions (FORWARD / REVERSE), the corresponding edge
+     * index bit in the active IndexSet mask is probed; when the bit is
+     * set and the projection's B+Tree is open, a `topology_fwd.csr` or
+     * `topology_rev.csr` file is generated via TopologySnapshotWriter.
+     *
+     * Called at the tail of `finalize()` after `storage->flush()` so the
+     * B+Tree `.leaf` / `.dir` files are complete and fsync'd on disk
+     * before the sidecar writer hashes them.
+     *
+     * Non-fatal: any exception raised while building a sidecar is caught
+     * and logged; the projection remains valid and the user can retry
+     * through the post-hoc procedure (T4.9).
+     */
+    void build_topology_snapshots_();
+
+    /**
+     * @brief Spec #4-B T4.6 — single-direction helper used by
+     *        `build_topology_snapshots_()`.
+     *
+     * Scans the supplied B+Tree twice: first to build the per-source
+     * degree histogram, then to stream edges in src-monotonic order into
+     * a freshly constructed TopologySnapshotWriter. Caller is responsible
+     * for gating on the active IndexSet mask — this helper trusts its
+     * arguments.
+     */
+    void build_one_topology_snapshot_(int direction /* 0=FORWARD, 1=REVERSE */,
+                                      void* edge_bpt_opaque);
+
+    /**
      * @brief Compute the ordered list of ProjectionIndex single-bit values to
      *        iterate during Phase A + Phase C, based on features flags.
      *
@@ -624,6 +682,13 @@ private:
     // actual default-initialization lives in the ctor to keep the
     // forward-declared enum viable as a class member.
     IndexSet index_set_;
+
+    // Spec #4-B T4.6: opt-in flag controlling CSR topology sidecar emission.
+    // When true, `finalize()` emits `topology_fwd.csr` / `topology_rev.csr`
+    // (gated per-direction by the active IndexSet mask) after the normal
+    // B+Tree build completes. Default false preserves pre-Spec-#4-B
+    // behavior for every existing caller of this constructor.
+    bool build_topology_snapshot_ = false;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
     std::unordered_map<std::string, Orientation> per_type_orientations;
@@ -750,6 +815,36 @@ namespace detail {
      * @param env_val nullable C-string as returned by std::getenv.
      */
     NativeProjectionBuilder::ScanMode init_scan_mode_for_test(const char* env_val);
+
+    /**
+     * @brief Spec #4-B T4.6 — test-only hook that runs the exact same CSR
+     *        emission logic that `NativeProjectionBuilder::finalize()`
+     *        invokes for a requested projection, but against a supplied
+     *        ProjectionStorage instead of a live builder.
+     *
+     * This is the cleanest hook the builder path exposes for gtest coverage
+     * without requiring the full graph-load + catalog machinery. The
+     * production builder method (`build_topology_snapshots_`) is a thin
+     * gate over the same routine (it consults the IndexSet mask and calls
+     * per-direction builds); the underlying work — scan BPT twice, stream
+     * into TopologySnapshotWriter, finalize — is shared byte-for-byte.
+     *
+     * @param storage Open projection storage with `from_to_edge_index` /
+     *        `to_from_edge_index` already populated via
+     *        `build_all_indexes_bulk()` and mapped by
+     *        `open_all_bplustree_readers_()`.
+     * @param build_forward If true, emit `topology_fwd.csr`.
+     * @param build_reverse If true, emit `topology_rev.csr`.
+     *
+     * Throws `std::runtime_error` on I/O failure (different policy than
+     * the production method, which swallows errors). Tests want the
+     * exception so a regression is caught at assert time instead of
+     * drifting into stderr.
+     */
+    void build_topology_snapshots_for_test(
+        ProjectionStorage& storage,
+        bool build_forward,
+        bool build_reverse);
 }
 
 } // namespace GQL
