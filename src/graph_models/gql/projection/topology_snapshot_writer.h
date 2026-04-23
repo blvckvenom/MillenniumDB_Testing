@@ -56,8 +56,9 @@ public:
     /// @param num_nodes       `N` as reported by the projection catalog. Used
     ///                        to size ROW_PTR (length = N+1).
     /// @param degrees         Per-node out-degree histogram of length `N`.
-    ///                        Moved into the writer (becomes the prefix-sum
-    ///                        input for ROW_PTR). Sum of degrees is `M`.
+    ///                        Consumed to build the prefix-sum ROW_PTR stored
+    ///                        as a private member; the parameter itself is
+    ///                        not retained. Sum of degrees is `M`.
     /// @param include_edge_ids Emit the EDGE_IDS section and set the
     ///                        has_edge_ids flag bit. The writer still accepts
     ///                        an `edge_id` argument to `append_edge()` when

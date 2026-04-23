@@ -77,10 +77,14 @@ std::array<uint8_t, 32> sha256_of_file(const std::filesystem::path& path) {
             "TopologySnapshotWriter: EVP_DigestInit_ex(SHA-256) failed");
     }
 
-    constexpr std::size_t BUF = 4096;
-    char buf[BUF];
-    while (f.read(buf, BUF) || f.gcount() > 0) {
-        if (EVP_DigestUpdate(ctx, buf, static_cast<std::size_t>(f.gcount())) != 1) {
+    // 64 KiB amortizes syscall overhead on multi-GB papers100M-scale .leaf
+    // files (~37 GB under GNN_MINIMAL) — 16× fewer read() calls than the
+    // 4 KiB reference pattern from model_checkpoint.cc at no extra memory
+    // cost on this hot one-shot code path.
+    constexpr std::size_t BUF = 64 * 1024;
+    std::array<char, BUF> buf;
+    while (f.read(buf.data(), BUF) || f.gcount() > 0) {
+        if (EVP_DigestUpdate(ctx, buf.data(), static_cast<std::size_t>(f.gcount())) != 1) {
             EVP_MD_CTX_free(ctx);
             throw std::runtime_error(
                 "TopologySnapshotWriter: EVP_DigestUpdate failed");
@@ -230,16 +234,31 @@ void TopologySnapshotWriter::append_edge(ObjectId src, ObjectId dst, ObjectId ed
     uint64_t src_idx = src.id;
     uint64_t dst_idx = dst.id;
 
-    // Debug-only invariants. Release builds trust the B+Tree scan driving
-    // the writer — consistent with the spec's "source-monotonic" contract.
-    assert(src_idx < num_nodes_
-           && "TopologySnapshotWriter: src_idx out of range");
-    assert(src_idx >= last_src_idx_
-           && "TopologySnapshotWriter: edges must arrive in src-monotonic order");
-    assert(write_cursor_[static_cast<std::size_t>(src_idx)]
-               < row_ptr_[static_cast<std::size_t>(src_idx) + 1]
-               - row_ptr_[static_cast<std::size_t>(src_idx)]
-           && "TopologySnapshotWriter: more edges than declared degree for this src");
+    // Always-on invariant checks. Release-build silent corruption of the
+    // CSR body would not be caught by the reader's SHA-256 (that hashes the
+    // source .leaf, not the CSR). Wrong sampling output is a thesis-grade
+    // correctness bug; the extra branch cost per edge is negligible vs the
+    // 8-byte pwrite syscall that follows.
+    if (src_idx >= num_nodes_) {
+        throw std::runtime_error(
+            "TopologySnapshotWriter: src_idx " + std::to_string(src_idx)
+            + " out of range (num_nodes=" + std::to_string(num_nodes_) + ")");
+    }
+    if (src_idx < last_src_idx_) {
+        throw std::runtime_error(
+            "TopologySnapshotWriter: edges must arrive in src-monotonic order "
+            "(src_idx=" + std::to_string(src_idx)
+            + ", last_src_idx=" + std::to_string(last_src_idx_) + ")");
+    }
+    const std::size_t src_slot = static_cast<std::size_t>(src_idx);
+    const uint64_t declared_degree =
+        row_ptr_[src_slot + 1] - row_ptr_[src_slot];
+    if (write_cursor_[src_slot] >= declared_degree) {
+        throw std::runtime_error(
+            "TopologySnapshotWriter: more edges than declared degree "
+            "for src_idx=" + std::to_string(src_idx)
+            + " (declared=" + std::to_string(declared_degree) + ")");
+    }
 
     // Index of this edge within COL_IDX: row_ptr[src] + local_cursor.
     const uint64_t edge_index =
@@ -277,14 +296,22 @@ void TopologySnapshotWriter::finalize() {
     // Hash the source .leaf end-to-end (separate pass over the file).
     std::array<uint8_t, 32> source_hash{};
     if (std::filesystem::exists(source_leaf_path_)) {
+        // Guard against an empty source file paired with a non-empty graph:
+        // hashing an empty file yields a well-defined digest, but that
+        // silently accepts an obviously corrupt projection layout. Fail
+        // fast so the caller can retry / rebuild the source.
+        if (num_edges_ != 0
+            && std::filesystem::file_size(source_leaf_path_) == 0) {
+            throw std::runtime_error(
+                "TopologySnapshotWriter: source .leaf is empty but graph has "
+                + std::to_string(num_edges_) + " edges: "
+                + source_leaf_path_.string());
+        }
         source_hash = sha256_of_file(source_leaf_path_);
     } else {
         // Source .leaf absent is allowed only when the projection has no
         // edges at all (e.g. N=0). For non-empty graphs this is almost
-        // certainly a configuration error, but we surface it as a zero hash
-        // rather than throwing — the reader's validation layer (T4.5/T4.10)
-        // will reject on hash mismatch anyway. In the N=M=0 fixture path
-        // used by the empty-projection test, we want the writer to succeed.
+        // certainly a configuration error — fail fast.
         if (num_edges_ != 0) {
             throw std::runtime_error(
                 "TopologySnapshotWriter: source .leaf missing: "

@@ -434,3 +434,55 @@ TEST_F(TopologySnapshotWriterTest, ParallelWritersRejectedOnSameFile) {
     // dangling fd warnings.
     writer_a.finalize();
 }
+
+// ---------------------------------------------------------------------------
+// Always-on invariant checks (promoted from assert to runtime throws so
+// Release builds catch B+Tree scan bugs before they corrupt the CSR body
+// in a way that would only surface as wrong GNN sampling output).
+// ---------------------------------------------------------------------------
+
+TEST_F(TopologySnapshotWriterTest, AppendEdgeRejectsOutOfRangeSrc) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "x");
+    // N=2 nodes, src=5 is out of range.
+    TopologySnapshotWriter writer(
+        dir_,
+        TopologySnapshotWriter::Direction::FORWARD,
+        /*num_nodes=*/2,
+        /*degrees=*/{1, 0},
+        /*include_edge_ids=*/false);
+    EXPECT_THROW(
+        writer.append_edge(ObjectId{5}, ObjectId{0}, ObjectId{0}),
+        std::runtime_error);
+}
+
+TEST_F(TopologySnapshotWriterTest, AppendEdgeRejectsDecreasingSrc) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "x");
+    TopologySnapshotWriter writer(
+        dir_,
+        TopologySnapshotWriter::Direction::FORWARD,
+        /*num_nodes=*/3,
+        /*degrees=*/{1, 1, 0},
+        /*include_edge_ids=*/false);
+    // First edge at src=1 advances last_src_idx_; a following edge at src=0
+    // violates monotonicity.
+    writer.append_edge(ObjectId{1}, ObjectId{2}, ObjectId{0});
+    EXPECT_THROW(
+        writer.append_edge(ObjectId{0}, ObjectId{1}, ObjectId{0}),
+        std::runtime_error);
+}
+
+TEST_F(TopologySnapshotWriterTest, AppendEdgeRejectsDegreeOverflow) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "x");
+    // N=2, src=0 has declared degree 1. A second append_edge with src=0
+    // exceeds the declared degree.
+    TopologySnapshotWriter writer(
+        dir_,
+        TopologySnapshotWriter::Direction::FORWARD,
+        /*num_nodes=*/2,
+        /*degrees=*/{1, 0},
+        /*include_edge_ids=*/false);
+    writer.append_edge(ObjectId{0}, ObjectId{1}, ObjectId{0});
+    EXPECT_THROW(
+        writer.append_edge(ObjectId{0}, ObjectId{1}, ObjectId{0}),
+        std::runtime_error);
+}
