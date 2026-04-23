@@ -1339,21 +1339,62 @@ void ProjectionStorage::build_all_indexes_bulk() {
     std::string sort_temp_dir = projection_dir + "/sort_tmp";
     std::filesystem::create_directories(sort_temp_dir);
 
-    // PHASE 1: Required indexes (always built)
-    build_nodes_index_();
-    build_from_to_edge_index_();
-    build_to_from_edge_index_();
-    build_edge_direction_index_();
-    build_edge_from_to_index_();
-    build_edge_n1_n2_index_();
+    // Spec #3 T3.8: gate topology/label index materialization on the active
+    // IndexSet preset mask. The 10 gated bits are: NODES, NODE_LABEL,
+    // LABEL_NODE, FROM_TO_EDGE, TO_FROM_EDGE, EDGE_DIRECTION, EDGE_FROM_TO,
+    // EDGE_N1_N2, EDGE_LABEL, LABEL_EDGE. Property indexes (NODE_KEY_VALUE,
+    // KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE) are NOT gated here —
+    // they remain conditional on features.include_*_properties inside their
+    // respective build_*_index_() helpers (Spec #3 §3.4). The mask is
+    // computed once per build since requested_index_set is immutable after
+    // the builder hands off to flush().
+    const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
-    // PHASE 2: Optional label indexes
-    build_node_label_index_();
-    build_label_node_index_();
-    build_edge_label_index_();
-    build_label_edge_index_();
+    // PHASE 1: Required topology indexes — now gated by IndexSet.
+    // GNN_MINIMAL keeps NODES + FROM_TO_EDGE + TO_FROM_EDGE; the 3
+    // edge-lookup indexes (EDGE_DIRECTION / EDGE_FROM_TO / EDGE_N1_N2)
+    // are elided for k-hop-sampling-only workloads.
+    if (has_flag(active_mask, ProjectionIndex::NODES)) {
+        build_nodes_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
+        build_from_to_edge_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
+        build_to_from_edge_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
+        build_edge_direction_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)) {
+        build_edge_from_to_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)) {
+        build_edge_n1_n2_index_();
+    }
 
-    // PHASE 3: Optional property indexes
+    // PHASE 2: Optional label indexes — gated by both IndexSet and the
+    // features.include_*_labels flag. The features flag is still consulted
+    // inside each build_*_label_index_() helper, so when include_label_indexes
+    // is false the helpers short-circuit even if IndexSet would have kept
+    // them; conversely, GNN_MINIMAL omits all four label bits regardless of
+    // the features flag.
+    if (has_flag(active_mask, ProjectionIndex::NODE_LABEL)) {
+        build_node_label_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::LABEL_NODE)) {
+        build_label_node_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_LABEL)) {
+        build_edge_label_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::LABEL_EDGE)) {
+        build_label_edge_index_();
+    }
+
+    // PHASE 3: Optional property indexes — NOT gated by IndexSet (Spec #3
+    // §3.4). Property-config gates via features.include_*_properties remain
+    // the sole controller inside each helper.
     build_node_key_value_index_();
     build_key_value_node_index_();
     build_edge_key_value_index_();
@@ -1381,25 +1422,55 @@ void ProjectionStorage::open_all_bplustree_readers_() {
     // best-effort: if already removed, remove_all is a no-op.
     std::filesystem::remove_all(projection_dir + "/sort_tmp");
 
-    // Open required indexes
-    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
-    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
-    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
-    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
-    edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to");
-    edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2");
+    // Spec #3 T3.8: open readers only for indexes whose bit is in the active
+    // IndexSet preset. FileManager::get_file_id() opens with O_CREAT, so
+    // unconditional construction of a BPlusTree for a skipped index would
+    // produce a 0-byte .leaf/.dir on disk — defeating the file-count /
+    // disk-footprint contract of GNN_MINIMAL. The query layer (T3.9, out of
+    // scope here) will diagnose attempts to use an elided index.
+    const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
-    // Open optional label indexes
+    // Open topology indexes (previously unconditionally opened).
+    if (has_flag(active_mask, ProjectionIndex::NODES)) {
+        nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
+    }
+    if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
+        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
+    }
+    if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
+        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
+        edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)) {
+        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to");
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)) {
+        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2");
+    }
+
+    // Open optional label indexes — dual gate: features.include_*_labels
+    // AND the IndexSet bit. features flag still participates so legacy
+    // include_label_indexes=false users retain their disk-saving behavior.
     if (features.include_node_labels) {
-        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
-        label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
+        if (has_flag(active_mask, ProjectionIndex::NODE_LABEL)) {
+            node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+        }
+        if (has_flag(active_mask, ProjectionIndex::LABEL_NODE)) {
+            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
+        }
     }
     if (features.include_edge_labels) {
-        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
-        label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
+        if (has_flag(active_mask, ProjectionIndex::EDGE_LABEL)) {
+            edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+        }
+        if (has_flag(active_mask, ProjectionIndex::LABEL_EDGE)) {
+            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
+        }
     }
 
-    // Open optional property indexes
+    // Open optional property indexes — NOT gated by IndexSet (Spec #3 §3.4).
     if (features.include_node_properties) {
         node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
         key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");

@@ -2263,6 +2263,22 @@ void NativeProjectionBuilder::finalize_serialized_() {
 
     auto all_idx = enabled_indexes_();
 
+    // Spec #3 T3.7: compute the active IndexSet preset mask once per build so
+    // each iteration of the Phase A / Phase C loops below can gate topology
+    // index materialization with a cheap bitwise probe (has_flag). Property
+    // indexes (NODE_KEY_VALUE, KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE)
+    // are NOT gated by IndexSet — their existing property-config gate (via
+    // features.include_*_properties inside build_*_index_()) remains the sole
+    // controller, per Spec #3 §3.4. The mask below is only consulted for the
+    // 10 topology / label indexes.
+    const ProjectionIndex active_mask = project_index_mask_for(index_set_);
+    auto is_property_index = [](ProjectionIndex idx) {
+        return idx == ProjectionIndex::NODE_KEY_VALUE
+            || idx == ProjectionIndex::KEY_VALUE_NODE
+            || idx == ProjectionIndex::EDGE_KEY_VALUE
+            || idx == ProjectionIndex::KEY_VALUE_EDGE;
+    };
+
     // Split into node phase (Phase A) + edge phase (Phase C) via bitmask.
     std::vector<ProjectionIndex> node_phase;
     std::vector<ProjectionIndex> edge_phase;
@@ -2286,6 +2302,16 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // re-processed by the flush() call, which overwrites the correct index with
     // a partial dataset (Spec #2 §4 correctness fix — I4 golden compare guard).
     for (auto idx : node_phase) {
+        // Spec #3 T3.7: skip topology index materialization when its bit is
+        // not in the active IndexSet preset. Property indexes bypass this gate
+        // (see is_property_index lambda); they remain controlled solely by
+        // their property-config gate inside build_one_index() → build_*_()
+        // helpers. NOTE: when the bit is masked out we skip the scan too —
+        // there is no buffer to populate since no downstream consumer would
+        // read it, so the scan work would be wasted I/O.
+        if (!is_property_index(idx) && !has_flag(active_mask, idx)) {
+            continue;
+        }
         scan_nodes_impl_serialized_(stored_labels_, idx);
         storage->drain_pending_batches();
         storage->build_one_index(idx);
@@ -2310,6 +2336,14 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // drain_pending_batches() before each build ensures the streaming buffer
     // is fully populated (same correctness argument as Phase A above).
     for (auto idx : edge_phase) {
+        // Spec #3 T3.7: skip topology index materialization when its bit is
+        // not in the active IndexSet preset. Property indexes bypass this gate
+        // (see is_property_index lambda above). Skipping the scan too avoids
+        // wasted per-pass I/O (filter probe, spill read) when no downstream
+        // buffer would be populated.
+        if (!is_property_index(idx) && !has_flag(active_mask, idx)) {
+            continue;
+        }
         // Arm the per-pass write mask BEFORE the scan so flush_edge_batch()
         // only populates the target buffer.  Also clears the bloom filter and
         // any stale spill files from previous passes (disk-bound fix for
