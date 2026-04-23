@@ -123,6 +123,9 @@ add_library(mdb_gnn_core STATIC
     # Phase 3: Four-Level Feature Store build procedure (L1-L4)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_feature_store_procedure.cc
 
+    # Spec #4-B T4.9: Post-hoc topology snapshot build procedure
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.cc
+
     # Phase 4: GNN Training procedure (GraphSAGE training orchestration)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_train_procedure.cc
 

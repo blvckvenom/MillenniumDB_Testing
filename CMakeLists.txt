@@ -688,6 +688,48 @@ if(GTest_FOUND AND ENABLE_GNN AND
     )
 endif()
 
+# ============================================================================
+# gnn_build_topology_snapshot procedure unit tests (Spec #4-B T4.9)
+# ============================================================================
+# EXISTS-gated so the target is only configured once the procedure source
+# lands. Shares the GTest linking recipe with the other projection tests.
+# Requires ENABLE_GNN because the procedure itself lives in mdb_gnn_core.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.cc")
+    add_executable(gnn_build_topology_snapshot_procedure_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_build_topology_snapshot_procedure_test.cc
+    )
+    set_target_properties(gnn_build_topology_snapshot_procedure_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over serdi's main(). mdb_gnn_core carries the procedure impl, and
+    # millenniumdb provides ProjectionStorage + BPlusTree — the T4.7
+    # link-order rule (mdb_gnn_core before trailing millenniumdb) applies.
+    target_link_libraries(gnn_build_topology_snapshot_procedure_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnBuildTopologySnapshotProcedureTests
+        COMMAND $<TARGET_FILE:gnn_build_topology_snapshot_procedure_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
