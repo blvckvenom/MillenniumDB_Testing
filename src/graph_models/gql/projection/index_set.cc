@@ -1,7 +1,9 @@
 #include "graph_models/gql/projection/index_set.h"
 
-#include <stdexcept>
+#include <cassert>
 #include <string>
+
+#include "query/exceptions.h"
 
 namespace GQL {
 
@@ -33,9 +35,12 @@ ProjectionIndex project_index_mask_for(IndexSet preset) noexcept {
              | ProjectionIndex::EDGE_LABEL
              | ProjectionIndex::LABEL_EDGE;
     }
-    // Unreachable for well-formed enum values; default to ALL to preserve
-    // the safest (current) behavior if a future value slips through.
-    return ProjectionIndex::ALL;
+    // Unreachable for valid enum values; for out-of-range casts (e.g., corrupt
+    // catalog reading static_cast<IndexSet>(99)), return NONE (visibly wrong)
+    // rather than ALL (which would silently mask the bug and materialize all
+    // indexes, defeating the purpose of Spec #3).
+    assert(false && "project_index_mask_for: unhandled IndexSet value");
+    return ProjectionIndex::NONE;
 }
 
 IndexSet parse_index_set(const std::string& s) {
@@ -48,7 +53,7 @@ IndexSet parse_index_set(const std::string& s) {
     if (s == "READONLY_TRAVERSAL") {
         return IndexSet::READONLY_TRAVERSAL;
     }
-    throw std::invalid_argument(
+    throw QueryException(
         "Invalid indexSet value: \"" + s + "\". "
         "Valid values are: ALL, GNN_MINIMAL, READONLY_TRAVERSAL "
         "(case-sensitive).");
@@ -60,6 +65,10 @@ const char* index_set_name(IndexSet preset) noexcept {
     case IndexSet::GNN_MINIMAL:        return "GNN_MINIMAL";
     case IndexSet::READONLY_TRAVERSAL: return "READONLY_TRAVERSAL";
     }
+    // Out-of-range cast: "UNKNOWN" is already visibly distinct from any valid
+    // preset name (unlike returning ALL from project_index_mask_for, which
+    // would mask a bug), but we still assert in debug builds for early detection.
+    assert(false && "index_set_name: unhandled IndexSet value");
     return "UNKNOWN";
 }
 

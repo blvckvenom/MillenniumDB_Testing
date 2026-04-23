@@ -6,13 +6,13 @@
 // canonical name conversion.
 
 #include <cstdint>
-#include <stdexcept>
 #include <string>
 
 #include <gtest/gtest.h>
 
 #include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
+#include "query/exceptions.h"
 
 namespace {
 
@@ -99,29 +99,29 @@ TEST(IndexSet, ParseReadonlyTraversalReturnsReadonly) {
 TEST(IndexSet, ParseUnknownThrows) {
     try {
         (void) GQL::parse_index_set("foo");
-        FAIL() << "Expected std::invalid_argument";
-    } catch (const std::invalid_argument& e) {
+        FAIL() << "Expected QueryException";
+    } catch (const QueryException& e) {
         const std::string msg = e.what();
         EXPECT_NE(msg.find("ALL"), std::string::npos);
         EXPECT_NE(msg.find("GNN_MINIMAL"), std::string::npos);
         EXPECT_NE(msg.find("READONLY_TRAVERSAL"), std::string::npos);
     } catch (...) {
-        FAIL() << "Expected std::invalid_argument, got different exception";
+        FAIL() << "Expected QueryException, got different exception";
     }
 }
 
 TEST(IndexSet, ParseEmptyStringThrows) {
-    EXPECT_THROW((void) GQL::parse_index_set(""), std::invalid_argument);
+    EXPECT_THROW((void) GQL::parse_index_set(""), QueryException);
 }
 
 TEST(IndexSet, ParseLowercaseRejected) {
     // parse_index_set is case-sensitive.
     EXPECT_THROW((void) GQL::parse_index_set("gnn_minimal"),
-                 std::invalid_argument);
+                 QueryException);
     EXPECT_THROW((void) GQL::parse_index_set("all"),
-                 std::invalid_argument);
+                 QueryException);
     EXPECT_THROW((void) GQL::parse_index_set("readonly_traversal"),
-                 std::invalid_argument);
+                 QueryException);
 }
 
 TEST(IndexSet, IndexSetNameReturnsCanonical) {
