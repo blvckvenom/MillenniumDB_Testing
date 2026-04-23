@@ -253,6 +253,7 @@ valores por tipo (forma MAP en `relationshipProjection`) sobrescriben estos.
 | `labelProperty` | STRING | `''` | Propiedad entera con el label de clasificación (requiere ENABLE_GNN) |
 | `splitProperty` | STRING | `''` | Propiedad con `"train"`/`"val"`/`"validation"`/`"test"` |
 | `indexSet` | STRING | `'ALL'` | Preset que controla qué índices B+Tree se materializan (ver "Index set selection" más abajo) |
+| `buildTopologySnapshot` | BOOL | `false` | Si `true`, emite los archivos sidecar `topology_fwd.csr`/`topology_rev.csr` con adyacencia CSR para acelerar sampling GNN (ver "Topology snapshot" más abajo) |
 
 Ejemplo combinando varias claves:
 
@@ -1238,3 +1239,131 @@ la metadata de la proyección (catalog v1.4). Para cambiar el preset,
 `drop_projection` y recrea con el nuevo valor. Las proyecciones
 pre-Spec-#3 (catalog v1.3) se leen como si fueran `ALL` para preservar
 compatibilidad total hacia atrás.
+
+---
+
+## Topology snapshot — `buildTopologySnapshot` (added 2026-04-25)
+
+### Motivación
+
+Con el B+Tree existente, `get_out_neighbors(v)` cuesta `O(log N + k)` por
+lookup. Al hacer sampling GNN con fanout `[15, 10]` sobre papers100M
+(~1.6 B aristas, 111 M nodos) son ~2.2 B lookups por epoch, lo que da
+~30 h/epoch en un workstation de 30 GB RAM — inviable para entrenamiento.
+El sidecar CSR reduce ese costo a `O(1)` mediante un simple slice sobre
+memoria mmap'd.
+
+### Archivos sidecar
+
+Cuando `buildTopologySnapshot: true`, al finalizar `graph_project` se
+emiten dos archivos adicionales junto a los `.leaf`/`.dir`:
+
+```
+projections/<nombre>/
+  ... archivos B+Tree existentes ...
+  topology_fwd.csr        ← adyacencia saliente  (from → to)
+  topology_rev.csr        ← adyacencia entrante   (to → from)
+```
+
+Formato binario de cada archivo: header fijo de 64 bytes
+(magic `TOPOCSR1`, versión, id_width, flags, num_nodes, num_edges,
+SHA-256 del `.leaf` fuente) + `ROW_PTR[N+1]` + `COL_IDX[M]` +
+opcional `EDGE_IDS[M]`. Todos little-endian uint64. Ver la especificación
+`docs/superpowers/specs/2026-04-25-topology-snapshot-design.md` §5.1.
+
+### Ejemplo
+
+```gql
+CALL graph_project('gnn_proj', 'Paper', 'CITES', {
+  orientation: 'NATURAL',
+  indexSet: 'GNN_MINIMAL',
+  buildTopologySnapshot: true,
+  includeFeatures: 'node_features'
+}) YIELD graphName, nodeCount, relationshipCount, topologySnapshotBytes
+RETURN *;
+```
+
+`topologySnapshotBytes` es un nuevo campo YIELD con el tamaño total
+(bytes) de los sidecars efectivamente escritos. `0` si el flag no estaba
+activo o si el `IndexSet` activo no incluía ninguno de los dos índices
+de aristas.
+
+### Composabilidad con `indexSet`
+
+El builder verifica el `IndexSet` activo antes de escribir cada dirección:
+
+| IndexSet | `topology_fwd.csr` | `topology_rev.csr` |
+|---|:---:|:---:|
+| `ALL` | ✅ | ✅ |
+| `GNN_MINIMAL` | ✅ | ✅ |
+| `READONLY_TRAVERSAL` | ✅ | ✅ |
+
+Si alguna dirección no está disponible, el builder log-ea una línea
+indicándolo y omite sólo esa dirección (no falla el build).
+
+### Fallback automático
+
+El lado lector (`TopologyAccessor`) detecta la presencia de los sidecars
+al abrir la proyección y valida (magic, versión, tamaño, invariantes de
+`ROW_PTR`, SHA-256 del `.leaf` fuente). Cualquier falla
+(archivo ausente, stale por mutación externa del `.leaf`, corrupción,
+mmap error) degrada silenciosamente al path B+Tree existente — GNN
+sampling continúa siendo correcto, solo ~100× más lento. El output de
+`sample_neighbors` es bit-identical entre ambos paths bajo RNG fijo.
+
+### Tradeoffs
+
+| Costo | Dataset pequeño (cora) | ogbn-products | papers100M (proyectado) |
+|---|---:|---:|---:|
+| Overhead de disco | ~23 % | ~34 % | ~7-8 % |
+| Overhead wall-clock del build | ~45 % (ruido en graphs pequeños) | ~10 % | ~10 % |
+| Open-time latency (SHA-256 de fuente) | <1 ms | ~10-20 s | ~40-70 s |
+| Speedup de sampling | 3-5× (ya cache-resident) | 50-500× | 100-1000× |
+
+Números concretos en `docs/research/2026-04-25-topology-snapshot-bench.md`
+(Gate B).
+
+### Cuándo activar
+
+- **Activa** si la proyección se va a usar como source para
+  `gnn_offline_sample` / `gnn_train` / `EmbeddingWriter` con on-the-fly
+  k-hop, especialmente en datasets > ~10 M aristas.
+- **No actives** en proyecciones usadas solo para queries GQL
+  tradicionales (`MATCH`, etc.) — el sidecar no acelera esas queries.
+- **No actives** si tienes pressure de disco crítica y cada GB cuenta —
+  el B+Tree solo ya es funcionalmente completo para GNN.
+
+### Construcción post-hoc
+
+Si una proyección ya fue creada sin el flag, no es necesario
+reconstruirla — se puede generar el sidecar después:
+
+```gql
+CALL gnn_build_topology_snapshot('gnn_proj')
+YIELD projectionName, fwdBytes, revBytes, durationMillis
+RETURN *;
+```
+
+Esto lee los `.leaf` existentes y escribe los `.csr` al lado. Idempotente
+(sobreescribe con warning si ya existían).
+
+### Borrado
+
+Los `.csr` se pueden borrar manualmente con `rm topology_fwd.csr` /
+`rm topology_rev.csr` en cualquier momento — la proyección queda válida
+y consultable; el siguiente open de `TopologyAccessor` simplemente usará
+el path B+Tree.
+
+### Backwards compat
+
+Zero impact: proyecciones pre-Spec-#4-B no tienen `.csr`; el lector cae
+automáticamente al path B+Tree. Binarios de MillenniumDB pre-Spec-#4-B
+ignoran los `.csr` (no son referenciados por el catálogo). Catalog
+version **no cambia** — no hay migración.
+
+### Referencias
+
+- Spec: `docs/superpowers/specs/2026-04-25-topology-snapshot-design.md`
+- Plan: `docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md`
+- ADR: `Partial_Idea/decisions/006_topology_snapshot.md`
+- Master plan §8-9: `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`
