@@ -689,6 +689,49 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
+# ============================================================================
+# Complements T4.7 (single-layer sample_neighbors determinism). Exercises
+# TopologyAccessor::sample_khop_neighbors under the 3×N matrix of
+# orientations × fanout shapes, asserting bit-identical output between the
+# CSR fast-path and the B+Tree fallback for fixed RNG seeds. Also covers
+# the mixed-path scenario where topology_rev.csr is deleted after build.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gnn_sampling_snapshot_test.cc")
+    add_executable(gnn_sampling_snapshot_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_sampling_snapshot_test.cc
+    )
+    set_target_properties(gnn_sampling_snapshot_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # Link order mirrors topology_accessor_csr_path_test: gtest_main before
+    # millenniumdb (wins over serdi's main), and mdb_gnn_core before the
+    # trailing millenniumdb so symbols from the GNN module resolve first.
+    target_link_libraries(gnn_sampling_snapshot_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnSamplingSnapshotTests
+        COMMAND $<TARGET_FILE:gnn_sampling_snapshot_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # gnn_build_topology_snapshot procedure unit tests (Spec #4-B T4.9)
 # ============================================================================
 # EXISTS-gated so the target is only configured once the procedure source
