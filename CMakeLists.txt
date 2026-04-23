@@ -260,7 +260,12 @@ foreach(target ${BUILD_TARGETS})
     )
     # Link GNN module and LibTorch when enabled
     if(ENABLE_GNN)
-        target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES})
+        # millenniumdb is listed again after mdb_gnn_core so that any symbol
+        # defined in libmillenniumdb.a that is first referenced from
+        # libmdb_gnn_core.a (e.g. Spec #4-B T4.7's TopologySnapshotReader,
+        # whose only consumer under LTO is mdb_gnn/projection/topology_accessor)
+        # is still resolved by the single-pass ld.bfd static-archive linker.
+        target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES} millenniumdb)
     endif()
 endforeach(target)
 
@@ -281,7 +286,9 @@ foreach(target ${TEST_TARGETS})
     )
     # Link GNN module and LibTorch when enabled
     if(ENABLE_GNN)
-        target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES})
+        # See comment above BUILD_TARGETS loop for why millenniumdb is
+        # re-linked after mdb_gnn_core under ENABLE_GNN (T4.7 link-order).
+        target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES} millenniumdb)
     endif()
     add_test(
         NAME ${target}
@@ -635,6 +642,48 @@ if(GTest_FOUND AND
     add_test(
         NAME NativeProjectionBuilderTopologySnapshotTests
         COMMAND $<TARGET_FILE:native_projection_builder_topology_snapshot_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# TopologyAccessor × CSR fast-path integration test (Spec #4-B T4.7)
+# ============================================================================
+# Verifies the mmap fast-path integration in
+# src/gnn/projection/topology_accessor.cc and the per-direction fallback
+# behavior when sidecars are absent / stale / corrupt. Requires ENABLE_GNN
+# because the accessor itself lives in mdb_gnn_core.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_csr_path_test.cc")
+    add_executable(topology_accessor_csr_path_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_csr_path_test.cc
+    )
+    set_target_properties(topology_accessor_csr_path_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over serdi's main(), and mdb_gnn_core must come before the trailing
+    # millenniumdb so the T4.7 link-order fix applies here too.
+    target_link_libraries(topology_accessor_csr_path_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyAccessorCsrPathTests
+        COMMAND $<TARGET_FILE:topology_accessor_csr_path_test>
         WORKING_DIRECTORY tests
     )
 endif()

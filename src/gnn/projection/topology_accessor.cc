@@ -1,9 +1,12 @@
 #include "topology_accessor.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <iostream>
 #include <unordered_set>
 
 #include "graph_models/gql/projection/projection_storage.h"
+#include "graph_models/gql/projection/topology_snapshot_reader.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
 #include "gnn/core/cuda_context.h"
@@ -19,10 +22,72 @@ struct TopologyAccessor::Impl {
     torch::Device target_device;
     std::mt19937_64 rng;
 
+    // CSR fast-path sidecars (Spec #4-B T4.7). Each reader holds its own mmap +
+    // fd state; `has_data()` reports whether the fast path is usable for this
+    // direction. Absent / stale / malformed sidecars leave the reader inert,
+    // in which case every accessor silently falls back to the B+Tree path
+    // below.
+    GQL::Projection::TopologySnapshotReader fwd_csr_;
+    GQL::Projection::TopologySnapshotReader rev_csr_;
+
     explicit Impl(GQL::ProjectionStorage& storage_)
         : storage(storage_),
           target_device(CudaContext::instance().torch_device()),
-          rng(std::random_device{}()) {}
+          rng(std::random_device{}()),
+          fwd_csr_(GQL::Projection::TopologySnapshotReader::open(
+              std::filesystem::path(storage_.get_projection_dir()),
+              GQL::Projection::TopologySnapshotReader::Direction::FORWARD)),
+          rev_csr_(GQL::Projection::TopologySnapshotReader::open(
+              std::filesystem::path(storage_.get_projection_dir()),
+              GQL::Projection::TopologySnapshotReader::Direction::REVERSE)) {
+        std::cerr << "TopologyAccessor: fwd="
+                  << (fwd_csr_.has_data() ? "csr" : "bpt")
+                  << " rev="
+                  << (rev_csr_.has_data() ? "csr" : "bpt") << "\n";
+    }
+
+    // CSR fast-path for outgoing neighbors. Returns std::nullopt when the
+    // fast-path is not viable (reader inert, node_idx out of range) so the
+    // caller falls through to the B+Tree path.
+    std::optional<Neighbors> try_csr_out_neighbors(ObjectId node_id) const {
+        if (!fwd_csr_.has_data() || node_id.id >= fwd_csr_.num_nodes()) {
+            return std::nullopt;
+        }
+        auto dst_span = fwd_csr_.neighbors(node_id.id);
+        auto eid_span = fwd_csr_.edge_ids(node_id.id);
+        Neighbors result;
+        result.node_ids.reserve(dst_span.size());
+        for (std::size_t i = 0; i < dst_span.size(); ++i) {
+            result.node_ids.push_back(ObjectId(dst_span[i]));
+        }
+        if (eid_span.size() == dst_span.size()) {
+            result.edge_ids.reserve(eid_span.size());
+            for (std::size_t i = 0; i < eid_span.size(); ++i) {
+                result.edge_ids.push_back(ObjectId(eid_span[i]));
+            }
+        }
+        return result;
+    }
+
+    std::optional<Neighbors> try_csr_in_neighbors(ObjectId node_id) const {
+        if (!rev_csr_.has_data() || node_id.id >= rev_csr_.num_nodes()) {
+            return std::nullopt;
+        }
+        auto dst_span = rev_csr_.neighbors(node_id.id);
+        auto eid_span = rev_csr_.edge_ids(node_id.id);
+        Neighbors result;
+        result.node_ids.reserve(dst_span.size());
+        for (std::size_t i = 0; i < dst_span.size(); ++i) {
+            result.node_ids.push_back(ObjectId(dst_span[i]));
+        }
+        if (eid_span.size() == dst_span.size()) {
+            result.edge_ids.reserve(eid_span.size());
+            for (std::size_t i = 0; i < eid_span.size(); ++i) {
+                result.edge_ids.push_back(ObjectId(eid_span[i]));
+            }
+        }
+        return result;
+    }
 
     /**
      * @brief Get neighbors using from_to_edge index (outgoing).
@@ -93,10 +158,20 @@ TopologyAccessor& TopologyAccessor::operator=(TopologyAccessor&&) noexcept = def
 // ----- Single Node Neighbor Access -----
 
 Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
+    // Fast path: mmap'd topology_fwd.csr (Spec #4-B T4.7). Absent / stale /
+    // out-of-range → fall through to the B+Tree path below.
+    if (auto fast = impl_->try_csr_out_neighbors(node_id)) {
+        return std::move(*fast);
+    }
     return impl_->get_neighbors_from_index(node_id, impl_->storage.get_from_to_edge_index());
 }
 
 Neighbors TopologyAccessor::get_in_neighbors(ObjectId node_id) {
+    // Fast path: mmap'd topology_rev.csr (Spec #4-B T4.7).
+    if (auto fast = impl_->try_csr_in_neighbors(node_id)) {
+        return std::move(*fast);
+    }
+
     // to_from_edge: (to, from, edge_id)
     Neighbors result;
 
