@@ -1578,3 +1578,196 @@ v1.5 reader las trata como `BITSET` de forma transparente.
 - Plan: `docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md`
 - ADR: `Partial_Idea/decisions/007_delta_varint_leaf.md`
 - Master plan: `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`
+
+---
+
+## Graph storage — `graphStorage` config parameter (added 2026-04-24, ADR 008)
+
+Spec #8 introduce un switch arquitectónico opt-in que hace que las
+páginas hoja de los índices de arista **sean** la CSR (Compressed
+Sparse Row) en lugar de almacenarla en un sidecar aparte. El resultado
+unifica el B+Tree de Spec #5 con la topología de Spec #4-B en una única
+estructura on-disk, eliminando la duplicación de ~34 % que costaba el
+sidecar y reduciendo el tamaño de los índices de arista ~81 % adicional
+sobre la baseline bitset.
+
+### Valores
+
+| Valor | Significado | Compatibilidad |
+|-------|-------------|----------------|
+| `'BTREE'` (default) | Cada índice usa un B+Tree por separado; el encoding de leaf viene dado por `leafFormat` (BITSET o DELTA_VARINT). Preserva el comportamiento pre-2026-04-24 byte-a-byte. | Catalog v1.5 y anteriores: implícito. Catalog v1.6+: explícito por proyección. |
+| `'CSR_HYBRID'` | Los índices de arista (`FROM_TO_EDGE`, `TO_FROM_EDGE`) emiten páginas v3 con layout CSR interno (tabla de offsets + stream de dst comprimido con DELTA_VARINT). Los demás índices (`nodes`, `node_label`, `label_node`, propiedades) siguen usando el `leafFormat` configurado. | Solo catalog v1.6+ (introducido 2026-04-24). |
+
+El valor se persiste **por proyección** como un uint8 en el catalog
+v1.6. El scope intencionalmente excluye índices de nodo y propiedad
+porque la ganancia CSR se concentra en aristas ordenadas — los índices
+de nodo ya tienen cardinalidad 1:1 con la clave.
+
+### Ejemplo
+
+```gql
+CALL graph_project('gnn_proj', 'Paper', 'CITES', {
+  orientation: 'NATURAL',
+  indexSet: 'GNN_MINIMAL',
+  leafFormat: 'DELTA_VARINT',
+  graphStorage: 'CSR_HYBRID'
+}) YIELD graphName, nodeCount, relationshipCount RETURN *;
+```
+
+Este es el stack de compresión completo de la tesis: `GNN_MINIMAL`
+recorta los índices innecesarios (Spec #3), `DELTA_VARINT` comprime los
+índices de nodo/propiedad (Spec #5), y `CSR_HYBRID` colapsa los índices
+de arista a layout CSR v3 (Spec #8).
+
+### Reducción de tamaño empírica
+
+| Dataset | BTREE (baseline BITSET) | CSR_HYBRID | Ratio | Reducción |
+|---------|------------------------:|-----------:|:-----:|:---------:|
+| cora_gnn (GNN_MINIMAL) | 150 KB | 54 KB | 0.361 | **-63.9%** |
+| ogbn-arxiv (GNN_MINIMAL) | 35 MB | 6.5 MB | 0.185 | **-81.5%** |
+
+El ratio mejora al escalar porque el header fijo de 16 B se amortiza
+mejor sobre páginas más densas. En cora_gnn el overhead de headers
+domina; en ogbn-arxiv cada hub comprime cerca del mínimo teórico
+(~0.5 B por arista).
+
+### Throughput de scan
+
+Tras el fix de cursor secuencial (T8.12b, commit `b9ca276f` que cambió
+`BPTLeafCSR::search_index` de O(n²) a O(n)):
+
+| Dataset | BTREE | CSR_HYBRID | Ratio v3/baseline |
+|---------|------:|-----------:|:-----------------:|
+| ogbn-arxiv | reference | 1.046× | ≈ paridad |
+
+El Gate D requería ≤ 1.20×; el resultado real (≈ 1.0×) significa que
+el scan es efectivamente equivalente al B+Tree original, con la
+reducción de disco del 81.5 % además.
+
+### Interacción con `buildTopologySnapshot`
+
+Cuando `graphStorage: 'CSR_HYBRID'` está activo, **`buildTopologySnapshot`
+es silenciosamente ignorado**. La razón es que los sidecar
+`topology_fwd.csr` + `topology_rev.csr` duplicaban on-disk el mismo
+layout CSR que ahora vive dentro de las hojas del B+Tree. El skip se
+aplica en `build_topology_snapshots_()` y no emite warning — es la
+semántica documentada del opt-in.
+
+Si se necesita el sidecar (por ejemplo, para tooling externo que aún
+no conoce v3), dejar `graphStorage: 'BTREE'` y activar
+`buildTopologySnapshot: true` es la configuración correcta; los dos
+caminos son mutuamente exclusivos a nivel de proyección.
+
+### Composabilidad con `indexSet` y `leafFormat`
+
+- `indexSet`: el scope de `CSR_HYBRID` son los índices de arista; si
+  el preset no materializa `FROM_TO_EDGE` / `TO_FROM_EDGE` (no aplica
+  a ningún preset actual), el flag es no-op.
+- `leafFormat`: `DELTA_VARINT` aplica a los índices de nodo y
+  propiedad incluso bajo `CSR_HYBRID`; el stream de dst interno al
+  page v3 siempre usa delta-varint independientemente del
+  `leafFormat` del resto de índices.
+- `MDB_PROJECTION_SORTER` (classic / radix): ambos backends producen
+  output v3 byte-idéntico bajo CSR_HYBRID, validado por T8.10.
+
+### Limitaciones conocidas (tracked for Spec #8-B)
+
+1. **`edge_id` no está persistido en v3.** El layout CSR emite solo
+   `(src-implied, dst)`; el edge_id queda implícito por posición. Las
+   queries GQL que cuentan aristas con `count(e)` o enlazan `e` a una
+   variable devuelven conteos inflados o ids sintéticos. Spec #8-B
+   añadirá un stream opcional `EDGE_IDS[]` gated por un flag del
+   header. Las queries que solo necesitan topología (el caso GNN)
+   funcionan sin esta extensión.
+2. **Sampling CSR en ogbn-arxiv bloqueado.** El flujo
+   `gnn_offline_sample` sobre una proyección `CSR_HYBRID` a escala
+   arxiv dispara un fallo `decode_tuple_` en la posición 3974 de una
+   hub-page. `cora_gnn` pasa correctamente. El benchmark T8.12
+   excluye arxiv+sampling en CSR_HYBRID para evitar falsos positivos;
+   el fix está planificado como Spec #8-B.
+
+### Layout on-disk
+
+Cada página v3 (4096 bytes) tiene la siguiente estructura:
+
+```
++--------------------------------------+  offset 0
+| header v3 (16 B)                      |   magic, version=3, record_width=3,
+|                                       |   num_src_nodes, num_edges, next_leaf
++--------------------------------------+  offset 16
+| offset_table[num_src_nodes + 1]       |   uint32 por entrada, apunta a byte
+|                                       |   offset dentro del payload por src
++--------------------------------------+
+| src_table[num_src_nodes]              |   full LEB128 src-ids (1-10 B cada)
++--------------------------------------+
+| csr_entries                           |   para cada src, lista de dst
+|   src_0: dst_0 (full varint),         |   codificada con DELTA_VARINT
+|          dst_1..dst_m (zigzag-delta)  |   (Spec #5 codec)
+|   src_1: dst_0 (full varint),         |
+|          ...                          |
++--------------------------------------+
+| zero-pad hasta 4096                   |
++--------------------------------------+
+```
+
+El reader valida en el primer open (T8.4): `format_version == 3`,
+`record_width == 3`, `num_src_nodes + 1 ≤ offset_table_cap`, cada
+offset está dentro del page. Cualquier corrupción eleva
+`BPTLeafCSRDecodeException` con offset preciso. Páginas v1 / v2
+siguen el camino existente sin cambios — el dispatch es a 3 vías en
+`BptIter` basado en el primer byte del header.
+
+### Hubs y split de páginas
+
+Cuando la adjacencia de un src excede el budget de página (4 KB), el
+writer parte la lista en páginas consecutivas enlazadas por
+`next_leaf`. Esto preserva la invariante single-file del B+Tree sin
+introducir una chain de overflow separada. En ogbn-arxiv (max degree
+13 161) cada hub ocupa 1-2 páginas; en papers100M (max degree 3.8 M)
+un hub ocupará ~940 páginas, caso que motiva el follow-up H1 en
+Spec #8-B.
+
+### Archivos
+
+- `src/storage/index/bplus_tree/bpt_leaf_csr_format.{h,cc}` — enum
+  value `LeafFormat::CSR_HYBRID` + v3 header struct + helpers.
+- `src/storage/index/bplus_tree/bplus_tree_leaf_csr.{h,cc}` —
+  `BPTLeafCSR` reader con cursor secuencial (T8.12b).
+- `src/storage/index/bplus_tree/bpt_mem_import.h` —
+  `BPTLeafCSRWriter` bulk-load, integrado en ambos pipelines de sort.
+- `src/graph_models/gql/projection/projection_catalog.{h,cc}` —
+  catalog v1.6 con byte `graphStorage` por proyección.
+- `src/query/procedure/builtin/project_procedure.cc` — parsing del
+  config key `graphStorage`.
+- `src/gnn/projection/topology_accessor.cc` — fast-path que detecta
+  v3 y bypasea el sidecar path.
+
+### Tests
+
+- Unit: `bpt_leaf_csr_format_test`, `bpt_leaf_csr_reader_test`,
+  `bpt_leaf_csr_writer_test`, `bpt_iter_dispatch_test` (extendido a
+  3 vías), `projection_catalog_v6_test`,
+  `projection_graph_storage_config_test`,
+  `graph_storage_integration_test`.
+- Fuzz: `bpt_leaf_csr_fuzz_test` — 500 K random + 10 K boundary + 1 K
+  tamper-flip, zero mismatches bajo seed `0xC5B8_1234_5678_9ABC`.
+- Integración: `scripts/test_projection_csr_hybrid.sh` — 4-mode
+  golden compare (BTREE/CSR_HYBRID × {classic, radix}) sobre cora_gnn
+  + check de supersedencia del sidecar.
+- Bench: `scripts/bench_csr_hybrid.sh` — Gate D harness (size + scan
+  throughput + GNN sampling por dataset × modo).
+
+### Construcción y backwards compat
+
+Las páginas v3 son inmutables: cambiar `graphStorage` requiere
+`drop_projection` + recrear. Proyecciones pre-Spec-#8 (catalog v1.5 y
+anteriores) se leen como `BTREE` implícitamente. El catalog v1.6
+añade exactamente un byte por proyección sobre v1.5 — sin impacto
+material en storage.
+
+### Referencias
+
+- Spec: `docs/superpowers/specs/2026-04-25-csr-hybrid-design.md`
+- Plan: `docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md`
+- ADR: `Partial_Idea/decisions/008_csr_hybrid.md`
+- Master plan: `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`

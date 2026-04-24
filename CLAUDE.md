@@ -338,6 +338,39 @@ Build time is unchanged in both directions (~0.06 s cora_gnn; ~3.1 s ogbn-arxiv)
 **Benchmark:** `scripts/bench_leaffmt.sh` (Gate C harness — size + read throughput per dataset × format).
 **Design record:** ADR 007 (`Partial_Idea/decisions/007_delta_varint_leaf.md`), spec `docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md`, plan `docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md`, master plan `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`.
 
+### Graph storage — `graphStorage` config parameter (added 2026-04-24, ADR 008)
+
+Spec #8 makes the B+Tree leaves of edge indexes **be** the CSR (Compressed Sparse Row) layout, unifying the Spec #4-B topology sidecar with the Spec #5 compressed leaf. Opt-in per projection via the `graph_project` config key `graphStorage`; scope is edge indexes only (`FROM_TO_EDGE`, `TO_FROM_EDGE`); persisted as a uint8 in catalog v1.6.
+
+- `graphStorage: 'BTREE'` (default) — legacy per-index B+Tree; leaf encoding follows `leafFormat` (BITSET or DELTA_VARINT). Catalog v1.5 and earlier projections read implicitly as BTREE.
+- `graphStorage: 'CSR_HYBRID'` — edge indexes emit v3 leaves: 16-byte header + offset table + src table + DELTA_VARINT-encoded dst stream. Node/property indexes preserve their `leafFormat`. When active, `buildTopologySnapshot` is silently ignored (the v3 leaves already provide O(1) neighbour access).
+
+Example (full compression stack):
+
+```gql
+CALL graph_project('gnn_proj', 'Paper', 'CITES', {
+    orientation: 'NATURAL',
+    indexSet: 'GNN_MINIMAL',
+    leafFormat: 'DELTA_VARINT',
+    graphStorage: 'CSR_HYBRID'
+}) YIELD graphName, nodeCount, relCount RETURN *
+```
+
+Empirical measurements (with `indexSet: 'GNN_MINIMAL'`):
+- **cora_gnn:** edge B+Trees 150 KB → 54 KB (-63.9%).
+- **ogbn-arxiv:** edge B+Trees 35 MB → 6.5 MB (-81.5%, ratio 0.185). Scan throughput 1.046× baseline (Gate D ≤ 1.20×) after T8.12b sequential cursor cache (commit `b9ca276f`, 343× fix). GNN sampling byte-identical on cora_gnn.
+
+Build time is unchanged; sort dominates. v3 pages are immutable — switching `graphStorage` requires `drop_projection` + recreate. Pre-Spec-#8 catalogs (v1.5 and earlier) read as BTREE with full backwards compat.
+
+**Known limitations (Spec #8-B follow-up):**
+1. `edge_id` is NOT persisted in the v3 layout — `count(e)` queries over CSR_HYBRID projections return inflated counts; GNN flows that only need topology are unaffected.
+2. `gnn_offline_sample` on arxiv-scale CSR_HYBRID projections hits a `decode_tuple_` failure at hub position 3974 (cora_gnn passes). Bench script excludes arxiv+sampling under CSR_HYBRID to avoid false-positive regressions.
+
+**Files:** `src/storage/index/bplus_tree/bpt_leaf_csr_format.{h,cc}` (enum + v3 header), `bplus_tree_leaf_csr.{h,cc}` (reader with sequential cursor cache), `bpt_mem_import.h` (`BPTLeafCSRWriter` bulk-load), `src/graph_models/gql/projection/projection_catalog.{h,cc}` (catalog v1.6 per-projection byte), `src/query/procedure/builtin/project_procedure.cc` (parse `graphStorage`), `src/gnn/projection/topology_accessor.cc` (v3 fast-path).
+**Tests:** unit suites `bpt_leaf_csr_format_test`, `bpt_leaf_csr_reader_test`, `bpt_leaf_csr_writer_test`, `bpt_iter_dispatch_test` (extended 3-way), `projection_catalog_v6_test`, `projection_graph_storage_config_test`, `graph_storage_integration_test`; fuzz `bpt_leaf_csr_fuzz_test` (500 K random + 10 K boundary + 1 K tamper-flip under seed `0xC5B8_1234_5678_9ABC`); integration `scripts/test_projection_csr_hybrid.sh` (4-mode golden compare + sidecar supersedence check).
+**Benchmark:** `scripts/bench_csr_hybrid.sh` (Gate D harness — size + scan throughput + GNN sampling per dataset × mode).
+**Design record:** ADR 008 (`Partial_Idea/decisions/008_csr_hybrid.md`), spec `docs/superpowers/specs/2026-04-25-csr-hybrid-design.md`, plan `docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md`, master plan `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`.
+
 ## Claude Code Configuration
 
 This project includes Claude Code configuration:
