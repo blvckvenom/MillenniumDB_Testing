@@ -50,12 +50,44 @@ public:
     /// flush time.
     explicit BPTLeafV2(char* page_bytes, uint32_t next_leaf = 0) noexcept;
 
+    /// Tag type used to disambiguate the reader-mode constructor from the
+    /// writer constructor above. Reader-mode is read-only and takes a
+    /// `const char*` since production callers pin the page via BufferManager
+    /// read-only; the writer-only fields (`payload_`, `prev_record_`,
+    /// `has_prev_`) are dead weight in reader state and are left zeroed.
+    struct ReadTag {};
+
+    /// Reader-mode construction. Parses and validates the 16-byte header at
+    /// the start of `page_bytes`, raising BPT::BPTLeafV2DecodeException if
+    /// any of the page-open validation invariants fail (design §5.5):
+    ///   - byte 0 must equal 2 (format_version)
+    ///   - byte 1 must equal N (record_width)
+    ///   - byte 2 (flags) must be 0 (reserved in Spec #5)
+    ///   - byte 3 (reserved) must be 0
+    ///   - value_count must be <= leaf_max_records_v2() = (PAGE_SIZE-16)/N
+    ///   - bytes 12..15 (reserved2) must be all zero
+    ///
+    /// The `ReadTag` parameter disambiguates from the writer ctor.
+    BPTLeafV2(const char* page_bytes, ReadTag);
+
     BPTLeafV2(const BPTLeafV2&)            = delete;
     BPTLeafV2& operator=(const BPTLeafV2&) = delete;
     BPTLeafV2(BPTLeafV2&&)                 = default;
     BPTLeafV2& operator=(BPTLeafV2&&)      = delete;
 
     ~BPTLeafV2() override = default;
+
+    /// Upper bound on the number of records a single v2 leaf page can hold.
+    /// 4080 bytes of payload budget divided by the minimum record size (N
+    /// varints at 1 byte each) gives the absolute ceiling. Used by the
+    /// ReadTag ctor to reject corrupted value_count fields cheaply.
+    static constexpr size_t leaf_max_records_v2() noexcept
+    {
+        // Page::SIZE - header = 4080 bytes of payload; each varint is at
+        // least 1 byte, and a Record<N> needs at least N varints, so the
+        // upper bound is 4080 / N.
+        return (4096 - 16) / N;
+    }
 
     /// Append one record to the in-memory buffer.
     ///
@@ -125,6 +157,13 @@ private:
     // overflow-check-before-commit protocol. Capacity is at most
     // Page::SIZE - sizeof(BPTLeafV2Header) = 4080 bytes.
     std::vector<uint8_t> payload_;
+
+    // Reader state (populated only by the ReadTag constructor). Writer ctor
+    // leaves these zeroed. When `read_page_bytes_ == nullptr` the instance
+    // was constructed in writer mode and the read-side methods either throw
+    // (non-noexcept) or return a sentinel (noexcept).
+    const char*             read_page_bytes_ = nullptr;  // mmap'd page
+    BPT::BPTLeafV2Header    read_header_{};              // deserialized header
 
     // Helper: encode one record into a scratch buffer. Returns the number of
     // bytes written. `prev_or_null == nullptr` for the first record (full

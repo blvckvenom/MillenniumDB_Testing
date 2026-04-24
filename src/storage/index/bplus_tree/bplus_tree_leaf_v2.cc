@@ -1,22 +1,28 @@
-// BPTLeafV2 write-path implementation (Spec #5 T5.7).
+// BPTLeafV2 write-path (T5.7) and read-path (T5.8) implementation.
 //
-// This file implements the encoder: append_record() serialises a Record<N>
-// as delta + LEB128 varint bytes against a running cursor, and flush()
-// commits the 16-byte v2 header plus the accumulated payload to the backing
-// 4 KB page buffer, zero-padding to Page::SIZE.
+// The writer (append_record + flush) serialises a Record<N> as delta +
+// LEB128 varint bytes against a running cursor, and flush() commits the
+// 16-byte v2 header plus the accumulated payload to the backing 4 KB page
+// buffer, zero-padding to Page::SIZE.
 //
-// The reader side (get_record, search_index, check_range, print, mutating
-// methods) is T5.8; those overrides here throw std::logic_error so the class
-// remains instantiable for the write path without committing to a
-// half-finished read-path contract.
+// The reader (ReadTag ctor + get_record + search_index) is fully live in
+// T5.8: ctor validates the header, get_record linear-decodes through the
+// varint stream accumulating the running cursor, and search_index scans
+// the records in-stream (design §3.4 — no binary search, no offset index).
+//
+// Mutation paths (insert, delete_record, update_to_next_leaf) throw
+// std::logic_error: v2 pages are immutable post-build per design §2.2
+// non-goal 6 ("Not supporting in-place mutation of v2 leaf pages").
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-//                 (§5.2 layout, §5.3 worked example, §5.4 padding)
+//                 (§5.2 layout, §5.3 worked example, §5.4 padding, §5.5
+//                  page-open validation)
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -159,76 +165,311 @@ size_t BPTLeafV2<N>::bytes_used() const noexcept
 }
 
 
-// ===== Read-side stubs (replaced by T5.8). ===================================
+// ===== Read-side implementation (T5.8). ======================================
 
 template <std::size_t N>
-Record<N> BPTLeafV2<N>::get_record(uint_fast32_t) const
+BPTLeafV2<N>::BPTLeafV2(const char* page_bytes, ReadTag) :
+    page_bytes_ (nullptr),   // writer-side buffer unused in reader mode
+    next_leaf_  (0),
+    read_page_bytes_ (page_bytes)
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    // Deserialize the 16-byte header from page_bytes[0..15].
+    uint8_t raw[sizeof(BPT::BPTLeafV2Header)];
+    std::memcpy(raw, page_bytes, sizeof(raw));
+    read_header_ = BPT::deserialize_header(raw);
+
+    // Validate (design §5.5).
+    if (read_header_.format_version != 2) {
+        throw BPT::BPTLeafV2DecodeException(
+            "invalid format_version at page offset 0 (expected 2, got "
+            + std::to_string(read_header_.format_version) + ")");
+    }
+    if (read_header_.record_width != N) {
+        throw BPT::BPTLeafV2DecodeException(
+            "record_width mismatch at page offset 1 (expected "
+            + std::to_string(N) + ", got "
+            + std::to_string(read_header_.record_width) + ")");
+    }
+    if (read_header_.flags != 0) {
+        throw BPT::BPTLeafV2DecodeException(
+            "non-zero flags byte at offset 2 (reserved in Spec #5)");
+    }
+    if (read_header_.reserved != 0) {
+        throw BPT::BPTLeafV2DecodeException(
+            "non-zero reserved byte at offset 3");
+    }
+    if (read_header_.reserved2 != 0) {
+        throw BPT::BPTLeafV2DecodeException(
+            "non-zero reserved2 field at offset 12");
+    }
+    if (read_header_.value_count > leaf_max_records_v2()) {
+        throw BPT::BPTLeafV2DecodeException(
+            "value_count " + std::to_string(read_header_.value_count)
+            + " exceeds leaf_max_records_v2 "
+            + std::to_string(leaf_max_records_v2()));
+    }
+
+    // Mirror the writer-facing fields so get_value_count() / has_next() /
+    // search_index() can read value_count_ and next_leaf_ uniformly.
+    value_count_ = read_header_.value_count;
+    next_leaf_   = read_header_.next_leaf;
+    // prev_record_ / has_prev_ / payload_ remain default-constructed —
+    // writer-only state.
 }
 
-template <std::size_t N>
-void BPTLeafV2<N>::set_record(uint_fast32_t, Record<N>&) const
-{
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
-}
 
 template <std::size_t N>
-void BPTLeafV2<N>::set_redundant_record(Record<N>&) const
+Record<N> BPTLeafV2<N>::get_record(uint_fast32_t pos) const
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    if (read_page_bytes_ == nullptr) {
+        throw std::logic_error(
+            "BPTLeafV2::get_record called on a writer-mode instance");
+    }
+    if (pos >= value_count_) {
+        throw std::out_of_range(
+            "BPTLeafV2::get_record position " + std::to_string(pos)
+            + " >= value_count " + std::to_string(value_count_));
+    }
+
+    const uint8_t* in  = reinterpret_cast<const uint8_t*>(read_page_bytes_) + kPayloadOffset;
+    const uint8_t* end = reinterpret_cast<const uint8_t*>(read_page_bytes_) + Page::SIZE;
+
+    // Running cursor: accumulated fields of the most recently decoded record.
+    uint64_t cursor[N] = {};
+
+    for (uint_fast32_t i = 0; i <= pos; ++i) {
+        for (std::size_t j = 0; j < N; ++j) {
+            uint64_t v = 0;
+            const size_t consumed = BPT::varint_decode(in, end, v);
+            in += consumed;
+            if (i == 0) {
+                cursor[j] = v;
+            } else {
+                // Zigzag-decoded delta is int64; adding to a uint64 is
+                // well-defined modular arithmetic via the static_cast. This
+                // mirrors the writer's `int64 delta = rec[j] - prev[j]` on
+                // the encode side.
+                const int64_t delta = BPT::zigzag_decode_u64(v);
+                cursor[j] += static_cast<uint64_t>(delta);
+            }
+        }
+    }
+
+    Record<N> rec;
+    for (std::size_t j = 0; j < N; ++j) {
+        rec[j] = cursor[j];
+    }
+    return rec;
 }
 
-template <std::size_t N>
-void BPTLeafV2<N>::update_record(uint_fast32_t, Record<N>&) const
-{
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
-}
 
 template <std::size_t N>
-uint_fast32_t BPTLeafV2<N>::search_index(const Record<N>&) const noexcept
+void BPTLeafV2<N>::set_record(uint_fast32_t pos, Record<N>& out) const
 {
-    // noexcept contract prevents throwing here. Return a sentinel that any
-    // caller invoking this on a T5.7 writer will treat as "no match found".
-    // T5.8 replaces this with the real linear-scan implementation.
-    return 0;
+    // Write-through semantics: out receives the decoded record.
+    out = get_record(pos);
 }
 
+
 template <std::size_t N>
-bool BPTLeafV2<N>::check_range(const Record<N>&) const
+void BPTLeafV2<N>::set_redundant_record(Record<N>& out) const
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    // V2 has no redundant-bitset concept (design §3.4 — delta encoding
+    // obsoletes it). Zero out `out` so callers that use this as an initial
+    // scratch value see a well-defined state. V1 callers that relied on
+    // set_redundant_record populating bitset-redundant bytes are not valid
+    // on a V2 page.
+    for (std::size_t j = 0; j < N; ++j) {
+        out[j] = 0;
+    }
 }
+
+
+template <std::size_t N>
+void BPTLeafV2<N>::update_record(uint_fast32_t pos, Record<N>& out) const
+{
+    // V1 semantics: overwrite only the non-redundant fields. V2 has no
+    // redundant fields, so every field is overwritten — equivalent to
+    // set_record on V2.
+    out = get_record(pos);
+}
+
+
+template <std::size_t N>
+uint_fast32_t BPTLeafV2<N>::search_index(const Record<N>& target) const noexcept
+{
+    // Design §3.4: linear scan, no binary search, no offset index.
+    // `noexcept` because the caller (BptIter) cannot handle exceptions
+    // here; a malformed page should have failed at ctor time. On
+    // per-record varint corruption we return value_count_ (no match) and
+    // the caller falls through to the next leaf.
+    if (read_page_bytes_ == nullptr) {
+        // Writer-mode instance; caller contract violation.
+        return 0;
+    }
+
+    const uint8_t* in  = reinterpret_cast<const uint8_t*>(read_page_bytes_) + kPayloadOffset;
+    const uint8_t* end = reinterpret_cast<const uint8_t*>(read_page_bytes_) + Page::SIZE;
+
+    uint64_t cursor[N] = {};
+
+    for (uint_fast32_t i = 0; i < value_count_; ++i) {
+        for (std::size_t j = 0; j < N; ++j) {
+            uint64_t v = 0;
+            size_t consumed = 0;
+            try {
+                consumed = BPT::varint_decode(in, end, v);
+            } catch (...) {
+                // In-page varint corruption on a noexcept path. Stop and
+                // return "not found"; caller descends to the next leaf.
+                return value_count_;
+            }
+            in += consumed;
+            if (i == 0) {
+                cursor[j] = v;
+            } else {
+                cursor[j] += static_cast<uint64_t>(BPT::zigzag_decode_u64(v));
+            }
+        }
+
+        // Compare the just-decoded record to target: find first cursor >= target.
+        bool lt = false;
+        for (std::size_t j = 0; j < N; ++j) {
+            if (cursor[j] < target[j]) { lt = true; break; }
+            if (cursor[j] > target[j]) { break; }
+        }
+        if (!lt) {
+            // cursor >= target; this is the first such record.
+            return i;
+        }
+    }
+    return value_count_;
+}
+
+
+template <std::size_t N>
+bool BPTLeafV2<N>::check_range(const Record<N>& r) const
+{
+    if (value_count_ == 0) {
+        return false;
+    }
+    const auto min = get_record(0);
+    const auto max = get_record(value_count_ - 1);
+    return min <= r && r <= max;
+}
+
+
+// ===== Mutation path: V2 is immutable (design §2.2 non-goal 6). ==============
 
 template <std::size_t N>
 std::unique_ptr<BPlusTreeSplit<N>>
 BPTLeafV2<N>::insert(const Record<N>&, bool&)
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    // V2 pages are immutable post-build (design §2.2 non-goal 6).
+    throw std::logic_error("BPTLeafV2 is immutable; insert() is not supported");
 }
 
 template <std::size_t N>
 bool BPTLeafV2<N>::delete_record(const Record<N>&)
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    // V2 pages are immutable post-build (design §2.2 non-goal 6).
+    throw std::logic_error("BPTLeafV2 is immutable; delete_record() is not supported");
 }
 
 template <std::size_t N>
 void BPTLeafV2<N>::update_to_next_leaf()
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    // V2 pages are immutable post-build (design §2.2 non-goal 6).
+    // Caller should construct a new BPTLeafV2(page_bytes, ReadTag) on the
+    // next page rather than mutating this instance.
+    throw std::logic_error("BPTLeafV2 is immutable; update_to_next_leaf() is not supported");
 }
 
-template <std::size_t N>
-bool BPTLeafV2<N>::check(std::ostream&) const
-{
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
-}
+
+// ===== Diagnostics ===========================================================
 
 template <std::size_t N>
-void BPTLeafV2<N>::print(std::ostream&) const
+bool BPTLeafV2<N>::check(std::ostream& os) const
 {
-    throw std::logic_error("BPTLeafV2 read path not yet implemented - T5.8");
+    if (read_page_bytes_ == nullptr) {
+        // Writer-mode: nothing to check on the page (flush has not happened
+        // or bytes are not readable through this instance's reader state).
+        os << "  WARNING: BPTLeafV2::check called on writer-mode instance\n";
+        return true;
+    }
+
+    if (value_count_ == 0) {
+        os << "  WARNING: empty v2 leaf. Ok only if the b+tree is empty.\n";
+        return true;
+    }
+
+    Record<N> x;
+    try {
+        x = get_record(0);
+    } catch (const BPT::BPTLeafV2DecodeException& e) {
+        os << "  ERROR: BPTLeafV2 decode failure at record 0: " << e.what() << "\n";
+        return false;
+    }
+
+    for (std::size_t i = 0; i < N; ++i) {
+        if (x[i] == 0xFFFF'FFFF'FFFF'FFFFULL) {
+            os << "  ERROR: record not_found(0xFFFF'FFFF'FFFF'FFFF) at BPTLeafV2\n";
+            return false;
+        }
+    }
+
+    Record<N> y;
+    for (uint32_t k = 1; k < value_count_; ++k) {
+        try {
+            y = get_record(k);
+        } catch (const BPT::BPTLeafV2DecodeException& e) {
+            os << "  ERROR: BPTLeafV2 decode failure at record " << k
+               << ": " << e.what() << "\n";
+            return false;
+        }
+        if (y <= x) {
+            os << "  ERROR: bad record order at BPTLeafV2\n";
+            for (std::size_t n = 0; n < N; ++n) {
+                os << "\t" << x[n];
+            }
+            os << "\n";
+            for (std::size_t n = 0; n < N; ++n) {
+                os << "\t" << y[n];
+            }
+            os << "\n";
+            return false;
+        }
+        x = y;
+    }
+    return true;
+}
+
+
+template <std::size_t N>
+void BPTLeafV2<N>::print(std::ostream& os) const
+{
+    os << "Printing Leaf:\n";
+    if (read_page_bytes_ == nullptr) {
+        os << "  (writer-mode instance; no page bytes to print)\n";
+        return;
+    }
+    for (uint_fast32_t i = 0; i < value_count_; ++i) {
+        Record<N> r;
+        try {
+            r = get_record(i);
+        } catch (const BPT::BPTLeafV2DecodeException& e) {
+            os << "  <decode error at record " << i << ": " << e.what() << ">\n";
+            return;
+        }
+        os << "  (";
+        for (std::size_t j = 0; j < N; ++j) {
+            if (j != 0) {
+                os << ", ";
+            }
+            os << r[j];
+        }
+        os << ")\n";
+    }
 }
 
 
