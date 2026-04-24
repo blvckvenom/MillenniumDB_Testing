@@ -99,4 +99,19 @@ size_t varint_size(uint64_t value) noexcept {
     return n;
 }
 
+uint64_t zigzag_encode_i64(int64_t v) noexcept {
+    // Cast to unsigned first to make the left-shift defined behavior.
+    // Right-shift of a signed int64 by 63 produces 0 or -1 (two's complement);
+    // casting to uint64 reinterprets -1 as 0xFFFF...FF which is exactly the
+    // sign-mask we want to XOR.
+    return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
+}
+
+int64_t zigzag_decode_u64(uint64_t v) noexcept {
+    // v & 1 extracts the sign bit we folded in. Negating it produces all-ones
+    // for negatives (sign-extend) or all-zeros for non-negatives. XOR with
+    // (v >> 1) unfolds the sign.
+    return static_cast<int64_t>((v >> 1) ^ (-static_cast<int64_t>(v & 1)));
+}
+
 }  // namespace BPT

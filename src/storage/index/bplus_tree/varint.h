@@ -60,4 +60,30 @@ size_t varint_decode(const uint8_t* in, const uint8_t* end, uint64_t& out_value)
 // actually writing — 1..10.
 size_t varint_size(uint64_t value) noexcept;
 
+// Zigzag encoder: maps int64_t -> uint64_t so that small-magnitude signed
+// integers (both positive and negative) encode to small uint64 values.
+//
+// Encoding: (v << 1) ^ (v >> 63)
+//   0   -> 0
+//   -1  -> 1
+//   1   -> 2
+//   -2  -> 3
+//   2   -> 4
+//   ...
+//
+// Paired with varint_encode, this gives 1 byte for |v| < 64, 2 bytes for
+// |v| < 8192, etc. Exact pairing with LEB128 means:
+//   |v| in [0, 2^6)   -> 1 byte
+//   |v| in [0, 2^13)  -> 2 bytes
+//   ...
+//   v == INT64_MIN    -> 10 bytes (maps to UINT64_MAX, which is the max
+//                                   varint length).
+uint64_t zigzag_encode_i64(int64_t v) noexcept;
+
+// Zigzag decoder: inverse of zigzag_encode_i64. Bit-identical roundtrip
+// for any int64 input, by construction.
+//
+// Decoding: (v >> 1) ^ -(int64_t)(v & 1)
+int64_t zigzag_decode_u64(uint64_t v) noexcept;
+
 }  // namespace BPT

@@ -20,6 +20,8 @@ using BPT::varint_decode;
 using BPT::varint_size;
 using BPT::VARINT_MAX_BYTES;
 using BPT::BPTLeafV2DecodeException;
+using BPT::zigzag_encode_i64;
+using BPT::zigzag_decode_u64;
 
 namespace {
 
@@ -266,5 +268,124 @@ TEST(Varint, Exception_ContainsOffset) {
         EXPECT_TRUE(msg.find("offset") != std::string::npos
                     || msg.find("consumed") != std::string::npos)
             << "message did not contain offset/consumed: " << msg;
+    }
+}
+
+// ----- Zigzag encoder/decoder tests (T5.5) ---------------------------------
+//
+// Zigzag folds the sign bit into the LSB of a uint64, so that small-magnitude
+// signed integers (positive or negative) encode to small uint64 values. When
+// composed with varint_encode this gives short LEB128 sequences for the
+// negative deltas that arise in v2 leaf encoding when the primary key
+// advances and a secondary field "rolls back" to a smaller value.
+
+TEST(Varint, Zigzag_Encode_Zero) {
+    EXPECT_EQ(zigzag_encode_i64(0), 0u);
+}
+
+TEST(Varint, Zigzag_Encode_PositiveOne) {
+    EXPECT_EQ(zigzag_encode_i64(1), 2u);
+}
+
+TEST(Varint, Zigzag_Encode_NegativeOne) {
+    EXPECT_EQ(zigzag_encode_i64(-1), 1u);
+}
+
+TEST(Varint, Zigzag_Encode_PositiveTwo) {
+    EXPECT_EQ(zigzag_encode_i64(2), 4u);
+}
+
+TEST(Varint, Zigzag_Encode_NegativeTwo) {
+    EXPECT_EQ(zigzag_encode_i64(-2), 3u);
+}
+
+TEST(Varint, Zigzag_Encode_Int64Max) {
+    // INT64_MAX = 2^63 - 1 maps to (2^63 - 1) << 1 = 2^64 - 2 = UINT64_MAX - 1.
+    EXPECT_EQ(zigzag_encode_i64(INT64_MAX), UINT64_MAX - 1u);
+}
+
+TEST(Varint, Zigzag_Encode_Int64Min) {
+    // INT64_MIN = -2^63 maps to UINT64_MAX (2^64 - 1). This is the worst-case
+    // varint (10 bytes) and the encoding that would trip a naive (v << 1)
+    // signed-shift implementation with UB on INT64_MIN.
+    EXPECT_EQ(zigzag_encode_i64(INT64_MIN), UINT64_MAX);
+}
+
+TEST(Varint, Zigzag_Roundtrip_Int64_Boundaries) {
+    // Hand-picked boundary values: zero, +/-1, +/-2, byte/word boundaries,
+    // int32 min/max and one past, plus int64 min/max. If any of these fails
+    // the encoder/decoder pair is broken in a way generic random testing
+    // might miss for thousands of iterations.
+    const std::array<int64_t, 15> values = {
+        0,
+        1, -1,
+        2, -2,
+        127, -128,
+        16383, -16384,
+        INT64_MAX, INT64_MIN,
+        INT32_MAX, INT32_MIN,
+        static_cast<int64_t>(INT32_MAX) + 1LL,
+        static_cast<int64_t>(INT32_MIN) - 1LL,
+    };
+    for (int64_t v : values) {
+        const uint64_t enc = zigzag_encode_i64(v);
+        const int64_t dec = zigzag_decode_u64(enc);
+        EXPECT_EQ(dec, v) << "value=" << v << " enc=" << enc;
+    }
+}
+
+TEST(Varint, Zigzag_Roundtrip_1000_Random) {
+    // Deterministic PRNG so a failure is reproducible without hunting for
+    // the seed. Uniform over the full int64 range — covers both signs.
+    std::mt19937_64 rng(0xCAFEBABEDEADBEEFULL);
+    std::uniform_int_distribution<int64_t> dist(INT64_MIN, INT64_MAX);
+    for (int i = 0; i < 1000; ++i) {
+        const int64_t v = dist(rng);
+        const uint64_t enc = zigzag_encode_i64(v);
+        const int64_t dec = zigzag_decode_u64(enc);
+        ASSERT_EQ(dec, v) << "iter=" << i << " value=" << v << " enc=" << enc;
+    }
+}
+
+TEST(Varint, Zigzag_EncodedOrder_Preserves_AbsValue_Near_Zero) {
+    // Small magnitudes (|v| <= 5) all fit in a single varint byte (since the
+    // zigzag-encoded uint64 is at most 10, well below 128).
+    for (int64_t v : {-5, -3, -1, 0, 1, 3, 5}) {
+        EXPECT_EQ(varint_size(zigzag_encode_i64(v)), 1u) << "value=" << v;
+    }
+    // Transition into the 2-byte band: |v| around 64 maps to encoded values
+    // around 128, where the 1-byte LEB128 limit (< 128) sits. The encoded
+    // size lands in {1, 2}.
+    for (int64_t v : {-64, 63, 64, -65}) {
+        const size_t s = varint_size(zigzag_encode_i64(v));
+        EXPECT_GE(s, 1u) << "value=" << v;
+        EXPECT_LE(s, 2u) << "value=" << v;
+    }
+    // Transition into the 3-byte band: |v| around 8192 maps to encoded values
+    // around 16384, where the 2-byte LEB128 limit (< 16384) sits. The encoded
+    // size lands in {2, 3}.
+    for (int64_t v : {-8192, 8191, 8192, -8193}) {
+        const size_t s = varint_size(zigzag_encode_i64(v));
+        EXPECT_GE(s, 2u) << "value=" << v;
+        EXPECT_LE(s, 3u) << "value=" << v;
+    }
+}
+
+TEST(Varint, Zigzag_Compose_Varint_Roundtrip) {
+    // The compose-then-decompose chain is what the v2 leaf writer/reader
+    // actually performs for signed deltas. Verify the full pipeline produces
+    // bit-identical input/output for a small set of representative values.
+    std::array<uint8_t, VARINT_MAX_BYTES> buf{};
+    for (int64_t v : {-1000000, -1, 0, 1, 1000000}) {
+        const uint64_t zz = zigzag_encode_i64(v);
+        const size_t n = varint_encode(zz, buf.data(), buf.size());
+        ASSERT_GE(n, 1u);
+        ASSERT_LE(n, VARINT_MAX_BYTES);
+        uint64_t decoded_zz = 0;
+        const size_t consumed = varint_decode(buf.data(), buf.data() + n, decoded_zz);
+        EXPECT_EQ(consumed, n) << "value=" << v;
+        EXPECT_EQ(decoded_zz, zz) << "value=" << v;
+        const int64_t decoded = zigzag_decode_u64(decoded_zz);
+        EXPECT_EQ(decoded, v) << "value=" << v;
     }
 }
