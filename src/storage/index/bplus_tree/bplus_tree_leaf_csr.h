@@ -33,6 +33,7 @@
 #include <memory>
 #include <ostream>
 #include <stdexcept>
+#include <vector>
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_base.h"
 #include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
@@ -46,6 +47,23 @@ class BPTLeafCSR : public BPTLeafBase<N> {
 public:
     /// Reader-mode tag. Disambiguates from a future writer-mode ctor (T8.5).
     struct ReadTag {};
+
+    /// Continuation-mode tag (Spec #8-B T8-B.1). Enables BptIter to open a
+    /// hub continuation page as a BPTLeafBase<N> view during cross-page
+    /// transitions, so BptIter can iterate the hub's remaining dsts that
+    /// spilled onto continuations. The chain-head reader cannot do this —
+    /// its ctor rejects continuations per I6.
+    ///
+    /// `owning_src_id` is the hub's src_id decoded from its chain-head entry;
+    /// continuation pages do not store it.
+    /// `prev_dst_carry` is the running dst cursor at the end of the previous
+    /// chunk (chain-head's last dst, or the previous continuation's last dst).
+    /// The first varint on this continuation decodes as a zigzag-delta
+    /// against this carry per the writer's §5.4 convention.
+    struct ContinuationTag {
+        uint64_t owning_src_id;
+        uint64_t prev_dst_carry;
+    };
 
     /// Read-mode construction. Validates the v3 header at the start of
     /// `page_bytes` (design §5.5 + T8.3 checks) and caches metadata,
@@ -63,6 +81,16 @@ public:
     ///   - value_count out of range for a single 4 KB page
     ///   - offset table not monotonically increasing or out of page bounds
     BPTLeafCSR(const char* page_bytes, ReadTag);
+
+    /// Continuation-mode construction (Spec #8-B T8-B.1). Validates the
+    /// v3 continuation header (format_version=3, record_width=N,
+    /// flags & kIsContinuation != 0, reserved=0), pre-decodes the chunk's
+    /// zigzag-delta varint stream against `prev_dst_carry` into an internal
+    /// buffer, and exposes them via the BPTLeafBase<N> contract so BptIter
+    /// can iterate the hub's remaining dsts.
+    ///
+    /// Raises BPT::BPTLeafCSRDecodeException on header / payload corruption.
+    BPTLeafCSR(const char* page_bytes, ContinuationTag tag);
 
     ~BPTLeafCSR() override = default;
 
@@ -145,6 +173,13 @@ private:
     // Payload starts at the offset table right after the 16-byte header.
     static constexpr std::size_t kHeaderBytes = sizeof(BPT::BPTLeafCSRHeader); // 16
 
+    // Two distinct decode modes share one class. ChainHead is the original
+    // reader opened by ReadTag — has offset table, multiple src entries.
+    // Continuation (T8-B.1) is the hub-chunk reader opened by ContinuationTag
+    // — no offset table, dsts pre-decoded into cont_dsts_, single owning_src_id.
+    enum class Mode : uint8_t { ChainHead, Continuation };
+    Mode                    mode_         = Mode::ChainHead;
+
     const char*             page_bytes_   = nullptr;
     BPT::BPTLeafCSRHeader   header_{};
 
@@ -153,13 +188,37 @@ private:
     // uint8_t* and decoded lazily via offset_at(i) so we don't rely on
     // alignment of the buffer (the buffer comes from BufferManager which
     // aligns to 4 KB, but unit tests may pass stack buffers).
+    //
+    // ChainHead mode only; null in Continuation mode.
     const uint8_t*          offset_table_ = nullptr;
 
-    // Cached total tuple count: sum of degrees across all src entries.
-    // Populated once at construction by a single linear scan of the
-    // offset table. Used by get_value_count() — the BptIter range scan
-    // would otherwise need to recompute this per call.
+    // Cached total tuple count: sum of PHYSICAL degrees across all src
+    // entries on this page (post T8-B.1 Bug-A fix). For a chain-head page
+    // carrying a hub whose on-disk `degree` header describes the TOTAL chain
+    // size (§3.9), physical_degrees_[i] holds only the dsts actually
+    // serialized on THIS page — varints past the entry boundary / page end
+    // are not counted. For a non-hub entry physical_degrees_[i] == stored
+    // degree.
+    //
+    // In Continuation mode, this equals chunk_count (the pre-decoded dst
+    // count) and is used by get_value_count() uniformly.
     uint32_t                total_tuples_ = 0;
+
+    // Per-src-entry physical tuple count (ChainHead mode only, length =
+    // header_.value_count). For non-hub entries: equal to the entry's stored
+    // `degree`. For hub chain-head entries where stored degree > physical
+    // varints, this is the count of varints actually present on THIS page.
+    std::vector<uint32_t>   physical_degrees_;
+
+    // Byte offset within the page where each src entry's col_idx varint
+    // stream begins (ChainHead mode only, length = header_.value_count).
+    // Pre-computed at construction to avoid re-decoding the (src_id, degree)
+    // header on every decode_tuple_ / find_src_entry call.
+    std::vector<uint32_t>   entry_col_idx_start_;
+
+    // Continuation mode state. Empty in ChainHead mode.
+    uint64_t                cont_owning_src_id_ = 0;
+    std::vector<uint64_t>   cont_dsts_;
 
     // Sequential-decode cache. When get_dst_at(start_offset, degree, i+1)
     // follows a get_dst_at(..., i) call with the same (start_offset, degree),

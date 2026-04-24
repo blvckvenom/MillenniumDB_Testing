@@ -765,3 +765,109 @@ TEST(BPTLeafCSRWriterTest, HubReadback_ChainTraversal)
         ASSERT_EQ(decoded[0].dsts[i], dsts[i]) << "i=" << i;
     }
 }
+
+// ============================================================================
+// T8-B.1 Bug-C — last continuation of a hub chain that is FOLLOWED by
+// another src must have next_leaf pointing at the next chain-head page, not
+// 0. Pre-fix the writer emitted next_leaf=0 on the tail continuation and
+// left the leaf chain broken at hub boundaries.
+// ============================================================================
+
+TEST(BPTLeafCSRWriterTest, HubFollowedBySrc_LeafChainContinuous)
+{
+    TempFile tf;
+    // src=1: a few dsts on one page (non-hub).
+    // src=42: hub, produces chain-head + continuations.
+    // src=777: a regular single-page entry AFTER the hub's continuations.
+    const std::size_t hub_deg = 2000;
+    auto hub_dsts = make_hub_dsts(hub_deg, (1ULL << 14));
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path);
+        w.append(rec(1, 10));
+        w.append(rec(1, 11));
+        for (uint64_t d : hub_dsts) w.append(rec(42, d));
+        for (uint64_t d = 1; d <= 5; ++d) w.append(rec(777, 9000 + d));
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+
+    auto bytes = read_file_bytes(tf.path);
+    ASSERT_EQ(bytes.size(), static_cast<std::size_t>(Page::SIZE) * pages_written);
+
+    // Find the last continuation page in the file. Its next_leaf MUST be
+    // the page number of the following chain-head (which hosts src=777),
+    // NOT 0.
+    int last_continuation_idx = -1;
+    for (uint32_t pg = 0; pg < pages_written; ++pg) {
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(page_at(bytes, pg));
+        if (raw[0] == 3 && (raw[2] & BPT::CSRHybridFlags::kIsContinuation) != 0) {
+            last_continuation_idx = static_cast<int>(pg);
+        }
+    }
+    ASSERT_GE(last_continuation_idx, 0);
+
+    const uint8_t* last_cont = reinterpret_cast<const uint8_t*>(
+        page_at(bytes, last_continuation_idx));
+    uint32_t next_leaf =  static_cast<uint32_t>(last_cont[8])
+                       | (static_cast<uint32_t>(last_cont[9])  <<  8)
+                       | (static_cast<uint32_t>(last_cont[10]) << 16)
+                       | (static_cast<uint32_t>(last_cont[11]) << 24);
+
+    // The immediately following page must be a chain-head holding src=777.
+    const uint32_t expected_next = static_cast<uint32_t>(last_continuation_idx + 1);
+    EXPECT_EQ(next_leaf, expected_next)
+        << "last continuation's next_leaf should point at the chain-head of "
+           "the subsequent src, not 0";
+
+    // Cross-check: that page IS a chain-head and its only src entries reach
+    // src=777.
+    const uint8_t* head_after = reinterpret_cast<const uint8_t*>(
+        page_at(bytes, expected_next));
+    EXPECT_EQ(head_after[0], 3u);
+    EXPECT_EQ(head_after[2] & BPT::CSRHybridFlags::kIsContinuation, 0);
+    BPTLeafCSR<3> leaf_after(reinterpret_cast<const char*>(head_after),
+                             BPTLeafCSR<3>::ReadTag{});
+    uint32_t off = 0, deg = 0;
+    EXPECT_TRUE(leaf_after.find_src_entry(777, off, deg));
+    EXPECT_EQ(deg, 5u);
+}
+
+TEST(BPTLeafCSRWriterTest, HubIsLast_LastContinuationNextLeafZero)
+{
+    // Regression: when the hub is the LAST src, the last continuation's
+    // next_leaf must stay 0 (no patch). This is the case
+    // HubSrc_SpansThreePages already covers at a higher level, but we
+    // assert on the raw bytes here for clarity.
+    TempFile tf;
+    const std::size_t hub_deg = 2000;
+    auto hub_dsts = make_hub_dsts(hub_deg, (1ULL << 14));
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path);
+        for (uint64_t d : hub_dsts) w.append(rec(99, d));
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    auto bytes = read_file_bytes(tf.path);
+
+    // Last continuation page.
+    int last_cont_idx = -1;
+    for (uint32_t pg = 0; pg < pages_written; ++pg) {
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(page_at(bytes, pg));
+        if (raw[0] == 3 && (raw[2] & BPT::CSRHybridFlags::kIsContinuation) != 0) {
+            last_cont_idx = static_cast<int>(pg);
+        }
+    }
+    ASSERT_GE(last_cont_idx, 0);
+
+    const uint8_t* last = reinterpret_cast<const uint8_t*>(
+        page_at(bytes, last_cont_idx));
+    uint32_t next_leaf =  static_cast<uint32_t>(last[8])
+                       | (static_cast<uint32_t>(last[9])  <<  8)
+                       | (static_cast<uint32_t>(last[10]) << 16)
+                       | (static_cast<uint32_t>(last[11]) << 24);
+    EXPECT_EQ(next_leaf, 0u);
+}

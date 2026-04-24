@@ -455,38 +455,75 @@ const Record<N>* BptIter<N>::next() {
                 }
             }
             if (leaf_format_ == BPT::LeafFormat::CSR_HYBRID) {
-                // Cross-page transition for v3 pages (Spec #8).
+                // Cross-page transition for v3 pages (Spec #8 / T8-B.1).
                 //
-                // T8.6 scope limitation: this path handles only the simple
-                // chain-head-to-chain-head transition where the current
-                // page represents a single-page (non-hub) adjacency
-                // sequence. Hub chains that span multiple pages — where
-                // the chain-head's `next_leaf` points at a continuation
-                // page (flags bit 0 set) — are T8.9's scope (the
-                // TopologyAccessor fast path follows chains via the
-                // chain_head_page_id back-pointer). If this transition
-                // lands on a continuation page, the v3 reader's
-                // constructor raises BPTLeafCSRDecodeException, which is
-                // the desired loud-fail behavior for the current
-                // iterator contract.
+                // Two sub-cases depending on the new page's flags byte:
+                //   (a) Chain-head page (flags bit 0 clear): open via
+                //       BPTLeafCSR<N>::ReadTag, as before.
+                //   (b) Continuation page (flags bit 0 set): open via
+                //       BPTLeafCSR<N>::ContinuationTag, carrying over the
+                //       owning src_id and last dst of the CURRENT page so
+                //       the hub's spilled adjacency is iterable end-to-end.
+                //
+                // Before T8-B.1 this branch unconditionally used ReadTag
+                // which rejected continuation pages, causing hub sampling
+                // on arxiv-scale projections to fail mid-iteration.
                 if constexpr (N >= 2 && N <= 3) {
                     auto* v1 = dynamic_cast<BPTLeafV1<N>*>(current_leaf_.get());
                     if (v1 == nullptr) return nullptr;  // defensive
+
+                    // Carry state from the CURRENT page before we drop it.
+                    // If the current page returned at least one tuple, the
+                    // BptIter has already seen a record — use the last
+                    // emitted record's src/dst as the carry-over for a
+                    // continuation page. If the current page was empty
+                    // (value_count=0), no continuation can legitimately
+                    // follow; fall back to (0, 0) — writer invariant
+                    // guarantees an empty chain-head has no continuations.
+                    uint64_t carry_src_id   = 0;
+                    uint64_t carry_prev_dst = 0;
+                    if (reader->get_value_count() > 0) {
+                        carry_src_id   = current_record[0];
+                        carry_prev_dst = current_record[1];
+                    }
+
                     // Read next-leaf page number from the v3 header
-                    // (bytes 8..11, little-endian) — same slot as v2.
+                    // (bytes 8..11, little-endian) — same slot across
+                    // chain-head and continuation variants.
                     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(
                         v1->get_page().get_bytes());
                     uint32_t next_page_number = 0;
                     std::memcpy(&next_page_number, bytes + 8, sizeof(uint32_t));
                     const FileId leaf_file_id = v1->get_page().page_id.file_id;
+
                     // Drop the v3 view first, then the v1 pin holder.
                     v3_reader_.reset();
                     current_leaf_.reset();  // V1 dtor unpins the old page
                     Page& new_page = buffer_manager.get_page_readonly(
                         leaf_file_id, next_page_number);
                     current_leaf_ = std::make_unique<BPTLeafV1<N>>(&new_page);
-                    v3_reader_ = open_v3_reader_over_pinned_page_<N>(
-                        current_leaf_.get());
+
+                    // Sniff the new page's continuation flag. The 16-byte
+                    // header layout guarantees flags is at byte 2 regardless
+                    // of chain-head vs continuation variant.
+                    const uint8_t* new_bytes = reinterpret_cast<const uint8_t*>(
+                        new_page.get_bytes());
+                    const bool is_continuation =
+                        (new_bytes[2] & BPT::CSRHybridFlags::kIsContinuation) != 0;
+
+                    if (is_continuation) {
+                        try {
+                            v3_reader_ = std::make_unique<BPTLeafCSR<N>>(
+                                new_page.get_bytes(),
+                                typename BPTLeafCSR<N>::ContinuationTag{
+                                    carry_src_id, carry_prev_dst});
+                        } catch (const BPT::BPTLeafCSRDecodeException&) {
+                            return nullptr;  // corrupt continuation; stop
+                        }
+                    } else {
+                        v3_reader_ = open_v3_reader_over_pinned_page_<N>(
+                            current_leaf_.get());
+                    }
                     reader = v3_reader_ ? v3_reader_.get() : current_leaf_.get();
                     current_pos = 0;
                     continue;

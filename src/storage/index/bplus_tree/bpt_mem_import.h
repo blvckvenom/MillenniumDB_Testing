@@ -295,6 +295,7 @@ public:
         , current_page_bytes_used_(0)
         , staging_has_(false)
         , staging_src_(0)
+        , pending_cont_patch_page_(UINT32_MAX)
     {
         if (!file_.is_open()) {
             // Retry without the `in` flag — some std::fstream impls refuse
@@ -476,6 +477,37 @@ private:
         return Page::SIZE - total_used;
     }
 
+    // Patch the last-emitted continuation's next_leaf to point at the page
+    // about to be written (T8-B.1 Bug-C fix). emit_hub_continuation_ writes
+    // the tail continuation with next_leaf=0 because it doesn't yet know
+    // whether a subsequent src will open a new chain-head page. This
+    // helper, called immediately before every new page write that follows
+    // a hub chain, resolves the forward pointer so the leaf chain stays
+    // walkable across the hub.
+    void patch_pending_continuation_next_leaf_(uint32_t target_page_num) noexcept
+    {
+        if (pending_cont_patch_page_ == UINT32_MAX) return;
+
+        const std::streamoff patch_byte_off =
+            static_cast<std::streamoff>(pending_cont_patch_page_)
+          * static_cast<std::streamoff>(Page::SIZE)
+          + 8;  // next_leaf is at bytes 8..11
+        const std::streamoff resume_pos =
+            static_cast<std::streamoff>(pages_written_)
+          * static_cast<std::streamoff>(Page::SIZE);
+
+        char patch_bytes[4];
+        patch_bytes[0] = static_cast<char>( target_page_num        & 0xFFu);
+        patch_bytes[1] = static_cast<char>((target_page_num >>  8) & 0xFFu);
+        patch_bytes[2] = static_cast<char>((target_page_num >> 16) & 0xFFu);
+        patch_bytes[3] = static_cast<char>((target_page_num >> 24) & 0xFFu);
+        file_.seekp(patch_byte_off, std::ios::beg);
+        file_.write(patch_bytes, 4);
+        file_.seekp(resume_pos, std::ios::beg);
+
+        pending_cont_patch_page_ = UINT32_MAX;
+    }
+
     // Write the current buffered page (with the given header fields) to
     // disk. After writing, resets per-page state for the next chain-head
     // page. Does NOT touch staging_ fields.
@@ -484,6 +516,11 @@ private:
                                 uint32_t value_or_chunk_count,
                                 uint32_t min_src_or_head) noexcept
     {
+        // Before writing this page, patch any dangling continuation next_leaf
+        // so the leaf chain walks into this page. pages_written_ is the
+        // page number about to be assigned.
+        patch_pending_continuation_next_leaf_(pages_written_);
+
         // Assemble header.
         BPT::BPTLeafCSRHeader h{};
         h.format_version = 3;
@@ -545,6 +582,12 @@ private:
                                 uint32_t        chain_head_page_id,
                                 uint64_t        prev_dst_carry) noexcept
     {
+        // A continuation page that is itself NOT the first continuation in
+        // its own chain may need to patch a prior-chain dangling next_leaf
+        // (e.g. back-to-back hubs). The forward pointer we're writing here
+        // is authoritative; patch any earlier dangling ptr to point at us.
+        patch_pending_continuation_next_leaf_(pages_written_);
+
         std::memset(buffer_, 0, Page::SIZE);
 
         // Header as continuation variant.
@@ -759,8 +802,13 @@ private:
             prev_dst_carry = carry;
         }
 
-        // Emit continuations.
+        // Emit continuations. The LAST continuation is emitted with
+        // next_leaf=0 initially; if a subsequent chain-head page follows
+        // (another src), patch_pending_continuation_next_leaf_ will rewrite
+        // it at the next page-write callsite (T8-B.1 Bug-C fix). If no src
+        // follows, the 0 correctly marks end-of-chain.
         const uint32_t first_continuation_page_num = pages_written_;
+        uint32_t last_continuation_page_num = UINT32_MAX;
         for (std::size_t s = 0; s < slices.size(); ++s) {
             const auto& sl = slices[s];
             const bool is_last = (s + 1 == slices.size());
@@ -771,6 +819,12 @@ private:
                                    next,
                                    chain_head_page_num,
                                    sl.prev_carry);
+            if (is_last) {
+                last_continuation_page_num = this_page_num;
+            }
+        }
+        if (last_continuation_page_num != UINT32_MAX) {
+            pending_cont_patch_page_ = last_continuation_page_num;
         }
 
         // Patch the chain-head's next_leaf to point at the first
@@ -883,6 +937,12 @@ private:
     bool                  staging_has_;
     uint64_t              staging_src_;
     std::vector<uint64_t> staging_dsts_;
+
+    // Bug-C patch state (T8-B.1). When emit_hub_chain_ writes a continuation
+    // chain whose last page has next_leaf=0, we record its page number here;
+    // the next new-page write callsite patches its next_leaf to the new page
+    // before proceeding. UINT32_MAX == no pending patch.
+    uint32_t pending_cont_patch_page_;
 };
 
 template<std::size_t N>

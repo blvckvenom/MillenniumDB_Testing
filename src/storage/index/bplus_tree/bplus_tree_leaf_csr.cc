@@ -17,6 +17,7 @@
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_csr.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -139,15 +140,32 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
         }
     }
 
-    // --- Compute total_tuples_ (sum of degrees) by a single pass ---
+    // --- Compute physical tuple counts per entry (T8-B.1 Bug-A fix) ---
     //
-    // We decode each src entry's header (src_id varint + degree varint)
-    // to accumulate total tuples. This also cross-checks that the entry
-    // headers are well-formed varints at construction time, so the
-    // BPTLeafBase contract methods can assume valid headers later.
+    // Pre-fix, this loop accumulated stored `degree` values directly. But
+    // hub entries' stored degree is the TOTAL chain size (design §3.9), and
+    // only a subset of those dsts is physically serialized on the chain-head
+    // page — the rest spills onto continuation pages. Summing stored degrees
+    // inflated total_tuples_, causing BptIter to walk past the physical end
+    // of the varint stream and crash in decode_tuple_.
+    //
+    // The fix: count the actual varints present on THIS page per entry by
+    // decoding the col_idx stream until one of:
+    //   (a) stored `degree` varints consumed (non-hub or chain-head whose
+    //       dsts all fit on the page),
+    //   (b) the next varint would start at or beyond the next entry's
+    //       offset_table[i+1] (hit the neighbor boundary),
+    //   (c) the next varint would start at or beyond kPageSize (last entry
+    //       on page, hit page end).
+    //
+    // Also cache entry_col_idx_start_[i] so decode_tuple_ / find_src_entry
+    // don't have to re-decode the (src_id, degree) header on every call.
 
     const uint8_t* const page_start = reinterpret_cast<const uint8_t*>(page_bytes_);
     const uint8_t* const page_end   = page_start + kPageSize;
+
+    physical_degrees_.assign(vc, 0);
+    entry_col_idx_start_.assign(vc, 0);
 
     uint64_t running_total = 0;
     for (uint_fast32_t i = 0; i < vc; ++i) {
@@ -166,19 +184,67 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
         }
         (void)src_id; // decoded only for bounds validation
 
-        // Sanity: degree cannot exceed the number of uint64 that could fit
-        // in a single page even if every varint were 1 byte. For a
-        // non-chained entry this is conservative; chained hubs store
-        // `degree` that covers the combined chain, which can exceed
-        // single-page capacity — the cross-check below is thus only a
-        // ceiling against gross corruption, not a tight bound.
         if (degree > static_cast<uint64_t>(UINT32_MAX)) {
             throw BPT::BPTLeafCSRDecodeException(
                 "implausible degree " + std::to_string(degree)
                 + " at src index " + std::to_string(i));
         }
 
-        running_total += degree;
+        entry_col_idx_start_[i] = static_cast<uint32_t>(in - page_start);
+
+        // Boundary for this entry's col_idx stream: either the next entry's
+        // offset_table slot, or the page end for the last entry.
+        const uint8_t* boundary = page_end;
+        if (i + 1 < vc) {
+            const uint32_t next_off = offset_at_(i + 1);
+            boundary = page_start + next_off;
+        }
+
+        // Walk varints until stored degree is exhausted OR next varint
+        // would cross the boundary OR we hit the zero-padding sentinel
+        // (see below). Physical count is min(stored, actual).
+        //
+        // Zero-padding detection for hub chain-heads:
+        // the chain-head of a hub carries a stored `degree` that reflects
+        // the TOTAL chain size (including dsts spilled onto continuation
+        // pages); only `k_on_head <= degree` dsts are physically serialized
+        // here and the tail is zero-padded. A zigzag-delta of 0 (encoded
+        // as the single byte 0x00) means dst[k] == dst[k-1] — a duplicate
+        // edge, which violates the per-src distinct-dst invariant enforced
+        // by the GQL projection builder (see `native_projection_builder.cc`
+        // dedup + sort). Therefore, seeing a 0x00 delta byte at position
+        // k >= 1 marks the start of zero-padding and we stop counting.
+        //
+        // This heuristic does NOT apply to position 0 (full varint, not a
+        // delta — the first dst can legitimately be 0 for node id 0), nor
+        // to continuation pages (chunk_count is authoritative and
+        // pre-decoded by the ContinuationTag ctor).
+        uint64_t phys = 0;
+        const uint8_t* cursor = in;
+        while (phys < degree) {
+            if (cursor >= boundary) {
+                break;
+            }
+            // Zero-padding sentinel: a single 0x00 byte at position phys>=1
+            // is a zigzag-delta=0, meaning a duplicate-dst that writer
+            // output never produces.
+            if (phys >= 1 && *cursor == 0x00) {
+                break;
+            }
+            uint64_t v = 0;
+            std::size_t consumed = 0;
+            try {
+                consumed = BPT::varint_decode(cursor, boundary, v);
+            } catch (...) {
+                // Next varint would span the boundary — stop here.
+                break;
+            }
+            cursor += consumed;
+            ++phys;
+        }
+
+        physical_degrees_[i] = static_cast<uint32_t>(phys);
+        running_total += phys;
     }
 
     if (running_total > static_cast<uint64_t>(UINT32_MAX)) {
@@ -186,6 +252,105 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
             "total tuples on page exceeds uint32 range");
     }
     total_tuples_ = static_cast<uint32_t>(running_total);
+}
+
+
+// ============================================================================
+// Continuation-mode ctor (T8-B.1 Bug-B fix)
+// ============================================================================
+//
+// Opens a v3 continuation page as a BPTLeafBase<N> view. Validates header,
+// pre-decodes all `chunk_count` zigzag-delta varints starting from
+// `tag.prev_dst_carry` into cont_dsts_, and sets total_tuples_ = chunk_count
+// so BptIter can iterate the dsts via get_record / update_record.
+//
+// This is the ONLY legal path to open a continuation page. The ReadTag
+// ctor still rejects continuation pages per I6 — directory-routed opens
+// should never land on a continuation.
+
+template <std::size_t N>
+BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ContinuationTag tag) :
+    mode_(Mode::Continuation),
+    page_bytes_(page_bytes)
+{
+    if (page_bytes_ == nullptr) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "BPTLeafCSR: null page_bytes passed to continuation ctor");
+    }
+
+    // Validate header bytes 0..3 before trusting anything else.
+    const uint8_t* const page_start = reinterpret_cast<const uint8_t*>(page_bytes_);
+    if (page_start[0] != 3) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "continuation ctor: format_version != 3 (got "
+            + std::to_string(page_start[0]) + ")");
+    }
+    if (page_start[1] != static_cast<uint8_t>(N)) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "continuation ctor: record_width mismatch (expected "
+            + std::to_string(N) + ", got "
+            + std::to_string(page_start[1]) + ")");
+    }
+    if ((page_start[2] & BPT::CSRHybridFlags::kReservedMask) != 0) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "continuation ctor: reserved flag bits non-zero");
+    }
+    if ((page_start[2] & BPT::CSRHybridFlags::kIsContinuation) == 0) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "continuation ctor: kIsContinuation flag is clear "
+            "(expected a continuation page)");
+    }
+    if (page_start[3] != 0) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "continuation ctor: reserved byte at offset 3 non-zero");
+    }
+
+    // Deserialize header in the continuation view (same 16 bytes, but the
+    // last uint32 has different semantics — chain_head_page_id). We route
+    // it through the chain-head struct anyway for storage-compat reasons
+    // (header_ is shared across modes); only fields actually used per-mode
+    // are read.
+    uint8_t raw[kHeaderBytes];
+    std::memcpy(raw, page_bytes_, sizeof(raw));
+    header_ = BPT::deserialize_csr_header(raw);
+
+    cont_owning_src_id_ = tag.owning_src_id;
+
+    // Pre-decode all chunk_count zigzag-delta varints starting from
+    // prev_dst_carry.
+    const uint32_t chunk_count = header_.value_count;  // chunk_count in this mode
+
+    // Upper bound: a continuation payload is at most kPageSize - 16 bytes
+    // at 1 byte per varint = 4080 varints. Refuse anything larger than that
+    // as grossly corrupt.
+    const uint32_t max_possible = static_cast<uint32_t>(kPageSize - kHeaderBytes);
+    if (chunk_count > max_possible) {
+        throw BPT::BPTLeafCSRDecodeException(
+            "continuation chunk_count " + std::to_string(chunk_count)
+            + " exceeds plausible bound " + std::to_string(max_possible));
+    }
+
+    cont_dsts_.reserve(chunk_count);
+
+    const uint8_t* const page_end = page_start + kPageSize;
+    const uint8_t* in             = page_start + kHeaderBytes;
+    uint64_t running              = tag.prev_dst_carry;
+
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        uint64_t v = 0;
+        try {
+            in += BPT::varint_decode(in, page_end, v);
+        } catch (const std::exception& e) {
+            throw BPT::BPTLeafCSRDecodeException(
+                std::string("continuation payload decode failure at i=")
+                + std::to_string(i) + ": " + e.what());
+        }
+        const int64_t delta = BPT::zigzag_decode_u64(v);
+        running += static_cast<uint64_t>(delta);
+        cont_dsts_.push_back(running);
+    }
+
+    total_tuples_ = chunk_count;
 }
 
 
@@ -288,11 +453,9 @@ uint32_t BPTLeafCSR<N>::src_entry_count() const noexcept
 template <std::size_t N>
 bool BPTLeafCSR<N>::is_chain_head() const noexcept
 {
-    // Construction rejected continuation pages, so every successfully-
-    // constructed instance is a chain head (possibly a trivial one-page
-    // chain). Expose the bit explicitly so future T8.9 code that opens
-    // a continuation via a lower-level path can share the accessor.
-    return (header_.flags & BPT::CSRHybridFlags::kIsContinuation) == 0;
+    // Continuation-mode instances (T8-B.1) report false; ReadTag-opened
+    // instances report true.
+    return mode_ == Mode::ChainHead;
 }
 
 
@@ -430,6 +593,17 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             + " >= total_tuples " + std::to_string(total_tuples_));
     }
 
+    // Continuation mode: dsts are pre-decoded into cont_dsts_ during ctor,
+    // all with the same owning src_id. Short-circuit ahead of the chain-head
+    // offset-table walk.
+    if (mode_ == Mode::Continuation) {
+        Record<N> rec{};
+        if constexpr (N >= 1) rec[0] = cont_owning_src_id_;
+        if constexpr (N >= 2) rec[1] = cont_dsts_[pos];
+        if constexpr (N >= 3) rec[2] = 0;
+        return rec;
+    }
+
     const uint8_t* const page_start = reinterpret_cast<const uint8_t*>(page_bytes_);
     const uint8_t* const page_end   = page_start + kPageSize;
 
@@ -452,7 +626,10 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
         && pos == seq_tuple_pos_ + 1
         && seq_tuple_entry_idx_ < header_.value_count)
     {
-        // (a) Stay in the same src entry, advance within it.
+        // (a) Stay in the same src entry, advance within it. Note that
+        // seq_tuple_entry_degree_ is the PHYSICAL degree (T8-B.1 Bug-A fix),
+        // not the stored degree — so this bound reflects actual varints
+        // present on this page, not the hub-total stored in the entry header.
         if (seq_tuple_within_idx_ + 1 < seq_tuple_entry_degree_) {
             const uint_fast32_t next_within = seq_tuple_within_idx_ + 1;
             uint64_t dst_value = 0;
@@ -471,40 +648,37 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             }
             // get_dst_at failure falls through to the linear restart below.
         } else {
-            // (b) Cross into the next src entry. Decode its header once.
+            // (b) Cross into the next src entry. Use cached start offset and
+            // physical degree (T8-B.1 Bug-A fix) — no header re-decode needed.
             const uint_fast32_t next_entry = seq_tuple_entry_idx_ + 1;
             if (next_entry < header_.value_count) {
                 const uint32_t off = offset_at_(next_entry);
                 const uint8_t* in  = page_start + off;
 
                 uint64_t src_id = 0;
-                uint64_t degree = 0;
                 bool hdr_ok = true;
                 try {
+                    // Only src_id needs re-decode for the record; physical
+                    // degree + dst stream start are pre-cached.
                     in += BPT::varint_decode(in, page_end, src_id);
-                    in += BPT::varint_decode(in, page_end, degree);
                 } catch (...) {
                     hdr_ok = false;
                 }
 
-                if (hdr_ok && degree > 0) {
+                const uint32_t phys_deg = physical_degrees_[next_entry];
+                if (hdr_ok && phys_deg > 0) {
                     const uint32_t dst_start_off =
-                        static_cast<uint32_t>(in - page_start);
+                        entry_col_idx_start_[next_entry];
                     uint64_t dst_value = 0;
-                    // Fresh entry: the dst-level cache must not be reused
-                    // across different start_offsets. get_dst_at with i=0
-                    // against a new start_offset misses the cache and
-                    // restarts from the first varint, which is the desired
-                    // behavior.
                     if (get_dst_at(dst_start_off,
-                                   static_cast<uint32_t>(degree),
+                                   phys_deg,
                                    0,
                                    dst_value))
                     {
                         seq_tuple_entry_idx_ = next_entry;
                         seq_tuple_entry_cumulative_ =
                             seq_tuple_entry_cumulative_ + seq_tuple_entry_degree_;
-                        seq_tuple_entry_degree_  = static_cast<uint32_t>(degree);
+                        seq_tuple_entry_degree_  = phys_deg;
                         seq_tuple_dst_start_off_ = dst_start_off;
                         seq_tuple_src_id_        = src_id;
                         seq_tuple_within_idx_    = 0;
@@ -529,61 +703,50 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
     // ---- Fallback: linear walk over the offset table ----------------------
     //
     // Used for random access, backwards access, the first call, or any
-    // fast-path failure. Walk the offset table accumulating degrees until
+    // fast-path failure. Walk physical degrees (T8-B.1 Bug-A fix) until
     // the entry containing `pos` is located; then decode its within-entry
     // dst. Populate the sequential cache so subsequent pos+1 calls take the
     // fast path above.
 
     uint_fast32_t cumulative = 0;
     for (uint_fast32_t i = 0; i < header_.value_count; ++i) {
-        const uint32_t off = offset_at_(i);
-        const uint8_t* in  = page_start + off;
+        const uint32_t phys_deg = physical_degrees_[i];
 
-        uint64_t src_id = 0;
-        uint64_t degree = 0;
-        in += BPT::varint_decode(in, page_end, src_id);
-        in += BPT::varint_decode(in, page_end, degree);
-
-        if (pos < cumulative + degree) {
-            // The tuple falls in this entry. Compute its within-entry index.
+        if (pos < cumulative + phys_deg) {
+            // The tuple falls in this entry. Compute within-entry index.
             const uint_fast32_t within = pos - cumulative;
 
-            const uint32_t dst_start_off = static_cast<uint32_t>(in - page_start);
+            // Decode only src_id (degree + stream start are pre-cached).
+            const uint32_t off = offset_at_(i);
+            const uint8_t* in  = page_start + off;
+            uint64_t src_id = 0;
+            in += BPT::varint_decode(in, page_end, src_id);
+
+            const uint32_t dst_start_off = entry_col_idx_start_[i];
             uint64_t dst_value = 0;
-            if (!get_dst_at(dst_start_off, static_cast<uint32_t>(degree),
-                            within, dst_value))
+            if (!get_dst_at(dst_start_off, phys_deg, within, dst_value))
             {
                 throw BPT::BPTLeafCSRDecodeException(
                     "get_dst_at failed inside decode_tuple_ at pos "
                     + std::to_string(pos));
             }
 
-            // Populate the sequential cursor so the next call with pos+1
-            // can advance in O(1) amortized.
             seq_tuple_pos_              = pos;
             seq_tuple_entry_idx_        = i;
             seq_tuple_within_idx_       = within;
             seq_tuple_entry_cumulative_ = cumulative;
-            seq_tuple_entry_degree_     = static_cast<uint32_t>(degree);
+            seq_tuple_entry_degree_     = phys_deg;
             seq_tuple_dst_start_off_    = dst_start_off;
             seq_tuple_src_id_           = src_id;
 
             Record<N> rec{};
             if constexpr (N >= 1) rec[0] = src_id;
             if constexpr (N >= 2) rec[1] = dst_value;
-            // For N >= 3 we do NOT reconstruct edge_id in this base
-            // contract path. Edge_id recovery for v3 pages is the scope
-            // of T8.5/T8.6 — the flags-bit-1 has_edge_ids encoding adds
-            // a parallel varint stream that the writer emits; T8.4's
-            // read surface focuses on (src, dst) adjacency lookup. The
-            // BPTLeafBase path here fills edge_id with 0 and logs no
-            // error; the field will be populated when the 3-way
-            // dispatch and hub-aware iteration land in T8.6-T8.9.
             if constexpr (N >= 3) rec[2] = 0;
             return rec;
         }
 
-        cumulative += static_cast<uint_fast32_t>(degree);
+        cumulative += phys_deg;
     }
 
     // Unreachable: pos < total_tuples_ means some entry must contain it,

@@ -615,3 +615,273 @@ TEST(BPTLeafCSRReader, OffsetTable_PointsPastPageEnd_Rejected) {
         (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
         BPT::BPTLeafCSRDecodeException);
 }
+
+// ============================================================================
+// T8-B.1 Bug-A: physical_degrees_ reflects varints actually on the page, NOT
+// the stored header degree (which for hub chain-heads is the total chain
+// size). The reader must refuse to iterate past the physical count.
+// ============================================================================
+
+namespace {
+
+// Build a synthetic chain-head page with one hub-style entry: stored degree
+// claims `claimed_degree`, but only `physical_dsts.size()` dsts are actually
+// varint-serialized followed by zero-padding. No continuation page is
+// emitted (this test exercises the reader, not the writer).
+AlignedPageBuffer build_synthetic_hub_head(uint64_t src_id,
+                                           uint64_t claimed_degree,
+                                           const std::vector<uint64_t>& physical_dsts,
+                                           uint32_t next_leaf = 0)
+{
+    AlignedPageBuffer page;
+    const uint32_t vc = 1;
+
+    // Encode entry body: varint(src_id) + varint(claimed_degree)
+    //                  + varint(dst[0]) + zigzag-delta varints for dst[1..]
+    std::vector<uint8_t> body;
+    uint8_t scratch[BPT::VARINT_MAX_BYTES];
+    std::size_t n = BPT::varint_encode(src_id, scratch, sizeof(scratch));
+    body.insert(body.end(), scratch, scratch + n);
+    n = BPT::varint_encode(claimed_degree, scratch, sizeof(scratch));
+    body.insert(body.end(), scratch, scratch + n);
+
+    for (std::size_t k = 0; k < physical_dsts.size(); ++k) {
+        uint64_t to_encode;
+        if (k == 0) {
+            to_encode = physical_dsts[k];
+        } else {
+            const uint64_t delta_u = physical_dsts[k] - physical_dsts[k - 1];
+            const int64_t  delta   = static_cast<int64_t>(delta_u);
+            to_encode = BPT::zigzag_encode_i64(delta);
+        }
+        n = BPT::varint_encode(to_encode, scratch, sizeof(scratch));
+        body.insert(body.end(), scratch, scratch + n);
+    }
+
+    // Header
+    BPT::BPTLeafCSRHeader h{};
+    h.format_version = 3;
+    h.record_width   = 3;
+    h.flags          = 0;
+    h.reserved       = 0;
+    h.value_count    = vc;
+    h.next_leaf      = next_leaf;
+    h.min_src_id_low = static_cast<uint32_t>(src_id & 0xFFFFFFFFu);
+    uint8_t raw[16];
+    BPT::serialize_csr_header(h, raw);
+    for (std::size_t i = 0; i < 16; ++i) page.set_byte(i, raw[i]);
+
+    // Offset table (one slot pointing past the table)
+    const uint16_t off = static_cast<uint16_t>(16 + 2 * vc);
+    page.set_byte(16, static_cast<uint8_t>(off & 0xFF));
+    page.set_byte(17, static_cast<uint8_t>((off >> 8) & 0xFF));
+
+    // Body bytes
+    for (std::size_t k = 0; k < body.size(); ++k) {
+        page.set_byte(off + k, body[k]);
+    }
+    return page;
+}
+
+}  // anonymous namespace
+
+TEST(BPTLeafCSRReader, PhysicalDegrees_InflatedStoredDegree_RejectedAtIteration) {
+    // Hub-style entry: degree header says 100, but only 30 dsts serialized.
+    std::vector<uint64_t> dsts;
+    for (uint64_t i = 0; i < 30; ++i) dsts.push_back(1000 + i * 7);
+    auto page = build_synthetic_hub_head(/*src=*/42,
+                                         /*claimed_degree=*/100,
+                                         dsts);
+    BPTLeafCSR<3> reader(page.data(), BPTLeafCSR<3>::ReadTag{});
+
+    // Physical tuple count must match the real varint count, NOT 100.
+    EXPECT_EQ(reader.get_value_count(), 30u);
+
+    // get_record(0..29) must work and decode the correct dsts.
+    for (uint32_t i = 0; i < 30; ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[0], 42u);
+        EXPECT_EQ(r[1], dsts[i]);
+    }
+
+    // get_record(30+) must throw, not crash.
+    EXPECT_THROW(reader.get_record(30), std::out_of_range);
+    EXPECT_THROW(reader.get_record(99), std::out_of_range);
+}
+
+TEST(BPTLeafCSRReader, PhysicalDegrees_BoundaryAtNextEntry) {
+    // Two entries: first hub claims degree=50 with 20 physical dsts,
+    // second entry is regular (degree=3, all 3 physical). The boundary
+    // is the second entry's offset, not the page end.
+    AlignedPageBuffer page;
+    const uint32_t vc = 2;
+
+    // Hub body
+    std::vector<uint64_t> hub_dsts;
+    for (uint64_t i = 0; i < 20; ++i) hub_dsts.push_back(100 + i * 5);
+    std::vector<uint8_t> body0;
+    uint8_t scratch[BPT::VARINT_MAX_BYTES];
+    std::size_t n = BPT::varint_encode(50, scratch, sizeof(scratch));  // src_id=50
+    body0.insert(body0.end(), scratch, scratch + n);
+    n = BPT::varint_encode(50 /*claimed degree*/, scratch, sizeof(scratch));
+    body0.insert(body0.end(), scratch, scratch + n);
+    for (std::size_t k = 0; k < hub_dsts.size(); ++k) {
+        uint64_t to_encode = (k == 0) ? hub_dsts[0]
+                                      : BPT::zigzag_encode_i64(
+                                          static_cast<int64_t>(hub_dsts[k] - hub_dsts[k-1]));
+        n = BPT::varint_encode(to_encode, scratch, sizeof(scratch));
+        body0.insert(body0.end(), scratch, scratch + n);
+    }
+
+    // Regular body
+    std::vector<uint64_t> reg_dsts = {500, 510, 520};
+    std::vector<uint8_t> body1;
+    n = BPT::varint_encode(200, scratch, sizeof(scratch));  // src_id=200
+    body1.insert(body1.end(), scratch, scratch + n);
+    n = BPT::varint_encode(3, scratch, sizeof(scratch));
+    body1.insert(body1.end(), scratch, scratch + n);
+    for (std::size_t k = 0; k < reg_dsts.size(); ++k) {
+        uint64_t to_encode = (k == 0) ? reg_dsts[0]
+                                      : BPT::zigzag_encode_i64(
+                                          static_cast<int64_t>(reg_dsts[k] - reg_dsts[k-1]));
+        n = BPT::varint_encode(to_encode, scratch, sizeof(scratch));
+        body1.insert(body1.end(), scratch, scratch + n);
+    }
+
+    const uint16_t off0 = static_cast<uint16_t>(16 + 2 * vc);
+    const uint16_t off1 = static_cast<uint16_t>(off0 + body0.size());
+
+    // Header
+    BPT::BPTLeafCSRHeader h{};
+    h.format_version = 3; h.record_width = 3; h.flags = 0; h.reserved = 0;
+    h.value_count = vc; h.next_leaf = 0; h.min_src_id_low = 50;
+    uint8_t raw[16];
+    BPT::serialize_csr_header(h, raw);
+    for (std::size_t i = 0; i < 16; ++i) page.set_byte(i, raw[i]);
+
+    page.set_byte(16, static_cast<uint8_t>(off0 & 0xFF));
+    page.set_byte(17, static_cast<uint8_t>((off0 >> 8) & 0xFF));
+    page.set_byte(18, static_cast<uint8_t>(off1 & 0xFF));
+    page.set_byte(19, static_cast<uint8_t>((off1 >> 8) & 0xFF));
+
+    for (std::size_t k = 0; k < body0.size(); ++k) page.set_byte(off0 + k, body0[k]);
+    for (std::size_t k = 0; k < body1.size(); ++k) page.set_byte(off1 + k, body1[k]);
+
+    BPTLeafCSR<3> reader(page.data(), BPTLeafCSR<3>::ReadTag{});
+
+    // Physical count = 20 hub dsts + 3 regular dsts = 23.
+    EXPECT_EQ(reader.get_value_count(), 23u);
+
+    // First 20 records come from the hub entry.
+    for (uint32_t i = 0; i < 20; ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[0], 50u);
+        EXPECT_EQ(r[1], hub_dsts[i]);
+    }
+    // Next 3 come from the regular entry.
+    for (uint32_t i = 0; i < 3; ++i) {
+        Record<3> r = reader.get_record(20 + i);
+        EXPECT_EQ(r[0], 200u);
+        EXPECT_EQ(r[1], reg_dsts[i]);
+    }
+}
+
+// ============================================================================
+// T8-B.1 Bug-B: ContinuationTag ctor opens continuation pages directly and
+// decodes their zigzag-delta varint stream against the carry-over dst.
+// ============================================================================
+
+namespace {
+
+// Build a synthetic continuation page with zigzag-delta varints for
+// `dsts`, starting from prev_dst_carry as the running cursor. The first
+// varint encodes zigzag(dsts[0] - prev_dst_carry); subsequent varints
+// encode deltas against the prior dst.
+AlignedPageBuffer build_synthetic_continuation(uint64_t prev_dst_carry,
+                                               const std::vector<uint64_t>& dsts,
+                                               uint32_t next_leaf = 0,
+                                               uint32_t chain_head_page_id = 0)
+{
+    AlignedPageBuffer page;
+
+    // Header (continuation variant — same 16 bytes, different semantics on
+    // the last uint32).
+    BPT::BPTLeafCSRContinuationHeader h{};
+    h.format_version     = 3;
+    h.record_width       = 3;
+    h.flags              = BPT::CSRHybridFlags::kIsContinuation;
+    h.reserved           = 0;
+    h.chunk_count        = static_cast<uint32_t>(dsts.size());
+    h.next_leaf          = next_leaf;
+    h.chain_head_page_id = chain_head_page_id;
+    uint8_t raw[16];
+    BPT::serialize_csr_continuation_header(h, raw);
+    for (std::size_t i = 0; i < 16; ++i) page.set_byte(i, raw[i]);
+
+    // Payload: zigzag-delta varints starting from prev_dst_carry.
+    std::size_t cursor = 16;
+    uint64_t prev = prev_dst_carry;
+    for (std::size_t k = 0; k < dsts.size(); ++k) {
+        const uint64_t delta_u = dsts[k] - prev;
+        const int64_t  delta_i = static_cast<int64_t>(delta_u);
+        uint8_t scratch[BPT::VARINT_MAX_BYTES];
+        const std::size_t n = BPT::varint_encode(
+            BPT::zigzag_encode_i64(delta_i), scratch, sizeof(scratch));
+        for (std::size_t j = 0; j < n; ++j) page.set_byte(cursor + j, scratch[j]);
+        cursor += n;
+        prev = dsts[k];
+    }
+    return page;
+}
+
+}  // anonymous namespace
+
+TEST(BPTLeafCSRReader, ContinuationTag_BasicDecode) {
+    std::vector<uint64_t> dsts = {100, 105, 110, 200, 250};
+    auto page = build_synthetic_continuation(/*prev_dst_carry=*/ 50, dsts);
+
+    BPTLeafCSR<3> reader(page.data(),
+                         BPTLeafCSR<3>::ContinuationTag{/*src=*/ 42,
+                                                        /*prev_dst_carry=*/ 50});
+
+    EXPECT_EQ(reader.get_value_count(), dsts.size());
+    EXPECT_FALSE(reader.is_chain_head());
+
+    for (uint32_t i = 0; i < dsts.size(); ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[0], 42u);
+        EXPECT_EQ(r[1], dsts[i]);
+    }
+}
+
+TEST(BPTLeafCSRReader, ContinuationTag_RejectsChainHeadPage) {
+    // Build a regular chain-head page; continuation ctor must reject it
+    // since the kIsContinuation flag bit is clear.
+    auto page = build_csr_page({{1000, {5000}}});
+    EXPECT_THROW(
+        (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ContinuationTag{0, 0})),
+        BPT::BPTLeafCSRDecodeException);
+}
+
+TEST(BPTLeafCSRReader, ContinuationTag_InheritsNextLeafAndHasNext) {
+    std::vector<uint64_t> dsts = {100, 110};
+    auto page = build_synthetic_continuation(50, dsts,
+                                             /*next_leaf=*/ 7,
+                                             /*chain_head_page_id=*/ 3);
+    BPTLeafCSR<3> reader(page.data(),
+                         BPTLeafCSR<3>::ContinuationTag{0, 50});
+    // next_leaf slot is at the same byte offset across variants (8..11),
+    // so has_next / next_leaf reflect the value written in the header.
+    EXPECT_TRUE(reader.has_next());
+    EXPECT_EQ(reader.next_leaf(), 7u);
+}
+
+TEST(BPTLeafCSRReader, ContinuationTag_ReadTagStillRejectsContinuationPage) {
+    // Regression: Bug-B's fix MUST NOT weaken the ReadTag ctor — directory-
+    // routed opens still must not land on continuations.
+    std::vector<uint64_t> dsts = {100};
+    auto page = build_synthetic_continuation(50, dsts);
+    EXPECT_THROW(
+        (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
+        BPT::BPTLeafCSRDecodeException);
+}
