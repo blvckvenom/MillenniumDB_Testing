@@ -8,21 +8,21 @@
 using namespace std;
 
 template <std::size_t N>
-BPlusTreeLeaf<N>::~BPlusTreeLeaf() {
+BPTLeafV1<N>::~BPTLeafV1() {
     if (page != nullptr)
         buffer_manager.unpin(*page);
 }
 
 
 template <std::size_t N>
-BPlusTreeLeaf<N> BPlusTreeLeaf<N>::clone() const {
+BPTLeafV1<N> BPTLeafV1<N>::clone() const {
     buffer_manager.pin(*page);
-    return BPlusTreeLeaf<N>(page);
+    return BPTLeafV1<N>(page);
 }
 
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::update_to_next_leaf() {
+void BPTLeafV1<N>::update_to_next_leaf() {
     auto next_page_number = *next_leaf;
 
     assert(page->page_id.page_number != next_page_number);
@@ -49,7 +49,7 @@ void BPlusTreeLeaf<N>::update_to_next_leaf() {
 
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::upgrade_to_editable() {
+void BPTLeafV1<N>::upgrade_to_editable() {
     if (buffer_manager.need_edit_version(*page)) {
 
         auto new_page = &buffer_manager.get_page_editable(leaf_file_id, page->get_page_number());
@@ -76,7 +76,7 @@ void BPlusTreeLeaf<N>::upgrade_to_editable() {
 
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::set_record(uint_fast32_t pos, Record<N>& out) const {
+void BPTLeafV1<N>::set_record(uint_fast32_t pos, Record<N>& out) const {
     unsigned char* out_char = (unsigned char*) &out;
 
     unsigned char* current_record = records + pos * (N * sizeof(uint64_t) - redundant_count);
@@ -96,7 +96,7 @@ void BPlusTreeLeaf<N>::set_record(uint_fast32_t pos, Record<N>& out) const {
 
 
 template <std::size_t N>
-Record<N> BPlusTreeLeaf<N>::get_record(uint_fast32_t pos) const {
+Record<N> BPTLeafV1<N>::get_record(uint_fast32_t pos) const {
     Record<N> out;
     set_record(pos, out);
     return out;
@@ -104,7 +104,7 @@ Record<N> BPlusTreeLeaf<N>::get_record(uint_fast32_t pos) const {
 
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::set_redundant_record(Record<N>& out) const {
+void BPTLeafV1<N>::set_redundant_record(Record<N>& out) const {
     unsigned char* out_char = (unsigned char*) &out;
     size_t redundant_pos = 0;
 
@@ -117,7 +117,7 @@ void BPlusTreeLeaf<N>::set_redundant_record(Record<N>& out) const {
 }
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::update_record(uint_fast32_t pos, Record<N>& out) const {
+void BPTLeafV1<N>::update_record(uint_fast32_t pos, Record<N>& out) const {
     unsigned char* out_char = (unsigned char*) &out;
 
     unsigned char* current_record = records + pos * (N * sizeof(uint64_t) - redundant_count);
@@ -133,7 +133,7 @@ void BPlusTreeLeaf<N>::update_record(uint_fast32_t pos, Record<N>& out) const {
 
 
 template <std::size_t N>
-bool BPlusTreeLeaf<N>::delete_record(const Record<N>& record) {
+bool BPTLeafV1<N>::delete_record(const Record<N>& record) {
     if (*value_count == 0) {
         return false;
     }
@@ -155,13 +155,13 @@ bool BPlusTreeLeaf<N>::delete_record(const Record<N>& record) {
 
 
 template <std::size_t N>
-uint32_t BPlusTreeLeaf<N>::get_page_size(std::bitset<N * 8> bitset, uint32_t n_records) {
+uint32_t BPTLeafV1<N>::get_page_size(std::bitset<N * 8> bitset, uint32_t n_records) {
     return 2 * sizeof(uint32_t) + N + bitset.count() + n_records * (sizeof(uint64_t) * N - bitset.count());
 }
 
 
 template <std::size_t N>
-std::bitset<N * 8> BPlusTreeLeaf<N>::create_new_bitset(const Record<N>& reference, uint64_t from, uint64_t to) {
+std::bitset<N * 8> BPTLeafV1<N>::create_new_bitset(const Record<N>& reference, uint64_t from, uint64_t to) {
     std::bitset<N * 8> new_bitset;
     new_bitset.set();
 
@@ -184,7 +184,7 @@ std::bitset<N * 8> BPlusTreeLeaf<N>::create_new_bitset(const Record<N>& referenc
 
 
 template<std::size_t N>
-void BPlusTreeLeaf<N>::compress_to_buffer(unsigned char*     compression_buffer,
+void BPTLeafV1<N>::compress_to_buffer(unsigned char*     compression_buffer,
                                           std::bitset<N * 8> bitset,
                                           uint64_t           from,
                                           uint64_t           to) {
@@ -206,7 +206,7 @@ void BPlusTreeLeaf<N>::compress_to_buffer(unsigned char*     compression_buffer,
 }
 
 template<std::size_t N>
-void BPlusTreeLeaf<N>::update_leaf(BPlusTreeLeaf<N>&   leaf,
+void BPTLeafV1<N>::update_leaf(BPTLeafV1<N>&   leaf,
                                    std::bitset<N * 8>& bitset,
                                    uint64_t            n_records,
                                    unsigned char*      buffer) {
@@ -242,7 +242,7 @@ void BPlusTreeLeaf<N>::update_leaf(BPlusTreeLeaf<N>&   leaf,
 
 
 template <std::size_t N>
-unique_ptr<BPlusTreeSplit<N>> BPlusTreeLeaf<N>::insert(const Record<N>& record, bool& error) {
+unique_ptr<BPlusTreeSplit<N>> BPTLeafV1<N>::insert(const Record<N>& record, bool& error) {
     unsigned char* new_record_char_ptr = (unsigned char*) &record;
 
     if (*value_count == 0) {
@@ -427,7 +427,7 @@ unique_ptr<BPlusTreeSplit<N>> BPlusTreeLeaf<N>::insert(const Record<N>& record, 
     // Case 1: the leaf does not require a double split
     if (n_records_left + n_records_right >= *value_count + 1) {
         auto& right_page = buffer_manager.append_page(leaf_file_id);
-        auto right_leaf = BPlusTreeLeaf<N>(&right_page);
+        auto right_leaf = BPTLeafV1<N>(&right_page);
 
         *right_leaf.next_leaf = *next_leaf;
         *next_leaf = right_leaf.page->get_page_number();
@@ -471,10 +471,10 @@ unique_ptr<BPlusTreeSplit<N>> BPlusTreeLeaf<N>::insert(const Record<N>& record, 
     // Case 2: the leaf requires a double split
     else {
         auto& middle_page = buffer_manager.append_page(leaf_file_id);
-        auto middle_leaf = BPlusTreeLeaf<N>(&middle_page);
+        auto middle_leaf = BPTLeafV1<N>(&middle_page);
 
         auto& right_page = buffer_manager.append_page(leaf_file_id);
-        auto right_leaf = BPlusTreeLeaf<N>(&right_page);
+        auto right_leaf = BPTLeafV1<N>(&right_page);
 
         *right_leaf.next_leaf = *next_leaf;
         *middle_leaf.next_leaf = right_leaf.page->get_page_number();
@@ -516,7 +516,7 @@ unique_ptr<BPlusTreeSplit<N>> BPlusTreeLeaf<N>::insert(const Record<N>& record, 
 // returns the position of the minimum key greater or equal than the record given.
 // if there is no such key, returns (to + 1)
 template <std::size_t N>
-uint_fast32_t BPlusTreeLeaf<N>::search_index(const Record<N>& record) const noexcept {
+uint_fast32_t BPTLeafV1<N>::search_index(const Record<N>& record) const noexcept {
     int_fast32_t from = 0;
     int_fast32_t to = static_cast<int_fast32_t>(*value_count)-1;
     Record<N> search_record;
@@ -555,7 +555,7 @@ search_index_begin:
 
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::shift_right_records(int_fast32_t from, int_fast32_t to) {
+void BPTLeafV1<N>::shift_right_records(int_fast32_t from, int_fast32_t to) {
     uint64_t record_step = N * 8 - redundant_count;
 
     for (auto i = to; i >= from; i--) {
@@ -567,7 +567,7 @@ void BPlusTreeLeaf<N>::shift_right_records(int_fast32_t from, int_fast32_t to) {
 
 
 template <std::size_t N>
-bool BPlusTreeLeaf<N>::equal_record(const Record<N>& record, uint_fast32_t index) {
+bool BPTLeafV1<N>::equal_record(const Record<N>& record, uint_fast32_t index) {
     unsigned char* record_char_ptr = (unsigned char*) &(record);
     int unique_size = N * 8 - redundant_count;
 
@@ -592,7 +592,7 @@ bool BPlusTreeLeaf<N>::equal_record(const Record<N>& record, uint_fast32_t index
 
 
 template <std::size_t N>
-bool BPlusTreeLeaf<N>::check_range(const Record<N>& r) const {
+bool BPTLeafV1<N>::check_range(const Record<N>& r) const {
     if (*value_count == 0) {
         return false;
     }
@@ -604,7 +604,7 @@ bool BPlusTreeLeaf<N>::check_range(const Record<N>& r) const {
 
 
 template <std::size_t N>
-void BPlusTreeLeaf<N>::print(std::ostream& os) const {
+void BPTLeafV1<N>::print(std::ostream& os) const {
     os << "Printing Leaf:\n";
     for (uint_fast32_t i = 0; i < (*value_count); i++) {
         os << "  (";
@@ -630,7 +630,7 @@ void BPlusTreeLeaf<N>::print(std::ostream& os) const {
 
 
 template <std::size_t N>
-bool BPlusTreeLeaf<N>::check(std::ostream& os) const {
+bool BPTLeafV1<N>::check(std::ostream& os) const {
     if ((*value_count) == 0) {
         if (page->get_page_number() == 0) {
             os << "  WARNING: empty leaf. Ok only if the b+tree is empty.\n";
@@ -673,7 +673,7 @@ bool BPlusTreeLeaf<N>::check(std::ostream& os) const {
     return true;
 }
 
-template class BPlusTreeLeaf<1>;
-template class BPlusTreeLeaf<2>;
-template class BPlusTreeLeaf<3>;
-template class BPlusTreeLeaf<4>;
+template class BPTLeafV1<1>;
+template class BPTLeafV1<2>;
+template class BPTLeafV1<3>;
+template class BPTLeafV1<4>;
