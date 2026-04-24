@@ -190,6 +190,41 @@ private:
     );
 
     // =========================================================================
+    // Adjacency cache (Phase B performance path)
+    // =========================================================================
+
+    /// Adjacency pair: neighbor node id + edge id (both uint64_t raw form).
+    struct AdjEntry {
+        uint64_t node_id;
+        uint64_t edge_id;
+    };
+
+    /// Full-scan the projection's from_to_edge + to_from_edge B+Trees once
+    /// and materialize an in-memory undirected adjacency map keyed by
+    /// source node id. Called lazily on the first build_graph_sample()
+    /// invocation inside Phase B.
+    ///
+    /// Rationale: per-node `get_range({seed_id, 0, 0}, {seed_id, MAX,
+    /// MAX})` lookups via the live B+Tree incur O(page_tuples) work per
+    /// call under the CSR_HYBRID v3 leaf format because search_index
+    /// performs a linear decode scan of the leaf page. With K seeds and
+    /// L layers expanding K * avg_fan nodes, Phase B pays
+    /// O(K * fan^L * page_tuples) wall-clock time per chunk. Caching
+    /// a dense adjacency up-front collapses every subsequent lookup to
+    /// O(avg_degree) and amortizes the full-scan O(|E|) across chunks.
+    ///
+    /// Memory cost: ~16 bytes per edge. arxiv (1.07 M edges): ~17 MB;
+    /// products (61.9 M edges): ~1 GB — well inside the 31 GB RAM budget.
+    void build_adjacency_cache_();
+
+    /// Look up (neighbor_node_id, edge_id) pairs for a given node id
+    /// from the in-memory undirected cache. Returns the (possibly empty)
+    /// span of entries; an absent node id returns an empty range.
+    const std::vector<AdjEntry>& get_neighbors_cached_(
+        uint64_t node_id
+    ) const;
+
+    // =========================================================================
     // Phase C: Write embeddings to projection as tensor properties
     // =========================================================================
 
@@ -235,6 +270,19 @@ private:
 
     /// RNG for uniform neighbor sampling (Phase B).
     std::mt19937_64            rng_;
+
+    /// Undirected adjacency cache: node_id -> list of (neighbor, edge_id).
+    /// Populated on first use by `build_adjacency_cache_()`.
+    std::unordered_map<uint64_t, std::vector<AdjEntry>> adj_cache_;
+
+    /// Sentinel empty vector returned by get_neighbors_cached_() when a
+    /// node id is not present (avoids reallocating a fresh empty vector
+    /// per miss). Mutable because get_neighbors_cached_() is const.
+    mutable std::vector<AdjEntry> adj_empty_sentinel_;
+
+    /// True once build_adjacency_cache_() has finished populating
+    /// adj_cache_. Defaults to false; set to true exactly once.
+    bool adj_cache_built_ = false;
 };
 
 } // namespace mdb::gnn

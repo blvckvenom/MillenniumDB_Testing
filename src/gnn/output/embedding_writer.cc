@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -211,9 +212,18 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
               << " (device=" << (device.is_cpu() ? "cpu" : "cuda") << ")"
               << std::endl;
 
+    // Optional per-chunk timing instrumentation (env MDB_EMBWRITER_TIMING=1).
+    // Emits one line per chunk with wall-clock breakdown of each step so we
+    // can diagnose O(N^2)-style growth without a profiler.
+    const char* timing_env = std::getenv("MDB_EMBWRITER_TIMING");
+    const bool  emit_timing = (timing_env != nullptr && timing_env[0] != '0'
+                               && timing_env[0] != '\0');
+
     for (uint64_t start = 0; start < missing.size(); start += chunk_size) {
         uint64_t end = std::min(start + chunk_size,
                                 static_cast<uint64_t>(missing.size()));
+
+        auto t_step0 = std::chrono::steady_clock::now();
 
         // 1. Convert row indices to ObjectIds via RowMapping
         std::vector<ObjectId> seed_oids;
@@ -231,14 +241,20 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
             continue;
         }
 
+        auto t_step1 = std::chrono::steady_clock::now();
+
         // 2. Build GraphSample by k-hop sampling from the projection topology
         GraphSample sample = build_graph_sample(seed_oids, batch_id_counter++);
+
+        auto t_step2 = std::chrono::steady_clock::now();
 
         // 3. Assemble MiniBatch using FeatureMatrix mode (not FourLevelStore).
         //    Inference batches have no pre-packed files in packed_slim, so
         //    FourLevelStore::load_batch_features(batch_id) would fail.
         //    Use a temporary BatchAssembler in FeatureMatrix fallback mode.
         MiniBatch mini = inference_assembler->assemble_from_sample(sample);
+
+        auto t_step3 = std::chrono::steady_clock::now();
 
         // 4. Move batch tensors to model device
         if (!device.is_cpu()) {
@@ -247,6 +263,8 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
                 ei = ei.to(device);
             }
         }
+
+        auto t_step4 = std::chrono::steady_clock::now();
 
         // 5. Forward pass to get embeddings
         auto num_seeds = static_cast<int64_t>(seed_oids.size());
@@ -257,6 +275,8 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
         );
         // emb shape: [num_seeds, hidden_dim]
 
+        auto t_step5 = std::chrono::steady_clock::now();
+
         // 6. Move to CPU and collect
         emb = emb.cpu().contiguous();
 
@@ -265,7 +285,41 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
                                 emb[i].clone());
         }
 
+        auto t_step6 = std::chrono::steady_clock::now();
+
         ++chunk_idx;
+
+        if (emit_timing) {
+            using ms = std::chrono::duration<double, std::milli>;
+            const double t_convert   = ms(t_step1 - t_step0).count();
+            const double t_build     = ms(t_step2 - t_step1).count();
+            const double t_assemble  = ms(t_step3 - t_step2).count();
+            const double t_to_device = ms(t_step4 - t_step3).count();
+            const double t_forward   = ms(t_step5 - t_step4).count();
+            const double t_to_cpu    = ms(t_step6 - t_step5).count();
+            const double t_total     = ms(t_step6 - t_step0).count();
+            const size_t nun         = sample.all_unique_nodes.size();
+            size_t l0 = sample.nodes_per_layer.size() > 0 ? sample.nodes_per_layer[0].size() : 0;
+            size_t l1 = sample.nodes_per_layer.size() > 1 ? sample.nodes_per_layer[1].size() : 0;
+            size_t l2 = sample.nodes_per_layer.size() > 2 ? sample.nodes_per_layer[2].size() : 0;
+            size_t e0 = sample.edges_per_layer.size() > 0 ? sample.edges_per_layer[0].size() : 0;
+            size_t e1 = sample.edges_per_layer.size() > 1 ? sample.edges_per_layer[1].size() : 0;
+            std::cerr << "[EmbWriter-timing] chunk=" << chunk_idx
+                      << "/" << total_chunks
+                      << " nseeds=" << num_seeds
+                      << " nunique=" << nun
+                      << " layers=" << l0 << "," << l1 << "," << l2
+                      << " edges=" << e0 << "," << e1
+                      << " t_convert=" << static_cast<int>(t_convert)
+                      << " t_build=" << static_cast<int>(t_build)
+                      << " t_assemble=" << static_cast<int>(t_assemble)
+                      << " t_to_dev=" << static_cast<int>(t_to_device)
+                      << " t_fwd=" << static_cast<int>(t_forward)
+                      << " t_to_cpu=" << static_cast<int>(t_to_cpu)
+                      << " t_total=" << static_cast<int>(t_total)
+                      << "ms" << std::endl;
+        }
+
         if (chunk_idx == 1 || chunk_idx == total_chunks
             || chunk_idx % std::max<uint64_t>(1, total_chunks / 20) == 0) {
             const auto now = std::chrono::steady_clock::now();
@@ -310,6 +364,13 @@ GraphSample EmbeddingWriter::build_graph_sample(
         return sample;
     }
 
+    // Build the undirected adjacency cache on first use. Subsequent chunks
+    // re-use the cached hash map so the O(|E|) scan is amortised across
+    // Phase B.
+    if (!adj_cache_built_) {
+        build_adjacency_cache_();
+    }
+
     const size_t K = config_.fanouts.size();
 
     // nodes_per_layer[0] = seeds, nodes_per_layer[k] = k-hop neighbors
@@ -328,17 +389,18 @@ GraphSample EmbeddingWriter::build_graph_sample(
         const auto& current_layer = sample.nodes_per_layer[k];
 
         for (const ObjectId& node_id : current_layer) {
-            // Get all neighbors with the configured orientation
-            Neighbors all_neighbors = topology_.get_neighbors(
-                node_id, config_.orientation);
-
-            if (all_neighbors.node_ids.empty()) {
+            // Pull neighbors from the in-memory undirected cache (Phase B
+            // performance path — see EmbeddingWriter::build_adjacency_cache_
+            // for rationale). This replaces the per-call B+Tree range query,
+            // which is O(page_tuples) under CSR_HYBRID v3 storage and
+            // dominates wall-clock time on arxiv-scale graphs.
+            const auto& cached = get_neighbors_cached_(node_id.id);
+            const size_t n = cached.size();
+            if (n == 0) {
                 continue;
             }
 
-            // Uniform sampling via Fisher-Yates partial shuffle
-            size_t n = all_neighbors.node_ids.size();
-            size_t f = std::min(static_cast<size_t>(fanout), n);
+            const size_t f = std::min(static_cast<size_t>(fanout), n);
 
             std::vector<std::pair<ObjectId, ObjectId>> selected;
             selected.reserve(f);
@@ -346,8 +408,8 @@ GraphSample EmbeddingWriter::build_graph_sample(
             if (f == n) {
                 // Take all neighbors
                 for (size_t i = 0; i < n; ++i) {
-                    selected.emplace_back(all_neighbors.node_ids[i],
-                                          all_neighbors.edge_ids[i]);
+                    selected.emplace_back(ObjectId(cached[i].node_id),
+                                          ObjectId(cached[i].edge_id));
                 }
             } else {
                 // Fisher-Yates partial shuffle on indices
@@ -362,8 +424,8 @@ GraphSample EmbeddingWriter::build_graph_sample(
 
                 for (size_t i = 0; i < f; ++i) {
                     size_t idx = indices[i];
-                    selected.emplace_back(all_neighbors.node_ids[idx],
-                                          all_neighbors.edge_ids[idx]);
+                    selected.emplace_back(ObjectId(cached[idx].node_id),
+                                          ObjectId(cached[idx].edge_id));
                 }
             }
 
@@ -544,6 +606,79 @@ uint64_t EmbeddingWriter::write_to_projection(
     projection_storage_.flush();
 
     return written;
+}
+
+// =============================================================================
+// Adjacency cache (Phase B performance path)
+// =============================================================================
+
+void EmbeddingWriter::build_adjacency_cache_() {
+    if (adj_cache_built_) {
+        return;
+    }
+
+    const auto t_start = std::chrono::steady_clock::now();
+
+    auto* fwd_index = projection_storage_.get_from_to_edge_index();
+    auto* rev_index = projection_storage_.get_to_from_edge_index();
+
+    // Reserve a generous bucket count up-front. We size against the node
+    // count from RowMapping because every non-isolated node will become a
+    // key in the adjacency map; load factor headroom avoids mid-scan
+    // rehashes that would serialize against the streaming inserts below.
+    adj_cache_.reserve(row_mapping_.size());
+
+    auto scan_and_merge = [&](BPlusTree<3>* index, bool forward) {
+        if (!index) return;
+        Record<3> min_record = {0, 0, 0};
+        Record<3> max_record = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+        bool interruption_requested = false;
+        auto it = index->get_range(&interruption_requested,
+                                   min_record, max_record);
+        const Record<3>* rec;
+        while ((rec = it.next()) != nullptr) {
+            const uint64_t a = std::get<0>(*rec);
+            const uint64_t b = std::get<1>(*rec);
+            const uint64_t e = std::get<2>(*rec);
+            // from_to_edge stores (from, to, edge_id); to_from_edge
+            // stores (to, from, edge_id). Under UNDIRECTED semantics the
+            // adjacency map is keyed on "this endpoint" so both edges
+            // contribute to both endpoints' neighbor lists.
+            (void)forward; // same merge for both indexes — symmetry baked in
+            adj_cache_[a].push_back({b, e});
+        }
+    };
+
+    scan_and_merge(fwd_index, /*forward=*/true);
+    scan_and_merge(rev_index, /*forward=*/false);
+
+    adj_cache_built_ = true;
+
+    // Report cache size + build time so large-graph runs (products) can be
+    // diagnosed without re-running under instrumentation. Emitted once per
+    // Phase B.
+    const auto t_end = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(
+        t_end - t_start).count();
+    uint64_t total_edges = 0;
+    for (const auto& [k, v] : adj_cache_) {
+        total_edges += v.size();
+    }
+    std::cerr << "[EmbeddingWriter] adjacency cache built: "
+              << adj_cache_.size() << " nodes, "
+              << total_edges << " directed entries (incl. both directions), "
+              << static_cast<int>(ms) << " ms"
+              << std::endl;
+}
+
+const std::vector<EmbeddingWriter::AdjEntry>&
+EmbeddingWriter::get_neighbors_cached_(uint64_t node_id) const
+{
+    auto it = adj_cache_.find(node_id);
+    if (it == adj_cache_.end()) {
+        return adj_empty_sentinel_;
+    }
+    return it->second;
 }
 
 } // namespace mdb::gnn
