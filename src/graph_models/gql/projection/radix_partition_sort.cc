@@ -21,6 +21,7 @@
 
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 #include "storage/page/page.h"
 
@@ -41,8 +42,10 @@ namespace GQL {
 // Inline dedup at write time preserves the "no duplicates" invariant that
 // ExternalRecordSort's single-pass writer delivers to the classic backend.
 // ---------------------------------------------------------------------------
+// BITSET-backed concatenation (V1 leaf format, pre-Spec-#5).
+// Preserves pre-Spec-#5 byte-identical output.
 template<std::size_t N>
-std::size_t write_btree_from_sorted_partitions(
+static std::size_t write_btree_from_sorted_partitions_bitset_(
     const std::vector<std::string>& sorted_partition_paths,
     const std::string& base_path)
 {
@@ -139,6 +142,85 @@ std::size_t write_btree_from_sorted_partitions(
     write_leaf_page(/*is_last_page=*/true);
 
     return unique_count;
+}
+
+// DELTA_VARINT-backed concatenation (V2 leaf format, Spec #5).
+// Streams records one at a time into BPTLeafV2Writer, which handles
+// page boundaries internally (variable per-record bytes via zigzag
+// deltas). Directory entries are emitted on page boundary crossings.
+template<std::size_t N>
+static std::size_t write_btree_from_sorted_partitions_delta_varint_(
+    const std::vector<std::string>& sorted_partition_paths,
+    const std::string& base_path)
+{
+    BPTLeafV2Writer<N> leaf_writer(base_path + ".leaf");
+    BPTDirWriter<N>    dir_writer(base_path + ".dir");
+
+    // Empty-index: finalize writes one empty v2 leaf page.
+    bool any_nonempty = false;
+    for (const auto& p : sorted_partition_paths) {
+        if (fs::exists(p) && fs::file_size(p) > 0) {
+            any_nonempty = true;
+            break;
+        }
+    }
+    if (!any_nonempty) {
+        leaf_writer.make_empty();
+        return 0;
+    }
+
+    Record<N>   prev_record{};
+    bool        has_prev     = false;
+    std::size_t unique_count = 0;
+    std::size_t page_count   = 0;   // number of completed page boundary crossings
+
+    for (const auto& path : sorted_partition_paths) {
+        if (!fs::exists(path)) continue;
+        typename PartitionFile<N>::Reader reader(path);
+        Record<N> r{};
+        while (reader.next(r)) {
+            if (has_prev && r == prev_record) {
+                continue;  // dedup
+            }
+            prev_record = r;
+            has_prev    = true;
+            ++unique_count;
+
+            const bool started_new_page = leaf_writer.append_record(r);
+            if (started_new_page) {
+                // `r` is now the first record of page index
+                // current_page_index(). B+Tree convention: the very first
+                // leaf (index 0) does not get a dir entry. Every boundary
+                // crossing happens at page_count >= 1, so we always emit.
+                ++page_count;
+                dir_writer.bulk_insert(
+                    &r,
+                    0,
+                    static_cast<int32_t>(leaf_writer.current_page_index()));
+            }
+        }
+    }
+
+    // Finalize: flush the tail page with next_leaf = 0.
+    leaf_writer.finalize();
+
+    return unique_count;
+}
+
+// Dispatch shim. Default leaf_format is BITSET to preserve pre-Spec-#5
+// behavior for any caller not yet plumbed through T5.11b.
+template<std::size_t N>
+std::size_t write_btree_from_sorted_partitions(
+    const std::vector<std::string>& sorted_partition_paths,
+    const std::string& base_path,
+    BPT::LeafFormat leaf_format)
+{
+    if (leaf_format == BPT::LeafFormat::DELTA_VARINT) {
+        return write_btree_from_sorted_partitions_delta_varint_<N>(
+            sorted_partition_paths, base_path);
+    }
+    return write_btree_from_sorted_partitions_bitset_<N>(
+        sorted_partition_paths, base_path);
 }
 
 template<std::size_t N>
@@ -280,7 +362,7 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
         }
     }
     total_written = write_btree_from_sorted_partitions<N>(
-        sorted_paths, output_base_path);
+        sorted_paths, output_base_path, config_.leaf_format);
 
     // Cleanup intermediate per-partition sorted files — the B+Tree
     // (`.leaf` + `.dir`) is now the authoritative output.
@@ -386,10 +468,10 @@ template class RadixPartitionSort<3>;
 
 // Explicit instantiations for the free-function Phase 3 helper.
 template std::size_t write_btree_from_sorted_partitions<1>(
-    const std::vector<std::string>&, const std::string&);
+    const std::vector<std::string>&, const std::string&, BPT::LeafFormat);
 template std::size_t write_btree_from_sorted_partitions<2>(
-    const std::vector<std::string>&, const std::string&);
+    const std::vector<std::string>&, const std::string&, BPT::LeafFormat);
 template std::size_t write_btree_from_sorted_partitions<3>(
-    const std::vector<std::string>&, const std::string&);
+    const std::vector<std::string>&, const std::string&, BPT::LeafFormat);
 
 }  // namespace GQL

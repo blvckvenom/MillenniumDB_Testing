@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "graph_models/gql/projection/streaming_record_buffer.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/record.h"
 
 namespace GQL {
@@ -48,6 +49,10 @@ public:
         std::size_t num_workers            = 0;   // 0 = auto (cores/mem)
         std::size_t num_scan_threads       = 0;   // 0 = auto (nproc/2)
         std::string scratch_dir;                   // partition file directory
+        // Spec #5 T5.11b — leaf encoding for the B+Tree `.leaf` output.
+        // BITSET (default) preserves pre-Spec-#5 byte-identical behavior;
+        // DELTA_VARINT opts in to the delta+varint v2 encoding.
+        BPT::LeafFormat leaf_format        = BPT::LeafFormat::BITSET;
     };
 
     explicit RadixPartitionSort(Config config);

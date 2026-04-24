@@ -26,6 +26,7 @@
 #include "graph_models/gql/projection/radix_partition_sort.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/record.h"
 
 namespace fs = std::filesystem;
@@ -255,4 +256,93 @@ TEST(RadixPartitionSort, ScratchFilesCleanedOnException) {
         }
         ASSERT_EQ(remaining, 0u) << "scratch files not cleaned after destructor";
     }
+}
+
+// Read the first 16 bytes of a file and return them.
+static std::vector<uint8_t> read_first_16_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> out(16, 0);
+    in.read(reinterpret_cast<char*>(out.data()), 16);
+    return out;
+}
+
+// --- T5.11b Test: BITSET backend produces byte 0 != 0x02 ---
+TEST(RadixPartitionSort, BitsetBackend_ByteZeroNotTwo) {
+    wipe_scratch();
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir = kScratchBase;
+    cfg.min_partitions = 8;
+    cfg.max_partitions = 8;
+    cfg.leaf_format = BPT::LeafFormat::BITSET;  // explicit default
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input("/tmp/test_input_bitset");
+    for (std::uint64_t i = 1; i <= 500; ++i) {
+        input.push_back(Record<3>{{i, i + 1, i + 2}});
+    }
+    rps.scan_and_partition(input, 500);
+    const std::string out_base = "/tmp/test_output_bitset";
+    std::size_t written = rps.sort_and_write(out_base);
+    ASSERT_EQ(written, 500u);
+    // Byte 0 is the V1 value_count LSB; the first page's value_count is
+    // 170 (max_records_per_leaf for N=3) in this 500-record dataset.
+    // What we positively assert is: byte 0 != 0x02 under BITSET for this
+    // specific dataset. (A different dataset with value_count=2 would
+    // legitimately have byte 0 = 0x02 — design §6.1 edge case.)
+    const auto hdr = read_first_16_bytes(out_base + ".leaf");
+    EXPECT_NE(hdr[0], 0x02) << "BITSET backend must not emit v2 magic";
+    fs::remove(out_base + ".leaf");
+    fs::remove(out_base + ".dir");
+}
+
+// --- T5.11b Test: DELTA_VARINT backend produces byte 0 == 0x02 ---
+TEST(RadixPartitionSort, DeltaVarintBackend_ByteZeroIsTwo) {
+    wipe_scratch();
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir = kScratchBase;
+    cfg.min_partitions = 8;
+    cfg.max_partitions = 8;
+    cfg.leaf_format = BPT::LeafFormat::DELTA_VARINT;  // opt-in
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input("/tmp/test_input_dv");
+    for (std::uint64_t i = 1; i <= 500; ++i) {
+        input.push_back(Record<3>{{i, i + 1, i + 2}});
+    }
+    rps.scan_and_partition(input, 500);
+    const std::string out_base = "/tmp/test_output_dv";
+    std::size_t written = rps.sort_and_write(out_base);
+    ASSERT_EQ(written, 500u) << "DELTA_VARINT dedup count must match input";
+
+    const auto hdr = read_first_16_bytes(out_base + ".leaf");
+    EXPECT_EQ(hdr[0], 0x02) << "DELTA_VARINT backend must emit v2 format_version magic";
+    EXPECT_EQ(hdr[1], 3)    << "record_width must equal N=3";
+    EXPECT_EQ(hdr[2], 0)    << "flags must be 0 (reserved)";
+    EXPECT_EQ(hdr[3], 0)    << "reserved must be 0";
+    fs::remove(out_base + ".leaf");
+    fs::remove(out_base + ".dir");
+}
+
+// --- T5.11b Test: empty index under DELTA_VARINT emits a single v2 page ---
+TEST(RadixPartitionSort, DeltaVarintEmpty_EmitsSingleV2Page) {
+    wipe_scratch();
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir = kScratchBase;
+    cfg.min_partitions = 8;
+    cfg.max_partitions = 8;
+    cfg.leaf_format = BPT::LeafFormat::DELTA_VARINT;
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input("/tmp/test_input_dv_empty");
+    // Intentionally empty input.
+    rps.scan_and_partition(input, 0);
+    const std::string out_base = "/tmp/test_output_dv_empty";
+    std::size_t written = rps.sort_and_write(out_base);
+    EXPECT_EQ(written, 0u);
+
+    const auto hdr = read_first_16_bytes(out_base + ".leaf");
+    EXPECT_EQ(hdr[0], 0x02) << "empty v2 leaf must still carry format_version=2";
+    EXPECT_EQ(hdr[1], 3);
+    fs::remove(out_base + ".leaf");
+    fs::remove(out_base + ".dir");
 }

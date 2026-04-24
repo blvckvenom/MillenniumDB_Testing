@@ -31,7 +31,8 @@ public:
     BptIter(bool* interruption_requested,
             SearchLeafResult<N>&& leaf_and_pos,
             const Record<N>& max,
-            BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET) noexcept;
+            BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET,
+            const Record<N>* min = nullptr) noexcept;
 
     BptIter(BptIter&& other) noexcept;
 
@@ -53,11 +54,17 @@ private:
     uint_fast32_t current_pos;
     Record<N> current_record;
     Record<N> max;
-    // Polymorphic leaf view. Virtual dispatch is paid once per page-open
-    // (ctor + update_to_next_leaf), never per-record; the inner record
-    // accessors on BPTLeafV1<N> / BPTLeafV2<N> are non-virtual within each
-    // subclass. See bplus_tree_leaf_base.h for the dispatch contract.
+    // Primary leaf view. In BITSET mode this is the only reader. In
+    // DELTA_VARINT mode this is still a BPTLeafV1 purely to hold the
+    // BufferManager page pin through RAII — see v2_reader_ below for the
+    // actual record decoder.
     std::unique_ptr<BPTLeafBase<N>> current_leaf_;
+    // DELTA_VARINT auxiliary reader. Populated only when
+    // leaf_format_ == DELTA_VARINT. Views the same page bytes as
+    // current_leaf_ under a BPTLeafV2<N> ReadTag decoder; all record
+    // reads (get_value_count, update_record, has_next) dispatch here
+    // in v2 mode. See Spec #5 §5.2 for the on-disk format.
+    std::unique_ptr<BPTLeafBase<N>> v2_reader_;
     BPT::LeafFormat leaf_format_;
 };
 

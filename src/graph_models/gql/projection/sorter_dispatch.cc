@@ -116,30 +116,43 @@ std::size_t sort_and_build_index(
     const std::string&           index_base_path,
     std::uint64_t                estimated_count,
     const BuildFromSorterFn<N>&  build_from_sorter,
-    const std::string&           sort_temp_dir
+    const std::string&           sort_temp_dir,
+    BPT::LeafFormat              leaf_format
 ) {
     switch (get_sorter_backend()) {
         case SorterBackend::CLASSIC: {
             (void)estimated_count;  // Unused in CLASSIC.
+            // CLASSIC does not directly honor `leaf_format` in this layer —
+            // the caller's `build_from_sorter` callback closes over the
+            // ProjectionStorage instance and reads `requested_leaf_format`
+            // from there when it calls build_index_streaming. We accept the
+            // parameter for signature symmetry and to satisfy the unit-
+            // level API contract (T5.11b unit tests pass BITSET explicitly
+            // to pin default behavior).
+            (void)leaf_format;
             return run_classic<N>(
                 input_stream, index_base_path, build_from_sorter, sort_temp_dir);
         }
         case SorterBackend::RADIX: {
-            // RADIX backend pipeline (Tasks 5-11):
+            // RADIX backend pipeline (Tasks 5-11, Spec #5 T5.11b):
             //   Phase 1: scan + partition by top-bits of record[0]
             //   Phase 2: parallel per-partition sort (in-memory or external fallback)
-            //   Phase 3: concatenate sorted partitions into BPTLeafWriter/BPTDirWriter
+            //   Phase 3: concatenate sorted partitions into BPT{V1,V2}LeafWriter
+            //            / BPTDirWriter depending on `leaf_format`.
             // The `build_from_sorter` callback is unused here because RADIX's own
             // write_btree_from_sorted_partitions<N> performs the B+Tree write
             // directly (mirroring the page-level process_block pattern used by
-            // ProjectionStorage::build_index_streaming). The resulting .leaf /
-            // .dir files are bit-identical to the CLASSIC backend's output on
-            // the same input (validated by Task 13's golden-compare script).
+            // ProjectionStorage::build_index_streaming). Under BITSET, the
+            // resulting .leaf / .dir files are bit-identical to the CLASSIC
+            // backend's output on the same input (validated by Task 13's
+            // golden-compare script). Under DELTA_VARINT, the .leaf file starts
+            // with the v2 header (byte 0 = 0x02).
             (void)build_from_sorter;
 
             typename RadixPartitionSort<N>::Config cfg;
             cfg.scratch_dir =
                 (std::filesystem::path(sort_temp_dir) / ".radix_scratch").string();
+            cfg.leaf_format = leaf_format;
             // Reuse sort_temp_dir's subdirectory so each projection has its own
             // scratch area — build_all_indexes_bulk passes the same
             // sort_temp_dir across all 14 index builds, but `.radix_scratch`
@@ -168,12 +181,12 @@ std::size_t sort_and_build_index(
 // Explicit instantiations.
 template std::size_t sort_and_build_index<1>(
     StreamingRecordBuffer<1>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<1>&, const std::string&);
+    const BuildFromSorterFn<1>&, const std::string&, BPT::LeafFormat);
 template std::size_t sort_and_build_index<2>(
     StreamingRecordBuffer<2>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<2>&, const std::string&);
+    const BuildFromSorterFn<2>&, const std::string&, BPT::LeafFormat);
 template std::size_t sort_and_build_index<3>(
     StreamingRecordBuffer<3>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<3>&, const std::string&);
+    const BuildFromSorterFn<3>&, const std::string&, BPT::LeafFormat);
 
 }  // namespace GQL

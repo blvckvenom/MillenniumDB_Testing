@@ -987,6 +987,50 @@ size_t ProjectionStorage::build_index_bulk(std::vector<Record<N>>& records, cons
 
 template<std::size_t N>
 size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, const std::string& base_path) {
+    // Spec #5 T5.11b — dispatch on the projection-wide leaf-format preset.
+    // BITSET preserves pre-Spec-#5 byte-identical behavior; DELTA_VARINT
+    // produces v2 leaves with a 16-byte header + zigzag-delta varint
+    // payload. The format is populated from the config parameter on
+    // graph_project (project_procedure.cc) and threaded through
+    // NativeProjectionBuilder into requested_leaf_format during ctor.
+    if (requested_leaf_format == BPT::LeafFormat::DELTA_VARINT) {
+        BPTLeafV2Writer<N> leaf_writer(base_path + ".leaf");
+        BPTDirWriter<N>    dir_writer(base_path + ".dir");
+
+        if (sorter.total_records() == 0) {
+            leaf_writer.make_empty();
+            return 0;
+        }
+
+        Record<N> prev_record{};
+        bool   has_prev_v2  = false;
+        size_t unique_count = 0;
+
+        sorter.stream_sorted([&](const Record<N>& record) {
+            // Inline dedup
+            if (has_prev_v2 && record == prev_record) return;
+            prev_record = record;
+            has_prev_v2 = true;
+            ++unique_count;
+
+            const bool started_new_page = leaf_writer.append_record(record);
+            if (started_new_page) {
+                // `record` is the first record of the newly-opened page.
+                // B+Tree dir convention: every non-first leaf gets a dir
+                // entry pointing at its own index.
+                dir_writer.bulk_insert(
+                    &record, 0,
+                    static_cast<int32_t>(leaf_writer.current_page_index()));
+            }
+        });
+
+        // Flush tail page with next_leaf = 0 so read-side chain terminates.
+        leaf_writer.finalize();
+
+        return unique_count;
+    }
+
+    // BITSET path — unchanged from pre-Spec-#5 (byte-identical output).
     BPTLeafWriter<N> leaf_writer(base_path + ".leaf");
     BPTDirWriter<N> dir_writer(base_path + ".dir");
 
@@ -1104,7 +1148,8 @@ void ProjectionStorage::build_nodes_index_() {
         [this](ExternalRecordSort<1>& sorter, const std::string& path) {
             return build_index_streaming<1>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1119,7 +1164,8 @@ void ProjectionStorage::build_from_to_edge_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 
     // Spec #4-B T4.18 integrated topology snapshot emission.
@@ -1155,7 +1201,8 @@ void ProjectionStorage::build_to_from_edge_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 
     // Spec #4-B T4.18 integrated topology snapshot emission (reverse).
@@ -1187,7 +1234,8 @@ void ProjectionStorage::build_edge_direction_index_() {
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1202,7 +1250,8 @@ void ProjectionStorage::build_edge_from_to_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1217,7 +1266,8 @@ void ProjectionStorage::build_edge_n1_n2_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1233,7 +1283,8 @@ void ProjectionStorage::build_node_label_index_() {
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1249,7 +1300,8 @@ void ProjectionStorage::build_label_node_index_() {
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1265,7 +1317,8 @@ void ProjectionStorage::build_edge_label_index_() {
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1281,7 +1334,8 @@ void ProjectionStorage::build_label_edge_index_() {
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1297,7 +1351,8 @@ void ProjectionStorage::build_node_key_value_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1313,7 +1368,8 @@ void ProjectionStorage::build_key_value_node_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1329,7 +1385,8 @@ void ProjectionStorage::build_edge_key_value_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 
@@ -1345,7 +1402,8 @@ void ProjectionStorage::build_key_value_edge_index_() {
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
-        sort_temp_dir
+        sort_temp_dir,
+        requested_leaf_format
     );
 }
 

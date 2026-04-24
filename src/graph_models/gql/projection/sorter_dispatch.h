@@ -50,6 +50,7 @@
 
 #include "graph_models/gql/projection/external_record_sort.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 
 namespace GQL {
 
@@ -99,6 +100,19 @@ using BuildFromSorterFn =
  *                          forwarding to `ProjectionStorage::build_index_streaming`.
  * @param  sort_temp_dir    Directory for the sorter's temporary files.
  *                          Usually `<projection_dir>/sort_tmp`.
+ * @param  leaf_format      Spec #5 T5.11b. Selects the on-disk leaf encoding.
+ *                          BITSET (default) preserves pre-Spec-#5 byte-
+ *                          identical behavior; DELTA_VARINT opts into the
+ *                          zigzag-delta + LEB128 varint v2 encoding. The
+ *                          RADIX backend propagates this into
+ *                          RadixPartitionSort<N>::Config.leaf_format; the
+ *                          CLASSIC backend relies on the caller-supplied
+ *                          `build_from_sorter` callback picking up the same
+ *                          per-projection preset from ProjectionStorage
+ *                          (the callback closes over `this` and reads
+ *                          `requested_leaf_format` directly, so the value
+ *                          does not need to be re-threaded through the
+ *                          callback signature).
  * @return Total unique records written to the B+Tree (return value of the
  *         caller's build callback).
  */
@@ -108,18 +122,19 @@ std::size_t sort_and_build_index(
     const std::string&           index_base_path,
     std::uint64_t                estimated_count,
     const BuildFromSorterFn<N>&  build_from_sorter,
-    const std::string&           sort_temp_dir
+    const std::string&           sort_temp_dir,
+    BPT::LeafFormat              leaf_format = BPT::LeafFormat::BITSET
 );
 
 // Explicit instantiations (declared here, defined in .cc).
 extern template std::size_t sort_and_build_index<1>(
     StreamingRecordBuffer<1>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<1>&, const std::string&);
+    const BuildFromSorterFn<1>&, const std::string&, BPT::LeafFormat);
 extern template std::size_t sort_and_build_index<2>(
     StreamingRecordBuffer<2>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<2>&, const std::string&);
+    const BuildFromSorterFn<2>&, const std::string&, BPT::LeafFormat);
 extern template std::size_t sort_and_build_index<3>(
     StreamingRecordBuffer<3>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<3>&, const std::string&);
+    const BuildFromSorterFn<3>&, const std::string&, BPT::LeafFormat);
 
 }  // namespace GQL

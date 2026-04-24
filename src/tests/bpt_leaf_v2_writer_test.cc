@@ -362,3 +362,176 @@ TEST(BPTLeafV2Writer, FlushIdempotent) {
 }
 
 }  // namespace
+
+
+// ============================================================================
+// Tests for BPTLeafV2Writer<N> — the BULK-LOAD sibling of BPTLeafWriter<N>
+// (Spec #5 T5.11b). Scope: file-level streaming API that wraps a
+// BPTLeafV2<N> and emits a chained sequence of 4 KB pages on overflow,
+// mirroring BPTLeafWriter's external contract (process_block + make_empty)
+// but record-at-a-time instead of page-at-a-time.
+// ============================================================================
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <unistd.h>
+
+#include "storage/index/bplus_tree/bpt_mem_import.h"
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Pick a unique scratch path for this test binary run.
+std::string scratch_leaf_path(const char* tag) {
+    const auto dir = fs::temp_directory_path()
+                   / ("mdb_bpt_leaf_v2_writer_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    return (dir / (std::string(tag) + ".leaf")).string();
+}
+
+// Read entire file contents into a vector of bytes.
+std::vector<uint8_t> read_all_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(0, std::ios::end);
+    const auto sz = static_cast<std::size_t>(in.tellg());
+    in.seekg(0, std::ios::beg);
+    std::vector<uint8_t> out(sz);
+    in.read(reinterpret_cast<char*>(out.data()), sz);
+    return out;
+}
+
+TEST(BPTLeafV2BulkWriter, MakeEmpty_ProducesSinglePage_ByteZeroIsTwo) {
+    const auto path = scratch_leaf_path("MakeEmpty");
+    {
+        BPTLeafV2Writer<3> w(path);
+        w.make_empty();
+    }
+    const auto bytes = read_all_bytes(path);
+    ASSERT_EQ(bytes.size(), Page::SIZE);
+    EXPECT_EQ(bytes[0], 0x02);          // format_version = 2
+    EXPECT_EQ(bytes[1], 3);             // record_width = N
+    EXPECT_EQ(bytes[2], 0);             // flags reserved
+    EXPECT_EQ(bytes[3], 0);             // reserved
+    // value_count (offset 4..7) = 0
+    EXPECT_EQ(bytes[4], 0); EXPECT_EQ(bytes[5], 0);
+    EXPECT_EQ(bytes[6], 0); EXPECT_EQ(bytes[7], 0);
+    // next_leaf (offset 8..11) = 0 (terminal page)
+    EXPECT_EQ(bytes[8], 0); EXPECT_EQ(bytes[9], 0);
+    EXPECT_EQ(bytes[10], 0); EXPECT_EQ(bytes[11], 0);
+    fs::remove(path);
+}
+
+TEST(BPTLeafV2BulkWriter, AppendSinglePage_ValueCountAndNextLeafCorrect) {
+    const auto path = scratch_leaf_path("SinglePage");
+    {
+        BPTLeafV2Writer<3> w(path);
+        EXPECT_FALSE(w.append_record(Record<3>{1, 2, 3}));     // fits
+        EXPECT_FALSE(w.append_record(Record<3>{10, 20, 30}));  // fits
+        EXPECT_FALSE(w.append_record(Record<3>{100, 200, 300}));// fits
+        w.finalize();
+    }
+    const auto bytes = read_all_bytes(path);
+    ASSERT_EQ(bytes.size(), Page::SIZE);
+    EXPECT_EQ(bytes[0], 0x02);
+    EXPECT_EQ(bytes[1], 3);
+    // value_count LE
+    const uint32_t vc = static_cast<uint32_t>(bytes[4])
+                      | (static_cast<uint32_t>(bytes[5]) << 8)
+                      | (static_cast<uint32_t>(bytes[6]) << 16)
+                      | (static_cast<uint32_t>(bytes[7]) << 24);
+    EXPECT_EQ(vc, 3u);
+    // next_leaf = 0 (tail page)
+    const uint32_t nl = static_cast<uint32_t>(bytes[8])
+                      | (static_cast<uint32_t>(bytes[9]) << 8)
+                      | (static_cast<uint32_t>(bytes[10]) << 16)
+                      | (static_cast<uint32_t>(bytes[11]) << 24);
+    EXPECT_EQ(nl, 0u);
+    fs::remove(path);
+}
+
+TEST(BPTLeafV2BulkWriter, AppendManyRecords_CrossesPageBoundaries) {
+    const auto path = scratch_leaf_path("ManyRecords");
+    constexpr int kNumRecords = 8000;  // forces multiple pages for N=3
+    std::size_t page_breaks = 0;
+    {
+        BPTLeafV2Writer<3> w(path);
+        for (int i = 0; i < kNumRecords; ++i) {
+            // Dense sorted records with small deltas — best case for v2 compression.
+            if (w.append_record(Record<3>{
+                    static_cast<uint64_t>(i),
+                    static_cast<uint64_t>(i * 2),
+                    static_cast<uint64_t>(i * 3)})) {
+                ++page_breaks;
+            }
+        }
+        w.finalize();
+    }
+    EXPECT_GT(page_breaks, 0u)
+        << "8000 records MUST span multiple pages; writer never crossed a page boundary";
+    const auto bytes = read_all_bytes(path);
+    // File must be a multiple of Page::SIZE.
+    ASSERT_EQ(bytes.size() % Page::SIZE, 0u);
+    const std::size_t num_pages = bytes.size() / Page::SIZE;
+    EXPECT_EQ(num_pages, page_breaks + 1)
+        << "num_pages (" << num_pages << ") != page_breaks + 1 ("
+        << (page_breaks + 1) << ")";
+
+    // Every page must start with byte 0x02 (v2 format_version).
+    for (std::size_t p = 0; p < num_pages; ++p) {
+        EXPECT_EQ(bytes[p * Page::SIZE], 0x02)
+            << "page " << p << " byte 0 is not 0x02";
+        EXPECT_EQ(bytes[p * Page::SIZE + 1], 3)
+            << "page " << p << " record_width mismatch";
+    }
+
+    // Every non-final page must have next_leaf = p + 1; final page must have 0.
+    for (std::size_t p = 0; p < num_pages; ++p) {
+        const std::size_t off = p * Page::SIZE + 8;
+        const uint32_t nl = static_cast<uint32_t>(bytes[off])
+                          | (static_cast<uint32_t>(bytes[off + 1]) << 8)
+                          | (static_cast<uint32_t>(bytes[off + 2]) << 16)
+                          | (static_cast<uint32_t>(bytes[off + 3]) << 24);
+        if (p + 1 < num_pages) {
+            EXPECT_EQ(nl, static_cast<uint32_t>(p + 1))
+                << "page " << p << " next_leaf should point to " << (p + 1);
+        } else {
+            EXPECT_EQ(nl, 0u)
+                << "final page next_leaf must be 0 (terminator)";
+        }
+    }
+    fs::remove(path);
+}
+
+TEST(BPTLeafV2BulkWriter, RoundtripViaReadTag_RecordsDecodeCorrectly) {
+    const auto path = scratch_leaf_path("Roundtrip");
+    const std::vector<Record<3>> inputs = {
+        {10, 20, 30},
+        {11, 21, 31},
+        {100, 200, 300},
+        {1000, 2000, 3000},
+    };
+    {
+        BPTLeafV2Writer<3> w(path);
+        for (const auto& r : inputs) {
+            w.append_record(r);
+        }
+        w.finalize();
+    }
+    const auto bytes = read_all_bytes(path);
+    ASSERT_EQ(bytes.size(), Page::SIZE);
+
+    // Re-interpret as a V2 reader over the page bytes.
+    BPTLeafV2<3> reader(reinterpret_cast<const char*>(bytes.data()),
+                        BPTLeafV2<3>::ReadTag{});
+    ASSERT_EQ(reader.get_value_count(), inputs.size());
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const auto r = reader.get_record(static_cast<uint_fast32_t>(i));
+        EXPECT_EQ(r, inputs[i]) << "record " << i << " mismatch";
+    }
+    fs::remove(path);
+}
+
+}  // namespace (bulk writer)
