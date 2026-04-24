@@ -265,6 +265,20 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
                 build_topology_snapshot = Common::Conversions::unpack_bool(v);
             }
         }
+
+        // Spec #8 T8.9 (design §3.8 D8) — when the user asks for both the
+        // CSR-in-B+Tree hybrid AND a topology sidecar, the sidecar is
+        // silently dropped because the in-leaf CSR supersedes it. Emit a
+        // one-line warning to stderr so the operator sees the flag had no
+        // effect; the projection itself remains valid.
+        if (graph_storage == BPT::GraphStorage::CSR_HYBRID
+            && build_topology_snapshot) {
+            std::cerr << "[graph_project] warning: buildTopologySnapshot is "
+                         "ignored when graphStorage='CSR_HYBRID' — the in-leaf "
+                         "CSR supersedes the sidecar (design §3.8 D8)."
+                      << std::endl;
+            build_topology_snapshot = false;
+        }
     }
 
     // Validate includeFeatures against catalog (must be a registered FeatureMatrix)

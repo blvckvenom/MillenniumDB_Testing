@@ -113,6 +113,20 @@ using BuildFromSorterFn =
  *                          `requested_leaf_format` directly, so the value
  *                          does not need to be re-threaded through the
  *                          callback signature).
+ * @param  graph_storage    Spec #8 T8.9. When CSR_HYBRID AND N == 3 (edge
+ *                          index widths), the dispatch emits v3 CSR leaves
+ *                          via BPTLeafCSRWriter instead of the BITSET/
+ *                          DELTA_VARINT path. The caller is expected to
+ *                          pass CSR_HYBRID only for FROM_TO_EDGE /
+ *                          TO_FROM_EDGE index builds; non-edge indexes
+ *                          (N != 3 or other semantic positions) must keep
+ *                          the default BTREE. The CLASSIC backend bypasses
+ *                          the caller-supplied `build_from_sorter` callback
+ *                          when this gate fires and emits pages directly
+ *                          through BPTLeafCSRWriter, matching the RADIX
+ *                          path's self-contained write_btree_from_sorted_
+ *                          partitions_csr_ helper. Default BTREE preserves
+ *                          pre-Spec-#8 byte-for-byte behavior.
  * @return Total unique records written to the B+Tree (return value of the
  *         caller's build callback).
  */
@@ -123,18 +137,22 @@ std::size_t sort_and_build_index(
     std::uint64_t                estimated_count,
     const BuildFromSorterFn<N>&  build_from_sorter,
     const std::string&           sort_temp_dir,
-    BPT::LeafFormat              leaf_format = BPT::LeafFormat::BITSET
+    BPT::LeafFormat              leaf_format   = BPT::LeafFormat::BITSET,
+    BPT::GraphStorage            graph_storage = BPT::GraphStorage::BTREE
 );
 
 // Explicit instantiations (declared here, defined in .cc).
 extern template std::size_t sort_and_build_index<1>(
     StreamingRecordBuffer<1>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<1>&, const std::string&, BPT::LeafFormat);
+    const BuildFromSorterFn<1>&, const std::string&, BPT::LeafFormat,
+    BPT::GraphStorage);
 extern template std::size_t sort_and_build_index<2>(
     StreamingRecordBuffer<2>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<2>&, const std::string&, BPT::LeafFormat);
+    const BuildFromSorterFn<2>&, const std::string&, BPT::LeafFormat,
+    BPT::GraphStorage);
 extern template std::size_t sort_and_build_index<3>(
     StreamingRecordBuffer<3>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<3>&, const std::string&, BPT::LeafFormat);
+    const BuildFromSorterFn<3>&, const std::string&, BPT::LeafFormat,
+    BPT::GraphStorage);
 
 }  // namespace GQL

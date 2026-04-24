@@ -210,10 +210,21 @@ void ProjectionStorage::open() {
     // reader so BptIter dispatches on the right leaf layout at read time.
     const BPT::LeafFormat lf = requested_leaf_format;
 
+    // Spec #8 T8.9 — under CSR_HYBRID, edge indexes (from_to_edge /
+    // to_from_edge) carry v3 CSR leaves with a distinct header byte (0x03).
+    // BptIter's 3-way dispatch (T8.6) keys on the LeafFormat passed to the
+    // BPlusTree<N> ctor, so we must pass CSR_HYBRID for edge indexes in
+    // this mode while keeping the user-requested format for everything
+    // else. Non-edge indexes remain on lf (BITSET / DELTA_VARINT).
+    const BPT::LeafFormat edge_lf =
+        (requested_graph_storage == BPT::GraphStorage::CSR_HYBRID)
+            ? BPT::LeafFormat::CSR_HYBRID
+            : lf;
+
     // Open required indexes (always present)
     nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
-    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", lf);
-    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", lf);
+    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
+    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
     edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
 
     // Open edge-first indexes if they exist (added in Phase 13)
@@ -856,6 +867,15 @@ void ProjectionStorage::save_catalog() {
     // the same byte. ProjectionCatalog::save() defaults an empty vector to
     // all-BITSET, but we populate it explicitly here so DELTA_VARINT is
     // actually recorded when the user opts in.
+    //
+    // Spec #8 T8.9: CSR_HYBRID is NOT recorded per-slot in leaf_formats —
+    // the v1.5 array validator only accepts BITSET/DELTA_VARINT, and the
+    // sealed catalog file cannot be extended. Instead, the per-projection
+    // `graph_storage` byte (v1.6) carries the CSR_HYBRID signal; the
+    // open-time reader in ProjectionStorage::open() derives the right
+    // LeafFormat for FROM_TO_EDGE / TO_FROM_EDGE from that byte and
+    // bypasses leaf_formats for those two slots. Non-edge indexes honor
+    // leaf_formats as before.
     {
         const auto mask =
             static_cast<uint32_t>(project_index_mask_for(requested_index_set));
@@ -1187,14 +1207,22 @@ void ProjectionStorage::build_from_to_edge_index_() {
             return build_index_streaming<3>(sorter, path);
         },
         sort_temp_dir,
-        requested_leaf_format
+        requested_leaf_format,
+        // Spec #8 T8.9 — edge indexes pick up the per-projection
+        // graph_storage mode. Under CSR_HYBRID the dispatch bypasses
+        // the build_from_sorter callback and invokes BPTLeafCSRWriter
+        // directly, producing v3 leaf pages. BTREE (default) preserves
+        // pre-Spec-#8 byte-identical output.
+        requested_graph_storage
     );
 
     // Spec #4-B T4.18 integrated topology snapshot emission.
-    // Runs only when NativeProjectionBuilder pre-set the opt-in flag.
-    // The legacy post-hoc path (build_topology_snapshots_()) still exists
-    // but short-circuits when fwd_topology_snapshot_built_ is already true.
-    if (build_topology_snapshot_) {
+    // Runs only when NativeProjectionBuilder pre-set the opt-in flag AND
+    // the projection is in BTREE mode. Under CSR_HYBRID the in-leaf CSR
+    // supersedes the sidecar (design §3.8 D8), so we skip emission here
+    // and build_topology_snapshots_() short-circuits below.
+    if (build_topology_snapshot_
+        && requested_graph_storage != BPT::GraphStorage::CSR_HYBRID) {
         try {
             GQL::Projection::build_topology_snapshot_from_leaf(
                 std::filesystem::path(projection_dir),
@@ -1224,12 +1252,16 @@ void ProjectionStorage::build_to_from_edge_index_() {
             return build_index_streaming<3>(sorter, path);
         },
         sort_temp_dir,
-        requested_leaf_format
+        requested_leaf_format,
+        // Spec #8 T8.9 — see build_from_to_edge_index_() above.
+        requested_graph_storage
     );
 
     // Spec #4-B T4.18 integrated topology snapshot emission (reverse).
-    // Same gate + fallback logic as the FORWARD builder above.
-    if (build_topology_snapshot_) {
+    // Same gate + fallback logic as the FORWARD builder above, plus the
+    // Spec #8 T8.9 CSR_HYBRID supersession (design §3.8 D8).
+    if (build_topology_snapshot_
+        && requested_graph_storage != BPT::GraphStorage::CSR_HYBRID) {
         try {
             GQL::Projection::build_topology_snapshot_from_leaf(
                 std::filesystem::path(projection_dir),
@@ -1610,15 +1642,23 @@ void ProjectionStorage::open_all_bplustree_readers_() {
     // current graph_project surface exposes.
     const BPT::LeafFormat lf = requested_leaf_format;
 
+    // Spec #8 T8.9 — mirrored from the open() path: under CSR_HYBRID the
+    // FROM_TO_EDGE / TO_FROM_EDGE B+Trees carry v3 CSR leaves; all other
+    // indexes keep the projection-wide lf.
+    const BPT::LeafFormat edge_lf =
+        (requested_graph_storage == BPT::GraphStorage::CSR_HYBRID)
+            ? BPT::LeafFormat::CSR_HYBRID
+            : lf;
+
     // Open topology indexes (previously unconditionally opened).
     if (has_flag(active_mask, ProjectionIndex::NODES)) {
         nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
     }
     if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
-        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", lf);
+        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
     }
     if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
-        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", lf);
+        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
         edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);

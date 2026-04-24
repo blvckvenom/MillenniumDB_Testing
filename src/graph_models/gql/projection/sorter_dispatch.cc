@@ -21,6 +21,7 @@
 #include "graph_models/gql/projection/external_record_sort.h"
 #include "graph_models/gql/projection/radix_partition_sort.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
+#include "storage/index/bplus_tree/bpt_mem_import.h"
 
 namespace GQL {
 
@@ -43,6 +44,66 @@ void init_cached_backend() {
         // Unknown value → safe default.
         cached_backend_ = SorterBackend::CLASSIC;
     }
+}
+
+/**
+ * @brief Spec #8 T8.9 — CLASSIC-backend CSR_HYBRID write helper.
+ *
+ * Invoked only when the caller requests CSR_HYBRID on an edge-index
+ * (Record<3>). Drains the populated `sorter` in key order and streams each
+ * record through `BPTLeafCSRWriter<N>`, which groups by record[0] (src) and
+ * emits v3 chain-head + optional continuation pages. A trivial (key_count=0)
+ * root directory page is written alongside — lookups route unconditionally
+ * to leaf 0 and walk the `next_leaf` chain to locate the target src. This
+ * MVP dir layout is correctness-first; dir-keyed routing that narrows to
+ * the specific chain-head page is a future optimization covered by the
+ * T8.12 Gate D benchmark.
+ *
+ * The writer's `append()` contract requires records sorted by record[0]
+ * (src) — this matches the sorter's output. A return value of `unique_count`
+ * is used as the post-dedup row count; CSR deduplication at the writer
+ * level is a design deferral (see bpt_mem_import.h class comment), so the
+ * streaming loop runs a single-record adjacent-equals check on the full
+ * Record<N> to preserve the B+Tree invariant that identical records are
+ * collapsed.
+ */
+template<std::size_t N>
+std::size_t build_index_csr_from_sorter_(
+    ExternalRecordSort<N>& sorter,
+    const std::string&     index_base_path)
+{
+    BPTLeafCSRWriter<N> leaf_writer(index_base_path + ".leaf");
+    // Dtor emits a single empty root dir page (key_count=0, children[0]=0).
+    // With the CSR leaf chain walked via next_leaf from page 0, any
+    // search_leaf(min) lands at leaf 0 and the forward chain covers the
+    // rest — preserving correctness at the cost of an O(num_pages) scan
+    // per range lookup. Proper src-keyed dir entries are the subject of
+    // the Gate D performance sweep (T8.12).
+    BPTDirWriter<N>  dir_writer(index_base_path + ".dir");
+
+    if (sorter.total_records() == 0) {
+        leaf_writer.make_empty();
+        return 0;
+    }
+
+    Record<N>   prev_record{};
+    bool        has_prev     = false;
+    std::size_t unique_count = 0;
+
+    sorter.stream_sorted([&](const Record<N>& record) {
+        if (has_prev && record == prev_record) {
+            return;  // inline dedup, matches BITSET/DELTA_VARINT paths
+        }
+        prev_record = record;
+        has_prev    = true;
+        ++unique_count;
+        leaf_writer.append(record);
+    });
+
+    // Flush any pending staged src + the current chain-head page.
+    leaf_writer.flush_finalize();
+
+    return unique_count;
 }
 
 /**
@@ -117,8 +178,19 @@ std::size_t sort_and_build_index(
     std::uint64_t                estimated_count,
     const BuildFromSorterFn<N>&  build_from_sorter,
     const std::string&           sort_temp_dir,
-    BPT::LeafFormat              leaf_format
+    BPT::LeafFormat              leaf_format,
+    BPT::GraphStorage            graph_storage
 ) {
+    // Spec #8 T8.9 — CSR_HYBRID gates only on Record<3> edge indexes. The
+    // caller is responsible for passing CSR_HYBRID exclusively for the
+    // FROM_TO_EDGE / TO_FROM_EDGE builds (design §3.6 D6 scopes the hybrid
+    // format to those two topology indexes). Non-edge widths must keep
+    // BTREE; this constexpr check enforces the scope at compile time so a
+    // slip through to BPTLeafCSRWriter<1> (which would be instantiation-
+    // failing anyway) never silently drops to an incorrect write path.
+    const bool csr_edge =
+        (graph_storage == BPT::GraphStorage::CSR_HYBRID) && (N == 3);
+
     switch (get_sorter_backend()) {
         case SorterBackend::CLASSIC: {
             (void)estimated_count;  // Unused in CLASSIC.
@@ -130,6 +202,37 @@ std::size_t sort_and_build_index(
             // level API contract (T5.11b unit tests pass BITSET explicitly
             // to pin default behavior).
             (void)leaf_format;
+
+            if (csr_edge) {
+                // Drain input into the sorter (same prologue as run_classic)
+                // and write v3 CSR leaves directly, bypassing the caller's
+                // BITSET/DELTA_VARINT-oriented build_from_sorter callback.
+                input_stream.finalize();
+                std::size_t count = 0;
+                {
+                    ExternalRecordSort<N> sorter(sort_temp_dir);
+                    const auto& spill_paths  = input_stream.get_spill_paths();
+                    const auto& spill_counts = input_stream.get_spill_counts();
+                    for (std::size_t i = 0; i < spill_paths.size(); ++i) {
+                        sorter.add_run(spill_paths[i], spill_counts[i]);
+                    }
+                    if (input_stream.memory_buffer_size() > 0) {
+                        sorter.add_memory_records(input_stream.take_memory_buffer());
+                    }
+                    if constexpr (N == 3) {
+                        count = build_index_csr_from_sorter_<N>(sorter, index_base_path);
+                    } else {
+                        // Unreachable — csr_edge already requires N == 3.
+                        (void)build_from_sorter;
+                    }
+                }
+                input_stream.clear();
+#if defined(__GLIBC__)
+                malloc_trim(0);
+#endif
+                return count;
+            }
+
             return run_classic<N>(
                 input_stream, index_base_path, build_from_sorter, sort_temp_dir);
         }
@@ -153,6 +256,13 @@ std::size_t sort_and_build_index(
             cfg.scratch_dir =
                 (std::filesystem::path(sort_temp_dir) / ".radix_scratch").string();
             cfg.leaf_format = leaf_format;
+            // Spec #8 T8.9 — propagate the edge-index CSR gate so the
+            // RADIX backend's Phase 3 writer (write_btree_from_sorted_
+            // partitions_csr_) replaces the BITSET/DELTA_VARINT writers
+            // when the caller asks for CSR_HYBRID on an edge index.
+            cfg.graph_storage = csr_edge
+                ? BPT::GraphStorage::CSR_HYBRID
+                : BPT::GraphStorage::BTREE;
             // Reuse sort_temp_dir's subdirectory so each projection has its own
             // scratch area — build_all_indexes_bulk passes the same
             // sort_temp_dir across all 14 index builds, but `.radix_scratch`
@@ -181,12 +291,15 @@ std::size_t sort_and_build_index(
 // Explicit instantiations.
 template std::size_t sort_and_build_index<1>(
     StreamingRecordBuffer<1>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<1>&, const std::string&, BPT::LeafFormat);
+    const BuildFromSorterFn<1>&, const std::string&, BPT::LeafFormat,
+    BPT::GraphStorage);
 template std::size_t sort_and_build_index<2>(
     StreamingRecordBuffer<2>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<2>&, const std::string&, BPT::LeafFormat);
+    const BuildFromSorterFn<2>&, const std::string&, BPT::LeafFormat,
+    BPT::GraphStorage);
 template std::size_t sort_and_build_index<3>(
     StreamingRecordBuffer<3>&, const std::string&, std::uint64_t,
-    const BuildFromSorterFn<3>&, const std::string&, BPT::LeafFormat);
+    const BuildFromSorterFn<3>&, const std::string&, BPT::LeafFormat,
+    BPT::GraphStorage);
 
 }  // namespace GQL

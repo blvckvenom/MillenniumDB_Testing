@@ -995,6 +995,45 @@ if(GTest_FOUND AND
     )
 endif()
 
+# Registers graph_storage_integration_test when GTest is available and the
+# source file exists. Spec #8 T8.9 integration-level regressions for the
+# CSR_HYBRID write dispatch (edge indexes), leaf-format invariants, and the
+# sidecar supersession (design §3.8 D8).
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/graph_storage_integration_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(graph_storage_integration_test
+        ${CMAKE_SOURCE_DIR}/src/tests/graph_storage_integration_test.cc
+    )
+    set_target_properties(graph_storage_integration_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(graph_storage_integration_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(graph_storage_integration_test
+            mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME graph_storage_integration_test
+        COMMAND $<TARGET_FILE:graph_storage_integration_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 # Registers projection_leaffmt_config_test when GTest is available and the
 # source file exists. Follows the precedent of projection_catalog_v5_test.
 if(GTest_FOUND AND

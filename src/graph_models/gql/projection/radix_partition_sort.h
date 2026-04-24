@@ -53,6 +53,13 @@ public:
         // BITSET (default) preserves pre-Spec-#5 byte-identical behavior;
         // DELTA_VARINT opts in to the delta+varint v2 encoding.
         BPT::LeafFormat leaf_format        = BPT::LeafFormat::BITSET;
+
+        // Spec #8 T8.9 — when CSR_HYBRID, Phase 3 emits v3 CSR leaves via
+        // BPTLeafCSRWriter<N> instead of the BITSET/DELTA_VARINT writers.
+        // Caller gates this to N==3 edge indexes (FROM_TO_EDGE /
+        // TO_FROM_EDGE) per design §3.6 D6. Default BTREE preserves
+        // pre-Spec-#8 byte-identical RADIX output.
+        BPT::GraphStorage graph_storage    = BPT::GraphStorage::BTREE;
     };
 
     explicit RadixPartitionSort(Config config);

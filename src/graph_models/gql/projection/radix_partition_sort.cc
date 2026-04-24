@@ -207,14 +207,86 @@ static std::size_t write_btree_from_sorted_partitions_delta_varint_(
     return unique_count;
 }
 
+// CSR_HYBRID concatenation (v3 leaf format, Spec #8). Streams records
+// from globally-ordered partition files into BPTLeafCSRWriter, which
+// groups by record[0] (src) and emits chain-head + optional continuation
+// pages. A trivial root .dir (key_count=0) is emitted; lookups route to
+// leaf 0 and walk the next_leaf chain. Correctness-first MVP: src-keyed
+// directory routing is deferred to T8.12's Gate D bench optimization.
+//
+// N == 3 is the only instantiation that produces sensible CSR output
+// (src, dst, edge_id). The writer drops edge_id (design §3.4 notes the
+// single-stream v3 payload does not encode it) — on read, v3 returns 0
+// for position 2, which GnnProjectionAdapter / TopologyAccessor callers
+// tolerate.
+template<std::size_t N>
+static std::size_t write_btree_from_sorted_partitions_csr_(
+    const std::vector<std::string>& sorted_partition_paths,
+    const std::string& base_path)
+{
+    if constexpr (N == 3) {
+        BPTLeafCSRWriter<N> leaf_writer(base_path + ".leaf");
+        // Dtor emits the root dir page.
+        BPTDirWriter<N>     dir_writer(base_path + ".dir");
+
+        bool any_nonempty = false;
+        for (const auto& p : sorted_partition_paths) {
+            if (fs::exists(p) && fs::file_size(p) > 0) {
+                any_nonempty = true;
+                break;
+            }
+        }
+        if (!any_nonempty) {
+            leaf_writer.make_empty();
+            return 0;
+        }
+
+        Record<N>   prev_record{};
+        bool        has_prev     = false;
+        std::size_t unique_count = 0;
+
+        for (const auto& path : sorted_partition_paths) {
+            if (!fs::exists(path)) continue;
+            typename PartitionFile<N>::Reader reader(path);
+            Record<N> r{};
+            while (reader.next(r)) {
+                if (has_prev && r == prev_record) continue;
+                prev_record = r;
+                has_prev    = true;
+                ++unique_count;
+                leaf_writer.append(r);
+            }
+        }
+
+        leaf_writer.flush_finalize();
+        return unique_count;
+    } else {
+        // Spec #8 scopes CSR_HYBRID to edge indexes (N==3). Reaching here
+        // is a caller-side invariant violation — radix config should have
+        // kept graph_storage at BTREE for N==2 indexes. Return 0 as a
+        // defensive fallback; the upstream ProjectionStorage dispatch
+        // enforces the scope at config time.
+        (void)sorted_partition_paths;
+        (void)base_path;
+        return 0;
+    }
+}
+
 // Dispatch shim. Default leaf_format is BITSET to preserve pre-Spec-#5
 // behavior for any caller not yet plumbed through T5.11b.
 template<std::size_t N>
 std::size_t write_btree_from_sorted_partitions(
     const std::vector<std::string>& sorted_partition_paths,
     const std::string& base_path,
-    BPT::LeafFormat leaf_format)
+    BPT::LeafFormat leaf_format,
+    BPT::GraphStorage graph_storage)
 {
+    // Spec #8 T8.9 — CSR_HYBRID supersedes leaf_format for its scope
+    // (edge indexes, N==3). The helper itself gates on N via constexpr.
+    if (graph_storage == BPT::GraphStorage::CSR_HYBRID) {
+        return write_btree_from_sorted_partitions_csr_<N>(
+            sorted_partition_paths, base_path);
+    }
     if (leaf_format == BPT::LeafFormat::DELTA_VARINT) {
         return write_btree_from_sorted_partitions_delta_varint_<N>(
             sorted_partition_paths, base_path);
@@ -362,7 +434,8 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
         }
     }
     total_written = write_btree_from_sorted_partitions<N>(
-        sorted_paths, output_base_path, config_.leaf_format);
+        sorted_paths, output_base_path,
+        config_.leaf_format, config_.graph_storage);
 
     // Cleanup intermediate per-partition sorted files — the B+Tree
     // (`.leaf` + `.dir`) is now the authoritative output.
@@ -468,10 +541,13 @@ template class RadixPartitionSort<3>;
 
 // Explicit instantiations for the free-function Phase 3 helper.
 template std::size_t write_btree_from_sorted_partitions<1>(
-    const std::vector<std::string>&, const std::string&, BPT::LeafFormat);
+    const std::vector<std::string>&, const std::string&,
+    BPT::LeafFormat, BPT::GraphStorage);
 template std::size_t write_btree_from_sorted_partitions<2>(
-    const std::vector<std::string>&, const std::string&, BPT::LeafFormat);
+    const std::vector<std::string>&, const std::string&,
+    BPT::LeafFormat, BPT::GraphStorage);
 template std::size_t write_btree_from_sorted_partitions<3>(
-    const std::vector<std::string>&, const std::string&, BPT::LeafFormat);
+    const std::vector<std::string>&, const std::string&,
+    BPT::LeafFormat, BPT::GraphStorage);
 
 }  // namespace GQL

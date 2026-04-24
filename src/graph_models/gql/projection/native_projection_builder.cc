@@ -2427,6 +2427,17 @@ void NativeProjectionBuilder::build_topology_snapshots_() {
         return;
     }
 
+    // Spec #8 T8.9 (design §3.8 D8) — under graphStorage='CSR_HYBRID' the
+    // in-leaf CSR on the FROM_TO_EDGE / TO_FROM_EDGE B+Trees supersedes
+    // any topology sidecar. If the user also set buildTopologySnapshot=true
+    // we silently drop the sidecar emission here; project_procedure.cc
+    // logs a single warning line so callers notice the flag had no effect.
+    // The projection itself remains valid and fully queryable via the
+    // CSR-aware BPT readers opened in ProjectionStorage.
+    if (graph_storage_ == BPT::GraphStorage::CSR_HYBRID) {
+        return;
+    }
+
     const ProjectionIndex active_mask = project_index_mask_for(index_set_);
     const bool fwd_ok = has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE);
     const bool rev_ok = has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE);
