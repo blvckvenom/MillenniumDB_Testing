@@ -175,59 +175,78 @@ void ProjectionStorage::open() {
         // index is accessed. Older catalogs (pre-v1.4) default to ALL via
         // ProjectionCatalog::load(), so this is safe for all versions.
         requested_index_set = catalog.index_set;
+
+        // Spec #5 T5.11 — restore the leaf-format preset from v1.5 catalog.
+        // Pre-v1.5 catalogs default every slot to BITSET (handled by
+        // ProjectionCatalog::load); we pick the first entry as the
+        // projection-wide format since the current surface only supports a
+        // single format per projection. Empty vector (no materialized
+        // indexes recorded) falls through to the BITSET default.
+        if (!catalog.leaf_formats.empty()) {
+            const uint8_t fmt = catalog.leaf_formats[0];
+            if (fmt == static_cast<uint8_t>(BPT::LeafFormat::DELTA_VARINT)) {
+                requested_leaf_format = BPT::LeafFormat::DELTA_VARINT;
+            } else {
+                requested_leaf_format = BPT::LeafFormat::BITSET;
+            }
+        }
     }
 
+    // Spec #5 T5.11 — thread the restored leaf_format into every BPlusTree
+    // reader so BptIter dispatches on the right leaf layout at read time.
+    const BPT::LeafFormat lf = requested_leaf_format;
+
     // Open required indexes (always present)
-    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
-    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
-    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
-    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
+    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
+    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", lf);
+    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", lf);
+    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
 
     // Open edge-first indexes if they exist (added in Phase 13)
     std::filesystem::path proj_path_check(projection_dir);
     if (std::filesystem::exists(proj_path_check / "edge_from_to.leaf")) {
-        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to");
+        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
     }
     if (std::filesystem::exists(proj_path_check / "edge_n1_n2.leaf")) {
-        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2");
+        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
     }
 
     // Open optional label indexes if they exist
     if (std::filesystem::exists(proj_path / "node_label.leaf")) {
-        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label", lf);
         features.include_node_labels = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "label_node.leaf")) {
-            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
+            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node", lf);
         }
     }
 
     if (std::filesystem::exists(proj_path / "edge_label.leaf")) {
-        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label", lf);
         features.include_edge_labels = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "label_edge.leaf")) {
-            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
+            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge", lf);
         }
     }
 
     // Open optional property indexes if they exist
     if (std::filesystem::exists(proj_path / "node_key_value.leaf")) {
-        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
+        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
         features.include_node_properties = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "key_value_node.leaf")) {
-            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");
+            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", lf);
         }
     }
 
     // Edge property indexes
     if (std::filesystem::exists(proj_path / "edge_key_value.leaf")) {
-        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
+        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", lf);
         features.include_edge_properties = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "key_value_edge.leaf")) {
-            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
+            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", lf);
         }
     }
 }
@@ -235,18 +254,27 @@ void ProjectionStorage::open() {
 void ProjectionStorage::ensure_node_property_indexes() {
     std::filesystem::path proj_path(projection_dir);
 
+    // Spec #5 T5.11 — lazy-create readers with the same leaf-format preset
+    // recorded on this storage (projection-wide). Empty leaves emitted by
+    // BPTLeafWriter::make_empty() are 4 KB of zeros, which the v2 reader
+    // would reject on open; for now the ensure_* path is only used by the
+    // EmbeddingWriter (Phase 6) and that callsite hasn't adopted v2 yet, so
+    // passing the format through here is forward-compatible without
+    // requiring writer changes.
+    const BPT::LeafFormat lf = requested_leaf_format;
+
     if (!node_key_value_index) {
         std::string base = rel_dir + "/node_key_value";
         { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
         { BPTDirWriter<3>  dw(base + ".dir"); }
-        node_key_value_index = std::make_unique<BPlusTree<3>>(base);
+        node_key_value_index = std::make_unique<BPlusTree<3>>(base, lf);
         features.include_node_properties = true;
     }
     if (!key_value_node_index) {
         std::string base = rel_dir + "/key_value_node";
         { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
         { BPTDirWriter<3>  dw(base + ".dir"); }
-        key_value_node_index = std::make_unique<BPlusTree<3>>(base);
+        key_value_node_index = std::make_unique<BPlusTree<3>>(base, lf);
     }
 }
 
@@ -805,6 +833,24 @@ void ProjectionStorage::save_catalog() {
     // preset still produces a well-formed v1.4 catalog equivalent to the
     // pre-Spec #3 "everything materialized" behavior.
     catalog.index_set = requested_index_set;
+
+    // Spec #5 T5.11 — persist the per-index leaf_format byte array in
+    // catalog v1.5. Size == number of materialized indexes under the active
+    // IndexSet preset (one byte per slot, in canonical ProjectionIndex enum
+    // order; see projection_catalog.{h,cc}). The current graph_project
+    // surface exposes a single projection-wide format, so every slot gets
+    // the same byte. ProjectionCatalog::save() defaults an empty vector to
+    // all-BITSET, but we populate it explicitly here so DELTA_VARINT is
+    // actually recorded when the user opts in.
+    {
+        const auto mask =
+            static_cast<uint32_t>(project_index_mask_for(requested_index_set));
+        const size_t num_materialized =
+            static_cast<size_t>(__builtin_popcount(mask));
+        catalog.leaf_formats.assign(
+            num_materialized,
+            static_cast<uint8_t>(requested_leaf_format));
+    }
 
     // Save to disk
     catalog.save();
@@ -1477,24 +1523,31 @@ void ProjectionStorage::open_all_bplustree_readers_() {
     // scope here) will diagnose attempts to use an elided index.
     const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
+    // Spec #5 T5.11 — projection-wide leaf encoding threaded into every
+    // BPlusTree reader so BptIter dispatches on the right leaf layout. Spec
+    // #5-B will later introduce per-index mixed formats; this call site
+    // consumes a single projection-wide value because that is what the
+    // current graph_project surface exposes.
+    const BPT::LeafFormat lf = requested_leaf_format;
+
     // Open topology indexes (previously unconditionally opened).
     if (has_flag(active_mask, ProjectionIndex::NODES)) {
-        nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
+        nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
     }
     if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
-        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
+        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", lf);
     }
     if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
-        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
+        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", lf);
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
-        edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
+        edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)) {
-        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to");
+        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)) {
-        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2");
+        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
     }
 
     // Open optional label indexes — dual gate: features.include_*_labels
@@ -1502,29 +1555,29 @@ void ProjectionStorage::open_all_bplustree_readers_() {
     // include_label_indexes=false users retain their disk-saving behavior.
     if (features.include_node_labels) {
         if (has_flag(active_mask, ProjectionIndex::NODE_LABEL)) {
-            node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+            node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label", lf);
         }
         if (has_flag(active_mask, ProjectionIndex::LABEL_NODE)) {
-            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
+            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node", lf);
         }
     }
     if (features.include_edge_labels) {
         if (has_flag(active_mask, ProjectionIndex::EDGE_LABEL)) {
-            edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+            edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label", lf);
         }
         if (has_flag(active_mask, ProjectionIndex::LABEL_EDGE)) {
-            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
+            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge", lf);
         }
     }
 
     // Open optional property indexes — NOT gated by IndexSet (Spec #3 §3.4).
     if (features.include_node_properties) {
-        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
-        key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");
+        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
+        key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", lf);
     }
     if (features.include_edge_properties) {
-        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
-        key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
+        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", lf);
+        key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", lf);
     }
 }
 

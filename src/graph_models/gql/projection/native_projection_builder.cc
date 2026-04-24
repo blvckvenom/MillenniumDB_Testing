@@ -149,7 +149,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     const std::string& split_property,
     bool include_label_indexes,
     IndexSet index_set,
-    bool build_topology_snapshot
+    bool build_topology_snapshot,
+    BPT::LeafFormat leaf_format
 )
     : projection_name(projection_name_)
     , db_folder(db_folder_)
@@ -166,6 +167,7 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     , include_label_indexes_(include_label_indexes)
     , index_set_(index_set)
     , build_topology_snapshot_(build_topology_snapshot)
+    , leaf_format_(leaf_format)
     , per_type_orientations(type_orientations)
     , per_type_aggregations(type_aggregations)
     , per_type_agg_properties(type_agg_properties)
@@ -227,6 +229,13 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     // the persisted value to raise descriptive errors when a query needs an
     // index that wasn't materialized (e.g., EDGE_LABEL under GNN_MINIMAL).
     storage->requested_index_set = index_set_;
+
+    // Spec #5 T5.11 — push the leaf-format preset down so every BPlusTree
+    // reader constructed by ProjectionStorage uses the matching encoding,
+    // and save_catalog() can populate the v1.5 `leaf_formats` byte array
+    // (one byte per materialized index). Default BITSET is byte-identical
+    // to pre-Spec-#5 behavior for every caller that doesn't set the key.
+    storage->requested_leaf_format = leaf_format_;
 
     // Spec #4-B T4.18: push the topology-snapshot opt-in down into storage
     // so the two edge-index builders (build_from_to_edge_index_ and

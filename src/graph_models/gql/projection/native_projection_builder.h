@@ -14,6 +14,7 @@
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 #include "query/procedure/builtin/project_procedure.h"  // For Orientation enum
+#include "storage/index/bplus_tree/bpt_leaf_format.h"   // For BPT::LeafFormat (Spec #5 T5.11)
 
 namespace GQL { enum class IndexSet : uint8_t; }  // fwd: defined in index_set.h
 
@@ -420,6 +421,13 @@ public:
      *        surface (config key + YIELD field) is wired in T4.8; this
      *        constructor parameter is the builder-level hook the test suite
      *        drives directly.
+     * @param leaf_format Spec #5 T5.11 — selects the on-disk B+Tree leaf
+     *        encoding for every index materialized by this projection.
+     *        BPT::LeafFormat::BITSET (default) preserves the pre-Spec-#5
+     *        byte-identical behavior. BPT::LeafFormat::DELTA_VARINT opts
+     *        into the Spec-#5 v2 layout. The value is threaded to
+     *        ProjectionStorage (for per-index BPlusTree reader construction)
+     *        and persisted per materialized index in catalog v1.5.
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -439,7 +447,8 @@ public:
         const std::string& split_property = "",
         bool include_label_indexes = true,
         IndexSet index_set = static_cast<IndexSet>(0),  // IndexSet::ALL (fwd-declared)
-        bool build_topology_snapshot = false
+        bool build_topology_snapshot = false,
+        BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET
     );
 
     ~NativeProjectionBuilder();
@@ -494,6 +503,17 @@ public:
      * direction whose edge index is not in the active IndexSet mask.
      */
     bool get_build_topology_snapshot() const noexcept { return build_topology_snapshot_; }
+
+    /**
+     * @brief Returns the BPT::LeafFormat stored on the builder (Spec #5 T5.11).
+     *
+     * Reflects the value wired in by graph_project's `leafFormat` config key
+     * (or BPT::LeafFormat::BITSET when the key is absent / the legacy
+     * positional constructor is used). Exposed for testability; the actual
+     * propagation to ProjectionStorage and per-index BPlusTree readers
+     * happens inside the ctor body.
+     */
+    BPT::LeafFormat get_leaf_format() const noexcept { return leaf_format_; }
 
 private:
     /**
@@ -689,6 +709,14 @@ private:
     // B+Tree build completes. Default false preserves pre-Spec-#4-B
     // behavior for every existing caller of this constructor.
     bool build_topology_snapshot_ = false;
+
+    // Spec #5 T5.11: on-disk B+Tree leaf encoding preset. Threaded through
+    // ProjectionStorage before build so each materialized B+Tree reader is
+    // constructed with the matching BPT::LeafFormat, and persisted per-index
+    // in catalog v1.5 (one byte per materialized index). Default BITSET
+    // preserves pre-Spec-#5 byte-identical behavior for every pre-T5.11
+    // caller of this constructor.
+    BPT::LeafFormat leaf_format_ = BPT::LeafFormat::BITSET;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
     std::unordered_map<std::string, Orientation> per_type_orientations;

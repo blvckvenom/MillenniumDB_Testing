@@ -17,6 +17,7 @@
 #include "graph_models/gql/projection/projection_manager.h"
 #include "query/exceptions.h"
 #include "storage/dictionary/dictionary.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "system/file_manager.h"
 
 using namespace GQL;
@@ -125,6 +126,13 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     bool include_label_indexes = true;
     GQL::IndexSet index_set = GQL::IndexSet::ALL;
 
+    // Spec #5 T5.11 — user-selectable leaf-page encoding. Defaults to BITSET
+    // (pre-Spec-#5 byte-identical behavior); the config key `leafFormat`
+    // opts the projection into DELTA_VARINT v2 leaves. Threaded through
+    // NativeProjectionBuilder -> ProjectionStorage -> per-index BPlusTree
+    // readers, and persisted per materialized index in catalog v1.5.
+    BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET;
+
     // Spec #4-B T4.8 — opt-in CSR topology sidecar generation. Default
     // false so existing projections remain byte-identical on disk and
     // pre-Spec-#4-B callers see zero behavior change. The flag is parsed
@@ -168,6 +176,26 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             std::string index_set_str =
                 get_string_from_dict(config_dict, "indexSet", "ALL");
             index_set = GQL::parse_index_set(index_set_str);
+        }
+
+        // Spec #5 T5.11 — user-selectable leaf-page encoding. Case-sensitive
+        // parse of "BITSET" / "DELTA_VARINT" via BPT::parse_leaf_format;
+        // unknown values raise std::invalid_argument which we convert to
+        // QueryException so GQL callers get a proper query-level error.
+        // Non-string config values are already rejected by
+        // get_string_from_dict() (throws runtime_error with type info).
+        {
+            bool lf_found = false;
+            (void) get_value_from_dict(config_dict, "leafFormat", lf_found);
+            if (lf_found) {
+                std::string leaf_format_str =
+                    get_string_from_dict(config_dict, "leafFormat", "BITSET");
+                try {
+                    leaf_format = BPT::parse_leaf_format(leaf_format_str);
+                } catch (const std::invalid_argument& e) {
+                    throw QueryException(e.what());
+                }
+            }
         }
 
         // Disk-cost opt-out. The key is parsed inline because it is the only
@@ -379,7 +407,8 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             split_property,
             include_label_indexes,
             index_set,
-            build_topology_snapshot
+            build_topology_snapshot,
+            leaf_format
         );
         builder.scan_nodes_by_labels(node_labels);
         builder.scan_edges_by_types(relationship_types);

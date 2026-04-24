@@ -10,6 +10,7 @@
 #include "graph_models/gql/projection/bloom_filter.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
 #include "graph_models/object_id.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/record.h"
 
 template<std::size_t N>
@@ -604,6 +605,20 @@ public:
     /// by the query-layer error diagnostic (Spec #3 T3.9) to report the
     /// active preset when a missing index is accessed.
     IndexSet get_index_set() const { return requested_index_set; }
+
+    /// @brief Spec #5 T5.11 — leaf-encoding preset for every B+Tree index
+    /// this projection owns. Set by NativeProjectionBuilder from the GQL
+    /// `leafFormat` config key before flush()/open(). Consumed by:
+    ///   (1) every `std::make_unique<BPlusTree<N>>(...)` call in open() and
+    ///       open_all_bplustree_readers_() (passes it as the second ctor
+    ///       argument so BptIter dispatches on the right leaf layout).
+    ///   (2) save_catalog() to populate ProjectionCatalog::leaf_formats with
+    ///       one byte per materialized index (catalog v1.5). Default BITSET
+    ///       preserves pre-Spec-#5 byte-identical behavior.
+    BPT::LeafFormat requested_leaf_format = BPT::LeafFormat::BITSET;
+
+    /// @brief Returns the leaf-format preset this projection was built under.
+    BPT::LeafFormat get_leaf_format() const noexcept { return requested_leaf_format; }
 
     /// @name Spec #4-B T4.18: integrated topology snapshot emission
     /// @{

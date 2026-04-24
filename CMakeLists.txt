@@ -783,6 +783,46 @@ if(GTest_FOUND AND
     )
 endif()
 
+# Registers projection_leaffmt_config_test when GTest is available and the
+# source file exists. Follows the precedent of projection_catalog_v5_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_leaffmt_config_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(projection_leaffmt_config_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_leaffmt_config_test.cc
+    )
+    set_target_properties(projection_leaffmt_config_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # projection_catalog_v5_test above.
+    target_link_libraries(projection_leaffmt_config_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_leaffmt_config_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME projection_leaffmt_config_test
+        COMMAND $<TARGET_FILE:projection_leaffmt_config_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 # ============================================================================
 # TopologySnapshot CSR writer unit tests (Spec #4-B T4.4)
 # ============================================================================
