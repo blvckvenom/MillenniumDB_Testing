@@ -118,7 +118,16 @@ std::unique_ptr<BPlusTreeSplit<N>> BPlusTreeDir<N>::insert(const Record<N>& reco
 
             // splitted key is the last key
             if (splitted_index == *key_count) {
-                last_keys[0] = record;
+                // The separator promoted for `split->encoded_page_number`
+                // must be the one the CHILD split returned (the right
+                // sibling's smallest record), never the record this insert()
+                // call happens to be carrying. `record` sorts at or above the
+                // whole splitting child's range, so promoting it violates
+                //     greatest_left_record < separator <= smallest_right_record
+                // and routes every key in [split->record, record) to the LEFT
+                // sibling while those records physically live in the RIGHT
+                // one: present on disk, unreachable by any descent.
+                last_keys[0] = split->record;
                 last_dirs[0] = split->encoded_page_number;
             }
             else {
@@ -236,7 +245,12 @@ std::unique_ptr<BPlusTreeSplit<N>> BPlusTreeDir<N>::insert(const Record<N>& reco
 
             // splitted key is the last key
             if (splitted_index == *key_count) {
-                last_keys[0] = record;
+                // Same invariant as Case 3: promote the separator the child
+                // split produced, not the record being inserted. Keys arriving
+                // in ascending order make the rightmost child the splitting
+                // child at EVERY split, so this branch is the common path
+                // there, not a rare one.
+                last_keys[0] = split->record;
                 last_dirs[0] = split->encoded_page_number;
             }
             else {

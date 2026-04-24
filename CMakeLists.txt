@@ -250,6 +250,7 @@ if(ENABLE_GNN)
 endif()
 set(BUILD_TARGETS
     mdb
+    mdb_leaf_dump
 )
 set(PROFILE_TARGETS
     profile-query
@@ -257,6 +258,7 @@ set(PROFILE_TARGETS
 )
 set(TEST_TARGETS
     available_ram-test
+    bpt_dir_split_separator_test
     compare_datetime
     iri_prefixes-test
     # native_projection_builder_test  # DISABLED: needs API updates
@@ -355,21 +357,485 @@ find_package(GTest QUIET)
 
 
 
+# ============================================================================
+# B+Tree v2 leaf header format unit tests
+# ============================================================================
+# Registers bpt_leaf_v2_format_test when GTest is available and the source
+# file exists. Follows the precedent of topology_snapshot_format_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_format_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_v2_format_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_format_test.cc
+    )
+    set_target_properties(bpt_leaf_v2_format_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # topology_snapshot_format_test above.
+    target_link_libraries(bpt_leaf_v2_format_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_v2_format_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_v2_format_test
+        COMMAND $<TARGET_FILE:bpt_leaf_v2_format_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v3 (CSR_HYBRID) leaf header format unit tests
+# ============================================================================
+# Registers bpt_leaf_csr_format_test when GTest is available and the source
+# file exists. Follows the precedent of bpt_leaf_v2_format_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_format_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_format_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_format_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_format_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_v2_format_test above.
+    target_link_libraries(bpt_leaf_csr_format_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_format_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_format_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_format_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v3 CSR_HYBRID leaf reader unit tests
+# ============================================================================
+# Registers bpt_leaf_csr_reader_test when GTest is available and the source file
+# exists. Follows the precedent of bpt_leaf_csr_format_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_reader_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_reader_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_reader_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_reader_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_csr_format_test above.
+    target_link_libraries(bpt_leaf_csr_reader_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_reader_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_reader_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_reader_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v3 CSR_HYBRID leaf writer unit tests
+# ============================================================================
+# Registers bpt_leaf_csr_writer_test when GTest is available and the source
+# file exists. Follows the precedent of bpt_leaf_csr_reader_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_writer_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_writer_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_writer_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_writer_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_csr_reader_test above.
+    target_link_libraries(bpt_leaf_csr_writer_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_writer_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_writer_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_writer_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v3 CSR_HYBRID multipage integration test
+# ============================================================================
+# Registers bpt_leaf_csr_multipage_test — end-to-end writer + reader +
+# ContinuationTag dispatch across hub chains. Guards the hub-chain fixes
+# (reader tuple counting across continuation pages, ContinuationTag
+# construction, and writer leaf-chain linkage).
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_multipage_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_multipage_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_multipage_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_multipage_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(bpt_leaf_csr_multipage_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_multipage_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_multipage_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_multipage_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v3 CSR_HYBRID leaf fuzz tests
+# ============================================================================
+# Registers bpt_leaf_csr_fuzz_test when GTest is available and the source file
+# exists. Follows the precedent of bpt_leaf_v2_fuzz_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_fuzz_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_fuzz_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_fuzz_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_fuzz_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_csr_writer_test above.
+    target_link_libraries(bpt_leaf_csr_fuzz_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_fuzz_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_fuzz_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_fuzz_test>
+        WORKING_DIRECTORY tests
+    )
+    # The 500k Release iterations take on the order of a minute on a
+    # desktop-class CPU; Debug/ASan is typically 3-5x slower. 180 s
+    # accommodates Release with margin; Debug/ASan runs may need more.
+    set_tests_properties(bpt_leaf_csr_fuzz_test PROPERTIES TIMEOUT 180)
+endif()
+
+# ============================================================================
+# B+Tree LEB128 varint codec unit tests
+# ============================================================================
+# Registers varint_test when GTest is available and the source file exists.
+# Follows the precedent of bpt_leaf_v2_format_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/varint_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(varint_test
+        ${CMAKE_SOURCE_DIR}/src/tests/varint_test.cc
+    )
+    set_target_properties(varint_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_v2_format_test above.
+    target_link_libraries(varint_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(varint_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME varint_test
+        COMMAND $<TARGET_FILE:varint_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v2 leaf writer unit tests
+# ============================================================================
+# Registers bpt_leaf_v2_writer_test when GTest is available and the source
+# file exists. Follows the precedent of varint_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_writer_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_v2_writer_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_writer_test.cc
+    )
+    set_target_properties(bpt_leaf_v2_writer_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # varint_test above.
+    target_link_libraries(bpt_leaf_v2_writer_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_v2_writer_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_v2_writer_test
+        COMMAND $<TARGET_FILE:bpt_leaf_v2_writer_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree v2 leaf reader unit tests
+# ============================================================================
+# Registers bpt_leaf_v2_reader_test when GTest is available and the source file
+# exists. Follows the precedent of bpt_leaf_v2_writer_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_reader_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_v2_reader_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_reader_test.cc
+    )
+    set_target_properties(bpt_leaf_v2_reader_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_v2_writer_test above.
+    target_link_libraries(bpt_leaf_v2_reader_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_v2_reader_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_v2_reader_test
+        COMMAND $<TARGET_FILE:bpt_leaf_v2_reader_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# B+Tree polymorphic leaf dispatch unit tests
+# ============================================================================
+# Registers bpt_iter_dispatch_test when GTest is available and the source file
+# exists. Follows the precedent of bpt_leaf_v2_reader_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_iter_dispatch_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_iter_dispatch_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_iter_dispatch_test.cc
+    )
+    set_target_properties(bpt_iter_dispatch_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_v2_reader_test above.
+    target_link_libraries(bpt_iter_dispatch_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_iter_dispatch_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_iter_dispatch_test
+        COMMAND $<TARGET_FILE:bpt_iter_dispatch_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
 
 
 
 
 
-
-
-
-
-
-
-
-
-
+# Registers bpt_leaf_v2_fuzz_test when GTest is available and the source file
+# exists. Follows the precedent of projection_leaffmt_config_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_fuzz_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_v2_fuzz_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_v2_fuzz_test.cc
+    )
+    set_target_properties(bpt_leaf_v2_fuzz_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # projection_leaffmt_config_test above.
+    target_link_libraries(bpt_leaf_v2_fuzz_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_v2_fuzz_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_v2_fuzz_test
+        COMMAND $<TARGET_FILE:bpt_leaf_v2_fuzz_test>
+        WORKING_DIRECTORY tests
+    )
+    # Release wall-clock is on the order of a minute on a desktop-class
+    # CPU; Debug/ASan is typically 3-5x slower. 360 s accommodates both.
+    set_tests_properties(bpt_leaf_v2_fuzz_test PROPERTIES TIMEOUT 360)
+endif()
 
 
 

@@ -17,6 +17,7 @@ file paths from the file manager.
 #pragma once
 
 #include <map>
+#include <mutex>
 #include <string>
 
 #ifdef _MSC_VER
@@ -53,6 +54,13 @@ private:
 
     // FileId -> PageCount (on disk)
     std::map<FileId, uint32_t> fid2pages;
+
+    // get_file_id() is safe to call from multiple threads concurrently
+    // (used by ProjectionStorage::open_all_bplustree_readers_ when
+    // MDB_PROJECTION_PARALLEL_READERS is enabled). The mutex is taken
+    // around the map mutations only; the open()/lseek() syscalls run
+    // outside the critical section so they can overlap across threads.
+    std::mutex maps_mutex;
 
     // private constructor, other classes must use the global object `file_manager`
     FileManager(const std::string& db_folder);
