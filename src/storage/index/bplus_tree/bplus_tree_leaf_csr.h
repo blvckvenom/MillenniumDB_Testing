@@ -1,0 +1,209 @@
+#pragma once
+
+// BPTLeafCSR — read-mode view over a v3 CSR-hybrid leaf page. Third
+// subclass of BPTLeafBase<N>, alongside BPTLeafV1<N> (bitset) and
+// BPTLeafV2<N> (delta+varint).
+//
+// Spec #8: each v3 leaf page holds MULTIPLE source nodes' adjacency
+// lists, packed CSR-style. An in-page offset table (uint16 per source
+// node entry) enables O(log srcs) lookup within a page; each entry
+// contains (src_id varint, degree varint, col_idx[degree] list) where
+// col_idx is delta+varint encoded (first dst full, subsequent zigzag
+// deltas — composes with Spec #5 T5.4/T5.5 codec).
+//
+// Hub nodes whose adjacency exceeds 4 KB span multiple pages via the
+// continuation-header variant (see bpt_leaf_csr_format.h): the
+// chain-head page carries value_count > 0 src entries with degrees
+// that describe the total (including bytes spilled onto continuation
+// pages), and continuation pages are marked via flags bit 0 and point
+// back via chain_head_page_id (stored in the repurposed
+// min_src_id_low slot).
+//
+// This class is READ-ONLY. v3 pages are immutable post-build — the
+// mutation methods on BPTLeafBase<N> all throw std::logic_error (I6).
+//
+// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
+//   §3.1 (D1 multi-source layout), §3.3 (D3 offset table),
+//   §3.5 (D5 composition with varint), §3.10 (D10 read path),
+//   §5 (on-disk format).
+
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <stdexcept>
+
+#include "storage/index/bplus_tree/bplus_tree_leaf_base.h"
+#include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
+#include "storage/index/record.h"
+
+// Forward declarations
+template <std::size_t N> class BPlusTreeSplit;
+
+template <std::size_t N>
+class BPTLeafCSR : public BPTLeafBase<N> {
+public:
+    /// Reader-mode tag. Disambiguates from a future writer-mode ctor (T8.5).
+    struct ReadTag {};
+
+    /// Read-mode construction. Validates the v3 header at the start of
+    /// `page_bytes` (design §5.5 + T8.3 checks) and caches metadata,
+    /// including a pointer to the in-page uint16 offset table that
+    /// begins immediately after the 16-byte header.
+    ///
+    /// Raises BPT::BPTLeafCSRDecodeException on any invariant violation:
+    ///   - byte 0 (format_version) != 3
+    ///   - byte 1 (record_width) != N
+    ///   - flags byte has any reserved bit set (bits 2..7)
+    ///   - flags byte has bit 0 set (opening a continuation page as root
+    ///     is not supported; continuations are reached by chain traversal
+    ///     through the chain head, not opened directly)
+    ///   - byte 3 (reserved) != 0
+    ///   - value_count out of range for a single 4 KB page
+    ///   - offset table not monotonically increasing or out of page bounds
+    BPTLeafCSR(const char* page_bytes, ReadTag);
+
+    ~BPTLeafCSR() override = default;
+
+    BPTLeafCSR(const BPTLeafCSR&)            = delete;
+    BPTLeafCSR& operator=(const BPTLeafCSR&) = delete;
+    BPTLeafCSR(BPTLeafCSR&&)                 = default;
+    BPTLeafCSR& operator=(BPTLeafCSR&&)      = delete;
+
+    // ======= BPTLeafBase<N> contract ========================================
+    //
+    // get_value_count() returns the TOTAL number of (src, dst, edge_id)
+    // tuples on this page — i.e. the sum of degrees across all src entries
+    // — NOT the number of src entries. This matches BptIter / range-scan
+    // semantics for which a "record" is one triple.
+
+    uint32_t      get_value_count() const override;
+    bool          has_next() const override;
+    Record<N>     get_record(uint_fast32_t pos) const override;
+    void          set_record(uint_fast32_t pos, Record<N>& out) const override;
+    void          set_redundant_record(Record<N>& out) const override;
+    void          update_record(uint_fast32_t pos, Record<N>& out) const override;
+    uint_fast32_t search_index(const Record<N>& record) const noexcept override;
+    bool          check_range(const Record<N>& r) const override;
+
+    std::unique_ptr<BPlusTreeSplit<N>> insert(const Record<N>& record, bool& error) override;
+    bool delete_record(const Record<N>& record) override;
+    void update_to_next_leaf() override;
+
+    bool check(std::ostream& os) const override;
+    void print(std::ostream& os) const override;
+
+    // ======= CSR-specific API (not on BPTLeafBase<N>) =======================
+
+    /// Look up the adjacency list for source node `src_id` within THIS page.
+    /// Returns true if found, populating:
+    ///   - `out_start_offset`: byte offset into the page where the col_idx
+    ///     varint stream begins (i.e. immediately past the src_id and degree
+    ///     varints at the start of the matched entry).
+    ///   - `out_degree`: number of destinations in that entry.
+    ///
+    /// Returns false if `src_id` is not present on this page.
+    ///
+    /// O(log value_count) via binary search over the in-page offset table
+    /// (design §3.3 R-A).
+    bool find_src_entry(uint64_t src_id,
+                        uint32_t& out_start_offset,
+                        uint32_t& out_degree) const noexcept;
+
+    /// Decode the i-th destination of an adjacency list starting at
+    /// `start_offset` (the col_idx stream position returned by
+    /// find_src_entry) with a known `degree`. `i` must be in [0, degree).
+    ///
+    /// Uses a sequential-access cache (mirroring the Spec #5 T5.13b cursor
+    /// pattern) to amortize decoding cost. Non-sequential or cross-entry
+    /// access restarts the cursor from `start_offset`.
+    ///
+    /// Returns true on success with `out_dst` populated; false if `i >= degree`.
+    bool get_dst_at(uint32_t start_offset,
+                    uint32_t degree,
+                    uint_fast32_t i,
+                    uint64_t& out_dst) const noexcept;
+
+    /// Chain support: returns true if this is a chain-head page (always
+    /// the case when the reader-mode ctor accepts the page, since
+    /// continuation pages are rejected at construction per I6 —
+    /// kept as an explicit accessor for future-proofing T8.9's
+    /// TopologyAccessor shortcut).
+    bool is_chain_head() const noexcept;
+
+    /// Page id of the next leaf in the leaf chain, used by the reader of a
+    /// hub's multi-page adjacency (T8.9) to follow continuation pages. A
+    /// value of 0 means "this is the last leaf in the B+Tree".
+    uint32_t next_leaf() const noexcept;
+
+    /// Number of src entries on this page (NOT the total tuple count —
+    /// that's get_value_count()).
+    uint32_t src_entry_count() const noexcept;
+
+private:
+    // Payload starts at the offset table right after the 16-byte header.
+    static constexpr std::size_t kHeaderBytes = sizeof(BPT::BPTLeafCSRHeader); // 16
+
+    const char*             page_bytes_   = nullptr;
+    BPT::BPTLeafCSRHeader   header_{};
+
+    // Pointer to the in-page offset table (uint16 LE per src entry), just
+    // past the 16-byte header. Length = header_.value_count. Stored as a
+    // uint8_t* and decoded lazily via offset_at(i) so we don't rely on
+    // alignment of the buffer (the buffer comes from BufferManager which
+    // aligns to 4 KB, but unit tests may pass stack buffers).
+    const uint8_t*          offset_table_ = nullptr;
+
+    // Cached total tuple count: sum of degrees across all src entries.
+    // Populated once at construction by a single linear scan of the
+    // offset table. Used by get_value_count() — the BptIter range scan
+    // would otherwise need to recompute this per call.
+    uint32_t                total_tuples_ = 0;
+
+    // Sequential-decode cache. When get_dst_at(start_offset, degree, i+1)
+    // follows a get_dst_at(..., i) call with the same (start_offset, degree),
+    // we resume from cache_dst_in_ using cache_dst_value_ as the running
+    // accumulator. Non-sequential access restarts from start_offset.
+    //
+    // Mutable so const methods (get_dst_at / get_record / search_index) can
+    // update the cache — purely a memoization of the immutable page state.
+    //
+    // cache_valid_ == false means "cache empty".
+    mutable bool            cache_valid_     = false;
+    mutable uint32_t        cache_start_off_ = 0;      // start_offset of the cached entry
+    mutable uint_fast32_t   cache_i_         = 0;      // last decoded index within that entry
+    mutable uint64_t        cache_value_     = 0;      // its decoded dst value
+    mutable const uint8_t*  cache_in_        = nullptr; // byte ptr just past the last varint
+
+    // ------- internal helpers -------
+
+    /// Read offset_table[i] with explicit LE byte layout. i in [0, value_count).
+    uint32_t offset_at_(uint_fast32_t i) const noexcept;
+
+    /// Binary search over the offset table. Returns true and sets `out_index`
+    /// to the index of the entry whose src_id equals `src_id`; else false.
+    /// O(log value_count) varint decodes.
+    bool binary_search_src_(uint64_t src_id,
+                            uint_fast32_t& out_index) const noexcept;
+
+    /// Decode the src_id stored at `offset_table_[i]`. Callers must have
+    /// validated i < value_count and the offset itself.
+    uint64_t decode_src_id_at_(uint_fast32_t i) const noexcept;
+
+    /// Decode the raw tuple (src_id, dst, edge_id) at logical position `pos`
+    /// (0 <= pos < total_tuples_). For the BPTLeafBase<N> contract.
+    /// Used only when N == 3 for edge indexes; for N != 3 it returns
+    /// a record with (src_id, dst, 0) (N==2) or (src_id,) (N==1) — but
+    /// Spec #8 scope limits CSR_HYBRID to edge indexes (N=3), so those
+    /// paths are defensive only.
+    Record<N> decode_tuple_(uint_fast32_t pos) const;
+
+    /// Invalidate the sequential cache. Called when a new entry is probed
+    /// so stale cursor state doesn't serve a wrong dst.
+    void invalidate_cache_() const noexcept;
+};
+
+extern template class BPTLeafCSR<1>;
+extern template class BPTLeafCSR<2>;
+extern template class BPTLeafCSR<3>;

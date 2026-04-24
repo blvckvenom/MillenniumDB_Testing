@@ -616,6 +616,49 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
+# B+Tree v3 CSR_HYBRID leaf reader unit tests (Spec #8 T8.4)
+# ============================================================================
+# Registers bpt_leaf_csr_reader_test when GTest is available and the source file
+# exists. Follows the precedent of bpt_leaf_csr_format_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_reader_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_reader_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_reader_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_reader_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_csr_format_test above.
+    target_link_libraries(bpt_leaf_csr_reader_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_reader_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_reader_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_reader_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # B+Tree LEB128 varint codec unit tests (Spec #5 T5.4)
 # ============================================================================
 # Registers varint_test when GTest is available and the source file exists.
