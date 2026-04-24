@@ -221,6 +221,7 @@ target_link_libraries(millenniumdb PUBLIC mdb_gpu)
 target_compile_definitions(millenniumdb PUBLIC SERD_STATIC)
 set(BUILD_TARGETS
     mdb
+    mdb_leaf_dump
 )
 set(PROFILE_TARGETS
     profile-query
