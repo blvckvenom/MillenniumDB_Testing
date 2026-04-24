@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -200,6 +201,16 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
     const uint64_t chunk_size = config_.batch_size > 0 ? config_.batch_size : 256;
     uint64_t batch_id_counter = catalog_.total_batches;  // avoid ID collision
 
+    const uint64_t total_chunks =
+        (missing.size() + chunk_size - 1) / chunk_size;
+    uint64_t chunk_idx = 0;
+    const auto progress_t0 = std::chrono::steady_clock::now();
+    std::cerr << "[EmbeddingWriter] Phase B starting: " << missing.size()
+              << " non-seed nodes in " << total_chunks
+              << " chunks of " << chunk_size
+              << " (device=" << (device.is_cpu() ? "cpu" : "cuda") << ")"
+              << std::endl;
+
     for (uint64_t start = 0; start < missing.size(); start += chunk_size) {
         uint64_t end = std::min(start + chunk_size,
                                 static_cast<uint64_t>(missing.size()));
@@ -252,6 +263,26 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
         for (int64_t i = 0; i < num_seeds; ++i) {
             result.emplace_back(chunk_row_indices[static_cast<size_t>(i)],
                                 emb[i].clone());
+        }
+
+        ++chunk_idx;
+        if (chunk_idx == 1 || chunk_idx == total_chunks
+            || chunk_idx % std::max<uint64_t>(1, total_chunks / 20) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed_s =
+                std::chrono::duration<double>(now - progress_t0).count();
+            const double pct = 100.0 * static_cast<double>(chunk_idx)
+                                      / static_cast<double>(total_chunks);
+            const double eta_s = chunk_idx > 0
+                ? elapsed_s * (static_cast<double>(total_chunks - chunk_idx)
+                               / static_cast<double>(chunk_idx))
+                : 0.0;
+            std::cerr << "[EmbeddingWriter] chunk " << chunk_idx
+                      << "/" << total_chunks
+                      << " (" << static_cast<int>(pct) << "%)"
+                      << " elapsed=" << static_cast<int>(elapsed_s) << "s"
+                      << " eta=" << static_cast<int>(eta_s) << "s"
+                      << std::endl;
         }
     }
 

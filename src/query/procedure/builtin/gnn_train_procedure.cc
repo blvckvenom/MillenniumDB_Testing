@@ -312,6 +312,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     std::string output_dir_name  = "default";
     bool        export_emb       = true;
     std::string write_property;              // writeProperty option (empty = no write-back)
+    uint64_t    inference_batch_size = 0;    // 0 = use EmbeddingWriter default (Phase B chunk size)
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
     bool        save_final       = true;
@@ -376,6 +377,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                 throw std::runtime_error("writeProperty must be a non-empty string");
             }
             validate_safe_name(write_property, "writeProperty");
+        }
+        if (auto v = opts.get_int("inferenceBatchSize")) {
+            if (*v <= 0) {
+                throw std::runtime_error(
+                    "inferenceBatchSize must be positive, got: "
+                    + std::to_string(*v));
+            }
+            inference_batch_size = static_cast<uint64_t>(*v);
         }
         if (auto v = opts.get_string("resumeFrom")) {
             resume_from = *v;
@@ -698,6 +707,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         wconfig.fanouts            = catalog.fanouts;
         wconfig.orientation        = EdgeOrientation::UNDIRECTED;
         wconfig.feature_matrix_path = fmat_path;
+        if (inference_batch_size > 0) {
+            wconfig.batch_size = inference_batch_size;
+        }
 
         GQL::ProjectionStorage proj_storage(proj_dir, db_folder);
         proj_storage.open();

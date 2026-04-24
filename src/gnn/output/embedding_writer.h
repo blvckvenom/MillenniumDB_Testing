@@ -70,7 +70,7 @@ public:
 
     struct Config {
         std::string              property_name;     ///< Target property for embeddings
-        uint64_t                 batch_size = 256;  ///< Inference batch size (Phase B)
+        uint64_t                 batch_size = 2048; ///< Inference batch size (Phase B)
         std::vector<uint64_t>    fanouts;           ///< Sampling fanouts   (Phase B)
         EdgeOrientation          orientation = EdgeOrientation::UNDIRECTED;
         std::filesystem::path    feature_matrix_path; ///< Path to .fmat for inference feature loading
