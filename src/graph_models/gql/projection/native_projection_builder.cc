@@ -2471,7 +2471,14 @@ void NativeProjectionBuilder::build_one_topology_snapshot_(
     // Pass 1: per-source degree histogram.
     // The B+Tree key layout for both from_to_edge (src, dst, edge_id) and
     // to_from_edge (dst, src, edge_id) places the node whose adjacency the
-    // CSR is keyed by at index 0, matching TopologySnapshotWriter's contract.
+    // CSR is keyed by at index 0. Records store FULL ObjectIds (with the
+    // 8-bit type tag), but the CSR's ROW_PTR is indexed by dense row id
+    // — so we mask off the type tag via ObjectId::VALUE_MASK before using
+    // the value as a degrees[] subscript. This assumes the projection's
+    // node ObjectIds are a dense [0, N) range after stripping the type
+    // tag, which holds for single-label projections (the thesis case:
+    // cora_gnn, ogbn-*, papers100M). Non-dense multi-label projections
+    // are a known limitation (skipped+warned in future work).
     std::vector<uint64_t> degrees(num_nodes, 0);
     bool interrupt = false;
     Record<3> min_rec = {0, 0, 0};
@@ -2481,7 +2488,7 @@ void NativeProjectionBuilder::build_one_topology_snapshot_(
         auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
         const Record<3>* rec = nullptr;
         while ((rec = iter.next()) != nullptr) {
-            uint64_t src_idx = (*rec)[0];
+            const uint64_t src_idx = (*rec)[0] & ObjectId::VALUE_MASK;
             if (src_idx < num_nodes) {
                 ++degrees[src_idx];
             }
@@ -2494,7 +2501,9 @@ void NativeProjectionBuilder::build_one_topology_snapshot_(
     // Pass 2: stream edges in src-monotonic order into the writer. BptIter
     // walks in key order, which for both directions starts with the key-0
     // component ascending — the exact monotonicity contract append_edge()
-    // enforces.
+    // enforces. The writer uses src.id as the row subscript, so we pass
+    // the stripped value; dst and edge_id retain their full ObjectId so
+    // the reader's COL_IDX / EDGE_IDS slices match the B+Tree path.
     TopologySnapshotWriter writer(
         proj_dir,
         dir,
@@ -2507,7 +2516,7 @@ void NativeProjectionBuilder::build_one_topology_snapshot_(
         const Record<3>* rec = nullptr;
         while ((rec = iter.next()) != nullptr) {
             writer.append_edge(
-                ObjectId{(*rec)[0]},
+                ObjectId{(*rec)[0] & ObjectId::VALUE_MASK},
                 ObjectId{(*rec)[1]},
                 ObjectId{(*rec)[2]});
         }
@@ -2547,6 +2556,8 @@ void build_one_snapshot_for_test(
     const uint64_t num_nodes = storage.get_node_count();
     const std::filesystem::path proj_dir = storage.get_projection_dir();
 
+    // Mirror the production path's type-tag stripping so the test fixture
+    // exercises the same code as the shipped builder.
     std::vector<uint64_t> degrees(num_nodes, 0);
     bool interrupt = false;
     Record<3> min_rec = {0, 0, 0};
@@ -2556,7 +2567,7 @@ void build_one_snapshot_for_test(
         auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
         const Record<3>* rec = nullptr;
         while ((rec = iter.next()) != nullptr) {
-            uint64_t src_idx = (*rec)[0];
+            const uint64_t src_idx = (*rec)[0] & ObjectId::VALUE_MASK;
             if (src_idx < num_nodes) {
                 ++degrees[src_idx];
             }
@@ -2575,7 +2586,7 @@ void build_one_snapshot_for_test(
         const Record<3>* rec = nullptr;
         while ((rec = iter.next()) != nullptr) {
             writer.append_edge(
-                ObjectId{(*rec)[0]},
+                ObjectId{(*rec)[0] & ObjectId::VALUE_MASK},
                 ObjectId{(*rec)[1]},
                 ObjectId{(*rec)[2]});
         }

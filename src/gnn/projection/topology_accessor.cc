@@ -50,11 +50,16 @@ struct TopologyAccessor::Impl {
     // fast-path is not viable (reader inert, node_idx out of range) so the
     // caller falls through to the B+Tree path.
     std::optional<Neighbors> try_csr_out_neighbors(ObjectId node_id) const {
-        if (!fwd_csr_.has_data() || node_id.id >= fwd_csr_.num_nodes()) {
+        // The CSR is indexed by dense row id (see native_projection_builder.cc
+        // build_one_topology_snapshot_). B+Tree records store full ObjectIds
+        // with the 8-bit type tag, so the caller's node_id is masked here to
+        // match the ROW_PTR subscript convention.
+        const uint64_t row_idx = node_id.get_value();
+        if (!fwd_csr_.has_data() || row_idx >= fwd_csr_.num_nodes()) {
             return std::nullopt;
         }
-        auto dst_span = fwd_csr_.neighbors(node_id.id);
-        auto eid_span = fwd_csr_.edge_ids(node_id.id);
+        auto dst_span = fwd_csr_.neighbors(row_idx);
+        auto eid_span = fwd_csr_.edge_ids(row_idx);
         Neighbors result;
         result.node_ids.reserve(dst_span.size());
         for (std::size_t i = 0; i < dst_span.size(); ++i) {
@@ -70,11 +75,13 @@ struct TopologyAccessor::Impl {
     }
 
     std::optional<Neighbors> try_csr_in_neighbors(ObjectId node_id) const {
-        if (!rev_csr_.has_data() || node_id.id >= rev_csr_.num_nodes()) {
+        // Same masking convention as try_csr_out_neighbors — see its comment.
+        const uint64_t row_idx = node_id.get_value();
+        if (!rev_csr_.has_data() || row_idx >= rev_csr_.num_nodes()) {
             return std::nullopt;
         }
-        auto dst_span = rev_csr_.neighbors(node_id.id);
-        auto eid_span = rev_csr_.edge_ids(node_id.id);
+        auto dst_span = rev_csr_.neighbors(row_idx);
+        auto eid_span = rev_csr_.edge_ids(row_idx);
         Neighbors result;
         result.node_ids.reserve(dst_span.size());
         for (std::size_t i = 0; i < dst_span.size(); ++i) {
