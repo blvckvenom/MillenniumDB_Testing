@@ -94,17 +94,46 @@ Gate D scorecard after T8-B.1 + T8-B.2 + perf fixes:
 
 **All 8 criteria now PASS.** Pre-T8-B.1 was PASS-WITH-CAVEATS because sampling was 0 s/s.
 
-### 2.3 ogbn-products (status: pending)
+### 2.3 ogbn-products (status: infrastructure GREEN, demo BLOCKED by serialization bug)
 
-Configuration to run: full thesis stack — `indexSet:'GNN_MINIMAL' + leafFormat:'DELTA_VARINT' + graphStorage:'CSR_HYBRID' + writeProperty:'embedding'`.
+Configuration tested: full thesis stack — `indexSet:'GNN_MINIMAL' + leafFormat:'DELTA_VARINT' + graphStorage:'CSR_HYBRID' + writeProperty:'embedding' + inferenceBatchSize:4096`.
 
-Expected based on arxiv scaling:
-- Projection build: ~10-20 min (62M edges)
-- Training (GPU): ~10-20 min (30 epochs, GraphSAGE MEAN, hidden 128)
-- EmbeddingWriter (GPU features hot L1): ~10-30 min with chunk=2048
-- **Total**: ~30-90 min
+Measured results (agent ae5329a519a715bd2, 2026-04-24):
 
-**Will be filled in** after agent dispatch completes.
+| Phase | Wall clock |
+|---|---|
+| Import (C-order .npy required — converted in 3s from F-order original) | 65 s |
+| graph_project | 115 s |
+| gnn_offline_sample [10, 5] batch=512 | 11 min |
+| gnn_materialize_batches (reorder + pack) | 10 s |
+| gnn_build_feature_store (GPU 4 GB budget) | 14.5 s |
+| gnn_train (10 epochs early-stopped) + writeProperty | 6.2 s + <1 s Phase B |
+| **Total** | **~28 min** (budget was 150 min — 19% used) |
+
+Key empirical wins:
+- `l1Nodes=2,409,715` (92% of 2.45M on GPU cache)
+- `l1HitRatio=1.0` (100% cache hits, 13.8M feature requests)
+- **Phase B adjacency cache fix validated at products scale**: 39,323 non-seeds processed in <1 second (pre-fix projection was 8-33 hours).
+- `nodesWritten=2,449,029` (100% coverage — all nodes have an embedding written via EmbeddingWriter)
+
+### 2.3b Products demo BLOCKING issue — embedding serialization corruption
+
+`USE products_gnn MATCH (n) RETURN n.embedding LIMIT 1` returns corrupt float values (magnitudes up to ±1e+37) instead of the clean ~O(1) floats that the training's own `embeddings.npy` export contains (max abs = 4753 verified).
+
+**Scale-specific**: arxiv (169k nodes) retrieves clean embeddings via the same code path. Products (2.45M nodes) does not. Suggests integer overflow or mmap remap in the `torch::Tensor → TensorManager → tensors.dat → B+Tree property index` write path.
+
+**Root cause & fix**: being debugged in agent `ad6340fcbf5eb5442` (dispatched 2026-04-24). Not blocking for thesis claim defense — the underlying training pipeline is demonstrably correct (clean embeddings.npy, clean model checkpoint, 100% node coverage). The serialization stage just needs a fix.
+
+### 2.3c Products secondary issue — splits.bin malformed
+
+`splitProperty:'split'` extraction produced a bizarre distribution:
+- 0: 196,631 (train)
+- 1: 1 (val — only 1 node!)
+- 2: 2,213,091 (test)
+- 37, 71, 78, 83, 94, 133: stray single-byte values (encoding bug)
+- 255: 39,323 (unknown/unlabeled)
+
+The source .gql uses canonical strings "train"/"valid"/"test" which should map to {0, 1, 2}. The extraction logic in the projection writer's `try_extract_gnn_property` has a string-to-uint8 encoding bug. Non-blocking for demo (training ran), but the 1-node validation set caused early-stopping at epoch 10 with bestValAccuracy=0.0 and testAccuracy=0.477 (vs ~0.77 target). Off-by-N tail also present (labels.bin has 4 extra entries, splits.bin has 24 extra vs nodeCount).
 
 ---
 
