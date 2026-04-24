@@ -255,23 +255,31 @@ void ProjectionStorage::open() {
         }
     }
 
+    // Property indexes must be opened as BITSET regardless of the projection's
+    // requested leafFormat. Rationale: EmbeddingWriter (Phase 6) calls
+    // BPlusTree::insert() to add embedding properties post-training, and only
+    // v1 BITSET leaves are mutable (v2/v3 throw logic_error on insert). The
+    // writer path already emits v1 for these indexes; forcing the reader to
+    // also dispatch v1 prevents byte0 format mismatch → terminate.
+    const BPT::LeafFormat prop_lf = BPT::LeafFormat::BITSET;
+
     // Open optional property indexes if they exist
     if (std::filesystem::exists(proj_path / "node_key_value.leaf")) {
-        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
+        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", prop_lf);
         features.include_node_properties = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "key_value_node.leaf")) {
-            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", lf);
+            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", prop_lf);
         }
     }
 
     // Edge property indexes
     if (std::filesystem::exists(proj_path / "edge_key_value.leaf")) {
-        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", lf);
+        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", prop_lf);
         features.include_edge_properties = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "key_value_edge.leaf")) {
-            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", lf);
+            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", prop_lf);
         }
     }
 }
@@ -279,27 +287,25 @@ void ProjectionStorage::open() {
 void ProjectionStorage::ensure_node_property_indexes() {
     std::filesystem::path proj_path(projection_dir);
 
-    // Spec #5 T5.11 — lazy-create readers with the same leaf-format preset
-    // recorded on this storage (projection-wide). Empty leaves emitted by
-    // BPTLeafWriter::make_empty() are 4 KB of zeros, which the v2 reader
-    // would reject on open; for now the ensure_* path is only used by the
-    // EmbeddingWriter (Phase 6) and that callsite hasn't adopted v2 yet, so
-    // passing the format through here is forward-compatible without
-    // requiring writer changes.
-    const BPT::LeafFormat lf = requested_leaf_format;
+    // Property indexes must be BITSET (mutable v1). EmbeddingWriter (Phase 6)
+    // calls BPlusTree::insert() on these indexes to persist embedding tensors,
+    // and only v1 supports insert(); v2 / v3 throw logic_error on mutation.
+    // BPTLeafWriter<3>::make_empty() also emits v1 leaves, so BITSET keeps
+    // both writer and reader dispatch aligned.
+    const BPT::LeafFormat prop_lf = BPT::LeafFormat::BITSET;
 
     if (!node_key_value_index) {
         std::string base = rel_dir + "/node_key_value";
         { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
         { BPTDirWriter<3>  dw(base + ".dir"); }
-        node_key_value_index = std::make_unique<BPlusTree<3>>(base, lf);
+        node_key_value_index = std::make_unique<BPlusTree<3>>(base, prop_lf);
         features.include_node_properties = true;
     }
     if (!key_value_node_index) {
         std::string base = rel_dir + "/key_value_node";
         { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
         { BPTDirWriter<3>  dw(base + ".dir"); }
-        key_value_node_index = std::make_unique<BPlusTree<3>>(base, lf);
+        key_value_node_index = std::make_unique<BPlusTree<3>>(base, prop_lf);
     }
 }
 
