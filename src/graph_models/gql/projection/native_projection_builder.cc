@@ -228,6 +228,16 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     // index that wasn't materialized (e.g., EDGE_LABEL under GNN_MINIMAL).
     storage->requested_index_set = index_set_;
 
+    // Spec #4-B T4.18: push the topology-snapshot opt-in down into storage
+    // so the two edge-index builders (build_from_to_edge_index_ and
+    // build_to_from_edge_index_) emit CSR sidecars via mmap over the fresh
+    // `.leaf`, instead of the 3-pass-per-direction post-hoc walker. The
+    // post-hoc walker is retained as a safety fallback: build_topology_snapshots_()
+    // skips any direction whose integrated emit already succeeded, and only
+    // runs the legacy BPT-iterator path for the others (should not occur on
+    // a successful build).
+    storage->set_build_topology_snapshot(build_topology_snapshot_);
+
     // Initialize native scanner with main graph indexes
     // Include edge_from_to and edge_n1_n2 for O(log n) edge endpoint lookup
     scanner = std::make_unique<NativeScanner>(
@@ -2411,18 +2421,34 @@ void NativeProjectionBuilder::build_topology_snapshots_() {
         return;
     }
 
+    // Spec #4-B T4.18: fast path — if the integrated build path (invoked
+    // inline by ProjectionStorage::build_{from_to,to_from}_edge_index_)
+    // already emitted both sidecars, we have nothing to do. Fall through
+    // only for directions where the integrated path was disabled or
+    // failed, so the legacy post-hoc BPT walker retries them as a safety
+    // net. On a healthy build this branch is the common case and the
+    // whole function returns with a single fast check.
+    const bool fwd_done = storage->fwd_topology_snapshot_built();
+    const bool rev_done = storage->rev_topology_snapshot_built();
+
     if (fwd_ok) {
-        BPlusTree<3>* fwd_bpt = storage->get_from_to_edge_index();
-        if (fwd_bpt == nullptr) {
-            std::cerr << "[Projection] buildTopologySnapshot: from_to_edge B+Tree "
-                         "not open for projection '" << projection_name
-                      << "' — skipping topology_fwd.csr." << std::endl;
+        if (fwd_done) {
+            // Integrated path already wrote topology_fwd.csr during the
+            // FROM_TO_EDGE build. Nothing to do.
         } else {
-            try {
-                build_one_topology_snapshot_(/*direction=*/0, fwd_bpt);
-            } catch (const std::exception& e) {
-                std::cerr << "[Projection] failed to build topology_fwd.csr for '"
-                          << projection_name << "': " << e.what() << std::endl;
+            BPlusTree<3>* fwd_bpt = storage->get_from_to_edge_index();
+            if (fwd_bpt == nullptr) {
+                std::cerr << "[Projection] buildTopologySnapshot: from_to_edge "
+                             "B+Tree not open for projection '" << projection_name
+                          << "' — skipping topology_fwd.csr." << std::endl;
+            } else {
+                try {
+                    build_one_topology_snapshot_(/*direction=*/0, fwd_bpt);
+                } catch (const std::exception& e) {
+                    std::cerr << "[Projection] failed to build topology_fwd.csr"
+                              << " for '" << projection_name << "': " << e.what()
+                              << std::endl;
+                }
             }
         }
     } else {
@@ -2431,17 +2457,22 @@ void NativeProjectionBuilder::build_topology_snapshots_() {
     }
 
     if (rev_ok) {
-        BPlusTree<3>* rev_bpt = storage->get_to_from_edge_index();
-        if (rev_bpt == nullptr) {
-            std::cerr << "[Projection] buildTopologySnapshot: to_from_edge B+Tree "
-                         "not open for projection '" << projection_name
-                      << "' — skipping topology_rev.csr." << std::endl;
+        if (rev_done) {
+            // Integrated path already wrote topology_rev.csr.
         } else {
-            try {
-                build_one_topology_snapshot_(/*direction=*/1, rev_bpt);
-            } catch (const std::exception& e) {
-                std::cerr << "[Projection] failed to build topology_rev.csr for '"
-                          << projection_name << "': " << e.what() << std::endl;
+            BPlusTree<3>* rev_bpt = storage->get_to_from_edge_index();
+            if (rev_bpt == nullptr) {
+                std::cerr << "[Projection] buildTopologySnapshot: to_from_edge "
+                             "B+Tree not open for projection '" << projection_name
+                          << "' — skipping topology_rev.csr." << std::endl;
+            } else {
+                try {
+                    build_one_topology_snapshot_(/*direction=*/1, rev_bpt);
+                } catch (const std::exception& e) {
+                    std::cerr << "[Projection] failed to build topology_rev.csr"
+                              << " for '" << projection_name << "': " << e.what()
+                              << std::endl;
+                }
             }
         }
     } else {

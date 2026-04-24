@@ -149,6 +149,15 @@ TopologySnapshotWriter::TopologySnapshotWriter(
 
     write_cursor_.assign(static_cast<std::size_t>(num_nodes_), 0);
 
+    // Reserve 1 MiB of staging space for each per-section coalescing
+    // buffer. Append_edge() pushes words here instead of issuing a
+    // pwrite per call; the buffer flushes when full and once at
+    // finalize(). Keeps peak RAM at ~2 MiB regardless of graph size.
+    col_idx_buf_.reserve(kCoalesceBytes / sizeof(uint64_t));
+    if (include_edge_ids_) {
+        edge_ids_buf_.reserve(kCoalesceBytes / sizeof(uint64_t));
+    }
+
     // Section offsets. Fixed once N and M are known.
     col_idx_offset_  = static_cast<uint64_t>(kTopologySnapshotHeaderSize)
                      + sizeof(uint64_t) * (num_nodes_ + 1);
@@ -261,23 +270,81 @@ void TopologySnapshotWriter::append_edge(ObjectId src, ObjectId dst, ObjectId ed
     }
 
     // Index of this edge within COL_IDX: row_ptr[src] + local_cursor.
+    // The contract in the header allows partial fills — a source with
+    // declared degree > actual appended count leaves a gap whose bytes
+    // come from ftruncate's zero-fill. To preserve that, the per-section
+    // coalescing buffers detect any gap between the previously-buffered
+    // last word and the current edge_index, and flush the buffer
+    // (repositioning its logical start) so the pwrite always lands at
+    // the correct contiguous offset. In the common path (full fill,
+    // src-monotone, which is what the integrated builder produces) this
+    // branch never triggers and we stay in the 1 MiB coalescing regime.
     const uint64_t edge_index =
         row_ptr_[static_cast<std::size_t>(src_idx)]
         + write_cursor_[static_cast<std::size_t>(src_idx)];
     last_src_idx_ = src_idx;
     ++write_cursor_[static_cast<std::size_t>(src_idx)];
 
-    // COL_IDX: pwrite one u64 at col_idx_offset_ + edge_index * 8.
-    pwrite_all(&dst_idx, sizeof(uint64_t),
-               col_idx_offset_ + edge_index * sizeof(uint64_t));
+    // ---- COL_IDX ---------------------------------------------------
+    {
+        const uint64_t buffered_next =
+            col_idx_flushed_words_ + col_idx_buf_.size();
+        if (edge_index != buffered_next) {
+            // Gap detected. Flush whatever is in the buffer at its
+            // current offset, then reposition the logical "flushed"
+            // cursor to the new edge_index so subsequent pwrites are
+            // offset correctly. The gap words themselves are left
+            // zero — ftruncate pre-filled the file.
+            flush_col_idx_buffer_();
+            col_idx_flushed_words_ = edge_index;
+        }
+        col_idx_buf_.push_back(dst_idx);
+        if (col_idx_buf_.size() * sizeof(uint64_t) >= kCoalesceBytes) {
+            flush_col_idx_buffer_();
+        }
+    }
 
+    // ---- EDGE_IDS --------------------------------------------------
     if (include_edge_ids_) {
-        uint64_t eid = edge_id.id;
-        pwrite_all(&eid, sizeof(uint64_t),
-                   edge_ids_offset_ + edge_index * sizeof(uint64_t));
+        const uint64_t buffered_next =
+            edge_ids_flushed_words_ + edge_ids_buf_.size();
+        if (edge_index != buffered_next) {
+            flush_edge_ids_buffer_();
+            edge_ids_flushed_words_ = edge_index;
+        }
+        edge_ids_buf_.push_back(edge_id.id);
+        if (edge_ids_buf_.size() * sizeof(uint64_t) >= kCoalesceBytes) {
+            flush_edge_ids_buffer_();
+        }
     } else {
         (void)edge_id;  // intentionally unused
     }
+}
+
+void TopologySnapshotWriter::flush_col_idx_buffer_() {
+    if (col_idx_buf_.empty()) {
+        return;
+    }
+    const std::size_t n = col_idx_buf_.size();
+    pwrite_all(
+        col_idx_buf_.data(),
+        n * sizeof(uint64_t),
+        col_idx_offset_ + col_idx_flushed_words_ * sizeof(uint64_t));
+    col_idx_flushed_words_ += n;
+    col_idx_buf_.clear();
+}
+
+void TopologySnapshotWriter::flush_edge_ids_buffer_() {
+    if (edge_ids_buf_.empty()) {
+        return;
+    }
+    const std::size_t n = edge_ids_buf_.size();
+    pwrite_all(
+        edge_ids_buf_.data(),
+        n * sizeof(uint64_t),
+        edge_ids_offset_ + edge_ids_flushed_words_ * sizeof(uint64_t));
+    edge_ids_flushed_words_ += n;
+    edge_ids_buf_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +359,12 @@ void TopologySnapshotWriter::finalize() {
         throw std::logic_error(
             "TopologySnapshotWriter: finalize on closed writer");
     }
+
+    // Flush any residual COL_IDX / EDGE_IDS words still in the 1 MiB
+    // coalescing buffers. Any un-flushed tail is <1 MiB, so this is a
+    // single pwrite per section worst case.
+    flush_col_idx_buffer_();
+    flush_edge_ids_buffer_();
 
     // Hash the source .leaf end-to-end (separate pass over the file).
     std::array<uint8_t, 32> source_hash{};

@@ -289,3 +289,180 @@ TEST(NativeProjectionBuilderTopologySnapshot, ReverseNeighborSlicesAreCorrect) {
     ASSERT_EQ(n3.size(), 1u);
     EXPECT_EQ(n3[0], 2u);
 }
+
+// ---------------------------------------------------------------------------
+// Spec #4-B T4.18 — golden compare: integrated path vs post-hoc path.
+//
+// Builds the same fixture two ways:
+//   A. Integrated path: set_build_topology_snapshot(true) before flush(),
+//      which triggers the mmap-over-.leaf builder inside
+//      ProjectionStorage::build_{from_to,to_from}_edge_index_().
+//   B. Post-hoc path: flush() without the flag, then
+//      detail::build_topology_snapshots_for_test() drives the legacy
+//      BPT-iterator walker (build_one_topology_snapshot_ body).
+//
+// The byte contents of `topology_fwd.csr` and `topology_rev.csr` must be
+// identical under both paths — same header, same ROW_PTR, same COL_IDX,
+// same EDGE_IDS, same source-.leaf SHA-256. This is the load-bearing
+// invariant that makes the performance optimization safe to ship.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Read a file fully into a byte vector. Returns an empty vector if the
+// file is missing (caller asserts existence separately).
+std::vector<unsigned char> read_file_bytes(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    std::vector<unsigned char> out(
+        (std::istreambuf_iterator<char>(f)),
+        std::istreambuf_iterator<char>());
+    return out;
+}
+
+// Build a small projection that exercises both the dense row indices
+// AND a couple of non-trivial degrees (src 0 has degree 2, src 1 has
+// degree 1, src 2 has degree 1, src 3 has degree 0). Returns the proj
+// directory. Unlike build_small_projection above, this one does NOT
+// drive the post-hoc walker — callers choose the path.
+std::string build_projection_without_snapshot(const std::string& proj_name,
+                                              bool               set_flag) {
+    auto& manager = GQL::ProjectionManager::get_instance();
+    std::string proj_dir = manager.create_projection(proj_name);
+
+    GQL::ProjectionStorage storage(
+        proj_dir,
+        MdbFixture::instance().db_folder(),
+        proj_name);
+    storage.init();
+
+    // When set_flag == true, the two edge-index builders inside flush()
+    // will emit topology_{fwd,rev}.csr via the integrated mmap path.
+    storage.set_build_topology_snapshot(set_flag);
+
+    for (uint64_t i = 0; i < 4; ++i) {
+        GQL::ProjectedNode node;
+        node.node_id = ObjectId(i);
+        storage.add_node(node);
+    }
+
+    auto make_edge = [](uint64_t from, uint64_t to, uint64_t eid) {
+        GQL::ProjectedEdge edge;
+        edge.from_node   = ObjectId(from);
+        edge.to_node     = ObjectId(to);
+        edge.edge_id     = ObjectId(eid);
+        edge.is_directed = true;
+        return edge;
+    };
+
+    storage.add_edge(make_edge(0, 1, 100));
+    storage.add_edge(make_edge(0, 2, 101));
+    storage.add_edge(make_edge(1, 2, 102));
+    storage.add_edge(make_edge(2, 3, 103));
+
+    storage.flush();
+
+    if (!set_flag) {
+        // Drive the legacy BPT-iterator walker. With set_flag == true,
+        // the integrated path already produced the sidecars during
+        // flush() — no post-hoc call is needed.
+        GQL::detail::build_topology_snapshots_for_test(
+            storage,
+            /*build_forward=*/true,
+            /*build_reverse=*/true);
+    }
+
+    return proj_dir;
+}
+
+}  // namespace
+
+TEST(NativeProjectionBuilderTopologySnapshot,
+     IntegratedPathProducesByteIdenticalOutputVsPostHoc) {
+    (void)MdbFixture::instance();
+
+    // Path A (integrated — set_flag=true triggers the mmap path inside
+    // ProjectionStorage::build_from_to_edge_index_ / build_to_from_edge_index_).
+    const std::string integrated_dir = build_projection_without_snapshot(
+        "topo_snap_integrated_proj", /*set_flag=*/true);
+
+    // Path B (post-hoc — the pre-T4.18 BPT-iterator walker driven via the
+    // test detail hook).
+    const std::string posthoc_dir = build_projection_without_snapshot(
+        "topo_snap_posthoc_proj", /*set_flag=*/false);
+
+    // Both sidecars must exist on both sides.
+    for (const auto* basename : {"topology_fwd.csr", "topology_rev.csr"}) {
+        const fs::path a = fs::path(integrated_dir) / basename;
+        const fs::path b = fs::path(posthoc_dir)    / basename;
+        ASSERT_TRUE(fs::exists(a)) << "integrated path missing " << basename;
+        ASSERT_TRUE(fs::exists(b)) << "post-hoc path missing "   << basename;
+    }
+
+    // Byte compare: header (including source-.leaf SHA-256), ROW_PTR,
+    // COL_IDX, EDGE_IDS. A single byte diff would indicate either a
+    // reordering, a dedup gap, or a stale SHA digest — any of those
+    // would silently break TopologyAccessor at read time.
+    const auto a_fwd = read_file_bytes(fs::path(integrated_dir) / "topology_fwd.csr");
+    const auto b_fwd = read_file_bytes(fs::path(posthoc_dir)    / "topology_fwd.csr");
+    ASSERT_EQ(a_fwd.size(), b_fwd.size())
+        << "topology_fwd.csr size mismatch: integrated=" << a_fwd.size()
+        << " post-hoc=" << b_fwd.size();
+    EXPECT_EQ(a_fwd, b_fwd)
+        << "topology_fwd.csr bytes differ between integrated and post-hoc "
+           "paths — integration broke byte-identical invariant";
+
+    const auto a_rev = read_file_bytes(fs::path(integrated_dir) / "topology_rev.csr");
+    const auto b_rev = read_file_bytes(fs::path(posthoc_dir)    / "topology_rev.csr");
+    ASSERT_EQ(a_rev.size(), b_rev.size())
+        << "topology_rev.csr size mismatch: integrated=" << a_rev.size()
+        << " post-hoc=" << b_rev.size();
+    EXPECT_EQ(a_rev, b_rev)
+        << "topology_rev.csr bytes differ between integrated and post-hoc "
+           "paths — integration broke byte-identical invariant";
+}
+
+// ---------------------------------------------------------------------------
+// Zero-impact check: building with the flag OFF must produce byte-identical
+// `.leaf` / `.dir` files as any prior baseline. We can't diff against a
+// previously-checked-in baseline (we have no such fixture), but we can
+// verify: (a) no `.csr` files land on disk when the flag is off, and
+// (b) the builder's "emitted" accessors remain false.
+// ---------------------------------------------------------------------------
+
+TEST(NativeProjectionBuilderTopologySnapshot, FlagOffEmitsNoSidecars) {
+    (void)MdbFixture::instance();
+
+    auto& manager = GQL::ProjectionManager::get_instance();
+    const std::string proj_name = "topo_snap_flag_off_proj";
+    std::string proj_dir = manager.create_projection(proj_name);
+
+    GQL::ProjectionStorage storage(
+        proj_dir,
+        MdbFixture::instance().db_folder(),
+        proj_name);
+    storage.init();
+    // Flag defaults to false; not calling set_build_topology_snapshot.
+
+    for (uint64_t i = 0; i < 3; ++i) {
+        GQL::ProjectedNode node;
+        node.node_id = ObjectId(i);
+        storage.add_node(node);
+    }
+    GQL::ProjectedEdge e;
+    e.from_node = ObjectId(0);
+    e.to_node = ObjectId(1);
+    e.edge_id = ObjectId(200);
+    e.is_directed = true;
+    storage.add_edge(e);
+
+    storage.flush();
+
+    EXPECT_FALSE(fs::exists(fs::path(proj_dir) / "topology_fwd.csr"))
+        << "topology_fwd.csr leaked through a build with the flag OFF";
+    EXPECT_FALSE(fs::exists(fs::path(proj_dir) / "topology_rev.csr"))
+        << "topology_rev.csr leaked through a build with the flag OFF";
+    EXPECT_FALSE(storage.fwd_topology_snapshot_built());
+    EXPECT_FALSE(storage.rev_topology_snapshot_built());
+    EXPECT_FALSE(storage.get_build_topology_snapshot());
+}

@@ -605,6 +605,44 @@ public:
     /// active preset when a missing index is accessed.
     IndexSet get_index_set() const { return requested_index_set; }
 
+    /// @name Spec #4-B T4.18: integrated topology snapshot emission
+    /// @{
+
+    /**
+     * @brief Enable inline CSR sidecar emission during edge index builds.
+     *
+     * When set to true before `flush()` / `build_one_index(FROM_TO_EDGE|
+     * TO_FROM_EDGE)` runs, each of the two edge index builders emits the
+     * matching `topology_{fwd,rev}.csr` right after the `.leaf` lands on
+     * disk, reading back via mmap over the freshly-written file. This
+     * replaces the post-hoc 3-pass-per-direction builder previously
+     * invoked from `NativeProjectionBuilder::build_topology_snapshots_()`.
+     *
+     * Default `false` preserves byte-identical behavior for every caller
+     * that does not request topology snapshots.
+     */
+    void set_build_topology_snapshot(bool enable) {
+        build_topology_snapshot_ = enable;
+    }
+    bool get_build_topology_snapshot() const noexcept {
+        return build_topology_snapshot_;
+    }
+
+    /**
+     * @brief Returns true if `topology_fwd.csr` was successfully emitted
+     *        by the integrated path during this storage's build.
+     *
+     * Used by NativeProjectionBuilder's logging layer to decide whether
+     * the legacy post-hoc builder needs to run as a fallback.
+     */
+    bool fwd_topology_snapshot_built() const noexcept {
+        return fwd_topology_snapshot_built_;
+    }
+    bool rev_topology_snapshot_built() const noexcept {
+        return rev_topology_snapshot_built_;
+    }
+    /// @}
+
 private:
     /// @name Internal Batch Operations
     /// @{
@@ -747,6 +785,27 @@ private:
      * 1% is a good balance: ~10 bits per element.
      */
     static constexpr double BLOOM_FILTER_FPR = 0.01;
+    /// @}
+
+    /// @name Spec #4-B T4.18: integrated topology snapshot state
+    /// @{
+    /// Opt-in flag set by NativeProjectionBuilder via
+    /// set_build_topology_snapshot() before finalize. When true, the two
+    /// edge index builders (build_from_to_edge_index_ / build_to_from_edge_index_)
+    /// invoke GQL::Projection::build_topology_snapshot_from_leaf() right
+    /// after the `.leaf` is written to disk, emitting the matching CSR
+    /// sidecar via mmap over the fresh file. Default false preserves the
+    /// pre-T4.18 behavior for every existing caller.
+    bool build_topology_snapshot_ = false;
+
+    /// Per-direction "already emitted" flags, set by the integrated path.
+    /// Consulted by NativeProjectionBuilder::build_topology_snapshots_()
+    /// so the legacy post-hoc walker is skipped whenever the integrated
+    /// path has already produced the sidecar. In SERIALIZED mode each
+    /// edge index is built exactly once, so these are a single-transition
+    /// false -> true per direction.
+    bool fwd_topology_snapshot_built_ = false;
+    bool rev_topology_snapshot_built_ = false;
     /// @}
 
     /// @name Serialized-mode edge-write mask

@@ -146,6 +146,27 @@ private:
     bool          finalized_   = false;
     uint64_t      bytes_written_ = 0;
 
+    // Per-section coalescing write buffers (T4.18 perf fix).
+    // Without these, append_edge() would issue one pwrite per word — on
+    // ogbn-arxiv (~1.2 M edges × 2 pwrites / edge × 2 directions) the
+    // syscall cost alone was ~4.4 s, dominating the integrated path.
+    //
+    // The buffers flush when they reach kCoalesceBytes or at finalize().
+    // COL_IDX / EDGE_IDS are always filled at a contiguous section-local
+    // cursor (edge order is monotone in src AND monotone in row_ptr[src]
+    // + cursor[src], so after all N sources are visited the buffer is a
+    // dense prefix of the section). Cursor tracking is therefore a
+    // single uint64_t per section — no sparse writes are possible under
+    // the monotonicity contract.
+    static constexpr std::size_t kCoalesceBytes = 1 << 20;  // 1 MiB
+    std::vector<uint64_t> col_idx_buf_;   // pending COL_IDX words
+    std::vector<uint64_t> edge_ids_buf_;  // pending EDGE_IDS words (may be empty)
+    uint64_t              col_idx_flushed_words_  = 0;
+    uint64_t              edge_ids_flushed_words_ = 0;
+
+    void flush_col_idx_buffer_();
+    void flush_edge_ids_buffer_();
+
     // Write `len` bytes at file offset `offset`, handling short writes and
     // EINTR. All writes go via pwrite so the file-position cursor never
     // matters; append_edge() can freely interleave COL_IDX and EDGE_IDS.

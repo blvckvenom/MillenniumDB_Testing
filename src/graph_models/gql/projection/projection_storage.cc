@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 
 // Parallel execution for std::sort (requires TBB on GCC/Clang)
@@ -16,6 +17,8 @@
 #include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
+#include "graph_models/gql/projection/topology_snapshot_from_leaf.h"
+#include "graph_models/gql/projection/topology_snapshot_writer.h"
 #include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
@@ -1072,6 +1075,27 @@ void ProjectionStorage::build_from_to_edge_index_() {
         },
         sort_temp_dir
     );
+
+    // Spec #4-B T4.18 integrated topology snapshot emission.
+    // Runs only when NativeProjectionBuilder pre-set the opt-in flag.
+    // The legacy post-hoc path (build_topology_snapshots_()) still exists
+    // but short-circuits when fwd_topology_snapshot_built_ is already true.
+    if (build_topology_snapshot_) {
+        try {
+            GQL::Projection::build_topology_snapshot_from_leaf(
+                std::filesystem::path(projection_dir),
+                GQL::Projection::TopologySnapshotWriter::Direction::FORWARD,
+                node_count,
+                /*include_edge_ids=*/true);
+            fwd_topology_snapshot_built_ = true;
+        } catch (const std::exception& e) {
+            // Non-fatal: leave the flag false so the legacy post-hoc
+            // path can retry from the BPT iterator in finalize().
+            std::cerr << "[Projection] integrated topology_fwd.csr build "
+                         "failed: " << e.what()
+                      << " — falling back to post-hoc builder" << std::endl;
+        }
+    }
 }
 
 void ProjectionStorage::build_to_from_edge_index_() {
@@ -1087,6 +1111,23 @@ void ProjectionStorage::build_to_from_edge_index_() {
         },
         sort_temp_dir
     );
+
+    // Spec #4-B T4.18 integrated topology snapshot emission (reverse).
+    // Same gate + fallback logic as the FORWARD builder above.
+    if (build_topology_snapshot_) {
+        try {
+            GQL::Projection::build_topology_snapshot_from_leaf(
+                std::filesystem::path(projection_dir),
+                GQL::Projection::TopologySnapshotWriter::Direction::REVERSE,
+                node_count,
+                /*include_edge_ids=*/true);
+            rev_topology_snapshot_built_ = true;
+        } catch (const std::exception& e) {
+            std::cerr << "[Projection] integrated topology_rev.csr build "
+                         "failed: " << e.what()
+                      << " — falling back to post-hoc builder" << std::endl;
+        }
+    }
 }
 
 void ProjectionStorage::build_edge_direction_index_() {
