@@ -44,6 +44,7 @@ enum class IndexSet : uint8_t;
  * | 1.3 | Fixed key mappings to persist actual IDs (not indices) |
  * | 1.4 | Added IndexSet preset byte (Spec #3 T3.6) |
  * | 1.5 | Added per-index leaf_format byte array (Spec #5 T5.10) |
+ * | 1.6 | Added per-projection graphStorage byte (Spec #8 T8.7) |
  *
  * ## v1.5 additions
  *
@@ -58,6 +59,16 @@ enum class IndexSet : uint8_t;
  * MINOR < 5 are read by populating leaf_formats with all-BITSET (1) for
  * every materialized index, preserving pre-Spec-#5 behavior.
  *
+ * ## v1.6 additions
+ *
+ * After the v1.5 leaf_formats section, v1.6 appends a single per-projection
+ * graph_storage byte selecting the on-disk topology representation. Values:
+ * 1 = BTREE (classic per-index B+Tree leaves using leaf_format), 2 =
+ * CSR_HYBRID (edge indexes emit inline CSR leaves per Spec #8; other
+ * indexes use leaf_format normally). Catalogs with MINOR < 6 are read by
+ * defaulting graph_storage to 1 (BTREE), preserving pre-Spec-#8 behavior
+ * byte-for-byte.
+ *
  * @see ProjectionStorage for the actual index storage
  * @see ProjectionManager for projection lifecycle management
  */
@@ -66,8 +77,8 @@ public:
     /// @name Format Constants
     /// @{
     static constexpr uint8_t MAJOR_VERSION = 1;    ///< Catalog format major version
-    /// Minor version (1.5 adds per-index leaf_format byte array)
-    static constexpr uint8_t MINOR_VERSION = 5;
+    /// Minor version (1.6 adds per-projection graphStorage byte for Spec #8)
+    static constexpr uint8_t MINOR_VERSION = 6;
     static constexpr uint8_t magic_number[] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};  ///< File type identifier
     static constexpr uint8_t MODEL_ID = 255;       ///< Special ID distinguishing from GQL/RDF catalogs
     /// @}
@@ -198,6 +209,25 @@ public:
     /// @brief Accessor mirroring get-style helpers elsewhere in the catalog.
     /// Returns the persisted per-index leaf_format byte array (const).
     const std::vector<uint8_t>& get_leaf_formats() const { return leaf_formats; }
+
+    /// @name Graph Storage Mode (v1.6+)
+    /// @{
+    /// Per-projection graph-storage mode byte (Spec #8, v1.6+). Values:
+    ///   1 = BTREE       — classic B+Tree leaves with per-index leaf_format
+    ///                      (default, preserves pre-Spec-#8 behavior).
+    ///   2 = CSR_HYBRID  — edge indexes (FROM_TO_EDGE, TO_FROM_EDGE) use
+    ///                      inline CSR leaves per Spec #8; other indexes
+    ///                      use leaf_format normally.
+    ///
+    /// Pre-v1.6 catalogs read under v1.6 code default to BTREE (1),
+    /// preserving behavior.
+    uint8_t graph_storage = 1;  // default = BTREE
+    /// @}
+
+    /// @brief Accessor returning the persisted per-projection graphStorage
+    /// byte. Never throws; returns the in-memory value populated by load()
+    /// (or the default 1 = BTREE if no catalog has been loaded yet).
+    uint8_t get_graph_storage() const noexcept { return graph_storage; }
 
     /// @name Debug Information
     /// @{

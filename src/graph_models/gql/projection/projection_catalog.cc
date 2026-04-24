@@ -212,6 +212,22 @@ void ProjectionCatalog::load() {
         leaf_formats.assign(n, static_cast<uint8_t>(BPT::LeafFormat::BITSET));
     }
 
+    // v1.6 field: per-projection graphStorage byte. For MINOR < 6 we leave
+    // graph_storage at its default (1 = BTREE), preserving the byte-for-byte
+    // behavior of every pre-Spec-#8 projection. For MINOR >= 6 the byte must
+    // be 1 (BTREE) or 2 (CSR_HYBRID); any other value is an on-disk
+    // corruption signal and raises.
+    if (minor_ver >= 6) {
+        graph_storage = read_uint8(file);
+        if (graph_storage != 1 && graph_storage != 2) {
+            throw std::runtime_error(
+                "Catalog v1.6: invalid graph_storage byte "
+                + std::to_string(graph_storage)
+                + " (expected 1=BTREE or 2=CSR_HYBRID)");
+        }
+    }
+    // v1.5 and earlier: graph_storage stays at default (1 = BTREE)
+
     file.close();
 }
 
@@ -314,6 +330,14 @@ void ProjectionCatalog::save() {
     for (uint8_t fmt : leaf_formats) {
         write_uint8(file, fmt);
     }
+
+    // Write v1.6 field: per-projection graphStorage byte. Appended after the
+    // v1.5 leaf_formats array so v1.5 readers stop cleanly after the format
+    // bytes. The MINOR_VERSION header (written above) is now 6, so any
+    // future reader selecting on minor_ver >= 6 will consume this byte.
+    // Values are fixed to 1=BTREE (default) or 2=CSR_HYBRID — T8.8 will
+    // plumb the value from the graph_project config; T8.6 dispatches on it.
+    write_uint8(file, graph_storage);
 
     // Ensure data is flushed to OS buffer before close
     file.flush();
