@@ -176,6 +176,29 @@ private:
     mutable uint64_t        cache_value_     = 0;      // its decoded dst value
     mutable const uint8_t*  cache_in_        = nullptr; // byte ptr just past the last varint
 
+    // Sequential tuple-cursor cache for decode_tuple_ / get_record (T8.12b).
+    // Pre-fix, decode_tuple_(pos) walked the offset table from src entry 0
+    // on every call, linearly accumulating degrees until it found the src
+    // entry containing tuple `pos`. BptIter<N>::next() drives pos=0,1,...,
+    // total_tuples_-1 sequentially, so without a cross-entry cursor the cost
+    // was O(total_tuples_ * value_count) per leaf scan.
+    //
+    // This cache captures the (src_entry, within-entry) position of the
+    // most recently decoded tuple. Calls with pos == seq_tuple_pos_ + 1
+    // advance O(1) amortized: either the next within-entry dst (decoded via
+    // the dst cache above), or — when crossing an entry boundary — the next
+    // src entry decoded in O(1) via seq_tuple_next_entry_idx_. Random or
+    // backwards access falls back to the linear walk.
+    //
+    // seq_tuple_pos_ == UINT_FAST32_MAX sentinel means "cache empty".
+    mutable uint_fast32_t   seq_tuple_pos_              = UINT_FAST32_MAX;
+    mutable uint_fast32_t   seq_tuple_entry_idx_        = 0;  // src entry index for this tuple
+    mutable uint_fast32_t   seq_tuple_within_idx_       = 0;  // within-entry dst index
+    mutable uint_fast32_t   seq_tuple_entry_cumulative_ = 0;  // sum of degrees BEFORE this entry
+    mutable uint32_t        seq_tuple_entry_degree_     = 0;  // degree of this entry
+    mutable uint32_t        seq_tuple_dst_start_off_    = 0;  // byte offset where col_idx stream starts
+    mutable uint64_t        seq_tuple_src_id_           = 0;  // decoded src_id of this entry
+
     // ------- internal helpers -------
 
     /// Read offset_table[i] with explicit LE byte layout. i in [0, value_count).

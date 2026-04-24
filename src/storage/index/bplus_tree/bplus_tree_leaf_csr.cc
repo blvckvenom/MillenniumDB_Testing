@@ -430,16 +430,109 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             + " >= total_tuples " + std::to_string(total_tuples_));
     }
 
-    // Find which src entry contains tuple `pos`. A simple linear walk over
-    // the offset table, accumulating degrees. For a typical 3-10 src page,
-    // this is bounded by the value_count. (A more aggressive cache could
-    // avoid the re-walk across sequential get_record calls, but BptIter's
-    // access pattern is already serviced by the dst-level cursor cache on
-    // find_src_entry/get_dst_at path; the BPTLeafBase path here is used
-    // chiefly by range scans that march through pos = 0, 1, 2, ... .)
-
     const uint8_t* const page_start = reinterpret_cast<const uint8_t*>(page_bytes_);
     const uint8_t* const page_end   = page_start + kPageSize;
+
+    // ---- Fast path (T8.12b): sequential forward access ---------------------
+    //
+    // If the previous decode landed on pos = seq_tuple_pos_, and the caller
+    // is now asking for pos + 1, we can advance in O(1) amortized without
+    // walking the offset table from entry 0:
+    //   (a) If within-entry room remains, stay in the same src entry and
+    //       increment seq_tuple_within_idx_. The per-dst varint advance is
+    //       serviced by the existing dst-level cache via get_dst_at.
+    //   (b) If the current entry is exhausted, cross to the next src entry:
+    //       bump seq_tuple_entry_idx_, decode its (src_id, degree) header
+    //       exactly once, and emit its first dst.
+    //
+    // Correctness: the cache memoizes a derived state of the immutable v3
+    // page; any path that reaches the same (entry_idx, within_idx) observes
+    // the same tuple values.
+    if (seq_tuple_pos_ != UINT_FAST32_MAX
+        && pos == seq_tuple_pos_ + 1
+        && seq_tuple_entry_idx_ < header_.value_count)
+    {
+        // (a) Stay in the same src entry, advance within it.
+        if (seq_tuple_within_idx_ + 1 < seq_tuple_entry_degree_) {
+            const uint_fast32_t next_within = seq_tuple_within_idx_ + 1;
+            uint64_t dst_value = 0;
+            if (get_dst_at(seq_tuple_dst_start_off_,
+                           seq_tuple_entry_degree_,
+                           next_within,
+                           dst_value))
+            {
+                seq_tuple_within_idx_ = next_within;
+                seq_tuple_pos_        = pos;
+                Record<N> rec{};
+                if constexpr (N >= 1) rec[0] = seq_tuple_src_id_;
+                if constexpr (N >= 2) rec[1] = dst_value;
+                if constexpr (N >= 3) rec[2] = 0;
+                return rec;
+            }
+            // get_dst_at failure falls through to the linear restart below.
+        } else {
+            // (b) Cross into the next src entry. Decode its header once.
+            const uint_fast32_t next_entry = seq_tuple_entry_idx_ + 1;
+            if (next_entry < header_.value_count) {
+                const uint32_t off = offset_at_(next_entry);
+                const uint8_t* in  = page_start + off;
+
+                uint64_t src_id = 0;
+                uint64_t degree = 0;
+                bool hdr_ok = true;
+                try {
+                    in += BPT::varint_decode(in, page_end, src_id);
+                    in += BPT::varint_decode(in, page_end, degree);
+                } catch (...) {
+                    hdr_ok = false;
+                }
+
+                if (hdr_ok && degree > 0) {
+                    const uint32_t dst_start_off =
+                        static_cast<uint32_t>(in - page_start);
+                    uint64_t dst_value = 0;
+                    // Fresh entry: the dst-level cache must not be reused
+                    // across different start_offsets. get_dst_at with i=0
+                    // against a new start_offset misses the cache and
+                    // restarts from the first varint, which is the desired
+                    // behavior.
+                    if (get_dst_at(dst_start_off,
+                                   static_cast<uint32_t>(degree),
+                                   0,
+                                   dst_value))
+                    {
+                        seq_tuple_entry_idx_ = next_entry;
+                        seq_tuple_entry_cumulative_ =
+                            seq_tuple_entry_cumulative_ + seq_tuple_entry_degree_;
+                        seq_tuple_entry_degree_  = static_cast<uint32_t>(degree);
+                        seq_tuple_dst_start_off_ = dst_start_off;
+                        seq_tuple_src_id_        = src_id;
+                        seq_tuple_within_idx_    = 0;
+                        seq_tuple_pos_           = pos;
+
+                        Record<N> rec{};
+                        if constexpr (N >= 1) rec[0] = seq_tuple_src_id_;
+                        if constexpr (N >= 2) rec[1] = dst_value;
+                        if constexpr (N >= 3) rec[2] = 0;
+                        return rec;
+                    }
+                }
+                // Any failure falls through to the linear restart below.
+            }
+            // next_entry out of range means total_tuples_ already covered —
+            // but the top-of-function bound check guarantees pos <
+            // total_tuples_, so this branch is unreachable under a
+            // well-formed page. Fall through for safety.
+        }
+    }
+
+    // ---- Fallback: linear walk over the offset table ----------------------
+    //
+    // Used for random access, backwards access, the first call, or any
+    // fast-path failure. Walk the offset table accumulating degrees until
+    // the entry containing `pos` is located; then decode its within-entry
+    // dst. Populate the sequential cache so subsequent pos+1 calls take the
+    // fast path above.
 
     uint_fast32_t cumulative = 0;
     for (uint_fast32_t i = 0; i < header_.value_count; ++i) {
@@ -464,6 +557,16 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
                     "get_dst_at failed inside decode_tuple_ at pos "
                     + std::to_string(pos));
             }
+
+            // Populate the sequential cursor so the next call with pos+1
+            // can advance in O(1) amortized.
+            seq_tuple_pos_              = pos;
+            seq_tuple_entry_idx_        = i;
+            seq_tuple_within_idx_       = within;
+            seq_tuple_entry_cumulative_ = cumulative;
+            seq_tuple_entry_degree_     = static_cast<uint32_t>(degree);
+            seq_tuple_dst_start_off_    = dst_start_off;
+            seq_tuple_src_id_           = src_id;
 
             Record<N> rec{};
             if constexpr (N >= 1) rec[0] = src_id;
