@@ -75,8 +75,13 @@ size_t BPTLeafV2<N>::encode_one_record_(const Record<N>& rec,
         if (prev_or_null == nullptr) {
             to_encode = rec[j];
         } else {
-            const int64_t delta =
-                static_cast<int64_t>(rec[j]) - static_cast<int64_t>((*prev_or_null)[j]);
+            // Unsigned subtraction is well-defined modular arithmetic; signed
+            // subtraction of two int64 casts would be UB for record values
+            // near UINT64_MAX. Reinterp the uint64 wrap-around as int64 for
+            // the zigzag step — two's-complement makes this bit-equivalent
+            // to the naive signed path for every input pair.
+            const uint64_t delta_u = rec[j] - (*prev_or_null)[j];
+            const int64_t delta    = static_cast<int64_t>(delta_u);
             to_encode = BPT::zigzag_encode_i64(delta);
         }
 
