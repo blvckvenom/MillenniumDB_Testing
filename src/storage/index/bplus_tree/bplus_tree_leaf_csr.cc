@@ -166,6 +166,13 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
 
     physical_degrees_.assign(vc, 0);
     entry_col_idx_start_.assign(vc, 0);
+    entry_edge_id_start_.assign(vc, 0);
+
+    // Spec #8-B task #1: cache whether this page carries a parallel
+    // edge_id stream per entry. Checked once at construction so every
+    // subsequent decode_tuple_ / get_dst_at call is branch-predictable.
+    page_has_edge_ids_ =
+        (header_.flags & BPT::CSRHybridFlags::kHasEdgeIds) != 0;
 
     uint64_t running_total = 0;
     for (uint_fast32_t i = 0; i < vc; ++i) {
@@ -244,6 +251,16 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
         }
 
         physical_degrees_[i] = static_cast<uint32_t>(phys);
+
+        // Spec #8-B: if the page advertises edge_ids, the parallel eid
+        // stream starts at the byte immediately after the dst stream's
+        // last-consumed varint. Capture that offset now so decode_tuple_
+        // can resolve eids in O(1) amortized alongside dsts.
+        if (page_has_edge_ids_) {
+            entry_edge_id_start_[i] =
+                static_cast<uint32_t>(cursor - page_start);
+        }
+
         running_total += phys;
     }
 
@@ -576,6 +593,50 @@ bool BPTLeafCSR<N>::get_dst_at(uint32_t start_offset,
 
 
 // ============================================================================
+// Spec #8-B task #1: parallel edge_id stream decoder
+// ============================================================================
+//
+// Standalone O(i) walk over the eid varint chain (no cache). Used only
+// from decode_tuple_'s fallback path; the sequential tuple cache above
+// collapses successive eid lookups into back-to-back O(i) calls whose
+// cost stays bounded by the degree of one src entry.
+
+template <std::size_t N>
+bool BPTLeafCSR<N>::get_eid_at(uint32_t eid_start_offset,
+                               uint32_t degree,
+                               uint_fast32_t i,
+                               uint64_t& out_eid) const noexcept
+{
+    if (i >= degree) {
+        return false;
+    }
+
+    const uint8_t* const page_start = reinterpret_cast<const uint8_t*>(page_bytes_);
+    const uint8_t* const page_end   = page_start + kPageSize;
+
+    const uint8_t* in = page_start + eid_start_offset;
+    uint64_t running = 0;
+
+    for (uint_fast32_t k = 0; k <= i; ++k) {
+        uint64_t v = 0;
+        try {
+            in += BPT::varint_decode(in, page_end, v);
+        } catch (...) {
+            return false;
+        }
+        if (k == 0) {
+            running = v;
+        } else {
+            const int64_t delta = BPT::zigzag_decode_u64(v);
+            running += static_cast<uint64_t>(delta);
+        }
+    }
+
+    out_eid = running;
+    return true;
+}
+
+// ============================================================================
 // BPTLeafBase<N> contract: tuple iteration
 // ============================================================================
 //
@@ -640,10 +701,22 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             {
                 seq_tuple_within_idx_ = next_within;
                 seq_tuple_pos_        = pos;
+                // Spec #8-B: when the page advertises edge_ids, decode the
+                // parallel eid stream at the same within-entry index so
+                // downstream consumers (count(e), edge-id lookups) see
+                // real values instead of the ADR 008 zero fallback.
+                uint64_t eid_value = 0;
+                if (page_has_edge_ids_) {
+                    get_eid_at(
+                        entry_edge_id_start_[seq_tuple_entry_idx_],
+                        seq_tuple_entry_degree_,
+                        next_within,
+                        eid_value);
+                }
                 Record<N> rec{};
                 if constexpr (N >= 1) rec[0] = seq_tuple_src_id_;
                 if constexpr (N >= 2) rec[1] = dst_value;
-                if constexpr (N >= 3) rec[2] = 0;
+                if constexpr (N >= 3) rec[2] = eid_value;
                 return rec;
             }
             // get_dst_at failure falls through to the linear restart below.
@@ -684,10 +757,21 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
                         seq_tuple_within_idx_    = 0;
                         seq_tuple_pos_           = pos;
 
+                        // Spec #8-B: decode parallel eid for tuple 0 of
+                        // the newly-entered entry.
+                        uint64_t eid_value = 0;
+                        if (page_has_edge_ids_) {
+                            get_eid_at(
+                                entry_edge_id_start_[next_entry],
+                                phys_deg,
+                                0,
+                                eid_value);
+                        }
+
                         Record<N> rec{};
                         if constexpr (N >= 1) rec[0] = seq_tuple_src_id_;
                         if constexpr (N >= 2) rec[1] = dst_value;
-                        if constexpr (N >= 3) rec[2] = 0;
+                        if constexpr (N >= 3) rec[2] = eid_value;
                         return rec;
                     }
                 }
@@ -739,10 +823,21 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             seq_tuple_dst_start_off_    = dst_start_off;
             seq_tuple_src_id_           = src_id;
 
+            // Spec #8-B: resolve parallel eid at the same within-entry
+            // index. Skipped (left as zero-sentinel) on pages that do not
+            // advertise edge_ids — preserves pre-Spec-#8-B behavior.
+            uint64_t eid_value = 0;
+            if (page_has_edge_ids_) {
+                get_eid_at(entry_edge_id_start_[i],
+                           phys_deg,
+                           within,
+                           eid_value);
+            }
+
             Record<N> rec{};
             if constexpr (N >= 1) rec[0] = src_id;
             if constexpr (N >= 2) rec[1] = dst_value;
-            if constexpr (N >= 3) rec[2] = 0;
+            if constexpr (N >= 3) rec[2] = eid_value;
             return rec;
         }
 

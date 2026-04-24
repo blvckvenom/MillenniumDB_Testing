@@ -153,6 +153,23 @@ public:
                     uint_fast32_t i,
                     uint64_t& out_dst) const noexcept;
 
+    /// Spec #8-B task #1 companion to get_dst_at(): decode the i-th
+    /// edge_id from an entry's parallel edge_id varint stream that
+    /// begins at `eid_start_offset`. Walks the stream from position 0
+    /// (first varint is a full-value varint; subsequent entries are
+    /// zigzag-delta varints against the running accumulator) — the
+    /// call is O(i) time with no persistent cache. Intended for
+    /// decode_tuple_'s "emit eid for this tuple" path, which is itself
+    /// wrapped in a sequential cursor by the tuple-level cache, so
+    /// the per-call cost stays amortised O(1) on forward scans.
+    ///
+    /// Returns true on success with `out_eid` populated; false if
+    /// `i >= degree` or a varint decode fault occurs.
+    bool get_eid_at(uint32_t eid_start_offset,
+                    uint32_t degree,
+                    uint_fast32_t i,
+                    uint64_t& out_eid) const noexcept;
+
     /// Chain support: returns true if this is a chain-head page (always
     /// the case when the reader-mode ctor accepts the page, since
     /// continuation pages are rejected at construction per I6 —
@@ -215,6 +232,19 @@ private:
     // Pre-computed at construction to avoid re-decoding the (src_id, degree)
     // header on every decode_tuple_ / find_src_entry call.
     std::vector<uint32_t>   entry_col_idx_start_;
+
+    // Spec #8-B: byte offset where each entry's parallel edge_id varint
+    // stream begins. Populated only when the page-level flag kHasEdgeIds
+    // is set in header_.flags and we are in ChainHead mode. Same length
+    // as physical_degrees_; zero at every index otherwise.
+    std::vector<uint32_t>   entry_edge_id_start_;
+
+    // Cached header-level flag: true iff this page carries a parallel
+    // edge_id stream per entry (header_.flags & kHasEdgeIds != 0). Read
+    // path branches on this to decide whether to decode the eid varint
+    // chain or return eid = 0 (the Spec #8 ADR 008 Known-limitation
+    // fallback for pre-Spec-#8-B projections).
+    bool                    page_has_edge_ids_ = false;
 
     // Continuation mode state. Empty in ChainHead mode.
     uint64_t                cont_owning_src_id_ = 0;

@@ -225,7 +225,12 @@ static std::size_t write_btree_from_sorted_partitions_csr_(
     const std::string& base_path)
 {
     if constexpr (N == 3) {
-        BPTLeafCSRWriter<N> leaf_writer(base_path + ".leaf");
+        // Spec #8-B task #1: enable edge_id stream emission on edge
+        // indexes (N == 3 only; property indexes route through the
+        // non-CSR sibling). See sorter_dispatch.cc build_index_csr_from_sorter_
+        // for the full rationale.
+        BPTLeafCSRWriter<N> leaf_writer(base_path + ".leaf",
+                                        /*emit_edge_ids=*/true);
         // Dtor emits the root dir page.
         BPTDirWriter<N>     dir_writer(base_path + ".dir");
 

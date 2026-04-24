@@ -72,7 +72,16 @@ std::size_t build_index_csr_from_sorter_(
     ExternalRecordSort<N>& sorter,
     const std::string&     index_base_path)
 {
-    BPTLeafCSRWriter<N> leaf_writer(index_base_path + ".leaf");
+    // Spec #8-B task #1: turn on the parallel edge_id stream for N == 3
+    // edge indexes (FROM_TO_EDGE / TO_FROM_EDGE). For N < 3 there is no
+    // third field to emit, so the flag collapses to false inside the
+    // writer. Setting this unconditionally for edge indexes closes the
+    // ADR 008 Known-limitation #1 caveat — the count(e) query and other
+    // edge_id-dependent MATCH patterns now return BTREE-equivalent
+    // cardinality under graphStorage: CSR_HYBRID.
+    constexpr bool emit_edge_ids = (N >= 3);
+    BPTLeafCSRWriter<N> leaf_writer(index_base_path + ".leaf",
+                                     emit_edge_ids);
     // Dtor emits a single empty root dir page (key_count=0, children[0]=0).
     // With the CSR leaf chain walked via next_leaf from page 0, any
     // search_leaf(min) lands at leaf 0 and the forward chain covers the

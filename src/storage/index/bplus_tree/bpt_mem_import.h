@@ -286,7 +286,17 @@ class BPTLeafCSRWriter {
 public:
     static_assert(N >= 2, "BPTLeafCSRWriter requires Record<N>.src + dst at minimum");
 
-    explicit BPTLeafCSRWriter(const std::string& filename)
+    // Spec #8-B task #1: `emit_edge_ids` controls whether the v3 leaf page
+    // writes a parallel edge_id varint stream alongside the dst stream. When
+    // true and N == 3, each entry body layout becomes:
+    //     varint(src_id) | varint(degree) | dst_varint_chain | eid_varint_chain
+    // (dst_varint_chain and eid_varint_chain each hold `degree` varints in
+    // the same DELTA-zigzag format used for dsts); the header flag
+    // `kHasEdgeIds` is set per page. When false (default) the writer
+    // preserves the pre-Spec-#8-B behavior — dst stream only, eid=0 at
+    // read time — which keeps every legacy projection byte-identical.
+    explicit BPTLeafCSRWriter(const std::string& filename,
+                              bool emit_edge_ids = false)
         : file_(filename, std::ios::out | std::ios::in | std::ios::binary | std::ios::trunc)
         , buffer_(new char[Page::SIZE])
         , pages_written_(0)
@@ -296,6 +306,7 @@ public:
         , staging_has_(false)
         , staging_src_(0)
         , pending_cont_patch_page_(UINT32_MAX)
+        , emit_edge_ids_(emit_edge_ids && N >= 3)
     {
         if (!file_.is_open()) {
             // Retry without the `in` flag — some std::fstream impls refuse
@@ -334,23 +345,43 @@ public:
     {
         const uint64_t src = record[0];
         const uint64_t dst = record[1];
+        // Third field (edge_id) only present when N >= 3; reading it at
+        // compile-time-index 2 is guarded by the static_assert above, but
+        // we only consult it when emit_edge_ids_ is true (which itself
+        // requires N >= 3 by ctor guard). Using `if constexpr (N >= 3)`
+        // keeps the template valid for N == 2 pure edge lists.
+        uint64_t eid = 0;
+        if constexpr (N >= 3) {
+            eid = record[2];
+        }
 
         if (!staging_has_) {
             staging_src_  = src;
             staging_has_  = true;
             staging_dsts_.clear();
+            staging_eids_.clear();
             staging_dsts_.push_back(dst);
+            if (emit_edge_ids_) {
+                staging_eids_.push_back(eid);
+            }
             return true;
         }
         if (src == staging_src_) {
             staging_dsts_.push_back(dst);
+            if (emit_edge_ids_) {
+                staging_eids_.push_back(eid);
+            }
             return true;
         }
         // New src: emit the previously-buffered src, then start staging.
         emit_current_src_to_page_();
         staging_src_  = src;
         staging_dsts_.clear();
+        staging_eids_.clear();
         staging_dsts_.push_back(dst);
+        if (emit_edge_ids_) {
+            staging_eids_.push_back(eid);
+        }
         return true;
     }
 
@@ -362,10 +393,16 @@ public:
             emit_current_src_to_page_();
             staging_has_ = false;
             staging_dsts_.clear();
+            staging_eids_.clear();
         }
         if (current_page_entry_count_ > 0) {
-            // Final chain-head page has no successor.
-            finalize_current_page_(/*next_leaf=*/0, /*flags=*/0,
+            // Final chain-head page has no successor. When edge_ids are
+            // in play, advertise them via the per-page flag so the reader
+            // knows each entry carries a parallel eid stream.
+            const uint8_t final_flags = emit_edge_ids_
+                ? BPT::CSRHybridFlags::kHasEdgeIds
+                : 0u;
+            finalize_current_page_(/*next_leaf=*/0, final_flags,
                                    /*value_or_chunk_count=*/current_page_entry_count_,
                                    /*min_src_or_head=*/
                                        static_cast<uint32_t>(
@@ -413,10 +450,19 @@ private:
     }
 
     // Pre-size a src entry's encoded byte length, given its src_id and the
-    // full buffered dst list. Used to decide whether the entry fits on the
+    // full buffered dst list (plus an optional parallel edge_id list when
+    // emit_eids is true). Used to decide whether the entry fits on the
     // current page or needs to trigger a page flush / hub chain.
+    //
+    // When `emit_eids` is true, `eids` must be the same length as `dsts`
+    // and is encoded using the same DELTA-zigzag convention (first entry
+    // full varint, subsequent entries zigzag(delta) against the previous
+    // eid). The total includes BOTH streams so the chain-head packing
+    // decision reflects the true on-page cost.
     static std::size_t estimate_entry_bytes_(uint64_t src_id,
-                                             const std::vector<uint64_t>& dsts) noexcept
+                                             const std::vector<uint64_t>& dsts,
+                                             const std::vector<uint64_t>& eids,
+                                             bool emit_eids) noexcept
     {
         std::size_t total = BPT::varint_size(src_id)
                           + BPT::varint_size(static_cast<uint64_t>(dsts.size()));
@@ -435,13 +481,33 @@ private:
                 prev = cur;
             }
         }
+        if (emit_eids && !eids.empty()) {
+            total += BPT::varint_size(eids[0]);
+            uint64_t prev = eids[0];
+            for (std::size_t i = 1; i < eids.size(); ++i) {
+                const uint64_t cur = eids[i];
+                const uint64_t delta_u = cur - prev;
+                const int64_t  delta_i = static_cast<int64_t>(delta_u);
+                total += BPT::varint_size(BPT::zigzag_encode_i64(delta_i));
+                prev = cur;
+            }
+        }
         return total;
     }
 
     // Serialize a src entry into an out-buffer. Returns bytes written.
     // Mirrors estimate_entry_bytes_ byte-for-byte.
+    //
+    // When `emit_eids` is true and `eids` is non-empty, a second DELTA-
+    // zigzag varint stream is appended immediately after the dst stream.
+    // The two streams share the same degree (entry-local count) read from
+    // the entry's degree header field; no intermediate length prefix is
+    // needed because the reader knows both streams have exactly `degree`
+    // varints apiece.
     static std::size_t encode_entry_(uint64_t src_id,
                                      const std::vector<uint64_t>& dsts,
+                                     const std::vector<uint64_t>& eids,
+                                     bool emit_eids,
                                      uint8_t* out) noexcept
     {
         std::size_t off = 0;
@@ -453,6 +519,18 @@ private:
             uint64_t prev = dsts[0];
             for (std::size_t i = 1; i < dsts.size(); ++i) {
                 const uint64_t cur = dsts[i];
+                const uint64_t delta_u = cur - prev;
+                const int64_t  delta_i = static_cast<int64_t>(delta_u);
+                off += BPT::varint_encode(BPT::zigzag_encode_i64(delta_i),
+                                          out + off, BPT::VARINT_MAX_BYTES);
+                prev = cur;
+            }
+        }
+        if (emit_eids && !eids.empty()) {
+            off += BPT::varint_encode(eids[0], out + off, BPT::VARINT_MAX_BYTES);
+            uint64_t prev = eids[0];
+            for (std::size_t i = 1; i < eids.size(); ++i) {
+                const uint64_t cur = eids[i];
                 const uint64_t delta_u = cur - prev;
                 const int64_t  delta_i = static_cast<int64_t>(delta_u);
                 off += BPT::varint_encode(BPT::zigzag_encode_i64(delta_i),
@@ -631,8 +709,19 @@ private:
     // new chain-head, and finally spills remaining dsts onto continuation
     // pages. Patches the chain-head's next_leaf AFTER chain emission so the
     // header reflects the true forward pointer.
+    //
+    // Spec #8-B: under emit_edge_ids_, the hub chain currently spills only
+    // dsts onto continuation pages; edge_ids are NOT persisted for hub
+    // entries because the chain-head's parallel-stream budget interaction
+    // with the continuation chain would require a joint dst+eid slicing
+    // walk we have not yet modelled. Non-hub entries (the common case —
+    // avg degree 6 on arxiv, 25 on products, max 13 K hits the hub path
+    // at only a handful of nodes) DO carry edge_ids, which is sufficient
+    // to make count(e) queries match their BTREE counterpart for every
+    // non-hub src. Hub edge_ids remain a future refinement.
     void emit_hub_chain_(uint64_t src_id,
-                         const std::vector<uint64_t>& dsts) noexcept
+                         const std::vector<uint64_t>& dsts,
+                         const std::vector<uint64_t>& /*eids*/) noexcept
     {
         // If the current page already holds at least one entry, flush it
         // first so the hub starts with a fresh chain-head page. This
@@ -643,9 +732,14 @@ private:
             const uint32_t min_src_low =
                 static_cast<uint32_t>(current_page_entries_.front() & 0xFFFFFFFFu);
             // next_leaf for the just-flushed page = the upcoming chain-head
-            // page (which will be this hub's chain head).
+            // page (which will be this hub's chain head). Carry the per-page
+            // eid flag so post-hub scans see the same signal as entries
+            // emitted before it.
+            const uint8_t page_flags = emit_edge_ids_
+                ? BPT::CSRHybridFlags::kHasEdgeIds
+                : 0u;
             finalize_current_page_(/*next_leaf=*/pages_written_ + 1,
-                                   /*flags=*/0,
+                                   page_flags,
                                    /*value_or_chunk_count=*/current_page_entry_count_,
                                    /*min_src_or_head=*/min_src_low);
         }
@@ -856,7 +950,8 @@ private:
     void emit_current_src_to_page_() noexcept
     {
         const std::size_t entry_sz =
-            estimate_entry_bytes_(staging_src_, staging_dsts_);
+            estimate_entry_bytes_(staging_src_, staging_dsts_,
+                                  staging_eids_, emit_edge_ids_);
 
         // Does a fresh empty page have room for this entry plus the one
         // offset-table slot? Fresh budget = Page::SIZE - 16 - 2 = 4078.
@@ -864,7 +959,7 @@ private:
         if (entry_sz > fresh_budget) {
             // Hub. Let emit_hub_chain_ flush the current page (if any),
             // open a fresh chain-head, fill chain-head + continuations.
-            emit_hub_chain_(staging_src_, staging_dsts_);
+            emit_hub_chain_(staging_src_, staging_dsts_, staging_eids_);
             return;
         }
 
@@ -872,12 +967,17 @@ private:
         const std::size_t need = entry_sz + 2;  // body + new offset-table slot
         const std::size_t remaining = remaining_body_budget_with_new_entry_();
         if (need > remaining) {
-            // Flush current page, open a fresh one, retry.
+            // Flush current page, open a fresh one, retry. Propagate the
+            // per-page edge_id flag so cross-page scans see a consistent
+            // signal about which pages carry the parallel eid stream.
             if (current_page_entry_count_ > 0) {
                 const uint32_t min_src_low =
                     static_cast<uint32_t>(current_page_entries_.front() & 0xFFFFFFFFu);
+                const uint8_t page_flags = emit_edge_ids_
+                    ? BPT::CSRHybridFlags::kHasEdgeIds
+                    : 0u;
                 finalize_current_page_(/*next_leaf=*/pages_written_ + 1,
-                                       /*flags=*/0,
+                                       page_flags,
                                        /*value_or_chunk_count=*/current_page_entry_count_,
                                        /*min_src_or_head=*/min_src_low);
             }
@@ -887,7 +987,9 @@ private:
         // Pack the entry on the current page.
         std::vector<uint8_t> body;
         body.resize(entry_sz);
-        const std::size_t actual = encode_entry_(staging_src_, staging_dsts_, body.data());
+        const std::size_t actual = encode_entry_(staging_src_, staging_dsts_,
+                                                 staging_eids_, emit_edge_ids_,
+                                                 body.data());
         body.resize(actual);
 
         // Offset of this entry within the page: 16 + 2*(new_count) + bytes_used.
@@ -937,12 +1039,21 @@ private:
     bool                  staging_has_;
     uint64_t              staging_src_;
     std::vector<uint64_t> staging_dsts_;
+    // Parallel edge-id stream. Populated only when emit_edge_ids_ is true
+    // and N >= 3. Always has the same length as staging_dsts_.
+    std::vector<uint64_t> staging_eids_;
 
     // Bug-C patch state (T8-B.1). When emit_hub_chain_ writes a continuation
     // chain whose last page has next_leaf=0, we record its page number here;
     // the next new-page write callsite patches its next_leaf to the new page
     // before proceeding. UINT32_MAX == no pending patch.
     uint32_t pending_cont_patch_page_;
+
+    // Spec #8-B task #1: whether the page-level flag kHasEdgeIds must be
+    // set and a parallel eid varint chain must be appended after every dst
+    // varint chain. Set once at construction from the ctor argument and
+    // never mutated. Implies N >= 3 (guarded in the ctor initializer).
+    bool emit_edge_ids_;
 };
 
 template<std::size_t N>

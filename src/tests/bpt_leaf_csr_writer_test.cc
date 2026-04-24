@@ -871,3 +871,142 @@ TEST(BPTLeafCSRWriterTest, HubIsLast_LastContinuationNextLeafZero)
                        | (static_cast<uint32_t>(last[11]) << 24);
     EXPECT_EQ(next_leaf, 0u);
 }
+
+// ============================================================================
+// Spec #8-B task #1 — parallel edge_id stream tests.
+//
+// These exercise the `emit_edge_ids` constructor flag introduced to close
+// the ADR 008 Known-limitation #1 caveat (`edge_id` persisted as zero on
+// CSR_HYBRID). The writer emits a parallel DELTA-zigzag varint chain
+// after every entry's dst chain, and advertises the stream via the
+// header bit `kHasEdgeIds` (0x02). The reader detects the flag and
+// returns real edge_ids through decode_tuple_.
+// ============================================================================
+
+// Default-disabled: writer keeps legacy behavior unless opted in.
+TEST(BPTLeafCSRWriterTest, EdgeIds_Default_FlagUnset)
+{
+    TempFile tf;
+    {
+        BPTLeafCSRWriter<3> w(tf.path);
+        w.append(rec(1, 10, 100));
+        w.append(rec(1, 11, 101));
+        w.append(rec(2, 20, 200));
+        w.flush_finalize();
+    }
+    auto bytes = read_file_bytes(tf.path);
+    ASSERT_GE(bytes.size(), static_cast<std::size_t>(Page::SIZE));
+    EXPECT_EQ(bytes[2] & 0x02, 0u) << "default writer must not set kHasEdgeIds";
+}
+
+// Opted in: flag is set AND the reader returns the encoded edge_ids.
+TEST(BPTLeafCSRWriterTest, EdgeIds_Enabled_FlagSetAndReaderRoundTrip)
+{
+    TempFile tf;
+    std::vector<std::array<uint64_t, 3>> truth = {
+        {1, 10, 100}, {1, 11, 101}, {1, 12, 102},
+        {2, 20, 200}, {2, 22, 222},
+        {3, 30, 300},
+    };
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (const auto& r : truth) w.append(r);
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    auto bytes = read_file_bytes(tf.path);
+    ASSERT_EQ(pages_written, 1u);
+    EXPECT_NE(bytes[2] & 0x02, 0u);
+
+    BPTLeafCSR<3> reader(
+        reinterpret_cast<const char*>(bytes.data()),
+        BPTLeafCSR<3>::ReadTag{});
+    const uint32_t total = reader.get_value_count();
+    ASSERT_EQ(total, truth.size());
+    for (uint_fast32_t i = 0; i < total; ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(std::get<0>(r), truth[i][0]) << "pos=" << i << " src";
+        EXPECT_EQ(std::get<1>(r), truth[i][1]) << "pos=" << i << " dst";
+        EXPECT_EQ(std::get<2>(r), truth[i][2]) << "pos=" << i << " eid";
+    }
+}
+
+// Larger mix: multiple srcs with varied edge_id ranges exercises the
+// zigzag-delta encoding / decoding on non-monotone eid sequences.
+TEST(BPTLeafCSRWriterTest, EdgeIds_Enabled_ZigzagDeltaRoundTrip)
+{
+    TempFile tf;
+    std::vector<std::array<uint64_t, 3>> truth;
+    for (uint64_t src = 1; src <= 30; ++src) {
+        for (uint64_t k = 0; k < 4; ++k) {
+            const uint64_t dst = src * 1000 + k * 7;
+            const uint64_t eid = src * 10 + (k == 0 ? 5 : k == 1 ? 1
+                                                         : k == 2 ? 8 : 3);
+            truth.push_back({src, dst, eid});
+        }
+    }
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (const auto& r : truth) w.append(r);
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    auto bytes = read_file_bytes(tf.path);
+    ASSERT_GE(pages_written, 1u);
+
+    BPTLeafCSR<3> reader(
+        reinterpret_cast<const char*>(bytes.data()),
+        BPTLeafCSR<3>::ReadTag{});
+    const uint32_t total = reader.get_value_count();
+    ASSERT_EQ(total, truth.size());
+    for (uint_fast32_t i = 0; i < total; ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(std::get<2>(r), truth[i][2])
+            << "pos=" << i << " src=" << truth[i][0]
+            << " dst=" << truth[i][1];
+    }
+}
+
+// Opt-in false (explicit) matches the default path byte-for-byte.
+TEST(BPTLeafCSRWriterTest, EdgeIds_ExplicitlyDisabled_SameAsDefault)
+{
+    TempFile default_file, off_file;
+    const std::vector<std::array<uint64_t, 3>> input = {
+        {1, 10, 100}, {1, 11, 101},
+        {2, 20, 200},
+    };
+    {
+        BPTLeafCSRWriter<3> a(default_file.path);
+        BPTLeafCSRWriter<3> b(off_file.path, /*emit_edge_ids=*/false);
+        for (const auto& r : input) { a.append(r); b.append(r); }
+        a.flush_finalize();
+        b.flush_finalize();
+    }
+    auto a_bytes = read_file_bytes(default_file.path);
+    auto b_bytes = read_file_bytes(off_file.path);
+    ASSERT_EQ(a_bytes, b_bytes);
+}
+
+// Reader-side edge_id = 0 sentinel preserved for legacy default-writer
+// pages (no kHasEdgeIds bit).
+TEST(BPTLeafCSRWriterTest, EdgeIds_Disabled_ReaderReturnsZero)
+{
+    TempFile tf;
+    {
+        BPTLeafCSRWriter<3> w(tf.path);
+        w.append(rec(7, 70, 700));
+        w.append(rec(7, 77, 777));
+        w.flush_finalize();
+    }
+    auto bytes = read_file_bytes(tf.path);
+    BPTLeafCSR<3> reader(
+        reinterpret_cast<const char*>(bytes.data()),
+        BPTLeafCSR<3>::ReadTag{});
+    for (uint_fast32_t i = 0; i < reader.get_value_count(); ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(std::get<2>(r), 0u)
+            << "legacy writer path must keep eid=0 sentinel at pos=" << i;
+    }
+}
