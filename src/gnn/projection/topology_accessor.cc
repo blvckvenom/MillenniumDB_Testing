@@ -98,6 +98,22 @@ struct TopologyAccessor::Impl {
 
     /**
      * @brief Get neighbors using from_to_edge index (outgoing).
+     *
+     * Filters emitted records by exact src-id match as a defensive post-pass.
+     * The BPT range iterator (BptIter<3>::next) emits every record in
+     * [min, max] by pairwise-comparing each field against max only. Under
+     * BTREE storage, page ordering guarantees records with src < seed_id
+     * never reach the iterator because search_leaf + search_index position
+     * past min exactly. Under CSR_HYBRID v3 storage (Spec #8 ADR 008),
+     * cross-page transitions reset current_pos to 0 on the new page;
+     * continuation pages carry the correct src automatically, but a
+     * chain-head page reached immediately after the query's own tail
+     * may surface tuples whose src is strictly less than max[0] yet
+     * unrelated to the queried seed. Because those records satisfy
+     * record[0] < max[0] in next()'s inequality check, they are returned.
+     * We discard them here by comparing against the queried src_id.
+     * This post-filter is O(1) per tuple and preserves correctness
+     * regardless of the underlying leaf format.
      */
     Neighbors get_neighbors_from_index(ObjectId node_id, BPlusTree<3>* index) {
         Neighbors result;
@@ -116,6 +132,11 @@ struct TopologyAccessor::Impl {
         const Record<3>* record;
         while ((record = it.next()) != nullptr) {
             // from_to_edge: (from, to, edge_id)
+            // Defensive: drop records whose src does not exactly match.
+            // See function-level comment above for the CSR_HYBRID motivation.
+            if (std::get<0>(*record) != node_id.id) {
+                continue;
+            }
             result.node_ids.push_back(ObjectId(std::get<1>(*record)));
             result.edge_ids.push_back(ObjectId(std::get<2>(*record)));
         }
@@ -196,6 +217,11 @@ Neighbors TopologyAccessor::get_in_neighbors(ObjectId node_id) {
     const Record<3>* record;
     while ((record = it.next()) != nullptr) {
         // to_from_edge: (to, from, edge_id)
+        // Defensive: same-key post-filter as in get_neighbors_from_index().
+        // See that function's comment for CSR_HYBRID range-iterator rationale.
+        if (std::get<0>(*record) != node_id.id) {
+            continue;
+        }
         result.node_ids.push_back(ObjectId(std::get<1>(*record)));
         result.edge_ids.push_back(ObjectId(std::get<2>(*record)));
     }
@@ -219,24 +245,54 @@ Neighbors TopologyAccessor::get_neighbors(ObjectId node_id, EdgeOrientation orie
             Neighbors out_neighbors = get_out_neighbors(node_id);
             Neighbors in_neighbors = get_in_neighbors(node_id);
 
-            // Deduplicate by EDGE ID (not node ID) to handle undirected edges correctly.
-            // With canonical storage (memory optimization), undirected edges are stored once
-            // with (min_id, max_id, edge_id). Both indexes still provide bidirectional access:
-            // - from_to_edge: (min_id, max_id, edge_id) -> found via out_neighbors for min_id
-            // - to_from_edge: (max_id, min_id, edge_id) -> found via in_neighbors for min_id
-            // Deduplication remains necessary to merge results from both index lookups.
-            std::unordered_set<uint64_t> seen_edges;
+            // Deduplicate to merge results from both out- and in- index lookups.
+            //
+            // Historically we deduplicated by EDGE ID. That works for BTREE
+            // storage where each edge has a unique id, but breaks under
+            // Spec #8 CSR_HYBRID storage which currently omits edge_id from
+            // the v3 layout (edge_id = 0 for every tuple — see ADR 008
+            // "Known limitations" caveat #1). An all-zero dedup key collapses
+            // ALL neighbors of the node to a single element, which in turn
+            // makes Phase B k-hop sampling degenerate (layer-1 node count
+            // always = 1) and drags chunk-level wall-clock time into the
+            // O(N^2) regime for large projections (empirically observed on
+            // arxiv: chunk N took ~6*N seconds before this fix).
+            //
+            // The robust fix is to detect whether edge_ids are meaningful
+            // and fall back to NEIGHBOR NODE ID dedup otherwise. We sample
+            // the first tuple from each side — if either side reports a
+            // non-zero edge_id we trust the edge_id dedup key; otherwise
+            // we use the neighbor node id, which is the natural dedup key
+            // under simple graphs (no parallel edges), which covers every
+            // citation / co-purchase / knowledge-graph workload we currently
+            // target. Keep the result's parallel `edge_ids` array in sync
+            // so downstream consumers (GraphSample edge_ids) still receive
+            // zero-sentinels consistent with the storage's view of the edge
+            // space rather than synthesized values.
+            const bool has_edge_ids =
+                (!out_neighbors.edge_ids.empty()
+                     && out_neighbors.edge_ids.front().id != 0)
+                || (!in_neighbors.edge_ids.empty()
+                     && in_neighbors.edge_ids.front().id != 0);
+
             Neighbors result;
+            std::unordered_set<uint64_t> seen;
 
             for (size_t i = 0; i < out_neighbors.node_ids.size(); ++i) {
-                if (seen_edges.insert(out_neighbors.edge_ids[i].id).second) {
+                const uint64_t key = has_edge_ids
+                    ? out_neighbors.edge_ids[i].id
+                    : out_neighbors.node_ids[i].id;
+                if (seen.insert(key).second) {
                     result.node_ids.push_back(out_neighbors.node_ids[i]);
                     result.edge_ids.push_back(out_neighbors.edge_ids[i]);
                 }
             }
 
             for (size_t i = 0; i < in_neighbors.node_ids.size(); ++i) {
-                if (seen_edges.insert(in_neighbors.edge_ids[i].id).second) {
+                const uint64_t key = has_edge_ids
+                    ? in_neighbors.edge_ids[i].id
+                    : in_neighbors.node_ids[i].id;
+                if (seen.insert(key).second) {
                     result.node_ids.push_back(in_neighbors.node_ids[i]);
                     result.edge_ids.push_back(in_neighbors.edge_ids[i]);
                 }
