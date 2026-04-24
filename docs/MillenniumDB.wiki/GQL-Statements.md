@@ -261,3 +261,16 @@ MATCH (a:Author)
 LIMIT 10
 RETURN a
 ```
+
+## CALL Statement
+
+The `CALL` statement invokes a built-in procedure and yields results.
+
+### Examples
+
+```txt
+CALL procedure_name(arg1, arg2, ...)
+YIELD field1, field2, ...
+```
+
+See the list of available procedures in the source code under `src/query/procedure/builtin/`.
