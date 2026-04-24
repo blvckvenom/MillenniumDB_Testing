@@ -702,6 +702,53 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
+# B+Tree v3 CSR_HYBRID leaf fuzz tests (Spec #8 T8.11)
+# ============================================================================
+# Registers bpt_leaf_csr_fuzz_test when GTest is available and the source file
+# exists. Follows the precedent of bpt_leaf_v2_fuzz_test (Spec #5 T5.14).
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_fuzz_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(bpt_leaf_csr_fuzz_test
+        ${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_fuzz_test.cc
+    )
+    set_target_properties(bpt_leaf_csr_fuzz_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_leaf_csr_writer_test above.
+    target_link_libraries(bpt_leaf_csr_fuzz_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(bpt_leaf_csr_fuzz_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME bpt_leaf_csr_fuzz_test
+        COMMAND $<TARGET_FILE:bpt_leaf_csr_fuzz_test>
+        WORKING_DIRECTORY tests
+    )
+    # Release wall-clock target ~45 s on benito_pc for 500k iterations;
+    # Debug/ASan is typically 3-5x slower. 180 s accommodates Release with
+    # margin; Debug/ASan may need more but plan permits. Follows T5.14.
+    set_tests_properties(bpt_leaf_csr_fuzz_test PROPERTIES TIMEOUT 180)
+endif()
+
+# ============================================================================
 # B+Tree LEB128 varint codec unit tests (Spec #5 T5.4)
 # ============================================================================
 # Registers varint_test when GTest is available and the source file exists.
