@@ -60,10 +60,22 @@ CALL gnn_train('arxiv_s', 'node_features', {
 
 ## writeProperty / EmbeddingWriter
 
+### Initial run (pre-fix, 2026-04-24 morning)
 - Phase B: 29,799 non-seed nodes in 15 chunks of 2048 on device=cuda
-- Total Phase B wall-clock: ~23 min (chunks took 5s → 137s with linear growth per chunk index — suspected FeatureMatrix hot-page eviction)
+- Total Phase B wall-clock: ~23 min — chunks took 5s → 190s with LINEAR growth per chunk index (O(N²))
+- Root cause: 3-layer bug (TopologyAccessor dedup collapse under CSR zero-edge-ids + BPT cross-page iteration bug + cascade amplification of fanout×K)
 - Phase C: BPlusTree batch insert of all 169,343 embeddings to `node_key_value` + `key_value_node`
+
+### Post-fix run (commits `896b3897` + `6521cc21`, 2026-04-24 afternoon)
+- Adjacency cache build at Phase B start: **182 ms** (single full-scan of from_to_edge + to_from_edge)
+- Chunk 1: 260 ms (cache init + first sample + forward)
+- Chunks 2-15: **60-80 ms each** (constant time — no growth)
+- **Total Phase B: < 2 seconds** (previously 23 min = 700× speedup)
+- Sample quality correctness restored: layers=[2048, 9776, 29502] (vs [2048, 1, 1] pre-fix collapse)
+- Phase C unchanged: ~5-10 s for BPlusTree batch insert
 - Final: tensors.dat 86.86 MB (169343 × 128 × 4 = correct size)
+
+This fix generalizes to product-scale. For products (2.45M nodes, ~2M non-seeds), projected Phase B with adjacency cache is <1 min (vs hours projected pre-fix).
 
 ## THESIS DEMO — queryable embeddings
 
