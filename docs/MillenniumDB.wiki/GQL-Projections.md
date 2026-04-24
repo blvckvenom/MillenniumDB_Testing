@@ -1391,3 +1391,190 @@ version **no cambia** — no hay migración.
 - Plan: `docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md`
 - ADR: `Partial_Idea/decisions/006_topology_snapshot.md`
 - Master plan §8-9: `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`
+
+---
+
+## Leaf encoding — `leafFormat` config parameter (added 2026-04-24, ADR 007)
+
+Por defecto, las páginas hoja del B+Tree usan el formato v1 (`BITSET`):
+una bitmask de bytes redundantes seguida de los bytes restantes de cada
+record. Spec #5 introduce un formato v2 alternativo (`DELTA_VARINT`) que
+delta-codifica cada record contra el anterior y comprime cada delta con
+LEB128 + zigzag, reduciendo el tamaño en disco ~80% sobre datasets GNN
+reales sin penalizar el throughput de lectura. Es opt-in por proyección y
+por índice — el default preserva el formato pre-Spec-#5 byte-a-byte.
+
+### Valores
+
+| Valor | Significado | Compatibilidad |
+|-------|-------------|----------------|
+| `'BITSET'` (default) | Formato v1 (redundant-byte-bitset). Idéntico al output pre-2026-04. | Catalog v1.4 y anteriores: implícito. Catalog v1.5+: explícito por índice. |
+| `'DELTA_VARINT'` | Formato v2 (16 B header + varint LEB128 + zigzag delta payload). | Solo catalog v1.5+ (introducido 2026-04-24). |
+
+### Ejemplo
+
+```gql
+CALL graph_project('paper_gnn', 'Paper', 'CITES', {
+  orientation: 'NATURAL',
+  leafFormat: 'DELTA_VARINT',
+  indexSet: 'GNN_MINIMAL',
+  buildTopologySnapshot: true,
+  includeFeatures: 'node_features'
+}) YIELD graphName, nodeCount, relationshipCount RETURN *;
+```
+
+El parámetro se aplica uniformemente a **todos los índices materializados**
+de la proyección (B+Tree topológicos y de propiedad). La granularidad
+per-índice está soportada en el catalog v1.5 (un byte por índice), pero
+la API GQL actual expone solo el modo uniforme; selección heurística per
+índice queda diferida a Spec #5-B.
+
+### Reducción de tamaño empírica
+
+| Dataset | BITSET | DELTA_VARINT | Ratio | Reducción |
+|---------|-------:|-------------:|:-----:|:---------:|
+| cora_gnn (GNN_MINIMAL) | 368 KB | 72 KB | 0.196 | **-80%** |
+| ogbn-arxiv (GNN_MINIMAL) | 60.10 MB | 12.91 MB | 0.215 | **-79%** |
+| ogbn-products (GNN_MINIMAL) | TBD — ver bench report | TBD | TBD | TBD |
+
+Desglose por índice en ogbn-arxiv:
+
+| Índice | BITSET | DELTA_VARINT | Ratio |
+|--------|-------:|-------------:|:-----:|
+| `from_to_edge` | 28 MB | 5.5 MB | 0.195 |
+| `to_from_edge` | 28 MB | 7.2 MB | 0.256 |
+| `label_node`, `node_label`, `nodes` | ~similar | ~similar | ~0.20 |
+
+El ratio asimétrico entre `from_to_edge` (0.195) y `to_from_edge` (0.256)
+refleja que la entropía de los deltas depende del orden de sort: el lado
+forward queda mejor agrupado por destino contiguo que el reverse.
+
+### Throughput de lectura
+
+Tras el fix de cursor secuencial (T5.13b, commit `a94c06cf` que cambió
+`search_index` de O(k²) a O(k)):
+
+| Dataset | BITSET | DELTA_VARINT | Ratio v2/v1 |
+|---------|-------:|-------------:|:-----------:|
+| cora_gnn | 31.1 ms | 31.6 ms | 1.016× |
+| ogbn-arxiv | 437.6 ms | 435.7 ms | 0.996× |
+
+Gate C requería ratio ≤ 1.20×; el resultado real (≈ 1.0×) es
+Pareto-dominante: comprime mucho sin costar nada en lectura.
+
+El tiempo de build es indistinguible entre ambos formatos (cora_gnn
+≈0.06 s; ogbn-arxiv ≈3.1 s) — la fase dominante es el sort, no la
+escritura de leaves.
+
+### Cuándo elegir cada formato
+
+- **BITSET** (default): proyecciones existentes que ya están en disco;
+  pipelines que necesitan reproducir output pre-Spec-#5 byte-a-byte
+  (golden compares, regression suites externos).
+- **DELTA_VARINT**: cualquier proyección nueva sobre datasets ≥10 M
+  aristas, especialmente para cargas GNN. Combina con `indexSet:
+  'GNN_MINIMAL'` y `buildTopologySnapshot: true` para obtener el stack
+  completo de compresión Spec #3 + Spec #4-B + Spec #5.
+
+### Cómo funciona
+
+Cada record (Record\<N\>) se interpreta como N enteros uint64.
+**Record 0** se escribe como N varints completos (LEB128 sin signo, 1-10
+bytes por entero según magnitud). **Records 1..k-1** se escriben como
+N **deltas** contra el record anterior, cada delta pasado por
+**zigzag** (mapeo bijectivo signed→unsigned `(n << 1) ^ (n >> 63)`) y
+codificado como LEB128. Este encoding aprovecha que los records están
+ordenados — la mayoría de los deltas son pequeños (1-2 bytes), comparado
+con los 8 bytes nominales de un uint64. El header de 16 bytes contiene
+`format_version=2`, `record_width=N`, `value_count=k`, `next_leaf` y
+campos reservados; padding hasta 4096 al final de la página.
+
+### Catalog format
+
+El leaf format se persiste como **un uint8 por índice materializado** en
+el catalog v1.5 (introducido 2026-04-24). Catalog v1.4 (Spec #3) y
+anteriores se leen como `BITSET` para todos sus índices, preservando
+compatibilidad backward total con proyecciones pre-Spec-#5.
+
+### Ejemplo byte-a-byte
+
+Dado el set de records sorted (Record\<3\>):
+
+```
+r[0] = (1000, 2000, 3000)
+r[1] = (1000, 2001, 3005)
+r[2] = (1001,  500, 3100)
+```
+
+Encoding v2:
+
+- **Header (16 B):** `02 03 00 00 03 00 00 00 00 00 00 00 00 00 00 00`
+  (format_version=2, record_width=3, value_count=3, next_leaf=0)
+- **Record 0** (full varints, 6 B):
+  - `1000` → `E8 07`
+  - `2000` → `D0 0F`
+  - `3000` → `B8 17`
+- **Record 1** (zigzag-deltas vs r[0], 3 B):
+  - `0` → `00`
+  - `+1` → `02`
+  - `+5` → `0A`
+- **Record 2** (zigzag-deltas vs r[1], 5 B):
+  - `+1` → `02`
+  - `-1501` → `B9 17`
+  - `+95` → `BE 01`
+
+**Total usado: 16 + 6 + 3 + 5 = 30 bytes** (de los 4096 disponibles en
+la página). El resto se zero-fillea hasta 4096. La equivalencia bitset
+del mismo set ronda los 35 bytes (8 header + 3 bitset + 24 records
+parcialmente comprimidos), un -14% en este micro-ejemplo. Los gains
+reales escalan a ~-80% en páginas de ~150 records donde el overhead
+amortizado del record 0 se diluye.
+
+### Fallback y validación
+
+Cada página v2 valida en el primer open (T5.4-T5.8): magic byte
+`format_version=2`, `record_width` coincide con el `Record<N>`
+esperado, `value_count` ≤ `leaf_max_records`, decode varint sin
+overflow ni underflow. Cualquier corrupción eleva
+`BPTLeafV2DecodeException` con offset preciso. Páginas v1 siguen el
+camino existente sin cambios.
+
+### Construcción y backwards compat
+
+Los formatos NO son interconvertibles in-place: la página v2 es
+inmutable, por lo que cambiar de formato requiere `drop_projection` +
+recrear con el nuevo `leafFormat`. Proyecciones pre-Spec-#5 (catalog
+v1.4 y anteriores) siguen siendo legibles sin migración — el catalog
+v1.5 reader las trata como `BITSET` de forma transparente.
+
+### Archivos
+
+- `src/storage/index/bplus_tree/bpt_leaf_format.{h,cc}` — enum + helpers.
+- `src/storage/index/bplus_tree/varint.{h,cc}` — LEB128 + zigzag codec.
+- `src/storage/index/bplus_tree/bplus_tree_leaf_v2.{h,cc}` — v2 leaf
+  read/write path.
+- `src/storage/index/bplus_tree/bpt_mem_import.h` — `BPTLeafV2Writer`
+  bulk-load.
+- `src/graph_models/gql/projection/projection_catalog.{h,cc}` —
+  catalog v1.5.
+- `src/query/procedure/builtin/project_procedure.cc` — parsing del
+  config key.
+
+### Tests
+
+- Unit: `bpt_leaf_v2_format_test`, `varint_test`, `bpt_leaf_v2_writer_test`,
+  `bpt_leaf_v2_reader_test`, `bpt_iter_dispatch_test`,
+  `projection_catalog_v5_test`, `projection_leaffmt_config_test`.
+- Fuzz: `bpt_leaf_v2_fuzz_test` — 500 K random + 1 K smoke + 10 K
+  boundary roundtrips, 100 % tamper-flip detection.
+- Integración: `scripts/test_projection_leaffmt.sh` — golden compare
+  6-mode (BITSET/DELTA_VARINT × {classic, radix} × {serial, parallel}).
+- Bench: `scripts/bench_leaffmt.sh` — Gate C harness (size + read
+  throughput por dataset).
+
+### Referencias
+
+- Spec: `docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md`
+- Plan: `docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md`
+- ADR: `Partial_Idea/decisions/007_delta_varint_leaf.md`
+- Master plan: `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`

@@ -242,6 +242,102 @@ Key properties of the RADIX backend:
 
 Related env vars: `MDB_SORT_BUFFER_MB` (CLASSIC backend's external-sort buffer) still applies; `MDB_PROJECTION_SPILL_DIR` for spill file location.
 
+### Index set selection — `indexSet` config parameter (added 2026-04-23, ADR 005)
+
+Projections can now opt into a reduced set of B+Tree indexes appropriate for GNN workloads. Config parameter on `graph_project`:
+
+- `indexSet: 'ALL'` (default) — materializes all 10 topology indexes. Preserves pre-2026-04-23 behavior exactly.
+- `indexSet: 'GNN_MINIMAL'` — materializes only 5 indexes (`nodes`, `node_label`, `label_node`, `from_to_edge`, `to_from_edge`). Sufficient for `gnn_offline_sample`, `gnn_materialize_batches`, `gnn_build_feature_store`, `gnn_train`, `gnn_predict`, and `EmbeddingWriter` on-the-fly k-hop.
+- `indexSet: 'READONLY_TRAVERSAL'` — materializes 7 indexes (`GNN_MINIMAL` + `edge_label` + `label_edge`). Supports label-filtered GQL traversal but not edge-id lookups.
+
+Example:
+
+```gql
+CALL graph_project('gnn_proj', 'Paper', 'CITES', {
+    orientation: 'NATURAL',
+    indexSet: 'GNN_MINIMAL',
+    includeFeatures: 'node_features'
+}) YIELD graphName, nodeCount, relCount RETURN *
+```
+
+Persisted in catalog v1.4 (projections from pre-Spec-#3 era read as `ALL` automatically, full backwards compat). Querying a dropped index raises `QueryException` with remediation hint naming the minimum preset that includes it.
+
+Empirical measurements on ogbn-products (62 M edges, 2.5 M nodes):
+- **GNN_MINIMAL:** 2.95 GB (-61% disk), 213 s (-57% wall-clock) vs ALL 7.24 GB / 493 s.
+- **READONLY_TRAVERSAL:** 4.86 GB (-36%), 281 s (-43%).
+
+Property indexes (`node_key_value`, etc.) are NOT controlled by `indexSet`; they remain conditional on the property configuration in `nodeProjection`/`relationshipProjection`, so GNN feature ingestion works with any preset.
+
+**Files:** `src/graph_models/gql/projection/index_set.{h,cc}`, gated `build_one_index()` calls in `native_projection_builder.cc` + `projection_storage.cc`, catalog v1.4 in `projection_catalog.{h,cc}`, runtime checks in `gql_model.cc`.
+**Tests:** 14 unit (IndexSet) + 15 unit (projection_missing_index) + 5 catalog v1.4 roundtrip + 86 shell-script checks (`scripts/test_projection_indexset_build.sh`) + 8 E2E missing-index query scenarios (`scripts/test_projection_missing_index_query.sh`).
+**Benchmark:** `scripts/bench_indexset.sh` produces CSV with wall-clock/disk/RSS per dataset × preset.
+**Design record:** ADR 005 (`Partial_Idea/decisions/005_gnn_minimal_indexset.md`), spec `docs/superpowers/specs/2026-04-25-gnn-minimal-indexset-design.md`, plan `docs/superpowers/plans/2026-04-25-gnn-minimal-indexset-plan.md`, master plan `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md` §6.
+
+### Topology snapshot — `buildTopologySnapshot` config parameter (added 2026-04-25, ADR 006)
+
+Projections can now emit a pair of optional mmap-backed CSR sidecar files that accelerate GNN neighbor lookup from `O(log N)` (B+Tree) to `O(1)` (slice). Opt-in via `graph_project` config:
+
+- `buildTopologySnapshot: true` — at finalize, emit `topology_fwd.csr` + `topology_rev.csr` next to the B+Tree files. Composes with any `indexSet` preset: each direction is skipped when its edge index (`FROM_TO_EDGE` / `TO_FROM_EDGE`) is absent from the active mask.
+- `buildTopologySnapshot: false` (default) — preserves pre-2026-04-25 behavior exactly.
+
+Example:
+
+```gql
+CALL graph_project('gnn_proj', 'Paper', 'CITES', {
+    orientation: 'NATURAL',
+    indexSet: 'GNN_MINIMAL',
+    buildTopologySnapshot: true,
+    includeFeatures: 'node_features'
+}) YIELD graphName, nodeCount, relCount, topologySnapshotBytes RETURN *
+```
+
+The reader side (`TopologyAccessor::Impl`) detects sidecar presence at construction, validates magic/version/size/ROW_PTR invariants + SHA-256 of the source `.leaf` file, and falls back silently to the B+Tree path on any absence/failure/staleness. GNN sampling output is bit-identical across both paths under a fixed RNG seed (determinism test T4.11). Staleness detection is `SHA-256` of the source `.leaf` cached per-`TopologyAccessor` lifetime — typically 40-70 s one-time open cost on papers100M scale, free thereafter.
+
+Post-hoc build for projections created without the flag: `CALL gnn_build_topology_snapshot('proj_name')` (procedure T4.9).
+
+**Expected measurements on ogbn-products** (62 M edges, fanout [15, 10] UNIFORM, to be verified by Gate B benchmark):
+- Sampling throughput: ≥ 50× baseline (target per master plan §9).
+- Disk overhead: ~34% of projection size (fixed header amortization improves at scale — projected ~7-8% on papers100M).
+- Build-time overhead: ~10% wall-clock (one O(M) degree scan + one O(M) streaming pass per direction + SHA-256 of source `.leaf`).
+
+On-disk sidecar layout (per direction): 64-byte header (magic `TOPOCSR1`, version=1, id_width=8, flags, num_nodes, num_edges, source_sha256[32]) + `ROW_PTR[N+1]` + `COL_IDX[M]` + optional `EDGE_IDS[M]` (all uint64 little-endian). No catalog version bump — sidecar presence is detected by filesystem probe so pre-Spec-#4-B projections are fully forward-compat.
+
+**Files:** `src/graph_models/gql/projection/topology_snapshot.h` (format header), `topology_snapshot_writer.{h,cc}` (streaming SHA-256 + atomic rename), `topology_snapshot_reader.{h,cc}` (mmap-backed `TopologySnapshotReader`), integration in `native_projection_builder.{h,cc}` (constructor 18th param + `build_topology_snapshots_()`), fast-path in `src/gnn/projection/topology_accessor.cc`.
+**Tests:** 8 format + 12 writer + 17 reader + 3 builder-integration + sampling-determinism tests in `src/tests/`; shell integration scripts TBD in T4.12.
+**Benchmark:** `scripts/bench_topology_snapshot.sh` (T4.12) produces CSV with sampling throughput + disk/build overhead per dataset.
+**Design record:** ADR 006 (`Partial_Idea/decisions/006_topology_snapshot.md`), spec `docs/superpowers/specs/2026-04-25-topology-snapshot-design.md`, plan `docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md`, master plan §8-9.
+
+### Leaf encoding — `leafFormat` config parameter (added 2026-04-24, ADR 007)
+
+Projections can now encode B+Tree leaf pages with a delta + LEB128-varint format that exploits the sort order of records, instead of the v1 redundant-byte-bitset that assumes shared prefix bytes. Opt-in per projection via the new `graph_project` config key `leafFormat`; persisted **per index** as a uint8 in catalog v1.5 (added 2026-04-24).
+
+- `leafFormat: 'BITSET'` (default) — v1 leaf format. Byte-identical to pre-2026-04 output. Catalog v1.4 and earlier projections read implicitly as BITSET.
+- `leafFormat: 'DELTA_VARINT'` — v2 leaf format: 16-byte header (`format_version=2`, `record_width`, `value_count`, `next_leaf`) + record 0 as N full LEB128 varints + records 1..k-1 as N zigzag-delta LEB128 varints. Each v2 page is bounds-checked, fail-safe via `BPTLeafV2DecodeException`, and decoded once-per-open into a stack-local `k×N` uint64 buffer.
+
+Example:
+
+```gql
+CALL graph_project('paper_gnn', 'Paper', 'CITES', {
+    orientation: 'NATURAL',
+    leafFormat: 'DELTA_VARINT',
+    indexSet: 'GNN_MINIMAL',
+    buildTopologySnapshot: true,
+    includeFeatures: 'node_features'
+}) YIELD graphName, nodeCount, relCount RETURN *
+```
+
+Empirical measurements (with `indexSet: 'GNN_MINIMAL'`):
+- **cora_gnn:** 368 KB → 72 KB (-80% disk). Read throughput 31.1 ms → 31.6 ms = 1.016× (Gate C ≤ 1.20×).
+- **ogbn-arxiv:** 60.10 MB → 12.91 MB (-79%). Per-index: `from_to_edge` 28 MB → 5.5 MB (0.195×); `to_from_edge` 28 MB → 7.2 MB (0.256×, asymmetric due to sort-order entropy). Read throughput 437.6 ms → 435.7 ms = 0.996× (slightly faster than v1).
+- **ogbn-products:** TBD — see bench report (T5.15).
+
+Build time is unchanged in both directions (~0.06 s cora_gnn; ~3.1 s ogbn-arxiv); sort dominates, leaf serialisation is < 5%. v2 pages are immutable — switching `leafFormat` requires `drop_projection` + recreate. The T5.13b cursor-cache fix (commit `a94c06cf`) made `BPTLeafV2::search_index` sequentially O(k) instead of O(k²) per-iteration, restoring read parity.
+
+**Files:** `src/storage/index/bplus_tree/bpt_leaf_format.{h,cc}`, `varint.{h,cc}`, `bplus_tree_leaf_v2.{h,cc}`, `bpt_mem_import.h` (`BPTLeafV2Writer` bulk-load), `src/graph_models/gql/projection/projection_catalog.{h,cc}` (catalog v1.5 per-index byte), `src/query/procedure/builtin/project_procedure.cc` (parse `leafFormat`).
+**Tests:** unit suites `bpt_leaf_v2_format_test`, `varint_test`, `bpt_leaf_v2_writer_test`, `bpt_leaf_v2_reader_test`, `bpt_iter_dispatch_test`, `projection_catalog_v5_test`, `projection_leaffmt_config_test`; fuzz `bpt_leaf_v2_fuzz_test` (500 K random + 1 K smoke + 10 K boundary roundtrips, 100% tamper-flip detection); integration `scripts/test_projection_leaffmt.sh` (6-mode golden compare).
+**Benchmark:** `scripts/bench_leaffmt.sh` (Gate C harness — size + read throughput per dataset × format).
+**Design record:** ADR 007 (`Partial_Idea/decisions/007_delta_varint_leaf.md`), spec `docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md`, plan `docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md`, master plan `docs/superpowers/plans/2026-04-23-projection-compression-stack-plan.md`.
+
 ## Claude Code Configuration
 
 This project includes Claude Code configuration:
