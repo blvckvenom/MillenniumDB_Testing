@@ -23,6 +23,7 @@ namespace BPT {
 enum class LeafFormat : uint8_t {
     BITSET       = 1,   // v1 — existing redundant-bitset encoding (pre-Spec-#5)
     DELTA_VARINT = 2,   // v2 — delta + LEB128 varint encoding (Spec #5)
+    CSR_HYBRID   = 3,   // v3 — CSR-in-B+Tree hybrid (Spec #8, edge indexes only)
 };
 
 // Exactly 16 bytes, matches disk layout in design §5.2.

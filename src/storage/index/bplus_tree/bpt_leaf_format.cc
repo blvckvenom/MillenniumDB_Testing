@@ -65,6 +65,7 @@ const char* leaf_format_to_string(LeafFormat f) noexcept {
     switch (f) {
         case LeafFormat::BITSET:       return "BITSET";
         case LeafFormat::DELTA_VARINT: return "DELTA_VARINT";
+        case LeafFormat::CSR_HYBRID:   return "CSR_HYBRID";
     }
     return "<invalid>";
 }
@@ -76,9 +77,12 @@ LeafFormat parse_leaf_format(std::string_view s) {
     if (s == "DELTA_VARINT") {
         return LeafFormat::DELTA_VARINT;
     }
+    if (s == "CSR_HYBRID") {
+        return LeafFormat::CSR_HYBRID;
+    }
     std::string msg = "Unknown leafFormat value '";
     msg.append(s.data(), s.size());
-    msg += "'. Valid values: 'BITSET', 'DELTA_VARINT'.";
+    msg += "'. Valid values: 'BITSET', 'DELTA_VARINT', 'CSR_HYBRID'.";
     throw std::invalid_argument(msg);
 }
 
