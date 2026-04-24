@@ -1232,6 +1232,30 @@ papers100M (con tope asintótico al 5/9 de índices eliminados).
   label-filtradas (e.g. `MATCH (n:Paper)-[:CITES]->(m)`) que NO requieren
   lookup por edge-id.
 
+### Matriz de tareas GNN soportadas
+
+El preset correcto depende de la tarea GNN que vayas a entrenar. Las dos
+familias relevantes para MillenniumDB hoy son **Node Property Prediction
+(NPP)** y **Link Property Prediction (LPP)**.
+
+| Tarea GNN | Ejemplos dataset | `indexSet` recomendado | Procedures MDB activas |
+|---|---|---|---|
+| **Node Property Prediction** (clasificación / regresión sobre nodos) | Cora, ogbn-arxiv, ogbn-products, papers100M | `GNN_MINIMAL` | `gnn_offline_sample`, `gnn_materialize_batches`, `gnn_build_feature_store`, `gnn_train`, `gnn_predict`, `EmbeddingWriter` (Phase 6) |
+| **Link Property Prediction** (homogeneous: un único tipo de arista) | ogbl-ppa, ogbl-collab, recommender sobre single-type graph | `GNN_MINIMAL` | pipeline node-centric reutilizable; la iteración de aristas positivas se hace con scan lineal de `from_to_edge` |
+| **Link Property Prediction** (heterogeneous: varios `edge_label` a filtrar) | ogbl-biokg, ogbl-ddi, knowledge graphs | `READONLY_TRAVERSAL` | mismo pipeline; `MATCH ()-[r:DRUG_TARGET]->()` + scoring function per-type requiere `edge_label` |
+
+**Por qué GNN_MINIMAL basta para LPP homogeneous:** LPP node-centric
+samplea el k-hop neighborhood de cada endpoint de una arista positiva,
+luego scorea. Ambos pasos son **node-entry** (parten de un nodo, no de
+una arista). La iteración de aristas positivas durante training se
+resuelve con un scan lineal de `from_to_edge`, no con edge-by-id lookup
+— por eso `edge_from_to` sigue siendo innecesario.
+
+**Por qué LPP heterogeneous sube a READONLY_TRAVERSAL:** si el dataset
+tiene varios tipos de arista y quieres filtrar por tipo durante
+training (p.ej. entrenar scoring separado por cada `edge_label`),
+necesitas `edge_label` + `label_edge` para el filtro eficiente.
+
 ### Cambiar de preset
 
 Los presets son fijos al momento de creación; están persistidos en
