@@ -236,13 +236,42 @@ Record<N> BPTLeafV2<N>::get_record(uint_fast32_t pos) const
             + " >= value_count " + std::to_string(value_count_));
     }
 
-    const uint8_t* in  = reinterpret_cast<const uint8_t*>(read_page_bytes_) + kPayloadOffset;
-    const uint8_t* end = reinterpret_cast<const uint8_t*>(read_page_bytes_) + Page::SIZE;
+    const uint8_t* const start = reinterpret_cast<const uint8_t*>(read_page_bytes_) + kPayloadOffset;
+    const uint8_t* const end   = reinterpret_cast<const uint8_t*>(read_page_bytes_) + Page::SIZE;
 
-    // Running cursor: accumulated fields of the most recently decoded record.
-    uint64_t cursor[N] = {};
+    // Fast-path: if pos == cache_pos_, return cached record directly.
+    if (pos == cache_pos_) {
+        Record<N> rec;
+        for (std::size_t j = 0; j < N; ++j) {
+            rec[j] = cache_cursor_[j];
+        }
+        return rec;
+    }
 
-    for (uint_fast32_t i = 0; i <= pos; ++i) {
+    // Decide: resume from cache (pos > cache_pos_) or restart (pos < cache_pos_).
+    uint_fast32_t resume_from;
+    uint64_t cursor[N];
+    const uint8_t* in;
+
+    if (cache_pos_ != UINT_FAST32_MAX && pos > cache_pos_) {
+        // Resume from cache: cache_in_ is the byte pointer AFTER the varints
+        // of record cache_pos_, so decoding of record cache_pos_ + 1 starts
+        // exactly there with cache_cursor_ as the running accumulator.
+        in = cache_in_;
+        for (std::size_t j = 0; j < N; ++j) {
+            cursor[j] = cache_cursor_[j];
+        }
+        resume_from = cache_pos_ + 1;
+    } else {
+        // Restart from record 0.
+        in = start;
+        for (std::size_t j = 0; j < N; ++j) {
+            cursor[j] = 0;
+        }
+        resume_from = 0;
+    }
+
+    for (uint_fast32_t i = resume_from; i <= pos; ++i) {
         for (std::size_t j = 0; j < N; ++j) {
             uint64_t v = 0;
             const size_t consumed = BPT::varint_decode(in, end, v);
@@ -259,6 +288,14 @@ Record<N> BPTLeafV2<N>::get_record(uint_fast32_t pos) const
             }
         }
     }
+
+    // Update cache with our final state. `in` now points just past the
+    // varints of record `pos`, ready for the next resume.
+    cache_pos_ = pos;
+    for (std::size_t j = 0; j < N; ++j) {
+        cache_cursor_[j] = cursor[j];
+    }
+    cache_in_ = in;
 
     Record<N> rec;
     for (std::size_t j = 0; j < N; ++j) {

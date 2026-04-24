@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -164,6 +165,28 @@ private:
     // (non-noexcept) or return a sentinel (noexcept).
     const char*             read_page_bytes_ = nullptr;  // mmap'd page
     BPT::BPTLeafV2Header    read_header_{};              // deserialized header
+
+    // Sequential-decode cache. After a successful get_record(pos) call in
+    // read mode, these record:
+    //   - cache_pos_       : the pos of the most recently decoded record
+    //   - cache_cursor_[N] : its fully-decoded field values (the running
+    //                        accumulator at that position)
+    //   - cache_in_        : byte pointer just past the last varint consumed
+    //                        (so decoding record cache_pos_ + 1 resumes here)
+    //
+    // A subsequent get_record(pos') with pos' > cache_pos_ resumes from the
+    // cache, advancing (pos' - cache_pos_) records. pos' < cache_pos_
+    // falls back to restart-from-0. pos' == cache_pos_ returns the cached
+    // values directly.
+    //
+    // `cache_pos_ == UINT_FAST32_MAX` sentinel means "cache empty".
+    //
+    // The members are `mutable` so const methods (get_record / search_index
+    // / update_record) can update the cache — purely a memoization of the
+    // immutable page state, no externally visible effect.
+    mutable uint_fast32_t   cache_pos_       = UINT_FAST32_MAX;
+    mutable uint64_t        cache_cursor_[N] = {};
+    mutable const uint8_t*  cache_in_        = nullptr;
 
     // Helper: encode one record into a scratch buffer. Returns the number of
     // bytes written. `prev_or_null == nullptr` for the first record (full

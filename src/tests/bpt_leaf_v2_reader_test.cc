@@ -606,4 +606,48 @@ TEST(BPTLeafV2Reader, Mutation_Delete_Throws) {
     EXPECT_THROW(reader.delete_record(Record<3>{1, 2, 3}), std::logic_error);
 }
 
+// Exercise the T5.13b sequential-decode cache: a fast-path forward scan
+// followed by random-access queries must both return correct values. The
+// cache logic covers three paths (pos == cache_pos_, pos > cache_pos_
+// resume, pos < cache_pos_ restart), and this test ensures all three yield
+// identical results to a stateless decode.
+TEST(BPTLeafV2Reader, SequentialGetRecord_FastPath) {
+    AlignedPageBuffer page;
+    std::vector<std::array<uint64_t, 3>> records;
+    {
+        BPTLeafV2<3> writer(page.data());
+        for (uint32_t i = 0; i < 100; ++i) {
+            std::array<uint64_t, 3> r{
+                static_cast<uint64_t>(i) * 10,
+                static_cast<uint64_t>(i) * 11,
+                static_cast<uint64_t>(i) * 12};
+            records.push_back(r);
+            Record<3> rec;
+            rec[0] = r[0];
+            rec[1] = r[1];
+            rec[2] = r[2];
+            ASSERT_TRUE(writer.append_record(rec));
+        }
+        writer.flush();
+    }
+
+    BPTLeafV2<3> reader(page.data(), BPTLeafV2<3>::ReadTag{});
+    // Sequential forward pass: exercises cache resume path (pos > cache_pos_).
+    for (uint32_t i = 0; i < 100; ++i) {
+        Record<3> rec = reader.get_record(i);
+        EXPECT_EQ(rec[0], records[i][0]) << "i=" << i;
+        EXPECT_EQ(rec[1], records[i][1]) << "i=" << i;
+        EXPECT_EQ(rec[2], records[i][2]) << "i=" << i;
+    }
+    // Random access: includes a backward jump (75 -> 0 -> 99 would also
+    // traverse the restart path), a repeat (50, 50) for the pos==cache_pos_
+    // fast-path, and forward resumes between entries.
+    for (uint32_t i : {50u, 5u, 75u, 0u, 99u, 50u, 50u}) {
+        Record<3> rec = reader.get_record(i);
+        EXPECT_EQ(rec[0], records[i][0]) << "random i=" << i;
+        EXPECT_EQ(rec[1], records[i][1]) << "random i=" << i;
+        EXPECT_EQ(rec[2], records[i][2]) << "random i=" << i;
+    }
+}
+
 }  // namespace
