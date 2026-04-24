@@ -773,6 +773,41 @@ if(GTest_FOUND AND ENABLE_GNN AND
     )
 endif()
 
+# ============================================================================
+# Isolated TopologyAccessor micro-benchmark (Spec #4-B T4.17)
+# ============================================================================
+# Standalone binary that measures `TopologyAccessor::sample_khop_neighbors`
+# wall-clock on a preexisting projection under two modes (CSR sidecars
+# present vs parked). Built only when ENABLE_GNN because it links the GNN
+# module. No gtest dependency — it's a plain CLI binary but mirrors the
+# link recipe used by the snapshot/accessor unit tests.
+if(ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/bench/bench_topology_micro.cc")
+    add_executable(bench_topology_micro
+        ${CMAKE_SOURCE_DIR}/src/bench/bench_topology_micro.cc
+    )
+    set_target_properties(bench_topology_micro PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # Link order mirrors gnn_sampling_snapshot_test: mdb_gnn_core before
+    # the trailing millenniumdb so GNN symbols resolve first.
+    target_link_libraries(bench_topology_micro
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
