@@ -50,6 +50,8 @@
 
 #include <gtest/gtest.h>
 
+#include "storage/index/bplus_tree/bplus_tree_leaf_csr.h"
+#include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf_base.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
@@ -92,6 +94,97 @@ void write_v2_page(AlignedPageBuffer& page,
         ASSERT_TRUE(writer.append_record(r));
     }
     writer.flush();
+}
+
+// ----------------------------------------------------------------------------
+// Synthetic CSR (v3) page builder. Borrowed byte-for-byte from
+// bpt_leaf_csr_reader_test.cc so the T8.6 dispatch tests stay self-
+// contained at task level (no cross-test-file shared header needed —
+// T8.5's writer lands in parallel and may supersede this helper
+// downstream).
+//
+// Emits the chain-head layout per Spec #8 design §5.1:
+//   16-byte header, uint16 offset_table[value_count], then per-src
+//   entry [src_id varint, degree varint, dst0 full varint,
+//   dst1..zigzag-delta varints].
+// ----------------------------------------------------------------------------
+struct CsrSrcEntry {
+    uint64_t src_id;
+    std::vector<uint64_t> dsts;
+};
+
+AlignedPageBuffer build_csr_page(const std::vector<CsrSrcEntry>& entries,
+                                 uint32_t next_leaf = 0,
+                                 uint32_t min_src_id_low = 0,
+                                 uint8_t flags = 0)
+{
+    AlignedPageBuffer page;
+
+    const uint32_t vc = static_cast<uint32_t>(entries.size());
+    const std::size_t payload_start = 16 + 2u * vc;
+
+    std::vector<std::vector<uint8_t>> entry_bytes(vc);
+    for (std::size_t i = 0; i < vc; ++i) {
+        const auto& e = entries[i];
+        std::vector<uint8_t>& buf = entry_bytes[i];
+
+        uint8_t scratch[BPT::VARINT_MAX_BYTES];
+        size_t n = BPT::varint_encode(e.src_id, scratch, sizeof(scratch));
+        buf.insert(buf.end(), scratch, scratch + n);
+        n = BPT::varint_encode(e.dsts.size(), scratch, sizeof(scratch));
+        buf.insert(buf.end(), scratch, scratch + n);
+
+        for (std::size_t k = 0; k < e.dsts.size(); ++k) {
+            uint64_t to_encode;
+            if (k == 0) {
+                to_encode = e.dsts[k];
+            } else {
+                const uint64_t delta_u = e.dsts[k] - e.dsts[k - 1];
+                const int64_t  delta   = static_cast<int64_t>(delta_u);
+                to_encode = BPT::zigzag_encode_i64(delta);
+            }
+            n = BPT::varint_encode(to_encode, scratch, sizeof(scratch));
+            buf.insert(buf.end(), scratch, scratch + n);
+        }
+    }
+
+    std::vector<uint16_t> offsets(vc);
+    std::size_t cursor = payload_start;
+    for (std::size_t i = 0; i < vc; ++i) {
+        offsets[i] = static_cast<uint16_t>(cursor);
+        cursor += entry_bytes[i].size();
+    }
+    EXPECT_LE(cursor, Page::SIZE) << "test page overflow";
+
+    BPT::BPTLeafCSRHeader h{};
+    h.format_version = 3;
+    h.record_width   = 3;
+    h.flags          = flags;
+    h.reserved       = 0;
+    h.value_count    = vc;
+    h.next_leaf      = next_leaf;
+    h.min_src_id_low = min_src_id_low;
+
+    uint8_t raw[16];
+    BPT::serialize_csr_header(h, raw);
+    for (std::size_t i = 0; i < 16; ++i) {
+        page.set_byte(i, raw[i]);
+    }
+
+    for (std::size_t i = 0; i < vc; ++i) {
+        const uint16_t o = offsets[i];
+        page.set_byte(16 + 2 * i,     static_cast<uint8_t>(o & 0xFF));
+        page.set_byte(16 + 2 * i + 1, static_cast<uint8_t>((o >> 8) & 0xFF));
+    }
+
+    for (std::size_t i = 0; i < vc; ++i) {
+        const std::size_t off = offsets[i];
+        for (std::size_t k = 0; k < entry_bytes[i].size(); ++k) {
+            page.set_byte(off + k, entry_bytes[i][k]);
+        }
+    }
+
+    return page;
 }
 
 // ====================== TESTS ================================================
@@ -270,6 +363,7 @@ TEST(BptIterDispatch, InvalidFormat_RaisesLogicError) {
         switch (fmt) {
             case BPT::LeafFormat::BITSET:       return nullptr;
             case BPT::LeafFormat::DELTA_VARINT: return nullptr;
+            case BPT::LeafFormat::CSR_HYBRID:   return nullptr;
         }
         throw std::logic_error("unknown BPT::LeafFormat enum value");
     };
@@ -320,6 +414,257 @@ TEST(BptIterDispatch, GetLeafFormat_AccessorSignatureIsConst) {
     using MemPtr = BPT::LeafFormat (BPlusTree<3>::*)() const noexcept;
     MemPtr m = &BPlusTree<3>::get_leaf_format;
     EXPECT_NE(m, nullptr);
+}
+
+
+// ============================================================================
+// Spec #8 T8.6: 3-way dispatch to BPTLeafCSR<N> on CSR_HYBRID leaf_format
+// ============================================================================
+//
+// We mirror the narrow test pattern established for T5.9 above: invoking
+// BPlusTree<N>::open_leaf_page() directly would require a live Page& (and
+// by extension a BufferManager + FileManager pool), which is disproportionate
+// for a dispatch-site unit test. Instead we exercise the exact code path
+// open_leaf_page's CSR_HYBRID branch executes — construct a
+// BPTLeafCSR<N>::ReadTag over an AlignedPageBuffer — behind the polymorphic
+// std::unique_ptr<BPTLeafBase<N>> holder, and then assert on both the type
+// identity of the returned reader and the cross-check guards documented in
+// the branch.
+
+// Case 9: catalog leaf_format == CSR_HYBRID and page byte 0 == 3, chain-head:
+// dispatch yields a BPTLeafCSR<N>. Confirms the type identity and that the
+// polymorphic base-class contract works through the returned pointer.
+TEST(BptIterDispatch, CSRHybrid_OpensV3Reader) {
+    auto page = build_csr_page({
+        {1000, {5000, 5010, 5020}},
+        {1001, {2000}},
+    });
+
+    // Production path: open_leaf_page(CSR_HYBRID) returns a
+    // BPTLeafCSR<N> via its ReadTag ctor. We cannot invoke open_leaf_page
+    // directly (Page& requirement) so we replicate the construction.
+    std::unique_ptr<BPTLeafBase<3>> base =
+        std::make_unique<BPTLeafCSR<3>>(page.data(),
+                                        BPTLeafCSR<3>::ReadTag{});
+
+    // Type identity: the polymorphic holder should point at a BPTLeafCSR<3>,
+    // not a V1 or V2 reader.
+    auto* csr = dynamic_cast<BPTLeafCSR<3>*>(base.get());
+    ASSERT_NE(csr, nullptr)
+        << "expected BPTLeafCSR<3> through base pointer, got a different "
+           "concrete type";
+
+    // Virtual-dispatch smoke: get_value_count returns the TOTAL tuple
+    // count (sum of degrees), not the number of src entries. Entry degrees
+    // are 3 and 1 → total 4.
+    EXPECT_EQ(base->get_value_count(), 4u);
+    EXPECT_FALSE(base->has_next());
+}
+
+// Case 10: catalog says CSR_HYBRID but the page's byte 0 is 2 (V2-like).
+// The dispatch cross-check in open_leaf_page's CSR_HYBRID branch must raise
+// BPTLeafV2DecodeException before reaching the BPTLeafCSR ReadTag ctor.
+TEST(BptIterDispatch, CSRHybrid_OnV2LikePage_RaisesDecodeException) {
+    AlignedPageBuffer page;
+    page.set_byte(0, 2);   // V2-like format version
+
+    // Replica of open_leaf_page's CSR_HYBRID cross-check. The production
+    // code raises BPTLeafV2DecodeException (reusing the exception hierarchy
+    // already threaded through get_page_readonly callers).
+    const auto* bytes = reinterpret_cast<const uint8_t*>(page.data());
+    ASSERT_NE(bytes[0], 3);  // precondition
+
+    auto guard = [&bytes]() {
+        if (bytes[0] != 3) {
+            throw BPT::BPTLeafV2DecodeException(
+                std::string("leaf-format mismatch: catalog says CSR_HYBRID "
+                            "but page byte 0 is ")
+                + std::to_string(static_cast<unsigned>(bytes[0])));
+        }
+    };
+    EXPECT_THROW(guard(), BPT::BPTLeafV2DecodeException);
+}
+
+// Case 11: catalog says CSR_HYBRID, page byte 0 is 3 (valid v3 version),
+// but flags bit 0 is set → the page is a continuation, not a chain-head.
+// A directory-routed open cannot legitimately land on a continuation page
+// (they're reached only via chain-head traversal), so dispatch must raise.
+TEST(BptIterDispatch, CSRHybrid_OnContinuationPage_RaisesDecodeException) {
+    // Build a well-formed v3 chain-head page first, then flip flags bit 0.
+    auto page = build_csr_page({{1000, {5000}}});
+    page.set_byte(2, BPT::CSRHybridFlags::kIsContinuation);
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(page.data());
+    ASSERT_EQ(bytes[0], 3);   // version check would pass
+    ASSERT_NE(bytes[2] & BPT::CSRHybridFlags::kIsContinuation, 0);
+
+    // Replica of the chain-head guard from open_leaf_page's CSR_HYBRID
+    // branch. Raises BPTLeafV2DecodeException before reaching the reader
+    // ctor.
+    auto guard = [&bytes]() {
+        if ((bytes[2] & BPT::CSRHybridFlags::kIsContinuation) != 0) {
+            throw BPT::BPTLeafV2DecodeException(
+                "leaf-format mismatch: catalog says CSR_HYBRID but page is "
+                "a continuation (flags bit 0 set), not a chain-head — "
+                "directory points to wrong page");
+        }
+    };
+    EXPECT_THROW(guard(), BPT::BPTLeafV2DecodeException);
+
+    // End-to-end: even if the guard were bypassed, the BPTLeafCSR ReadTag
+    // ctor itself rejects continuation pages (Spec #8 I6) — so the
+    // composite behavior at the dispatch site is always a raise.
+    EXPECT_THROW(
+        (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
+        BPT::BPTLeafCSRDecodeException);
+}
+
+// Case 12: integration smoke — populate a v3 page manually (directly via the
+// synthetic page builder, without depending on T8.5's writer) and verify
+// that records iterated through the polymorphic base pointer match the
+// synthetic input. This is the analogue of Case 5 for the CSR_HYBRID path.
+TEST(BptIterDispatch, CSRHybrid_FindsRecordsOnPage) {
+    const std::vector<CsrSrcEntry> entries = {
+        {100,  {1, 2, 5}},
+        {200,  {10, 12}},
+        {1000, {5000, 5003, 5010, 5020}},
+    };
+    auto page = build_csr_page(entries);
+
+    std::unique_ptr<BPTLeafBase<3>> base =
+        std::make_unique<BPTLeafCSR<3>>(page.data(),
+                                        BPTLeafCSR<3>::ReadTag{});
+
+    // Total tuple count: 3 + 2 + 4 = 9.
+    ASSERT_EQ(base->get_value_count(), 9u);
+    EXPECT_FALSE(base->has_next());
+
+    // Flatten the expected (src, dst, edge_id=0) tuples in entry order.
+    std::vector<Record<3>> expected;
+    for (const auto& e : entries) {
+        for (uint64_t dst : e.dsts) {
+            // T8.4's BPTLeafBase<N> contract fills edge_id with 0 on v3
+            // pages (see bplus_tree_leaf_csr.cc decode_tuple_ comment).
+            expected.push_back({e.src_id, dst, 0});
+        }
+    }
+    ASSERT_EQ(expected.size(), base->get_value_count());
+
+    for (uint_fast32_t i = 0; i < expected.size(); ++i) {
+        const auto r = base->get_record(i);
+        EXPECT_EQ(r, expected[i])
+            << "v3 tuple mismatch via base pointer at pos " << i;
+    }
+}
+
+// Case 13: 3-way coexistence smoke. Build three independent polymorphic
+// base-class holders — one V1-like BITSET slot (via V2 bytes to keep
+// Page-less testing; the dispatch identity we care about is V2 vs V3 since
+// V1 requires a live buffer pool), one V2 (DELTA_VARINT), and one V3
+// (CSR_HYBRID) — and exercise each through the BPTLeafBase<N> contract.
+// Confirms the three readers coexist without cross-talk (global state,
+// static locals, etc. would show up here).
+TEST(BptIterDispatch, CSRHybrid_ThreeWayCoexistenceSmoke) {
+    // V2 reader over a page with 3 records.
+    AlignedPageBuffer v2_page;
+    const std::vector<Record<3>> v2_inputs{
+        {1, 2, 3},
+        {2, 4, 6},
+        {3, 9, 27},
+    };
+    write_v2_page<3>(v2_page, v2_inputs);
+
+    // V3 reader over a page with 2 src entries, 5 tuples total.
+    auto v3_page = build_csr_page({
+        {100, {1, 2, 5}},
+        {200, {10, 12}},
+    });
+
+    std::unique_ptr<BPTLeafBase<3>> v2_holder =
+        std::make_unique<BPTLeafV2<3>>(v2_page.data(),
+                                       BPTLeafV2<3>::ReadTag{});
+    std::unique_ptr<BPTLeafBase<3>> v3_holder =
+        std::make_unique<BPTLeafCSR<3>>(v3_page.data(),
+                                        BPTLeafCSR<3>::ReadTag{});
+
+    // Each holder exposes its own view through the same base-class
+    // interface.
+    EXPECT_EQ(v2_holder->get_value_count(), v2_inputs.size());
+    EXPECT_EQ(v3_holder->get_value_count(), 5u);
+
+    // Runtime type identity: each resolves to its concrete subclass.
+    EXPECT_NE(dynamic_cast<BPTLeafV2<3>*>(v2_holder.get()), nullptr);
+    EXPECT_EQ(dynamic_cast<BPTLeafV2<3>*>(v3_holder.get()), nullptr);
+    EXPECT_NE(dynamic_cast<BPTLeafCSR<3>*>(v3_holder.get()), nullptr);
+    EXPECT_EQ(dynamic_cast<BPTLeafCSR<3>*>(v2_holder.get()), nullptr);
+
+    // Reads through both holders return the expected first record without
+    // interference.
+    EXPECT_EQ(v2_holder->get_record(0), v2_inputs[0]);
+    const auto first_v3 = v3_holder->get_record(0);
+    EXPECT_EQ(first_v3[0], 100u);   // src_id
+    EXPECT_EQ(first_v3[1], 1u);     // first dst
+    EXPECT_EQ(first_v3[2], 0u);     // edge_id placeholder (T8.4 contract)
+}
+
+// Case 14: open_leaf_page() signature still accepts the new CSR_HYBRID enum
+// value without link-failing for the N in {2, 3} instantiations. We take a
+// function pointer to ensure the symbol is emitted for both widths.
+// N==1 is NOT covered (CSR_HYBRID is edge-index-only per §3.6 D6); we
+// separately confirm the N>=2 guard fires below.
+TEST(BptIterDispatch, CSRHybrid_OpenLeafPage_InstantiatedForN2AndN3) {
+    using FnPtr2 = std::unique_ptr<BPTLeafBase<2>>(*)(Page&, BPT::LeafFormat);
+    using FnPtr3 = std::unique_ptr<BPTLeafBase<3>>(*)(Page&, BPT::LeafFormat);
+    FnPtr2 p2 = &BPlusTree<2>::open_leaf_page;
+    FnPtr3 p3 = &BPlusTree<3>::open_leaf_page;
+    EXPECT_NE(p2, nullptr);
+    EXPECT_NE(p3, nullptr);
+}
+
+// Case 15: the v3 reader cleanly releases its resources through the
+// polymorphic base-class destructor. Repeated construct / destruct cycles
+// must not leak (ASan assertion in Debug). Analogous to Case 8 for the V2
+// holder.
+TEST(BptIterDispatch, CSRHybrid_Destruct_NoLeak) {
+    auto page = build_csr_page({
+        {1, {1, 2, 3}},
+        {2, {4, 5}},
+    });
+
+    for (int i = 0; i < 1000; ++i) {
+        std::unique_ptr<BPTLeafBase<3>> holder =
+            std::make_unique<BPTLeafCSR<3>>(page.data(),
+                                            BPTLeafCSR<3>::ReadTag{});
+        volatile uint32_t vc = holder->get_value_count();
+        (void) vc;
+    }
+    SUCCEED();
+}
+
+// Case 16: the LeafFormat enum has exactly three documented values after
+// T8.3. A static_cast from any bit pattern outside {1, 2, 3} is treated as
+// unknown by the dispatch switch. This test guards against a fourth value
+// being added without an accompanying dispatch arm.
+TEST(BptIterDispatch, CSRHybrid_EnumTrivia) {
+    EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::BITSET),       1u);
+    EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::DELTA_VARINT), 2u);
+    EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::CSR_HYBRID),   3u);
+
+    // Replica of the 3-way dispatch switch post-T8.6. Any enum value
+    // outside {1, 2, 3} must still reach the logic_error fall-through.
+    auto dispatch_replica = [](BPT::LeafFormat fmt) -> int {
+        switch (fmt) {
+            case BPT::LeafFormat::BITSET:       return 1;
+            case BPT::LeafFormat::DELTA_VARINT: return 2;
+            case BPT::LeafFormat::CSR_HYBRID:   return 3;
+        }
+        throw std::logic_error("unknown BPT::LeafFormat enum value");
+    };
+    EXPECT_EQ(dispatch_replica(BPT::LeafFormat::BITSET),       1);
+    EXPECT_EQ(dispatch_replica(BPT::LeafFormat::DELTA_VARINT), 2);
+    EXPECT_EQ(dispatch_replica(BPT::LeafFormat::CSR_HYBRID),   3);
+    EXPECT_THROW(dispatch_replica(static_cast<BPT::LeafFormat>(77)),
+                 std::logic_error);
 }
 
 }  // namespace

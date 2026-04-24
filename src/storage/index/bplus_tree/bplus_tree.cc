@@ -9,7 +9,9 @@
 #include "query/exceptions.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf_base.h"
+#include "storage/index/bplus_tree/bplus_tree_leaf_csr.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
+#include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/bplus_tree/varint.h"
 #include "storage/index/record.h"
@@ -58,6 +60,43 @@ std::unique_ptr<BPTLeafBase<N>> BPlusTree<N>::open_leaf_page(Page& page,
                 throw std::logic_error(
                     "BPT::LeafFormat::DELTA_VARINT is not supported for this "
                     "record width; only N in {1,2,3} has a BPTLeafV2 reader");
+            }
+        }
+
+        case BPT::LeafFormat::CSR_HYBRID: {
+            // CSR_HYBRID (Spec #8) is an edge-index-only encoding
+            // instantiated for N in {2, 3}. Per design §3.6 D6 the hybrid
+            // format is selected only for FROM_TO_EDGE / TO_FROM_EDGE
+            // topology indexes; BPlusTree<1> / BPlusTree<4> never carries
+            // it, so hitting this branch outside [2..3] is a catalog
+            // bit-flip and we fail loudly rather than link-failing.
+            if constexpr (N >= 2 && N <= 3) {
+                const auto* bytes = reinterpret_cast<const uint8_t*>(page.get_bytes());
+                // Cross-check 1: catalog says CSR_HYBRID so byte 0 must be 3.
+                if (bytes[0] != 3) {
+                    throw BPT::BPTLeafV2DecodeException(
+                        std::string("leaf-format mismatch: catalog says CSR_HYBRID "
+                                    "but page byte 0 is ")
+                        + std::to_string(static_cast<unsigned>(bytes[0])));
+                }
+                // Cross-check 2: a directory-routed open must land on a
+                // chain-head page (flags bit 0 clear). Continuation pages
+                // are reached only via chain-head traversal; if the
+                // directory points at a continuation, the catalog / builder
+                // state is inconsistent.
+                if ((bytes[2] & BPT::CSRHybridFlags::kIsContinuation) != 0) {
+                    throw BPT::BPTLeafV2DecodeException(
+                        "leaf-format mismatch: catalog says CSR_HYBRID but "
+                        "page is a continuation (flags bit 0 set), not a "
+                        "chain-head — directory points to wrong page");
+                }
+                return std::make_unique<BPTLeafCSR<N>>(
+                    page.get_bytes(),
+                    typename BPTLeafCSR<N>::ReadTag{});
+            } else {
+                throw std::logic_error(
+                    "BPT::LeafFormat::CSR_HYBRID is not supported for this "
+                    "record width; only N in {2,3} has a BPTLeafCSR reader");
             }
         }
     }
@@ -211,6 +250,38 @@ static std::unique_ptr<BPTLeafBase<N>> open_v2_reader_over_pinned_page_(
     }
 }
 
+// Rebuild `v3_reader_` over the page currently pinned by `current_leaf_`
+// (a BPTLeafV1<N> held only for its Page* pin). Used at ctor time and on
+// every cross-page transition when leaf_format_ == CSR_HYBRID. The V3
+// reader validates the 16-byte v3 header at construction per Spec #8
+// §5.5; any failure here raises BPTLeafCSRDecodeException (propagated
+// to the caller). The v3 reader owns nothing about the page pin — it
+// holds a raw `const char*` into the pinned page bytes, valid only as
+// long as `current_leaf_` stays alive.
+template <std::size_t N>
+static std::unique_ptr<BPTLeafBase<N>> open_v3_reader_over_pinned_page_(
+    BPTLeafBase<N>* current_leaf_v1)
+{
+    if constexpr (N >= 2 && N <= 3) {
+        auto* v1 = dynamic_cast<BPTLeafV1<N>*>(current_leaf_v1);
+        if (v1 == nullptr) {
+            // The pin-holder slot is not a V1. The CSR_HYBRID path always
+            // populates current_leaf_ with a V1 at ctor / cross-page
+            // transition time; reaching here indicates a programming
+            // error. Return nullptr; the caller surfaces a NO_MATCH path
+            // to avoid corruption.
+            return nullptr;
+        }
+        return std::make_unique<BPTLeafCSR<N>>(
+            v1->get_page().get_bytes(),
+            typename BPTLeafCSR<N>::ReadTag{});
+    } else {
+        // N outside [2..3] has no BPTLeafCSR<N> instantiation per design
+        // §3.6 D6 (CSR_HYBRID is edge-index-only).
+        return nullptr;
+    }
+}
+
 template<std::size_t N>
 BptIter<N>::BptIter(bool* interruption_requested,
                     SearchLeafResult<N>&& leaf_and_pos,
@@ -228,6 +299,7 @@ BptIter<N>::BptIter(bool* interruption_requested,
     // in here — it doubles as the BufferManager pin holder under v2.
     current_leaf_(std::make_unique<BPTLeafV1<N>>(std::move(leaf_and_pos.leaf))),
     v2_reader_(nullptr),
+    v3_reader_(nullptr),
     leaf_format_(leaf_format)
 {
     if (leaf_format_ == BPT::LeafFormat::DELTA_VARINT) {
@@ -248,9 +320,27 @@ BptIter<N>::BptIter(bool* interruption_requested,
         } else {
             current_pos = 0;
         }
+    } else if (leaf_format_ == BPT::LeafFormat::CSR_HYBRID) {
+        // Re-interpret the pinned page under a v3 decoder. The V1 held
+        // in `current_leaf_` stays alive purely as a pin; all reads
+        // dispatch to v3_reader_ below. Construction validates the v3
+        // header per Spec #8 §5.5 and rejects continuation pages
+        // (flags bit 0 set) — a directory that routed us to a
+        // continuation page is a catalog inconsistency, surfaced here
+        // via BPTLeafCSRDecodeException.
+        v3_reader_ = open_v3_reader_over_pinned_page_<N>(current_leaf_.get());
+        // V3's search_index walks the logical tuple stream; same
+        // reasoning as V2 applies for why the directory's V1 result_index
+        // cannot be reused.
+        if (v3_reader_ && min != nullptr) {
+            current_pos = v3_reader_->search_index(*min);
+        } else {
+            current_pos = 0;
+        }
     } else {
         // BITSET mode: set_redundant_record populates the running record
-        // with the V1 redundant-byte prefix. V2 has no redundant concept.
+        // with the V1 redundant-byte prefix. V2 / V3 have no redundant
+        // concept.
         current_leaf_->set_redundant_record(current_record);
     }
 }
@@ -262,6 +352,7 @@ BptIter<N>::BptIter(BptIter&& other) noexcept :
     max(std::move(other.max)),
     current_leaf_(std::move(other.current_leaf_)),
     v2_reader_(std::move(other.v2_reader_)),
+    v3_reader_(std::move(other.v3_reader_)),
     leaf_format_(other.leaf_format_)
 {
     if (current_leaf_ && leaf_format_ == BPT::LeafFormat::BITSET) {
@@ -276,6 +367,7 @@ void BptIter<N>::operator=(BptIter&& other) noexcept {
     max                    = std::move(other.max);
     current_leaf_          = std::move(other.current_leaf_);
     v2_reader_             = std::move(other.v2_reader_);
+    v3_reader_             = std::move(other.v3_reader_);
     leaf_format_           = other.leaf_format_;
     if (current_leaf_ && leaf_format_ == BPT::LeafFormat::BITSET) {
         current_leaf_->set_redundant_record(current_record);
@@ -285,12 +377,17 @@ void BptIter<N>::operator=(BptIter&& other) noexcept {
 template <std::size_t N>
 const Record<N>* BptIter<N>::next() {
     // Pick the effective reader for this format. v2_reader_ is populated
-    // only in DELTA_VARINT mode; current_leaf_ stays alive under v2 as
-    // the BufferManager pin-holder.
-    BPTLeafBase<N>* reader = (leaf_format_ == BPT::LeafFormat::DELTA_VARINT
-                              && v2_reader_)
-                                 ? v2_reader_.get()
-                                 : current_leaf_.get();
+    // only in DELTA_VARINT mode; v3_reader_ only in CSR_HYBRID mode.
+    // current_leaf_ stays alive under V2/V3 as the BufferManager pin
+    // holder.
+    BPTLeafBase<N>* reader;
+    if (leaf_format_ == BPT::LeafFormat::DELTA_VARINT && v2_reader_) {
+        reader = v2_reader_.get();
+    } else if (leaf_format_ == BPT::LeafFormat::CSR_HYBRID && v3_reader_) {
+        reader = v3_reader_.get();
+    } else {
+        reader = current_leaf_.get();
+    }
 
     while (true) {
         if (MDB_unlikely(*interruption_requested)) {
@@ -355,6 +452,46 @@ const Record<N>* BptIter<N>::next() {
                     continue;
                 } else {
                     return nullptr;  // no V2 for N outside [1..3]
+                }
+            }
+            if (leaf_format_ == BPT::LeafFormat::CSR_HYBRID) {
+                // Cross-page transition for v3 pages (Spec #8).
+                //
+                // T8.6 scope limitation: this path handles only the simple
+                // chain-head-to-chain-head transition where the current
+                // page represents a single-page (non-hub) adjacency
+                // sequence. Hub chains that span multiple pages — where
+                // the chain-head's `next_leaf` points at a continuation
+                // page (flags bit 0 set) — are T8.9's scope (the
+                // TopologyAccessor fast path follows chains via the
+                // chain_head_page_id back-pointer). If this transition
+                // lands on a continuation page, the v3 reader's
+                // constructor raises BPTLeafCSRDecodeException, which is
+                // the desired loud-fail behavior for the current
+                // iterator contract.
+                if constexpr (N >= 2 && N <= 3) {
+                    auto* v1 = dynamic_cast<BPTLeafV1<N>*>(current_leaf_.get());
+                    if (v1 == nullptr) return nullptr;  // defensive
+                    // Read next-leaf page number from the v3 header
+                    // (bytes 8..11, little-endian) — same slot as v2.
+                    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(
+                        v1->get_page().get_bytes());
+                    uint32_t next_page_number = 0;
+                    std::memcpy(&next_page_number, bytes + 8, sizeof(uint32_t));
+                    const FileId leaf_file_id = v1->get_page().page_id.file_id;
+                    // Drop the v3 view first, then the v1 pin holder.
+                    v3_reader_.reset();
+                    current_leaf_.reset();  // V1 dtor unpins the old page
+                    Page& new_page = buffer_manager.get_page_readonly(
+                        leaf_file_id, next_page_number);
+                    current_leaf_ = std::make_unique<BPTLeafV1<N>>(&new_page);
+                    v3_reader_ = open_v3_reader_over_pinned_page_<N>(
+                        current_leaf_.get());
+                    reader = v3_reader_ ? v3_reader_.get() : current_leaf_.get();
+                    current_pos = 0;
+                    continue;
+                } else {
+                    return nullptr;  // no V3 for N outside [2..3]
                 }
             }
             // BITSET path preserved byte-for-byte below.

@@ -9,7 +9,9 @@
 #include "storage/index/bplus_tree/bplus_tree_dir.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf_base.h"
+#include "storage/index/bplus_tree/bplus_tree_leaf_csr.h"
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
+#include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/record.h"
 
@@ -65,6 +67,13 @@ private:
     // reads (get_value_count, update_record, has_next) dispatch here
     // in v2 mode. See Spec #5 §5.2 for the on-disk format.
     std::unique_ptr<BPTLeafBase<N>> v2_reader_;
+    // CSR_HYBRID auxiliary reader. Populated only when
+    // leaf_format_ == CSR_HYBRID. Views the same page bytes as
+    // current_leaf_ under a BPTLeafCSR<N> ReadTag decoder (Spec #8
+    // T8.4). The v1 held in current_leaf_ remains purely as a pin
+    // holder; all record reads dispatch to v3_reader_ when this slot
+    // is populated. See Spec #8 §5 for the on-disk format.
+    std::unique_ptr<BPTLeafBase<N>> v3_reader_;
     BPT::LeafFormat leaf_format_;
 };
 
