@@ -190,6 +190,20 @@ void ProjectionStorage::open() {
                 requested_leaf_format = BPT::LeafFormat::BITSET;
             }
         }
+
+        // Spec #8 T8.8 — restore the per-projection graph-storage mode from
+        // the v1.6 catalog byte. ProjectionCatalog::load() defaults this to
+        // BTREE (1) for pre-v1.6 catalogs and validates the byte is in
+        // {1, 2} on read, so we can trust the value here. T8.9 will consume
+        // requested_graph_storage from the edge-index sorter dispatch to
+        // select BPTLeafCSRWriter when CSR_HYBRID; under T8.8 alone the
+        // dispatch path still emits BTREE leaves regardless.
+        if (catalog.graph_storage
+            == static_cast<uint8_t>(BPT::GraphStorage::CSR_HYBRID)) {
+            requested_graph_storage = BPT::GraphStorage::CSR_HYBRID;
+        } else {
+            requested_graph_storage = BPT::GraphStorage::BTREE;
+        }
     }
 
     // Spec #5 T5.11 — thread the restored leaf_format into every BPlusTree
@@ -851,6 +865,14 @@ void ProjectionStorage::save_catalog() {
             num_materialized,
             static_cast<uint8_t>(requested_leaf_format));
     }
+
+    // Spec #8 T8.8 — persist the per-projection graph-storage mode as the
+    // v1.6 catalog byte. Default BTREE (1) is byte-for-byte identical to
+    // pre-Spec-#8 catalogs (the v1.6 byte is absent there, and load()
+    // defaults to BTREE for those). Under T8.8 alone this is the only
+    // observable effect of CSR_HYBRID; the build pipeline still emits
+    // BTREE leaves regardless.
+    catalog.graph_storage = static_cast<uint8_t>(requested_graph_storage);
 
     // Save to disk
     catalog.save();

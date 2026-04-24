@@ -86,4 +86,25 @@ LeafFormat parse_leaf_format(std::string_view s) {
     throw std::invalid_argument(msg);
 }
 
+const char* graph_storage_to_string(GraphStorage s) noexcept {
+    switch (s) {
+        case GraphStorage::BTREE:      return "BTREE";
+        case GraphStorage::CSR_HYBRID: return "CSR_HYBRID";
+    }
+    return "<invalid>";
+}
+
+GraphStorage parse_graph_storage(std::string_view s) {
+    if (s == "BTREE") {
+        return GraphStorage::BTREE;
+    }
+    if (s == "CSR_HYBRID") {
+        return GraphStorage::CSR_HYBRID;
+    }
+    std::string msg = "Unknown graphStorage value '";
+    msg.append(s.data(), s.size());
+    msg += "'. Valid values: 'BTREE', 'CSR_HYBRID'.";
+    throw std::invalid_argument(msg);
+}
+
 }  // namespace BPT

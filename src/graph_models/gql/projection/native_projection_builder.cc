@@ -150,7 +150,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     bool include_label_indexes,
     IndexSet index_set,
     bool build_topology_snapshot,
-    BPT::LeafFormat leaf_format
+    BPT::LeafFormat leaf_format,
+    BPT::GraphStorage graph_storage
 )
     : projection_name(projection_name_)
     , db_folder(db_folder_)
@@ -168,6 +169,7 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     , index_set_(index_set)
     , build_topology_snapshot_(build_topology_snapshot)
     , leaf_format_(leaf_format)
+    , graph_storage_(graph_storage)
     , per_type_orientations(type_orientations)
     , per_type_aggregations(type_aggregations)
     , per_type_agg_properties(type_agg_properties)
@@ -236,6 +238,13 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     // (one byte per materialized index). Default BITSET is byte-identical
     // to pre-Spec-#5 behavior for every caller that doesn't set the key.
     storage->requested_leaf_format = leaf_format_;
+
+    // Spec #8 T8.8 — push the graph-storage mode down so save_catalog()
+    // persists the v1.6 graph_storage byte. T8.8 plumbs the value only;
+    // the build pipeline still emits BTREE leaves regardless. T8.9 will
+    // consume requested_graph_storage from ProjectionStorage to dispatch
+    // the edge indexes through BPTLeafCSRWriter under CSR_HYBRID.
+    storage->requested_graph_storage = graph_storage_;
 
     // Spec #4-B T4.18: push the topology-snapshot opt-in down into storage
     // so the two edge-index builders (build_from_to_edge_index_ and

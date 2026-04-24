@@ -64,4 +64,29 @@ const char* leaf_format_to_string(LeafFormat f) noexcept;
 // Raises std::invalid_argument on unknown input.
 LeafFormat parse_leaf_format(std::string_view s);
 
+// Per-projection graph-storage selector (Spec #8 T8.7 / T8.8).
+//
+// Controls whether a projection's edge indexes persist as classic per-index
+// B+Tree leaves (`BTREE`) or as inline CSR-in-B+Tree leaves emitted by the
+// CSR_HYBRID pipeline. The value is threaded from graph_project's
+// `graphStorage` config key (case-sensitive), through
+// NativeProjectionBuilder, into ProjectionCatalog::graph_storage (v1.6
+// byte), and finally back out through ProjectionStorage on open.
+//
+// T8.8 plumbs the value only — the build pipeline itself still emits
+// BTREE leaves regardless of this enum; T8.9 switches the dispatch.
+enum class GraphStorage : uint8_t {
+    BTREE       = 1,   // default, classic per-index B+Tree leaves
+    CSR_HYBRID  = 2,   // edge indexes emit CSR leaves per Spec #8
+};
+
+// Debug-friendly enum <-> string helpers, symmetric with the leaf_format
+// pair above. Useful for log lines that name the selected storage mode.
+const char* graph_storage_to_string(GraphStorage s) noexcept;
+
+// Case-SENSITIVE parser. Accepts "BTREE" and "CSR_HYBRID" only.
+// Raises std::invalid_argument on unknown input with a message naming
+// the key ("Unknown graphStorage value '<s>'.").
+GraphStorage parse_graph_storage(std::string_view s);
+
 }  // namespace BPT

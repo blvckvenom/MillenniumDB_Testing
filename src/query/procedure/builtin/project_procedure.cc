@@ -133,6 +133,15 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // readers, and persisted per materialized index in catalog v1.5.
     BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET;
 
+    // Spec #8 T8.8 — user-selectable per-projection graph-storage mode.
+    // Defaults to BTREE (pre-Spec-#8 byte-for-byte behavior); the config
+    // key `graphStorage` opts the projection into CSR_HYBRID edge leaves.
+    // Threaded through NativeProjectionBuilder -> ProjectionStorage into
+    // the v1.6 catalog byte. T8.8 plumbs the value only — the build
+    // pipeline still emits BTREE leaves regardless; T8.9 wires the actual
+    // CSR leaf writer into the edge-index sorter dispatch.
+    BPT::GraphStorage graph_storage = BPT::GraphStorage::BTREE;
+
     // Spec #4-B T4.8 — opt-in CSR topology sidecar generation. Default
     // false so existing projections remain byte-identical on disk and
     // pre-Spec-#4-B callers see zero behavior change. The flag is parsed
@@ -192,6 +201,29 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
                     get_string_from_dict(config_dict, "leafFormat", "BITSET");
                 try {
                     leaf_format = BPT::parse_leaf_format(leaf_format_str);
+                } catch (const std::invalid_argument& e) {
+                    throw QueryException(e.what());
+                }
+            }
+        }
+
+        // Spec #8 T8.8 — user-selectable per-projection graph-storage mode.
+        // Case-sensitive parse of "BTREE" / "CSR_HYBRID" via
+        // BPT::parse_graph_storage; unknown values raise
+        // std::invalid_argument which we convert to QueryException so GQL
+        // callers get a proper query-level error. Non-string config values
+        // are already rejected by get_string_from_dict() (throws
+        // runtime_error with type info). T8.8 plumbs the value only — the
+        // build pipeline still emits BTREE leaves regardless; T8.9 wires
+        // BPTLeafCSRWriter into the edge-index sorter dispatch.
+        {
+            bool gs_found = false;
+            (void) get_value_from_dict(config_dict, "graphStorage", gs_found);
+            if (gs_found) {
+                std::string graph_storage_str =
+                    get_string_from_dict(config_dict, "graphStorage", "BTREE");
+                try {
+                    graph_storage = BPT::parse_graph_storage(graph_storage_str);
                 } catch (const std::invalid_argument& e) {
                     throw QueryException(e.what());
                 }
@@ -408,7 +440,8 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             include_label_indexes,
             index_set,
             build_topology_snapshot,
-            leaf_format
+            leaf_format,
+            graph_storage
         );
         builder.scan_nodes_by_labels(node_labels);
         builder.scan_edges_by_types(relationship_types);

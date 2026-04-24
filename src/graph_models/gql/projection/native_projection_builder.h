@@ -428,6 +428,14 @@ public:
      *        into the Spec-#5 v2 layout. The value is threaded to
      *        ProjectionStorage (for per-index BPlusTree reader construction)
      *        and persisted per materialized index in catalog v1.5.
+     * @param graph_storage Spec #8 T8.8 — selects the per-projection
+     *        graph-storage mode. BTREE (default) preserves pre-Spec-#8
+     *        behavior byte-for-byte. CSR_HYBRID opts the edge indexes into
+     *        CSR-in-B+Tree leaves; however, T8.8 only plumbs the config
+     *        through the builder and catalog — the build pipeline itself
+     *        still emits BTREE leaves regardless of this value. T8.9 will
+     *        wire BPTLeafCSRWriter into sorter_dispatch.cc to complete
+     *        the feature.
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -448,7 +456,8 @@ public:
         bool include_label_indexes = true,
         IndexSet index_set = static_cast<IndexSet>(0),  // IndexSet::ALL (fwd-declared)
         bool build_topology_snapshot = false,
-        BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET
+        BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET,
+        BPT::GraphStorage graph_storage = BPT::GraphStorage::BTREE
     );
 
     ~NativeProjectionBuilder();
@@ -514,6 +523,19 @@ public:
      * happens inside the ctor body.
      */
     BPT::LeafFormat get_leaf_format() const noexcept { return leaf_format_; }
+
+    /**
+     * @brief Returns the BPT::GraphStorage stored on the builder (Spec #8 T8.8).
+     *
+     * Reflects the value wired in by graph_project's `graphStorage` config
+     * key (or BPT::GraphStorage::BTREE when the key is absent / the legacy
+     * positional constructor is used). Exposed for testability; the actual
+     * propagation to ProjectionStorage (and thence to the v1.6 catalog byte)
+     * happens inside the ctor body.
+     */
+    BPT::GraphStorage get_graph_storage() const noexcept {
+        return graph_storage_;
+    }
 
 private:
     /**
@@ -717,6 +739,14 @@ private:
     // preserves pre-Spec-#5 byte-identical behavior for every pre-T5.11
     // caller of this constructor.
     BPT::LeafFormat leaf_format_ = BPT::LeafFormat::BITSET;
+
+    // Spec #8 T8.8: per-projection graph-storage mode. Threaded through
+    // ProjectionStorage so save_catalog() can populate the v1.6
+    // graph_storage byte. Default BTREE preserves pre-Spec-#8 byte-for-byte
+    // behavior for every existing caller; CSR_HYBRID is the opt-in that
+    // T8.9 will pick up when wiring BPTLeafCSRWriter into the edge-index
+    // sorter-dispatch path.
+    BPT::GraphStorage graph_storage_ = BPT::GraphStorage::BTREE;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
     std::unordered_map<std::string, Orientation> per_type_orientations;

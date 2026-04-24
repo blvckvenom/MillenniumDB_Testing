@@ -620,6 +620,25 @@ public:
     /// @brief Returns the leaf-format preset this projection was built under.
     BPT::LeafFormat get_leaf_format() const noexcept { return requested_leaf_format; }
 
+    /// @brief Spec #8 T8.8 — per-projection graph-storage mode. Set by
+    /// NativeProjectionBuilder from the GQL `graphStorage` config key
+    /// before flush(), restored on open() from ProjectionCatalog::
+    /// graph_storage (v1.6 byte). Consumed by:
+    ///   (1) save_catalog() which forwards it into catalog.graph_storage
+    ///       for v1.6 persistence.
+    ///   (2) T8.9's edge-index dispatch in sorter_dispatch.cc, which will
+    ///       select BPTLeafCSRWriter under CSR_HYBRID. Under T8.8 alone
+    ///       the dispatch path still emits BTREE leaves regardless, so
+    ///       CSR_HYBRID projections currently round-trip the catalog byte
+    ///       only.
+    /// Default BTREE preserves pre-Spec-#8 byte-identical behavior.
+    BPT::GraphStorage requested_graph_storage = BPT::GraphStorage::BTREE;
+
+    /// @brief Returns the graph-storage mode this projection was built under.
+    BPT::GraphStorage get_graph_storage() const noexcept {
+        return requested_graph_storage;
+    }
+
     /// @name Spec #4-B T4.18: integrated topology snapshot emission
     /// @{
 
