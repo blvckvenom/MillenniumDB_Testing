@@ -336,15 +336,17 @@ int main() {
                 cat.save();
             }
             auto catalog_path = std::filesystem::path(dir) / "catalog.dat";
-            auto total_size = std::filesystem::file_size(catalog_path);
-            // Truncate the trailing IndexSet byte (1 byte at end of v1.4).
-            std::filesystem::resize_file(catalog_path, total_size - 1);
-            // Rewrite minor version byte from 4 to 3 (at offset 12:
-            // 6 magic + 3 mdb_ver + 1 model_id + 1 major_ver).
+            // Rewrite minor version byte to 3 at offset 11
+            // (6 magic + 3 mdb_ver + 1 model_id + 1 major_ver = 11 bytes
+            // before the catalog minor_ver byte). Reader then treats the
+            // catalog as pre-IndexSet (v1.3) and defaults index_set to ALL
+            // without attempting to read the v1.4 IndexSet byte or any
+            // v1.5+ trailing payload — which is the core backwards-compat
+            // guarantee this test pins.
             {
                 std::fstream f(catalog_path, std::ios::in | std::ios::out
                                            | std::ios::binary);
-                f.seekp(12);
+                f.seekp(11);
                 char three = 3;
                 f.write(&three, 1);
                 f.close();

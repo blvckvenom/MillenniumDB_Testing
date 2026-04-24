@@ -43,6 +43,20 @@ enum class IndexSet : uint8_t;
  * | 1.2 | Added property key mappings (index-based, DEPRECATED) |
  * | 1.3 | Fixed key mappings to persist actual IDs (not indices) |
  * | 1.4 | Added IndexSet preset byte (Spec #3 T3.6) |
+ * | 1.5 | Added per-index leaf_format byte array (Spec #5 T5.10) |
+ *
+ * ## v1.5 additions
+ *
+ * After the v1.4 IndexSet preset byte, v1.5 appends a length-prefixed byte
+ * array naming the on-disk leaf encoding (BPT::LeafFormat) of each
+ * materialized index. The array has one entry per materialized index, in
+ * the canonical ProjectionIndex single-bit enum order (NODES, NODE_LABEL,
+ * LABEL_NODE, NODE_KEY_VALUE, KEY_VALUE_NODE, FROM_TO_EDGE, TO_FROM_EDGE,
+ * EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2, EDGE_LABEL, LABEL_EDGE,
+ * EDGE_KEY_VALUE, KEY_VALUE_EDGE). Values: 1 = BITSET (legacy redundant
+ * bitset encoding), 2 = DELTA_VARINT (Spec #5 v2 encoding). Catalogs with
+ * MINOR < 5 are read by populating leaf_formats with all-BITSET (1) for
+ * every materialized index, preserving pre-Spec-#5 behavior.
  *
  * @see ProjectionStorage for the actual index storage
  * @see ProjectionManager for projection lifecycle management
@@ -52,7 +66,8 @@ public:
     /// @name Format Constants
     /// @{
     static constexpr uint8_t MAJOR_VERSION = 1;    ///< Catalog format major version
-    static constexpr uint8_t MINOR_VERSION = 4;    ///< Minor version (1.4 adds IndexSet preset byte)
+    /// Minor version (1.5 adds per-index leaf_format byte array)
+    static constexpr uint8_t MINOR_VERSION = 5;
     static constexpr uint8_t magic_number[] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};  ///< File type identifier
     static constexpr uint8_t MODEL_ID = 255;       ///< Special ID distinguishing from GQL/RDF catalogs
     /// @}
@@ -164,6 +179,25 @@ public:
     /// @{
     IndexSet index_set = static_cast<IndexSet>(0);  ///< IndexSet::ALL (fwd-declared)
     /// @}
+
+    /// @name Per-Index Leaf Format (v1.5+)
+    /// @brief Per-index LeafFormat byte (Spec #5, v1.5+). Size == number of
+    /// materialized indexes (those whose bit is set in index_set). Order
+    /// follows the canonical ProjectionIndex enum (NODES, NODE_LABEL,
+    /// LABEL_NODE, NODE_KEY_VALUE, KEY_VALUE_NODE, FROM_TO_EDGE, TO_FROM_EDGE,
+    /// EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2, EDGE_LABEL, LABEL_EDGE,
+    /// EDGE_KEY_VALUE, KEY_VALUE_EDGE). Values: 1 = BITSET (legacy), 2 =
+    /// DELTA_VARINT (Spec #5 v2). v1.4 and earlier catalogs read under v1.5
+    /// code default every entry to BITSET (1). The on-disk representation is
+    /// uint8_t per slot; conversion to BPT::LeafFormat happens in consumers
+    /// (T5.11 wires this field into BPlusTree<N>::ctor).
+    /// @{
+    std::vector<uint8_t> leaf_formats;
+    /// @}
+
+    /// @brief Accessor mirroring get-style helpers elsewhere in the catalog.
+    /// Returns the persisted per-index leaf_format byte array (const).
+    const std::vector<uint8_t>& get_leaf_formats() const { return leaf_formats; }
 
     /// @name Debug Information
     /// @{

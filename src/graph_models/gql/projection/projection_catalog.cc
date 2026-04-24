@@ -5,12 +5,33 @@
 #include <stdexcept>
 
 #include "graph_models/gql/projection/index_set.h"
+#include "graph_models/gql/projection/native_projection_builder.h"
+#include "storage/index/bplus_tree/bpt_leaf_format.h"
 
 namespace fs = std::filesystem;
 
 namespace GQL {
 
 constexpr uint8_t ProjectionCatalog::magic_number[];
+
+namespace {
+
+// Count the number of single-bit ProjectionIndex entries set in the mask
+// corresponding to the given IndexSet preset. Used by v1.5 to size the
+// leaf_formats byte array both at read time (validation) and at save time
+// (defaulting an empty vector to all-BITSET).
+//
+// Note: the full ProjectionIndex::ALL mask is 14 bits (0x3FFF). Property
+// indexes (NODE_KEY_VALUE, KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE)
+// are always counted here because the catalog's index_set byte encodes the
+// *preset*, not the runtime-gated property conditionals — matching the
+// behavior of project_index_mask_for().
+size_t count_materialized_indexes(IndexSet preset) noexcept {
+    const auto mask = static_cast<uint32_t>(project_index_mask_for(preset));
+    return static_cast<size_t>(__builtin_popcount(mask));
+}
+
+}  // namespace
 
 ProjectionCatalog::ProjectionCatalog(const std::string& projection_dir)
     : catalog_path(projection_dir + "/catalog.dat")
@@ -155,6 +176,42 @@ void ProjectionCatalog::load() {
         index_set = IndexSet::ALL;
     }
 
+    // v1.5 field: per-index leaf_format byte array. One byte per materialized
+    // index, in canonical ProjectionIndex enum order. For v1.4 and earlier
+    // catalogs, populate with all BITSET (1) so pre-Spec-#5 projections read
+    // as redundant-bitset-encoded (preserving historical behavior).
+    leaf_formats.clear();
+    if (minor_ver >= 5) {
+        const uint8_t num_format_bytes = read_uint8(file);
+        const size_t expected = count_materialized_indexes(index_set);
+        if (static_cast<size_t>(num_format_bytes) != expected) {
+            throw std::runtime_error(
+                "Catalog v1.5: leaf_format array length mismatch (got "
+                + std::to_string(num_format_bytes)
+                + ", expected " + std::to_string(expected) + ")");
+        }
+        leaf_formats.reserve(num_format_bytes);
+        for (uint8_t i = 0; i < num_format_bytes; ++i) {
+            const uint8_t fmt = read_uint8(file);
+            if (fmt != static_cast<uint8_t>(BPT::LeafFormat::BITSET) &&
+                fmt != static_cast<uint8_t>(BPT::LeafFormat::DELTA_VARINT)) {
+                throw std::runtime_error(
+                    "Catalog v1.5: invalid leaf_format byte "
+                    + std::to_string(fmt) + " at index " + std::to_string(i)
+                    + " (expected 1=BITSET or 2=DELTA_VARINT)");
+            }
+            leaf_formats.push_back(fmt);
+        }
+    } else {
+        // Pre-v1.5 catalog: synthesize an all-BITSET array whose length
+        // matches the current materialized-index count. This keeps the
+        // in-memory shape consistent for any consumer that iterates
+        // leaf_formats without caring whether the on-disk file had the
+        // section or not.
+        const size_t n = count_materialized_indexes(index_set);
+        leaf_formats.assign(n, static_cast<uint8_t>(BPT::LeafFormat::BITSET));
+    }
+
     file.close();
 }
 
@@ -230,6 +287,33 @@ void ProjectionCatalog::save() {
     // uint32 count. v1.3 readers stop reading after the edge key mappings
     // loop, which is why appending here preserves read-side compatibility.
     write_uint8(file, static_cast<uint8_t>(index_set));
+
+    // Write v1.5 field: per-index leaf_format byte array. Length-prefixed
+    // (uint8_t) because the full ProjectionIndex enum has 14 single-bit
+    // values, well within 0-255. If leaf_formats hasn't been populated by
+    // the caller (e.g. a freshly-constructed catalog that only set index_set
+    // and the basic metadata), default every slot to BITSET so on-disk and
+    // on-read invariants hold. Same defaulting rule is applied by the
+    // v1.4-catalog read path so both code paths yield the same in-memory
+    // state for pre-Spec-#5 workloads.
+    if (leaf_formats.empty()) {
+        const size_t n = count_materialized_indexes(index_set);
+        leaf_formats.assign(n, static_cast<uint8_t>(BPT::LeafFormat::BITSET));
+    }
+    // Guard against an accidental out-of-range size. The v1.5 length prefix
+    // is a single byte, so we must keep leaf_formats.size() <= 255. The
+    // active ProjectionIndex enum tops out at 14 bits, but this guard
+    // insulates the write path from any future enum expansion that would
+    // silently truncate the count.
+    if (leaf_formats.size() > 255) {
+        throw std::runtime_error(
+            "Catalog v1.5: leaf_formats size exceeds uint8_t limit ("
+            + std::to_string(leaf_formats.size()) + " > 255)");
+    }
+    write_uint8(file, static_cast<uint8_t>(leaf_formats.size()));
+    for (uint8_t fmt : leaf_formats) {
+        write_uint8(file, fmt);
+    }
 
     // Ensure data is flushed to OS buffer before close
     file.flush();
