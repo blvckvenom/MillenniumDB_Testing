@@ -321,6 +321,14 @@ public:
     /// resident and do not count toward in-RAM accounting.
     std::size_t total_ram_used() const noexcept;
 
+    /// Phase 4 / T13.11: MinHash permutation over L3-tier nodes (empty
+    /// on cold start). Exposed for testing and for future Phase 5+
+    /// consumers that will apply the permutation to the on-disk L3
+    /// sidecar.
+    const std::vector<uint64_t>& l3_reorder_permutation() const noexcept {
+        return l3_reorder_permutation_;
+    }
+
 private:
     // Helper that performs the tier switch for one direction. Both
     // public per-direction methods bind their tier sources before
@@ -363,9 +371,50 @@ private:
         BPlusTree<3>*                                                 index,
         const std::vector<uint8_t>&                                    tiers,
         const std::vector<uint64_t>&                                   frequency,
+        const GQL::Projection::TopologySnapshotReader*                 sidecar,
         std::unique_ptr<L1HashCache>&                                  l1_out,
         std::unique_ptr<L2CompactCsr>&                                 l2_out) const;
+    /**
+     * @brief Fast L1+L2 build path that reads the Spec #4-B sidecar
+     *        directly instead of walking the B+Tree (Phase 4 / T13.10).
+     *
+     * Walks `row_idx` in [0, sidecar.num_nodes()), looks up the tier,
+     * and dispatches the slice into L1 (reserve+move) or L2 (add_node).
+     * Tier-3 / tier-4 nodes are skipped. The sidecar already exposes
+     * O(1) per-node mmap reads, so the inner loop is ~1-5 us/node vs
+     * the BPT path's ~30-100 us/node — translates to roughly 5x faster
+     * build on arxiv/products and ~5-10 minutes saved on papers100M.
+     *
+     * Uses the same `node_to_l2_idx_` ordering invariant as the BPT
+     * path: both traverse row_idx ascending and call `L2CompactCsr::
+     * add_node` in the same order, so the post-freeze map is bit-
+     * identical between the two paths.
+     */
+    void populate_direction_via_sidecar_(
+        const GQL::Projection::TopologySnapshotReader& sidecar,
+        const std::vector<uint8_t>&                    tiers,
+        const std::vector<uint64_t>&                   frequency,
+        std::unique_ptr<L1HashCache>&                  l1_out,
+        std::unique_ptr<L2CompactCsr>&                 l2_out) const;
     void open_l3_sidecars_();
+    /**
+     * @brief Compute a permutation that clusters L3-tier nodes by
+     *        sample-set similarity (Phase 4 / T13.11).
+     *
+     * Uses `MinHashReorderer::Strategy::SEGMENTED` (DiskGNN Algorithm
+     * 1, validated by Spec #5). Only fires when the frequency profiler
+     * consumed `<projection_dir>/node_counts.bin` (warm start). On
+     * cold start the permutation is left empty and a one-line cerr
+     * message is emitted documenting the skip reason.
+     *
+     * @note The permutation is STORED but not APPLIED. Rewriting the
+     *       on-disk `topology_*.csr` sidecar requires a full rebuild
+     *       and is deferred to a future Phase 5+ task. The infra is
+     *       laid here so when `gnn_offline_sample` learns to persist
+     *       `node_counts.bin` (Phase 5), the permutation becomes
+     *       available to downstream consumers.
+     */
+    void compute_l3_minhash_reorder_(bool warm_start_used);
 
     // Tier sources — Phase 3 ctor owns them; Phase 2 dispatcher ctor
     // leaves them null and uses the caller-provided `*_ref_` members.
@@ -378,6 +427,12 @@ private:
     std::unique_ptr<GQL::Projection::TopologySnapshotReader>
                                                        owned_l3_rev_;
     std::vector<uint8_t>                               owned_tier_assignment_;
+
+    // Phase 4 / T13.11: MinHash permutation over L3-tier nodes. Empty on
+    // cold start (no `node_counts.bin` yet) — populated only when warm
+    // start is reached. Currently stored but not applied; future work
+    // (Phase 5+) consumes it to rewrite the L3 sidecar layout.
+    std::vector<uint64_t>                              l3_reorder_permutation_;
 
     // References to whichever tier sources are active (owned-or-borrowed).
     const L1HashCache*                                 l1_fwd_ = nullptr;

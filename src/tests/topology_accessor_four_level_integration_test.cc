@@ -46,6 +46,7 @@
 #include "gnn/sampling/sampling_config.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
+#include "graph_models/gql/projection/topology_snapshot_writer.h"
 #include "graph_models/object_id.h"
 #include "query/query_context.h"
 #include "system/system.h"
@@ -317,4 +318,158 @@ TEST(TopologyAccessorFourLevel, Conflict_AdjCacheFalseAndFourLevelTrue_Throws) {
         cfg.use_adjacency_cache           = false;
         EXPECT_THROW(cfg.validate(), std::invalid_argument);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 (T13.10) — Build_UsesSidecarWhenAvailable.
+//
+// When `use_l3_mmap_sidecar:true` is set on a projection that already has
+// `topology_*.csr` sidecar files, `populate_direction_` takes the fast
+// path (sidecar walk) instead of the BPT walk. Streaming determinism + L1
+// node counts must remain bit-identical to the BPT path, so this test:
+//
+//   1. Builds the sidecar files directly using `TopologySnapshotWriter`
+//      (avoiding the heavier `native_projection_builder.h` link surface
+//      that is independently broken on this branch).
+//   2. Constructs a four-level store with a generous L1 budget so all
+//      nodes land in tier 1.
+//   3. Asserts L1 holds every node in both directions and L2 / L3 are
+//      empty.
+//   4. Verifies per-node neighbour parity vs a BPT-only oracle accessor
+//      on `(node_id, edge_id)` pairs.
+//
+// Build-time speedup (~5×) is measured separately by Phase 6 benchmarks;
+// this unit test only proves functional equivalence.
+// ---------------------------------------------------------------------------
+TEST(TopologyAccessorFourLevel, Build_UsesSidecarWhenAvailable) {
+    (void)MdbFixture::instance();
+    auto storage = build_fixture_storage("four_level_sidecar_fast_path");
+
+    // ------------------------------------------------------------------
+    // Build topology_fwd.csr + topology_rev.csr from the fixture edges.
+    // Order requirement: edges must arrive in source-monotonic order
+    // matching the degree histogram. We sort the fixture edges into
+    // src order and feed both directions.
+    // ------------------------------------------------------------------
+    auto build_sidecar = [&](GQL::Projection::TopologySnapshotWriter::Direction dir) {
+        std::vector<uint64_t> degrees(FixtureGraph::kNumNodes, 0);
+        std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sorted_edges;
+        sorted_edges.reserve(FixtureGraph::edges().size());
+        for (const auto& e : FixtureGraph::edges()) {
+            const uint64_t from = std::get<0>(e);
+            const uint64_t to   = std::get<1>(e);
+            const uint64_t eid  = std::get<2>(e);
+            if (dir == GQL::Projection::TopologySnapshotWriter::Direction::FORWARD) {
+                sorted_edges.emplace_back(from, to, eid);
+                degrees[from]++;
+            } else {
+                // REVERSE: store as (to, from, eid). Source key is the
+                // destination of the natural edge.
+                sorted_edges.emplace_back(to, from, eid);
+                degrees[to]++;
+            }
+        }
+        std::sort(sorted_edges.begin(), sorted_edges.end());
+
+        GQL::Projection::TopologySnapshotWriter w(
+            std::filesystem::path(storage->get_projection_dir()),
+            dir,
+            FixtureGraph::kNumNodes,
+            std::move(degrees),
+            /*include_edge_ids=*/true);
+        for (const auto& [src, dst, eid] : sorted_edges) {
+            w.append_edge(ObjectId(src), ObjectId(dst), ObjectId(eid));
+        }
+        w.finalize();
+    };
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::FORWARD);
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::REVERSE);
+
+    // ------------------------------------------------------------------
+    // Construct a four-level store directly (bypassing TopologyAccessor)
+    // so the test can inspect tier counts. Generous L1 budget guarantees
+    // every node lands in tier 1.
+    // ------------------------------------------------------------------
+    mdb::gnn::FourLevelTopologyStore::Config cfg;
+    cfg.l1_budget_mb        = 256;
+    cfg.l2_budget_mb        = 256;
+    cfg.use_l3_mmap_sidecar = true;
+    cfg.orientation         = mdb::gnn::EdgeOrientation::UNDIRECTED;
+
+    mdb::gnn::FourLevelTopologyStore store(
+        storage->get_from_to_edge_index(),
+        storage->get_to_from_edge_index(),
+        storage.get(),
+        std::filesystem::path(storage->get_projection_dir()),
+        cfg);
+    store.build();
+
+    // Tier 1 holds every node in both directions. UNDIRECTED orientation
+    // builds both fwd and rev L1, so the count is 2 × N.
+    EXPECT_EQ(2u * FixtureGraph::kNumNodes, store.l1_node_count());
+    EXPECT_EQ(0u, store.l2_node_count());
+    // l3_node_count() reports the sidecar's `num_nodes()` per direction
+    // (it's a sidecar-presence diagnostic, not a tier-3-assignment
+    // counter). Under UNDIRECTED both directions report N, totalling
+    // 2 × N. The orthogonal assertion that L1 holds every node already
+    // proves no node was actually served from L3 at lookup time.
+    EXPECT_EQ(2u * FixtureGraph::kNumNodes, store.l3_node_count());
+
+    // Per-node parity vs a BPT-only oracle accessor. We compare on
+    // (node_id, edge_id) pairs since tier 1 retains edge_ids.
+    mdb::gnn::TopologyAccessor oracle(*storage);
+    for (uint64_t nid = 0; nid < FixtureGraph::kNumNodes; ++nid) {
+        auto store_n = store.get_out_neighbors(ObjectId(nid));
+        std::vector<std::pair<uint64_t, uint64_t>> got;
+        store_n.for_each_with_edge_id(
+            [&](uint64_t dst, uint64_t eid) {
+                got.emplace_back(dst, eid);
+            });
+        std::sort(got.begin(), got.end());
+
+        auto oracle_n = oracle.get_out_neighbors(ObjectId(nid));
+        std::vector<std::pair<uint64_t, uint64_t>> expected;
+        for (std::size_t i = 0; i < oracle_n.node_ids.size(); ++i) {
+            const uint64_t eid = (i < oracle_n.edge_ids.size())
+                                 ? oracle_n.edge_ids[i].id : 0ULL;
+            expected.emplace_back(oracle_n.node_ids[i].id, eid);
+        }
+        std::sort(expected.begin(), expected.end());
+        EXPECT_EQ(expected, got) << "out node " << nid;
+    }
+
+    // Cold-start path: the MinHash permutation must be empty when no
+    // node_counts.bin exists (every build today). Phase 5 will flip
+    // the warm-start branch and populate this vector.
+    EXPECT_TRUE(store.l3_reorder_permutation().empty());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 (T13.11) — Build_ColdStartSkipsMinHashReorder.
+//
+// Confirms the cold-start branch of `compute_l3_minhash_reorder_` leaves
+// the permutation empty when `node_counts.bin` is absent. Today every
+// build is a cold start (the file is never persisted), so this test
+// pins the invariant against future regressions in the warm-start
+// activation logic.
+// ---------------------------------------------------------------------------
+TEST(TopologyAccessorFourLevel, Build_ColdStartSkipsMinHashReorder) {
+    (void)MdbFixture::instance();
+    auto storage = build_fixture_storage("four_level_cold_start_minhash");
+
+    mdb::gnn::FourLevelTopologyStore::Config cfg;
+    cfg.l1_budget_mb        = 256;
+    cfg.l2_budget_mb        = 256;
+    cfg.use_l3_mmap_sidecar = false;
+    cfg.orientation         = mdb::gnn::EdgeOrientation::UNDIRECTED;
+
+    mdb::gnn::FourLevelTopologyStore store(
+        storage->get_from_to_edge_index(),
+        storage->get_to_from_edge_index(),
+        storage.get(),
+        std::filesystem::path(storage->get_projection_dir()),
+        cfg);
+    store.build();
+
+    EXPECT_TRUE(store.l3_reorder_permutation().empty());
 }

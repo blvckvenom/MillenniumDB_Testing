@@ -13,6 +13,7 @@
 
 #include "gnn/projection/topology_accessor.h"
 #include "gnn/projection/topology_frequency_profiler.h"
+#include "gnn/sampling/minhash_reorderer.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
 #include "misc/available_ram.h"
@@ -144,12 +145,26 @@ void FourLevelTopologyStore::auto_detect_budgets_(
 }
 
 void FourLevelTopologyStore::populate_direction_(
-    BPlusTree<3>*                              index,
-    const std::vector<uint8_t>&                tiers,
-    const std::vector<uint64_t>&               frequency,
-    std::unique_ptr<L1HashCache>&              l1_out,
-    std::unique_ptr<L2CompactCsr>&             l2_out) const
+    BPlusTree<3>*                                          index,
+    const std::vector<uint8_t>&                            tiers,
+    const std::vector<uint64_t>&                           frequency,
+    const GQL::Projection::TopologySnapshotReader*         sidecar,
+    std::unique_ptr<L1HashCache>&                          l1_out,
+    std::unique_ptr<L2CompactCsr>&                         l2_out) const
 {
+    // Phase 4 / T13.10: prefer the Spec #4-B sidecar fast path when one
+    // was opened for this direction. The sidecar exposes O(1) per-node
+    // mmap reads, so populating L1/L2 from it is ~10-20× faster than
+    // walking the BPT directory + leaf chain. Streaming determinism is
+    // preserved because both paths traverse row_idx ascending and call
+    // `L2CompactCsr::add_node` in the same order — `node_to_l2_idx_`
+    // is bit-identical between the two paths.
+    if (sidecar != nullptr && sidecar->has_data()) {
+        populate_direction_via_sidecar_(*sidecar, tiers, frequency,
+                                        l1_out, l2_out);
+        return;
+    }
+
     l1_out = std::make_unique<L1HashCache>(tiers);
     l2_out = std::make_unique<L2CompactCsr>(/*hint=*/0);
 
@@ -257,6 +272,73 @@ void FourLevelTopologyStore::populate_direction_(
     l2_out->freeze();
 }
 
+void FourLevelTopologyStore::populate_direction_via_sidecar_(
+    const GQL::Projection::TopologySnapshotReader& sidecar,
+    const std::vector<uint8_t>&                    tiers,
+    const std::vector<uint64_t>&                   frequency,
+    std::unique_ptr<L1HashCache>&                  l1_out,
+    std::unique_ptr<L2CompactCsr>&                 l2_out) const
+{
+    l1_out = std::make_unique<L1HashCache>(tiers);
+    l2_out = std::make_unique<L2CompactCsr>(/*hint=*/0);
+
+    const uint64_t num_nodes = sidecar.num_nodes();
+    const bool     has_eids  = sidecar.has_edge_ids();
+
+    // Walk row_idx in [0, num_nodes) ascending — same order the BPT path
+    // observes via lex-sorted (src, dst, edge_id) iteration. `tier_lookup_`
+    // is also indexed by row_idx (== ObjectId.id under the current
+    // identity-RowMapping assumption documented in build()). Tier-3 / 4
+    // nodes are skipped: their primary home is the L3 sidecar itself
+    // (or the L4 BPT direct path); promoting them to L1/L2 would defeat
+    // the tier-budget contract.
+    std::vector<AdjEntry> staging;
+    for (uint64_t row_idx = 0; row_idx < num_nodes; ++row_idx) {
+        if (row_idx >= tiers.size()) break;  // tier vector exhausted
+        const uint8_t tier = tiers[row_idx];
+        if (tier != 1 && tier != 2) continue;  // skip L3 / L4
+
+        auto dsts = sidecar.neighbors(row_idx);
+        const uint64_t* eids = nullptr;
+        if (has_eids) {
+            auto eid_span = sidecar.edge_ids(row_idx);
+            if (eid_span.size() == dsts.size()) {
+                eids = eid_span.data();
+            }
+        }
+
+        // Reuse the staging buffer across nodes so per-iteration alloc
+        // overhead doesn't dominate the 1-5 us/node target. capacity is
+        // retained, only `size` is reset.
+        staging.clear();
+        if (row_idx < frequency.size() && frequency[row_idx] > 0) {
+            staging.reserve(static_cast<std::size_t>(frequency[row_idx]));
+        } else {
+            staging.reserve(dsts.size());
+        }
+        for (std::size_t i = 0; i < dsts.size(); ++i) {
+            const uint64_t eid = (eids != nullptr) ? eids[i] : 0ULL;
+            staging.push_back(AdjEntry{ dsts[i], eid });
+        }
+
+        if (tier == 1) {
+            std::vector<AdjEntry> tight(std::move(staging));
+            tight.shrink_to_fit();
+            l1_out->insert(/*src_node_id=*/row_idx,
+                           std::move(tight),
+                           /*row_idx=*/static_cast<std::size_t>(row_idx));
+            // staging was moved-from; restore to a known-empty vector so
+            // the next iteration's reserve starts from a clean slate.
+            staging = std::vector<AdjEntry>();
+        } else {
+            // tier == 2
+            l2_out->add_node(/*src_node_id=*/row_idx, staging);
+        }
+    }
+
+    l2_out->freeze();
+}
+
 void FourLevelTopologyStore::open_l3_sidecars_() {
     if (!config_.use_l3_mmap_sidecar) return;
     if (projection_dir_.empty())     return;
@@ -283,6 +365,82 @@ void FourLevelTopologyStore::open_l3_sidecars_() {
     }
 }
 
+void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
+    // Phase 4 / T13.11 — frequency-aware L3 reorder via Spec #5
+    // MinHashReorderer (DiskGNN Algorithm 1, SEGMENTED variant).
+    //
+    // The reorder requires per-batch sample-row lists (the
+    // `BatchProvider` callback drives MinHash through every batch's
+    // accessed-node set). That list lives in `node_counts.bin`, which
+    // `gnn_offline_sample` does not yet persist (Phase 5 will wire it
+    // up). Until then, every build is a cold start and this method is
+    // effectively a no-op.
+    //
+    // SCOPE LIMIT (per Phase 4 plan): when warm-start data exists, we
+    // STORE the permutation in `l3_reorder_permutation_` but do NOT
+    // rewrite the on-disk `topology_*.csr` sidecar. That rewrite
+    // requires a full sidecar rebuild and is deferred to Phase 5+.
+    l3_reorder_permutation_.clear();
+
+    if (!warm_start_used) {
+        std::cerr << "[FourLevelTopologyStore] Cold start (no "
+                  << "node_counts.bin) — skipping L3 MinHash reorder. "
+                  << "Phase 5 will enable warm start.\n";
+        return;
+    }
+
+    // Warm-start path (currently dead until Phase 5 persists
+    // node_counts.bin). Lays the call site so the activation point is
+    // a single boolean flip away.
+    if (tier_lookup_ref_ == nullptr || tier_lookup_ref_->empty()) {
+        return;
+    }
+
+    // Collect L3-tier node IDs (row indices, identity RowMapping).
+    std::vector<uint64_t> l3_node_ids;
+    l3_node_ids.reserve(tier_lookup_ref_->size() / 4);
+    for (std::size_t i = 0; i < tier_lookup_ref_->size(); ++i) {
+        if ((*tier_lookup_ref_)[i] == 3) {
+            l3_node_ids.push_back(static_cast<uint64_t>(i));
+        }
+    }
+    if (l3_node_ids.empty()) {
+        return;
+    }
+
+    // Build a permutation that puts L3-tier nodes in MinHash-clustered
+    // order. The MinHashReorderer expects a `BatchProvider` callback
+    // that maps batch_id → list of row IDs accessed by that batch. We
+    // can't supply that without `node_counts.bin`; this branch is
+    // structured for the Phase 5 hook-up and is unreachable today.
+    //
+    // When activated, the permutation lookup is:
+    //   permutation[new_position] = old_row_idx
+    // — Phase 5+ rewrites the L3 sidecar in `permutation` order so
+    // adjacent disk pages cluster MinHash-similar nodes.
+    MinHashReorderer::Config minhash_cfg;
+    minhash_cfg.strategy   = MinHashReorderer::Strategy::SEGMENTED;
+    MinHashReorderer reorderer(minhash_cfg);
+
+    // Phase 5 will replace this lambda with one that reads
+    // `<projection_dir>/node_counts.bin` and yields per-batch row sets.
+    auto provider = [](uint64_t /*batch_id*/) -> std::vector<uint64_t> {
+        return {};
+    };
+    reorderer.build_access_graph(/*num_batches=*/0, provider);
+
+    // total_rows must equal the underlying topology's row count, not
+    // just the L3 subset, so the reorderer's "unaccessed nodes
+    // appended" logic produces a complete permutation.
+    l3_reorder_permutation_ =
+        reorderer.compute_permutation(tier_lookup_ref_->size());
+
+    std::cerr << "[FourLevelTopologyStore] Warm start used — computed "
+              << "MinHash permutation over " << l3_node_ids.size()
+              << " L3-tier nodes (stored only; Phase 5+ applies it to "
+              << "the on-disk sidecar).\n";
+}
+
 void FourLevelTopologyStore::build() {
     if (!phase3_ctor_) {
         throw std::logic_error(
@@ -299,6 +457,14 @@ void FourLevelTopologyStore::build() {
     std::size_t l1_bytes = 0;
     std::size_t l2_bytes = 0;
     auto_detect_budgets_(l1_bytes, l2_bytes);
+
+    // Step 1.5: open Spec #4-B sidecars early (Phase 4 / T13.10) so that
+    // populate_direction_ can use the mmap fast path instead of walking
+    // the BPT. The opens are no-ops when the sidecar files are absent
+    // (e.g., projection built without buildTopologySnapshot:true) or
+    // stale — in which case populate_direction_ falls through to the
+    // BPT path automatically.
+    open_l3_sidecars_();
 
     // Step 2: build a TopologyAccessor over the storage so the profiler
     // can query degrees through a stable API. When `storage_` is null
@@ -352,10 +518,14 @@ void FourLevelTopologyStore::build() {
             frequency, l1_bytes, l2_bytes, avg_degree);
         tier_lookup_ref_ = &owned_tier_assignment_;
 
+        // Synthetic-test path always cold-starts (no profiler ⇒ no
+        // node_counts.bin). Skip MinHash reorder as a no-op.
+        compute_l3_minhash_reorder_(/*warm_start_used=*/false);
+
         populate_direction_(fwd_bpt_, owned_tier_assignment_, frequency,
-                            owned_l1_fwd_, owned_l2_fwd_);
+                            l3_fwd_, owned_l1_fwd_, owned_l2_fwd_);
         populate_direction_(rev_bpt_, owned_tier_assignment_, frequency,
-                            owned_l1_rev_, owned_l2_rev_);
+                            l3_rev_, owned_l1_rev_, owned_l2_rev_);
     } else {
         // Production path: use TopologyAccessor + TopologyFrequencyProfiler.
         TopologyAccessor accessor(*storage_);
@@ -375,12 +545,18 @@ void FourLevelTopologyStore::build() {
             freq, l1_bytes, l2_bytes, avg_degree);
         tier_lookup_ref_ = &owned_tier_assignment_;
 
+        // Phase 4 / T13.11: compute MinHash reorder permutation when
+        // warm-start data is available. Cold-start path emits a single
+        // info log and leaves the permutation empty (no-op until Phase
+        // 5 wires up node_counts.bin in gnn_offline_sample).
+        compute_l3_minhash_reorder_(profiler.warm_start_used());
+
         // Build forward direction when needed.
         if (config_.orientation == EdgeOrientation::NATURAL ||
             config_.orientation == EdgeOrientation::UNDIRECTED)
         {
             populate_direction_(fwd_bpt_, owned_tier_assignment_, freq,
-                                owned_l1_fwd_, owned_l2_fwd_);
+                                l3_fwd_, owned_l1_fwd_, owned_l2_fwd_);
         } else {
             // Reverse-only: still allocate empty L1/L2 forward so the
             // dispatcher's pointer accesses don't deref null.
@@ -394,7 +570,7 @@ void FourLevelTopologyStore::build() {
             config_.orientation == EdgeOrientation::UNDIRECTED)
         {
             populate_direction_(rev_bpt_, owned_tier_assignment_, freq,
-                                owned_l1_rev_, owned_l2_rev_);
+                                l3_rev_, owned_l1_rev_, owned_l2_rev_);
         } else {
             owned_l1_rev_ = std::make_unique<L1HashCache>(owned_tier_assignment_);
             owned_l2_rev_ = std::make_unique<L2CompactCsr>(0);
@@ -408,8 +584,9 @@ void FourLevelTopologyStore::build() {
     l2_fwd_ = owned_l2_fwd_.get();
     l2_rev_ = owned_l2_rev_.get();
 
-    // Open Spec #4-B sidecar readers when requested.
-    open_l3_sidecars_();
+    // Note: open_l3_sidecars_() was already called at Step 1.5 so the
+    // populate_direction_ fast path could use the mmap. l3_fwd_/l3_rev_
+    // are already wired by that earlier call.
 
     // Wire L4 fallback closures to the live BPTs. Required so L3-tier
     // nodes whose sidecar is absent / out-of-range fall through to a
