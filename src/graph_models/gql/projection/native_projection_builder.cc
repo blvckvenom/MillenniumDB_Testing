@@ -1070,6 +1070,7 @@ void NativeProjectionBuilder::try_extract_gnn_property(
             uint8_t split_val = 255;  // UNLABELED
             if (split_str == "train")           split_val = 0;
             else if (split_str == "val")        split_val = 1;
+            else if (split_str == "valid")      split_val = 1;  // OGB convention
             else if (split_str == "validation") split_val = 1;
             else if (split_str == "test")       split_val = 2;
             splits_buffer_[row] = split_val;
