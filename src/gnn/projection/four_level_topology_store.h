@@ -231,6 +231,14 @@ public:
     //
     // Lifetimes: `fwd_bpt` / `rev_bpt` / `storage` (when non-null)
     // must outlive the store.
+    //
+    /// @note `fwd_bpt` or `rev_bpt` may individually be null when the
+    ///       projection is restricted to one direction
+    ///       (NATURAL → fwd only, REVERSE → rev only). When both are
+    ///       null, `build()` produces an empty store and the dispatcher
+    ///       returns empty `Neighbors` for all queries. Synthetic-test
+    ///       paths that drive the dispatcher with pre-built tiers use
+    ///       the Phase 2 reference-taking constructor instead.
     FourLevelTopologyStore(BPlusTree<3>*               fwd_bpt,
                            BPlusTree<3>*               rev_bpt,
                            GQL::ProjectionStorage*     storage,
@@ -329,12 +337,32 @@ private:
     // -------------------------------------------------
     void auto_detect_budgets_(std::size_t& l1_bytes,
                               std::size_t& l2_bytes) const;
-    void scan_bpt_into_per_node_(
-        BPlusTree<3>*                                                 index,
-        std::vector<std::vector<AdjEntry>>&                            per_node) const;
+    /**
+     * @brief Stream-distribute BPT records into L1 / L2 by tier.
+     *
+     * Walks `index` once in `(src, dst, edge_id)` lexicographic order
+     * (the BPT iterator's natural order — verified at
+     * `bplus_tree.cc::BptIter<N>::next()`). Buffers the neighbors of
+     * the *current* src in a single `staging_buffer` and flushes that
+     * buffer to L1 (tier 1), L2 (tier 2), or drops it (tier 3 / 4)
+     * the moment the src key advances. Peak transient memory is
+     * therefore O(max_node_degree × sizeof(AdjEntry)) — bounded by
+     * ~2 MB on papers100M scale rather than ~50 GB if all per-node
+     * vectors were materialized first.
+     *
+     * @param frequency Per-row directed-edge degree, used purely as a
+     *                  `reserve(degree_hint)` so the staging buffer's
+     *                  growth doubling doesn't allocate beyond the
+     *                  actual degree (and so L1HashCache::total_bytes
+     *                  reports a tight estimate). May be empty in
+     *                  test paths; the streaming distribution stays
+     *                  correct without it (only the reserve hint is
+     *                  lost).
+     */
     void populate_direction_(
         BPlusTree<3>*                                                 index,
         const std::vector<uint8_t>&                                    tiers,
+        const std::vector<uint64_t>&                                   frequency,
         std::unique_ptr<L1HashCache>&                                  l1_out,
         std::unique_ptr<L2CompactCsr>&                                 l2_out) const;
     void open_l3_sidecars_();

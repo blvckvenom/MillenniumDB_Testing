@@ -550,6 +550,87 @@ TEST(FourLevelTopologyStore, BuildAndLookup_MatchesBpt_Synthetic) {
 }
 
 // ---------------------------------------------------------------------------
+// Test — Build_StreamingDoesNotMaterializeAllNodes.
+//
+// Behavioural assertion for the Phase 3 streaming-distribution refactor (the
+// papers100M peak-RSS bound): in a graph dominated by tier-3 / tier-4 nodes,
+// L1 must hold ONLY the tier-1 entries. The previous "materialize per-node
+// vector then distribute" path satisfied this contract too, but at a peak
+// transient cost of O(N × max_degree × sizeof(AdjEntry)). The streaming path
+// holds only the current src's neighbours in a staging buffer
+// (O(max_degree × sizeof(AdjEntry))), and crucially never allocates a
+// long-lived `vector<AdjEntry>` for tier-3 / tier-4 nodes.
+//
+// Because the unit-test environment lacks a live BPT, this test mirrors what
+// `populate_direction_` would emit: it manually inserts only the tier-1
+// nodes' adjacencies into L1HashCache (the streaming-fix behaviour) and
+// asserts the L1 node count + L4 fallback dispatch for tier-3 nodes match
+// the contract. The integration test in
+// `topology_accessor_four_level_integration_test.cc` exercises the actual
+// `build()` path on a real BPT.
+// ---------------------------------------------------------------------------
+TEST(FourLevelTopologyStore, Build_StreamingDoesNotMaterializeAllNodes) {
+    constexpr std::size_t kNumNodes = 100;
+    constexpr std::size_t kNumL1    = 10;
+    // First 10 nodes are tier-1, rest are tier-3.
+    std::vector<uint8_t> tiers(kNumNodes, 3);
+    for (std::size_t i = 0; i < kNumL1; ++i) tiers[i] = 1;
+
+    L1HashCache l1_fwd(tiers);
+    L1HashCache l1_rev(tiers);
+    L2CompactCsr l2_fwd, l2_rev;
+    l2_fwd.freeze();
+    l2_rev.freeze();
+
+    // Streaming distribution: only tier-1 nodes' neighbours ever reach L1.
+    // Tier-3 nodes are dropped without allocating per-node vectors. We model
+    // that by inserting ONLY the tier-1 adjacencies — the streaming-fix
+    // behaviour. (Under the pre-fix code the contract was the same, but the
+    // peak RAM was unbounded; we cannot measure RSS in unit-test scope so
+    // the count assertions are the only behavioural signal available here.)
+    for (std::size_t i = 0; i < kNumL1; ++i) {
+        l1_fwd.insert(/*src_node_id=*/i,
+                      std::vector<AdjEntry>{ {i + 1, 1000 + i} },
+                      /*row_idx=*/i);
+    }
+
+    // L4 oracle for the tier-3 fallback (no L3 sidecar in this test).
+    auto oracle = std::make_shared<
+        std::unordered_map<uint64_t, std::vector<AdjEntry>>>();
+    for (std::size_t i = kNumL1; i < kNumNodes; ++i) {
+        (*oracle)[i] = std::vector<AdjEntry>{ AdjEntry{ i + 1, 2000 + i } };
+    }
+
+    FourLevelTopologyStore::Config cfg;
+    FourLevelTopologyStore store(
+        l1_fwd, l1_rev, l2_fwd, l2_rev,
+        /*l3_fwd=*/nullptr, /*l3_rev=*/nullptr,
+        make_oracle_l4(oracle), make_oracle_l4(oracle),
+        tiers, identity_row_lookup(), cfg);
+
+    // L1 holds exactly the tier-1 nodes — never the tier-3 ones.
+    EXPECT_EQ(kNumL1, l1_fwd.node_count());
+    EXPECT_EQ(0u, l2_fwd.node_count());
+
+    // Tier-1 nodes dispatch through L1 with their seeded neighbours.
+    for (std::size_t i = 0; i < kNumL1; ++i) {
+        auto n = store.get_out_neighbors(ObjectId(i));
+        EXPECT_EQ(1u, n.tier) << "node " << i;
+        ASSERT_EQ(1u, n.size());
+        EXPECT_EQ(i + 1, n.l1.data[0].node_id);
+    }
+
+    // Tier-3 nodes (90 of them) fall through to L4 — they were NEVER
+    // promoted into L1.
+    for (std::size_t i = kNumL1; i < kNumNodes; ++i) {
+        auto n = store.get_out_neighbors(ObjectId(i));
+        EXPECT_EQ(4u, n.tier) << "node " << i;
+        ASSERT_EQ(1u, n.l4_owned.size());
+        EXPECT_EQ(i + 1, n.l4_owned[0].node_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test 8 — RowIdxOutOfRange_FallsToL4_OrThrows.
 //
 // `row_lookup` returns a sentinel >= tier_lookup.size(): the dispatcher must

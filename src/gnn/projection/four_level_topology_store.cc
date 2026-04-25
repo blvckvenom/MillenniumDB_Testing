@@ -1,6 +1,7 @@
 #include "gnn/projection/four_level_topology_store.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -142,30 +143,10 @@ void FourLevelTopologyStore::auto_detect_budgets_(
     }
 }
 
-void FourLevelTopologyStore::scan_bpt_into_per_node_(
-    BPlusTree<3>*                                              index,
-    std::vector<std::vector<AdjEntry>>&                         per_node) const
-{
-    if (index == nullptr) return;
-    Record<3> min_record = {0, 0, 0};
-    Record<3> max_record = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
-    bool interruption = false;
-    auto it = index->get_range(&interruption, min_record, max_record);
-    const Record<3>* rec;
-    while ((rec = it.next()) != nullptr) {
-        const uint64_t a = std::get<0>(*rec);
-        const uint64_t b = std::get<1>(*rec);
-        const uint64_t e = std::get<2>(*rec);
-        if (a >= per_node.size()) {
-            per_node.resize(a + 1);
-        }
-        per_node[a].push_back(AdjEntry{ b, e });
-    }
-}
-
 void FourLevelTopologyStore::populate_direction_(
     BPlusTree<3>*                              index,
     const std::vector<uint8_t>&                tiers,
+    const std::vector<uint64_t>&               frequency,
     std::unique_ptr<L1HashCache>&              l1_out,
     std::unique_ptr<L2CompactCsr>&             l2_out) const
 {
@@ -177,43 +158,101 @@ void FourLevelTopologyStore::populate_direction_(
         return;
     }
 
-    // Materialise per-node adjacency once. For papers100M scale this
-    // dominates RAM during the build; the temporary vector is freed
-    // immediately after distributing entries to L1 / L2 (tier-3/4
-    // nodes are dropped — those tiers have no in-RAM home).
-    std::vector<std::vector<AdjEntry>> per_node;
-    per_node.resize(tiers.size());
-    scan_bpt_into_per_node_(index, per_node);
-
-    // First pass: distribute to L1 / L2 by tier.
+    // Streaming distribution (Spec #13 Phase 3, refined for papers100M
+    // peak-RSS bound): walk the BPT once in (src, dst, edge_id) lex
+    // order, buffer the current src's neighbors in a single staging
+    // vector, and flush to L1 / L2 / drop the moment src advances.
     //
-    // L2 must see add_node calls in the same order tiers are scanned
-    // so the L2 row index is deterministic across runs (matters for
-    // reproducible byte-identical sample output between sessions).
-    for (std::size_t row_idx = 0; row_idx < per_node.size(); ++row_idx) {
-        if (row_idx >= tiers.size()) break;
-        const uint8_t tier = tiers[row_idx];
-        auto& adj = per_node[row_idx];
+    // Why streaming: the previous "materialize vector<vector<AdjEntry>>(N)
+    // first" approach allocated an outer header (24 B × N) plus per-node
+    // inner vectors for ALL N nodes — including tier-3 / tier-4 nodes that
+    // get immediately dropped. On papers100M (110 M nodes × ~30 directed
+    // edges/node) the transient peak was ~50 GB, exceeding the 30 GB
+    // commodity-RAM target Spec #13 was designed to hit.
+    //
+    // Streaming bounds the transient at:
+    //   O(max_node_degree × sizeof(AdjEntry)) = O(deg_max × 16 B).
+    // On papers100M with deg_max ~ 10⁵ that is < 2 MB regardless of N.
+    //
+    // Order requirement: BPT iteration is lexicographic over the (src,
+    // dst, edge_id) record, so all records of one src appear consecutively
+    // and `staging_buffer` only ever holds one src's neighbors at a time.
+    // Verified at `src/storage/index/bplus_tree/bplus_tree.cc::next()`
+    // (line 378): the iterator drains the current leaf in stored order,
+    // then walks the leaf chain — both paths preserve sort order.
+    //
+    // Tier-3 / tier-4 nodes are dropped without ever entering a
+    // long-lived allocation. The L3 mmap or L4 BPT path serves them at
+    // lookup time.
 
-        if (tier == 1) {
-            // Phase 2 carry-forward (c): reserve(degree) before insert
-            // so L1HashCache::total_bytes() accurately reflects RSS
-            // (capacity == size at insertion time).
-            std::vector<AdjEntry> tight;
-            tight.reserve(adj.size());
-            for (auto& e : adj) tight.push_back(e);
-            l1_out->insert(/*src_node_id=*/row_idx,
-                           std::move(tight),
-                           /*row_idx=*/row_idx);
-        } else if (tier == 2) {
-            l2_out->add_node(/*src_node_id=*/row_idx, adj);
+    Record<3> min_record = {0, 0, 0};
+    Record<3> max_record = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    bool interruption = false;
+    auto it = index->get_range(&interruption, min_record, max_record);
+
+    constexpr uint64_t kSentinelNoSrc = UINT64_MAX;
+    uint64_t                last_src = kSentinelNoSrc;
+    std::vector<AdjEntry>   staging_buffer;
+
+    auto flush_current_src = [&]() {
+        if (last_src == kSentinelNoSrc) {
+            staging_buffer.clear();
+            return;
         }
-        // tier == 3 / 4 -> drop. The L3 mmap or L4 BPT path serves
-        // those nodes at lookup time.
+        if (last_src >= tiers.size()) {
+            // Out-of-range src (the BPT carries an id past the
+            // RowMapping's tier vector). Drop. The dispatcher's
+            // out-of-range warning will fire if such an id is queried.
+            staging_buffer.clear();
+            return;
+        }
+        const uint8_t tier = tiers[last_src];
+        if (tier == 1) {
+            // L1 wants `capacity == size` so total_bytes() is accurate.
+            // staging_buffer was sized via reserve(frequency[row_idx])
+            // at the start of the run, so capacity already matches the
+            // expected degree; a final shrink covers nodes whose
+            // observed degree fell below the hint (or whose hint was
+            // missing).
+            std::vector<AdjEntry> tight(std::move(staging_buffer));
+            tight.shrink_to_fit();
+            l1_out->insert(/*src_node_id=*/last_src,
+                           std::move(tight),
+                           /*row_idx=*/static_cast<std::size_t>(last_src));
+            // After move-from, staging_buffer is in a valid but unspecified
+            // state — re-initialise to a known-empty vector so the next
+            // src's reserve_for_src call starts from a clean slate.
+            staging_buffer = std::vector<AdjEntry>();
+        } else if (tier == 2) {
+            l2_out->add_node(/*src_node_id=*/last_src, staging_buffer);
+            staging_buffer.clear();
+        } else {
+            // tier == 3 / 4 -> drop without allocating beyond staging.
+            staging_buffer.clear();
+        }
+    };
 
-        // Free the per-node vector eagerly to reduce peak RSS.
-        std::vector<AdjEntry>().swap(adj);
+    auto reserve_for_src = [&](uint64_t src_id) {
+        if (src_id < frequency.size()) {
+            const uint64_t hint = frequency[src_id];
+            if (hint > 0) staging_buffer.reserve(static_cast<std::size_t>(hint));
+        }
+    };
+
+    const Record<3>* rec;
+    while ((rec = it.next()) != nullptr) {
+        const uint64_t a = std::get<0>(*rec);
+        const uint64_t b = std::get<1>(*rec);
+        const uint64_t e = std::get<2>(*rec);
+
+        if (a != last_src) {
+            flush_current_src();
+            last_src = a;
+            reserve_for_src(a);
+        }
+        staging_buffer.push_back(AdjEntry{ b, e });
     }
+    flush_current_src();
 
     l2_out->freeze();
 }
@@ -313,9 +352,9 @@ void FourLevelTopologyStore::build() {
             frequency, l1_bytes, l2_bytes, avg_degree);
         tier_lookup_ref_ = &owned_tier_assignment_;
 
-        populate_direction_(fwd_bpt_, owned_tier_assignment_,
+        populate_direction_(fwd_bpt_, owned_tier_assignment_, frequency,
                             owned_l1_fwd_, owned_l2_fwd_);
-        populate_direction_(rev_bpt_, owned_tier_assignment_,
+        populate_direction_(rev_bpt_, owned_tier_assignment_, frequency,
                             owned_l1_rev_, owned_l2_rev_);
     } else {
         // Production path: use TopologyAccessor + TopologyFrequencyProfiler.
@@ -340,7 +379,7 @@ void FourLevelTopologyStore::build() {
         if (config_.orientation == EdgeOrientation::NATURAL ||
             config_.orientation == EdgeOrientation::UNDIRECTED)
         {
-            populate_direction_(fwd_bpt_, owned_tier_assignment_,
+            populate_direction_(fwd_bpt_, owned_tier_assignment_, freq,
                                 owned_l1_fwd_, owned_l2_fwd_);
         } else {
             // Reverse-only: still allocate empty L1/L2 forward so the
@@ -354,7 +393,7 @@ void FourLevelTopologyStore::build() {
         if (config_.orientation == EdgeOrientation::REVERSE ||
             config_.orientation == EdgeOrientation::UNDIRECTED)
         {
-            populate_direction_(rev_bpt_, owned_tier_assignment_,
+            populate_direction_(rev_bpt_, owned_tier_assignment_, freq,
                                 owned_l1_rev_, owned_l2_rev_);
         } else {
             owned_l1_rev_ = std::make_unique<L1HashCache>(owned_tier_assignment_);
@@ -508,6 +547,24 @@ FourLevelTopologyStore::dispatch_(
     const bool row_in_range = (row_idx < tier_lookup_ref_->size());
 
     if (!row_in_range) {
+        // Spec #13 RowMapping assumption guard: production projections
+        // built today have an identity row_idx == ObjectId.id. A miss
+        // here means a future projection moved to a non-identity
+        // RowMapping without updating the row_lookup_ closure (or the
+        // caller queried a node id outside the projection altogether).
+        // We fall through to L4 (correct, just slow) and emit a single
+        // warning per process the first time it fires — repeated
+        // warnings would drown sampler logs at scale.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::cerr << "[FourLevelTopologyStore] WARNING: ObjectId.id="
+                      << v.id << " exceeds tier_lookup_ size="
+                      << tier_lookup_ref_->size()
+                      << " - falling through to L4. The projection's "
+                      << "RowMapping may not be identity (Spec #13 "
+                      << "currently assumes ObjectId.id == row_idx). "
+                      << "Subsequent warnings suppressed.\n";
+        }
         if (l4) {
             out.l4_owned = l4(v);
             out.tier     = 4;
