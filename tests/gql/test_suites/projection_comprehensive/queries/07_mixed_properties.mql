@@ -1,0 +1,3 @@
+CALL graph_project('comp_07', ['Person', 'Item'], ['BOUGHT'], {nodeProperties: ['name'], relationshipProperties: ['price']})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

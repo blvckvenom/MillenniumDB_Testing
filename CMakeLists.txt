@@ -231,10 +231,27 @@ if(CUDAToolkit_FOUND)
     message(STATUS "Found CUDA Toolkit: ${CUDAToolkit_VERSION}")
 endif()
 
+add_subdirectory(${CMAKE_SOURCE_DIR}/src/gpu)
 
+if(ENABLE_GNN)
+    message(STATUS "GNN module enabled - looking for LibTorch...")
+
+    # Define preprocessor macro for conditional compilation
+    add_definitions(-DENABLE_GNN)
+
+    # Find LibTorch for the main binary
+    set(CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/third_party/libtorch" ${CMAKE_PREFIX_PATH})
+    find_package(Torch REQUIRED)
+
+    # Add LibTorch include directories globally for GNN procedures
+    include_directories(${TORCH_INCLUDE_DIRS})
+
+    add_subdirectory(${CMAKE_SOURCE_DIR}/src/gnn)
+endif()
 
 # Define targets
 add_library(millenniumdb STATIC ${SRCS})
+target_link_libraries(millenniumdb PUBLIC mdb_gpu)
 target_compile_definitions(millenniumdb PUBLIC SERD_STATIC)
 # millenniumdb and mdb_gnn_core are mutually dependent static archives:
 # projection code in millenniumdb calls mdb::gnn::RowMapping/FeatureMatrix
@@ -264,6 +281,9 @@ set(TEST_TARGETS
     # native_projection_builder_test  # DISABLED: needs API updates
     # native_scanner_test  # DISABLED: needs initialized GQLModel with imported data
     # project_procedure_test  # DISABLED: needs ProcedureContext updates
+    projection_storage_test
+    projection_features_test
+    spill_codec_test
     # property_projection_test  # DISABLED: needs pre-imported test database
     regular_path_expr_to_rpq_dfa
     scsu-test
@@ -348,13 +368,327 @@ endforeach(target)
 # Precedent for EXISTS-gated test registration: src/gnn/CMakeLists.txt.
 # ============================================================================
 find_package(GTest QUIET)
+if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/partition_file.h")
+    add_executable(radix_partition_sort_test
+        ${CMAKE_SOURCE_DIR}/src/tests/radix_partition_sort_test.cc
+    )
+    set_target_properties(radix_partition_sort_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves.
+    target_link_libraries(radix_partition_sort_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    # Match the ENABLE_GNN-conditional link done by the TEST_TARGETS foreach
+    # above — libmillenniumdb.a references vtables defined in mdb_gnn_core
+    # when ENABLE_GNN=ON, so this test target would fail to link otherwise.
+    if(ENABLE_GNN)
+        target_link_libraries(radix_partition_sort_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME RadixPartitionSortTests
+        COMMAND $<TARGET_FILE:radix_partition_sort_test>
+        WORKING_DIRECTORY tests
+    )
+elseif(NOT GTest_FOUND)
+    message(STATUS "GTest not found - radix_partition_sort_test disabled")
+else()
+    message(STATUS "partition_file.h not present - radix_partition_sort_test registration deferred")
+endif()
 
+# ============================================================================
+# CLASSIC external-sort spill/merge roundtrip unit tests
+# ----------------------------------------------------------------------------
+# Pins the correctness of GQL::ExternalRecordSort<N>'s spill -> sort_run_files
+# -> merge_runs path (the CLASSIC projection sorter backend). Guards the
+# task_arena fan-out cap and the K-way merge against future refactors.
+# Mirrors the radix_partition_sort_test target above.
+# ============================================================================
+if(GTest_FOUND)
+    add_executable(external_record_sort_test
+        ${CMAKE_SOURCE_DIR}/src/tests/external_record_sort_test.cc
+    )
+    set_target_properties(external_record_sort_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins over
+    # the main() in src/third_party/serd/serdi.cc (same constraint as the
+    # radix_partition_sort_test target above).
+    target_link_libraries(external_record_sort_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(external_record_sort_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME ExternalRecordSortSpillTests
+        COMMAND $<TARGET_FILE:external_record_sort_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Parallel edge-scan abort/exception-propagation unit tests
+# ============================================================================
+if(GTest_FOUND)
+    add_executable(native_scanner_parallel_abort_test
+        ${CMAKE_SOURCE_DIR}/src/tests/native_scanner_parallel_abort_test.cc
+    )
+    set_target_properties(native_scanner_parallel_abort_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # Same link-order constraint as radix_partition_sort_test: gtest_main
+    # must precede millenniumdb so its main() wins over serdi.cc's.
+    target_link_libraries(native_scanner_parallel_abort_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(native_scanner_parallel_abort_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME NativeScannerParallelAbortTests
+        COMMAND $<TARGET_FILE:native_scanner_parallel_abort_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Partitioned edge-scan seam unit tests (builder-level PARALLEL scan mode)
+# ============================================================================
+if(GTest_FOUND)
+    add_executable(native_scanner_partitioned_test
+        ${CMAKE_SOURCE_DIR}/src/tests/native_scanner_partitioned_test.cc
+    )
+    set_target_properties(native_scanner_partitioned_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # gtest_main must precede millenniumdb so its main() wins over serdi.cc's.
+    target_link_libraries(native_scanner_partitioned_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(native_scanner_partitioned_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME NativeScannerPartitionedTests
+        COMMAND $<TARGET_FILE:native_scanner_partitioned_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Serial scan pipeline unit tests
+# ============================================================================
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_keep_bitmap.h" AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_filter.h")
+    add_executable(serial_scan_test
+        ${CMAKE_SOURCE_DIR}/src/tests/serial_scan_test.cc
+    )
+    set_target_properties(serial_scan_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as
+    # radix_partition_sort_test above.
+    target_link_libraries(serial_scan_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    # Match the ENABLE_GNN-conditional link done by the TEST_TARGETS foreach
+    # above — libmillenniumdb.a references vtables defined in mdb_gnn_core
+    # when ENABLE_GNN=ON, so this test target would fail to link otherwise.
+    if(ENABLE_GNN)
+        target_link_libraries(serial_scan_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME SerialScanTests
+        COMMAND $<TARGET_FILE:serial_scan_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# IndexSet unit tests
+# ============================================================================
+# Registers the index_set_test target when GTest is available and the
+# corresponding header exists. Mirrors the EXISTS-gated registration
+# precedent of radix_partition_sort_test / serial_scan_test so that the
+# test only wires in after its sources land.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/index_set.h")
+    add_executable(index_set_test
+        ${CMAKE_SOURCE_DIR}/src/tests/index_set_test.cc
+    )
+    set_target_properties(index_set_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as
+    # radix_partition_sort_test / serial_scan_test above.
+    target_link_libraries(index_set_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    # Match the ENABLE_GNN-conditional link done by the TEST_TARGETS foreach
+    # above — libmillenniumdb.a references vtables defined in mdb_gnn_core
+    # when ENABLE_GNN=ON, so this test target would fail to link otherwise.
+    if(ENABLE_GNN)
+        target_link_libraries(index_set_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME IndexSetTests
+        COMMAND $<TARGET_FILE:index_set_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Missing-index query-layer diagnostic unit tests
+# ============================================================================
+# Registers projection_missing_index_test when GTest is available and the
+# corresponding source exists. Validates the `projection_index_name` /
+# `minimum_preset_for` helpers in index_set.{h,cc}, plus the
+# format of the QueryException message produced by GQLModel getters when a
+# query hits an index elided by the active IndexSet preset.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_missing_index_test.cc")
+    add_executable(projection_missing_index_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_missing_index_test.cc
+    )
+    set_target_properties(projection_missing_index_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(projection_missing_index_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_missing_index_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME ProjectionMissingIndexTests
+        COMMAND $<TARGET_FILE:projection_missing_index_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# TopologySnapshot CSR file format unit tests
+# ============================================================================
+# Registers topology_snapshot_format_test when GTest is available and the
+# corresponding header exists. Mirrors the EXISTS-gated registration
+# precedent of radix_partition_sort_test / serial_scan_test / index_set_test
+# so that the test only wires in after its source lands.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot.h")
+    add_executable(topology_snapshot_format_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_snapshot_format_test.cc
+    )
+    set_target_properties(topology_snapshot_format_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as
+    # radix_partition_sort_test / serial_scan_test / index_set_test above.
+    target_link_libraries(topology_snapshot_format_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_snapshot_format_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySnapshotFormatTests
+        COMMAND $<TARGET_FILE:topology_snapshot_format_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
 
 # ============================================================================
@@ -789,10 +1123,208 @@ if(GTest_FOUND AND
     )
 endif()
 
+# Registers projection_catalog_v5_test when GTest is available and the source
+# file exists. Follows the precedent of bpt_iter_dispatch_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_catalog_v5_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(projection_catalog_v5_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_catalog_v5_test.cc
+    )
+    set_target_properties(projection_catalog_v5_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # bpt_iter_dispatch_test above.
+    target_link_libraries(projection_catalog_v5_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_catalog_v5_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME projection_catalog_v5_test
+        COMMAND $<TARGET_FILE:projection_catalog_v5_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# Registers projection_catalog_v6_test when GTest is available and the source
+# file exists. Follows the precedent of projection_catalog_v5_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_catalog_v6_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(projection_catalog_v6_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_catalog_v6_test.cc
+    )
+    set_target_properties(projection_catalog_v6_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # projection_catalog_v5_test above.
+    target_link_libraries(projection_catalog_v6_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_catalog_v6_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME projection_catalog_v6_test
+        COMMAND $<TARGET_FILE:projection_catalog_v6_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# Registers projection_graph_storage_config_test when GTest is available and
+# the source file exists. Follows the precedent of
+# projection_leaffmt_config_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_graph_storage_config_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(projection_graph_storage_config_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_graph_storage_config_test.cc
+    )
+    set_target_properties(projection_graph_storage_config_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # projection_catalog_v6_test above.
+    target_link_libraries(projection_graph_storage_config_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_graph_storage_config_test
+            mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME projection_graph_storage_config_test
+        COMMAND $<TARGET_FILE:projection_graph_storage_config_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# Registers graph_storage_integration_test when GTest is available and the
+# source file exists. Integration-level regressions for the CSR_HYBRID write
+# dispatch (edge indexes), leaf-format invariants, and sidecar supersession:
+# a CSR_HYBRID projection must not also emit topology_*.csr sidecars, since
+# its v3 leaves already provide the O(1) neighbour access the sidecar exists
+# to give.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/graph_storage_integration_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(graph_storage_integration_test
+        ${CMAKE_SOURCE_DIR}/src/tests/graph_storage_integration_test.cc
+    )
+    set_target_properties(graph_storage_integration_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(graph_storage_integration_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(graph_storage_integration_test
+            mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME graph_storage_integration_test
+        COMMAND $<TARGET_FILE:graph_storage_integration_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# Registers projection_leaffmt_config_test when GTest is available and the
+# source file exists. Follows the precedent of projection_catalog_v5_test.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_leaffmt_config_test.cc"
+   AND TARGET GTest::gtest_main)
+    add_executable(projection_leaffmt_config_test
+        ${CMAKE_SOURCE_DIR}/src/tests/projection_leaffmt_config_test.cc
+    )
+    set_target_properties(projection_leaffmt_config_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Same precedent as
+    # projection_catalog_v5_test above.
+    target_link_libraries(projection_leaffmt_config_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(projection_leaffmt_config_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME projection_leaffmt_config_test
+        COMMAND $<TARGET_FILE:projection_leaffmt_config_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
 # Registers bpt_leaf_v2_fuzz_test when GTest is available and the source file
 # exists. Follows the precedent of projection_leaffmt_config_test.
@@ -837,6 +1369,126 @@ if(GTest_FOUND AND
     set_tests_properties(bpt_leaf_v2_fuzz_test PROPERTIES TIMEOUT 360)
 endif()
 
+# ============================================================================
+# TopologySnapshot CSR writer unit tests
+# ============================================================================
+# Same EXISTS-gated registration pattern as topology_snapshot_format_test.
+# The writer depends on the topology_snapshot.h format header plus its own
+# .cc, so the gate keys on the .cc landing.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot_writer.cc")
+    add_executable(topology_snapshot_writer_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_snapshot_writer_test.cc
+    )
+    set_target_properties(topology_snapshot_writer_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as the
+    # format_test registration above.
+    target_link_libraries(topology_snapshot_writer_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_snapshot_writer_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySnapshotWriterTests
+        COMMAND $<TARGET_FILE:topology_snapshot_writer_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# TopologySnapshot CSR reader unit tests
+# ============================================================================
+# Same EXISTS-gated registration pattern as topology_snapshot_writer_test.
+# The reader depends on the topology_snapshot.h format header plus its own
+# .cc, so the gate keys on the .cc landing.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot_reader.cc")
+    add_executable(topology_snapshot_reader_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_snapshot_reader_test.cc
+    )
+    set_target_properties(topology_snapshot_reader_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves. Same precedent as the
+    # writer_test registration above.
+    target_link_libraries(topology_snapshot_reader_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_snapshot_reader_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySnapshotReaderTests
+        COMMAND $<TARGET_FILE:topology_snapshot_reader_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+
+# ============================================================================
+# NativeProjectionBuilder × TopologySnapshot integration test
+# ============================================================================
+# EXISTS-gated so the target is only configured once the integration source
+# lands. Shares the GTest linking recipe with the other projection tests.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/native_projection_builder_topology_snapshot_test.cc")
+    add_executable(native_projection_builder_topology_snapshot_test
+        ${CMAKE_SOURCE_DIR}/src/tests/native_projection_builder_topology_snapshot_test.cc
+    )
+    set_target_properties(native_projection_builder_topology_snapshot_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(native_projection_builder_topology_snapshot_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(native_projection_builder_topology_snapshot_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME NativeProjectionBuilderTopologySnapshotTests
+        COMMAND $<TARGET_FILE:native_projection_builder_topology_snapshot_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
 
 
@@ -861,9 +1513,51 @@ endif()
 
 
 
-
-
-
+# ============================================================================
+# BatchedEdgeAggregator unit tests
+# ============================================================================
+# Registers batched_edge_aggregator_test when GTest is available and the
+# corresponding header exists. Mirrors the EXISTS-gated registration
+# precedent of index_set_test / topology_snapshot_format_test so the test
+# only wires in after its sources land.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/batched_edge_aggregator.h"
+   AND TARGET GTest::gtest_main)
+    add_executable(batched_edge_aggregator_test
+        ${CMAKE_SOURCE_DIR}/src/tests/batched_edge_aggregator_test.cc
+    )
+    set_target_properties(batched_edge_aggregator_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves.
+    target_link_libraries(batched_edge_aggregator_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(batched_edge_aggregator_test
+            mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME batched_edge_aggregator_test
+        COMMAND $<TARGET_FILE:batched_edge_aggregator_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
 if(PROFILE)
     # Profile targets

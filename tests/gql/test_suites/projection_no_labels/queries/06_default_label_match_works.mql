@@ -1,0 +1,8 @@
+// Control case: uses proj_default (test 01, built WITH label indexes).
+// A label-filtered MATCH uses the label_node index. This query must work
+// and return all 5 users. Its presence alongside tests 04/05 and the bad
+// queries proves the flag flips behavior: with labels it works, without
+// labels it throws the QueryException (see bad_queries/01).
+USE proj_default
+MATCH (n:User)
+RETURN count(*) AS labeled_nodes

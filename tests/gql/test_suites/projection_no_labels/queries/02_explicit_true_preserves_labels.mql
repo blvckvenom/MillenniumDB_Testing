@@ -1,0 +1,10 @@
+// Explicit includeLabelIndexes: true.
+// Must be equivalent to the default: 4 label indexes are built, label-based
+// queries remain functional. Protects against drift in how the flag is
+// parsed or forwarded to the builder.
+CALL graph_project('proj_explicit_true', 'User', 'KNOWS', {
+    orientation: 'NATURAL',
+    includeLabelIndexes: true
+})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

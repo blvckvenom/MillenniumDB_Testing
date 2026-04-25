@@ -1,0 +1,4 @@
+MATCH (u:User)
+RETURN u.name, u.age
+ORDER BY u.age ASC
+LIMIT 3

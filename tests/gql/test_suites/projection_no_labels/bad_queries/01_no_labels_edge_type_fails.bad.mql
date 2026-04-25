@@ -1,0 +1,8 @@
+// Symmetric contract for edge types. MATCH with :TYPE filter requires the
+// edge_label index, which is ALSO gated by includeLabelIndexes (same flag
+// controls node + edge label indexes together - see analysis doc §3.A).
+// Expected: QueryException "Cannot use edge labels with projection
+// 'proj_no_labels'".
+USE proj_no_labels
+MATCH (n)-[r:KNOWS]->(m)
+RETURN count(*)

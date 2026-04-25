@@ -1,0 +1,8 @@
+// Uses proj_no_labels created in test 03. Label-free enumeration of all
+// nodes works because `nodes` (Record<1>) index is always built - it is
+// NOT one of the 4 label indexes gated by the flag. This query exercises
+// the path that matters for GNN training (iterate all seed nodes without
+// needing a label filter).
+USE proj_no_labels
+MATCH (n)
+RETURN count(*) AS total_nodes

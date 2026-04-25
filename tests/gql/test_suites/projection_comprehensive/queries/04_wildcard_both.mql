@@ -1,0 +1,3 @@
+CALL graph_project('comp_04', '*', '*')
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

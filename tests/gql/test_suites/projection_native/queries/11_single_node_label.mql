@@ -1,0 +1,3 @@
+CALL graph_project('test_single_label', 'Tag', 'HAS_TAG')
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

@@ -1,0 +1,12 @@
+// ============================================================
+// Adaptive buffer smoke dataset: minimal graph for projection.
+// 3 Person nodes, 3 KNOWS edges.
+// ============================================================
+
+0 :Person name:"Alice" age:30
+1 :Person name:"Bob" age:25
+2 :Person name:"Carol" age:35
+
+0->1 :KNOWS since:"2020"
+1->2 :KNOWS since:"2021"
+2->0 :KNOWS since:"2019"

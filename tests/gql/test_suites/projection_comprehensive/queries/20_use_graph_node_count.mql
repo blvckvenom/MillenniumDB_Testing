@@ -1,0 +1,3 @@
+USE comp_04
+MATCH (n)
+RETURN count(*) AS total_nodes

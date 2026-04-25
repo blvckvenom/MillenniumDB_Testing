@@ -53,7 +53,7 @@ std::unique_ptr<BindingIter> EdgeLabelPlan::get_binding_iter() const
     if (edge_assigned) {
         ranges[0] = ScanRange::get(edge, edge_assigned);
         ranges[1] = ScanRange::get(label, label_assigned);
-        return std::make_unique<IndexScan<2>>(*gql_model.edge_label, std::move(ranges));
+        return std::make_unique<IndexScan<2>>(gql_model.get_edge_label(), std::move(ranges));
     } else if (label_assigned) {
         ranges[0] = ScanRange::get(label, label_assigned);
         ranges[1] = ScanRange::get(edge, edge_assigned);
@@ -61,7 +61,7 @@ std::unique_ptr<BindingIter> EdgeLabelPlan::get_binding_iter() const
     } else {
         ranges[0] = ScanRange::get(edge, edge_assigned);
         ranges[1] = ScanRange::get(label, label_assigned);
-        return std::make_unique<IndexScan<2>>(*gql_model.edge_label, std::move(ranges));
+        return std::make_unique<IndexScan<2>>(gql_model.get_edge_label(), std::move(ranges));
     }
 }
 

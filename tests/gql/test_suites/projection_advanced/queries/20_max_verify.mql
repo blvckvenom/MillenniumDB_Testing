@@ -1,0 +1,4 @@
+USE adv_19
+MATCH (n)-[e]->(m)
+RETURN n, e.amount AS amount, m
+ORDER BY amount

@@ -1,0 +1,3 @@
+CALL graph_project('prop_single_edge', 'User', 'Friend', {relationshipProperties: 'since'})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

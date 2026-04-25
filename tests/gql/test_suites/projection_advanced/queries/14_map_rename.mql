@@ -1,0 +1,3 @@
+CALL graph_project('adv_16', {Person: {properties: {score: {property: 'rating'}}}}, 'KNOWS')
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

@@ -55,12 +55,13 @@ std::unique_ptr<BindingIter> NodePropertyPlan::get_binding_iter() const
         ranges[0] = ScanRange::get(object, object_assigned);
         ranges[1] = ScanRange::get(key, key_assigned);
         ranges[2] = ScanRange::get(value, value_assigned);
-        return std::make_unique<IndexScan<3>>(*gql_model.node_key_value, std::move(ranges));
+        return std::make_unique<IndexScan<3>>(gql_model.get_node_key_value(), std::move(ranges));
     } else {
         ranges[0] = ScanRange::get(key, key_assigned);
         ranges[1] = ScanRange::get(value, value_assigned);
         ranges[2] = ScanRange::get(object, object_assigned);
-        return std::make_unique<IndexScan<3>>(*gql_model.key_value_node, std::move(ranges));
+        // Use protected getter for proper projection context handling
+        return std::make_unique<IndexScan<3>>(gql_model.get_key_value_node(), std::move(ranges));
     }
 }
 

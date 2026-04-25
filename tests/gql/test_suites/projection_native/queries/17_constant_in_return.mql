@@ -1,0 +1,3 @@
+CALL graph_project('test_const', 'User', 'KNOWS')
+YIELD graphName, nodeCount
+RETURN graphName, nodeCount, 'SUCCESS' AS status

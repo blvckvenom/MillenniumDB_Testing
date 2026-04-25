@@ -1,0 +1,3 @@
+CALL graph_project('prop_multi_edge', ['User', 'Post'], 'Posted', {relationshipProperties: ['via', 'timestamp']})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

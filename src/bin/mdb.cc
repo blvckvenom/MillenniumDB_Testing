@@ -1,6 +1,9 @@
+#include <cstdlib>
+
 #include "bin/mdb-csv-import.h"
 #include "bin/mdb-dump.h"
 #include "bin/mdb-import.h"
+#include "bin/mdb-projection.h"
 #include "bin/mdb-server.h"
 #include "cli/cli.h"
 
@@ -70,6 +73,9 @@ Import Usage: mdb import <files...> <db_folder> [options]
   Options for RDF:
     --prefixes <path>                  Prefixes file path (for IRI compression)
     --btree-permutations <N>           3, 4, or 6 (default: 4)
+
+  Options for GQL:
+    --with-tensors <file.npy>          Import node embeddings from NumPy file
 )";
 }
 
@@ -113,6 +119,22 @@ CLI Usage:
 )";
 }
 
+void print_projection_help()
+{
+    std::cout << "\nProjection Management Usage:"
+            "\n  mdb list-projections <db_folder>"
+            "\n      List all projections in a GQL database"
+            "\n"
+            "\n  mdb drop-projection <db_folder> <projection_name>"
+            "\n      Delete a projection from a GQL database"
+            "\n"
+            "\n  mdb inspect-projection <db_folder> <projection_name>"
+            "\n      Show detailed information about a projection"
+            "\n"
+            "\nNote: Projections are only supported for GQL databases"
+            "\n";
+}
+
 void print_help()
 {
     print_mdb_version();
@@ -127,6 +149,9 @@ Commands:
   csv-import                           create a new database from csv files
   dump                                 Export a database to a file
   cli                                  Launch the CLI for querying a database
+  list-projections                     List all projections in a GQL database
+  drop-projection                      Delete a projection from a GQL database
+  inspect-projection                   Show projection details
   help,--help                          Print this message or help for a specific command
 
 )";
@@ -136,10 +161,18 @@ Commands:
     print_csv_import_help();
     print_dump_help();
     print_cli_help();
+    print_projection_help();
 }
 
 int main(int argc, char* argv[])
 {
+    // Default the CUDA caching allocator to expandable segments BEFORE any CUDA
+    // use (LibTorch reads this once at allocator init). This reclaims fragmented
+    // reserved-but-unallocated VRAM, which is what lets the GNN feature store run
+    // a large GPU feature cache (e.g. l1CacheMb:6144 on a 16 GB GPU) at N=8
+    // without the fragmentation OOM. overwrite=0 so an explicit user value wins.
+    ::setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True", 0);
+
     std::ios_base::sync_with_stdio(false);
 
     if (argc < 2) {
@@ -186,6 +219,8 @@ int main(int argc, char* argv[])
             print_dump_help();
         } else if (subcommand == "cli") {
             print_cli_help();
+        } else if (subcommand == "list-projections" || subcommand == "drop-projection" || subcommand == "inspect-projection") {
+            print_projection_help();
         } else {
             print_help();
         }
@@ -211,6 +246,15 @@ int main(int argc, char* argv[])
     if (subcommand == "dump") {
         DumpConfig config = parse_dump_config(args);
         return mdb_dump(config);
+    }
+    if (subcommand == "list-projections") {
+        return mdb_list_projections(args);
+    }
+    if (subcommand == "drop-projection") {
+        return mdb_drop_projection(args);
+    }
+    if (subcommand == "inspect-projection") {
+        return mdb_inspect_projection(args);
     }
 #ifndef NO_MDB_CLI
     if (subcommand == "cli") {
@@ -239,7 +283,7 @@ int main(int argc, char* argv[])
                 return RunCLI(Model::RDF, config.query_timeout);
             }
             case Catalog::ModelID::GQL: {
-                auto model_destroyer = GQLModel::init();
+                auto model_destroyer = GQLModel::init(config.db_directory);
                 return RunCLI(Model::GQL, config.query_timeout);
             }
             }

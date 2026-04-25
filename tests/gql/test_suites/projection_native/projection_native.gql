@@ -1,0 +1,64 @@
+// Test data for Native Projection test suite
+// Converted to import-compatible format (15 nodes, 19 edges)
+
+// Users (5 nodes: 0-4)
+0 :User name:"Alice" age:30 city:"NYC"
+1 :User name:"Bob" age:25 city:"SF"
+2 :User name:"Carol" age:35 city:"LA"
+3 :User name:"Dave" age:28 city:"NYC"
+4 :User name:"Eve" age:32 city:"SF"
+
+// Posts (3 nodes: P0-P2)
+P0 :Post title:"Hello World" views:100
+P1 :Post title:"GQL Tutorial" views:500
+P2 :Post title:"Graph Databases" views:1000
+
+// Comments (2 nodes: C0-C1)
+C0 :Comment text:"Great post!" rating:5
+C1 :Comment text:"Very helpful" rating:4
+
+// Products (2 nodes: PR0-PR1) - isolated nodes with no edges
+PR0 :Product name:"Laptop" price:1200
+PR1 :Product name:"Mouse" price:25
+
+// Tags (3 nodes: T0-T2)
+T0 :Tag value:"tech"
+T1 :Tag value:"tutorial"
+T2 :Tag value:"database"
+
+// KNOWS relationships (5 edges: User cycle 0->1->2->3->4->0)
+0->1 :KNOWS
+1->2 :KNOWS
+2->3 :KNOWS
+3->4 :KNOWS
+4->0 :KNOWS
+
+// LIKES relationships (4 edges: User -> Post)
+0->P0 :LIKES
+1->P0 :LIKES
+1->P1 :LIKES
+2->P2 :LIKES
+
+// WROTE relationships (2 edges: User -> Comment)
+0->C0 :WROTE
+1->C1 :WROTE
+
+// COMMENTED_ON relationships (2 edges: Comment -> Post)
+C0->P0 :COMMENTED_ON
+C1->P1 :COMMENTED_ON
+
+// FOLLOWS relationships (2 edges: User -> User)
+0->4 :FOLLOWS
+1->0 :FOLLOWS
+
+// HAS_TAG relationships (4 edges: Post -> Tag)
+P0->T0 :HAS_TAG
+P1->T1 :HAS_TAG
+P1->T2 :HAS_TAG
+P2->T2 :HAS_TAG
+
+// Summary:
+// - Total nodes: 15 (5 User + 3 Post + 2 Comment + 2 Product + 3 Tag)
+// - Total edges: 19 (5 KNOWS + 4 LIKES + 2 WROTE + 2 COMMENTED_ON + 2 FOLLOWS + 4 HAS_TAG)
+// - Edge types: KNOWS, LIKES, WROTE, COMMENTED_ON, FOLLOWS, HAS_TAG
+// - Isolated nodes: PR0, PR1 (Products have no edges)

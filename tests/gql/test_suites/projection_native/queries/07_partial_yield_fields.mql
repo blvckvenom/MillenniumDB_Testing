@@ -1,0 +1,3 @@
+CALL graph_project('test_partial', 'User', 'KNOWS')
+YIELD graphName, nodeCount
+RETURN graphName, nodeCount
