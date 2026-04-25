@@ -1450,6 +1450,138 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# L1HashCache tests (Spec #13 Phase 2 / T13.4)
+# ============================================================================
+# Pure data-structure tests for the lifted Spec #11 RAM hash cache: insert
+# respects tier_assignment, round-trip parity, large-degree safety, and the
+# total_bytes() contract anchored against kL1NodeFixedOverhead /
+# kL1PerEdgeBytes from topology_frequency_profiler.h.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/l1_hash_cache_test.cc")
+    add_executable(l1_hash_cache_test
+        ${CMAKE_SOURCE_DIR}/src/tests/l1_hash_cache_test.cc
+    )
+    set_target_properties(l1_hash_cache_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(l1_hash_cache_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME L1HashCacheTests
+        COMMAND $<TARGET_FILE:l1_hash_cache_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST L1HashCacheTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
+# L2CompactCsr tests (Spec #13 Phase 2 / T13.5)
+# ============================================================================
+# Pure data-structure tests for the warm-tier compact CSR cache: build/lookup
+# round-trip, out-of-order insert identity, freeze immutability, isolated
+# nodes, total_bytes contract.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/l2_compact_csr_test.cc")
+    add_executable(l2_compact_csr_test
+        ${CMAKE_SOURCE_DIR}/src/tests/l2_compact_csr_test.cc
+    )
+    set_target_properties(l2_compact_csr_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(l2_compact_csr_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME L2CompactCsrTests
+        COMMAND $<TARGET_FILE:l2_compact_csr_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST L2CompactCsrTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
+# FourLevelTopologyStore dispatcher tests (Spec #13 Phase 2 / T13.6)
+# ============================================================================
+# Validates the tier-dispatch skeleton: L1/L2 hits, L3 sidecar absence
+# falls through to L4, L4 BPT fallback, defensive throws on missing
+# fallback configuration, isolated nodes across tiers, multi-tier graph
+# consistency, out-of-range row_lookup behavior. Phase 3 (T13.7) wires the
+# build orchestration; Phase 2 ships only this dispatch contract.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_store_test.cc")
+    add_executable(four_level_topology_store_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_store_test.cc
+    )
+    set_target_properties(four_level_topology_store_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_store_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyStoreTests
+        COMMAND $<TARGET_FILE:four_level_topology_store_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyStoreTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
 # Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
 # ============================================================================
 # Complements T4.7 (single-layer sample_neighbors determinism). Exercises

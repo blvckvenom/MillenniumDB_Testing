@@ -129,6 +129,14 @@ std::vector<uint32_t> l2_col_idx_fwd_;     // total_l2_edges × 4 bytes
 std::vector<uint32_t> l2_edge_ids_fwd_;    // total_l2_edges × 4 bytes (optional)
 ```
 
+> **Phase 2 implementation note (T13.5)**: the Phase 2 `L2CompactCsr` class
+> deliberately omits `edge_ids_` — the listed `uint32_t` width above is too
+> small for ObjectId edge ids (8-bit type tag + 56-bit payload), and bumping
+> the per-edge byte budget to 12 would re-derive the Phase 1 sizing math.
+> Edge-id queries on L2-tier nodes therefore fall through to L4 (B+Tree
+> direct). See `src/gnn/projection/l2_compact_csr.h` header doc block for
+> the full rationale and alternatives considered.
+
 uint32 row_index works because papers100M < 4.3B nodes. Future-proof check: assert `num_nodes < UINT32_MAX` at construction.
 
 ### 2.7 D7 — Threading + safety
