@@ -43,6 +43,17 @@ namespace mdb::gnn {
  * Threading: post-construction, this class is read-only and safe to
  * call from any number of sampler threads concurrently.
  */
+/// Known follow-ups for Phase 3 (T13.7-T13.9):
+///   1. `Neighbors` is currently a tagged "fat" struct (~96 B). Phase 3 should
+///      add `for_each_dst(callback)` and `for_each_with_edge_id(callback)` member
+///      functions to centralize the tier-switch logic and remove caller-side
+///      switch-on-tier boilerplate.
+///   2. The header includes `topology_accessor.h` solely for `EdgeOrientation`.
+///      Phase 3 should hoist that enum (and possibly `RowMapping`) into a shared
+///      lightweight header.
+///   3. `Config::orientation` is stored but unused in Phase 2 dispatch (direction is
+///      selected by which member fn is called). Phase 3's build orchestrator will
+///      consume it.
 class FourLevelTopologyStore {
 public:
     /**

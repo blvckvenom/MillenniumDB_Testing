@@ -76,6 +76,17 @@ public:
      * orchestrator may therefore call `insert()` for every node it
      * scans without first filtering by tier.
      *
+     * Caller responsibility: the `neighbors` vector should have
+     * `capacity() == size()` for `total_bytes()` to accurately reflect
+     * actual RSS. Building the vector via `reserve(degree)` +
+     * `push_back`, or via direct construction with a sized initializer,
+     * satisfies this. A `push_back`-without-`reserve` build doubles
+     * capacity heuristically; in that case `total_bytes()`
+     * underestimates real RSS by up to ~2x for nodes whose vector
+     * growth left `capacity > size`. Phase 3's
+     * `FourLevelTopologyStore::build_phase` will enforce
+     * `reserve(degree)` prior to insert.
+     *
      * @param src_node_id Raw `ObjectId.id` of the source node.
      * @param neighbors   Adjacency list (taken by value so the caller
      *                    can move into the cache).

@@ -49,9 +49,17 @@ namespace mdb::gnn {
  *
  * Lifecycle: callers `add_node()` repeatedly during the build phase,
  * then call `freeze()` exactly once. After freeze the structure is
- * immutable and any further `add_node()` throws. `get()` works in
- * either state but is intended to be invoked only post-freeze for
- * deterministic results.
+ * immutable and any further `add_node()` throws. `get()` requires
+ * the structure to be frozen and throws `std::logic_error` if called
+ * pre-freeze (symmetric to add_node()'s post-freeze throw — the
+ * project's "fail loud" discipline rejects silent-miss foot-guns).
+ *
+ * **L2 fixed-cost note (papers100M scale):** at N_L2 ≈ 16M warm nodes,
+ * `row_ptr_` dominates the L2 fixed memory cost: 16M × 8 bytes = 128 MB
+ * pinned in RAM, vs ~32 MB for `node_to_l2_idx_` hash overhead. The
+ * Phase 1 byte-budget contract `kL2NodeFixedOverhead = 8` already
+ * accounts for this; the note exists to set expectations for the
+ * reader who might otherwise expect the hash map to dominate.
  */
 class L2CompactCsr {
 public:
@@ -115,6 +123,11 @@ public:
      * @return `(nullptr, 0)` on miss. On hit, the pointer is into
      *         the cache-owned `col_idx_` vector and remains valid
      *         for the lifetime of the cache.
+     *
+     * @throws std::logic_error if called before `freeze()`. The
+     *         pre-freeze prefix-sum table is empty, so a silent miss
+     *         would mask orchestrator bugs — symmetric to
+     *         `add_node()`'s post-freeze throw.
      */
     ColIdxSpan get(uint64_t src_node_id) const;
 

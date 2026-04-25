@@ -72,16 +72,20 @@ void L2CompactCsr::freeze() {
 }
 
 L2CompactCsr::ColIdxSpan L2CompactCsr::get(uint64_t src_node_id) const {
+    // Symmetric to add_node()'s post-freeze throw: a pre-freeze get()
+    // would silently miss every src (row_ptr_ is empty until freeze
+    // builds the prefix sum), masking orchestrator bugs. Fail loud
+    // instead — matches the project's "fail loud" discipline.
+    if (!frozen_) {
+        throw std::logic_error(
+            "L2CompactCsr::get called before freeze() — "
+            "call freeze() to lock the structure first");
+    }
     auto it = node_to_l2_idx_.find(src_node_id);
     if (it == node_to_l2_idx_.end()) {
         return ColIdxSpan{ nullptr, 0 };
     }
     const uint32_t l2_idx = it->second;
-    // Pre-freeze get() works as long as row_ptr_ has been populated
-    // through the L2 row in question; but the contract is post-freeze.
-    if (!frozen_) {
-        return ColIdxSpan{ nullptr, 0 };
-    }
     const uint64_t start = row_ptr_[l2_idx];
     const uint64_t end   = row_ptr_[static_cast<std::size_t>(l2_idx) + 1];
     return ColIdxSpan{ col_idx_.data() + start,

@@ -15,6 +15,8 @@
 //   5. EmptyNode_ZeroDegreeRoundTrips — node with empty neighbor list.
 //   6. TotalBytes_MatchesL2Contract — assertion against the Phase 1 contract
 //      (kL2NodeFixedOverhead + kL2PerEdgeBytes * degree).
+//   7. GetPreFreezeThrows — calling get() before freeze() throws
+//      std::logic_error, symmetric to add_node()'s post-freeze throw.
 //
 // Pure data-structure tests — no DB / System / projection dependency.
 
@@ -199,4 +201,28 @@ TEST(L2CompactCsr, TotalBytes_MatchesL2Contract) {
       + (0 + 5 + 17) * mdb::gnn::kL2PerEdgeBytes;
 
     EXPECT_EQ(expected, csr.total_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — GetPreFreezeThrows.
+//
+// Symmetric to FreezeRejectsAddNode: verifies that calling get() before
+// freeze() throws std::logic_error rather than silently returning
+// (nullptr, 0). Pre-freeze the row_ptr_ prefix sum has not been built,
+// so a silent miss for an already-added node would mask orchestrator
+// bugs — the project's "fail loud" discipline rejects this foot-gun.
+// ---------------------------------------------------------------------------
+TEST(L2CompactCsr, GetPreFreezeThrows) {
+    L2CompactCsr csr;
+    csr.add_node(/*src=*/7, make_neighbors(/*first_dst=*/100, /*count=*/3));
+
+    // The src exists in node_to_l2_idx_ but the structure is not frozen,
+    // so get() must throw rather than misleadingly return (nullptr, 0).
+    EXPECT_THROW(csr.get(7), std::logic_error);
+
+    // After freeze, lookup succeeds normally.
+    csr.freeze();
+    auto span = csr.get(7);
+    ASSERT_EQ(3u, span.second);
+    EXPECT_EQ(100u, span.first[0]);
 }
