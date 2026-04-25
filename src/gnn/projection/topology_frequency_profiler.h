@@ -1,0 +1,129 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <vector>
+
+#include "gnn/projection/topology_accessor.h"
+
+namespace mdb::gnn {
+
+/**
+ * @brief Frequency profile of nodes in a projection, used to seed the
+ *        Four-Level Topology Store tier assignment (Spec #13).
+ *
+ * The profiler exposes two source paths:
+ *
+ *   1. **Warm start** (`compute_from_node_counts`): reads a prior
+ *      `node_counts.bin` produced by a previous `gnn_offline_sample` run.
+ *      This file mirrors DiskGNN's "node access count" technique. Phase 1
+ *      keeps this method as a stub that returns false (no warm-start file
+ *      consumed) until `gnn_offline_sample` learns to persist the counts
+ *      (tracked separately as Spec #13 Phase 2).
+ *
+ *   2. **Cold start** (`compute_from_degrees`): falls back to the node's
+ *      out / in / out+in degree (depending on `EdgeOrientation`) as a
+ *      coarse popularity proxy. Always available, no prerequisite.
+ *
+ * The output is a `frequency()` vector indexed by node iteration order
+ * (matching `NodeIterator` for the bound `TopologyAccessor`). Tier
+ * assignment is delegated to `compute_tier_assignment()`, a free helper so
+ * tests can drive it with synthetic frequencies without instantiating a
+ * real projection.
+ *
+ * Lifetime: the profiler holds a non-owning reference to the
+ * `TopologyAccessor`. Keep the accessor alive for the duration of any
+ * `frequency()` consumer.
+ */
+class TopologyFrequencyProfiler {
+public:
+    /**
+     * @brief Construct a profiler bound to a topology accessor.
+     *
+     * @param topo            Source of degree / iteration data. Must outlive
+     *                        the profiler.
+     * @param projection_dir  Directory used to look up an optional
+     *                        `node_counts.bin` warm-start file.
+     */
+    TopologyFrequencyProfiler(const TopologyAccessor& topo,
+                              std::filesystem::path projection_dir);
+
+    /**
+     * @brief Compute a frequency vector for every node in the bound
+     *        topology under the requested edge orientation.
+     *
+     * Tries the warm-start path first; on miss falls back to the degree
+     * proxy. Idempotent: a second call overwrites the previous frequency
+     * vector and `warm_start_used()` flag.
+     */
+    void compute(EdgeOrientation direction);
+
+    /// Frequency vector indexed by node iteration order. Empty until
+    /// `compute()` is called.
+    const std::vector<uint64_t>& frequency() const { return frequency_; }
+
+    /// True iff the most recent `compute()` consumed `node_counts.bin`.
+    /// Phase 1 always returns false.
+    bool warm_start_used() const { return warm_start_used_; }
+
+private:
+    /**
+     * @brief Phase 1 STUB — read `<projection_dir>/node_counts.bin`.
+     *
+     * Returns false unconditionally in Phase 1 because
+     * `gnn_offline_sample` does not yet persist the file. The method is
+     * preserved in the API so Phase 2 can plug in the real reader without
+     * touching call sites.
+     */
+    bool compute_from_node_counts_(EdgeOrientation direction);
+
+    /// Cold-start path — populates `frequency_` from per-node degree.
+    void compute_from_degrees_(EdgeOrientation direction);
+
+    // Non-owning. Mutable to allow degree queries that internally lazy-cache.
+    TopologyAccessor& topo_;
+    std::filesystem::path projection_dir_;
+    std::vector<uint64_t> frequency_;
+    bool warm_start_used_ = false;
+};
+
+/**
+ * @brief Tier assignment helper (Spec #13 D2 / D6).
+ *
+ * Greedy partition: nodes are sorted by frequency descending; entries are
+ * packed into tier 1 (L1 RAM hash) until `l1_budget_bytes` is exhausted,
+ * then into tier 2 (L2 compact CSR) until `l2_budget_bytes` is exhausted,
+ * then everything else goes to tier 3 (L3 mmap sidecar / L4 BPT direct).
+ *
+ * Per-node memory accounting from design §1 / §2.6:
+ *   - L1: `degree(i) * 16 + 56` bytes (16 B per AdjEntry +
+ *         24 B vector header + ~32 B hash bucket overhead).
+ *   - L2: `degree(i) * 8  +  8` bytes (uint32 col_idx + uint32 edge_id
+ *         per edge + one uint64 row_ptr entry).
+ *
+ * @param frequency       Frequency vector (one entry per node, same indexing
+ *                        as the source `TopologyAccessor`).
+ * @param l1_budget_bytes Bytes available for tier 1.
+ * @param l2_budget_bytes Bytes available for tier 2.
+ * @param avg_degree      Mean degree across the graph; multiplied by
+ *                        per-tier per-edge cost to size each node when the
+ *                        caller chose not to pre-compute exact degrees.
+ *                        Caller is expected to have computed this once.
+ *
+ * @return Vector with one byte per node, indexed identically to
+ *         `frequency`. Values:
+ *           - 1 → tier 1 (L1 hash)
+ *           - 2 → tier 2 (L2 compact CSR)
+ *           - 3 → tier 3 (L3 mmap / L4 BPT)
+ *
+ * Edge case: when the combined budget exceeds the graph's notional cost,
+ * every node lands in tier 1.
+ */
+std::vector<uint8_t> compute_tier_assignment(
+    const std::vector<uint64_t>& frequency,
+    std::size_t l1_budget_bytes,
+    std::size_t l2_budget_bytes,
+    double avg_degree);
+
+} // namespace mdb::gnn

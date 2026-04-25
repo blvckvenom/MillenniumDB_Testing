@@ -1405,6 +1405,51 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# Topology frequency profiler tests (Spec #13 Phase 1)
+# ============================================================================
+# Validates the frequency profiler that the Four-Level Topology Store will
+# use to seed L1 / L2 / L3 tier assignment. Covers the cold-start (degree
+# proxy) and stubbed-warm-start paths, mixed orientations, and the greedy
+# tier sizing helper. Linker recipe mirrors topology_accessor_adjacency_cache_test.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_frequency_profiler_test.cc")
+    add_executable(topology_frequency_profiler_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_frequency_profiler_test.cc
+    )
+    set_target_properties(topology_frequency_profiler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_frequency_profiler_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyFrequencyProfilerTests
+        COMMAND $<TARGET_FILE:topology_frequency_profiler_test>
+        WORKING_DIRECTORY tests
+    )
+    # Suppress known CUDA driver leak (cuInit ~408 bytes) so ctest exits 0.
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologyFrequencyProfilerTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
 # Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
 # ============================================================================
 # Complements T4.7 (single-layer sample_neighbors determinism). Exercises

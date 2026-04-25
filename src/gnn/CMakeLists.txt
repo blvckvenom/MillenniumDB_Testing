@@ -86,6 +86,9 @@ add_library(mdb_gnn_core STATIC
     projection/topology_accessor.cc
     projection/gnn_projection_adapter.cc
 
+    # Spec #13 Phase 1: Frequency profiler for Four-Level Topology Store
+    projection/topology_frequency_profiler.cc
+
     # Phase 2: Offline Sampling Engine
     sampling/graph_sample.cc
     sampling/seed_selector.cc

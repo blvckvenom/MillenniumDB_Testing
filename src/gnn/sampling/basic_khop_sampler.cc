@@ -127,7 +127,12 @@ struct BasicKHopSampler::Impl {
         ObjectId node_id,
         uint64_t fanout
     ) {
-        Neighbors all_neighbors = topology->get_neighbors(node_id, config.orientation);
+        // TODO Spec #13 Phase 2: tally per-node access here and persist a
+        // `node_counts.bin` next to the sample artifacts. Consumed by
+        // TopologyFrequencyProfiler::compute_from_node_counts_ to seed
+        // the Four-Level Topology Store warm-start path.
+        Neighbors all_neighbors =
+            topology->get_neighbors(node_id, config.orientation);
 
         std::vector<std::pair<ObjectId, ObjectId>> result;
 
