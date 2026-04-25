@@ -176,6 +176,28 @@ struct SamplingConfig {
      */
     uint64_t reservoir_threshold = 10000;
 
+    /**
+     * @brief Use the in-memory projection adjacency cache (Spec #11).
+     *
+     * When true (default), the sampler full-scans `from_to_edge` +
+     * `to_from_edge` ONCE at construction and resolves every subsequent
+     * neighbour lookup in O(degree) from a hash map instead of paying an
+     * O(page_tuples) range query against the live B+Tree per seed.
+     *
+     * Empirically replaces an 11-minute run on ogbn-products (62 M edges)
+     * with a sub-30-second one — the same pattern that delivered ~700×
+     * speed-up in EmbeddingWriter Phase B (commit 6521cc21).
+     *
+     * Memory cost: ~16 bytes × num_directed_entries. Both UNDIRECTED
+     * directions cached together: ogbn-arxiv (~2.1 M directed) ≈ 34 MB,
+     * ogbn-products (~124 M directed) ≈ 3 GB.
+     *
+     * Disable with `useAdjacencyCache: false` for memory-constrained
+     * scenarios (papers100M scale needs partitioning before the cache fits
+     * — see master plan §11) or when bypassing the cache for benchmarking.
+     */
+    bool use_adjacency_cache = true;
+
     // =========================================================================
     // Output
     // =========================================================================

@@ -104,12 +104,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     uint64_t random_seed = SamplingConfig::DEFAULT_RANDOM_SEED;
     std::string orientation_str = "UNDIRECTED";
     bool use_predefined_splits = false;
+    bool use_adjacency_cache = true;
 
     if (ctx.arguments.size() >= 4) {
         try {
             parse_options(ctx, 3, batch_size, train_ratio, val_ratio,
                           test_ratio, random_seed, orientation_str,
-                          use_predefined_splits);
+                          use_predefined_splits, use_adjacency_cache);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -120,7 +121,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - testRatio (FLOAT): Test fraction (default: 0.15)\n"
                 "  - randomSeed (INT): For reproducibility (default: 42)\n"
                 "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED (default: UNDIRECTED)\n"
-                "  - usePredefinedSplits (BOOL): Use splits.bin from projection (default: false)\n\n"
+                "  - usePredefinedSplits (BOOL): Use splits.bin from projection (default: false)\n"
+                "  - useAdjacencyCache (BOOL): In-memory adjacency cache (default: true)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
                 "      batchSize: 512,\n"
@@ -195,6 +197,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.random_seed = random_seed;
     config.orientation = orientation;
     config.use_predefined_splits = use_predefined_splits;
+    config.use_adjacency_cache = use_adjacency_cache;
 
     // Validate config
     try {
@@ -305,7 +308,8 @@ void GnnOfflineSampleProcedure::parse_options(
     double& test_ratio,
     uint64_t& random_seed,
     std::string& orientation,
-    bool& use_predefined_splits
+    bool& use_predefined_splits,
+    bool& use_adjacency_cache
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -365,5 +369,10 @@ void GnnOfflineSampleProcedure::parse_options(
     // Parse orientation
     if (auto v = opts.get_string("orientation")) {
         orientation = *v;
+    }
+
+    // Parse useAdjacencyCache (Spec #11)
+    if (auto v = opts.get_bool("useAdjacencyCache")) {
+        use_adjacency_cache = *v;
     }
 }

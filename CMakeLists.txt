@@ -1365,6 +1365,46 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# TopologyAccessor adjacency cache unit tests (Spec #11)
+# ============================================================================
+# Validates the in-memory adjacency cache mode added by Spec #11. Cache vs
+# B+Tree paths must produce bit-identical neighbour sets and bit-identical
+# k-hop sampling output under a fixed RNG seed. Mirrors the linker recipe
+# of topology_accessor_csr_path_test (gtest_main first, mdb_gnn_core before
+# millenniumdb).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_adjacency_cache_test.cc")
+    add_executable(topology_accessor_adjacency_cache_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_adjacency_cache_test.cc
+    )
+    set_target_properties(topology_accessor_adjacency_cache_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_accessor_adjacency_cache_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyAccessorAdjacencyCacheTests
+        COMMAND $<TARGET_FILE:topology_accessor_adjacency_cache_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
 # ============================================================================
 # Complements T4.7 (single-layer sample_neighbors determinism). Exercises

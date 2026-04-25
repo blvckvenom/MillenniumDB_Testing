@@ -423,6 +423,71 @@ public:
      */
     void set_target_device(torch::Device device);
 
+    // =========================================================================
+    // In-memory adjacency cache (Spec #11)
+    // =========================================================================
+    //
+    // Opt-in performance path that materialises every projection edge into a
+    // pair of in-memory `unordered_map<uint64_t, vector<AdjEntry>>` instances
+    // (forward + reverse) by full-scanning the underlying B+Tree edge indexes
+    // ONCE. Subsequent `get_out_neighbors` / `get_in_neighbors` /
+    // `get_neighbors(UNDIRECTED)` calls then resolve in O(degree) via hash
+    // lookups instead of paying O(page_tuples) per range query against the
+    // live B+Tree.
+    //
+    // Memory cost: ~16 bytes per directed edge (uint64 neighbor + uint64
+    // edge_id) plus hash-map overhead. ogbn-products (62 M edges, both
+    // directions): ~3 GB — well inside a 31 GB commodity-RAM budget. Disabled
+    // by default; callers must explicitly opt in.
+    //
+    // Mirrors the design of the EmbeddingWriter Phase B cache (commit
+    // 6521cc21cf) but lives in TopologyAccessor so every consumer
+    // (BasicKHopSampler, EmbeddingWriter, future gnn_predict, etc.) can
+    // automatically benefit.
+
+    /// Single adjacency entry: neighbor node id + edge id (raw uint64 form,
+    /// without the 8-bit ObjectId type tag — added back when the cached
+    /// entries are converted to ObjectIds at lookup time).
+    struct AdjEntry {
+        uint64_t node_id;
+        uint64_t edge_id;
+    };
+
+    /// Enable the adjacency cache. Call before `prebuild_adjacency_cache(...)`
+    /// or before any `get_*_neighbors` call you want to benefit. Subsequent
+    /// disables are honoured (cache emptied, reverts to B+Tree path).
+    void enable_adjacency_cache(bool enabled);
+
+    /// Returns true if the cache is currently enabled.
+    bool is_adjacency_cache_enabled() const;
+
+    /// Eagerly populate the adjacency cache for the given orientation. For
+    /// UNDIRECTED this scans both `from_to_edge` and `to_from_edge`; for
+    /// NATURAL only `from_to_edge`; for REVERSE only `to_from_edge`.
+    /// No-op if the corresponding direction is already built. Returns the
+    /// number of milliseconds the build took (for instrumentation purposes).
+    ///
+    /// Pre-condition: `enable_adjacency_cache(true)` must have been called.
+    /// If the cache is disabled this is a silent no-op returning 0 ms.
+    uint64_t prebuild_adjacency_cache(EdgeOrientation orientation);
+
+    /// Returns true if at least the side of the cache needed for `orientation`
+    /// has been populated (i.e. fwd for NATURAL, rev for REVERSE, both for
+    /// UNDIRECTED). Otherwise the accessor will fall back to the B+Tree path.
+    bool is_adjacency_cache_built(EdgeOrientation orientation) const;
+
+    /// Approximate resident-memory cost of the cache in bytes (entries +
+    /// rough hash-map overhead). 0 when the cache is unbuilt or disabled.
+    uint64_t get_adjacency_cache_size_bytes() const;
+
+    /// Number of (src, neighbor, edge) triples currently held in the
+    /// forward cache (count of directed entries).
+    uint64_t get_adjacency_cache_fwd_entries() const;
+
+    /// Number of (src, neighbor, edge) triples currently held in the
+    /// reverse cache.
+    uint64_t get_adjacency_cache_rev_entries() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

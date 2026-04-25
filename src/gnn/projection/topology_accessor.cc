@@ -1,8 +1,10 @@
 #include "topology_accessor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "graph_models/gql/projection/projection_storage.h"
@@ -30,6 +32,25 @@ struct TopologyAccessor::Impl {
     GQL::Projection::TopologySnapshotReader fwd_csr_;
     GQL::Projection::TopologySnapshotReader rev_csr_;
 
+    // ----- In-memory adjacency cache (Spec #11) -----
+    //
+    // When `cache_enabled_` is true and the corresponding direction map is
+    // populated, `get_out_neighbors` / `get_in_neighbors` consult these maps
+    // first instead of the B+Tree range query. Maps are keyed by source-side
+    // raw uint64 node id (matches B+Tree record convention) and hold a
+    // contiguous vector of `(neighbor_id, edge_id)` pairs.
+    //
+    // Always-empty sentinel returned for absent keys keeps `get_neighbors_*`
+    // const-correct without per-call allocation. Built atomically once per
+    // direction; further `prebuild_adjacency_cache` calls are idempotent.
+    bool cache_enabled_ = false;
+    std::unordered_map<uint64_t, std::vector<TopologyAccessor::AdjEntry>> fwd_cache_;
+    std::unordered_map<uint64_t, std::vector<TopologyAccessor::AdjEntry>> rev_cache_;
+    bool fwd_cache_built_ = false;
+    bool rev_cache_built_ = false;
+    uint64_t fwd_cache_entries_ = 0;
+    uint64_t rev_cache_entries_ = 0;
+
     explicit Impl(GQL::ProjectionStorage& storage_)
         : storage(storage_),
           target_device(CudaContext::instance().torch_device()),
@@ -44,6 +65,102 @@ struct TopologyAccessor::Impl {
                   << (fwd_csr_.has_data() ? "csr" : "bpt")
                   << " rev="
                   << (rev_csr_.has_data() ? "csr" : "bpt") << "\n";
+    }
+
+    // -------------------------------------------------------------------------
+    // Adjacency cache helpers (Spec #11)
+    // -------------------------------------------------------------------------
+
+    // Full-scan a single B+Tree edge index and merge every record into
+    // `target` keyed on record[0] (the source-side endpoint). Returns the
+    // number of directed entries appended.
+    //
+    // Mirrors the EmbeddingWriter Phase B scan (commit 6521cc21) but tied to
+    // the accessor lifetime so multiple downstream consumers can share one
+    // build. Reads the same `from_to_edge` / `to_from_edge` indexes the
+    // BPT path uses, so cache contents are bit-identical to the live tree
+    // contents at construction time.
+    uint64_t scan_into_(
+        BPlusTree<3>* index,
+        std::unordered_map<uint64_t, std::vector<TopologyAccessor::AdjEntry>>& target)
+    {
+        uint64_t appended = 0;
+        if (!index) {
+            return appended;
+        }
+        Record<3> min_record = {0, 0, 0};
+        Record<3> max_record = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+        bool interruption_requested = false;
+        auto it = index->get_range(&interruption_requested, min_record, max_record);
+        const Record<3>* rec;
+        while ((rec = it.next()) != nullptr) {
+            const uint64_t a = std::get<0>(*rec);
+            const uint64_t b = std::get<1>(*rec);
+            const uint64_t e = std::get<2>(*rec);
+            target[a].push_back(TopologyAccessor::AdjEntry{b, e});
+            ++appended;
+        }
+        return appended;
+    }
+
+    // Build the forward (`from_to_edge`) cache once. Idempotent.
+    void build_fwd_cache_() {
+        if (fwd_cache_built_) {
+            return;
+        }
+        const auto t_start = std::chrono::steady_clock::now();
+        fwd_cache_.reserve(storage.get_node_count());
+        auto* fwd_index = storage.get_from_to_edge_index();
+        fwd_cache_entries_ = scan_into_(fwd_index, fwd_cache_);
+        fwd_cache_built_ = true;
+        const auto t_end = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(
+            t_end - t_start).count();
+        std::cerr << "TopologyAccessor: fwd adjacency cache built — "
+                  << fwd_cache_.size() << " keys, "
+                  << fwd_cache_entries_ << " directed entries, "
+                  << static_cast<int>(ms) << " ms" << std::endl;
+    }
+
+    // Build the reverse (`to_from_edge`) cache once. Idempotent.
+    void build_rev_cache_() {
+        if (rev_cache_built_) {
+            return;
+        }
+        const auto t_start = std::chrono::steady_clock::now();
+        rev_cache_.reserve(storage.get_node_count());
+        auto* rev_index = storage.get_to_from_edge_index();
+        rev_cache_entries_ = scan_into_(rev_index, rev_cache_);
+        rev_cache_built_ = true;
+        const auto t_end = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(
+            t_end - t_start).count();
+        std::cerr << "TopologyAccessor: rev adjacency cache built — "
+                  << rev_cache_.size() << " keys, "
+                  << rev_cache_entries_ << " directed entries, "
+                  << static_cast<int>(ms) << " ms" << std::endl;
+    }
+
+    // Returns the cached neighbours of `node_id` from `cache`, or an empty
+    // Neighbors when the key is absent. Repackages the raw entries as
+    // ObjectIds so callers get the same type they would from the BPT path.
+    static Neighbors materialise_from_cache_(
+        const std::unordered_map<uint64_t, std::vector<TopologyAccessor::AdjEntry>>& cache,
+        uint64_t node_id)
+    {
+        Neighbors result;
+        auto it = cache.find(node_id);
+        if (it == cache.end()) {
+            return result;
+        }
+        const auto& entries = it->second;
+        result.node_ids.reserve(entries.size());
+        result.edge_ids.reserve(entries.size());
+        for (const auto& e : entries) {
+            result.node_ids.push_back(ObjectId(e.node_id));
+            result.edge_ids.push_back(ObjectId(e.edge_id));
+        }
+        return result;
     }
 
     // CSR fast-path for outgoing neighbors. Returns std::nullopt when the
@@ -186,6 +303,11 @@ TopologyAccessor& TopologyAccessor::operator=(TopologyAccessor&&) noexcept = def
 // ----- Single Node Neighbor Access -----
 
 Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
+    // Fastest path (Spec #11): in-memory adjacency cache. Built once on
+    // demand, supersedes both the CSR mmap and the B+Tree range query.
+    if (impl_->cache_enabled_ && impl_->fwd_cache_built_) {
+        return Impl::materialise_from_cache_(impl_->fwd_cache_, node_id.id);
+    }
     // Fast path: mmap'd topology_fwd.csr (Spec #4-B T4.7). Absent / stale /
     // out-of-range → fall through to the B+Tree path below.
     if (auto fast = impl_->try_csr_out_neighbors(node_id)) {
@@ -195,6 +317,10 @@ Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
 }
 
 Neighbors TopologyAccessor::get_in_neighbors(ObjectId node_id) {
+    // Fastest path (Spec #11): in-memory adjacency cache.
+    if (impl_->cache_enabled_ && impl_->rev_cache_built_) {
+        return Impl::materialise_from_cache_(impl_->rev_cache_, node_id.id);
+    }
     // Fast path: mmap'd topology_rev.csr (Spec #4-B T4.7).
     if (auto fast = impl_->try_csr_in_neighbors(node_id)) {
         return std::move(*fast);
@@ -614,6 +740,92 @@ void TopologyAccessor::set_random_seed(uint64_t seed) {
 
 void TopologyAccessor::set_target_device(torch::Device device) {
     impl_->target_device = device;
+}
+
+// ----- Adjacency cache (Spec #11) -----
+
+void TopologyAccessor::enable_adjacency_cache(bool enabled) {
+    impl_->cache_enabled_ = enabled;
+    if (!enabled) {
+        // Drop existing entries so callers reverting to the BPT path are not
+        // silently held to stale data, and so the RAM is reclaimed
+        // immediately (the maps own their buckets).
+        impl_->fwd_cache_.clear();
+        impl_->rev_cache_.clear();
+        impl_->fwd_cache_built_ = false;
+        impl_->rev_cache_built_ = false;
+        impl_->fwd_cache_entries_ = 0;
+        impl_->rev_cache_entries_ = 0;
+    }
+}
+
+bool TopologyAccessor::is_adjacency_cache_enabled() const {
+    return impl_->cache_enabled_;
+}
+
+uint64_t TopologyAccessor::prebuild_adjacency_cache(EdgeOrientation orientation) {
+    if (!impl_->cache_enabled_) {
+        return 0;
+    }
+    const auto t_start = std::chrono::steady_clock::now();
+    switch (orientation) {
+        case EdgeOrientation::NATURAL:
+            impl_->build_fwd_cache_();
+            break;
+        case EdgeOrientation::REVERSE:
+            impl_->build_rev_cache_();
+            break;
+        case EdgeOrientation::UNDIRECTED:
+            impl_->build_fwd_cache_();
+            impl_->build_rev_cache_();
+            break;
+    }
+    const auto t_end = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(
+        std::chrono::duration<double, std::milli>(t_end - t_start).count());
+}
+
+bool TopologyAccessor::is_adjacency_cache_built(EdgeOrientation orientation) const {
+    if (!impl_->cache_enabled_) {
+        return false;
+    }
+    switch (orientation) {
+        case EdgeOrientation::NATURAL:
+            return impl_->fwd_cache_built_;
+        case EdgeOrientation::REVERSE:
+            return impl_->rev_cache_built_;
+        case EdgeOrientation::UNDIRECTED:
+            return impl_->fwd_cache_built_ && impl_->rev_cache_built_;
+    }
+    return false;
+}
+
+uint64_t TopologyAccessor::get_adjacency_cache_size_bytes() const {
+    if (!impl_->cache_enabled_) {
+        return 0;
+    }
+    // Each AdjEntry occupies 16 bytes (2 × uint64). Each map bucket pays an
+    // estimated 32-byte hash overhead (next-pointer + hash + key + size).
+    // The vector inside each value holds capacity ≥ size entries; use size
+    // as a tight lower bound (vectors reserved exact in scan_into_ are
+    // worst-case 1.5× via geometric growth). This is a rough resident
+    // estimate intended for instrumentation, not allocation accounting.
+    constexpr uint64_t kBucketOverhead = 32;
+    constexpr uint64_t kEntryBytes     = sizeof(AdjEntry);
+    uint64_t total = 0;
+    total += impl_->fwd_cache_.size() * kBucketOverhead;
+    total += impl_->fwd_cache_entries_ * kEntryBytes;
+    total += impl_->rev_cache_.size() * kBucketOverhead;
+    total += impl_->rev_cache_entries_ * kEntryBytes;
+    return total;
+}
+
+uint64_t TopologyAccessor::get_adjacency_cache_fwd_entries() const {
+    return impl_->fwd_cache_entries_;
+}
+
+uint64_t TopologyAccessor::get_adjacency_cache_rev_entries() const {
+    return impl_->rev_cache_entries_;
 }
 
 // ============================================================================

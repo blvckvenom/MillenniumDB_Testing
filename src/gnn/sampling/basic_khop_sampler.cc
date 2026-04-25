@@ -37,6 +37,22 @@ struct BasicKHopSampler::Impl {
         // Sync random seed with all samplers
         leapfrog_sampler->set_random_seed(config_.random_seed);
         seek_sampler->set_random_seed(config_.random_seed);
+
+        // Spec #11: opt into the in-memory adjacency cache up front so the
+        // O(|E|) full-scan is amortised across every batch in this sampling
+        // run. When the cache is built we force PER_NODE for every layer:
+        // PER_NODE → topology->get_neighbors → O(degree) hash lookup, which
+        // beats Leapfrog's O(|E|) per-batch range scan and SeekBased's per-
+        // node O(log E) seek under the cached path. Bit-identical sampling
+        // output is preserved because the cache holds the same edges the
+        // BPT path returns.
+        if (config_.use_adjacency_cache) {
+            topology->enable_adjacency_cache(true);
+            topology->prebuild_adjacency_cache(config_.orientation);
+            // Force PER_NODE: the cache makes per-node sampling
+            // unconditionally optimal compared to Leapfrog/Seek.
+            use_leapfrog = false;
+        }
     }
 
     /**

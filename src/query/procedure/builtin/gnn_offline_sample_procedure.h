@@ -46,6 +46,7 @@ namespace Procedures {
  * | randomSeed | INT | 42 | Seed for reproducibility |
  * | orientation | STRING | 'UNDIRECTED' | Edge direction: NATURAL, REVERSE, UNDIRECTED |
  * | usePredefinedSplits | BOOL | false | Use splits.bin from projection for train/val/test |
+ * | useAdjacencyCache | BOOL | true | Build in-memory adjacency cache for fast lookups (Spec #11) |
  *
  * ## Examples
  *
@@ -146,6 +147,7 @@ private:
      * @param[out] random_seed Parsed random seed
      * @param[out] orientation Parsed orientation string
      * @param[out] use_predefined_splits Whether to use splits.bin from projection
+     * @param[out] use_adjacency_cache Whether to build the in-memory adjacency cache (Spec #11)
      */
     void parse_options(
         ProcedureContext& ctx,
@@ -156,7 +158,8 @@ private:
         double& test_ratio,
         uint64_t& random_seed,
         std::string& orientation,
-        bool& use_predefined_splits
+        bool& use_predefined_splits,
+        bool& use_adjacency_cache
     );
 };
 
