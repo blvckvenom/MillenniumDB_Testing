@@ -584,9 +584,7 @@ void FourLevelTopologyStore::build() {
     l2_fwd_ = owned_l2_fwd_.get();
     l2_rev_ = owned_l2_rev_.get();
 
-    // Note: open_l3_sidecars_() was already called at Step 1.5 so the
-    // populate_direction_ fast path could use the mmap. l3_fwd_/l3_rev_
-    // are already wired by that earlier call.
+    // l3_fwd_/l3_rev_ are already wired by Step 1.5's open_l3_sidecars_().
 
     // Wire L4 fallback closures to the live BPTs. Required so L3-tier
     // nodes whose sidecar is absent / out-of-range fall through to a
