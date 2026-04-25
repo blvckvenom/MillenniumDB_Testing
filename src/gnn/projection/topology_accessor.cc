@@ -214,6 +214,44 @@ struct TopologyAccessor::Impl {
     }
 
     /**
+     * @brief Count neighbors of `node_id` in `index` without materialising
+     *        them.
+     *
+     * Companion to `get_neighbors_from_index` for the degree fast-path.
+     * Walks the same B+Tree range and applies the same defensive
+     * same-key post-filter, but only increments a counter — no
+     * `Neighbors` allocation, no per-tuple ObjectId construction. Critical
+     * on papers100M scale where naively reusing the materialising path
+     * (110M nodes × avg ~15 neighbors × 16 B/entry × 2 directions) would
+     * thrash the allocator with ~25 GB of transient allocations during
+     * `TopologyFrequencyProfiler::compute_from_degrees_`.
+     *
+     * The same-key filter is preserved verbatim from
+     * `get_neighbors_from_index` to keep the count semantically identical
+     * to that of the materialised path under both BTREE and CSR_HYBRID
+     * storage. See `get_neighbors_from_index`'s comment block for the
+     * CSR cross-page motivation.
+     */
+    int64_t count_neighbors_from_index(ObjectId node_id, BPlusTree<3>* index) {
+        if (!index) {
+            return 0;
+        }
+        Record<3> min_record = {node_id.id, 0, 0};
+        Record<3> max_record = {node_id.id, UINT64_MAX, UINT64_MAX};
+        bool interruption_requested = false;
+        auto it = index->get_range(&interruption_requested, min_record, max_record);
+        int64_t count = 0;
+        const Record<3>* record;
+        while ((record = it.next()) != nullptr) {
+            if (std::get<0>(*record) != node_id.id) {
+                continue;
+            }
+            ++count;
+        }
+        return count;
+    }
+
+    /**
      * @brief Get neighbors using from_to_edge index (outgoing).
      *
      * Filters emitted records by exact src-id match as a defensive post-pass.
@@ -715,13 +753,41 @@ std::vector<SampledSubgraph> TopologyAccessor::sample_khop_neighbors(
 // ----- Statistics -----
 
 int64_t TopologyAccessor::get_out_degree(ObjectId node_id) {
-    Neighbors neighbors = get_out_neighbors(node_id);
-    return static_cast<int64_t>(neighbors.node_ids.size());
+    // Fastest path: in-memory adjacency cache (Spec #11). Hash lookup
+    // returns the entry vector size directly — no copies.
+    if (impl_->cache_enabled_ && impl_->fwd_cache_built_) {
+        auto it = impl_->fwd_cache_.find(node_id.id);
+        return it == impl_->fwd_cache_.end()
+            ? 0
+            : static_cast<int64_t>(it->second.size());
+    }
+    // Fast path: mmap'd topology_fwd.csr (Spec #4-B). The reader exposes
+    // the per-row span O(1); we only need its size.
+    const uint64_t row_idx = node_id.get_value();
+    if (impl_->fwd_csr_.has_data() && row_idx < impl_->fwd_csr_.num_nodes()) {
+        return static_cast<int64_t>(impl_->fwd_csr_.neighbors(row_idx).size());
+    }
+    // B+Tree path: count tuples without materialising a Neighbors struct.
+    return impl_->count_neighbors_from_index(
+        node_id, impl_->storage.get_from_to_edge_index());
 }
 
 int64_t TopologyAccessor::get_in_degree(ObjectId node_id) {
-    Neighbors neighbors = get_in_neighbors(node_id);
-    return static_cast<int64_t>(neighbors.node_ids.size());
+    // Fastest path: in-memory adjacency cache (Spec #11).
+    if (impl_->cache_enabled_ && impl_->rev_cache_built_) {
+        auto it = impl_->rev_cache_.find(node_id.id);
+        return it == impl_->rev_cache_.end()
+            ? 0
+            : static_cast<int64_t>(it->second.size());
+    }
+    // Fast path: mmap'd topology_rev.csr (Spec #4-B).
+    const uint64_t row_idx = node_id.get_value();
+    if (impl_->rev_csr_.has_data() && row_idx < impl_->rev_csr_.num_nodes()) {
+        return static_cast<int64_t>(impl_->rev_csr_.neighbors(row_idx).size());
+    }
+    // B+Tree path: count without materialising.
+    return impl_->count_neighbors_from_index(
+        node_id, impl_->storage.get_to_from_edge_index());
 }
 
 uint64_t TopologyAccessor::get_edge_count() const {

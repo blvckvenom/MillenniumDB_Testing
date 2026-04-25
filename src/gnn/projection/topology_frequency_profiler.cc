@@ -12,11 +12,6 @@ namespace mdb::gnn {
 
 namespace {
 
-constexpr std::size_t kL1NodeFixedOverhead = 56;  // 24 vec header + ~32 hash bucket
-constexpr std::size_t kL1PerEdgeBytes      = 16;  // sizeof(AdjEntry) — node + edge id
-constexpr std::size_t kL2NodeFixedOverhead = 8;   // one uint64 row_ptr entry
-constexpr std::size_t kL2PerEdgeBytes      = 8;   // uint32 col_idx + uint32 edge_id
-
 inline std::size_t l1_cost_per_node(double avg_degree) {
     if (avg_degree < 0.0) avg_degree = 0.0;
     return static_cast<std::size_t>(avg_degree * kL1PerEdgeBytes) + kL1NodeFixedOverhead;
@@ -30,12 +25,9 @@ inline std::size_t l2_cost_per_node(double avg_degree) {
 }  // namespace
 
 TopologyFrequencyProfiler::TopologyFrequencyProfiler(
-    const TopologyAccessor& topo,
+    TopologyAccessor& topo,
     std::filesystem::path projection_dir)
-    // const_cast: TopologyAccessor::get_*_degree are non-const because they
-    // lazily fault in B+Tree cursors. The profiler treats the accessor as
-    // logically read-only — no mutation of stored topology occurs.
-    : topo_(const_cast<TopologyAccessor&>(topo)),
+    : topo_(topo),
       projection_dir_(std::move(projection_dir))
 {}
 
@@ -52,8 +44,9 @@ void TopologyFrequencyProfiler::compute(EdgeOrientation direction) {
 
 bool TopologyFrequencyProfiler::compute_from_node_counts_(EdgeOrientation /*direction*/) {
     // TODO Spec #13 Phase 2: implement node_counts.bin reader once
-    // gnn_offline_sample writer lands.
-    (void)projection_dir_;
+    // gnn_offline_sample writer lands. `projection_dir_` is the lookup
+    // root for the persisted counts file; it is stored on the profiler
+    // for the future reader to consume.
     return false;
 }
 

@@ -9,6 +9,32 @@
 
 namespace mdb::gnn {
 
+// ===========================================================================
+// Per-tier memory accounting constants (Spec #13 design §1 / §2.6)
+// ===========================================================================
+//
+// These four constants describe the bytes-per-node and bytes-per-edge cost
+// of holding a node in each tier of the Four-Level Topology Store. They are
+// declared in this public header (not buried in the .cc) so that Phase 2's
+// `FourLevelTopologyStore::build_phase`, `L1HashCache`, and `L2CompactCsr`
+// can `static_assert` / arithmetically share the same numbers used here by
+// `compute_tier_assignment`. Any change to the on-disk / in-memory layout
+// of those structures MUST be reflected here in lockstep.
+//
+//   L1 (RAM hash cache):
+//     - 16 B per AdjEntry                 → kL1PerEdgeBytes
+//     - 24 B vector header
+//     - ~32 B per-bucket hash overhead    → 56 B total fixed → kL1NodeFixedOverhead
+//
+//   L2 (compact CSR):
+//     -  8 B per edge (uint32 col_idx + uint32 edge_id) → kL2PerEdgeBytes
+//     -  8 B per node (one uint64 row_ptr entry)        → kL2NodeFixedOverhead
+
+constexpr std::size_t kL1NodeFixedOverhead = 56;
+constexpr std::size_t kL1PerEdgeBytes      = 16;
+constexpr std::size_t kL2NodeFixedOverhead = 8;
+constexpr std::size_t kL2PerEdgeBytes      = 8;
+
 /**
  * @brief Frequency profile of nodes in a projection, used to seed the
  *        Four-Level Topology Store tier assignment (Spec #13).
@@ -41,12 +67,19 @@ public:
     /**
      * @brief Construct a profiler bound to a topology accessor.
      *
+     * The accessor is taken by non-const reference to mirror the
+     * lazy-cursor reality of `TopologyAccessor::get_*_degree` (and the
+     * GNN-module convention used by `FeatureAccessor` over
+     * `GQL::ProjectionStorage&`). The profiler is still semantically
+     * read-only — it never mutates stored topology — but it threads the
+     * accessor's internal cache state through unchanged.
+     *
      * @param topo            Source of degree / iteration data. Must outlive
      *                        the profiler.
      * @param projection_dir  Directory used to look up an optional
      *                        `node_counts.bin` warm-start file.
      */
-    TopologyFrequencyProfiler(const TopologyAccessor& topo,
+    TopologyFrequencyProfiler(TopologyAccessor& topo,
                               std::filesystem::path projection_dir);
 
     /**
@@ -81,7 +114,8 @@ private:
     /// Cold-start path — populates `frequency_` from per-node degree.
     void compute_from_degrees_(EdgeOrientation direction);
 
-    // Non-owning. Mutable to allow degree queries that internally lazy-cache.
+    // Non-owning. Held as non-const because `TopologyAccessor::get_*_degree`
+    // lazily fault in B+Tree cursors / adjacency caches.
     TopologyAccessor& topo_;
     std::filesystem::path projection_dir_;
     std::vector<uint64_t> frequency_;

@@ -21,7 +21,6 @@
 // so both suites can share the process-lifetime System singleton when run
 // in the same process.
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -55,6 +54,18 @@ public:
     }
 
     const std::string& db_folder() const { return db_folder_; }
+
+    // Cleanup the per-process scratch directory on teardown so repeated
+    // ctest runs do not leak `test_db_topo_freq_profiler_*` directories
+    // into the working tree. `noexcept` because filesystem ops can throw
+    // and a destructor must not propagate.
+    ~MdbFixture() noexcept {
+        try {
+            fs::remove_all(db_folder_);
+        } catch (...) {
+            // Swallow — best-effort cleanup; nothing the test can do.
+        }
+    }
 
 private:
     MdbFixture() {
