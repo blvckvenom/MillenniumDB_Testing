@@ -47,6 +47,10 @@ namespace Procedures {
  * | orientation | STRING | 'UNDIRECTED' | Edge direction: NATURAL, REVERSE, UNDIRECTED |
  * | usePredefinedSplits | BOOL | false | Use splits.bin from projection for train/val/test |
  * | useAdjacencyCache | BOOL | true | Build in-memory adjacency cache for fast lookups (Spec #11) |
+ * | useFourLevelTopologyStore | BOOL | false | Build the Four-Level Topology Store (Spec #13) |
+ * | l1CacheMb | INT | 0 | L1 (RAM hot) budget in MiB; 0 = auto-detect from /proc/meminfo |
+ * | l2CacheMb | INT | 0 | L2 (RAM warm) budget in MiB; 0 = auto-detect from /proc/meminfo |
+ * | useL3MmapSidecar | BOOL | false | Open the Spec #4-B mmap sidecar as L3 cold tier when present |
  *
  * ## Examples
  *
@@ -159,7 +163,11 @@ private:
         uint64_t& random_seed,
         std::string& orientation,
         bool& use_predefined_splits,
-        bool& use_adjacency_cache
+        bool& use_adjacency_cache,
+        bool& use_four_level_topology_store,
+        uint64_t& l1_cache_mb,
+        uint64_t& l2_cache_mb,
+        bool& use_l3_mmap_sidecar
     );
 };
 

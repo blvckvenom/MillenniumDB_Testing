@@ -6,7 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "gnn/projection/topology_accessor.h"  // For EdgeOrientation, SamplingStrategy
+#include "gnn/projection/edge_orientation.h"   // EdgeOrientation (lightweight header)
+#include "gnn/projection/topology_accessor.h"  // SamplingStrategy + BatchStrategy (still depends on torch)
 
 namespace mdb::gnn {
 
@@ -199,6 +200,50 @@ struct SamplingConfig {
     bool use_adjacency_cache = true;
 
     // =========================================================================
+    // Four-Level Topology Store (Spec #13)
+    // =========================================================================
+
+    /**
+     * @brief Use the Four-Level Topology Store (Spec #13).
+     *
+     * When true, the sampler builds a tiered cache that partitions adjacency
+     * across four tiers:
+     *   - L1: RAM hash (hot nodes, ~5-20 ns/lookup)
+     *   - L2: RAM compact CSR (warm nodes, ~50-200 ns/lookup)
+     *   - L3: mmap-backed CSR sidecar (cold nodes, ~5-100 us/lookup)
+     *   - L4: B+Tree direct (rare fallback)
+     *
+     * Designed to enable papers100M-scale sampling on commodity 32 GB RAM
+     * hardware. When false (default), the legacy Spec #11 single-tier
+     * cache (`use_adjacency_cache`) is used instead.
+     *
+     * Validation: setting this true while `use_adjacency_cache=false` is
+     * an error — Spec #13 supersedes Spec #11 but does not bypass the cache
+     * gate (D8 in the design doc).
+     */
+    bool use_four_level_topology_store = false;
+
+    /**
+     * @brief L1 cache budget in MiB. 0 means auto-detect from
+     *        /proc/meminfo (25% of 70% of MemAvailable).
+     */
+    std::size_t l1_cache_mb = 0;
+
+    /**
+     * @brief L2 cache budget in MiB. 0 means auto-detect from
+     *        /proc/meminfo (75% of 70% of MemAvailable).
+     */
+    std::size_t l2_cache_mb = 0;
+
+    /**
+     * @brief Use the mmap-backed L3 sidecar (Spec #4-B `topology_*.csr`
+     *        files) when present. Requires `buildTopologySnapshot:true`
+     *        at projection-build time. Silently ignored when the sidecar
+     *        is absent or stale.
+     */
+    bool use_l3_mmap_sidecar = false;
+
+    // =========================================================================
     // Output
     // =========================================================================
 
@@ -255,6 +300,26 @@ struct SamplingConfig {
                 throw std::invalid_argument("split ratios cannot be negative");
             }
         }
+
+        // Spec #13 D8: useFourLevelTopologyStore implies useAdjacencyCache.
+        // Both flags being false is OK (legacy fallback through sidecar /
+        // BPT direct). Both true is OK (Spec #13 supersedes Spec #11
+        // transparently).  The single illegal combination is
+        // useFourLevelTopologyStore=true with useAdjacencyCache=false
+        // because the user is asking for a tiered cache while explicitly
+        // disabling the cache gate.
+        if (use_four_level_topology_store && !use_adjacency_cache) {
+            throw std::invalid_argument(
+                "useFourLevelTopologyStore=true requires useAdjacencyCache=true. "
+                "Set useAdjacencyCache:true (or omit it; default is true) when "
+                "enabling the Four-Level Topology Store, OR disable both for "
+                "the sidecar/BPT-direct path.");
+        }
+
+        // l1_cache_mb / l2_cache_mb are size_t and therefore non-negative
+        // by construction; the GQL parser layer is responsible for
+        // rejecting negative integer literals before they reach this
+        // struct.
     }
 
     /**

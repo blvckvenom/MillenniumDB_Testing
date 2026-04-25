@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "gnn/projection/four_level_topology_store.h"
 #include "gnn/projection/topology_accessor.h"
 #include "gnn/sampling/leapfrog_gnn_sampler.h"
 #include "gnn/sampling/seek_based_gnn_sampler.h"
@@ -38,6 +39,23 @@ struct BasicKHopSampler::Impl {
         leapfrog_sampler->set_random_seed(config_.random_seed);
         seek_sampler->set_random_seed(config_.random_seed);
 
+        // Spec #13 supersedes Spec #11. When the four-level store is
+        // enabled, we delegate the entire neighbor lookup pipeline to it
+        // (it owns its own L1 hash + L2 compact CSR + optional L3 mmap +
+        // L4 BPT fallback) and disable the legacy single-tier cache to
+        // avoid double-RAM accounting.
+        if (config_.use_four_level_topology_store) {
+            FourLevelTopologyStore::Config tcfg;
+            tcfg.l1_budget_mb        = config_.l1_cache_mb;
+            tcfg.l2_budget_mb        = config_.l2_cache_mb;
+            tcfg.use_l3_mmap_sidecar = config_.use_l3_mmap_sidecar;
+            tcfg.orientation         = config_.orientation;
+            topology->enable_four_level_store(tcfg);
+            // Force PER_NODE: the four-level store dispatch is O(1)
+            // hash / CSR slice and beats Leapfrog/Seek under cached
+            // paths just as Spec #11 did.
+            use_leapfrog = false;
+        }
         // Spec #11: opt into the in-memory adjacency cache up front so the
         // O(|E|) full-scan is amortised across every batch in this sampling
         // run. When the cache is built we force PER_NODE for every layer:
@@ -46,7 +64,7 @@ struct BasicKHopSampler::Impl {
         // node O(log E) seek under the cached path. Bit-identical sampling
         // output is preserved because the cache holds the same edges the
         // BPT path returns.
-        if (config_.use_adjacency_cache) {
+        else if (config_.use_adjacency_cache) {
             topology->enable_adjacency_cache(true);
             topology->prebuild_adjacency_cache(config_.orientation);
             // Force PER_NODE: the cache makes per-node sampling

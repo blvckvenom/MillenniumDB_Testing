@@ -8,6 +8,8 @@
 
 #include <torch/torch.h>
 
+#include "gnn/projection/edge_orientation.h"
+#include "gnn/projection/four_level_topology_store.h"  // FourLevelTopologyStore::Config
 #include "graph_models/object_id.h"
 
 namespace GQL {
@@ -47,19 +49,11 @@ struct SampledSubgraph {
     std::unordered_map<uint64_t, int64_t> dst_id_to_idx;  ///< ObjectId.id -> local index
 };
 
-/**
- * @brief Edge orientation for neighbor traversal.
- *
- * Mirrors GQL::Procedures::Orientation but kept separate for module isolation.
- * Controls how edges are traversed during neighbor lookup and sampling.
- *
- * @see ISO/IEC 39075:2024 §4.3.5 (Undirected Edge Handling)
- */
-enum class EdgeOrientation {
-    NATURAL,     ///< Follow edge direction as stored (from → to)
-    REVERSE,     ///< Reverse edge direction (to → from)
-    UNDIRECTED   ///< Traverse both directions (bidirectional access)
-};
+// EdgeOrientation is now defined in `gnn/projection/edge_orientation.h` so
+// lightweight consumers (sampling_config.h, four_level_topology_store.h)
+// can use the enum without including this entire header. The include at
+// the top of this file re-introduces the enum into this translation unit
+// for backwards-compatible access via `mdb::gnn::EdgeOrientation`.
 
 /**
  * @brief Sampling strategy for neighbor selection.
@@ -487,6 +481,53 @@ public:
     /// Number of (src, neighbor, edge) triples currently held in the
     /// reverse cache.
     uint64_t get_adjacency_cache_rev_entries() const;
+
+    // =========================================================================
+    // Four-Level Topology Store (Spec #13)
+    // =========================================================================
+    //
+    // When the four-level store is enabled, every neighbor lookup is
+    // routed through it INSTEAD of the Spec #11 / Spec #4-B / B+Tree
+    // dispatch chain. The store is a tiered cache (L1 RAM hash, L2 RAM
+    // compact CSR, L3 mmap sidecar, L4 BPT fallback) that targets
+    // commodity-RAM scenarios on >100M-node graphs where the simple
+    // Spec #11 cache would OOM.
+    //
+    // When unset (default), all existing dispatch logic is preserved
+    // byte-for-byte — the regression contract every existing test
+    // relies on.
+
+    /**
+     * @brief Build and enable the Four-Level Topology Store (Spec #13).
+     *
+     * Constructs a `FourLevelTopologyStore` over the underlying
+     * projection's B+Tree edge indexes, runs `build()` to populate
+     * tiers, and registers the result as the dispatch target for
+     * every subsequent `get_*_neighbors` call.
+     *
+     * Once enabled, the Spec #11 single-tier cache is bypassed (the
+     * four-level store has its own internal L1 hash cache that
+     * subsumes it; populating both would double-count RAM). Calling
+     * `enable_adjacency_cache(false)` after this method is a no-op.
+     *
+     * Idempotent: calling twice throws `std::logic_error`. To swap
+     * configurations, drop the accessor and recreate.
+     *
+     * Caller must include `gnn/projection/four_level_topology_store.h`
+     * for the `Config` type. The forward-declared
+     * `FourLevelTopologyStore` symbol above keeps this header
+     * lightweight while letting the .cc file resolve the full type.
+     *
+     * @throws std::logic_error when called more than once on the same
+     *         accessor.
+     * @throws std::runtime_error on any underlying I/O / build
+     *         failure.
+     */
+    void enable_four_level_store(
+        const FourLevelTopologyStore::Config& config);
+
+    /// Returns true iff `enable_four_level_store()` has run successfully.
+    bool is_four_level_store_enabled() const;
 
 private:
     struct Impl;

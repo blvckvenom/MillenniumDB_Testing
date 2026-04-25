@@ -2,76 +2,65 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
+#include <memory>
+#include <utility>
 #include <vector>
 
 #include "gnn/projection/adj_entry.h"
+#include "gnn/projection/edge_orientation.h"
 #include "gnn/projection/l1_hash_cache.h"
 #include "gnn/projection/l2_compact_csr.h"
-#include "gnn/projection/topology_accessor.h"  // EdgeOrientation
 #include "graph_models/object_id.h"
 
-namespace GQL::Projection {
+// Forward declarations to keep this header lightweight (no torch / mmap /
+// projection storage transitives leaking through).
+template <std::size_t N> class BPlusTree;
+
+namespace GQL {
+class ProjectionStorage;
+namespace Projection {
 class TopologySnapshotReader;
 }
+}  // namespace GQL
 
 namespace mdb::gnn {
+
+class TopologyAccessor;
+class TopologyFrequencyProfiler;
 
 /**
  * @brief Coordinator for the Four-Level Topology Store (Spec #13).
  *
- * Phase 2 (T13.6) skeleton. This class owns **only** the runtime
- * dispatch logic and a small amount of context plumbing. It does
- * NOT yet perform any of the heavy build orchestration (frequency
- * profiling, B+Tree scanning to populate L1/L2, mmap'ing the L3
- * sidecar). That is Phase 3 (T13.7).
+ * Phase 3 (T13.7) replaces the Phase 2 dispatcher-only skeleton with a
+ * full coordinator that:
  *
- * Phase 2 acceptance is: given pre-built L1 + L2 caches, an optional
- * pre-opened L3 sidecar, an optional L4 BPT fallback, a per-row tier
- * vector, and a `RowMapping`-equivalent callable that maps
- * `ObjectId → row_idx`, the dispatcher routes each
- * `get_out_neighbors` / `get_in_neighbors` call to the correct tier
- * and returns the raw neighbor span.
+ *   1. Owns the four tier sources internally (forward + reverse L1
+ *      hash caches and L2 compact CSRs, plus optional non-owning L3
+ *      sidecar reader pointers and an L4 B+Tree pointer pair for
+ *      fallback).
+ *   2. Builds the tiers from a `ProjectionStorage` (or directly from
+ *      its B+Tree pointers) using a `TopologyFrequencyProfiler` to
+ *      decide tier assignment.
+ *   3. Dispatches `get_out_neighbors` / `get_in_neighbors` /
+ *      `get_neighbors(UNDIRECTED)` to the correct tier per node.
  *
- * Phase 3 will:
- *   - Add a `build()` method that consumes a `TopologyAccessor`
- *     plus a `TopologyFrequencyProfiler` to populate the caches.
- *   - Wire a real `RowMapping` instead of the testable
- *     `std::function<uint64_t(ObjectId)>` callable used here.
- *   - Plug the dispatcher into `TopologyAccessor::get_*_neighbors`.
- *
- * Threading: post-construction, this class is read-only and safe to
- * call from any number of sampler threads concurrently.
+ * Threading: post-`build()` the store is read-only and safe for
+ * concurrent sampler threads. Calling `build()` twice is rejected; the
+ * caller must drop and recreate the store to rebuild.
  */
-/// Known follow-ups for Phase 3 (T13.7-T13.9):
-///   1. `Neighbors` is currently a tagged "fat" struct (~96 B). Phase 3 should
-///      add `for_each_dst(callback)` and `for_each_with_edge_id(callback)` member
-///      functions to centralize the tier-switch logic and remove caller-side
-///      switch-on-tier boilerplate.
-///   2. The header includes `topology_accessor.h` solely for `EdgeOrientation`.
-///      Phase 3 should hoist that enum (and possibly `RowMapping`) into a shared
-///      lightweight header.
-///   3. `Config::orientation` is stored but unused in Phase 2 dispatch (direction is
-///      selected by which member fn is called). Phase 3's build orchestrator will
-///      consume it.
 class FourLevelTopologyStore {
 public:
     /**
      * @brief Public neighbor span returned by every dispatch path.
      *
-     * Holds the lookup result in two interchangeable shapes:
-     *
-     *   - L1 hits set `l1` and leave `l2_col_idx` / `l3_col_idx` null.
-     *   - L2 hits set `l2_col_idx` (uint32 destination row indexes
-     *     only — see `L2CompactCsr` header for the edge_ids decision)
-     *     and `l2_size`.
-     *   - L3 hits set `l3_col_idx` (uint64 from the mmap'd snapshot)
-     *     and `l3_size`.
-     *   - L4 hits materialise into `l4_owned` because the BPT path
-     *     is the only tier that returns a freshly-allocated vector.
-     *
-     * Callers that only care about destination ids should call
-     * `for_each_dst()` which abstracts over the four shapes.
+     * Holds the lookup result in four interchangeable shapes (one per
+     * tier). Callers should consume the result through
+     * `for_each_dst()` / `for_each_with_edge_id()` rather than
+     * switching on `tier` themselves — the helpers absorb the
+     * tier-specific boilerplate so downstream consumers stay tier-
+     * agnostic.
      */
     struct Neighbors {
         // L1
@@ -81,6 +70,7 @@ public:
         std::size_t               l2_size    = 0;
         // L3: uint64 dst node ids, length l3_size. Owned by mmap.
         const uint64_t*           l3_col_idx = nullptr;
+        const uint64_t*           l3_edge_ids = nullptr;  // may be nullptr
         std::size_t               l3_size    = 0;
         // L4: BPT direct returns full Neighbors copies — the
         // dispatcher owns the allocation here.
@@ -90,83 +80,203 @@ public:
 
         bool empty() const noexcept;
         std::size_t size() const noexcept;
+
+        /**
+         * @brief Iterate destination ids only (edge-id-agnostic path).
+         *
+         * Consumers that don't care about edge ids (the GraphSAGE
+         * sampler in its hot path, EmbeddingWriter Phase B
+         * traversal) can use this helper to walk the result without
+         * branching on `tier`. The callback is invoked once per
+         * destination in storage order.
+         *
+         * Callback signature: `void(uint64_t dst_node_id)`.
+         */
+        template <typename Fn>
+        void for_each_dst(Fn&& callback) const {
+            switch (tier) {
+                case 1:
+                    for (std::size_t i = 0; i < l1.size; ++i) {
+                        callback(l1.data[i].node_id);
+                    }
+                    break;
+                case 2:
+                    for (std::size_t i = 0; i < l2_size; ++i) {
+                        callback(static_cast<uint64_t>(l2_col_idx[i]));
+                    }
+                    break;
+                case 3:
+                    for (std::size_t i = 0; i < l3_size; ++i) {
+                        callback(l3_col_idx[i]);
+                    }
+                    break;
+                case 4:
+                    for (const auto& e : l4_owned) {
+                        callback(e.node_id);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        /**
+         * @brief Iterate `(dst_node_id, edge_id)` pairs.
+         *
+         * For tiers without edge ids in their layout (currently L2 and
+         * L3-without-edge-ids) the callback receives `0` as the edge
+         * id. Callers that need true edge-id resolution for L2/L3
+         * nodes must fall through to L4 explicitly; the four-level
+         * store does not promote on a per-call basis.
+         *
+         * Callback signature:
+         *   `void(uint64_t dst_node_id, uint64_t edge_id_or_zero)`.
+         */
+        template <typename Fn>
+        void for_each_with_edge_id(Fn&& callback) const {
+            switch (tier) {
+                case 1:
+                    for (std::size_t i = 0; i < l1.size; ++i) {
+                        callback(l1.data[i].node_id, l1.data[i].edge_id);
+                    }
+                    break;
+                case 2:
+                    for (std::size_t i = 0; i < l2_size; ++i) {
+                        callback(static_cast<uint64_t>(l2_col_idx[i]),
+                                 uint64_t{0});
+                    }
+                    break;
+                case 3:
+                    for (std::size_t i = 0; i < l3_size; ++i) {
+                        const uint64_t eid =
+                            (l3_edge_ids != nullptr) ? l3_edge_ids[i] : 0ULL;
+                        callback(l3_col_idx[i], eid);
+                    }
+                    break;
+                case 4:
+                    for (const auto& e : l4_owned) {
+                        callback(e.node_id, e.edge_id);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
     };
 
     /**
-     * @brief Lightweight L4 (B+Tree direct) callback.
-     *
-     * Phase 2 keeps the BPT integration testable in isolation by
-     * accepting a callable instead of holding a `BPlusTree<3>*` and
-     * its surrounding cursor / decoder code. The orchestrator wires
-     * a `BPlusTree<3>::range_query` adapter here in Phase 3.
-     *
-     * Returns the source node's full adjacency. Empty vector for
-     * isolated nodes; null callable means "no L4 available" — a
-     * tier-4 dispatch with no callback throws.
-     */
-    using L4Lookup = std::function<std::vector<AdjEntry>(ObjectId)>;
-
-    /**
-     * @brief RowMapping-equivalent callable.
-     *
-     * Maps an `ObjectId` to its row index in the projection's node
-     * iteration order. Phase 3 will wire this through the real
-     * `RowMapping` class; Phase 2 keeps the abstraction lightweight
-     * so unit tests can drive synthetic graphs without spinning up a
-     * full projection.
-     *
-     * Must return a value `>= tier_lookup.size()` for nodes outside
-     * the projection (or any sentinel; the dispatcher treats out-of-
-     * range as "fall through to L4" / "throw if no L4").
-     */
-    using RowLookup = std::function<uint64_t(ObjectId)>;
-
-    /**
-     * @brief Phase 2 minimal config. Phase 3 will widen this.
+     * @brief Build configuration. All fields have safe defaults; the
+     *        only mandatory consumer-side decision is `orientation`.
      */
     struct Config {
+        /// L1 (RAM hot hash) budget in bytes. 0 = auto-detect (25% of
+        /// 70% of MemAvailable from `src/misc/available_ram.h`).
+        std::size_t l1_budget_mb = 0;
+
+        /// L2 (RAM warm compact-CSR) budget in bytes. 0 = auto-detect
+        /// (75% of 70% of MemAvailable).
+        std::size_t l2_budget_mb = 0;
+
+        /// Open the Spec #4-B mmap sidecar files for the L3 cold tier
+        /// when present. Composes with `indexSet` — the sidecar is
+        /// silently absent when the projection wasn't built with
+        /// `buildTopologySnapshot:true`.
+        bool use_l3_mmap_sidecar = false;
+
+        /// Edge orientation that drives which directions to build:
+        ///   - NATURAL    -> forward L1+L2 only.
+        ///   - REVERSE    -> reverse L1+L2 only.
+        ///   - UNDIRECTED -> both forward + reverse.
         EdgeOrientation orientation = EdgeOrientation::UNDIRECTED;
     };
 
-    /**
-     * @brief Construct a dispatcher from pre-built tier sources.
-     *
-     * @param l1_fwd          Forward L1 cache. Always required (may be
-     *                        empty).
-     * @param l1_rev          Reverse L1 cache. Required when
-     *                        `orientation` is REVERSE or UNDIRECTED.
-     * @param l2_fwd          Forward L2 CSR. Always required.
-     * @param l2_rev          Reverse L2 CSR. Required for non-NATURAL.
-     * @param l3_fwd          Optional forward L3 mmap reader. May be
-     *                        nullptr; tier-3 lookups then fall to L4.
-     * @param l3_rev          Optional reverse L3 mmap reader.
-     * @param l4_fwd          Optional forward L4 BPT callback.
-     * @param l4_rev          Optional reverse L4 BPT callback.
-     * @param tier_lookup     Per-row tier vector from
-     *                        `compute_tier_assignment()`. Held by
-     *                        const reference; must outlive *this.
-     * @param row_lookup      Callable mapping ObjectId to row index.
-     * @param config          Orientation + future-extension knobs.
-     */
+    // ------------------------------------------------------------------
+    //  Phase 2 dispatcher constructor (kept for unit-test compatibility).
+    // ------------------------------------------------------------------
+    //
+    // Pre-built tier sources are passed in by reference / pointer; the
+    // resulting store does NOT own L1/L2 (they live in caller scope) and
+    // `build()` is a no-op. Used exclusively by
+    // `four_level_topology_store_test.cc` to drive the dispatcher with
+    // synthetic L1/L2 fixtures.
+    //
+    // For real usage, prefer the Phase 3 constructor below + `build()`.
+
+    using L4Lookup = std::function<std::vector<AdjEntry>(ObjectId)>;
+    using RowLookup = std::function<uint64_t(ObjectId)>;
+
     FourLevelTopologyStore(
-        const L1HashCache&                          l1_fwd,
-        const L1HashCache&                          l1_rev,
-        const L2CompactCsr&                         l2_fwd,
-        const L2CompactCsr&                         l2_rev,
-        const GQL::Projection::TopologySnapshotReader* l3_fwd,
-        const GQL::Projection::TopologySnapshotReader* l3_rev,
-        L4Lookup                                    l4_fwd,
-        L4Lookup                                    l4_rev,
-        const std::vector<uint8_t>&                 tier_lookup,
-        RowLookup                                   row_lookup,
-        Config                                      config);
+        const L1HashCache&                              l1_fwd,
+        const L1HashCache&                              l1_rev,
+        const L2CompactCsr&                             l2_fwd,
+        const L2CompactCsr&                             l2_rev,
+        const GQL::Projection::TopologySnapshotReader*  l3_fwd,
+        const GQL::Projection::TopologySnapshotReader*  l3_rev,
+        L4Lookup                                        l4_fwd,
+        L4Lookup                                        l4_rev,
+        const std::vector<uint8_t>&                     tier_lookup,
+        RowLookup                                       row_lookup,
+        Config                                          config);
+
+    // ------------------------------------------------------------------
+    //  Phase 3 build constructor.
+    // ------------------------------------------------------------------
+    //
+    // Constructs a store wired to live B+Trees + an optional storage
+    // pointer (used to source `topology_*.csr` sidecars when the L3
+    // tier is enabled and the projection has them on disk). After
+    // construction the store is *not* yet built — call `build()` to
+    // populate the tiers. `is_built()` reports whether the store is
+    // ready for queries.
+    //
+    // Lifetimes: `fwd_bpt` / `rev_bpt` / `storage` (when non-null)
+    // must outlive the store.
+    FourLevelTopologyStore(BPlusTree<3>*               fwd_bpt,
+                           BPlusTree<3>*               rev_bpt,
+                           GQL::ProjectionStorage*     storage,
+                           std::filesystem::path       projection_dir,
+                           Config                      config);
 
     FourLevelTopologyStore(const FourLevelTopologyStore&)            = delete;
     FourLevelTopologyStore& operator=(const FourLevelTopologyStore&) = delete;
 
+    ~FourLevelTopologyStore();
+
+    /**
+     * @brief Orchestrate the build phase (Phase 3 constructor only).
+     *
+     * Sequence (per design §2.3):
+     *   1. Auto-detect L1/L2 budgets from /proc/meminfo when
+     *      Config::l1_budget_mb / l2_budget_mb are 0.
+     *   2. Run the frequency profiler (degree proxy when no
+     *      `node_counts.bin` exists yet).
+     *   3. Compute tier_assignment[] greedily by descending frequency.
+     *   4. Walk the live B+Trees, populating L1 (reserve+move) and L2
+     *      (add_node + freeze) per tier_assignment[].
+     *   5. When `use_l3_mmap_sidecar`, open the Spec #4-B sidecar
+     *      readers (silently no-op when the files are absent).
+     *   6. Mark the store built.
+     *
+     * Throws std::logic_error when called on the dispatcher
+     * constructor or when called twice. Throws std::runtime_error on
+     * any underlying I/O / B+Tree failure (no silent partial builds).
+     */
+    void build();
+
+    /**
+     * @brief Whether the store is ready for queries.
+     *
+     * Always true for the dispatcher constructor (caller-managed
+     * tiers). True for the Phase 3 constructor only after a
+     * successful `build()`.
+     */
+    bool is_built() const noexcept;
+
     /**
      * @brief Get outgoing neighbors (NATURAL).
      *
+     * @throws std::logic_error when the store was constructed via the
+     *         Phase 3 ctor and `build()` has not been called.
      * @throws std::out_of_range when `row_lookup(v)` is past
      *         `tier_lookup` AND no L4 callback is wired (defensive
      *         choice: silent empty would mask projection / config
@@ -179,30 +289,92 @@ public:
      */
     Neighbors get_in_neighbors(ObjectId v) const;
 
+    /**
+     * @brief Get neighbors per Config::orientation.
+     *
+     * Convenience wrapper. NATURAL -> get_out_neighbors,
+     * REVERSE -> get_in_neighbors, UNDIRECTED -> merges fwd + rev
+     * (the merge step allocates).
+     */
+    Neighbors get_neighbors(ObjectId v) const;
+
     const Config& config() const noexcept { return config_; }
 
-private:
-    // Helper that performs the tier switch for one direction. The two
-    // public `get_*_neighbors` methods just bind the per-direction
-    // tier sources before delegating here.
-    Neighbors dispatch_(
-        ObjectId                                       v,
-        const L1HashCache&                             l1,
-        const L2CompactCsr&                            l2,
-        const GQL::Projection::TopologySnapshotReader* l3,
-        const L4Lookup&                                l4) const;
+    // -----------------------------
+    //  Diagnostics (Phase 3 ctor)
+    // -----------------------------
+    std::size_t l1_node_count() const noexcept;
+    std::size_t l2_node_count() const noexcept;
+    std::size_t l3_node_count() const noexcept;
+    std::size_t l4_node_count() const noexcept;
 
-    const L1HashCache&                              l1_fwd_;
-    const L1HashCache&                              l1_rev_;
-    const L2CompactCsr&                             l2_fwd_;
-    const L2CompactCsr&                             l2_rev_;
-    const GQL::Projection::TopologySnapshotReader*  l3_fwd_ = nullptr;
-    const GQL::Projection::TopologySnapshotReader*  l3_rev_ = nullptr;
-    L4Lookup                                        l4_fwd_;
-    L4Lookup                                        l4_rev_;
-    const std::vector<uint8_t>&                     tier_lookup_;
-    RowLookup                                       row_lookup_;
-    Config                                          config_;
+    /// Sum of L1 + L2 resident bytes (using the `kL1*` / `kL2*` Phase
+    /// 1 contracts) across both directions. L3 / L4 are mmap / disk
+    /// resident and do not count toward in-RAM accounting.
+    std::size_t total_ram_used() const noexcept;
+
+private:
+    // Helper that performs the tier switch for one direction. Both
+    // public per-direction methods bind their tier sources before
+    // delegating here.
+    Neighbors dispatch_(
+        ObjectId                                        v,
+        const L1HashCache&                              l1,
+        const L2CompactCsr&                             l2,
+        const GQL::Projection::TopologySnapshotReader*  l3,
+        const L4Lookup&                                 l4) const;
+
+    // -------------------------------------------------
+    //  Build helpers (only used by the Phase 3 ctor)
+    // -------------------------------------------------
+    void auto_detect_budgets_(std::size_t& l1_bytes,
+                              std::size_t& l2_bytes) const;
+    void scan_bpt_into_per_node_(
+        BPlusTree<3>*                                                 index,
+        std::vector<std::vector<AdjEntry>>&                            per_node) const;
+    void populate_direction_(
+        BPlusTree<3>*                                                 index,
+        const std::vector<uint8_t>&                                    tiers,
+        std::unique_ptr<L1HashCache>&                                  l1_out,
+        std::unique_ptr<L2CompactCsr>&                                 l2_out) const;
+    void open_l3_sidecars_();
+
+    // Tier sources — Phase 3 ctor owns them; Phase 2 dispatcher ctor
+    // leaves them null and uses the caller-provided `*_ref_` members.
+    std::unique_ptr<L1HashCache>                       owned_l1_fwd_;
+    std::unique_ptr<L1HashCache>                       owned_l1_rev_;
+    std::unique_ptr<L2CompactCsr>                      owned_l2_fwd_;
+    std::unique_ptr<L2CompactCsr>                      owned_l2_rev_;
+    std::unique_ptr<GQL::Projection::TopologySnapshotReader>
+                                                       owned_l3_fwd_;
+    std::unique_ptr<GQL::Projection::TopologySnapshotReader>
+                                                       owned_l3_rev_;
+    std::vector<uint8_t>                               owned_tier_assignment_;
+
+    // References to whichever tier sources are active (owned-or-borrowed).
+    const L1HashCache*                                 l1_fwd_ = nullptr;
+    const L1HashCache*                                 l1_rev_ = nullptr;
+    const L2CompactCsr*                                l2_fwd_ = nullptr;
+    const L2CompactCsr*                                l2_rev_ = nullptr;
+    const GQL::Projection::TopologySnapshotReader*     l3_fwd_ = nullptr;
+    const GQL::Projection::TopologySnapshotReader*     l3_rev_ = nullptr;
+    L4Lookup                                           l4_fwd_;
+    L4Lookup                                           l4_rev_;
+
+    // tier_lookup_ref_ points either into owned_tier_assignment_ (Phase
+    // 3 ctor) or into a caller-provided const vector (Phase 2 ctor).
+    const std::vector<uint8_t>*                        tier_lookup_ref_ = nullptr;
+    RowLookup                                          row_lookup_;
+
+    // Phase 3 ctor only:
+    BPlusTree<3>*                                      fwd_bpt_       = nullptr;
+    BPlusTree<3>*                                      rev_bpt_       = nullptr;
+    GQL::ProjectionStorage*                            storage_       = nullptr;
+    std::filesystem::path                              projection_dir_;
+    bool                                               phase3_ctor_   = false;
+    bool                                               built_         = false;
+
+    Config                                             config_;
 };
 
 }  // namespace mdb::gnn

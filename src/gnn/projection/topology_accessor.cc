@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "gnn/projection/four_level_topology_store.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -50,6 +51,13 @@ struct TopologyAccessor::Impl {
     bool rev_cache_built_ = false;
     uint64_t fwd_cache_entries_ = 0;
     uint64_t rev_cache_entries_ = 0;
+
+    // ----- Four-Level Topology Store (Spec #13) -----
+    //
+    // Owned by the accessor when enable_four_level_store() has been called.
+    // Null otherwise — every existing dispatch path (Spec #11 cache, Spec #4-B
+    // sidecar, B+Tree direct) is preserved byte-for-byte for backwards-compat.
+    std::unique_ptr<FourLevelTopologyStore> four_level_store_;
 
     explicit Impl(GQL::ProjectionStorage& storage_)
         : storage(storage_),
@@ -340,7 +348,31 @@ TopologyAccessor& TopologyAccessor::operator=(TopologyAccessor&&) noexcept = def
 
 // ----- Single Node Neighbor Access -----
 
+namespace {
+
+// Convert a FourLevelTopologyStore::Neighbors into the legacy
+// `mdb::gnn::Neighbors` shape returned by every existing API call.
+Neighbors materialise_from_four_level_(
+    const FourLevelTopologyStore::Neighbors& src)
+{
+    Neighbors out;
+    out.node_ids.reserve(src.size());
+    out.edge_ids.reserve(src.size());
+    src.for_each_with_edge_id([&](uint64_t dst, uint64_t eid) {
+        out.node_ids.push_back(ObjectId(dst));
+        out.edge_ids.push_back(ObjectId(eid));
+    });
+    return out;
+}
+
+}  // namespace
+
 Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
+    // Spec #13 four-level store: dispatched first when enabled.
+    if (impl_->four_level_store_) {
+        return materialise_from_four_level_(
+            impl_->four_level_store_->get_out_neighbors(node_id));
+    }
     // Fastest path (Spec #11): in-memory adjacency cache. Built once on
     // demand, supersedes both the CSR mmap and the B+Tree range query.
     if (impl_->cache_enabled_ && impl_->fwd_cache_built_) {
@@ -351,10 +383,16 @@ Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
     if (auto fast = impl_->try_csr_out_neighbors(node_id)) {
         return std::move(*fast);
     }
-    return impl_->get_neighbors_from_index(node_id, impl_->storage.get_from_to_edge_index());
+    return impl_->get_neighbors_from_index(
+        node_id, impl_->storage.get_from_to_edge_index());
 }
 
 Neighbors TopologyAccessor::get_in_neighbors(ObjectId node_id) {
+    // Spec #13 four-level store: dispatched first when enabled.
+    if (impl_->four_level_store_) {
+        return materialise_from_four_level_(
+            impl_->four_level_store_->get_in_neighbors(node_id));
+    }
     // Fastest path (Spec #11): in-memory adjacency cache.
     if (impl_->cache_enabled_ && impl_->rev_cache_built_) {
         return Impl::materialise_from_cache_(impl_->rev_cache_, node_id.id);
@@ -892,6 +930,46 @@ uint64_t TopologyAccessor::get_adjacency_cache_fwd_entries() const {
 
 uint64_t TopologyAccessor::get_adjacency_cache_rev_entries() const {
     return impl_->rev_cache_entries_;
+}
+
+// ----- Four-Level Topology Store (Spec #13) -----
+
+void TopologyAccessor::enable_four_level_store(
+    const FourLevelTopologyStore::Config& config)
+{
+    if (impl_->four_level_store_) {
+        throw std::logic_error(
+            "TopologyAccessor::enable_four_level_store called twice — "
+            "drop the accessor and recreate to swap configurations");
+    }
+
+    // Drop the Spec #11 single-tier cache if it was populated. The
+    // four-level store contains its own L1 hash that subsumes the
+    // legacy cache; keeping both alive doubles RAM accounting.
+    impl_->cache_enabled_ = false;
+    impl_->fwd_cache_.clear();
+    impl_->rev_cache_.clear();
+    impl_->fwd_cache_built_ = false;
+    impl_->rev_cache_built_ = false;
+    impl_->fwd_cache_entries_ = 0;
+    impl_->rev_cache_entries_ = 0;
+
+    auto fwd_idx = impl_->storage.get_from_to_edge_index();
+    auto rev_idx = impl_->storage.get_to_from_edge_index();
+    auto proj_dir = std::filesystem::path(
+        impl_->storage.get_projection_dir());
+
+    impl_->four_level_store_ = std::make_unique<FourLevelTopologyStore>(
+        fwd_idx,
+        rev_idx,
+        &impl_->storage,
+        proj_dir,
+        config);
+    impl_->four_level_store_->build();
+}
+
+bool TopologyAccessor::is_four_level_store_enabled() const {
+    return static_cast<bool>(impl_->four_level_store_);
 }
 
 // ============================================================================

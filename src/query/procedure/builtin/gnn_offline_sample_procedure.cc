@@ -105,12 +105,19 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     std::string orientation_str = "UNDIRECTED";
     bool use_predefined_splits = false;
     bool use_adjacency_cache = true;
+    bool use_four_level_topology_store = false;
+    uint64_t l1_cache_mb = 0;
+    uint64_t l2_cache_mb = 0;
+    bool use_l3_mmap_sidecar = false;
 
     if (ctx.arguments.size() >= 4) {
         try {
             parse_options(ctx, 3, batch_size, train_ratio, val_ratio,
                           test_ratio, random_seed, orientation_str,
-                          use_predefined_splits, use_adjacency_cache);
+                          use_predefined_splits, use_adjacency_cache,
+                          use_four_level_topology_store,
+                          l1_cache_mb, l2_cache_mb,
+                          use_l3_mmap_sidecar);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -120,9 +127,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - validationRatio (FLOAT): Validation fraction (default: 0.15)\n"
                 "  - testRatio (FLOAT): Test fraction (default: 0.15)\n"
                 "  - randomSeed (INT): For reproducibility (default: 42)\n"
-                "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED (default: UNDIRECTED)\n"
-                "  - usePredefinedSplits (BOOL): Use splits.bin from projection (default: false)\n"
-                "  - useAdjacencyCache (BOOL): In-memory adjacency cache (default: true)\n\n"
+                "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED\n"
+                "  - usePredefinedSplits (BOOL): Use splits.bin (default: false)\n"
+                "  - useAdjacencyCache (BOOL): Spec #11 cache (default: true)\n"
+                "  - useFourLevelTopologyStore (BOOL): Spec #13 (default: false)\n"
+                "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
+                "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
+                "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
                 "      batchSize: 512,\n"
@@ -198,6 +209,10 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.orientation = orientation;
     config.use_predefined_splits = use_predefined_splits;
     config.use_adjacency_cache = use_adjacency_cache;
+    config.use_four_level_topology_store = use_four_level_topology_store;
+    config.l1_cache_mb = static_cast<std::size_t>(l1_cache_mb);
+    config.l2_cache_mb = static_cast<std::size_t>(l2_cache_mb);
+    config.use_l3_mmap_sidecar = use_l3_mmap_sidecar;
 
     // Validate config
     try {
@@ -309,7 +324,11 @@ void GnnOfflineSampleProcedure::parse_options(
     uint64_t& random_seed,
     std::string& orientation,
     bool& use_predefined_splits,
-    bool& use_adjacency_cache
+    bool& use_adjacency_cache,
+    bool& use_four_level_topology_store,
+    uint64_t& l1_cache_mb,
+    uint64_t& l2_cache_mb,
+    bool& use_l3_mmap_sidecar
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -374,5 +393,27 @@ void GnnOfflineSampleProcedure::parse_options(
     // Parse useAdjacencyCache (Spec #11)
     if (auto v = opts.get_bool("useAdjacencyCache")) {
         use_adjacency_cache = *v;
+    }
+
+    // Spec #13 — Four-Level Topology Store opt-ins.
+    if (auto v = opts.get_bool("useFourLevelTopologyStore")) {
+        use_four_level_topology_store = *v;
+    }
+    if (auto v = opts.get_int("l1CacheMb")) {
+        if (*v < 0) {
+            throw std::runtime_error(
+                "l1CacheMb must be non-negative, got: " + std::to_string(*v));
+        }
+        l1_cache_mb = static_cast<uint64_t>(*v);
+    }
+    if (auto v = opts.get_int("l2CacheMb")) {
+        if (*v < 0) {
+            throw std::runtime_error(
+                "l2CacheMb must be non-negative, got: " + std::to_string(*v));
+        }
+        l2_cache_mb = static_cast<uint64_t>(*v);
+    }
+    if (auto v = opts.get_bool("useL3MmapSidecar")) {
+        use_l3_mmap_sidecar = *v;
     }
 }

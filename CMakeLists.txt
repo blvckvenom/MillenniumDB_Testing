@@ -1582,6 +1582,50 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# TopologyAccessor four-level integration tests (Spec #13 Phase 3 / T13.8)
+# ============================================================================
+# End-to-end check that enable_four_level_store() over a live ProjectionStorage
+# returns byte-identical neighbour sets vs the BPT-direct path, that the
+# default-disabled path preserves Spec #4-B / Spec #11 behaviour, and that
+# SamplingConfig::validate() rejects the D8-violating combination.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_four_level_integration_test.cc")
+    add_executable(topology_accessor_four_level_integration_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_four_level_integration_test.cc
+    )
+    set_target_properties(topology_accessor_four_level_integration_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_accessor_four_level_integration_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyAccessorFourLevelIntegrationTests
+        COMMAND $<TARGET_FILE:topology_accessor_four_level_integration_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologyAccessorFourLevelIntegrationTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
 # Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
 # ============================================================================
 # Complements T4.7 (single-layer sample_neighbors determinism). Exercises
