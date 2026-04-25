@@ -911,3 +911,130 @@ TEST(BPTLeafCSRFuzzTest, TamperInjection_AllDetected) {
               << " via_mismatch=" << detected_mismatch
               << " silent=" << silent << '\n';
 }
+
+// ============================================================================
+// Spec #8-B task #1 (hub completion) — focused fuzz over hubs with eids.
+//
+// Generates random hub adjacency lists with parallel edge_ids, runs them
+// through BPTLeafCSRWriter<3>(emit_edge_ids=true), and walks the chain via
+// the ReadTag + ContinuationTag readers, verifying every (src, dst, eid)
+// triple matches the input. Distinct from the main fuzz harness because:
+//   - the main harness uses the default writer (no eids), so its tamper
+//     coverage already pins the legacy contract;
+//   - here we exercise the writer's k_on_head packing + chain-head's
+//     extra varint + continuation eid stream end-to-end on randomized
+//     inputs.
+// ============================================================================
+namespace {
+
+struct HubFixture {
+    uint64_t              src;
+    std::vector<uint64_t> dsts;
+    std::vector<uint64_t> eids;
+};
+
+HubFixture generate_hub_with_eids(std::mt19937_64& rng)
+{
+    HubFixture h;
+    h.src = static_cast<uint64_t>(rng() % 1'000'000ull);
+
+    // Hub degree in [200, 4000]: small enough for fast iteration, large
+    // enough to force at least one continuation page in most cases.
+    const std::size_t degree = 200 + (rng() % 3801ull);
+    h.dsts.reserve(degree);
+    h.eids.reserve(degree);
+
+    // dst stride regime mirrors the main fuzz harness's hub generator.
+    const uint32_t rs = static_cast<uint32_t>(rng() % 100u);
+    uint64_t d_cur = static_cast<uint64_t>(rng() % 1'000'000ull);
+    uint64_t e_cur = static_cast<uint64_t>(rng() % 1'000'000ull);
+    for (std::size_t i = 0; i < degree; ++i) {
+        h.dsts.push_back(d_cur);
+        h.eids.push_back(e_cur);
+        uint64_t dstep, estep;
+        if (rs < 50u) {
+            dstep = 1ull + (rng() % 8ull);
+            estep = 1ull + (rng() % 5ull);
+        } else if (rs < 80u) {
+            dstep = 100ull + (rng() % 10'000ull);
+            estep = 50ull + (rng() % 1000ull);
+        } else {
+            dstep = 1'000'000ull + (rng() % 10'000'000ull);
+            estep = 100ull + (rng() % 100'000ull);
+        }
+        d_cur += dstep;
+        e_cur += estep;
+    }
+    return h;
+}
+
+bool fuzz_one_hub_with_eids(std::mt19937_64& rng)
+{
+    HubFixture h = generate_hub_with_eids(rng);
+
+    TempFile tf;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (std::size_t i = 0; i < h.dsts.size(); ++i) {
+            w.append({h.src, h.dsts[i], h.eids[i]});
+        }
+    }
+    auto bytes = read_file_bytes(tf.path);
+    if (bytes.empty()) return true;
+
+    // Walk pages: chain-head first, then continuations.
+    BPTLeafCSR<3> head(bytes.data(), BPTLeafCSR<3>::ReadTag{});
+    std::vector<std::array<uint64_t, 3>> got;
+    got.reserve(h.dsts.size());
+    uint64_t carry_dst = 0;
+    uint64_t carry_eid = 0;
+    for (uint32_t i = 0; i < head.get_value_count(); ++i) {
+        Record<3> r = head.get_record(i);
+        got.push_back({r[0], r[1], r[2]});
+        carry_dst = r[1];
+        carry_eid = r[2];
+    }
+    uint32_t pg = head.next_leaf();
+    while (pg != 0) {
+        const char* p = page_at(bytes, pg);
+        if (p == nullptr) return true;
+        BPTLeafCSR<3> cont(p, BPTLeafCSR<3>::ContinuationTag{
+            h.src, carry_dst, carry_eid});
+        for (uint32_t i = 0; i < cont.get_value_count(); ++i) {
+            Record<3> r = cont.get_record(i);
+            got.push_back({r[0], r[1], r[2]});
+            carry_dst = r[1];
+            carry_eid = r[2];
+        }
+        pg = cont.next_leaf();
+    }
+
+    if (got.size() != h.dsts.size()) return true;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (got[i][0] != h.src) return true;
+        if (got[i][1] != h.dsts[i]) return true;
+        if (got[i][2] != h.eids[i]) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(BPTLeafCSRFuzzTest, HubEdgeIds_RoundTripFuzz) {
+#if MDB_FUZZ_UNDER_ASAN
+    constexpr std::size_t kIters = 200;
+#else
+    constexpr std::size_t kIters = 2000;
+#endif
+    constexpr uint64_t HUB_EID_SEED = 0xABCD1234EFF00DULL;
+    std::mt19937_64 rng(HUB_EID_SEED);
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < kIters; ++i) {
+        if (fuzz_one_hub_with_eids(rng)) {
+            ++mismatches;
+            ADD_FAILURE() << "hub-eid fuzz mismatch at iter " << i;
+            if (mismatches >= 3) break;
+        }
+    }
+    EXPECT_EQ(mismatches, 0u);
+}

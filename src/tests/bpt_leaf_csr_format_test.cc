@@ -198,13 +198,15 @@ TEST(BPTLeafCSRFormat, FlagConstants_HaveExpectedBitPositions) {
     // Pin the wire-level bit positions — call sites under T8.4-T8.6 will
     // depend on these values. A future reshuffle must update both the
     // constants and this test deliberately.
-    EXPECT_EQ(BPT::CSRHybridFlags::kIsContinuation, 0x01u);
-    EXPECT_EQ(BPT::CSRHybridFlags::kHasEdgeIds,     0x02u);
-    EXPECT_EQ(BPT::CSRHybridFlags::kReservedMask,   0xFCu);
-    // The three masks together must cover every bit exactly once: the two
+    EXPECT_EQ(BPT::CSRHybridFlags::kIsContinuation,  0x01u);
+    EXPECT_EQ(BPT::CSRHybridFlags::kHasEdgeIds,      0x02u);
+    EXPECT_EQ(BPT::CSRHybridFlags::kIsHubChainHead,  0x04u);
+    EXPECT_EQ(BPT::CSRHybridFlags::kReservedMask,    0xF8u);
+    // The four masks together must cover every bit exactly once: the three
     // defined flags plus the reserved mask span the full byte.
     constexpr uint8_t covered = BPT::CSRHybridFlags::kIsContinuation |
                                 BPT::CSRHybridFlags::kHasEdgeIds |
+                                BPT::CSRHybridFlags::kIsHubChainHead |
                                 BPT::CSRHybridFlags::kReservedMask;
     EXPECT_EQ(covered, 0xFFu);
 }

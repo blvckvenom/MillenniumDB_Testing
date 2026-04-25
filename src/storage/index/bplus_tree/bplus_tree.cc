@@ -480,11 +480,23 @@ const Record<N>* BptIter<N>::next() {
                     // (value_count=0), no continuation can legitimately
                     // follow; fall back to (0, 0) — writer invariant
                     // guarantees an empty chain-head has no continuations.
+                    //
+                    // Spec #8-B task #1: also carry the previous eid so a
+                    // continuation page that advertises kHasEdgeIds can
+                    // delta-decode its eid stream. current_record[2]
+                    // already holds the last emitted eid (real value when
+                    // the page advertised eids, 0 otherwise — the carry
+                    // is consulted by the continuation reader only when
+                    // its own header bit is set).
                     uint64_t carry_src_id   = 0;
                     uint64_t carry_prev_dst = 0;
+                    uint64_t carry_prev_eid = 0;
                     if (reader->get_value_count() > 0) {
                         carry_src_id   = current_record[0];
                         carry_prev_dst = current_record[1];
+                        if constexpr (N >= 3) {
+                            carry_prev_eid = current_record[2];
+                        }
                     }
 
                     // Read next-leaf page number from the v3 header
@@ -516,7 +528,8 @@ const Record<N>* BptIter<N>::next() {
                             v3_reader_ = std::make_unique<BPTLeafCSR<N>>(
                                 new_page.get_bytes(),
                                 typename BPTLeafCSR<N>::ContinuationTag{
-                                    carry_src_id, carry_prev_dst});
+                                    carry_src_id, carry_prev_dst,
+                                    carry_prev_eid});
                         } catch (const BPT::BPTLeafCSRDecodeException&) {
                             return nullptr;  // corrupt continuation; stop
                         }

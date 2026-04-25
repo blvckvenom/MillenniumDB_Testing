@@ -885,3 +885,232 @@ TEST(BPTLeafCSRReader, ContinuationTag_ReadTagStillRejectsContinuationPage) {
         (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
         BPT::BPTLeafCSRDecodeException);
 }
+
+// ============================================================================
+// Spec #8-B task #1 (hub completion) — reader-side tests
+//
+// Validate that:
+//   (1) ChainHead ctor rejects kIsHubChainHead without kHasEdgeIds.
+//   (2) ChainHead ctor rejects kIsHubChainHead with value_count != 1.
+//   (3) Continuation ctor decodes a parallel eid stream when the
+//       continuation page advertises kHasEdgeIds, using prev_eid_carry.
+//   (4) Continuation ctor returns eid=0 when the page does NOT advertise
+//       kHasEdgeIds (legacy fallback preserved).
+// ============================================================================
+
+namespace {
+
+// Build a synthetic continuation page with eids parallel to dsts. Both
+// streams use zigzag-delta varints; the eid stream starts immediately
+// after the dst stream and is bound by chunk_count. Sets kHasEdgeIds.
+AlignedPageBuffer build_synthetic_continuation_with_eids(
+    uint64_t prev_dst_carry,
+    uint64_t prev_eid_carry,
+    const std::vector<uint64_t>& dsts,
+    const std::vector<uint64_t>& eids)
+{
+    AlignedPageBuffer page;
+    BPT::BPTLeafCSRContinuationHeader h{};
+    h.format_version     = 3;
+    h.record_width       = 3;
+    h.flags              = static_cast<uint8_t>(
+        BPT::CSRHybridFlags::kIsContinuation
+      | BPT::CSRHybridFlags::kHasEdgeIds);
+    h.reserved           = 0;
+    h.chunk_count        = static_cast<uint32_t>(dsts.size());
+    h.next_leaf          = 0;
+    h.chain_head_page_id = 0;
+    uint8_t raw[16];
+    BPT::serialize_csr_continuation_header(h, raw);
+    for (std::size_t i = 0; i < 16; ++i) page.set_byte(i, raw[i]);
+
+    std::size_t cursor = 16;
+    {
+        uint64_t prev = prev_dst_carry;
+        for (uint64_t d : dsts) {
+            const uint64_t delta_u = d - prev;
+            const int64_t  delta_i = static_cast<int64_t>(delta_u);
+            uint8_t s[BPT::VARINT_MAX_BYTES];
+            const std::size_t n = BPT::varint_encode(
+                BPT::zigzag_encode_i64(delta_i), s, sizeof(s));
+            for (std::size_t j = 0; j < n; ++j) page.set_byte(cursor + j, s[j]);
+            cursor += n;
+            prev = d;
+        }
+    }
+    {
+        uint64_t prev = prev_eid_carry;
+        for (uint64_t e : eids) {
+            const uint64_t delta_u = e - prev;
+            const int64_t  delta_i = static_cast<int64_t>(delta_u);
+            uint8_t s[BPT::VARINT_MAX_BYTES];
+            const std::size_t n = BPT::varint_encode(
+                BPT::zigzag_encode_i64(delta_i), s, sizeof(s));
+            for (std::size_t j = 0; j < n; ++j) page.set_byte(cursor + j, s[j]);
+            cursor += n;
+            prev = e;
+        }
+    }
+    return page;
+}
+
+// Build a synthetic CSR chain-head page that mimics the writer's output
+// for a hub: 1 src entry whose body is
+//     varint(src_id) | varint(total_degree) | varint(k_on_head)
+//   | dst[0] full varint | dst[1..k-1] zigzag-delta varints
+//   | eid[0] full varint | eid[1..k-1] zigzag-delta varints
+// with header flags kHasEdgeIds | kIsHubChainHead.
+AlignedPageBuffer build_synthetic_hub_chain_head(
+    uint64_t src_id,
+    uint64_t total_degree,
+    const std::vector<uint64_t>& on_head_dsts,
+    const std::vector<uint64_t>& on_head_eids,
+    uint32_t next_leaf = 0)
+{
+    AlignedPageBuffer page;
+    EXPECT_EQ(on_head_dsts.size(), on_head_eids.size());
+
+    // Header.
+    BPT::BPTLeafCSRHeader h{};
+    h.format_version = 3;
+    h.record_width   = 3;
+    h.flags          = static_cast<uint8_t>(
+        BPT::CSRHybridFlags::kHasEdgeIds | BPT::CSRHybridFlags::kIsHubChainHead);
+    h.reserved       = 0;
+    h.value_count    = 1;
+    h.next_leaf      = next_leaf;
+    h.min_src_id_low = static_cast<uint32_t>(src_id & 0xFFFFFFFFu);
+    uint8_t raw[16];
+    BPT::serialize_csr_header(h, raw);
+    for (std::size_t i = 0; i < 16; ++i) page.set_byte(i, raw[i]);
+
+    // Offset table (1 slot, points right after the header + 2-byte offset
+    // table).
+    constexpr std::size_t entry_off = 16 + 2;
+    page.set_byte(16, static_cast<uint8_t>(entry_off & 0xFF));
+    page.set_byte(17, static_cast<uint8_t>((entry_off >> 8) & 0xFF));
+
+    // Entry body.
+    std::size_t cursor = entry_off;
+    auto write_varint = [&](uint64_t v) {
+        uint8_t s[BPT::VARINT_MAX_BYTES];
+        const std::size_t n = BPT::varint_encode(v, s, sizeof(s));
+        for (std::size_t j = 0; j < n; ++j) page.set_byte(cursor + j, s[j]);
+        cursor += n;
+    };
+    write_varint(src_id);
+    write_varint(total_degree);
+    write_varint(static_cast<uint64_t>(on_head_dsts.size()));
+    if (!on_head_dsts.empty()) {
+        write_varint(on_head_dsts[0]);
+        uint64_t prev = on_head_dsts[0];
+        for (std::size_t i = 1; i < on_head_dsts.size(); ++i) {
+            const uint64_t cur = on_head_dsts[i];
+            const uint64_t du = cur - prev;
+            const int64_t  di = static_cast<int64_t>(du);
+            write_varint(BPT::zigzag_encode_i64(di));
+            prev = cur;
+        }
+        write_varint(on_head_eids[0]);
+        uint64_t prev_e = on_head_eids[0];
+        for (std::size_t i = 1; i < on_head_eids.size(); ++i) {
+            const uint64_t cur = on_head_eids[i];
+            const uint64_t du = cur - prev_e;
+            const int64_t  di = static_cast<int64_t>(du);
+            write_varint(BPT::zigzag_encode_i64(di));
+            prev_e = cur;
+        }
+    }
+    return page;
+}
+
+}  // anonymous namespace
+
+TEST(BPTLeafCSRReader, HubChainHead_Flag_RequiresHasEdgeIds) {
+    // kIsHubChainHead set without kHasEdgeIds -> ctor must reject.
+    auto page = build_csr_page({{1000, {5000}}});
+    page.set_byte(2, BPT::CSRHybridFlags::kIsHubChainHead);
+    EXPECT_THROW(
+        (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
+        BPT::BPTLeafCSRDecodeException);
+}
+
+TEST(BPTLeafCSRReader, HubChainHead_Flag_RequiresValueCountOne) {
+    // kIsHubChainHead set with value_count > 1 -> ctor must reject. Build
+    // a 2-entry page and just OR in the hub flag; this corrupts the
+    // semantic invariant that the reader must catch.
+    auto page = build_csr_page({{10, {100, 110}}, {20, {200, 210}}});
+    const uint8_t old = page.byte(2);
+    page.set_byte(2, old | BPT::CSRHybridFlags::kHasEdgeIds
+                      | BPT::CSRHybridFlags::kIsHubChainHead);
+    EXPECT_THROW(
+        (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
+        BPT::BPTLeafCSRDecodeException);
+}
+
+TEST(BPTLeafCSRReader, HubChainHead_DecodesKOnHeadAndEids) {
+    // Synthetic hub chain-head: total_degree=1500, k_on_head=8.
+    std::vector<uint64_t> dsts_on_head = {100, 105, 200, 250, 1000, 5000, 5100, 9000};
+    std::vector<uint64_t> eids_on_head = {7, 8, 9, 10, 11, 12, 13, 14};
+    auto page = build_synthetic_hub_chain_head(/*src_id=*/ 42,
+                                               /*total_degree=*/ 1500,
+                                               dsts_on_head, eids_on_head,
+                                               /*next_leaf=*/ 1);
+    BPTLeafCSR<3> reader(page.data(), BPTLeafCSR<3>::ReadTag{});
+    // get_value_count returns the PHYSICAL count on this page (k_on_head),
+    // not the stored total_degree.
+    EXPECT_EQ(reader.get_value_count(), dsts_on_head.size());
+    for (uint_fast32_t i = 0; i < dsts_on_head.size(); ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[0], 42u);
+        EXPECT_EQ(r[1], dsts_on_head[i]) << "i=" << i;
+        EXPECT_EQ(r[2], eids_on_head[i]) << "i=" << i;
+    }
+}
+
+TEST(BPTLeafCSRReader, ContinuationTag_DecodesEidStream) {
+    std::vector<uint64_t> dsts = {100, 105, 110, 200, 250};
+    std::vector<uint64_t> eids = {1000, 1001, 1003, 1010, 1020};
+    auto page = build_synthetic_continuation_with_eids(
+        /*prev_dst_carry=*/ 50,
+        /*prev_eid_carry=*/ 999,
+        dsts, eids);
+    BPTLeafCSR<3> reader(page.data(),
+                         BPTLeafCSR<3>::ContinuationTag{
+                             /*src=*/ 42,
+                             /*prev_dst_carry=*/ 50,
+                             /*prev_eid_carry=*/ 999});
+    EXPECT_EQ(reader.get_value_count(), dsts.size());
+    for (uint32_t i = 0; i < dsts.size(); ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[0], 42u);
+        EXPECT_EQ(r[1], dsts[i]);
+        EXPECT_EQ(r[2], eids[i]);
+    }
+}
+
+TEST(BPTLeafCSRReader, ContinuationTag_NoEdgeIdsFlag_ReturnsZeroEid) {
+    // Legacy continuation page (no kHasEdgeIds bit) must still produce
+    // eid=0 — preserves the ADR 008 fallback for pre-Spec-#8-B projections.
+    std::vector<uint64_t> dsts = {100, 110};
+    auto page = build_synthetic_continuation(50, dsts);  // no eids
+    BPTLeafCSR<3> reader(page.data(),
+                         BPTLeafCSR<3>::ContinuationTag{
+                             /*src=*/ 42,
+                             /*prev_dst_carry=*/ 50,
+                             /*prev_eid_carry=*/ 12345});  // ignored
+    for (uint32_t i = 0; i < dsts.size(); ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[2], 0u);
+    }
+}
+
+TEST(BPTLeafCSRReader, ContinuationTag_PrevEidCarry_DefaultZero) {
+    // Constructing ContinuationTag without explicit prev_eid_carry must
+    // default it to 0 (back-compat with pre-hub-completion call sites).
+    std::vector<uint64_t> dsts = {100};
+    auto page = build_synthetic_continuation(50, dsts);
+    BPTLeafCSR<3> reader(page.data(),
+                         BPTLeafCSR<3>::ContinuationTag{0, 50});
+    EXPECT_EQ(reader.get_record(0)[2], 0u);  // no eid stream on legacy page
+}

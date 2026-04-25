@@ -94,6 +94,7 @@ simulate_full_scan(const std::vector<char>& bytes, uint32_t num_pages)
     uint32_t page = 0;
     uint64_t carry_src_id   = 0;
     uint64_t carry_prev_dst = 0;
+    uint64_t carry_prev_eid = 0;  // Spec #8-B hub completion
     bool have_carry         = false;
 
     while (page < num_pages) {
@@ -119,6 +120,7 @@ simulate_full_scan(const std::vector<char>& bytes, uint32_t num_pages)
                 out.push_back(r);
                 carry_src_id   = r[0];
                 carry_prev_dst = r[1];
+                carry_prev_eid = r[2];
                 have_carry     = true;
             }
         } else {
@@ -131,12 +133,13 @@ simulate_full_scan(const std::vector<char>& bytes, uint32_t num_pages)
                 break;
             }
             BPTLeafCSR<3> leaf(p, BPTLeafCSR<3>::ContinuationTag{
-                carry_src_id, carry_prev_dst});
+                carry_src_id, carry_prev_dst, carry_prev_eid});
             const uint32_t cnt = leaf.get_value_count();
             for (uint32_t i = 0; i < cnt; ++i) {
                 Record<3> r = leaf.get_record(i);
                 out.push_back(r);
                 carry_prev_dst = r[1];
+                carry_prev_eid = r[2];
             }
         }
 
@@ -360,5 +363,50 @@ TEST(BPTLeafCSRMultipage, HubAdjacency_ContinuationReconstruction)
     ASSERT_EQ(reconstructed.size(), hub_deg);
     for (std::size_t i = 0; i < hub_deg; ++i) {
         ASSERT_EQ(reconstructed[i], hub_dsts[i]) << "i=" << i;
+    }
+}
+
+// ============================================================================
+// Spec #8-B task #1 (hub completion) — full-scan with edge_ids on a
+// hub + continuations reproduces every (src, dst, eid) triple in order.
+// ============================================================================
+
+TEST(BPTLeafCSRMultipage, HubAdjacency_WithEdgeIds_FullScanRoundtrip)
+{
+    TempFile tf;
+    const std::size_t hub_deg = 4000;
+    const uint64_t stride = (1ULL << 14);
+    std::vector<uint64_t> hub_dsts;
+    std::vector<uint64_t> hub_eids;
+    {
+        uint64_t v = 1;
+        for (std::size_t i = 0; i < hub_deg; ++i) {
+            hub_dsts.push_back(v); v += stride;
+            hub_eids.push_back(50000ull + i * 17);
+        }
+    }
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (std::size_t i = 0; i < hub_deg; ++i) {
+            w.append({42ULL, hub_dsts[i], hub_eids[i]});
+        }
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    ASSERT_GE(pages_written, 2u);
+
+    auto bytes = read_file_bytes(tf.path);
+    auto scanned = simulate_full_scan(bytes, pages_written);
+
+    ASSERT_EQ(scanned.size(), hub_deg);
+
+    // Build truth records (src, dst, eid).
+    for (std::size_t i = 0; i < hub_deg; ++i) {
+        EXPECT_EQ(scanned[i][0], 42u);
+        EXPECT_EQ(scanned[i][1], hub_dsts[i]) << "i=" << i;
+        EXPECT_EQ(scanned[i][2], hub_eids[i])
+            << "eid mismatch at full-scan pos " << i;
     }
 }

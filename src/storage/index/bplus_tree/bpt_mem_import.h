@@ -654,11 +654,22 @@ private:
     // `chain_head_page_id` is the back-pointer.
     // `prev_dst_carry` is the dst value at the end of the previous chunk
     // (so the first dst in this chunk encodes as zigzag-delta against it).
+    //
+    // Spec #8-B task #1 (hub completion): when `eids_slice` is non-null,
+    // `eids_count` parallel eid varints are appended after the dst stream
+    // using the same zigzag-delta encoding (first eid as a full varint
+    // against `prev_eid_carry` semantics, but matching the v3 chain-head
+    // convention `zigzag(eids[0] - prev_eid_carry)` so cross-chunk decoding
+    // is uniform). The writer sets the kHasEdgeIds flag on the page when
+    // eids are present.
     void emit_hub_continuation_(const uint64_t* dsts_slice,
                                 std::size_t     dsts_count,
                                 uint32_t        next_leaf,
                                 uint32_t        chain_head_page_id,
-                                uint64_t        prev_dst_carry) noexcept
+                                uint64_t        prev_dst_carry,
+                                const uint64_t* eids_slice = nullptr,
+                                std::size_t     eids_count = 0,
+                                uint64_t        prev_eid_carry = 0) noexcept
     {
         // A continuation page that is itself NOT the first continuation in
         // its own chain may need to patch a prior-chain dangling next_leaf
@@ -668,11 +679,16 @@ private:
 
         std::memset(buffer_, 0, Page::SIZE);
 
+        const bool has_eids =
+            (eids_slice != nullptr) && (eids_count == dsts_count);
+
         // Header as continuation variant.
         BPT::BPTLeafCSRContinuationHeader h{};
         h.format_version     = 3;
         h.record_width       = static_cast<uint8_t>(N);
-        h.flags              = BPT::CSRHybridFlags::kIsContinuation;
+        h.flags              = static_cast<uint8_t>(
+            BPT::CSRHybridFlags::kIsContinuation
+          | (has_eids ? BPT::CSRHybridFlags::kHasEdgeIds : 0u));
         h.reserved           = 0;
         h.chunk_count        = static_cast<uint32_t>(dsts_count);
         h.next_leaf          = next_leaf;
@@ -698,6 +714,24 @@ private:
             prev = cur;
         }
 
+        // Spec #8-B: parallel eid stream, encoded analogously against
+        // prev_eid_carry. Counts match dsts_count so the reader can pair
+        // them 1:1 in cont_dsts_ / cont_eids_.
+        if (has_eids) {
+            uint64_t prev_eid = prev_eid_carry;
+            for (std::size_t i = 0; i < eids_count; ++i) {
+                const uint64_t cur = eids_slice[i];
+                const uint64_t delta_u = cur - prev_eid;
+                const int64_t  delta_i = static_cast<int64_t>(delta_u);
+                uint8_t scratch[BPT::VARINT_MAX_BYTES];
+                const std::size_t n = BPT::varint_encode(
+                    BPT::zigzag_encode_i64(delta_i), scratch, sizeof(scratch));
+                std::memcpy(buffer_ + cursor, scratch, n);
+                cursor += n;
+                prev_eid = cur;
+            }
+        }
+
         file_.write(buffer_, Page::SIZE);
         ++pages_written_;
     }
@@ -710,18 +744,19 @@ private:
     // pages. Patches the chain-head's next_leaf AFTER chain emission so the
     // header reflects the true forward pointer.
     //
-    // Spec #8-B: under emit_edge_ids_, the hub chain currently spills only
-    // dsts onto continuation pages; edge_ids are NOT persisted for hub
-    // entries because the chain-head's parallel-stream budget interaction
-    // with the continuation chain would require a joint dst+eid slicing
-    // walk we have not yet modelled. Non-hub entries (the common case —
-    // avg degree 6 on arxiv, 25 on products, max 13 K hits the hub path
-    // at only a handful of nodes) DO carry edge_ids, which is sufficient
-    // to make count(e) queries match their BTREE counterpart for every
-    // non-hub src. Hub edge_ids remain a future refinement.
+    // Spec #8-B task #1 (hub completion): under emit_edge_ids_, the hub
+    // chain ALSO persists parallel edge_ids alongside dsts. The chain-head
+    // carries an extra `k_on_head` varint after `(src_id, total_degree)` so
+    // the reader can recover where the dst stream ends and the eid stream
+    // begins; that varint is signalled by setting kIsHubChainHead in the
+    // page flags. Each continuation page also carries `chunk_count` eid
+    // varints after its dst chunk, with the running eid cursor crossing
+    // chunk boundaries the same way prev_dst_carry does. This converts
+    // count(e) over hub-bearing CSR_HYBRID projections from "under-counted"
+    // to "matches BTREE".
     void emit_hub_chain_(uint64_t src_id,
                          const std::vector<uint64_t>& dsts,
-                         const std::vector<uint64_t>& /*eids*/) noexcept
+                         const std::vector<uint64_t>& eids) noexcept
     {
         // If the current page already holds at least one entry, flush it
         // first so the hub starts with a fresh chain-head page. This
@@ -744,39 +779,75 @@ private:
                                    /*min_src_or_head=*/min_src_low);
         }
 
+        // Spec #8-B contract: when emit_edge_ids_ is on, eids must be a
+        // length-matched parallel stream to dsts. Defensive only — the
+        // append() entry point enforces this invariant; if the caller
+        // somehow passes a mismatched eids vector we fall back to the
+        // pre-Spec-#8-B "dsts-only" path on this hub.
+        const bool hub_emit_eids =
+            emit_edge_ids_ && (eids.size() == dsts.size());
+
         // --- Determine how many dsts fit on the fresh chain-head page.
         //
         // Layout on chain-head (single entry): 16 header + 2 offset slot =
         // 18 bytes fixed. Entry body: varint(src) + varint(total_degree) +
-        // varint(dst[0]) + sum_i>=1 zigzag-varint-delta. The chain-head's
-        // degree field is the TOTAL degree (including dsts on
-        // continuations), per design §3.4's "header carries total_degree"
-        // note.
+        // (hub_emit_eids ? varint(k_on_head) : 0) + varint(dst[0]) +
+        // sum_i>=1 zigzag-varint-delta + (hub_emit_eids ? eid stream).
+        // The chain-head's degree field is the TOTAL degree (including
+        // dsts on continuations), per design §3.4's "header carries
+        // total_degree" note.
+        //
+        // Greedy K-packing: we walk dsts, tracking the running on-page
+        // byte cost INCLUDING the parallel eid stream that would be
+        // emitted if we picked this K. The k_on_head varint is variable-
+        // length itself, so we conservatively reserve VARINT_MAX_BYTES (10)
+        // up front and trim later. (The exact varint size depends on the
+        // final K, which depends on the budget — chicken-and-egg. Using a
+        // 10-byte upper bound costs at most 9 bytes of unused budget on a
+        // ~4 KB page, which is negligible.)
         const std::size_t fixed_overhead = 16 + 2;
         const std::size_t budget = Page::SIZE - fixed_overhead;
+        const std::size_t k_on_head_reserved =
+            hub_emit_eids ? BPT::VARINT_MAX_BYTES : 0u;
         const std::size_t header_entry_prefix =
             BPT::varint_size(src_id)
-          + BPT::varint_size(static_cast<uint64_t>(dsts.size()));
+          + BPT::varint_size(static_cast<uint64_t>(dsts.size()))
+          + k_on_head_reserved;
         // Find K (number of dsts to include on chain-head) by greedy packing.
         // Start with dst[0] (full varint) and append dst[i] zigzag-deltas
-        // until the next would exceed budget.
+        // until the next would exceed budget. When hub_emit_eids is true,
+        // each new dst also costs an eid varint at the same K position.
         std::size_t k_on_head = 0;
         std::size_t running = header_entry_prefix;
         if (!dsts.empty()) {
             const std::size_t d0_sz = BPT::varint_size(dsts[0]);
-            if (running + d0_sz <= budget) {
-                running += d0_sz;
+            const std::size_t e0_sz = hub_emit_eids
+                ? BPT::varint_size(eids[0]) : 0u;
+            if (running + d0_sz + e0_sz <= budget) {
+                running += d0_sz + e0_sz;
                 k_on_head = 1;
                 uint64_t prev = dsts[0];
+                uint64_t prev_eid = hub_emit_eids ? eids[0] : 0;
                 for (std::size_t i = 1; i < dsts.size(); ++i) {
                     const uint64_t cur = dsts[i];
                     const uint64_t delta_u = cur - prev;
                     const int64_t  delta_i = static_cast<int64_t>(delta_u);
-                    const std::size_t sz = BPT::varint_size(BPT::zigzag_encode_i64(delta_i));
-                    if (running + sz > budget) break;
-                    running += sz;
+                    const std::size_t dst_sz =
+                        BPT::varint_size(BPT::zigzag_encode_i64(delta_i));
+                    std::size_t eid_sz = 0;
+                    if (hub_emit_eids) {
+                        const uint64_t eid_cur = eids[i];
+                        const uint64_t eid_delta_u = eid_cur - prev_eid;
+                        const int64_t  eid_delta_i =
+                            static_cast<int64_t>(eid_delta_u);
+                        eid_sz = BPT::varint_size(
+                            BPT::zigzag_encode_i64(eid_delta_i));
+                    }
+                    if (running + dst_sz + eid_sz > budget) break;
+                    running += dst_sz + eid_sz;
                     ++k_on_head;
                     prev = cur;
+                    if (hub_emit_eids) prev_eid = eids[i];
                 }
             }
         }
@@ -801,13 +872,24 @@ private:
         const uint32_t chain_head_page_num = pages_written_;
 
         // Pack the chain-head body: just one entry.
+        // Spec #8-B layout when hub_emit_eids:
+        //     varint(src_id) | varint(total_degree) | varint(k_on_head)
+        //   | dst[0] full varint | dst[1..k-1] zigzag-deltas
+        //   | eid[0] full varint | eid[1..k-1] zigzag-deltas
+        // Pre-Spec-#8-B layout when !hub_emit_eids:
+        //     varint(src_id) | varint(total_degree)
+        //   | dst[0] full varint | dst[1..k-1] zigzag-deltas
         std::vector<uint8_t> body;
-        body.resize(running);  // exact size from the packing walk above
+        body.resize(running);  // upper bound from the packing walk above
         {
             std::size_t off = 0;
             off += BPT::varint_encode(src_id, body.data() + off, BPT::VARINT_MAX_BYTES);
             off += BPT::varint_encode(static_cast<uint64_t>(dsts.size()),
                                       body.data() + off, BPT::VARINT_MAX_BYTES);
+            if (hub_emit_eids) {
+                off += BPT::varint_encode(static_cast<uint64_t>(k_on_head),
+                                          body.data() + off, BPT::VARINT_MAX_BYTES);
+            }
             if (k_on_head > 0) {
                 off += BPT::varint_encode(dsts[0], body.data() + off, BPT::VARINT_MAX_BYTES);
                 uint64_t prev = dsts[0];
@@ -819,8 +901,22 @@ private:
                                               body.data() + off, BPT::VARINT_MAX_BYTES);
                     prev = cur;
                 }
+                if (hub_emit_eids) {
+                    off += BPT::varint_encode(eids[0], body.data() + off,
+                                              BPT::VARINT_MAX_BYTES);
+                    uint64_t prev_eid = eids[0];
+                    for (std::size_t i = 1; i < k_on_head; ++i) {
+                        const uint64_t cur = eids[i];
+                        const uint64_t delta_u = cur - prev_eid;
+                        const int64_t  delta_i = static_cast<int64_t>(delta_u);
+                        off += BPT::varint_encode(
+                            BPT::zigzag_encode_i64(delta_i),
+                            body.data() + off, BPT::VARINT_MAX_BYTES);
+                        prev_eid = cur;
+                    }
+                }
             }
-            body.resize(off);  // trim if estimate was an overestimate (won't be; kept for safety)
+            body.resize(off);  // trim to actual encoded length
         }
 
         // Stage the single-entry chain head in the per-page vectors so the
@@ -835,8 +931,12 @@ private:
         // it to point to the first continuation below.
         const uint32_t chain_head_min_src_low =
             static_cast<uint32_t>(src_id & 0xFFFFFFFFu);
+        const uint8_t chain_head_flags = hub_emit_eids
+            ? static_cast<uint8_t>(BPT::CSRHybridFlags::kHasEdgeIds
+                                 | BPT::CSRHybridFlags::kIsHubChainHead)
+            : 0u;
         finalize_current_page_(/*next_leaf=*/0,
-                               /*flags=*/0,
+                               /*flags=*/chain_head_flags,
                                /*value_or_chunk_count=*/1,
                                /*min_src_or_head=*/chain_head_min_src_low);
 
@@ -845,9 +945,13 @@ private:
         // We need to decide, for each continuation, how many dsts fit in
         // one page (4080 byte payload budget). Greedy fill: starting from
         // the running cursor (previous dst), pack dsts via zigzag-varint
-        // until the next varint would exceed budget.
+        // until the next varint would exceed budget. Spec #8-B: when
+        // hub_emit_eids is true, each dst slot also costs an eid varint at
+        // the same K position, so the budget walk must account for both.
         const std::size_t continuation_budget = Page::SIZE - 16;
         uint64_t prev_dst_carry = (k_on_head > 0) ? dsts[k_on_head - 1] : 0;
+        uint64_t prev_eid_carry = (hub_emit_eids && k_on_head > 0)
+            ? eids[k_on_head - 1] : 0;
 
         std::size_t i = k_on_head;
         const std::size_t total = dsts.size();
@@ -864,24 +968,45 @@ private:
         // continuation chains terminate at chain end per design).
         //
         // Page-slicing walk: for each chunk, compute how many dsts fit.
-        struct ChunkSlice { std::size_t start; std::size_t count; uint64_t prev_carry; };
+        // Spec #8-B: each chunk also carries an eid carry-in / carry-out
+        // so emit_hub_continuation_ knows how to delta-encode eid[0] of
+        // the chunk against the previous chunk's last eid.
+        struct ChunkSlice {
+            std::size_t start;
+            std::size_t count;
+            uint64_t    prev_dst_carry;
+            uint64_t    prev_eid_carry;
+        };
         std::vector<ChunkSlice> slices;
         {
-            uint64_t carry = prev_dst_carry;
+            uint64_t carry_dst = prev_dst_carry;
+            uint64_t carry_eid = prev_eid_carry;
             while (i < total) {
                 std::size_t start = i;
                 std::size_t used  = 0;
-                uint64_t local_prev = carry;
+                uint64_t local_prev_dst = carry_dst;
+                uint64_t local_prev_eid = carry_eid;
                 while (i < total) {
                     const uint64_t cur = dsts[i];
-                    const uint64_t delta_u = cur - local_prev;
+                    const uint64_t delta_u = cur - local_prev_dst;
                     const int64_t  delta_i = static_cast<int64_t>(delta_u);
-                    const std::size_t sz = BPT::varint_size(BPT::zigzag_encode_i64(delta_i));
-                    if (used + sz > continuation_budget) {
+                    const std::size_t dst_sz =
+                        BPT::varint_size(BPT::zigzag_encode_i64(delta_i));
+                    std::size_t eid_sz = 0;
+                    if (hub_emit_eids) {
+                        const uint64_t eid_cur = eids[i];
+                        const uint64_t eid_delta_u = eid_cur - local_prev_eid;
+                        const int64_t  eid_delta_i =
+                            static_cast<int64_t>(eid_delta_u);
+                        eid_sz = BPT::varint_size(
+                            BPT::zigzag_encode_i64(eid_delta_i));
+                    }
+                    if (used + dst_sz + eid_sz > continuation_budget) {
                         break;
                     }
-                    used += sz;
-                    local_prev = cur;
+                    used += dst_sz + eid_sz;
+                    local_prev_dst = cur;
+                    if (hub_emit_eids) local_prev_eid = eids[i];
                     ++i;
                 }
                 if (i == start) {
@@ -890,10 +1015,13 @@ private:
                     // Break to avoid an infinite loop under a corrupt budget.
                     break;
                 }
-                slices.push_back(ChunkSlice{start, i - start, carry});
-                carry = local_prev;
+                slices.push_back(ChunkSlice{start, i - start, carry_dst,
+                                            carry_eid});
+                carry_dst = local_prev_dst;
+                carry_eid = local_prev_eid;
             }
-            prev_dst_carry = carry;
+            prev_dst_carry = carry_dst;
+            prev_eid_carry = carry_eid;
         }
 
         // Emit continuations. The LAST continuation is emitted with
@@ -908,11 +1036,17 @@ private:
             const bool is_last = (s + 1 == slices.size());
             const uint32_t this_page_num = pages_written_;
             const uint32_t next = is_last ? 0u : (this_page_num + 1);
+            const uint64_t* eid_ptr = hub_emit_eids
+                ? (eids.data() + sl.start) : nullptr;
+            const std::size_t eid_count = hub_emit_eids ? sl.count : 0u;
             emit_hub_continuation_(dsts.data() + sl.start,
                                    sl.count,
                                    next,
                                    chain_head_page_num,
-                                   sl.prev_carry);
+                                   sl.prev_dst_carry,
+                                   eid_ptr,
+                                   eid_count,
+                                   sl.prev_eid_carry);
             if (is_last) {
                 last_continuation_page_num = this_page_num;
             }

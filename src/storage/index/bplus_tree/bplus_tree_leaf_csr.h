@@ -60,9 +60,14 @@ public:
     /// chunk (chain-head's last dst, or the previous continuation's last dst).
     /// The first varint on this continuation decodes as a zigzag-delta
     /// against this carry per the writer's §5.4 convention.
+    /// `prev_eid_carry` (Spec #8-B task #1 hub completion) is the running
+    /// edge_id cursor at the end of the previous chunk's eid stream. Only
+    /// consulted when the continuation page advertises kHasEdgeIds. Defaults
+    /// to 0 to preserve back-compat with pre-hub-completion call sites.
     struct ContinuationTag {
         uint64_t owning_src_id;
         uint64_t prev_dst_carry;
+        uint64_t prev_eid_carry = 0;
     };
 
     /// Read-mode construction. Validates the v3 header at the start of
@@ -246,9 +251,24 @@ private:
     // fallback for pre-Spec-#8-B projections).
     bool                    page_has_edge_ids_ = false;
 
+    // Cached header-level flag: true iff this is a HUB chain-head page
+    // (header_.flags & kIsHubChainHead != 0). When set, the single entry
+    // (value_count must be 1) carries an extra varint `k_on_head` between
+    // (degree) and (dst stream) that the reader uses to bound the dst
+    // walk; without this signal the physical_degrees_ heuristic could not
+    // distinguish dst varints from the trailing eid varints when both
+    // streams are present on a hub chain-head. See Spec #8-B task #1.
+    bool                    page_is_hub_chain_head_ = false;
+
     // Continuation mode state. Empty in ChainHead mode.
     uint64_t                cont_owning_src_id_ = 0;
     std::vector<uint64_t>   cont_dsts_;
+    // Spec #8-B task #1 (hub completion): when the continuation page
+    // advertises kHasEdgeIds, cont_eids_ holds chunk_count parallel eid
+    // values pre-decoded against ContinuationTag::prev_eid_carry. Empty
+    // when the flag is clear (legacy pages); decode_tuple_ then emits
+    // eid=0 to preserve the ADR 008 fallback.
+    std::vector<uint64_t>   cont_eids_;
 
     // Sequential-decode cache. When get_dst_at(start_offset, degree, i+1)
     // follows a get_dst_at(..., i) call with the same (start_offset, degree),

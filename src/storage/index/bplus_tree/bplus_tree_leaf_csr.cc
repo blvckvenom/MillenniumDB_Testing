@@ -173,6 +173,24 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
     // subsequent decode_tuple_ / get_dst_at call is branch-predictable.
     page_has_edge_ids_ =
         (header_.flags & BPT::CSRHybridFlags::kHasEdgeIds) != 0;
+    page_is_hub_chain_head_ =
+        (header_.flags & BPT::CSRHybridFlags::kIsHubChainHead) != 0;
+
+    // Hub-chain-head pages must (a) carry edge_ids (the bit is meaningful
+    // only when paired with the parallel eid stream) and (b) contain
+    // exactly one src entry by writer construction. Reject anything else
+    // as corrupt rather than silently downgrade.
+    if (page_is_hub_chain_head_) {
+        if (!page_has_edge_ids_) {
+            throw BPT::BPTLeafCSRDecodeException(
+                "kIsHubChainHead set without kHasEdgeIds (invalid combo)");
+        }
+        if (vc != 1) {
+            throw BPT::BPTLeafCSRDecodeException(
+                "kIsHubChainHead requires value_count==1, got "
+                + std::to_string(vc));
+        }
+    }
 
     uint64_t running_total = 0;
     for (uint_fast32_t i = 0; i < vc; ++i) {
@@ -195,6 +213,30 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
             throw BPT::BPTLeafCSRDecodeException(
                 "implausible degree " + std::to_string(degree)
                 + " at src index " + std::to_string(i));
+        }
+
+        // Spec #8-B hub completion: when kIsHubChainHead is set, an extra
+        // `k_on_head` varint follows the (src_id, degree) header, telling
+        // us exactly how many dsts (and parallel eids) are physically
+        // present on THIS page. Without it the dst-stream walker could
+        // not distinguish dst varints from the immediately-following eid
+        // stream when degree > k_on_head.
+        uint64_t k_on_head_decl = 0;
+        bool     have_k_on_head = false;
+        if (page_is_hub_chain_head_) {
+            try {
+                in += BPT::varint_decode(in, page_end, k_on_head_decl);
+            } catch (const BPT::BPTLeafV2DecodeException& e) {
+                throw BPT::BPTLeafCSRDecodeException(
+                    std::string("malformed k_on_head at src index ")
+                    + std::to_string(i) + ": " + e.what());
+            }
+            if (k_on_head_decl > degree) {
+                throw BPT::BPTLeafCSRDecodeException(
+                    "k_on_head " + std::to_string(k_on_head_decl)
+                    + " exceeds total degree " + std::to_string(degree));
+            }
+            have_k_on_head = true;
         }
 
         entry_col_idx_start_[i] = static_cast<uint32_t>(in - page_start);
@@ -225,17 +267,24 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
         // This heuristic does NOT apply to position 0 (full varint, not a
         // delta — the first dst can legitimately be 0 for node id 0), nor
         // to continuation pages (chunk_count is authoritative and
-        // pre-decoded by the ContinuationTag ctor).
+        // pre-decoded by the ContinuationTag ctor). Spec #8-B hub
+        // completion: when k_on_head is declared explicitly, we trust it
+        // and skip the heuristic — which is necessary because the eid
+        // stream now sits immediately after the dst stream with no
+        // padding, so the 0x00 sentinel would never trigger.
+        const uint64_t walk_limit =
+            have_k_on_head ? k_on_head_decl : degree;
         uint64_t phys = 0;
         const uint8_t* cursor = in;
-        while (phys < degree) {
+        while (phys < walk_limit) {
             if (cursor >= boundary) {
                 break;
             }
             // Zero-padding sentinel: a single 0x00 byte at position phys>=1
             // is a zigzag-delta=0, meaning a duplicate-dst that writer
-            // output never produces.
-            if (phys >= 1 && *cursor == 0x00) {
+            // output never produces. Skipped on declared-k_on_head pages
+            // where the eid stream may legitimately start with 0x00.
+            if (!have_k_on_head && phys >= 1 && *cursor == 0x00) {
                 break;
             }
             uint64_t v = 0;
@@ -365,6 +414,30 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ContinuationTag tag) :
         const int64_t delta = BPT::zigzag_decode_u64(v);
         running += static_cast<uint64_t>(delta);
         cont_dsts_.push_back(running);
+    }
+
+    // Spec #8-B task #1 (hub completion): if the continuation page
+    // advertises kHasEdgeIds, parse a parallel chunk_count-length eid
+    // stream from the byte immediately after the dst stream. Encoded as
+    // zigzag-deltas against tag.prev_eid_carry, mirroring the dst format.
+    page_has_edge_ids_ =
+        (header_.flags & BPT::CSRHybridFlags::kHasEdgeIds) != 0;
+    if (page_has_edge_ids_) {
+        cont_eids_.reserve(chunk_count);
+        uint64_t running_eid = tag.prev_eid_carry;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            uint64_t v = 0;
+            try {
+                in += BPT::varint_decode(in, page_end, v);
+            } catch (const std::exception& e) {
+                throw BPT::BPTLeafCSRDecodeException(
+                    std::string("continuation eid stream decode failure at i=")
+                    + std::to_string(i) + ": " + e.what());
+            }
+            const int64_t delta = BPT::zigzag_decode_u64(v);
+            running_eid += static_cast<uint64_t>(delta);
+            cont_eids_.push_back(running_eid);
+        }
     }
 
     total_tuples_ = chunk_count;
@@ -505,7 +578,15 @@ bool BPTLeafCSR<N>::find_src_entry(uint64_t src_id,
     }
     (void)sid_check; // already validated equality via the binary search path
 
-    out_start_offset = static_cast<uint32_t>(in - page_start);
+    // Spec #8-B hub completion: hub chain-heads carry an extra `k_on_head`
+    // varint between (degree) and the dst stream. The cached
+    // entry_col_idx_start_[idx] already accounts for it, so we trust the
+    // cache for the start offset rather than re-walking the optional
+    // varint here. For non-hub pages this falls through to the legacy
+    // post-degree position which equals entry_col_idx_start_[idx] anyway.
+    out_start_offset = entry_col_idx_start_[idx];
+    // Stored degree (TOTAL across the chain for hubs) — preserves the
+    // pre-Spec-#8-B contract that callers expect from this getter.
     out_degree       = static_cast<uint32_t>(degree);
 
     // Probing a new entry invalidates the cache (a cursor belonging to a
@@ -656,12 +737,18 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
 
     // Continuation mode: dsts are pre-decoded into cont_dsts_ during ctor,
     // all with the same owning src_id. Short-circuit ahead of the chain-head
-    // offset-table walk.
+    // offset-table walk. Spec #8-B: when the continuation advertises
+    // kHasEdgeIds, parallel eids are pre-decoded into cont_eids_; otherwise
+    // we emit eid=0 to preserve the legacy ADR 008 fallback.
     if (mode_ == Mode::Continuation) {
         Record<N> rec{};
         if constexpr (N >= 1) rec[0] = cont_owning_src_id_;
         if constexpr (N >= 2) rec[1] = cont_dsts_[pos];
-        if constexpr (N >= 3) rec[2] = 0;
+        if constexpr (N >= 3) {
+            rec[2] = (page_has_edge_ids_ && pos < cont_eids_.size())
+                ? cont_eids_[pos]
+                : 0;
+        }
         return rec;
     }
 

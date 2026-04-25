@@ -1010,3 +1010,283 @@ TEST(BPTLeafCSRWriterTest, EdgeIds_Disabled_ReaderReturnsZero)
             << "legacy writer path must keep eid=0 sentinel at pos=" << i;
     }
 }
+
+// ============================================================================
+// Spec #8-B task #1 (hub completion) — edge_ids on hub chain-head + cont
+//
+// These exercise the deferred portion of #1: extending the eid stream to
+// hub chain-heads (k_on_head dsts on the chain-head page when the hub spills
+// to continuation pages) AND continuation pages themselves. Pre-fix, the
+// hub chain only carried dsts; eids decoded as zero. After this fix, every
+// edge in a hub adjacency carries its real edge_id, so count(e) over a
+// CSR_HYBRID projection matches BTREE.
+// ============================================================================
+
+// Single hub fits on chain-head + 1 continuation, with parallel eids.
+TEST(BPTLeafCSRWriterTest, HubEdgeIds_TwoPages_RoundTrip)
+{
+    TempFile tf;
+    const std::size_t degree = 1500;
+    auto dsts = make_hub_dsts(degree, /*stride=*/ (1ULL << 14));
+    // Edge ids: monotone +7 stride to exercise zigzag-delta = 14 (2 bytes).
+    std::vector<uint64_t> eids;
+    eids.reserve(degree);
+    for (std::size_t i = 0; i < degree; ++i) eids.push_back(1000ull + i * 7);
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (std::size_t i = 0; i < degree; ++i) {
+            w.append(rec(42, dsts[i], eids[i]));
+        }
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    ASSERT_GE(pages_written, 2u);
+
+    auto bytes = read_file_bytes(tf.path);
+
+    // Chain-head page must carry kHasEdgeIds | kIsHubChainHead.
+    EXPECT_NE(bytes[2] & BPT::CSRHybridFlags::kHasEdgeIds, 0u);
+    EXPECT_NE(bytes[2] & BPT::CSRHybridFlags::kIsHubChainHead, 0u);
+    // Page 1 (continuation) must carry kHasEdgeIds.
+    EXPECT_NE(bytes[Page::SIZE + 2] & BPT::CSRHybridFlags::kHasEdgeIds, 0u);
+    EXPECT_NE(bytes[Page::SIZE + 2] & BPT::CSRHybridFlags::kIsContinuation, 0u);
+
+    // Read back via BPTLeafCSR<N>::ReadTag (chain-head) then
+    // ContinuationTag (each continuation), threading the carry-over eid.
+    BPTLeafCSR<3> head(reinterpret_cast<const char*>(bytes.data()),
+                       BPTLeafCSR<3>::ReadTag{});
+    const uint32_t physical_on_head = head.get_value_count();
+    ASSERT_GT(physical_on_head, 0u);
+    ASSERT_LE(physical_on_head, degree);
+
+    // Verify the chain-head's k_on_head tuples decode to the right
+    // (src, dst, eid) triples.
+    uint64_t carry_dst = 0;
+    uint64_t carry_eid = 0;
+    for (uint32_t i = 0; i < physical_on_head; ++i) {
+        Record<3> r = head.get_record(i);
+        EXPECT_EQ(r[0], 42u);
+        EXPECT_EQ(r[1], dsts[i]);
+        EXPECT_EQ(r[2], eids[i]) << "eid mismatch at chain-head pos=" << i;
+        carry_dst = r[1];
+        carry_eid = r[2];
+    }
+
+    // Walk continuations.
+    std::size_t covered = physical_on_head;
+    uint32_t pg = head.next_leaf();
+    while (pg != 0) {
+        const char* p = page_at(bytes, pg);
+        ASSERT_NE(p, nullptr);
+        BPTLeafCSR<3> cont(p, BPTLeafCSR<3>::ContinuationTag{
+            42, carry_dst, carry_eid});
+        const uint32_t n = cont.get_value_count();
+        for (uint32_t i = 0; i < n; ++i) {
+            Record<3> r = cont.get_record(i);
+            EXPECT_EQ(r[0], 42u);
+            ASSERT_LT(covered, degree);
+            EXPECT_EQ(r[1], dsts[covered]);
+            EXPECT_EQ(r[2], eids[covered])
+                << "eid mismatch at continuation, global pos=" << covered;
+            carry_dst = r[1];
+            carry_eid = r[2];
+            ++covered;
+        }
+        pg = cont.next_leaf();
+    }
+    EXPECT_EQ(covered, degree);
+}
+
+// Larger hub spilling onto multiple continuations — exercises the eid carry
+// across continuation boundaries.
+TEST(BPTLeafCSRWriterTest, HubEdgeIds_MultiContinuation_RoundTrip)
+{
+    TempFile tf;
+    const std::size_t degree = 5000;
+    auto dsts = make_hub_dsts(degree, /*stride=*/ (1ULL << 14));
+    // Non-monotone eid pattern (zigzag): alternates +13/-3 around a base.
+    std::vector<uint64_t> eids;
+    eids.reserve(degree);
+    uint64_t e = 100000ull;
+    for (std::size_t i = 0; i < degree; ++i) {
+        eids.push_back(e);
+        e += (i % 2 == 0) ? 13 : 5;  // strictly increasing, varying delta
+    }
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (std::size_t i = 0; i < degree; ++i) {
+            w.append(rec(7, dsts[i], eids[i]));
+        }
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    ASSERT_GE(pages_written, 3u);
+
+    auto bytes = read_file_bytes(tf.path);
+
+    BPTLeafCSR<3> head(reinterpret_cast<const char*>(bytes.data()),
+                       BPTLeafCSR<3>::ReadTag{});
+    EXPECT_TRUE(head.is_chain_head());
+
+    uint64_t carry_dst = 0;
+    uint64_t carry_eid = 0;
+    std::size_t covered = 0;
+    for (uint32_t i = 0; i < head.get_value_count(); ++i) {
+        Record<3> r = head.get_record(i);
+        EXPECT_EQ(r[0], 7u);
+        EXPECT_EQ(r[1], dsts[covered]);
+        EXPECT_EQ(r[2], eids[covered]);
+        carry_dst = r[1]; carry_eid = r[2];
+        ++covered;
+    }
+    uint32_t pg = head.next_leaf();
+    while (pg != 0) {
+        const char* p = page_at(bytes, pg);
+        ASSERT_NE(p, nullptr);
+        BPTLeafCSR<3> cont(p, BPTLeafCSR<3>::ContinuationTag{
+            7, carry_dst, carry_eid});
+        for (uint32_t i = 0; i < cont.get_value_count(); ++i) {
+            Record<3> r = cont.get_record(i);
+            ASSERT_LT(covered, degree);
+            EXPECT_EQ(r[1], dsts[covered]);
+            EXPECT_EQ(r[2], eids[covered]);
+            carry_dst = r[1]; carry_eid = r[2];
+            ++covered;
+        }
+        pg = cont.next_leaf();
+    }
+    EXPECT_EQ(covered, degree);
+}
+
+// Hub with degree just at the chain-head capacity boundary — a rare-but-real
+// edge case where k_on_head exactly equals degree (no continuation needed).
+// In that case the writer should NOT set kIsHubChainHead (no overflow) and
+// the entry routes through the regular non-hub path.
+TEST(BPTLeafCSRWriterTest, HubEdgeIds_DegreeExactlyFitsChainHead)
+{
+    TempFile tf;
+    // Pick a degree that just fits one page: 50 dsts × ~3 B + 50 eids × ~3 B
+    // = 300 B << 4080 B. This is structurally a non-hub write path, but
+    // exercises the regression risk that a future tweak might mistakenly
+    // set kIsHubChainHead when no overflow occurs.
+    const std::size_t degree = 50;
+    std::vector<uint64_t> dsts, eids;
+    for (std::size_t i = 0; i < degree; ++i) {
+        dsts.push_back(1 + i * (1ULL << 14));
+        eids.push_back(2000 + i * 11);
+    }
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        for (std::size_t i = 0; i < degree; ++i) {
+            w.append(rec(99, dsts[i], eids[i]));
+        }
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    ASSERT_EQ(pages_written, 1u);
+
+    auto bytes = read_file_bytes(tf.path);
+    EXPECT_NE(bytes[2] & BPT::CSRHybridFlags::kHasEdgeIds, 0u);
+    EXPECT_EQ(bytes[2] & BPT::CSRHybridFlags::kIsHubChainHead, 0u)
+        << "non-hub-overflow path must NOT set kIsHubChainHead";
+
+    BPTLeafCSR<3> reader(reinterpret_cast<const char*>(bytes.data()),
+                         BPTLeafCSR<3>::ReadTag{});
+    ASSERT_EQ(reader.get_value_count(), degree);
+    for (uint_fast32_t i = 0; i < degree; ++i) {
+        Record<3> r = reader.get_record(i);
+        EXPECT_EQ(r[2], eids[i]);
+    }
+}
+
+// Hub followed by a non-hub src — verifies the leaf-chain post-hub patch
+// preserves correctness when the chain-head has kHasEdgeIds and kIsHubChainHead
+// flags set, AND that the post-hub non-hub page still iterates eids cleanly.
+TEST(BPTLeafCSRWriterTest, HubEdgeIds_HubFollowedByRegular_FullScan)
+{
+    TempFile tf;
+    const std::size_t hub_deg = 2000;
+    auto hub_dsts = make_hub_dsts(hub_deg, (1ULL << 14));
+    std::vector<uint64_t> hub_eids;
+    for (std::size_t i = 0; i < hub_deg; ++i) hub_eids.push_back(50000 + i * 3);
+
+    uint32_t pages_written = 0;
+    {
+        BPTLeafCSRWriter<3> w(tf.path, /*emit_edge_ids=*/true);
+        // src=1: small adjacency BEFORE the hub.
+        w.append(rec(1, 10, 100));
+        w.append(rec(1, 11, 101));
+        // src=42: hub.
+        for (std::size_t i = 0; i < hub_deg; ++i) {
+            w.append(rec(42, hub_dsts[i], hub_eids[i]));
+        }
+        // src=777: regular AFTER hub.
+        for (std::size_t k = 0; k < 5; ++k) {
+            w.append(rec(777, 9000 + k, 7000 + k));
+        }
+        w.flush_finalize();
+        pages_written = w.pages_written();
+    }
+    auto bytes = read_file_bytes(tf.path);
+    ASSERT_GE(pages_written, 3u);
+
+    // Walk the chain (chain-head -> continuations -> next chain-head -> ...)
+    std::vector<std::array<uint64_t, 3>> truth;
+    truth.push_back({1, 10, 100});
+    truth.push_back({1, 11, 101});
+    for (std::size_t i = 0; i < hub_deg; ++i) {
+        truth.push_back({42, hub_dsts[i], hub_eids[i]});
+    }
+    for (std::size_t k = 0; k < 5; ++k) {
+        truth.push_back({777, 9000 + k, 7000 + k});
+    }
+
+    // Simulate full-chain scan (mirrors BptIter's logic).
+    std::vector<std::array<uint64_t, 3>> scanned;
+    uint32_t page = 0;
+    uint64_t carry_src = 0, carry_dst = 0, carry_eid = 0;
+    bool have_carry = false;
+    while (page < pages_written) {
+        const char* p = page_at(bytes, page);
+        ASSERT_NE(p, nullptr);
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(p);
+        const bool is_cont = (raw[2] & BPT::CSRHybridFlags::kIsContinuation) != 0;
+        uint32_t next_leaf =  static_cast<uint32_t>(raw[8])
+                           | (static_cast<uint32_t>(raw[9]) << 8)
+                           | (static_cast<uint32_t>(raw[10]) << 16)
+                           | (static_cast<uint32_t>(raw[11]) << 24);
+        if (!is_cont) {
+            BPTLeafCSR<3> leaf(p, BPTLeafCSR<3>::ReadTag{});
+            for (uint32_t i = 0; i < leaf.get_value_count(); ++i) {
+                Record<3> r = leaf.get_record(i);
+                scanned.push_back({r[0], r[1], r[2]});
+                carry_src = r[0]; carry_dst = r[1]; carry_eid = r[2];
+                have_carry = true;
+            }
+        } else {
+            ASSERT_TRUE(have_carry);
+            BPTLeafCSR<3> leaf(p, BPTLeafCSR<3>::ContinuationTag{
+                carry_src, carry_dst, carry_eid});
+            for (uint32_t i = 0; i < leaf.get_value_count(); ++i) {
+                Record<3> r = leaf.get_record(i);
+                scanned.push_back({r[0], r[1], r[2]});
+                carry_dst = r[1]; carry_eid = r[2];
+            }
+        }
+        if (next_leaf == 0) break;
+        ASSERT_GT(next_leaf, page);
+        page = next_leaf;
+    }
+    ASSERT_EQ(scanned.size(), truth.size());
+    for (std::size_t i = 0; i < truth.size(); ++i) {
+        EXPECT_EQ(scanned[i][0], truth[i][0]) << "i=" << i;
+        EXPECT_EQ(scanned[i][1], truth[i][1]) << "i=" << i;
+        EXPECT_EQ(scanned[i][2], truth[i][2]) << "i=" << i;
+    }
+}

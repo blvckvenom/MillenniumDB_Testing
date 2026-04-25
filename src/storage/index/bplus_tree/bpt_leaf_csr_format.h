@@ -109,9 +109,23 @@ namespace CSRHybridFlags {
     inline constexpr uint8_t kIsContinuation = 0x01;
     inline constexpr uint8_t kHasEdgeIds     = 0x02;
 
-    // Reserved mask — bits 2..7 must always be zero. Readers raise
+    // Spec #8-B task #1 (hub completion): set on the chain-head page of a
+    // hub when the writer is emitting parallel edge_ids. The single
+    // (value_count == 1) entry on such a page encodes a third varint after
+    // (src_id, total_degree): the count `k_on_head` of dsts (and parallel
+    // eids) physically stored on the chain-head. The chain-head's eid
+    // stream has exactly k_on_head varints; continuation pages carry
+    // chunk_count eid varints. Without this bit the chain-head's
+    // physical_degrees_ walker could not distinguish dst varints from
+    // the trailing eid varints.
+    //
+    // Mutually compatible with kHasEdgeIds: kIsHubChainHead WITHOUT
+    // kHasEdgeIds is invalid (rejected at reader open).
+    inline constexpr uint8_t kIsHubChainHead = 0x04;
+
+    // Reserved mask — bits 3..7 must always be zero. Readers raise
     // BPTLeafCSRDecodeException if any bit in this mask is set.
-    inline constexpr uint8_t kReservedMask   = 0xFC;
+    inline constexpr uint8_t kReservedMask   = 0xF8;
 }  // namespace CSRHybridFlags
 
 // Serialize the 16-byte header into a little-endian byte buffer. The
