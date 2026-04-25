@@ -209,19 +209,32 @@ void FourLevelTopologyStore::populate_direction_(
     uint64_t                last_src = kSentinelNoSrc;
     std::vector<AdjEntry>   staging_buffer;
 
+    // BPT records carry the full ObjectId (8-bit type tag in the high byte
+    // + 56-bit value payload). The tier vector and L1/L2 caches are dense-
+    // row-indexed (matching the Spec #4-B sidecar's ROW_PTR layout and
+    // mirroring the masking convention that
+    // populate_direction_via_sidecar_ uses), so we strip the type tag
+    // here at the boundary. Without this both:
+    //   (a) tiers[last_src] over-runs the tier vector (last_src ~ 0xD4..),
+    //       and the previous version dropped the entry as "out-of-range"
+    //       even though the projection had a valid tier for the row, and
+    //   (b) the L1/L2 keys would be the tagged variant — disagreeing
+    //       with the sidecar path so the same BPT-walk projection could
+    //       not be queried by row_lookup_'s masked dispatch contract.
     auto flush_current_src = [&]() {
         if (last_src == kSentinelNoSrc) {
             staging_buffer.clear();
             return;
         }
-        if (last_src >= tiers.size()) {
-            // Out-of-range src (the BPT carries an id past the
+        const uint64_t row_idx = last_src & ObjectId::VALUE_MASK;
+        if (row_idx >= tiers.size()) {
+            // Out-of-range row (the BPT carries an id past the
             // RowMapping's tier vector). Drop. The dispatcher's
             // out-of-range warning will fire if such an id is queried.
             staging_buffer.clear();
             return;
         }
-        const uint8_t tier = tiers[last_src];
+        const uint8_t tier = tiers[row_idx];
         if (tier == 1) {
             // L1 wants `capacity == size` so total_bytes() is accurate.
             // staging_buffer was sized via reserve(frequency[row_idx])
@@ -231,15 +244,15 @@ void FourLevelTopologyStore::populate_direction_(
             // missing).
             std::vector<AdjEntry> tight(std::move(staging_buffer));
             tight.shrink_to_fit();
-            l1_out->insert(/*src_node_id=*/last_src,
+            l1_out->insert(/*src_node_id=*/row_idx,
                            std::move(tight),
-                           /*row_idx=*/static_cast<std::size_t>(last_src));
+                           /*row_idx=*/static_cast<std::size_t>(row_idx));
             // After move-from, staging_buffer is in a valid but unspecified
             // state — re-initialise to a known-empty vector so the next
             // src's reserve_for_src call starts from a clean slate.
             staging_buffer = std::vector<AdjEntry>();
         } else if (tier == 2) {
-            l2_out->add_node(/*src_node_id=*/last_src, staging_buffer);
+            l2_out->add_node(/*src_node_id=*/row_idx, staging_buffer);
             staging_buffer.clear();
         } else {
             // tier == 3 / 4 -> drop without allocating beyond staging.
@@ -248,8 +261,11 @@ void FourLevelTopologyStore::populate_direction_(
     };
 
     auto reserve_for_src = [&](uint64_t src_id) {
-        if (src_id < frequency.size()) {
-            const uint64_t hint = frequency[src_id];
+        // src_id arrives tagged (raw BPT key); use the masked variant for
+        // the frequency lookup since the profiler indexes by dense row.
+        const uint64_t row_idx = src_id & ObjectId::VALUE_MASK;
+        if (row_idx < frequency.size()) {
+            const uint64_t hint = frequency[row_idx];
             if (hint > 0) staging_buffer.reserve(static_cast<std::size_t>(hint));
         }
     };
@@ -622,13 +638,21 @@ void FourLevelTopologyStore::build() {
         };
     }
 
-    // Default row_lookup_ for the Phase 3 ctor: identity over ObjectId.id.
-    // Production projections enumerate row indices 0..N-1 and the
-    // row_idx == ObjectId.id assumption holds (matching the
-    // TopologyFrequencyProfiler's degree pass at row index `i ==
-    // ObjectId(i)`). When a projection ever moves to a non-identity
-    // RowMapping, this closure is the single point of update.
-    row_lookup_ = [](ObjectId v) -> uint64_t { return v.id; };
+    // Default row_lookup_ for the Phase 3 ctor: strip the 8-bit ObjectId
+    // type tag to recover the dense row index. Production projections
+    // (cora_gnn, ogbn-*, papers100M) enumerate row indices 0..N-1 and the
+    // row_idx == (ObjectId.id & VALUE_MASK) assumption holds — matching
+    // the TopologyFrequencyProfiler's degree pass that ran at row index
+    // `i == ObjectId(i).get_value()` and the Spec #4-B sidecar's dense
+    // ROW_PTR layout (writer at native_projection_builder.cc:2552 uses
+    // `(*rec)[0] & ObjectId::VALUE_MASK` for the same reason). The
+    // tag-bearing variant (`v.id`) drove every lookup past
+    // `tier_lookup_ref_->size()` and silently fell through to the L4
+    // BPT path, defeating the entire cache hierarchy and emitting the
+    // "ObjectId.id=… exceeds tier_lookup_ size=…" warning observed by
+    // the Spec #13 bench harness. When a projection ever moves to a
+    // non-identity RowMapping this closure is the single point of update.
+    row_lookup_ = [](ObjectId v) -> uint64_t { return v.get_value(); };
 
     built_ = true;
 
@@ -755,12 +779,17 @@ FourLevelTopologyStore::dispatch_(
 
     switch (tier) {
         case 1: {
-            out.l1   = l1.get(v.id);
+            // L1 is keyed by dense row idx (no type tag) — see
+            // populate_direction_via_sidecar_ + populate_direction_ which
+            // mask the tag at insert time. Use the same masked id here so
+            // the lookup hits the entry that build() materialised.
+            out.l1   = l1.get(row_idx);
             out.tier = 1;
             return out;
         }
         case 2: {
-            auto span = l2.get(v.id);
+            // Same masking story as case 1 — L2 is keyed by dense row idx.
+            auto span = l2.get(row_idx);
             out.l2_col_idx = span.first;
             out.l2_size    = span.second;
             out.tier       = 2;

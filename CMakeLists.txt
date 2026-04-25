@@ -1626,6 +1626,54 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# Four-Level Topology Store tagged-ObjectId dispatch regression (Spec #13)
+# ============================================================================
+# Guards the row_lookup_ tag-mask fix: production projections store nodes
+# with ObjectId.id = (MASK_NODE | row_idx), and pre-fix the dispatcher
+# treated the tag bits as part of the row index — landing every lookup in
+# the L4 BPT-fallback path and emitting the "exceeds tier_lookup_ size"
+# warning observed by scripts/bench_four_level_topology.sh. The 3 tests
+# here exercise the same row_lookup_ closure that the bench's
+# `gnn_offline_sample` invocation drives, but in-process so a gtest can
+# pin the regression without spinning up the HTTP server.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_tag_dispatch_test.cc")
+    add_executable(four_level_topology_tag_dispatch_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_tag_dispatch_test.cc
+    )
+    set_target_properties(four_level_topology_tag_dispatch_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_tag_dispatch_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyTagDispatchTests
+        COMMAND $<TARGET_FILE:four_level_topology_tag_dispatch_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyTagDispatchTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
 # Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
 # ============================================================================
 # Complements T4.7 (single-layer sample_neighbors determinism). Exercises
