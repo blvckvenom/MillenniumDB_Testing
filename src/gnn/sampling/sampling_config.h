@@ -214,14 +214,16 @@ struct SamplingConfig {
      *   - L4: B+Tree direct (rare fallback)
      *
      * Designed to enable papers100M-scale sampling on commodity 32 GB RAM
-     * hardware. When false (default), the legacy Spec #11 single-tier
-     * cache (`use_adjacency_cache`) is used instead.
+     * hardware. Default true: strictly better than Spec #11 — matches it
+     * for small graphs (everything fits in L1) and avoids OOM on graphs
+     * larger than available RAM. Set false to opt out for A/B benchmarks
+     * or to force pure Spec #11 behavior.
      *
      * Validation: setting this true while `use_adjacency_cache=false` is
      * an error — Spec #13 supersedes Spec #11 but does not bypass the cache
      * gate (D8 in the design doc).
      */
-    bool use_four_level_topology_store = false;
+    bool use_four_level_topology_store = true;
 
     /**
      * @brief L1 cache budget in MiB. 0 means auto-detect from

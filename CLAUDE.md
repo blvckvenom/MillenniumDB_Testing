@@ -383,6 +383,37 @@ Empirical wins: products `gnn_offline_sample` 726.48s → **4.71s (154×)**, arx
 **Design record:** ADR 009 (`Partial_Idea/decisions/009_sample_adjacency_cache.md`), spec `docs/superpowers/specs/2026-04-25-sample-adjacency-cache-design.md`.
 **Future work:** Spec #13 — frequency-aware two-tier topology cache (RAM hot subset + mmap'd cold tier) for papers100M-scale where the full hash cache exceeds available RAM.
 
+### Four-Level Topology Store (Spec #13, default true since 2026-04-25, ADR 010)
+
+`gnn_offline_sample` automatically uses the Four-Level Topology Store from Spec #13 since 2026-04-25 (commits `30548d4f` + `043507bf` + this default flip). On any `gnn_offline_sample` invocation without explicit cache flags, the system:
+
+1. Reads `/proc/meminfo` for available RAM, allocates 70% to cache (25% L1, 75% L2).
+2. Profiles per-node degree (cold start) or reads prior `node_counts.bin` (warm start, deferred to a future phase).
+3. Greedy frequency-sort tier assignment: top-K hubs → L1 RAM hash; next-J warm → L2 RAM compact CSR (uint32, ~5× denser than L1); rest → L3 mmap sidecar (Spec #4-B, if `buildTopologySnapshot:true` at projection time) or L4 BPT direct fallback.
+4. Streaming populate (single BPT scan, src-monotone, distribute inline by tier — peak transient memory `O(max_degree × 16 B)` ≈ 2 MB even on papers100M).
+5. Runtime dispatch: each `get_out_neighbors(v)` enrutes to L1 (~10-20 ns) / L2 (~50-200 ns) / L3 (~5-100 μs mmap) / L4 (~30-100 μs BPT) based on `tier_lookup_[row_idx]`.
+
+User config keys (all optional — defaults are sensible auto-detect):
+
+```gql
+CALL gnn_offline_sample('proj', 's', [10, 5], {
+    useFourLevelTopologyStore: true,   -- default true since 2026-04-25
+    useAdjacencyCache: true,            -- default true; false disables both Spec #11 and Spec #13
+    l1CacheMb: 0,                       -- 0 = auto-detect via /proc/meminfo
+    l2CacheMb: 0,                       -- 0 = auto-detect
+    useL3MmapSidecar: false             -- requires buildTopologySnapshot:true at projection
+})
+```
+
+D8 validation: `useFourLevelTopologyStore:true && useAdjacencyCache:false` throws (incompatible). Both true is canonical (Spec #13 supersedes Spec #11). Both false skips all caching (legacy fallback to sidecar/BPT direct).
+
+**Why this is the new default**: Spec #13 is strictly better than Spec #11 — matches it for small graphs (everything fits in L1, equivalent to the monolithic hash) and avoids OOM on graphs larger than available RAM (which Spec #11 cannot do). Power-law access distribution means ~5% of nodes (hubs) receive ~70% of sample lookups; keeping those in L1 RAM gives ~3,000-15,000× speedup on the dominant path while letting the cold tail live on disk.
+
+**Files:** `src/gnn/projection/four_level_topology_store.{h,cc}` (build orchestrator + dispatcher + Neighbors::for_each_dst helpers), `topology_frequency_profiler.{h,cc}` (Phase 1), `l1_hash_cache.{h,cc}` (Phase 2), `l2_compact_csr.{h,cc}` (Phase 2), `adj_entry.h` (shared type), `edge_orientation.h` (lightweight enum hoist), `topology_accessor.{h,cc}` (`enable_four_level_store` + early-return dispatch), `sampling_config.h` (4 flags + D8 validate), `gnn_offline_sample_procedure.cc` (parse + propagate).
+**Tests:** 4 profiler + 6 L1 + 7 L2 + 13 dispatcher + 3 integration = 33 unit tests. End-to-end byte-identical sample output vs Spec #11 verified via `TopologyAccessorFourLevel.EnableDisable_Roundtrip` BPT-oracle test.
+**Design record:** ADR 010 (`Partial_Idea/decisions/010_four_level_topology_store.md`), design `docs/superpowers/specs/2026-04-25-four-level-topology-store-design.md`, plan `docs/superpowers/plans/2026-04-25-four-level-topology-store-plan.md`.
+**Phase status (2026-04-25):** Phases 0-3 done (T13.1-T13.9 + default flip). Pending: Phase 4 build optimizations (T13.10-T13.11), Phase 5 testing (T13.12-T13.14), Phase 6 papers100M validation on celebi (T13.15-T13.16), Phase 7 Gate E sign-off (T13.17-T13.18).
+
 **Files:** `src/storage/index/bplus_tree/bpt_leaf_csr_format.{h,cc}` (enum + v3 header), `bplus_tree_leaf_csr.{h,cc}` (reader with sequential cursor cache), `bpt_mem_import.h` (`BPTLeafCSRWriter` bulk-load), `src/graph_models/gql/projection/projection_catalog.{h,cc}` (catalog v1.6 per-projection byte), `src/query/procedure/builtin/project_procedure.cc` (parse `graphStorage`), `src/gnn/projection/topology_accessor.cc` (v3 fast-path).
 **Tests:** unit suites `bpt_leaf_csr_format_test`, `bpt_leaf_csr_reader_test`, `bpt_leaf_csr_writer_test`, `bpt_iter_dispatch_test` (extended 3-way), `projection_catalog_v6_test`, `projection_graph_storage_config_test`, `graph_storage_integration_test`; fuzz `bpt_leaf_csr_fuzz_test` (500 K random + 10 K boundary + 1 K tamper-flip under seed `0xC5B8_1234_5678_9ABC`); integration `scripts/test_projection_csr_hybrid.sh` (4-mode golden compare + sidecar supersedence check).
 **Benchmark:** `scripts/bench_csr_hybrid.sh` (Gate D harness — size + scan throughput + GNN sampling per dataset × mode).

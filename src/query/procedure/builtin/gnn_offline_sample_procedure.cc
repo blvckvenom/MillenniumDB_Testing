@@ -105,7 +105,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     std::string orientation_str = "UNDIRECTED";
     bool use_predefined_splits = false;
     bool use_adjacency_cache = true;
-    bool use_four_level_topology_store = false;
+    bool use_four_level_topology_store = true;
     uint64_t l1_cache_mb = 0;
     uint64_t l2_cache_mb = 0;
     bool use_l3_mmap_sidecar = false;
@@ -130,7 +130,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED\n"
                 "  - usePredefinedSplits (BOOL): Use splits.bin (default: false)\n"
                 "  - useAdjacencyCache (BOOL): Spec #11 cache (default: true)\n"
-                "  - useFourLevelTopologyStore (BOOL): Spec #13 (default: false)\n"
+                "  - useFourLevelTopologyStore (BOOL): Spec #13 (default: true)\n"
                 "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
                 "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
                 "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3\n\n"
