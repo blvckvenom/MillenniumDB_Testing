@@ -1837,6 +1837,52 @@ if(ENABLE_GNN AND
     )
 endif()
 
+# ============================================================================
+# BatchedEdgeAggregator unit tests (Spec #26)
+# ============================================================================
+# Registers batched_edge_aggregator_test when GTest is available and the
+# corresponding header exists. Mirrors the EXISTS-gated registration
+# precedent of index_set_test / topology_snapshot_format_test so the test
+# only wires in after its sources land.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/batched_edge_aggregator.h"
+   AND TARGET GTest::gtest_main)
+    add_executable(batched_edge_aggregator_test
+        ${CMAKE_SOURCE_DIR}/src/tests/batched_edge_aggregator_test.cc
+    )
+    set_target_properties(batched_edge_aggregator_test PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over the main() in src/third_party/serd/serdi.cc (which is pulled into
+    # libmillenniumdb.a by the recursive src/*.cc glob). Static-archive link
+    # order determines which main() actually resolves.
+    target_link_libraries(batched_edge_aggregator_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(batched_edge_aggregator_test
+            mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME batched_edge_aggregator_test
+        COMMAND $<TARGET_FILE:batched_edge_aggregator_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
 if(PROFILE)
     # Profile targets
     foreach(target ${PROFILE_TARGETS})
