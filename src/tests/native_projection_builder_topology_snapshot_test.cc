@@ -430,6 +430,54 @@ TEST(NativeProjectionBuilderTopologySnapshot,
 // (b) the builder's "emitted" accessors remain false.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Spec #19 — parallel vs sequential byte-identity. Builds the same fixture
+// twice through the integrated mmap path: once with the parallel snapshot
+// builder enabled (default), once with MDB_PROJECTION_PARALLEL_SNAPSHOT=0.
+// Both `topology_fwd.csr` and `topology_rev.csr` must hash identically;
+// any divergence indicates a partition-boundary off-by-one or an output
+// reordering across worker boundaries.
+// ---------------------------------------------------------------------------
+
+TEST(NativeProjectionBuilderTopologySnapshot,
+     ParallelPathProducesByteIdenticalOutputVsSequential) {
+    (void)MdbFixture::instance();
+
+    // Path A — parallel default (MDB_PROJECTION_PARALLEL_SNAPSHOT unset →
+    // resolves to true). Force a small partition count so the small-fixture
+    // src space is split across multiple workers (default would be 16 over
+    // 4 nodes — still split, but explicit makes the intent obvious).
+    ::setenv("MDB_PROJECTION_PARALLEL_SNAPSHOT", "1", /*overwrite=*/1);
+    ::setenv("MDB_PROJECTION_SNAPSHOT_PARTITIONS", "4", /*overwrite=*/1);
+    const std::string parallel_dir = build_projection_without_snapshot(
+        "topo_snap_parallel_proj", /*set_flag=*/true);
+
+    // Path B — sequential fallback.
+    ::setenv("MDB_PROJECTION_PARALLEL_SNAPSHOT", "0", /*overwrite=*/1);
+    const std::string sequential_dir = build_projection_without_snapshot(
+        "topo_snap_sequential_proj", /*set_flag=*/true);
+
+    // Restore default so subsequent tests see the on-by-default state.
+    ::unsetenv("MDB_PROJECTION_PARALLEL_SNAPSHOT");
+    ::unsetenv("MDB_PROJECTION_SNAPSHOT_PARTITIONS");
+
+    for (const auto* basename : {"topology_fwd.csr", "topology_rev.csr"}) {
+        const fs::path a = fs::path(parallel_dir)   / basename;
+        const fs::path b = fs::path(sequential_dir) / basename;
+        ASSERT_TRUE(fs::exists(a)) << "parallel path missing " << basename;
+        ASSERT_TRUE(fs::exists(b)) << "sequential path missing " << basename;
+
+        const auto a_bytes = read_file_bytes(a);
+        const auto b_bytes = read_file_bytes(b);
+        ASSERT_EQ(a_bytes.size(), b_bytes.size())
+            << basename << " size mismatch: parallel=" << a_bytes.size()
+            << " sequential=" << b_bytes.size();
+        EXPECT_EQ(a_bytes, b_bytes)
+            << basename << " bytes differ between parallel and sequential "
+               "snapshot builders — Spec #19 partition output reorder bug";
+    }
+}
+
 TEST(NativeProjectionBuilderTopologySnapshot, FlagOffEmitsNoSidecars) {
     (void)MdbFixture::instance();
 

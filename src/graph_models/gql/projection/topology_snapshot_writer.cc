@@ -321,6 +321,67 @@ void TopologySnapshotWriter::append_edge(ObjectId src, ObjectId dst, ObjectId ed
     }
 }
 
+void TopologySnapshotWriter::append_subrange(
+    uint64_t lo_src,
+    uint64_t hi_src,
+    const std::vector<uint64_t>& dst_buf,
+    const std::vector<uint64_t>& edge_ids_buf)
+{
+    if (finalized_) {
+        throw std::logic_error(
+            "TopologySnapshotWriter: append_subrange after finalize");
+    }
+    if (lo_src > hi_src || hi_src > num_nodes_) {
+        throw std::runtime_error(
+            "TopologySnapshotWriter: append_subrange invalid range ["
+            + std::to_string(lo_src) + ", " + std::to_string(hi_src) + ")"
+            + " (num_nodes=" + std::to_string(num_nodes_) + ")");
+    }
+    if (lo_src == hi_src) {
+        return;
+    }
+
+    const uint64_t base_edge_index =
+        row_ptr_[static_cast<std::size_t>(lo_src)];
+    const uint64_t end_edge_index =
+        row_ptr_[static_cast<std::size_t>(hi_src)];
+    const uint64_t expected_count = end_edge_index - base_edge_index;
+
+    if (dst_buf.size() != expected_count) {
+        throw std::runtime_error(
+            "TopologySnapshotWriter: append_subrange dst_buf.size() ("
+            + std::to_string(dst_buf.size())
+            + ") != row_ptr[hi]-row_ptr[lo] ("
+            + std::to_string(expected_count) + ")");
+    }
+    if (include_edge_ids_ && edge_ids_buf.size() != expected_count) {
+        throw std::runtime_error(
+            "TopologySnapshotWriter: append_subrange edge_ids_buf.size() ("
+            + std::to_string(edge_ids_buf.size())
+            + ") != expected (" + std::to_string(expected_count) + ")");
+    }
+
+    if (expected_count == 0) {
+        return;
+    }
+
+    // Disjoint-region pwrite. Two workers calling this concurrently with
+    // non-overlapping [lo_src, hi_src) intervals write to disjoint byte
+    // ranges in COL_IDX and EDGE_IDS, so the kernel pwrite serialization
+    // is per-write-region — no cross-thread data races on the file content.
+    pwrite_all(
+        dst_buf.data(),
+        dst_buf.size() * sizeof(uint64_t),
+        col_idx_offset_ + base_edge_index * sizeof(uint64_t));
+
+    if (include_edge_ids_) {
+        pwrite_all(
+            edge_ids_buf.data(),
+            edge_ids_buf.size() * sizeof(uint64_t),
+            edge_ids_offset_ + base_edge_index * sizeof(uint64_t));
+    }
+}
+
 void TopologySnapshotWriter::flush_col_idx_buffer_() {
     if (col_idx_buf_.empty()) {
         return;

@@ -100,6 +100,37 @@ public:
     /// enclosing B+Tree scan driving the writer.
     void append_edge(ObjectId src, ObjectId dst, ObjectId edge_id);
 
+    /// Spec #19 parallel-append entry point.
+    ///
+    /// Append a contiguous block of edges that all belong to the half-open
+    /// src range `[lo_src, hi_src)`. The provided vectors hold the dst
+    /// (and optionally edge_id) words for those edges, ordered exactly as
+    /// the legacy `append_edge` call sequence would have produced them
+    /// when scanning the same src range — i.e. ascending src; for a fixed
+    /// src, the original .leaf record order; total length equals
+    /// `row_ptr[hi_src] - row_ptr[lo_src]`.
+    ///
+    /// pwrite is thread-safe and the writer's per-section offsets are
+    /// computed from `row_ptr` (an immutable construct-time prefix sum),
+    /// so calling this method concurrently from different workers — each
+    /// with a disjoint src range — is safe: every worker's bytes land in
+    /// a disjoint COL_IDX / EDGE_IDS slice. The writer's monotonicity
+    /// cursors (`last_src_idx_`, `write_cursor_`) are NOT updated by this
+    /// method, so it MUST NOT be interleaved with `append_edge()` for the
+    /// same writer instance.
+    ///
+    /// `edge_ids_buf` is ignored when `include_edge_ids == false`. When
+    /// included, its size must equal `dst_buf.size()`.
+    void append_subrange(uint64_t lo_src,
+                         uint64_t hi_src,
+                         const std::vector<uint64_t>& dst_buf,
+                         const std::vector<uint64_t>& edge_ids_buf);
+
+    /// Read-only view of the row_ptr prefix sum. Available immediately
+    /// after construction; used by parallel callers to compute their
+    /// per-worker output buffer sizes ahead of the parallel_for.
+    const std::vector<uint64_t>& row_ptr() const noexcept { return row_ptr_; }
+
     /// Commit the file. Safe to call at most once. After this returns, the
     /// `.tmp` has been renamed to the final name and the parent directory
     /// has been fsync'd.
