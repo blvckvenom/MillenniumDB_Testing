@@ -661,6 +661,209 @@ int main() {
         }
         std::cout << " OK" << std::endl;
 
+        // ================================================================
+        // Spec #16 — parallel B+Tree edge-scan parity tests
+        // ================================================================
+        // Verify MDB_PROJECTION_PARALLEL_EDGE_SCAN=0 (sequential, legacy)
+        // and the default (parallel TBB) produce IDENTICAL ordered
+        // (edge_id, from, to) sequences when scanning the label_edge
+        // B+Tree with inline endpoint resolution. Synthetic data is
+        // built via ProjectionStorage::add_edge / add_edge_label, which
+        // lands the exact same {label_id, edge_id} record format the
+        // scanner consumes in production AND populates the
+        // edge_from_to / from_to_edge endpoint trees.
+
+        // Helper: build a populated projection in-place, flush() it (so
+        // build_all_indexes_bulk() materializes the .leaf/.dir files AND
+        // open_all_bplustree_readers_() loads the BPlusTree readers), then
+        // run scan_label_edge_with_endpoints against the live readers.
+        // Returns observed (sorted by edge_id) sequence under the
+        // env-controlled path + the sorted expected sequence.
+        auto build_and_scan_edges = [&manager](
+            const std::string& proj_name,
+            uint64_t edge_label_id_raw,
+            std::size_t count,
+            const char* env_value)
+            -> std::pair<std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>,
+                         std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>>
+        {
+            if (env_value) {
+                ::setenv("MDB_PROJECTION_PARALLEL_EDGE_SCAN", env_value, 1);
+            } else {
+                ::unsetenv("MDB_PROJECTION_PARALLEL_EDGE_SCAN");
+            }
+
+            std::string pdir = manager.create_projection(proj_name);
+            GQL::ProjectionCatalog cat(pdir);
+            cat.projection_name = proj_name;
+            cat.save();
+
+            GQL::ProjectionStorage::Features feats;
+            // Both flags ON so label_node_index AND label_edge_index are
+            // materialized — the NativeScanner ctor enforces non-null on
+            // both, regardless of which scan path the test exercises.
+            feats.include_node_labels = true;
+            feats.include_edge_labels = true;
+            GQL::ProjectionStorage s(pdir, "test_db_storage",
+                                     proj_name, feats);
+            s.init();
+
+            ObjectId edge_label_id(edge_label_id_raw);
+            std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> expected;
+            expected.reserve(count);
+            // Spread edge ids and endpoint ids across the value space using
+            // coprime strides so a uniform partitioner cannot pass by
+            // accident.
+            const uint64_t edge_stride = 0x0001'9E37'79B9'7F4AULL;
+            const uint64_t from_stride = 0x0000'D34F'A765'1357ULL;
+            const uint64_t to_stride   = 0x0000'C0FF'EE12'3456ULL;
+            uint64_t cur_edge = ObjectId::MASK_DIRECTED_EDGE | 1;
+            uint64_t cur_from = ObjectId::MASK_NODE | 1;
+            uint64_t cur_to   = ObjectId::MASK_NODE | 2;
+            for (std::size_t i = 0; i < count; ++i) {
+                ObjectId eid(cur_edge);
+                ObjectId fid(cur_from);
+                ObjectId tid(cur_to);
+                // The edge endpoints must exist as nodes in the projection
+                // so subsequent has_node() callers downstream can succeed,
+                // and so the from_to_edge / edge_from_to indexes are
+                // populated by add_edge.
+                GQL::ProjectedNode nf; nf.node_id = fid; s.add_node(nf);
+                GQL::ProjectedNode nt; nt.node_id = tid; s.add_node(nt);
+                GQL::ProjectedEdge e;
+                e.from_node = fid;
+                e.to_node = tid;
+                e.edge_id = eid;
+                e.is_directed = true;
+                s.add_edge(e);
+                s.add_edge_label(eid, edge_label_id);
+                expected.emplace_back(cur_edge, cur_from, cur_to);
+                cur_edge = ((cur_edge + edge_stride)
+                            & ~ObjectId::SUB_TYPE_MASK)
+                          | ObjectId::MASK_DIRECTED_EDGE;
+                cur_from = ((cur_from + from_stride)
+                            & ~ObjectId::SUB_TYPE_MASK)
+                          | ObjectId::MASK_NODE;
+                cur_to = ((cur_to + to_stride)
+                          & ~ObjectId::SUB_TYPE_MASK)
+                        | ObjectId::MASK_NODE;
+            }
+            s.flush();
+
+            // Sort expected by edge_id ascending (B+Tree key order).
+            std::sort(expected.begin(), expected.end(),
+                [](const auto& a, const auto& b) {
+                    return std::get<0>(a) < std::get<0>(b);
+                });
+            // Drop edge-id duplicates (the coprime stride should never
+            // produce one, but guard so the test is robust to RNG).
+            expected.erase(std::unique(expected.begin(), expected.end(),
+                [](const auto& a, const auto& b) {
+                    return std::get<0>(a) == std::get<0>(b);
+                }),
+                expected.end());
+
+            GQL::NativeScanner scanner(
+                s.get_label_node_index(),
+                s.get_label_edge_index(),
+                s.get_from_to_edge_index(),
+                s.get_edge_from_to_index(),
+                s.get_from_to_edge_index(),  // n1_n2_edge stub
+                s.get_edge_from_to_index()); // edge_n1_n2 stub
+
+            std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> observed;
+            observed.reserve(count);
+            scanner.scan_label_edge_with_endpoints(
+                ObjectId(edge_label_id_raw),
+                [&observed](ObjectId edge_id, ObjectId from_node,
+                            ObjectId to_node) {
+                    observed.emplace_back(edge_id.id, from_node.id, to_node.id);
+                });
+            return {observed, expected};
+        };
+
+        const uint64_t kTestEdgeLabelId =
+            ObjectId::MASK_EDGE_LABEL | 0xDEF;
+
+        // Test 26: parallel scan returns the same sequence as sequential
+        // on a non-trivial dataset (256 edges, spread across the id range).
+        std::cout << "Test 26: scan_label_edge_with_endpoints parallel == sequential (256 edges)...";
+        {
+            auto [seq, expected_seq] = build_and_scan_edges(
+                "test_proj_edge_scan_seq", kTestEdgeLabelId, 256, "0");
+            manager.drop_projection("test_proj_edge_scan_seq");
+            auto [par, expected_par] = build_and_scan_edges(
+                "test_proj_edge_scan_par", kTestEdgeLabelId, 256, nullptr);
+            manager.drop_projection("test_proj_edge_scan_par");
+            ::unsetenv("MDB_PROJECTION_PARALLEL_EDGE_SCAN");
+            if (seq != expected_seq) {
+                std::cerr << "\nFAIL Test 26: sequential output mismatch ("
+                          << seq.size() << " vs " << expected_seq.size()
+                          << ")" << std::endl;
+                return 1;
+            }
+            if (par != expected_par) {
+                std::cerr << "\nFAIL Test 26: parallel output mismatch ("
+                          << par.size() << " vs " << expected_par.size()
+                          << ")" << std::endl;
+                return 1;
+            }
+            if (seq != par) {
+                std::cerr << "\nFAIL Test 26: parity broken (seq.size="
+                          << seq.size() << " par.size=" << par.size() << ")"
+                          << std::endl;
+                return 1;
+            }
+            // Endpoint mapping spot check: every observed triple matches
+            // the corresponding expected (from, to) pair for its edge_id.
+            for (std::size_t i = 0; i < par.size(); ++i) {
+                if (par[i] != expected_par[i]) {
+                    std::cerr << "\nFAIL Test 26: triple at " << i
+                              << " mismatched expected" << std::endl;
+                    return 1;
+                }
+            }
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 27: parallel scan handles tiny inputs (under partition
+        // count) gracefully — should still emit every edge with correct
+        // endpoints, no partition starvation.
+        std::cout << "Test 27: scan_label_edge_with_endpoints parallel on tiny input (3 edges)...";
+        {
+            auto [par, expected] = build_and_scan_edges(
+                "test_proj_edge_scan_tiny", kTestEdgeLabelId, 3, nullptr);
+            manager.drop_projection("test_proj_edge_scan_tiny");
+            ::unsetenv("MDB_PROJECTION_PARALLEL_EDGE_SCAN");
+            if (par != expected) {
+                std::cerr << "\nFAIL Test 27: tiny-input mismatch ("
+                          << par.size() << " vs " << expected.size() << ")"
+                          << std::endl;
+                return 1;
+            }
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 28: explicit partition-count override behaves correctly.
+        // 32 partitions over 64 edges still produces the full ordered set
+        // with correct endpoint mappings.
+        std::cout << "Test 28: scan_label_edge_with_endpoints MDB_PROJECTION_EDGE_SCAN_PARTITIONS=32...";
+        {
+            ::setenv("MDB_PROJECTION_EDGE_SCAN_PARTITIONS", "32", 1);
+            auto [par, expected] = build_and_scan_edges(
+                "test_proj_edge_scan_p32", kTestEdgeLabelId, 64, nullptr);
+            manager.drop_projection("test_proj_edge_scan_p32");
+            ::unsetenv("MDB_PROJECTION_EDGE_SCAN_PARTITIONS");
+            ::unsetenv("MDB_PROJECTION_PARALLEL_EDGE_SCAN");
+            if (par != expected) {
+                std::cerr << "\nFAIL Test 28: 32-partition mismatch ("
+                          << par.size() << " vs " << expected.size() << ")"
+                          << std::endl;
+                return 1;
+            }
+        }
+        std::cout << " OK" << std::endl;
+
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";
         auto projections = manager.list_projections();

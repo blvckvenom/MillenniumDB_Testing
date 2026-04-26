@@ -132,6 +132,24 @@ public:
      * Performance: ~30-40% faster than scan_label_edge + get_edge_endpoints
      * due to reduced function call overhead and better cache locality.
      *
+     * Behavior is controlled by the env var MDB_PROJECTION_PARALLEL_EDGE_SCAN
+     * (default ON; "0"/"false"/"off" disables). When enabled, the
+     * label-edge id range is split into K disjoint sub-ranges, each scanned
+     * in parallel by a TBB worker into a thread-local vector of
+     * (edge_id, from, to) triples. Per-edge endpoint lookups happen inside
+     * each worker (the secondary edge_from_to / edge_n1_n2 trees are
+     * thread-safe for concurrent reads). After all workers finish, the
+     * main thread invokes `callback` sequentially over the per-partition
+     * vectors in ascending sub-range order — preserving the observed
+     * callback ordering of the legacy single-threaded path AND the
+     * single-threaded callback contract (callers do NOT need to make
+     * their callback thread-safe; in particular the
+     * ParallelEdgeDetector aggregation state in native_projection_builder
+     * is mutated only on the parent thread).
+     *
+     * Partition count K is `min(hardware_concurrency, 16)` by default; can
+     * be overridden via MDB_PROJECTION_EDGE_SCAN_PARTITIONS (clamped [2, 64]).
+     *
      * @param type_id ObjectId of the edge type
      * @param callback Function called for each (edge_id, from, to) tuple found
      * @return Number of edges scanned
