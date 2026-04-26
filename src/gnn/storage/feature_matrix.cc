@@ -1,13 +1,19 @@
 #include "gnn/storage/feature_matrix.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 namespace mdb::gnn {
@@ -63,6 +69,30 @@ void write_all(int fd, const void* buf, size_t count) {
                 "FeatureMatrix: write returned 0 for non-zero count — disk full or I/O error");
         }
         p += written;
+        remaining -= static_cast<size_t>(written);
+    }
+}
+
+// Positional write of `count` bytes at file offset `offset`. Thread-safe across
+// workers writing to disjoint [offset, offset+count) ranges (POSIX pwrite does
+// not modify the shared file pointer). Loops over short writes and EINTR.
+void pwrite_all(int fd, const void* buf, size_t count, off_t offset) {
+    const char* p = static_cast<const char*>(buf);
+    size_t remaining = count;
+    off_t  off       = offset;
+    while (remaining > 0) {
+        ssize_t written = ::pwrite(fd, p, remaining, off);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error(
+                "FeatureMatrix: pwrite failed: " + std::string(std::strerror(errno)));
+        }
+        if (written == 0) {
+            throw std::runtime_error(
+                "FeatureMatrix: pwrite returned 0 for non-zero count — disk full or I/O error");
+        }
+        p        += written;
+        off      += written;
         remaining -= static_cast<size_t>(written);
     }
 }
@@ -432,6 +462,141 @@ FeatureMatrix FeatureMatrix::create_streaming(
     }
 
     // mmap the result
+    FeatureMatrix fm;
+    fm.header_    = header;
+    fm.path_      = path;
+    fm.mmap_size_ = file_size;
+    fm.mmap_ptr_  = mmap_file_readonly(path, file_size);
+    return fm;
+}
+
+// --- create_parallel() ---
+//
+// Pre-allocates the output file and dispatches num_workers std::threads to
+// write disjoint contiguous row ranges via pwrite(). The supplied RowWriter
+// is invoked concurrently on different (row_id, dest) pairs and MUST be
+// thread-safe. Each worker uses a private row buffer, so dest pointers do
+// not alias across threads. pwrite() is atomic per call against the file
+// descriptor's offset — workers writing to non-overlapping byte ranges do
+// not interfere.
+FeatureMatrix FeatureMatrix::create_parallel(
+    const fs::path& path,
+    uint64_t num_rows,
+    uint64_t num_cols,
+    GnnDtype dtype,
+    RowWriter writer,
+    unsigned num_workers)
+{
+    if (num_rows == 0 || num_cols == 0) {
+        throw std::invalid_argument(
+            "FeatureMatrix::create_parallel: num_rows and num_cols must be > 0");
+    }
+    if (!writer) {
+        throw std::invalid_argument(
+            "FeatureMatrix::create_parallel: writer must be non-null");
+    }
+
+    // Single-thread fallback — preserves existing semantics exactly.
+    if (num_workers <= 1) {
+        return create_streaming(path, num_rows, num_cols, dtype, std::move(writer));
+    }
+
+    auto header = FeatureMatrixHeader::make(num_rows, num_cols, dtype);
+
+    size_t ds = dtype_size(dtype);
+    if (ds > 0 && num_cols > SIZE_MAX / ds) {
+        throw std::overflow_error("FeatureMatrix::create_parallel: num_cols * dtype_size overflow");
+    }
+
+    const size_t rb = header.row_bytes();
+    if (rb > 0 && num_rows > SIZE_MAX / rb) {
+        throw std::overflow_error(
+            "FeatureMatrix::create_parallel: data size would overflow size_t");
+    }
+    size_t data_size = header.data_bytes();
+    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+        throw std::overflow_error(
+            "FeatureMatrix::create_parallel: total file size would overflow size_t");
+    }
+    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "FeatureMatrix::create_parallel: cannot open " + path.string() +
+            ": " + std::strerror(errno));
+    }
+    FdGuard guard(fd);
+
+    // Pre-allocate the full file. ftruncate only extends; sparse holes will be
+    // filled in by the parallel pwrite() pass that follows.
+    if (::ftruncate(fd, static_cast<off_t>(file_size)) != 0) {
+        throw std::runtime_error(
+            "FeatureMatrix::create_parallel: ftruncate(" + std::to_string(file_size) +
+            ") failed: " + std::string(std::strerror(errno)));
+    }
+
+    // Header at offset 0. Workers only touch offsets >= FeatureMatrixHeader::SIZE.
+    pwrite_all(fd, &header, sizeof(header), 0);
+
+    // Cap workers at num_rows so every worker has at least 1 row.
+    const uint64_t W64 = std::min<uint64_t>(num_workers, num_rows);
+    const unsigned W   = static_cast<unsigned>(W64);
+    const uint64_t base_chunk = num_rows / W;
+    const uint64_t remainder  = num_rows % W;
+
+    std::vector<std::thread>      threads;
+    std::vector<std::exception_ptr> errors(W, nullptr);
+    threads.reserve(W);
+
+    for (unsigned w = 0; w < W; ++w) {
+        // Distribute remainder across the first `remainder` workers so chunks
+        // differ by at most one row. Avoids a single straggler at the tail.
+        uint64_t start = w * base_chunk + std::min<uint64_t>(w, remainder);
+        uint64_t end   = start + base_chunk + (w < remainder ? 1 : 0);
+
+        threads.emplace_back([&, w, start, end]() {
+            try {
+                std::vector<char> row_buf(rb);
+                for (uint64_t i = start; i < end; ++i) {
+                    writer(i, row_buf.data(), rb);
+                    off_t off = static_cast<off_t>(FeatureMatrixHeader::SIZE +
+                                                   i * rb);
+                    pwrite_all(fd, row_buf.data(), rb, off);
+                }
+            } catch (...) {
+                errors[w] = std::current_exception();
+            }
+        });
+    }
+
+    for (auto& t : threads) t.join();
+
+    // Surface the first error (if any), removing the partial file.
+    for (unsigned w = 0; w < W; ++w) {
+        if (errors[w]) {
+            ::close(fd);
+            guard.release();
+            std::error_code ec;
+            fs::remove(path, ec);
+            std::rethrow_exception(errors[w]);
+        }
+    }
+
+    if (::fsync(fd) < 0) {
+        throw std::runtime_error(
+            "FeatureMatrix::create_parallel: fsync failed: " +
+            std::string(std::strerror(errno)));
+    }
+
+    {
+        int dir_fd = ::open(path.parent_path().c_str(), O_RDONLY);
+        if (dir_fd >= 0) {
+            ::fsync(dir_fd);
+            ::close(dir_fd);
+        }
+    }
+
     FeatureMatrix fm;
     fm.header_    = header;
     fm.path_      = path;

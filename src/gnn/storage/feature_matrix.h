@@ -45,6 +45,27 @@ public:
         RowWriter writer
     );
 
+    /**
+     * Parallel variant of create_streaming. Pre-allocates the output via
+     * ftruncate, then dispatches num_workers std::threads each handling a
+     * disjoint contiguous row range via pwrite() at the appropriate file
+     * offset. The supplied RowWriter MUST be thread-safe — it is called
+     * concurrently from multiple threads on different (row_id, dest) pairs.
+     *
+     * num_workers == 0 falls back to the sequential single-thread path.
+     *
+     * On any worker exception the partial file is removed and the first
+     * captured exception is rethrown after all workers join.
+     */
+    static FeatureMatrix create_parallel(
+        const std::filesystem::path& path,
+        uint64_t num_rows,
+        uint64_t num_cols,
+        GnnDtype dtype,
+        RowWriter writer,
+        unsigned num_workers
+    );
+
     static FeatureMatrix open(const std::filesystem::path& path);
 
     // --- Move only (owns mmap) ---

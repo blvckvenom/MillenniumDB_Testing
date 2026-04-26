@@ -753,3 +753,199 @@ TEST_F(FeatureMatrixTest, OpenCraftedOverflowHeaderThrows) {
     EXPECT_THROW(FeatureMatrix::open(path), std::exception)
         << "Opening FeatureMatrix with overflowing header dimensions should throw";
 }
+
+// ===========================================================================
+// Spec #14: Parallel create (multi-thread pwrite into pre-allocated file)
+// ===========================================================================
+
+// Build a deterministic input matrix and verify byte-equality against the
+// sequential single-thread path under several worker counts. The writer is a
+// pure memcpy from a const buffer — the same shape used by import_node_tensors
+// for the npy memmap source. Implemented as a fixture member so it can reach
+// the protected GnnStorageTest::test_path helper.
+class FeatureMatrixParallelTest : public GnnStorageTest {
+protected:
+    void run_byte_eq(uint64_t N, uint64_t D, unsigned workers,
+                     const std::string& tag)
+    {
+        std::vector<float> data(N * D);
+        for (uint64_t i = 0; i < N * D; ++i) {
+            data[i] = static_cast<float>(i * 0.25f + 0.5f);
+        }
+        const char* src = reinterpret_cast<const char*>(data.data());
+        const size_t rb = D * sizeof(float);
+
+        auto seq_path = test_path("seq_" + tag + ".fmat");
+        FeatureMatrix::create_streaming(
+            seq_path, N, D, GnnDtype::FLOAT32,
+            [src, rb](uint64_t row_id, void* dest, uint64_t bytes) {
+                ASSERT_EQ(bytes, rb);
+                std::memcpy(dest, src + row_id * rb, bytes);
+            });
+
+        auto par_path = test_path("par_" + tag + ".fmat");
+        FeatureMatrix::create_parallel(
+            par_path, N, D, GnnDtype::FLOAT32,
+            [src, rb](uint64_t row_id, void* dest, uint64_t bytes) {
+                std::memcpy(dest, src + row_id * rb, bytes);
+            },
+            workers);
+
+        auto seq_size = fs::file_size(seq_path);
+        auto par_size = fs::file_size(par_path);
+        ASSERT_EQ(seq_size, par_size)
+            << "[" << tag << "] sequential and parallel file sizes differ";
+
+        std::ifstream a(seq_path, std::ios::binary);
+        std::ifstream b(par_path, std::ios::binary);
+        ASSERT_TRUE(a.good() && b.good());
+        std::vector<char> ba(seq_size), bb(par_size);
+        a.read(ba.data(), ba.size());
+        b.read(bb.data(), bb.size());
+        EXPECT_EQ(std::memcmp(ba.data(), bb.data(), seq_size), 0)
+            << "[" << tag << "] parallel output differs from sequential ("
+            << workers << " workers)";
+
+        auto fm = FeatureMatrix::open(par_path);
+        EXPECT_EQ(fm.num_rows(), N);
+        EXPECT_EQ(fm.num_cols(), D);
+        EXPECT_EQ(fm.dtype(), GnnDtype::FLOAT32);
+        for (uint64_t i = 0; i < N; ++i) {
+            const float* row = fm.row_as<float>(i);
+            for (uint64_t j = 0; j < D; ++j) {
+                EXPECT_FLOAT_EQ(row[j], data[i * D + j])
+                    << "[" << tag << "] mismatch at (" << i << "," << j << ")";
+            }
+        }
+    }
+};
+
+TEST_F(FeatureMatrixParallelTest, SmokeMatchesSequential) {
+    // 1M rows × 16 floats = 64 MiB (small enough for CI, large enough to
+    // give each of 4 workers a non-trivial chunk).
+    run_byte_eq(/*N=*/1u << 20, /*D=*/16, /*workers=*/4, "smoke");
+}
+
+TEST_F(FeatureMatrixParallelTest, ByteEqUnderConcurrency) {
+    // Multiple worker counts to exercise both even-split (8 workers, N % 8 == 0)
+    // and remainder-distribution paths (3 and 7 workers).
+    run_byte_eq(/*N=*/1024u, /*D=*/8, /*workers=*/3, "w3");
+    run_byte_eq(/*N=*/1024u, /*D=*/8, /*workers=*/7, "w7");
+    run_byte_eq(/*N=*/1024u, /*D=*/8, /*workers=*/8, "w8");
+}
+
+TEST_F(FeatureMatrixTest, CreateParallelHeaderIntegrity) {
+    const uint64_t N = 7777, D = 17;  // odd dims to stress remainder math
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) data[i] = static_cast<float>(i);
+
+    auto path = test_path("parallel_header.fmat");
+    FeatureMatrix::create_parallel(
+        path, N, D, GnnDtype::FLOAT32,
+        [&data, D](uint64_t row_id, void* dest, uint64_t bytes) {
+            std::memcpy(dest, &data[row_id * D], bytes);
+        },
+        /*num_workers=*/5);
+
+    // Re-read the raw header bytes off disk and validate every field.
+    std::ifstream ifs(path, std::ios::binary);
+    ASSERT_TRUE(ifs.good());
+    FeatureMatrixHeader h{};
+    ifs.read(reinterpret_cast<char*>(&h), sizeof(h));
+    ASSERT_EQ(ifs.gcount(), static_cast<std::streamsize>(sizeof(h)));
+
+    EXPECT_EQ(h.magic,    FeatureMatrixHeader::MAGIC);
+    EXPECT_EQ(h.version,  FeatureMatrixHeader::VERSION);
+    EXPECT_EQ(h.num_rows, N);
+    EXPECT_EQ(h.num_cols, D);
+    EXPECT_EQ(h.get_dtype(), GnnDtype::FLOAT32);
+    EXPECT_TRUE(h.is_valid());
+
+    auto file_bytes = fs::file_size(path);
+    EXPECT_EQ(file_bytes, FeatureMatrixHeader::SIZE + N * D * sizeof(float));
+}
+
+TEST_F(FeatureMatrixTest, CreateParallelZeroWorkersFallsBackToSequential) {
+    // num_workers == 0 must use the sequential path verbatim — protects
+    // callers that cannot detect cores (e.g. some sandboxes).
+    const uint64_t N = 64, D = 4;
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) data[i] = static_cast<float>(i + 1);
+
+    auto path = test_path("parallel_w0.fmat");
+    FeatureMatrix::create_parallel(
+        path, N, D, GnnDtype::FLOAT32,
+        [&data, D](uint64_t row_id, void* dest, uint64_t bytes) {
+            std::memcpy(dest, &data[row_id * D], bytes);
+        },
+        /*num_workers=*/0);
+
+    auto fm = FeatureMatrix::open(path);
+    for (uint64_t i = 0; i < N; ++i) {
+        const float* row = fm.row_as<float>(i);
+        for (uint64_t j = 0; j < D; ++j) {
+            EXPECT_FLOAT_EQ(row[j], data[i * D + j]);
+        }
+    }
+}
+
+TEST_F(FeatureMatrixTest, CreateParallelMoreWorkersThanRowsIsSafe) {
+    // 16 workers but only 5 rows — extra workers must be skipped, not crash.
+    const uint64_t N = 5, D = 3;
+    std::vector<float> data = {
+         1, 2, 3,
+         4, 5, 6,
+         7, 8, 9,
+        10,11,12,
+        13,14,15,
+    };
+
+    auto path = test_path("parallel_excess.fmat");
+    FeatureMatrix::create_parallel(
+        path, N, D, GnnDtype::FLOAT32,
+        [&data, D](uint64_t row_id, void* dest, uint64_t bytes) {
+            std::memcpy(dest, &data[row_id * D], bytes);
+        },
+        /*num_workers=*/16);
+
+    auto fm = FeatureMatrix::open(path);
+    EXPECT_EQ(fm.num_rows(), N);
+    for (uint64_t i = 0; i < N; ++i) {
+        const float* row = fm.row_as<float>(i);
+        for (uint64_t j = 0; j < D; ++j) {
+            EXPECT_FLOAT_EQ(row[j], data[i * D + j]);
+        }
+    }
+}
+
+TEST_F(FeatureMatrixTest, CreateParallelWriterExceptionCleansUp) {
+    auto path = test_path("parallel_fail.fmat");
+
+    EXPECT_THROW(
+        FeatureMatrix::create_parallel(
+            path, /*N=*/64, /*D=*/4, GnnDtype::FLOAT32,
+            [](uint64_t row_id, void* dest, uint64_t bytes) {
+                if (row_id == 17) {
+                    throw std::runtime_error("simulated parallel writer failure");
+                }
+                std::memset(dest, 0, bytes);
+            },
+            /*num_workers=*/4),
+        std::runtime_error);
+
+    EXPECT_FALSE(fs::exists(path))
+        << "Partial parallel .fmat file should be cleaned up after writer exception";
+}
+
+TEST_F(FeatureMatrixTest, CreateParallelZeroDimsThrows) {
+    EXPECT_THROW(
+        FeatureMatrix::create_parallel(
+            test_path("p_zero_rows.fmat"), 0, 4, GnnDtype::FLOAT32,
+            [](uint64_t, void*, uint64_t) {}, 4),
+        std::invalid_argument);
+    EXPECT_THROW(
+        FeatureMatrix::create_parallel(
+            test_path("p_zero_cols.fmat"), 4, 0, GnnDtype::FLOAT32,
+            [](uint64_t, void*, uint64_t) {}, 4),
+        std::invalid_argument);
+}

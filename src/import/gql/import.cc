@@ -1,8 +1,11 @@
 #include "import.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <string>
+#include <thread>
 
 #ifdef ENABLE_GNN
 #include "gnn/storage/feature_matrix.h"
@@ -1164,16 +1167,46 @@ void OnDiskImport::import_node_tensors() {
 
     const char* src_bytes = static_cast<const char*>(mm.data());
 
+    // Worker count for the parallel feature copy. Sequential (papers100M
+    // 56 GiB) was ~30 min wall clock dominated by fwrite/fsync overhead, not
+    // the memcpy. Striping rows across N pwrite()-based workers turns the
+    // copy I/O-bound on the destination disk instead of single-thread bound.
+    //
+    // MDB_TENSOR_IMPORT_WORKERS:
+    //   unset / 0 — auto-detect: min(8, hardware_concurrency() - 1)
+    //   1         — force the legacy sequential path (for A/B benchmarking)
+    //   N > 1     — explicit worker count
+    unsigned tensor_workers = 0;
+    if (const char* env = std::getenv("MDB_TENSOR_IMPORT_WORKERS")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed >= 0) {
+                tensor_workers = static_cast<unsigned>(parsed);
+            }
+        } catch (...) {
+            // Ignore malformed values, fall through to auto-detect.
+        }
+    }
+    if (tensor_workers == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 2; // hardware_concurrency may return 0 on exotic systems
+        tensor_workers = std::min<unsigned>(8u, hw > 1 ? hw - 1 : 1);
+    }
+
+    std::cout << "  Workers: " << tensor_workers
+              << " (override via MDB_TENSOR_IMPORT_WORKERS)\n";
+
     try {
-        // Stream rows from the mmapped source into the .fmat output. Peak extra
-        // RAM in this callback is one row (~512 B for papers100M at 128 dims);
-        // the OS pages the mmap in on demand and discards clean pages under
-        // pressure, so total resident set stays bounded.
-        mdb::gnn::FeatureMatrix::create_streaming(
+        // Stream rows from the mmapped source into the .fmat output. Each
+        // worker uses its own row buffer (~row_bytes peak) and pwrite()s to
+        // disjoint offsets in the pre-allocated output file; the source mmap
+        // is read-only and shared safely across threads.
+        mdb::gnn::FeatureMatrix::create_parallel(
             fmat_path, num_nodes, feature_dim, gnn_dtype,
             [src_bytes, row_bytes](uint64_t row_id, void* dest, uint64_t dest_bytes) {
                 std::memcpy(dest, src_bytes + row_id * row_bytes, dest_bytes);
-            }
+            },
+            tensor_workers
         );
 
         // Write RowMapping (.rmap): sequential-ObjectId identity map.
