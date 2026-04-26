@@ -61,6 +61,22 @@ public:
      *   for each record in range:
      *     callback(record[1])  // node_id
      *
+     * Behavior is controlled by the env var MDB_PROJECTION_PARALLEL_NODE_SCAN
+     * (default ON; "0"/"false"/"off" disables). When enabled, the
+     * label-node id range is split into K disjoint sub-ranges, each scanned
+     * in parallel by a TBB worker into a thread-local vector. After all
+     * workers finish, the main thread invokes `callback` sequentially over
+     * the per-partition vectors in ascending sub-range order. This preserves
+     * the observed callback ordering of the legacy single-threaded path
+     * (records are visited in B+Tree key order, partition-by-partition) and
+     * keeps the callback contract single-threaded — callers do NOT need to
+     * make their callback thread-safe.
+     *
+     * Partition count K is `min(hardware_concurrency, 16)` by default; can be
+     * overridden via MDB_PROJECTION_NODE_SCAN_PARTITIONS (clamped [2, 64]).
+     * For label-ranges with fewer than K records, falls back automatically
+     * to the sequential path.
+     *
      * @param label_id ObjectId of the label
      * @param callback Function called for each node_id found
      * @return Number of nodes scanned

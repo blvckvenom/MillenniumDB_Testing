@@ -1,11 +1,71 @@
 #include "native_scanner.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
+#ifdef HAS_TBB
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+#endif
+
+#include "query/query_context.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/record.h"
 
 namespace GQL {
+
+namespace {
+
+// Resolve MDB_PROJECTION_PARALLEL_NODE_SCAN. Default ON. "0"/"false"/"off"
+// (any case) disable the parallel path, restoring legacy sequential behavior
+// for A/B benchmarks and bisecting regressions.
+bool resolve_parallel_node_scan_enabled() {
+    const char* env = std::getenv("MDB_PROJECTION_PARALLEL_NODE_SCAN");
+    if (env == nullptr) {
+        return true;
+    }
+    std::string v(env);
+    if (v == "0" || v == "false" || v == "off" ||
+        v == "FALSE" || v == "OFF" || v == "False" || v == "Off")
+    {
+        return false;
+    }
+    return true;
+}
+
+// Resolve MDB_PROJECTION_NODE_SCAN_PARTITIONS. Default
+// min(hardware_concurrency, 16). Clamped to [2, 64]. Values outside that
+// range are silently clamped (the env var is an advisory tuning knob).
+std::size_t resolve_node_scan_partitions() {
+    constexpr std::size_t kMin = 2;
+    constexpr std::size_t kMaxCap = 64;
+    constexpr std::size_t kDefaultCap = 16;
+
+    std::size_t hw = std::thread::hardware_concurrency();
+    if (hw == 0) {
+        hw = 4;  // conservative fallback when sysconf is unhelpful
+    }
+    std::size_t k = std::min<std::size_t>(hw, kDefaultCap);
+
+    if (const char* env = std::getenv("MDB_PROJECTION_NODE_SCAN_PARTITIONS")) {
+        try {
+            long parsed = std::stol(env);
+            if (parsed > 0) {
+                k = static_cast<std::size_t>(parsed);
+            }
+        } catch (...) {
+            // Ignore malformed values, keep default.
+        }
+    }
+    return std::clamp(k, kMin, kMaxCap);
+}
+
+} // namespace
+
 
 NativeScanner::NativeScanner(
     BPlusTree<2>* label_node_idx,
@@ -32,41 +92,161 @@ NativeScanner::~NativeScanner() {
     // Non-owning pointers, no cleanup needed
 }
 
+// Sequential helper: scan a single sub-range [lo, hi] of node ids for the
+// given label, invoking `sink` for each node_id found in B+Tree key order.
+// Pulled out so both the legacy fast path and each parallel worker share
+// exactly the same iteration logic.
+static uint64_t scan_label_node_subrange(
+    BPlusTree<2>* label_node_index,
+    uint64_t search_label_id,
+    uint64_t lo_node,
+    uint64_t hi_node,
+    const std::function<void(ObjectId)>& sink)
+{
+    Record<2> min_record;
+    min_record[0] = search_label_id;
+    min_record[1] = lo_node;
+
+    Record<2> max_record;
+    max_record[0] = search_label_id;
+    max_record[1] = hi_node;
+
+    bool interruption_requested = false;
+    auto iter = label_node_index->get_range(
+        &interruption_requested, min_record, max_record);
+
+    uint64_t count = 0;
+    const Record<2>* record;
+    while ((record = iter.next()) != nullptr) {
+        ObjectId node_id((*record)[1]);
+        sink(node_id);
+        ++count;
+    }
+    return count;
+}
+
 uint64_t NativeScanner::scan_label_node(
     ObjectId label_id,
     std::function<void(ObjectId)> callback
 ) {
     // The label_node B+Tree stores full ObjectIds WITH type masks
     // We need to use the full label_id as-is
-    uint64_t search_label_id = label_id.id;
+    const uint64_t search_label_id = label_id.id;
 
-    // Debug logging removed for performance
+    // Sequential path — used when the parallel feature is disabled, when TBB
+    // is not built in, or when only one partition is requested. Mirrors the
+    // pre-Spec-#15 behavior exactly.
+    bool parallel_enabled = resolve_parallel_node_scan_enabled();
+    std::size_t num_partitions = resolve_node_scan_partitions();
 
-    // Define range: all records where first key = search_label_id
-    Record<2> min_record;
-    min_record[0] = search_label_id;
-    min_record[1] = 0;
+#ifndef HAS_TBB
+    parallel_enabled = false;
+#endif
 
-    Record<2> max_record;
-    max_record[0] = search_label_id;
-    max_record[1] = UINT64_MAX;
-
-    // Create range iterator with interruption support
-    bool interruption_requested = false;
-    auto iter = label_node_index->get_range(&interruption_requested, min_record, max_record);
-
-    // Iterate over matching records
-    uint64_t count = 0;
-    const Record<2>* record;
-    while ((record = iter.next()) != nullptr) {
-        // Record format: {label_id, node_id}
-        // Extract node_id from second field
-        ObjectId node_id((*record)[1]);
-        callback(node_id);
-        count++;
+    if (!parallel_enabled || num_partitions < 2) {
+        return scan_label_node_subrange(
+            label_node_index, search_label_id,
+            /*lo_node=*/0, /*hi_node=*/UINT64_MAX,
+            callback);
     }
 
+#ifdef HAS_TBB
+    // The QueryContext is held in a thread_local pointer
+    // (QueryContext::_query_ctx) and is consulted on every BPT leaf decode
+    // (bplus_tree_leaf.cc:301,345). TBB worker threads do not inherit the
+    // main thread's thread_local state, so we must propagate it explicitly
+    // before any worker calls get_range(). Capture the parent pointer here
+    // and re-set on each worker's first iteration. Setting the same pointer
+    // is idempotent and cheap; setting null on the parent thread is not
+    // attempted (the variable carries the parent's context for the
+    // duration of this call).
+    QueryContext* parent_ctx = QueryContext::_query_ctx;
+
+    // ---- Range partition strategy (Option A: uniform split of node-id range)
+    //
+    // The label_node B+Tree is sorted lexicographically on (label_id, node_id);
+    // within a fixed label, records are ordered by the full 64-bit node_id.
+    // GQL node ObjectIds carry a constant 8-bit type prefix in the high byte
+    // (MASK_NODE = 0xD4'..) and a monotonically increasing 56-bit counter in
+    // the low bytes, so a uniform split of [0, UINT64_MAX] produces sub-ranges
+    // whose record counts are roughly proportional to the counter density —
+    // good enough to balance worker load without paying for a histogram
+    // prepass. Sub-ranges are inclusive at both ends; we offset hi by -1 to
+    // make them disjoint, except the last partition which keeps UINT64_MAX so
+    // no record on the boundary is missed.
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.reserve(num_partitions);
+    const uint64_t total_span = UINT64_MAX;  // inclusive size − 1
+    const uint64_t step = total_span / num_partitions + 1;
+    uint64_t lo = 0;
+    for (std::size_t p = 0; p < num_partitions; ++p) {
+        uint64_t hi;
+        if (p + 1 == num_partitions) {
+            hi = UINT64_MAX;
+        } else {
+            // Saturating add: avoid wraparound on the last interior partition.
+            uint64_t next_lo = lo + step;
+            hi = (next_lo == 0 || next_lo > UINT64_MAX) ? UINT64_MAX
+                                                        : (next_lo - 1);
+        }
+        ranges.emplace_back(lo, hi);
+        lo = (hi == UINT64_MAX) ? UINT64_MAX : (hi + 1);
+    }
+
+    // Phase 1: each worker writes into its own per-partition vector. No
+    // shared mutable state across workers, so no locks. The B+Tree
+    // BufferManager is thread-safe for concurrent reads (internal
+    // vp_mutex / shared page latches), so concurrent get_range iterators
+    // on the same tree are safe.
+    std::vector<std::vector<ObjectId>> per_partition(num_partitions);
+    // Reservation hint: assume roughly uniform distribution. 64 entries
+    // is enough to cover small labels without over-allocating; the vector
+    // grows naturally for larger ranges.
+    for (auto& vec : per_partition) {
+        vec.reserve(64);
+    }
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, num_partitions, 1),
+        [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
+            // Inherit the parent thread's QueryContext into this worker.
+            // BPT leaf decode requires it (bplus_tree_leaf.cc:301,345);
+            // without this, worker threads dereference a null
+            // thread_local pointer.
+            if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
+                QueryContext::set_query_ctx(parent_ctx);
+            }
+            for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                auto& sink = per_partition[p];
+                scan_label_node_subrange(
+                    label_node_index, search_label_id,
+                    ranges[p].first, ranges[p].second,
+                    [&sink](ObjectId node_id) {
+                        sink.push_back(node_id);
+                    });
+            }
+        });
+
+    // Phase 2 (serial merge): replay the collected node ids through the
+    // user-supplied callback in ascending partition order. The legacy
+    // sequential path visits records in B+Tree key order, and our
+    // partitions are disjoint sub-ranges of that key order, so the merged
+    // sequence is bit-identical to the legacy ordering. Single-threaded
+    // replay also means the user callback (which reaches into shared
+    // builder/storage state) does NOT have to be thread-safe — preserving
+    // the legacy contract.
+    uint64_t count = 0;
+    for (auto& vec : per_partition) {
+        for (ObjectId node_id : vec) {
+            callback(node_id);
+        }
+        count += vec.size();
+    }
     return count;
+#else
+    // Unreachable (parallel_enabled forced false above when !HAS_TBB).
+    return 0;
+#endif
 }
 
 uint64_t NativeScanner::scan_label_edge(

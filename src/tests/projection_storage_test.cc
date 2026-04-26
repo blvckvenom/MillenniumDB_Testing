@@ -1,8 +1,12 @@
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <vector>
 
 #include "graph_models/gql/projection/index_set.h"
+#include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
@@ -496,6 +500,166 @@ int main() {
         // Cleanup
         manager.drop_projection("test_proj_seq");
         manager.drop_projection("test_proj_par");
+
+        // ================================================================
+        // Spec #15 — parallel B+Tree node-scan parity tests
+        // ================================================================
+        // Verify MDB_PROJECTION_PARALLEL_NODE_SCAN=0 (sequential, legacy)
+        // and the default (parallel TBB) produce IDENTICAL ordered node
+        // sequences when scanning the label_node B+Tree. Synthetic data
+        // is built via ProjectionStorage::add_node_label, which lands the
+        // exact same {label_id, node_id} record format the scanner
+        // consumes in production.
+
+        // Helper: build a populated projection in-place, flush() it (so
+        // build_all_indexes_bulk() materializes the .leaf/.dir files AND
+        // open_all_bplustree_readers_() loads the BPlusTree readers into
+        // the same storage object), then run the scanner against the live
+        // readers. The storage object stays alive for the duration of the
+        // scan, so its readers are valid. Returns observed sequence under
+        // the env-controlled path + the sorted-unique expected sequence.
+        auto build_and_scan = [&manager](
+            const std::string& proj_name,
+            uint64_t label_id_raw,
+            std::size_t count,
+            const char* env_value)
+            -> std::pair<std::vector<uint64_t>, std::vector<uint64_t>>
+        {
+            if (env_value) {
+                ::setenv("MDB_PROJECTION_PARALLEL_NODE_SCAN", env_value, 1);
+            } else {
+                ::unsetenv("MDB_PROJECTION_PARALLEL_NODE_SCAN");
+            }
+
+            std::string pdir = manager.create_projection(proj_name);
+            GQL::ProjectionCatalog cat(pdir);
+            cat.projection_name = proj_name;
+            cat.save();
+
+            GQL::ProjectionStorage::Features feats;
+            feats.include_node_labels = true;
+            GQL::ProjectionStorage s(pdir, "test_db_storage",
+                                     proj_name, feats);
+            s.init();
+
+            ObjectId label_id(label_id_raw);
+            std::vector<uint64_t> expected;
+            expected.reserve(count);
+            // Spread node ids across the value space using a coprime stride
+            // so a uniform partitioner cannot pass by accident: with stride
+            // 0x0001'1234'... and 8+ partitions, every partition's
+            // sub-range contains at least one record on counts >= 8.
+            const uint64_t stride = 0x0001'1234'5678'9ABCULL;
+            uint64_t cur = ObjectId::MASK_NODE | 1;
+            for (std::size_t i = 0; i < count; ++i) {
+                ObjectId nid(cur);
+                GQL::ProjectedNode n;
+                n.node_id = nid;
+                s.add_node(n);
+                s.add_node_label(nid, label_id);
+                expected.push_back(cur);
+                cur = (cur + stride) | ObjectId::MASK_NODE;
+            }
+            // flush() builds .leaf/.dir AND opens BPlusTree readers, so
+            // s.get_label_node_index() etc. become non-null afterwards.
+            s.flush();
+
+            std::sort(expected.begin(), expected.end());
+            expected.erase(std::unique(expected.begin(), expected.end()),
+                           expected.end());
+
+            // NativeScanner ctor enforces non-null on label_node,
+            // label_edge, from_to_edge, n1_n2_edge — but for
+            // scan_label_node only label_node is dereferenced. Reuse the
+            // projection's label_node and from_to_edge indexes for the
+            // unused slots (same N=2 / N=3 types).
+            GQL::NativeScanner scanner(
+                s.get_label_node_index(),
+                s.get_label_node_index(),    // label_edge stub
+                s.get_from_to_edge_index(),
+                s.get_edge_from_to_index(),
+                s.get_from_to_edge_index(),  // n1_n2_edge stub
+                s.get_edge_from_to_index()); // edge_n1_n2 stub
+
+            std::vector<uint64_t> observed;
+            observed.reserve(count);
+            scanner.scan_label_node(ObjectId(label_id_raw),
+                [&observed](ObjectId node_id) {
+                    observed.push_back(node_id.id);
+                });
+            return {observed, expected};
+        };
+
+        const uint64_t kTestLabelId = ObjectId::MASK_NODE_LABEL | 0xABC;
+
+        // Test 23: parallel scan returns the same sequence as sequential
+        // on a non-trivial dataset (256 nodes, spread across the id range).
+        std::cout << "Test 23: scan_label_node parallel == sequential (256 nodes)...";
+        {
+            auto [seq, expected_seq] = build_and_scan(
+                "test_proj_node_scan_seq", kTestLabelId, 256, "0");
+            manager.drop_projection("test_proj_node_scan_seq");
+            auto [par, expected_par] = build_and_scan(
+                "test_proj_node_scan_par", kTestLabelId, 256, nullptr);
+            manager.drop_projection("test_proj_node_scan_par");
+            ::unsetenv("MDB_PROJECTION_PARALLEL_NODE_SCAN");
+            if (seq != expected_seq) {
+                std::cerr << "\nFAIL Test 23: sequential output mismatch ("
+                          << seq.size() << " vs " << expected_seq.size()
+                          << ")" << std::endl;
+                return 1;
+            }
+            if (par != expected_par) {
+                std::cerr << "\nFAIL Test 23: parallel output mismatch ("
+                          << par.size() << " vs " << expected_par.size()
+                          << ")" << std::endl;
+                return 1;
+            }
+            if (seq != par) {
+                std::cerr << "\nFAIL Test 23: parity broken (seq.size="
+                          << seq.size() << " par.size=" << par.size() << ")"
+                          << std::endl;
+                return 1;
+            }
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 24: parallel scan handles tiny inputs (under partition
+        // count) gracefully — should still emit every record, no
+        // partition starvation.
+        std::cout << "Test 24: scan_label_node parallel on tiny input (3 nodes)...";
+        {
+            auto [par, expected] = build_and_scan(
+                "test_proj_node_scan_tiny", kTestLabelId, 3, nullptr);
+            manager.drop_projection("test_proj_node_scan_tiny");
+            ::unsetenv("MDB_PROJECTION_PARALLEL_NODE_SCAN");
+            if (par != expected) {
+                std::cerr << "\nFAIL Test 24: tiny-input mismatch ("
+                          << par.size() << " vs " << expected.size() << ")"
+                          << std::endl;
+                return 1;
+            }
+        }
+        std::cout << " OK" << std::endl;
+
+        // Test 25: explicit partition-count override behaves correctly.
+        // 32 partitions over 64 nodes still produces the full ordered set.
+        std::cout << "Test 25: scan_label_node MDB_PROJECTION_NODE_SCAN_PARTITIONS=32...";
+        {
+            ::setenv("MDB_PROJECTION_NODE_SCAN_PARTITIONS", "32", 1);
+            auto [par, expected] = build_and_scan(
+                "test_proj_node_scan_p32", kTestLabelId, 64, nullptr);
+            manager.drop_projection("test_proj_node_scan_p32");
+            ::unsetenv("MDB_PROJECTION_NODE_SCAN_PARTITIONS");
+            ::unsetenv("MDB_PROJECTION_PARALLEL_NODE_SCAN");
+            if (par != expected) {
+                std::cerr << "\nFAIL Test 25: 32-partition mismatch ("
+                          << par.size() << " vs " << expected.size() << ")"
+                          << std::endl;
+                return 1;
+            }
+        }
+        std::cout << " OK" << std::endl;
 
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";
