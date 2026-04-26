@@ -377,16 +377,39 @@ std::size_t RadixPartitionSort<N>::scan_and_partition(
         num_partitions_, scan_threads, config_.scratch_dir,
         [this](const Record<N>& r) { return radix_bucket(r); });
 
-    partitioner.run([&](auto emit) {
-        // Single-threaded drain of the input buffer for now. The full
-        // TBB-driven B+Tree scan integration lands in the projection
-        // builder wiring task (Task 12); here we consume a streaming
-        // buffer directly to satisfy the unit tests.
+    // Spec #25 (Option C — CPU TBB): chunk-parallel partition fill.
+    // Default ON; opt-out with MDB_PROJECTION_RADIX_PHASE1_PARALLEL=0 for
+    // A/B benchmarking and bisecting regressions. The single-thread fallback
+    // preserves pre-Spec-#25 behavior bit-for-bit.
+    bool parallel_phase1 = true;
+    if (const char* env = std::getenv("MDB_PROJECTION_RADIX_PHASE1_PARALLEL")) {
+        if (std::string(env) == "0") parallel_phase1 = false;
+    }
+    // Tiny inputs don't amortize TBB dispatch — fall back to sequential.
+    // Threshold matches the default chunk size (64 K records).
+    constexpr std::uint64_t kParallelMinRecords = 65536;
+    if (parallel_phase1 && estimated_count >= kParallelMinRecords && scan_threads > 1) {
         input.begin_iteration();
-        while (input.has_next()) {
-            emit(input.next());
-        }
-    });
+        partitioner.run_parallel_chunked(
+            [&](std::vector<Record<N>>& out_chunk, std::size_t max_records)
+                -> std::size_t
+            {
+                std::size_t pulled = 0;
+                while (pulled < max_records && input.has_next()) {
+                    out_chunk.push_back(input.next());
+                    ++pulled;
+                }
+                return pulled;
+            });
+    } else {
+        partitioner.run([&](auto emit) {
+            // Sequential drain of the input buffer (legacy path).
+            input.begin_iteration();
+            while (input.has_next()) {
+                emit(input.next());
+            }
+        });
+    }
 
     partition_paths_ = partitioner.collect_merged_partition_paths();
     return num_partitions_;

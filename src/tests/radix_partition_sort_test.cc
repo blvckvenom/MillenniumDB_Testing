@@ -487,3 +487,129 @@ TEST(RadixPartitionSort, DeltaVarintEmpty_EmitsSingleV2Page) {
     fs::remove(out_base + ".leaf");
     fs::remove(out_base + ".dir");
 }
+
+// ---------------------------------------------------------------------------
+// Spec #25 — Phase 1 parallel partition fill bit-equal vs sequential.
+// ---------------------------------------------------------------------------
+// Two runs of `scan_and_partition` + `sort_and_write` with identical inputs
+// MUST produce byte-identical `.leaf` outputs regardless of whether the
+// chunk-parallel Phase 1 path engaged or not. The parallel path is gated
+// by MDB_PROJECTION_RADIX_PHASE1_PARALLEL (default ON; "0" forces the
+// legacy single-thread drain). Phase 2 sorts each partition end-to-end
+// after concatenation, so even though the records WITHIN a per-thread
+// part_p.bin file may land in different orders depending on how many
+// TBB workers run, the final B+Tree leaves must converge.
+TEST(RadixPartitionSortPhase1, ParallelVsSequentialBitEqualLeafOutput) {
+    constexpr uint64_t kTypePrefix = 0x4200000000000000ULL;
+    auto make_oid = [&](uint64_t v) {
+        return kTypePrefix | (v & 0xFFFFFFFFULL);
+    };
+
+    auto run = [&](const char* seed_label, bool parallel_on) {
+        const std::string scratch =
+            std::string(kScratchBase) + "_phase1_" + seed_label;
+        const std::string output_base =
+            std::string("/tmp/radix_phase1_test_output_") + seed_label;
+        fs::remove_all(scratch);
+        fs::create_directories(scratch);
+        fs::remove(output_base + ".leaf");
+        fs::remove(output_base + ".dir");
+
+        if (parallel_on) {
+            unsetenv("MDB_PROJECTION_RADIX_PHASE1_PARALLEL");  // default ON
+        } else {
+            setenv("MDB_PROJECTION_RADIX_PHASE1_PARALLEL", "0", 1);
+        }
+        // Make sure Phase 2 GPU path doesn't add a confound: keep it OFF
+        // for this Phase 1-focused comparison.
+        setenv("MDB_PROJECTION_RADIX_GPU", "0", 1);
+
+        GQL::RadixPartitionSort<3>::Config cfg;
+        cfg.scratch_dir      = scratch;
+        cfg.min_partitions   = 8;
+        cfg.max_partitions   = 8;
+        cfg.num_scan_threads = 4;
+        GQL::RadixPartitionSort<3> rps(cfg);
+
+        GQL::StreamingRecordBuffer<3> input(scratch + "/input");
+        std::mt19937_64 rng(0xFEEDC0DE);  // fixed seed → deterministic input
+        // Need >= kParallelMinRecords (65 K) to engage the parallel path.
+        for (int i = 0; i < 100000; i++) {
+            Record<3> r{{ make_oid(rng()), make_oid(rng()), make_oid(rng()) }};
+            input.push_back(r);
+        }
+        rps.scan_and_partition(input, 100000);
+        std::size_t written = rps.sort_and_write(output_base);
+        EXPECT_GT(written, 0u);
+
+        std::ifstream in(output_base + ".leaf", std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+
+    const std::string seq_bytes = run("seq", /*parallel_on=*/false);
+    const std::string par_bytes = run("par", /*parallel_on=*/true);
+
+    ASSERT_EQ(seq_bytes.size(), par_bytes.size())
+        << "RADIX .leaf size differs between sequential and parallel Phase 1 paths";
+    EXPECT_EQ(seq_bytes, par_bytes)
+        << "RADIX .leaf bytes differ between sequential and parallel Phase 1 paths";
+
+    unsetenv("MDB_PROJECTION_RADIX_PHASE1_PARALLEL");
+    unsetenv("MDB_PROJECTION_RADIX_GPU");
+}
+
+// Determinism: two independent runs with the parallel Phase 1 path engaged
+// must produce byte-identical .leaf output despite TBB worker non-determinism
+// in record-within-partition ordering. Phase 2's full sort masks the
+// non-determinism end-to-end.
+TEST(RadixPartitionSortPhase1, ParallelDeterministicRepeatedRuns) {
+    constexpr uint64_t kTypePrefix = 0x4200000000000000ULL;
+    auto make_oid = [&](uint64_t v) {
+        return kTypePrefix | (v & 0xFFFFFFFFULL);
+    };
+
+    auto run = [&](int run_idx) {
+        const std::string scratch =
+            std::string(kScratchBase) + "_phase1_det_" + std::to_string(run_idx);
+        const std::string output_base =
+            std::string("/tmp/radix_phase1_det_output_") + std::to_string(run_idx);
+        fs::remove_all(scratch);
+        fs::create_directories(scratch);
+        fs::remove(output_base + ".leaf");
+        fs::remove(output_base + ".dir");
+
+        unsetenv("MDB_PROJECTION_RADIX_PHASE1_PARALLEL");  // default ON
+        setenv("MDB_PROJECTION_RADIX_GPU", "0", 1);
+
+        GQL::RadixPartitionSort<3>::Config cfg;
+        cfg.scratch_dir      = scratch;
+        cfg.min_partitions   = 8;
+        cfg.max_partitions   = 8;
+        cfg.num_scan_threads = 4;
+        GQL::RadixPartitionSort<3> rps(cfg);
+
+        GQL::StreamingRecordBuffer<3> input(scratch + "/input");
+        std::mt19937_64 rng(0xCAFEBABE);
+        for (int i = 0; i < 80000; i++) {
+            Record<3> r{{ make_oid(rng()), make_oid(rng()), make_oid(rng()) }};
+            input.push_back(r);
+        }
+        rps.scan_and_partition(input, 80000);
+        rps.sort_and_write(output_base);
+
+        std::ifstream in(output_base + ".leaf", std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+
+    const std::string a = run(1);
+    const std::string b = run(2);
+    ASSERT_EQ(a.size(), b.size());
+    EXPECT_EQ(a, b)
+        << "RADIX parallel Phase 1 path is non-deterministic across repeated runs";
+
+    unsetenv("MDB_PROJECTION_RADIX_GPU");
+}
