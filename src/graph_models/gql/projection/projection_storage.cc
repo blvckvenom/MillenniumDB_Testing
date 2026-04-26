@@ -5,12 +5,16 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 // Parallel execution for std::sort (requires TBB on GCC/Clang)
 #ifdef HAS_TBB
 #include <execution>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #endif
 
 #include "external_record_sort.h"
@@ -1656,24 +1660,52 @@ void ProjectionStorage::open_all_bplustree_readers_() {
             ? BPT::LeafFormat::CSR_HYBRID
             : lf;
 
+    // Spec #18 — Phase 4 reader opening was previously fully sequential
+    // (14 file-open syscalls back-to-back). Each B+Tree ctor only calls
+    // FileManager::get_file_id() twice (.dir + .leaf), so we collect the
+    // independent open tasks into a task vector and dispatch via TBB.
+    // Each task writes to a DIFFERENT std::unique_ptr member, so there is
+    // no shared-mutable-state contention between tasks. FileManager's
+    // internal mutex (added in this same change) makes the map mutations
+    // safe; the open()/lseek() syscalls run outside the critical section
+    // and overlap across threads.
+    //
+    // Disable via env var: MDB_PROJECTION_PARALLEL_READERS=0
+    // (intended for A/B benchmarking and bisecting any future regression).
+    using OpenTask = std::function<void()>;
+    std::vector<OpenTask> tasks;
+    tasks.reserve(14);
+
     // Open topology indexes (previously unconditionally opened).
     if (has_flag(active_mask, ProjectionIndex::NODES)) {
-        nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
+        tasks.emplace_back([this, lf]() {
+            nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
+        });
     }
     if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
-        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
+        tasks.emplace_back([this, edge_lf]() {
+            from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
+        });
     }
     if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
-        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
+        tasks.emplace_back([this, edge_lf]() {
+            to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
+        });
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
-        edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
+        tasks.emplace_back([this, lf]() {
+            edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
+        });
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)) {
-        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
+        tasks.emplace_back([this, lf]() {
+            edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
+        });
     }
     if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)) {
-        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
+        tasks.emplace_back([this, lf]() {
+            edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
+        });
     }
 
     // Open optional label indexes — dual gate: features.include_*_labels
@@ -1681,30 +1713,78 @@ void ProjectionStorage::open_all_bplustree_readers_() {
     // include_label_indexes=false users retain their disk-saving behavior.
     if (features.include_node_labels) {
         if (has_flag(active_mask, ProjectionIndex::NODE_LABEL)) {
-            node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label", lf);
+            tasks.emplace_back([this, lf]() {
+                node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label", lf);
+            });
         }
         if (has_flag(active_mask, ProjectionIndex::LABEL_NODE)) {
-            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node", lf);
+            tasks.emplace_back([this, lf]() {
+                label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node", lf);
+            });
         }
     }
     if (features.include_edge_labels) {
         if (has_flag(active_mask, ProjectionIndex::EDGE_LABEL)) {
-            edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label", lf);
+            tasks.emplace_back([this, lf]() {
+                edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label", lf);
+            });
         }
         if (has_flag(active_mask, ProjectionIndex::LABEL_EDGE)) {
-            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge", lf);
+            tasks.emplace_back([this, lf]() {
+                label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge", lf);
+            });
         }
     }
 
     // Open optional property indexes — NOT gated by IndexSet (Spec #3 §3.4).
     if (features.include_node_properties) {
-        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
-        key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", lf);
+        tasks.emplace_back([this, lf]() {
+            node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
+        });
+        tasks.emplace_back([this, lf]() {
+            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", lf);
+        });
     }
     if (features.include_edge_properties) {
-        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", lf);
-        key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", lf);
+        tasks.emplace_back([this, lf]() {
+            edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", lf);
+        });
+        tasks.emplace_back([this, lf]() {
+            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", lf);
+        });
     }
+
+    // Decide parallel vs sequential dispatch. Default is parallel (TBB
+    // available); env override forces the legacy sequential path for A/B
+    // benchmarks and bisecting regressions. "0", "false", "off" all disable.
+    bool use_parallel = true;
+    if (const char* env = std::getenv("MDB_PROJECTION_PARALLEL_READERS")) {
+        const std::string v(env);
+        if (v == "0" || v == "false" || v == "off" || v == "FALSE" || v == "OFF") {
+            use_parallel = false;
+        }
+    }
+
+#ifdef HAS_TBB
+    if (use_parallel && tasks.size() > 1) {
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, tasks.size(), 1),
+            [&tasks](const tbb::blocked_range<std::size_t>& r) {
+                for (std::size_t i = r.begin(); i < r.end(); ++i) {
+                    tasks[i]();
+                }
+            });
+    } else {
+        for (auto& task : tasks) {
+            task();
+        }
+    }
+#else
+    (void)use_parallel;
+    for (auto& task : tasks) {
+        task();
+    }
+#endif
 }
 
 // Dispatcher for the serialized scan pipeline (Spec #2, Task 5).

@@ -398,6 +398,105 @@ int main() {
         }
         std::cout << " OK" << std::endl;
 
+        // ================================================================
+        // Spec #18 — parallel reader-opening parity tests
+        // ================================================================
+        // Verify MDB_PROJECTION_PARALLEL_READERS=0 (sequential, legacy)
+        // and the default (parallel TBB) produce IDENTICAL reader sets.
+        // Each variant builds its own throwaway projection so file-id
+        // comparison is meaningful only at "non-null reader" granularity.
+
+        // Helper: build a tiny projection with all 4 optional feature
+        // flags ON, exercising all 14 reader-open call sites. Returns a
+        // bitmask describing which readers are non-null after flush().
+        auto build_and_count_readers = [&manager](const std::string& proj_name) -> uint16_t {
+            std::string pdir = manager.create_projection(proj_name);
+            GQL::ProjectionCatalog cat(pdir);
+            cat.projection_name = proj_name;
+            cat.save();
+
+            GQL::ProjectionStorage::Features feats;
+            feats.include_node_labels    = true;
+            feats.include_edge_labels    = true;
+            feats.include_node_properties = true;
+            feats.include_edge_properties = true;
+
+            GQL::ProjectionStorage s(pdir, "test_db_storage", proj_name, feats);
+            s.init();
+            // Two nodes + one edge so all topology buffers have content
+            // and build_all_indexes_bulk takes the real path. The 4
+            // optional buffers (label_*, property_*) need their own
+            // populating call for the indexes to be built non-empty —
+            // but the reader-open path opens them regardless of content,
+            // which is the contract we are validating.
+            GQL::ProjectedNode n1; n1.node_id = ObjectId(1); s.add_node(n1);
+            GQL::ProjectedNode n2; n2.node_id = ObjectId(2); s.add_node(n2);
+            GQL::ProjectedEdge e1;
+            e1.from_node = ObjectId(1);
+            e1.to_node   = ObjectId(2);
+            e1.edge_id   = ObjectId(100);
+            e1.is_directed = true;
+            s.add_edge(e1);
+            s.flush();
+
+            uint16_t mask = 0;
+            // Topology (6) — always non-null under default IndexSet::ALL.
+            if (s.get_nodes_index())          mask |= (1u << 0);
+            if (s.get_from_to_edge_index())   mask |= (1u << 1);
+            if (s.get_to_from_edge_index())   mask |= (1u << 2);
+            if (s.get_edge_direction_index()) mask |= (1u << 3);
+            if (s.get_edge_from_to_index())   mask |= (1u << 4);
+            if (s.get_edge_n1_n2_index())     mask |= (1u << 5);
+            // Labels (4) — gated by features.include_*_labels (true here).
+            if (s.get_node_label_index())     mask |= (1u << 6);
+            if (s.get_label_node_index())     mask |= (1u << 7);
+            if (s.get_edge_label_index())     mask |= (1u << 8);
+            if (s.get_label_edge_index())     mask |= (1u << 9);
+            // Properties (4) — gated by features.include_*_properties.
+            if (s.get_node_key_value_index()) mask |= (1u << 10);
+            if (s.get_key_value_node_index()) mask |= (1u << 11);
+            if (s.get_edge_key_value_index()) mask |= (1u << 12);
+            if (s.get_key_value_edge_index()) mask |= (1u << 13);
+            return mask;
+        };
+
+        // Test 20: sequential path (env var = "0")
+        std::cout << "Test 20: Phase 4 reader open — sequential path"
+                     " (MDB_PROJECTION_PARALLEL_READERS=0)...";
+        ::setenv("MDB_PROJECTION_PARALLEL_READERS", "0", /*overwrite=*/1);
+        uint16_t seq_mask = build_and_count_readers("test_proj_seq");
+        ::unsetenv("MDB_PROJECTION_PARALLEL_READERS");
+        const uint16_t expected_mask = 0x3FFFu;  // 14 low bits set
+        if (seq_mask != expected_mask) {
+            std::cerr << "\nFAIL Test 20: expected reader mask 0x" << std::hex
+                      << expected_mask << " got 0x" << seq_mask << std::dec << std::endl;
+            return 1;
+        }
+        std::cout << " OK (mask=0x" << std::hex << seq_mask << std::dec << ")" << std::endl;
+
+        // Test 21: parallel path (env var unset → default)
+        std::cout << "Test 21: Phase 4 reader open — parallel path (default)...";
+        uint16_t par_mask = build_and_count_readers("test_proj_par");
+        if (par_mask != expected_mask) {
+            std::cerr << "\nFAIL Test 21: expected reader mask 0x" << std::hex
+                      << expected_mask << " got 0x" << par_mask << std::dec << std::endl;
+            return 1;
+        }
+        std::cout << " OK (mask=0x" << std::hex << par_mask << std::dec << ")" << std::endl;
+
+        // Test 22: parity — both paths produced the same reader set.
+        std::cout << "Test 22: Parallel == Sequential reader-set parity...";
+        if (seq_mask != par_mask) {
+            std::cerr << "\nFAIL Test 22: parity broken (seq=0x" << std::hex
+                      << seq_mask << " par=0x" << par_mask << std::dec << ")" << std::endl;
+            return 1;
+        }
+        std::cout << " OK" << std::endl;
+
+        // Cleanup
+        manager.drop_projection("test_proj_seq");
+        manager.drop_projection("test_proj_par");
+
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";
         auto projections = manager.list_projections();
