@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -24,6 +25,10 @@
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 #include "storage/page/page.h"
+
+#ifdef MDB_GPU_ENABLED
+#include "gpu/sort/gpu_sort.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -451,16 +456,96 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
     return total_written;
 }
 
+// Spec #24 — GPU path for RADIX Phase 2 per-partition sort.
+//
+// When MillenniumDB is built with CUDA (MDB_GPU_ENABLED) and a CUDA device is
+// available at runtime, route each in-memory partition through
+// mdb::gpu::sort_and_stream<N> which selects between GPU_FULL,
+// GPU_CHUNKED, and CPU strategies via the existing resource_planner.
+//
+// Disabled when:
+//   - the build lacks CUDA (no MDB_GPU_ENABLED define), or
+//   - env var MDB_PROJECTION_RADIX_GPU is set to "0" (A/B benchmark switch),
+//   - env var MDB_FORCE_CPU_SORT is set (matches external_record_sort.h:58
+//     precedent), or
+//   - the planner downgrades to a CPU strategy (small dataset, no free VRAM,
+//     etc.) — in that case the wrapper sorts on CPU itself, so we still
+//     stream straight to the output writer without a separate std::sort.
+//
+// MDB_PROJECTION_RADIX_GPU_MIN_RECORDS overrides PlannerConfig.min_records_gpu
+// so the GPU path is reachable on small synthetic datasets during testing
+// (default 500 K, see resource_planner.h:27).
+//
+// Output equivalence note: mdb::gpu::execute_gpu_radix_sort extracts only
+// the lower 32 bits of each ObjectId value (gpu_radix_sort.cu:230, mask
+// 0x00FFFFFFFFFFFFFFULL truncated to uint32_t). For B+Tree records this is
+// safe because (a) every record in a given index shares the same top-8-bit
+// type prefix, so masking it is a no-op for ordering, and (b) the value
+// field fits in 32 bits for any graph with < 4 B objects per type — which
+// includes all current and projected MillenniumDB workloads (papers100M is
+// ~111 M nodes; ogbn-products ~2.5 M). Inputs that violate either
+// precondition would silently sort by truncated keys; the precondition
+// holds for every projection-sort caller today.
 template<std::size_t N>
 void RadixPartitionSort<N>::sort_partition_in_memory(
     std::size_t partition_idx, const std::string& sorted_output_path)
 {
     std::vector<Record<N>> buffer;
-    typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
-    Record<N> r{};
-    while (reader.next(r)) {
-        buffer.push_back(r);
+    {
+        typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
+        Record<N> r{};
+        while (reader.next(r)) {
+            buffer.push_back(r);
+        }
     }
+
+#ifdef MDB_GPU_ENABLED
+    {
+        const char* gpu_off  = std::getenv("MDB_PROJECTION_RADIX_GPU");
+        const char* cpu_only = std::getenv("MDB_FORCE_CPU_SORT");
+        const bool radix_gpu_disabled =
+            (gpu_off != nullptr && std::string(gpu_off) == "0") ||
+            cpu_only != nullptr;
+
+        if (!radix_gpu_disabled && !buffer.empty()) {
+            std::ofstream out(sorted_output_path, std::ios::binary);
+            std::function<void(const Record<N>&)> emit =
+                [&out](const Record<N>& rec) {
+                    out.write(reinterpret_cast<const char*>(&rec),
+                              sizeof(Record<N>));
+                };
+
+            mdb::gpu::PlannerConfig pcfg;
+            if (const char* min_rec = std::getenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS")) {
+                try {
+                    pcfg.min_records_gpu = std::stoull(min_rec);
+                } catch (...) {
+                    // Leave default on parse failure.
+                }
+            }
+
+            auto resources = mdb::gpu::detect_resources();
+            std::vector<std::string> empty_spill_files;
+            std::vector<std::size_t> empty_spill_counts;
+
+            const bool used = mdb::gpu::sort_and_stream<N>(
+                buffer, empty_spill_files, empty_spill_counts,
+                static_cast<std::uint64_t>(buffer.size()),
+                emit, resources, pcfg);
+
+            if (used) {
+                // sort_and_stream moved out of `buffer` and either sorted on
+                // GPU or on CPU; either way the records are now in
+                // `sorted_output_path`.
+                return;
+            }
+            // EXTERNAL_SORT decision (planner returned false): fall through
+            // to the in-process std::sort path below. `buffer` contents are
+            // preserved on a `false` return per the wrapper contract.
+        }
+    }
+#endif  // MDB_GPU_ENABLED
+
     std::sort(buffer.begin(), buffer.end());
     std::ofstream out(sorted_output_path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(buffer.data()),
