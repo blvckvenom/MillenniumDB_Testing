@@ -1674,6 +1674,50 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# FourLevelTopologyStore warm-start activation tests (Spec #13 Phase 5)
+# ============================================================================
+# Exercises the round-trip between gnn_offline_sample's `node_counts.bin`
+# writer and the TopologyFrequencyProfiler reader, plus the activation
+# of FourLevelTopologyStore::compute_l3_minhash_reorder_'s warm-start
+# branch. Cold-start path remains the default and is preserved.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_warm_start_test.cc")
+    add_executable(four_level_topology_warm_start_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_warm_start_test.cc
+    )
+    set_target_properties(four_level_topology_warm_start_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_warm_start_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyWarmStartTests
+        COMMAND $<TARGET_FILE:four_level_topology_warm_start_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyWarmStartTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
 # Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
 # ============================================================================
 # Complements T4.7 (single-layer sample_neighbors determinism). Exercises

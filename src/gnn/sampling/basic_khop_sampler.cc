@@ -26,6 +26,31 @@ struct BasicKHopSampler::Impl {
     std::mt19937_64 rng;
     bool use_leapfrog = true;  ///< Enable batch optimization by default
 
+    // Spec #13 Phase 5 (T13.2 writer half) — per-node access tally.
+    // Indexed by dense row_idx == ObjectId::get_value(). The vector is
+    // sized lazily on first access so test doubles / synthetic graphs
+    // that never query topology->get_node_count() avoid the alloc.
+    std::vector<uint64_t> node_access_counts;
+
+    // Increment the access count for `id`, growing the vector on demand.
+    // The 8-bit ObjectId type tag is masked off here at the boundary —
+    // the same convention the FourLevelTopologyStore uses to align with
+    // `tier_lookup_` and the Spec #4-B sidecar's dense ROW_PTR layout
+    // (commit 2bfad825 fixed the same class of bug for row_lookup_).
+    inline void tally_(ObjectId id) {
+        const uint64_t row_idx = id.get_value();
+        if (row_idx >= node_access_counts.size()) {
+            // Lazy growth — start at the projection's node count when we
+            // can (the typical path; skips amortised reallocs on the
+            // hot loop), fall back to plain push-out resize for the
+            // rare case where the topology accessor isn't ready yet.
+            uint64_t target = static_cast<uint64_t>(topology->get_node_count());
+            if (target <= row_idx) target = row_idx + 1;
+            node_access_counts.resize(static_cast<std::size_t>(target), 0);
+        }
+        node_access_counts[static_cast<std::size_t>(row_idx)]++;
+    }
+
     Impl(GQL::ProjectionStorage& storage_, const SamplingConfig& config_)
         : storage(storage_)
         , config(config_)
@@ -145,10 +170,6 @@ struct BasicKHopSampler::Impl {
         ObjectId node_id,
         uint64_t fanout
     ) {
-        // TODO Spec #13 Phase 2: tally per-node access here and persist a
-        // `node_counts.bin` next to the sample artifacts. Consumed by
-        // TopologyFrequencyProfiler::compute_from_node_counts_ to seed
-        // the Four-Level Topology Store warm-start path.
         Neighbors all_neighbors =
             topology->get_neighbors(node_id, config.orientation);
 
@@ -167,6 +188,11 @@ struct BasicKHopSampler::Impl {
             // Take all neighbors
             for (size_t i = 0; i < n; ++i) {
                 result.emplace_back(all_neighbors.node_ids[i], all_neighbors.edge_ids[i]);
+                // Spec #13 Phase 5 — count each visited neighbour. This
+                // matches DiskGNN's `node_counts[v] += 1` in
+                // mega_batch_sampling.py:50: a node's "frequency" is
+                // its visit count across the sampling run.
+                tally_(all_neighbors.node_ids[i]);
             }
         } else {
             // Fisher-Yates partial shuffle: sample k elements from n
@@ -183,6 +209,10 @@ struct BasicKHopSampler::Impl {
             for (size_t i = 0; i < k; ++i) {
                 size_t idx = indices[i];
                 result.emplace_back(all_neighbors.node_ids[idx], all_neighbors.edge_ids[idx]);
+                // Spec #13 Phase 5 — count each sampled neighbour
+                // (only the k actually visited ones, mirroring the
+                // PER_NODE strategy below).
+                tally_(all_neighbors.node_ids[idx]);
             }
         }
 
@@ -265,6 +295,16 @@ struct BasicKHopSampler::Impl {
         // Get total edge count for strategy selection
         uint64_t total_edges = topology->get_edge_count();
 
+        // Spec #13 Phase 5 — tally the seed nodes themselves. They are
+        // touched by every sample (their adjacency drives the layer-0
+        // expansion), so they belong in the access-count vector even
+        // though `sample_neighbors_uniform` only counts the neighbours
+        // it returns. Done before the layer loop so the seed counts
+        // are deterministic w.r.t. the per-layer paths chosen.
+        for (const ObjectId& seed_id : seeds) {
+            tally_(seed_id);
+        }
+
         // Sample layer by layer
         for (size_t k = 0; k < K; ++k) {
             uint64_t layer_fanout = config.fanouts[k];
@@ -318,6 +358,16 @@ struct BasicKHopSampler::Impl {
 
                     for (const auto& [neighbor_node, edge_id] : it->second) {
                         next_layer_set.insert(neighbor_node.id);
+                        // Spec #13 Phase 5 — tally each neighbor visited
+                        // by SWEEP / SEEK strategies (PER_NODE already
+                        // tallied inside sample_neighbors_uniform). Same
+                        // semantic for all three strategies: count once
+                        // per visit during this sampling run.
+                        if (strategy == BatchStrategy::SWEEP ||
+                            strategy == BatchStrategy::SEEK)
+                        {
+                            tally_(neighbor_node);
+                        }
                     }
                 }
             }
@@ -391,6 +441,10 @@ void BasicKHopSampler::set_use_leapfrog(bool enable) {
 
 bool BasicKHopSampler::get_use_leapfrog() const {
     return impl_->use_leapfrog;
+}
+
+const std::vector<uint64_t>& BasicKHopSampler::node_access_counts() const {
+    return impl_->node_access_counts;
 }
 
 } // namespace mdb::gnn

@@ -3,12 +3,27 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <numeric>
 #include <utility>
 #include <vector>
 
 namespace mdb::gnn {
+
+namespace {
+
+// 8-byte magic for `node_counts.bin`. Version 0; little-endian only (the
+// project targets x86-64 and the format mirrors the host byte order at
+// write time, mirroring the GnnMeta convention in src/gnn/projection/
+// gnn_meta.h which also writes uint64s native and assumes little-endian).
+constexpr uint8_t  kNodeCountsMagic[8] = {'N','O','D','E','C','N','T','0'};
+constexpr std::size_t kNodeCountsHeaderBytes = 8 /*magic*/ + 8 /*num_nodes*/
+                                             + 8 /*direction_bitmask*/;
+
+}  // namespace
 
 namespace {
 
@@ -42,12 +57,102 @@ void TopologyFrequencyProfiler::compute(EdgeOrientation direction) {
     compute_from_degrees_(direction);
 }
 
-bool TopologyFrequencyProfiler::compute_from_node_counts_(EdgeOrientation /*direction*/) {
-    // TODO Spec #13 Phase 2: implement node_counts.bin reader once
-    // gnn_offline_sample writer lands. `projection_dir_` is the lookup
-    // root for the persisted counts file; it is stored on the profiler
-    // for the future reader to consume.
-    return false;
+bool TopologyFrequencyProfiler::compute_from_node_counts_(EdgeOrientation direction) {
+    // Spec #13 Phase 5 (T13.2 reader half) — read `<projection_dir>/
+    // node_counts.bin` if present. Format:
+    //
+    //   [8B magic "NODECNT0"]
+    //   [uint64_t num_nodes]
+    //   [uint64_t direction_bitmask]   (1=NATURAL, 2=REVERSE, 3=UNDIRECTED)
+    //   [num_nodes × uint64_t counts]
+    //
+    // All multibyte fields are written in host byte order (little-endian
+    // on x86-64; the project target). The reader is fail-safe: any I/O
+    // or validation error returns false so the caller falls back to the
+    // degree-proxy cold path. Logging is suppressed for the cold case
+    // (file absent) since that is the expected first-run path; warnings
+    // are emitted for malformed / stale files only.
+    if (projection_dir_.empty()) return false;
+    std::filesystem::path path = projection_dir_ / "node_counts.bin";
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return false;  // expected on first run — cold start.
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "[TopologyFrequencyProfiler] WARNING: cannot open "
+                  << path.string() << " for warm-start read; falling "
+                  << "back to degree proxy.\n";
+        return false;
+    }
+
+    uint8_t magic[8] = {};
+    if (!f.read(reinterpret_cast<char*>(magic), 8) ||
+        std::memcmp(magic, kNodeCountsMagic, 8) != 0)
+    {
+        std::cerr << "[TopologyFrequencyProfiler] WARNING: "
+                  << path.string() << " has invalid magic; ignoring "
+                  << "(treating as cold start).\n";
+        return false;
+    }
+
+    uint64_t num_nodes = 0;
+    uint64_t direction_bitmask = 0;
+    if (!f.read(reinterpret_cast<char*>(&num_nodes),         sizeof(num_nodes)) ||
+        !f.read(reinterpret_cast<char*>(&direction_bitmask), sizeof(direction_bitmask)))
+    {
+        std::cerr << "[TopologyFrequencyProfiler] WARNING: truncated "
+                  << "header in " << path.string()
+                  << "; treating as cold start.\n";
+        return false;
+    }
+
+    const uint64_t expected_n = topo_.get_node_count();
+    if (num_nodes != expected_n) {
+        std::cerr << "[TopologyFrequencyProfiler] WARNING: "
+                  << path.string() << " num_nodes=" << num_nodes
+                  << " mismatches projection num_nodes="
+                  << expected_n << " (stale file from a previous "
+                  << "projection?); treating as cold start.\n";
+        return false;
+    }
+
+    // direction_bitmask is informational. Counts gathered under any
+    // direction (typically UNDIRECTED, the bitmask=3 case) work as a
+    // popularity proxy for any subsequent profiler direction request:
+    // a node frequently visited by sampling is a good L1/L2 candidate
+    // regardless of which direction the future build will populate. Log
+    // a one-line note when the bitmask doesn't include the requested
+    // direction, but proceed.
+    uint64_t requested = 0;
+    switch (direction) {
+        case EdgeOrientation::NATURAL:    requested = 1; break;
+        case EdgeOrientation::REVERSE:    requested = 2; break;
+        case EdgeOrientation::UNDIRECTED: requested = 3; break;
+    }
+    if ((direction_bitmask & requested) != requested) {
+        std::cerr << "[TopologyFrequencyProfiler] note: "
+                  << path.string() << " direction_bitmask="
+                  << direction_bitmask << " does not include requested "
+                  << "direction=" << requested << "; using counts "
+                  << "anyway (popularity is direction-agnostic).\n";
+    }
+
+    frequency_.assign(static_cast<std::size_t>(num_nodes), 0);
+    if (num_nodes > 0) {
+        if (!f.read(reinterpret_cast<char*>(frequency_.data()),
+                    static_cast<std::streamsize>(num_nodes * sizeof(uint64_t))))
+        {
+            std::cerr << "[TopologyFrequencyProfiler] WARNING: truncated "
+                      << "counts payload in " << path.string()
+                      << "; treating as cold start.\n";
+            frequency_.clear();
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void TopologyFrequencyProfiler::compute_from_degrees_(EdgeOrientation direction) {

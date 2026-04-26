@@ -1,8 +1,17 @@
 #include "gnn/sampling/offline_sampling_engine.h"
 
+#include <fcntl.h>     // open
+#include <unistd.h>    // fsync, close
+
+#include <cerrno>
 #include <chrono>
+#include <cstdio>      // rename
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <stdexcept>
+#include <system_error>
 
 #include "gnn/projection/gnn_meta.h"
 #include "gnn/sampling/basic_khop_sampler.h"
@@ -13,6 +22,116 @@
 #include "graph_models/gql/projection/projection_storage.h"
 
 namespace mdb::gnn {
+
+namespace {
+
+// Spec #13 Phase 5 — `node_counts.bin` writer.
+//
+// Format (mirrors TopologyFrequencyProfiler::compute_from_node_counts_):
+//   [8B magic "NODECNT0"]
+//   [uint64_t num_nodes]
+//   [uint64_t direction_bitmask]   (1=NATURAL, 2=REVERSE, 3=UNDIRECTED)
+//   [num_nodes × uint64_t counts]
+//
+// Atomic write: temp file → fsync → rename → fsync(parent dir).
+// Mirrors src/gnn/output/model_checkpoint.cc::save_full's idiom so a
+// process crash mid-write never leaves a corrupted node_counts.bin.
+constexpr uint8_t kNodeCountsMagic[8] = {'N','O','D','E','C','N','T','0'};
+
+void fsync_directory_(const std::filesystem::path& dir) {
+    int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "[OfflineSamplingEngine] WARNING: cannot open dir for "
+                  << "fsync " << dir.string() << " (errno=" << errno
+                  << "); node_counts.bin may not be durable.\n";
+        return;
+    }
+    if (::fsync(fd) != 0) {
+        std::cerr << "[OfflineSamplingEngine] WARNING: fsync(dir) failed "
+                  << "for " << dir.string() << " (errno=" << errno
+                  << ").\n";
+    }
+    ::close(fd);
+}
+
+void persist_node_counts_(
+    const std::filesystem::path&        projection_dir,
+    const std::vector<uint64_t>&        counts,
+    EdgeOrientation                     orientation)
+{
+    if (projection_dir.empty()) return;
+    if (counts.empty()) {
+        // No tally accumulated (sample_neighbors_uniform was never
+        // entered — degenerate run). Nothing to persist.
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(projection_dir, ec);
+    auto target = projection_dir / "node_counts.bin";
+    auto tmp    = projection_dir / "node_counts.bin.tmp";
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            std::cerr << "[OfflineSamplingEngine] WARNING: cannot open "
+                      << tmp.string() << " for write (errno="
+                      << errno << "); node_counts.bin not persisted.\n";
+            return;
+        }
+
+        const uint64_t num_nodes = static_cast<uint64_t>(counts.size());
+        uint64_t direction_bitmask = 0;
+        switch (orientation) {
+            case EdgeOrientation::NATURAL:    direction_bitmask = 1; break;
+            case EdgeOrientation::REVERSE:    direction_bitmask = 2; break;
+            case EdgeOrientation::UNDIRECTED: direction_bitmask = 3; break;
+        }
+
+        f.write(reinterpret_cast<const char*>(kNodeCountsMagic), 8);
+        f.write(reinterpret_cast<const char*>(&num_nodes),         sizeof(num_nodes));
+        f.write(reinterpret_cast<const char*>(&direction_bitmask), sizeof(direction_bitmask));
+        f.write(reinterpret_cast<const char*>(counts.data()),
+                static_cast<std::streamsize>(num_nodes * sizeof(uint64_t)));
+        if (!f) {
+            std::cerr << "[OfflineSamplingEngine] WARNING: I/O error "
+                      << "writing " << tmp.string()
+                      << "; node_counts.bin not persisted.\n";
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+        f.flush();
+        // Best-effort fsync of the temp file before rename. ofstream's
+        // underlying FILE* doesn't expose its fd portably, so we close
+        // here (RAII) and trust the OS — the directory fsync below
+        // commits the rename, which is the durability contract that
+        // matters for this restart-correctness use case.
+    }
+
+    if (std::rename(tmp.c_str(), target.c_str()) != 0) {
+        std::cerr << "[OfflineSamplingEngine] WARNING: rename "
+                  << tmp.string() << " -> " << target.string()
+                  << " failed (errno=" << errno
+                  << "); node_counts.bin not persisted.\n";
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    fsync_directory_(projection_dir);
+
+    uint64_t logged_bitmask = 0;
+    switch (orientation) {
+        case EdgeOrientation::NATURAL:    logged_bitmask = 1; break;
+        case EdgeOrientation::REVERSE:    logged_bitmask = 2; break;
+        case EdgeOrientation::UNDIRECTED: logged_bitmask = 3; break;
+    }
+    std::cerr << "[OfflineSamplingEngine] Persisted "
+              << target.string() << " (" << counts.size()
+              << " nodes, direction_bitmask=" << logged_bitmask
+              << "). Next gnn_offline_sample run will warm-start the "
+              << "Four-Level Topology Store.\n";
+}
+
+}  // namespace
 
 // =============================================================================
 // Implementation
@@ -213,6 +332,24 @@ struct OfflineSamplingEngine::Impl {
 
             // Finalize storage
             sample_storage.finalize();
+
+            // Spec #13 Phase 5 (T13.2 writer half) — persist
+            // `<projection_dir>/node_counts.bin` so the next
+            // `gnn_offline_sample` run can warm-start the
+            // Four-Level Topology Store. Guarded by
+            // `useFourLevelTopologyStore`: when the user opted out of
+            // the tiered cache there is no consumer for the file, so
+            // skip the I/O. Failures inside `persist_node_counts_` log
+            // to stderr but never throw — the sample itself already
+            // succeeded; persistence is an optimization for future
+            // runs.
+            if (config.use_four_level_topology_store) {
+                auto proj_dir =
+                    std::filesystem::path(storage.get_projection_dir());
+                persist_node_counts_(proj_dir,
+                                     khop_sampler->node_access_counts(),
+                                     config.orientation);
+            }
 
             // Calculate final timing
             auto end_time = std::chrono::steady_clock::now();

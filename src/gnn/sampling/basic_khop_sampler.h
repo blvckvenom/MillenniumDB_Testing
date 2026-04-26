@@ -151,6 +151,26 @@ public:
      */
     bool get_use_leapfrog() const;
 
+    // =========================================================================
+    // Spec #13 Phase 5 — node access count tally (warm-start producer)
+    // =========================================================================
+
+    /**
+     * @brief Per-node access counts accumulated across every `sample()` call
+     *        on this instance. Indexed by dense `row_idx == ObjectId::get_value()`.
+     *
+     * Each entry tallies the number of times the node was accessed during
+     * sampling — incremented once per visit as either a seed or a sampled
+     * neighbor. The vector is empty until the first `sample()` call; it
+     * grows up to the projection's node count on first access.
+     *
+     * Consumed by `OfflineSamplingEngine` to persist
+     * `<projection_dir>/node_counts.bin`, which seeds
+     * `TopologyFrequencyProfiler::compute_from_node_counts_` on the next
+     * `gnn_offline_sample` run (warm start).
+     */
+    const std::vector<uint64_t>& node_access_counts() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
