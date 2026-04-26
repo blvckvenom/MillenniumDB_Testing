@@ -558,6 +558,24 @@ public:
      * O(N) linear scan.
      */
     void finalize_node_scan();
+
+    /**
+     * @brief Read-only access to the sorted, dedup'd in-memory node set.
+     *
+     * After `finalize_node_scan()`, the returned vector is sorted by
+     * value and contains each ObjectId.id at most once. Used by
+     * `EdgeKeepBitmapGpuBatcher` (Spec #27) to upload a single sorted
+     * array to the GPU for parallel binary-search membership testing,
+     * mirroring exactly the data structure that `has_node()` walks on
+     * the CPU path.
+     *
+     * Pre-`finalize_node_scan()` the vector is unsorted with possible
+     * duplicates — callers needing the sorted invariant must finalize
+     * first (Spec #2 invariant I1).
+     */
+    const std::vector<uint64_t>& collected_nodes() const noexcept {
+        return collected_nodes_;
+    }
     /// @}
 
     /// @name Const Index Accessors

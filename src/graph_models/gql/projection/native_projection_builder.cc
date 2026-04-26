@@ -18,6 +18,7 @@
 
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/projection/edge_filter.h"
+#include "graph_models/gql/projection/edge_keep_bitmap_gpu.h"
 #include "graph_models/gql/projection/external_edge_sort.h"
 #include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_scanner.h"
@@ -1939,28 +1940,34 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
     // that survive the has_node() filter. No batch emission, no aggregation,
     // no property extraction: this phase is purely a filter pre-computation.
     //
+    // Spec #27 (2026-04-26): the per-edge has_node()×2 work is GPU-friendly
+    // (parallel binary search over the sorted collected_nodes_ array), so
+    // we now route edges through EdgeKeepBitmapGpuBatcher, which buffers
+    // (edge_id, from, to) triples and dispatches them either to
+    // mdb::gpu::edge_keep_membership_gpu (sister to the bitset filter in
+    // src/gpu/ops/gpu_filter.cu) or to a CPU fallback that is bit-identical
+    // to the historic inline lambda. Set MDB_PROJECTION_BITMAP_GPU=0 to
+    // force the CPU path for A/B benchmarking. Tiny graphs (cora_gnn) are
+    // never sent to the GPU regardless: the batcher's min_edges_for_gpu
+    // threshold dominates the heuristic.
+    //
     // NOTE: ParallelEdgeDetector is NOT run here.  A detector that is never
     // cleared grows to hold ALL kept edges (~138 bytes per entry), which
     // caused 25 GB RSS on papers100M (Run 7 PSI-abort).  Detection instead
     // runs in scan_edges_impl_serialized_ on the first Phase C pass
     // (FROM_TO_EDGE), mirroring the per-batch clear() pattern of the classic
     // path (scan_edges_impl_classic_, line 723).
+    EdgeKeepBitmapGpuBatcher batcher(*filter, *storage);
     for (const auto& type : types) {
         ObjectId type_id = type_id_map[type];
         scanner->scan_label_edge_with_endpoints(
             type_id,
-            [this, &filter](
-                ObjectId edge_id, ObjectId from_node, ObjectId to_node)
+            [&batcher](ObjectId edge_id, ObjectId from_node, ObjectId to_node)
             {
-                const bool has_from = storage->has_node(from_node);
-                const bool has_to   = storage->has_node(to_node);
-                if (has_from && has_to) {
-                    // Pass the FULL ObjectId; EdgeFilter routes by the
-                    // top-byte type tag and keys by the 56-bit counter.
-                    filter->set_kept(edge_id);
-                }
+                batcher.add(edge_id, from_node, to_node);
             });
     }
+    batcher.flush();
 
     filter->finalize();
     return filter;

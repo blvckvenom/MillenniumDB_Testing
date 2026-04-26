@@ -45,6 +45,7 @@ if(CUDAToolkit_FOUND)
     target_sources(mdb_gpu PRIVATE
         sort/gpu_radix_sort.cu
         ops/gpu_filter.cu
+        ops/gpu_membership.cu
         ops/gpu_transform.cu
         tests/benchmark_gpu_kernels.cu
     )
