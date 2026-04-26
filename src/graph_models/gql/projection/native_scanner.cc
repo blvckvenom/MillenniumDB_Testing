@@ -431,11 +431,9 @@ static bool resolve_edge_endpoints(
 // successful (edge_id, from, to) triples into `sink`. Used by both the
 // sequential path and each parallel worker — endpoint lookups are pure
 // reads on the secondary B+Tree, so they are safe to issue concurrently.
-struct EdgeEndpointTriple {
-    ObjectId edge_id;
-    ObjectId from_node;
-    ObjectId to_node;
-};
+//
+// EdgeEndpointTriple was promoted to native_scanner.h (Spec #17) so the
+// new partitioned entry point can return per-partition vectors directly.
 
 static uint64_t scan_label_edge_with_endpoints_subrange(
     BPlusTree<2>* label_edge_index,
@@ -586,6 +584,80 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
 #else
     // Unreachable (parallel_enabled forced false above when !HAS_TBB).
     return 0;
+#endif
+}
+
+// Spec #17: parallel scan that returns the per-partition vectors directly
+// (no serial replay). The caller is responsible for combining them, which
+// allows downstream parallel consumers — specifically per-thread
+// ParallelEdgeDetector instances in NativeProjectionBuilder — to process
+// each partition's triples in parallel and merge afterwards.
+//
+// Layout/strategy/env-var contract is identical to
+// scan_label_edge_with_endpoints; the only difference is who walks the
+// per-partition vectors after Phase 1 (here: the caller, with worker-side
+// aggregation; in scan_label_edge_with_endpoints: the parent thread, with
+// a single shared callback).
+std::vector<std::vector<EdgeEndpointTriple>>
+NativeScanner::scan_label_edge_with_endpoints_partitioned(ObjectId type_id) {
+    const uint64_t search_type_id = type_id.id;
+
+    bool parallel_enabled = resolve_parallel_edge_scan_enabled();
+    std::size_t num_partitions = resolve_edge_scan_partitions();
+
+#ifndef HAS_TBB
+    parallel_enabled = false;
+#endif
+
+    if (!parallel_enabled || num_partitions < 2) {
+        // Single-partition fallback: caller still receives the
+        // outer-vector contract, just with one inner vector. The
+        // builder's parallel-aggregation guard checks num_partitions
+        // and falls back to the legacy single-detector path in that
+        // case, so this branch is mainly for symmetry / safety.
+        std::vector<std::vector<EdgeEndpointTriple>> result(1);
+        result[0].reserve(64);
+        scan_label_edge_with_endpoints_subrange(
+            label_edge_index,
+            edge_from_to_index, from_to_edge_index,
+            edge_n1_n2_index,   n1_n2_edge_index,
+            search_type_id,
+            /*lo_edge=*/0, /*hi_edge=*/UINT64_MAX,
+            result[0]);
+        return result;
+    }
+
+#ifdef HAS_TBB
+    QueryContext* parent_ctx = QueryContext::_query_ctx;
+
+    auto ranges = build_uniform_subranges(num_partitions);
+
+    std::vector<std::vector<EdgeEndpointTriple>> per_partition(num_partitions);
+    for (auto& vec : per_partition) {
+        vec.reserve(64);
+    }
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, num_partitions, 1),
+        [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
+            if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
+                QueryContext::set_query_ctx(parent_ctx);
+            }
+            for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                scan_label_edge_with_endpoints_subrange(
+                    label_edge_index,
+                    edge_from_to_index, from_to_edge_index,
+                    edge_n1_n2_index,   n1_n2_edge_index,
+                    search_type_id,
+                    ranges[p].first, ranges[p].second,
+                    per_partition[p]);
+            }
+        });
+
+    return per_partition;
+#else
+    // Unreachable (parallel_enabled forced false above when !HAS_TBB).
+    return {};
 #endif
 }
 

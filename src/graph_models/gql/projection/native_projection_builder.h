@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "graph_models/gql/projection/edge_aggregation_record.h"
+#include "graph_models/gql/projection/native_scanner.h"   // EdgeEndpointTriple (Spec #17)
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 #include "query/procedure/builtin/project_procedure.h"  // For Orientation enum
@@ -224,6 +226,40 @@ public:
      */
     double get_aggregated_value() const;
 
+    /**
+     * @brief Returns true if no edge has been processed yet.
+     */
+    bool empty() const { return count_ == 0; }
+
+    /**
+     * @brief Combines another partial aggregator into this one (Spec #17).
+     *
+     * Used by ParallelEdgeDetector::merge_from when two per-thread
+     * detectors observed the same (from, to, type) key in different
+     * partitions. Both inputs are partial views over a key's full
+     * occurrence sequence; the merged result is the value the
+     * legacy single-shared-detector path would have produced.
+     *
+     * Strategy semantics:
+     *   COUNT  — counts add (count_global = count_a + count_b)
+     *   SUM    — sums add (sum_global = sum_a + sum_b); has_value_
+     *            propagates by OR
+     *   MIN    — keep the lower value; if `other` wins, take its
+     *            representative_edge_id_
+     *   MAX    — keep the higher value; if `other` wins, take its
+     *            representative_edge_id_
+     *   SINGLE — combined count >= 2 means a duplicate was observed
+     *            across partitions; caller must throw the same
+     *            QueryException as the inline single-thread path.
+     *
+     * `first_edge_id_` is taken from whichever side has the lower
+     * partition index in scan order — the caller (ParallelEdgeDetector
+     * merge loop) walks partitions in ascending order and merges this
+     * (which already holds the earlier-partition state) with `other`
+     * (later partition), so we keep `first_edge_id_` as-is.
+     */
+    void merge_from(const EdgeAggregator& other);
+
 private:
     Aggregation strategy_;
     uint64_t count_;
@@ -309,6 +345,58 @@ public:
         }
 
         return result;
+    }
+
+    /**
+     * @brief Spec #17: combine `other`'s edge_map_ into this detector.
+     *
+     * Used after a parallel scan-and-aggregate phase: each TBB worker
+     * owns one detector, and at the end of the scan the merge phase
+     * folds them all into a single global view. For keys that appear
+     * in both detectors, the EdgeAggregator merge logic
+     * (EdgeAggregator::merge_from) reproduces the value the
+     * legacy single-shared-detector path would have computed.
+     *
+     * Caller (NativeProjectionBuilder::scan_edges_impl_classic_) MUST
+     * walk per-partition detectors in ascending partition (i.e.
+     * B+Tree key) order, so this->first_edge_id_ for any merged key
+     * always represents the earliest scan-order occurrence.
+     *
+     * For SINGLE strategy: a key present in both detectors implies
+     * count_a + count_b >= 2 — the caller is expected to detect this
+     * via EdgeAggregator::get_count() after merge and throw the same
+     * QueryException as the single-thread inline path.
+     */
+    void merge_from(const ParallelEdgeDetector& other) {
+        for (const auto& [key, agg] : other.edge_map_) {
+            auto it = edge_map_.find(key);
+            if (it == edge_map_.end()) {
+                edge_map_.emplace(key, agg);
+            } else {
+                it->second.merge_from(agg);
+            }
+        }
+    }
+
+    /**
+     * @brief Spec #17: returns true if `key` was seen by this detector.
+     *
+     * Used during the post-merge serial replay phase to identify the
+     * canonical "first occurrence" record per global key (the one to
+     * push into edge_batch + extract properties + register the edge
+     * label).
+     */
+    bool has_key(const ParallelEdgeKey& key) const {
+        return edge_map_.find(key) != edge_map_.end();
+    }
+
+    /**
+     * @brief Spec #17: lookup the merged aggregator for `key`.
+     *
+     * @pre has_key(key) == true.
+     */
+    const EdgeAggregator& get_aggregator(const ParallelEdgeKey& key) const {
+        return edge_map_.at(key);
     }
 
 private:
@@ -553,6 +641,61 @@ private:
     // from the public API when ScanMode == CLASSIC (default).
     void scan_nodes_impl_classic_(const std::vector<std::string>& labels);
     void scan_edges_impl_classic_(const std::vector<std::string>& types);
+
+    // Spec #17 emit callback: takes (edge_id, from_node, to_node,
+    // type_id, type_orientation, type_aggregation, type_agg_property).
+    // Pushed once per accepted first-occurrence edge into edge_batch and
+    // mirrored to property/label streams. Concrete instance lives in
+    // scan_edges_impl_classic_ as a stack lambda; helper functions take
+    // the bound type-erased view so they don't need to be templates.
+    using EmitFirstOccurrenceFn = std::function<void(
+        ObjectId edge_id,
+        ObjectId from_node,
+        ObjectId to_node,
+        ObjectId type_id,
+        Orientation type_orientation,
+        Aggregation type_aggregation,
+        const std::string& type_agg_property)>;
+
+    // Spec #17 — process one (edge_id, from, to) triple through the legacy
+    // hash-based detector + first-occurrence emit path. Extracted verbatim
+    // from the inline lambda body in scan_edges_impl_classic_ so the
+    // single-partition fallback of the parallel-aggregation branch can
+    // reuse it without code duplication.
+    void process_legacy_edge_triple_(
+        ParallelEdgeDetector&        detector,
+        ObjectId                     edge_id,
+        ObjectId                     from_node,
+        ObjectId                     to_node,
+        ObjectId                     type_id,
+        Orientation                  type_orientation,
+        Aggregation                  type_aggregation,
+        const std::string&           type_agg_property,
+        const EmitFirstOccurrenceFn& emit_first_occurrence);
+
+    // Spec #17 — parallel edge aggregation: per-thread detectors fed by
+    // each partition's triples in parallel, then a serial merge into
+    // one global ParallelEdgeDetector, then a serial replay of the
+    // partitioned triples (in B+Tree key order) that emits each global
+    // first-occurrence into the projection storage. SINGLE mode raises
+    // QueryException with the same text the inline single-thread path
+    // emits when a duplicate (from, to, type) is observed across or
+    // within partitions.
+    void run_parallel_edge_aggregation_(
+        const std::vector<std::vector<EdgeEndpointTriple>>& partitions,
+        ObjectId                     type_id,
+        Orientation                  type_orientation,
+        Aggregation                  type_aggregation,
+        const std::string&           type_agg_property,
+        const EmitFirstOccurrenceFn& emit_first_occurrence);
+
+    // Spec #17 — store aggregated property values from a finished
+    // detector (legacy or merged) into the projection. Extracted from
+    // scan_edges_impl_classic_ so the parallel-aggregation path can
+    // reuse it. No-op for SINGLE.
+    void store_aggregated_values_(const ParallelEdgeDetector& detector,
+                                  Aggregation          type_aggregation,
+                                  const std::string&   type_agg_property);
 
     // Serialized multi-pass scan implementations (Spec #2). Each call
     // emits records ONLY to buffers matching target_mask. Called in a
@@ -873,6 +1016,19 @@ namespace detail {
      * @param env_val nullable C-string as returned by std::getenv.
      */
     NativeProjectionBuilder::ScanMode init_scan_mode_for_test(const char* env_val);
+
+    /**
+     * @brief Spec #17 — test-only hook that re-runs the
+     *        MDB_PROJECTION_PARALLEL_AGGREGATION parser against an
+     *        explicit env-var value, bypassing the process-lifetime
+     *        cache in the production resolver.
+     *
+     * @param env_val nullable C-string as returned by std::getenv.
+     * @return true when the parallel-aggregation path is enabled; false
+     *         when the env var explicitly forces the legacy single-
+     *         shared-detector path.
+     */
+    bool init_parallel_aggregation_for_test(const char* env_val);
 
     /**
      * @brief Spec #4-B T4.6 — test-only hook that runs the exact same CSR
