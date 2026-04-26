@@ -401,7 +401,7 @@ CALL gnn_offline_sample('proj', 's', [10, 5], {
     useAdjacencyCache: true,            -- default true; false disables both Spec #11 and Spec #13
     l1CacheMb: 0,                       -- 0 = auto-detect via /proc/meminfo
     l2CacheMb: 0,                       -- 0 = auto-detect
-    useL3MmapSidecar: false             -- requires buildTopologySnapshot:true at projection
+    useL3MmapSidecar: true              -- default true; graceful fallback to L4 if sidecar absent
 })
 ```
 

@@ -240,10 +240,17 @@ struct SamplingConfig {
     /**
      * @brief Use the mmap-backed L3 sidecar (Spec #4-B `topology_*.csr`
      *        files) when present. Requires `buildTopologySnapshot:true`
-     *        at projection-build time. Silently ignored when the sidecar
-     *        is absent or stale.
+     *        at projection-build time.
+     *
+     * Default true: when the sidecar exists, tier-3 cold-tail nodes
+     * are served at ~5-50 us/lookup (mmap + kernel page cache) instead
+     * of falling through to L4 BPT direct at ~30-100 us. When the
+     * sidecar is absent (projection built without buildTopologySnapshot),
+     * dispatch silently falls through to L4 — no error, no behavior
+     * change vs the false default. The flip is therefore strictly better:
+     * faster when applicable, identical when not.
      */
-    bool use_l3_mmap_sidecar = false;
+    bool use_l3_mmap_sidecar = true;
 
     // =========================================================================
     // Output

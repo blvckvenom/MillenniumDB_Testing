@@ -108,7 +108,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     bool use_four_level_topology_store = true;
     uint64_t l1_cache_mb = 0;
     uint64_t l2_cache_mb = 0;
-    bool use_l3_mmap_sidecar = false;
+    bool use_l3_mmap_sidecar = true;
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -133,7 +133,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - useFourLevelTopologyStore (BOOL): Spec #13 (default: true)\n"
                 "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
                 "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
-                "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3\n\n"
+                "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3 (default: true)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
                 "      batchSize: 512,\n"
