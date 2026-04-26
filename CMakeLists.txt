@@ -1838,47 +1838,6 @@ if(ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# Parallel edge aggregation unit tests (Spec #17)
-# ============================================================================
-# Verifies the EdgeAggregator + ParallelEdgeDetector merge math used by
-# the parallel-aggregation path in scan_edges_impl_classic_, plus the
-# MDB_PROJECTION_PARALLEL_AGGREGATION env-var parser. Pure CPU unit
-# tests — does not spin up TBB or a live B+Tree (those paths are
-# covered indirectly by the GQL projection_native integration suite).
-if(GTest_FOUND AND TARGET GTest::gtest_main)
-    add_executable(parallel_edge_aggregation_test
-        ${CMAKE_SOURCE_DIR}/src/tests/parallel_edge_aggregation_test.cc
-    )
-    set_target_properties(parallel_edge_aggregation_test PROPERTIES
-        CXX_STANDARD 17
-        CXX_STANDARD_REQUIRED ON
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
-    )
-    target_link_libraries(parallel_edge_aggregation_test
-        GTest::gtest_main
-        GTest::gtest
-        millenniumdb
-        antlr4_cpp_runtime
-        ${FS}
-        ssl
-        crypto
-        ${ICU_LIBRARIES}
-        ${ASYNC_IO_LIBS}
-        ${TBB_LIBS}
-        ${LZ4_LIBS}
-    )
-    if(ENABLE_GNN)
-        target_link_libraries(parallel_edge_aggregation_test
-            mdb_gnn_core ${TORCH_LIBRARIES})
-    endif()
-    add_test(
-        NAME parallel_edge_aggregation_test
-        COMMAND $<TARGET_FILE:parallel_edge_aggregation_test>
-        WORKING_DIRECTORY tests
-    )
-endif()
-
-# ============================================================================
 # BatchedEdgeAggregator unit tests (Spec #26)
 # ============================================================================
 # Registers batched_edge_aggregator_test when GTest is available and the

@@ -14,14 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_set>
-#include <vector>
-
-#ifdef HAS_TBB
-#include <tbb/blocked_range.h>
-#include <tbb/parallel_for.h>
-#endif
 
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/projection/edge_filter.h"
@@ -84,51 +77,6 @@ NativeProjectionBuilder::ScanMode init_scan_mode_for_test(const char* env_val) {
         return NativeProjectionBuilder::ScanMode::SERIALIZED;
     }
     return NativeProjectionBuilder::ScanMode::CLASSIC;
-}
-} // namespace detail
-} // namespace GQL
-
-// ============================================================================
-// Spec #17: parallel edge aggregation env-var resolver.
-//
-// Default ON. Set MDB_PROJECTION_PARALLEL_AGGREGATION=0 (or false/off,
-// any case) to force the legacy single-shared-detector path. Mirrors the
-// polarity of MDB_PROJECTION_PARALLEL_EDGE_SCAN (Spec #16) so callers
-// can flip both together for clean A/B comparisons.
-//
-// Detail entry point exposes the same parse rules without the cache so
-// unit tests can cover truthy / unknown / null inputs deterministically.
-// ============================================================================
-namespace {
-bool init_parallel_aggregation_enabled() {
-    const char* env = std::getenv("MDB_PROJECTION_PARALLEL_AGGREGATION");
-    if (env == nullptr) return true;
-    std::string v(env);
-    if (v == "0" || v == "false" || v == "off" ||
-        v == "FALSE" || v == "OFF" || v == "False" || v == "Off")
-    {
-        return false;
-    }
-    return true;
-}
-
-bool parallel_aggregation_enabled() {
-    static const bool cached = init_parallel_aggregation_enabled();
-    return cached;
-}
-} // namespace
-
-namespace GQL {
-namespace detail {
-bool init_parallel_aggregation_for_test(const char* env_val) {
-    if (env_val == nullptr) return true;
-    std::string v(env_val);
-    if (v == "0" || v == "false" || v == "off" ||
-        v == "FALSE" || v == "OFF" || v == "False" || v == "Off")
-    {
-        return false;
-    }
-    return true;
 }
 } // namespace detail
 } // namespace GQL
@@ -485,80 +433,6 @@ double EdgeAggregator::get_aggregated_value() const {
     }
 }
 
-// Spec #17: merge a partial aggregator (from a later partition) into this
-// one (the running merged state from earlier partitions). See header doc
-// for strategy-by-strategy semantics. The SINGLE-mode caller is expected
-// to inspect get_count() after merging and throw if it reaches >= 2 — the
-// inline single-thread path raises the same QueryException at count_==2.
-void EdgeAggregator::merge_from(const EdgeAggregator& other) {
-    if (other.count_ == 0) {
-        return;
-    }
-    // First time we see this key globally: copy `other` wholesale (this
-    // path is normally hit through the unordered_map::emplace branch in
-    // ParallelEdgeDetector::merge_from, but keep the safety net here so
-    // direct callers behave identically).
-    if (count_ == 0) {
-        count_                  = other.count_;
-        sum_value_              = other.sum_value_;
-        min_value_              = other.min_value_;
-        max_value_              = other.max_value_;
-        has_value_              = other.has_value_;
-        first_edge_id_          = other.first_edge_id_;
-        representative_edge_id_ = other.representative_edge_id_;
-        return;
-    }
-
-    count_ += other.count_;
-
-    switch (strategy_) {
-        case Aggregation::SUM:
-            if (other.has_value_) {
-                sum_value_ += other.sum_value_;
-                has_value_ = true;
-            }
-            break;
-
-        case Aggregation::MIN:
-            if (other.has_value_) {
-                if (!has_value_ || other.min_value_ < min_value_) {
-                    min_value_ = other.min_value_;
-                    representative_edge_id_ = other.representative_edge_id_;
-                }
-                has_value_ = true;
-            }
-            break;
-
-        case Aggregation::MAX:
-            if (other.has_value_) {
-                if (!has_value_ || other.max_value_ > max_value_) {
-                    max_value_ = other.max_value_;
-                    representative_edge_id_ = other.representative_edge_id_;
-                }
-                has_value_ = true;
-            }
-            break;
-
-        case Aggregation::COUNT:
-            // count_ already adjusted above; nothing else to combine.
-            break;
-
-        case Aggregation::SINGLE:
-            // count_ already >=2 here — caller (ParallelEdgeDetector
-            // post-merge sweep) must throw the same QueryException as
-            // the inline path. Sentinel min/max/sum stay at their
-            // first-occurrence values; the throwing branch never reads
-            // them.
-            break;
-
-        default:
-            break;
-    }
-    // first_edge_id_ stays as-is: caller merges in ascending partition
-    // (== B+Tree key) order, so `this` always holds the earlier-scan
-    // occurrence.
-}
-
 // ============================================================================
 // ParallelEdgeDetector implementation
 // ============================================================================
@@ -776,67 +650,6 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
     // This reduces peak memory from O(total_edges) to O(edges_per_type).
     // Memory savings: ~4 GB for large graphs (vs holding all detectors until end).
 
-    // Spec #17: emit one accepted edge into edge_batch + property/label
-    // streams, mirroring the legacy callback body. Shared between the
-    // legacy single-detector path and the parallel-aggregation replay
-    // path so both produce identical state.
-    auto emit_first_occurrence = [&]
-        (ObjectId edge_id,
-         ObjectId from_node,
-         ObjectId to_node,
-         ObjectId type_id,
-         Orientation type_orientation,
-         Aggregation type_aggregation,
-         const std::string& type_agg_property)
-    {
-        switch (type_orientation) {
-            case Orientation::NATURAL: {
-                ProjectedEdge edge;
-                edge.from_node = from_node;
-                edge.to_node = to_node;
-                edge.edge_id = edge_id;
-                uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
-                edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
-                edge_batch.push_back(edge);
-                break;
-            }
-            case Orientation::REVERSE: {
-                ProjectedEdge edge;
-                edge.from_node = to_node;
-                edge.to_node = from_node;
-                edge.edge_id = edge_id;
-                uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
-                edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
-                edge_batch.push_back(edge);
-                break;
-            }
-            case Orientation::UNDIRECTED: {
-                ProjectedEdge edge;
-                if (from_node.id <= to_node.id) {
-                    edge.from_node = from_node;
-                    edge.to_node = to_node;
-                } else {
-                    edge.from_node = to_node;
-                    edge.to_node = from_node;
-                }
-                edge.edge_id = edge_id;
-                edge.is_directed = false;
-                edge_batch.push_back(edge);
-                break;
-            }
-        }
-
-        if (!edge_property_keys.empty()) {
-            if (type_aggregation != Aggregation::SINGLE && !type_agg_property.empty()) {
-                extract_edge_properties_excluding(edge_id, type_agg_property);
-            } else {
-                extract_edge_properties(edge_id);
-            }
-        }
-
-        storage->add_edge_label(edge_id, type_id);
-    };
-
     for (const auto& type : types) {
         // Get per-type configuration (falls back to global defaults)
         Orientation type_orientation = get_orientation_for_type(type);
@@ -846,78 +659,154 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
         // Get type_id from pre-built map
         ObjectId type_id = type_id_map[type];
 
-        // Spec #17 — when parallel aggregation is enabled (default ON
-        // and TBB built in), use per-thread detectors + serial merge.
-        // The condition mirrors the partitioned scan behaviour: if the
-        // scanner only returns one inner vector (parallel disabled, no
-        // TBB, or partition cap < 2) we fall straight back to the
-        // legacy single-shared-detector path — no change in behaviour
-        // or work distribution.
-        bool parallel_agg_active = false;
-#ifdef HAS_TBB
-        parallel_agg_active = parallel_aggregation_enabled();
-#endif
-
-        if (parallel_agg_active) {
-            auto partitions =
-                scanner->scan_label_edge_with_endpoints_partitioned(type_id);
-
-            if (partitions.size() >= 2) {
-                run_parallel_edge_aggregation_(
-                    partitions,
-                    type_id,
-                    type_orientation,
-                    type_aggregation,
-                    type_agg_property,
-                    emit_first_occurrence);
-                continue;  // type processed, move to next
-            }
-
-            // Single-partition fallthrough: walk the one returned
-            // vector through the legacy hash-based codepath. We
-            // re-use the existing detector + replay loop for clarity.
-            if (!partitions.empty()) {
-                auto detector =
-                    std::make_unique<ParallelEdgeDetector>(type_aggregation);
-                for (const auto& triple : partitions[0]) {
-                    process_legacy_edge_triple_(
-                        *detector,
-                        triple.edge_id, triple.from_node, triple.to_node,
-                        type_id,
-                        type_orientation, type_aggregation, type_agg_property,
-                        emit_first_occurrence);
-                }
-                store_aggregated_values_(*detector, type_aggregation, type_agg_property);
-                detector->clear();
-                continue;
-            }
-            // partitions.empty() shouldn't happen — fall through to the
-            // legacy callback path as a safety net.
-        }
-
-        // Legacy single-detector path (Spec #17 disabled, !HAS_TBB, or
-        // empty partition vector fallback). Behaviour identical to
-        // pre-Spec-#17 code.
-
+        // Create detector for this type with type-specific aggregation
         auto detector = std::make_unique<ParallelEdgeDetector>(type_aggregation);
 
         // Scan all edges with this type (OPTIMIZED: get endpoints in single pass)
         scanner->scan_label_edge_with_endpoints(
             type_id,
             [this, &detector, type_id, type_orientation,
-             type_aggregation, &type_agg_property, &emit_first_occurrence]
+             type_aggregation, &type_agg_property]
             (ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
-            process_legacy_edge_triple_(
-                *detector,
-                edge_id, from_node, to_node,
-                type_id,
-                type_orientation, type_aggregation, type_agg_property,
-                emit_first_occurrence);
+            // Filter: only include if both endpoints are in projection
+            bool has_from = storage->has_node(from_node);
+            bool has_to = storage->has_node(to_node);
+
+            if (!has_from || !has_to) {
+                return; // Skip edge - endpoints not in projection
+            }
+
+            // Extract property value for aggregation (if needed) - use type-specific property
+            std::optional<double> property_value = std::nullopt;
+            if (!type_agg_property.empty()) {
+                property_value = get_edge_property_value_for_aggregation(edge_id, type_agg_property);
+            }
+
+            // Parallel edge detection: Check if this edge is a duplicate
+            // detector.process_edge() returns true for first occurrence, false for duplicates
+            // For SINGLE mode: throws exception on duplicate
+            // For MIN/MAX/SUM: aggregates based on property_value
+            // For COUNT: just counts (property_value ignored)
+            bool is_first_occurrence = detector->process_edge(
+                from_node.id,
+                to_node.id,
+                type_id.id,
+                edge_id,
+                property_value
+            );
+
+            if (!is_first_occurrence) {
+                return;  // Skip duplicate edge (aggregated)
+            }
+
+            // Add to batch based on TYPE-SPECIFIC orientation
+            switch (type_orientation) {
+                case Orientation::NATURAL: {
+                    // Single edge: from → to (as specified)
+                    ProjectedEdge edge;
+                    edge.from_node = from_node;
+                    edge.to_node = to_node;
+                    edge.edge_id = edge_id;
+                    uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
+                    edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
+                    edge_batch.push_back(edge);
+                    break;
+                }
+                case Orientation::REVERSE: {
+                    // Single edge: to → from (reversed)
+                    ProjectedEdge edge;
+                    edge.from_node = to_node;  // Swap endpoints
+                    edge.to_node = from_node;  // Swap endpoints
+                    edge.edge_id = edge_id;
+                    uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
+                    edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
+                    edge_batch.push_back(edge);
+                    break;
+                }
+                case Orientation::UNDIRECTED: {
+                    // MEMORY OPTIMIZATION: Canonical storage for undirected edges
+                    // Store each edge ONCE with canonical ordering (smaller node ID first).
+                    // Bidirectional traversal still works via from_to_edge + to_from_edge indexes.
+                    //
+                    // ISO 39075 §3.4.13: "An undirected edge expresses a relationship
+                    // that is necessarily symmetric" - canonical storage preserves this.
+                    ProjectedEdge edge;
+                    if (from_node.id <= to_node.id) {
+                        edge.from_node = from_node;
+                        edge.to_node = to_node;
+                    } else {
+                        edge.from_node = to_node;
+                        edge.to_node = from_node;
+                    }
+                    edge.edge_id = edge_id;
+                    edge.is_directed = false;
+                    edge_batch.push_back(edge);
+                    break;
+                }
+            }
+
+            // Extract properties ONCE per logical edge (not duplicated for UNDIRECTED)
+            // For aggregation modes: exclude the aggregation property — it will be stored
+            // later with the aggregated value (SUM/MIN/MAX) or as _count (COUNT)
+            if (!edge_property_keys.empty()) {
+                if (type_aggregation != Aggregation::SINGLE && !type_agg_property.empty()) {
+                    extract_edge_properties_excluding(edge_id, type_agg_property);
+                } else {
+                    extract_edge_properties(edge_id);
+                }
+            }
+
+            // Store edge label (automatic - always included like Neo4j GDS)
+            storage->add_edge_label(edge_id, type_id);
+
+            // Auto-flush when batch is full (SINGLE only).
+            // MIN/MAX/SUM/COUNT must NOT flush+clear here because their aggregated
+            // values are read after the full type scan at get_aggregated_property_values().
+            // Clearing the detector mid-scan would lose accumulated min/max/sum/count state.
+            if (type_aggregation == Aggregation::SINGLE && edge_batch.size() >= BATCH_SIZE) {
+                flush_edges();
+                detector->clear();
+            }
         });
 
         // Store aggregated property values for all non-SINGLE modes after type scan.
         // This releases memory right away instead of holding all detectors until the end.
-        store_aggregated_values_(*detector, type_aggregation, type_agg_property);
+        if (type_aggregation != Aggregation::SINGLE) {
+            // Get map of edge_id -> aggregated_value
+            auto aggregated_values = detector->get_aggregated_property_values();
+
+            // Convert aggregation property key to ObjectId for storage
+            ObjectId property_key_id(0);
+            std::string property_key_name = type_agg_property;
+
+            // For COUNT mode, use synthetic "_count" property (same as streaming path)
+            if (type_aggregation == Aggregation::COUNT) {
+                property_key_name = "_count";
+                property_key_id = ObjectId(COUNT_KEY_SYNTHETIC_ID | ObjectId::MASK_EDGE_KEY);
+                storage->register_edge_key("_count", COUNT_KEY_SYNTHETIC_ID);
+            } else {
+                // Look up property key in catalog (SUM/MIN/MAX use existing properties)
+                auto key_it = gql_model.catalog.edge_keys2id.find(property_key_name);
+                if (key_it != gql_model.catalog.edge_keys2id.end()) {
+                    property_key_id = ObjectId(key_it->second | ObjectId::MASK_EDGE_KEY);
+                } else {
+                    std::cerr << "[Builder] Warning: Property key '"
+                              << property_key_name
+                              << "' not found in catalog. Aggregated values "
+                                 "may not be stored correctly." << std::endl;
+                }
+            }
+
+            // Store aggregated value as property on each representative edge
+            for (const auto& [edge_id_raw, agg_value] : aggregated_values) {
+                ObjectId edge_id(edge_id_raw);
+                ObjectId value_oid = Common::Conversions::pack_int(static_cast<int64_t>(agg_value));
+
+                if (property_key_id.id != 0) {
+                    storage->add_edge_property(edge_id, property_key_id, value_oid);
+                }
+            }
+        }
 
         // Clear detector immediately after processing this type (release memory)
         detector->clear();
@@ -931,315 +820,6 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
     if (benchmark_timers_.enabled) {
         benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - bench_t0).count();
-    }
-}
-
-// Spec #17 helper. Verbatim port of the original lambda body inside
-// scan_edges_impl_classic_ — see that function for a side-by-side
-// comparison. Pulled out so the parallel-aggregation branch can re-use
-// the exact same per-edge state mutation when it falls back to a
-// single-partition input.
-void NativeProjectionBuilder::process_legacy_edge_triple_(
-    ParallelEdgeDetector&        detector,
-    ObjectId                     edge_id,
-    ObjectId                     from_node,
-    ObjectId                     to_node,
-    ObjectId                     type_id,
-    Orientation                  type_orientation,
-    Aggregation                  type_aggregation,
-    const std::string&           type_agg_property,
-    const EmitFirstOccurrenceFn& emit_first_occurrence)
-{
-    bool has_from = storage->has_node(from_node);
-    bool has_to = storage->has_node(to_node);
-
-    if (!has_from || !has_to) {
-        return;
-    }
-
-    std::optional<double> property_value = std::nullopt;
-    if (!type_agg_property.empty()) {
-        property_value = get_edge_property_value_for_aggregation(edge_id, type_agg_property);
-    }
-
-    bool is_first_occurrence = detector.process_edge(
-        from_node.id,
-        to_node.id,
-        type_id.id,
-        edge_id,
-        property_value
-    );
-
-    if (!is_first_occurrence) {
-        return;
-    }
-
-    emit_first_occurrence(
-        edge_id, from_node, to_node,
-        type_id, type_orientation, type_aggregation, type_agg_property);
-
-    // Auto-flush when batch is full (SINGLE only). MIN/MAX/SUM/COUNT
-    // must NOT flush+clear here because their aggregated values are
-    // read after the full type scan.
-    if (type_aggregation == Aggregation::SINGLE && edge_batch.size() >= BATCH_SIZE) {
-        flush_edges();
-        detector.clear();
-    }
-}
-
-// Spec #17 — runs per-thread aggregation over the per-partition triple
-// vectors produced by scan_label_edge_with_endpoints_partitioned, then
-// merges into a single global ParallelEdgeDetector, then replays the
-// triples in B+Tree key order to emit each global first-occurrence
-// (batch push + property extraction + edge label registration).
-//
-// SINGLE mode: a key whose merged count >= 2 means a duplicate was
-// observed — we throw the exact same QueryException the inline
-// single-thread path emits. Within-partition duplicates are detected
-// while running process_edge in the worker (matching the legacy throw
-// site bit-for-bit on small inputs); cross-partition duplicates are
-// caught after merge by inspecting count_ on each merged aggregator.
-void NativeProjectionBuilder::run_parallel_edge_aggregation_(
-    const std::vector<std::vector<EdgeEndpointTriple>>& partitions,
-    ObjectId                     type_id,
-    Orientation                  type_orientation,
-    Aggregation                  type_aggregation,
-    const std::string&           type_agg_property,
-    const EmitFirstOccurrenceFn& emit_first_occurrence)
-{
-    const std::size_t num_partitions = partitions.size();
-
-    // Phase A — parallel per-thread aggregation. Each worker walks its
-    // partition's triples sequentially into a thread-local detector
-    // (ParallelEdgeDetector::process_edge mutates an unprotected
-    // unordered_map; running it from multiple threads on the same
-    // detector would race). storage->has_node() is a read-only binary
-    // search after finalize_node_scan, safe for concurrent reads.
-    // get_edge_property_value_for_aggregation traverses the
-    // edge_key_value B+Tree which is also thread-safe for reads.
-    std::vector<std::unique_ptr<ParallelEdgeDetector>> per_thread_detectors;
-    per_thread_detectors.reserve(num_partitions);
-    for (std::size_t i = 0; i < num_partitions; ++i) {
-        per_thread_detectors.push_back(
-            std::make_unique<ParallelEdgeDetector>(type_aggregation));
-    }
-
-    // QueryContext propagation — same pattern as Spec #15 / #16. BPT
-    // leaf decode dereferences QueryContext::_query_ctx on each read,
-    // and TBB workers do not inherit the parent thread_local.
-    QueryContext* parent_ctx = QueryContext::_query_ctx;
-
-    // Per-worker captured exception. SINGLE mode's process_edge throws
-    // QueryException on the second occurrence within a partition; we
-    // capture the first one observed (lowest partition index) and
-    // re-throw on the parent thread post-parallel_for so the user sees
-    // the same error class + text the legacy path raises.
-    std::vector<std::exception_ptr> per_worker_exception(num_partitions);
-
-#ifdef HAS_TBB
-    tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, num_partitions, 1),
-        [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
-            if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
-                QueryContext::set_query_ctx(parent_ctx);
-            }
-            for (std::size_t p = r.begin(); p < r.end(); ++p) {
-                ParallelEdgeDetector& local = *per_thread_detectors[p];
-                try {
-                    for (const auto& triple : partitions[p]) {
-                        if (!storage->has_node(triple.from_node)) continue;
-                        if (!storage->has_node(triple.to_node))   continue;
-
-                        std::optional<double> property_value = std::nullopt;
-                        if (!type_agg_property.empty()) {
-                            property_value = get_edge_property_value_for_aggregation(
-                                triple.edge_id, type_agg_property);
-                        }
-
-                        // Mutates the worker-local detector only. SINGLE
-                        // mode throws here on second within-partition
-                        // duplicate; the catch below captures it.
-                        local.process_edge(
-                            triple.from_node.id,
-                            triple.to_node.id,
-                            type_id.id,
-                            triple.edge_id,
-                            property_value);
-                    }
-                } catch (...) {
-                    per_worker_exception[p] = std::current_exception();
-                }
-            }
-        });
-#else
-    // Non-TBB: this branch should not execute (parallel_aggregation_active
-    // already gated on HAS_TBB at the call site), but keep a sequential
-    // fallback for safety.
-    for (std::size_t p = 0; p < num_partitions; ++p) {
-        ParallelEdgeDetector& local = *per_thread_detectors[p];
-        try {
-            for (const auto& triple : partitions[p]) {
-                if (!storage->has_node(triple.from_node)) continue;
-                if (!storage->has_node(triple.to_node))   continue;
-                std::optional<double> property_value = std::nullopt;
-                if (!type_agg_property.empty()) {
-                    property_value = get_edge_property_value_for_aggregation(
-                        triple.edge_id, type_agg_property);
-                }
-                local.process_edge(
-                    triple.from_node.id,
-                    triple.to_node.id,
-                    type_id.id,
-                    triple.edge_id,
-                    property_value);
-            }
-        } catch (...) {
-            per_worker_exception[p] = std::current_exception();
-        }
-    }
-#endif
-
-    // Re-throw the lowest-partition-index captured exception, matching
-    // the deterministic ordering the legacy single-thread path would
-    // produce (which would have failed at the very first within-type
-    // duplicate in B+Tree key order — i.e. the lowest partition index
-    // in our partitioning).
-    for (std::size_t p = 0; p < num_partitions; ++p) {
-        if (per_worker_exception[p]) {
-            std::rethrow_exception(per_worker_exception[p]);
-        }
-    }
-
-    // Phase B — serial merge into a single global detector. Walking
-    // partitions in ascending order ensures the merged detector's
-    // first_edge_id_ for each key is the earliest-scan-order
-    // occurrence (matching legacy semantics). For SINGLE strategy:
-    // a key present in two partitions means the merged count_ will
-    // be >= 2 even though no individual partition saw a duplicate
-    // — we detect that via get_count() and throw.
-    auto merged = std::make_unique<ParallelEdgeDetector>(type_aggregation);
-    for (std::size_t p = 0; p < num_partitions; ++p) {
-        merged->merge_from(*per_thread_detectors[p]);
-    }
-
-    if (type_aggregation == Aggregation::SINGLE) {
-        // Walk merged map: any aggregator with count >= 2 must throw
-        // the same QueryException as the inline path.
-        // ParallelEdgeDetector exposes the map indirectly via
-        // get_aggregated_property_values which returns nothing for
-        // SINGLE — so we go through has_key on the per-partition
-        // keys instead. Iterate per-partition triples to find any
-        // (key) whose merged aggregator has count_ >= 2.
-        for (std::size_t p = 0; p < num_partitions; ++p) {
-            for (const auto& triple : partitions[p]) {
-                if (!storage->has_node(triple.from_node)) continue;
-                if (!storage->has_node(triple.to_node))   continue;
-                ParallelEdgeKey key{
-                    triple.from_node.id, triple.to_node.id, type_id.id};
-                if (merged->has_key(key)
-                    && merged->get_aggregator(key).get_count() >= 2)
-                {
-                    // Re-trigger the legacy SINGLE branch so the
-                    // user sees the same error message they'd get
-                    // from the single-thread path.
-                    EdgeAggregator throwaway(Aggregation::SINGLE);
-                    throwaway.process_edge(triple.edge_id, std::nullopt);
-                    throwaway.process_edge(triple.edge_id, std::nullopt);
-                }
-            }
-        }
-    }
-
-    // Per-thread detectors no longer needed.
-    per_thread_detectors.clear();
-
-    // Phase C — serial replay across partitions in B+Tree key order.
-    // For each triple whose endpoints survive the has_node filter,
-    // emit on the very first occurrence of its key (tracked via the
-    // emitted set). The legacy single-detector path emits on the
-    // first call to detector.process_edge that returns true — which
-    // is exactly the first occurrence of the key in scan order.
-    // Single-threaded callback context: the existing
-    // emit_first_occurrence (mutates edge_batch / storage state) does
-    // NOT need to be thread-safe.
-    std::unordered_set<ParallelEdgeKey, ParallelEdgeKeyHash> emitted;
-    emitted.reserve(merged->get_map_size());
-
-    for (std::size_t p = 0; p < num_partitions; ++p) {
-        for (const auto& triple : partitions[p]) {
-            if (!storage->has_node(triple.from_node)) continue;
-            if (!storage->has_node(triple.to_node))   continue;
-
-            ParallelEdgeKey key{
-                triple.from_node.id, triple.to_node.id, type_id.id};
-            auto inserted = emitted.insert(key);
-            if (!inserted.second) continue;  // already emitted
-
-            emit_first_occurrence(
-                triple.edge_id, triple.from_node, triple.to_node,
-                type_id, type_orientation, type_aggregation,
-                type_agg_property);
-
-            // Match legacy SINGLE batch-flush behaviour: the inline
-            // path flushes the edge_batch + clears the detector when
-            // BATCH_SIZE is reached and aggregation is SINGLE. Here
-            // we only need to flush — the merged detector's content
-            // is already final and not consulted again for SINGLE
-            // (store_aggregated_values_ is a no-op for SINGLE).
-            if (type_aggregation == Aggregation::SINGLE
-                && edge_batch.size() >= BATCH_SIZE)
-            {
-                flush_edges();
-            }
-        }
-    }
-
-    // Phase D — write aggregated property values from the merged
-    // detector. Same code path as the legacy branch.
-    store_aggregated_values_(*merged, type_aggregation, type_agg_property);
-    merged->clear();
-}
-
-// Spec #17 — extracted from scan_edges_impl_classic_. Stores aggregated
-// property values for non-SINGLE modes after a type scan finishes,
-// using the merged detector's aggregated_property_values map.
-void NativeProjectionBuilder::store_aggregated_values_(
-    const ParallelEdgeDetector& detector,
-    Aggregation                 type_aggregation,
-    const std::string&          type_agg_property)
-{
-    if (type_aggregation == Aggregation::SINGLE) {
-        return;
-    }
-
-    auto aggregated_values = detector.get_aggregated_property_values();
-
-    ObjectId property_key_id(0);
-    std::string property_key_name = type_agg_property;
-
-    if (type_aggregation == Aggregation::COUNT) {
-        property_key_name = "_count";
-        property_key_id = ObjectId(COUNT_KEY_SYNTHETIC_ID | ObjectId::MASK_EDGE_KEY);
-        storage->register_edge_key("_count", COUNT_KEY_SYNTHETIC_ID);
-    } else {
-        auto key_it = gql_model.catalog.edge_keys2id.find(property_key_name);
-        if (key_it != gql_model.catalog.edge_keys2id.end()) {
-            property_key_id = ObjectId(key_it->second | ObjectId::MASK_EDGE_KEY);
-        } else {
-            std::cerr << "[Builder] Warning: Property key '"
-                      << property_key_name
-                      << "' not found in catalog. Aggregated values "
-                         "may not be stored correctly." << std::endl;
-        }
-    }
-
-    for (const auto& [edge_id_raw, agg_value] : aggregated_values) {
-        ObjectId edge_id(edge_id_raw);
-        ObjectId value_oid =
-            Common::Conversions::pack_int(static_cast<int64_t>(agg_value));
-        if (property_key_id.id != 0) {
-            storage->add_edge_property(edge_id, property_key_id, value_oid);
-        }
     }
 }
 

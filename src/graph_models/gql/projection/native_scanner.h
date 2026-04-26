@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <functional>
 #include <utility>
-#include <vector>
 
 #include "graph_models/object_id.h"
 
@@ -11,21 +10,6 @@ template<std::size_t N>
 class BPlusTree;
 
 namespace GQL {
-
-/**
- * @brief One label-edge record after endpoint resolution.
- *
- * Returned by `scan_label_edge_with_endpoints_partitioned` (Spec #17) so
- * downstream parallel consumers (per-thread aggregation in
- * NativeProjectionBuilder) can walk each partition's triples directly
- * instead of going through a serial replay callback. Same payload as the
- * tuples passed to the existing `scan_label_edge_with_endpoints` callback.
- */
-struct EdgeEndpointTriple {
-    ObjectId edge_id;
-    ObjectId from_node;
-    ObjectId to_node;
-};
 
 /**
  * @brief Performs direct B+Tree range scans for native projection.
@@ -174,34 +158,6 @@ public:
         ObjectId type_id,
         std::function<void(ObjectId, ObjectId, ObjectId)> callback
     );
-
-    /**
-     * @brief Same scan as scan_label_edge_with_endpoints but returns the
-     * per-partition vectors directly (no serial replay). Spec #17.
-     *
-     * Caller-side parallel aggregation consumers (e.g. per-thread
-     * ParallelEdgeDetector instances in NativeProjectionBuilder) need
-     * to walk each partition's triples in parallel, then merge. The
-     * legacy entry point hides the per-partition structure behind a
-     * serial replay callback. This entry exposes it.
-     *
-     * Behaviour, partition strategy, env-var control and TBB workers
-     * mirror the existing parallel path one-to-one. Output ordering:
-     * within each partition triples appear in B+Tree key order, and
-     * partitions are returned in ascending sub-range order, so
-     * concatenating them is bit-identical to the legacy serial
-     * callback ordering.
-     *
-     * Disabled / single-partition / no-TBB falls back to a single
-     * vector containing every triple (caller can run sequentially).
-     *
-     * @param type_id ObjectId of the edge type
-     * @return Per-partition vectors of (edge_id, from, to) triples.
-     *         Outer .size() is the number of partitions used (>= 1);
-     *         total triple count is the sum of inner .size().
-     */
-    std::vector<std::vector<EdgeEndpointTriple>>
-    scan_label_edge_with_endpoints_partitioned(ObjectId type_id);
 
     /**
      * @brief Counts edges with the given type without full enumeration.
