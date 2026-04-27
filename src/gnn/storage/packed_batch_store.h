@@ -177,4 +177,30 @@ void generate_packed_batches(
     const std::filesystem::path& output_dir
 );
 
+/// Spec B1 (DiskGNN-style inverted loop): partitioned packer.
+///
+/// Inverts the per-batch outer loop into a feature-partition-oriented
+/// sequential scan + scatter pwrites. Each region of the FeatureMatrix
+/// is read exactly once, then distributed to all batch files that
+/// reference rows in that region. Trades a single O(M) header pre-write
+/// pass + one O(M) scan of .fmat for the classic O(B × R) random reads
+/// (where B = batches, R = rows-per-batch). Wins big when .fmat exceeds
+/// page cache (e.g., papers100M: 56 GB .fmat vs 28 GB RAM).
+///
+/// On-disk file format is identical to generate_packed_batches
+/// (PackedBatchHeader v1 + features section). Output is bit-identical
+/// to the classic path for the same inputs — verified by golden compare.
+///
+/// partition_bytes: target bytes per partition (rounded down to whole rows).
+/// Default 256 MB matches DiskGNN's heuristic for ogbn-papers100M-class
+/// datasets. Smaller partitions reduce peak RSS but increase loop overhead;
+/// larger partitions reduce overhead but raise peak RSS.
+void generate_packed_batches_partitioned(
+    const FeatureMatrix& features,
+    uint64_t num_batches,
+    std::function<std::vector<uint64_t>(uint64_t batch_id)> batch_provider,
+    const std::filesystem::path& output_dir,
+    size_t partition_bytes = 256ULL * 1024 * 1024
+);
+
 } // namespace mdb::gnn

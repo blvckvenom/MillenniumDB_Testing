@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "gnn/storage/feature_matrix.h"
@@ -188,14 +190,41 @@ BatchMaterializer::Result BatchMaterializer::materialize(
 
     const std::vector<uint64_t>* inv_ptr = config.reorder ? &inverse : nullptr;
 
-    generate_packed_batches(
-        *active_fm,
-        num_batches,
-        [&](uint64_t batch_id) -> std::vector<uint64_t> {
-            auto sample = samples.read_sample(batch_id);
-            return translate_to_rows(sample.all_unique_nodes, row_mapping, inv_ptr, batch_id);
-        },
-        packed_dir);
+    auto batch_provider_lambda = [&](uint64_t batch_id) -> std::vector<uint64_t> {
+        auto sample = samples.read_sample(batch_id);
+        return translate_to_rows(sample.all_unique_nodes, row_mapping, inv_ptr, batch_id);
+    };
+
+    // Spec B1: dispatch between classic and partitioned packer via env var.
+    // MDB_BATCH_PACKER=partitioned activates the DiskGNN-style inverted loop
+    // (1× sequential .fmat scan + scatter pwrites). Default classic preserves
+    // pre-2026-04-27 behavior; flip to partitioned only after measuring on
+    // your dataset (mirrors MDB_PROJECTION_SORTER pattern from ADR-004).
+    const char* packer_env = std::getenv("MDB_BATCH_PACKER");
+    const bool use_partitioned = (packer_env != nullptr
+                                  && std::string(packer_env) == "partitioned");
+
+    if (use_partitioned) {
+        std::cout << "[Materialize] L4 packer mode: partitioned (Spec B1)\n"
+                  << std::flush;
+        size_t partition_bytes = 256ULL * 1024 * 1024;
+        if (const char* mb_env = std::getenv("MDB_BATCH_PARTITION_MB")) {
+            try {
+                long mb = std::stol(mb_env);
+                if (mb > 0) partition_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+            } catch (...) {
+                std::cout << "[Materialize] warning: MDB_BATCH_PARTITION_MB='"
+                          << mb_env << "' invalid, using default 256 MB\n";
+            }
+        }
+        generate_packed_batches_partitioned(
+            *active_fm, num_batches, batch_provider_lambda,
+            packed_dir, partition_bytes);
+    } else {
+        std::cout << "[Materialize] L4 packer mode: classic\n" << std::flush;
+        generate_packed_batches(
+            *active_fm, num_batches, batch_provider_lambda, packed_dir);
+    }
 
     result.total_batches = num_batches;
 

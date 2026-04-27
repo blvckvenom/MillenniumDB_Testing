@@ -302,4 +302,270 @@ void generate_packed_batches(
     );
 }
 
+// ===========================================================================
+// generate_packed_batches_partitioned (Spec B1 — DiskGNN-style inverted loop)
+// ===========================================================================
+
+void generate_packed_batches_partitioned(
+    const FeatureMatrix& features,
+    uint64_t num_batches,
+    std::function<std::vector<uint64_t>(uint64_t batch_id)> batch_provider,
+    const fs::path& output_dir,
+    size_t partition_bytes)
+{
+    fs::create_directories(output_dir);
+
+    const uint64_t row_bytes = features.row_bytes();
+    if (row_bytes == 0) {
+        throw std::runtime_error(
+            "generate_packed_batches_partitioned: row_bytes == 0");
+    }
+
+    const uint64_t total_rows = features.num_rows();
+    if (total_rows == 0) {
+        throw std::runtime_error(
+            "generate_packed_batches_partitioned: empty FeatureMatrix");
+    }
+
+    // Partition geometry: target partition_bytes, round down to whole rows.
+    uint64_t partition_rows = std::max<uint64_t>(1, partition_bytes / row_bytes);
+    if (partition_rows > total_rows) partition_rows = total_rows;
+    const uint64_t num_partitions =
+        (total_rows + partition_rows - 1) / partition_rows;
+
+    std::cout << "[Materialize] partitioned packer (B1): "
+              << num_partitions << " partitions × " << partition_rows
+              << " rows ("
+              << (partition_rows * row_bytes / (1024ULL * 1024)) << " MB each), "
+              << num_batches << " batches\n" << std::flush;
+
+    // RowRef: 16 bytes — one inverted-index entry per (row, batch, position).
+    // batch_id < 2^32 covers any realistic dataset; pos_in_batch < 2^32 too
+    // (a 4 B-node batch would need terabytes of features per single batch,
+    // way past any practical workload).
+    struct RowRef {
+        uint32_t batch_id;
+        uint32_t pos_in_batch;
+        uint64_t fmat_row;
+    };
+    static_assert(sizeof(RowRef) == 16, "RowRef must be 16 bytes");
+
+    // ----- Phase 0+1: pre-write headers, ftruncate, build inverted index -----
+    auto t_phase01_start = std::chrono::steady_clock::now();
+
+    std::vector<std::vector<RowRef>> inverted(num_partitions);
+
+    {
+        const uint64_t feature_dim = features.num_cols();
+        const auto     dtype       = features.dtype();
+
+        for (uint64_t b = 0; b < num_batches; ++b) {
+            auto row_ids = batch_provider(b);
+            const uint64_t N = row_ids.size();
+
+            // Phase 0a: write header
+            auto path = output_dir / make_batch_filename(b);
+            std::string path_str = path.string();
+
+            int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                throw std::runtime_error(
+                    "generate_packed_batches_partitioned: cannot create " +
+                    path_str + ": " + safe_strerror(errno));
+            }
+            FdGuard guard(fd);
+
+            auto header = PackedBatchHeader::make(N, feature_dim, dtype);
+            write_all(fd, &header, sizeof(header), path_str);
+
+            // Phase 0b: ftruncate to total size, leaving the features region
+            // as a sparse hole. ext4/xfs do not allocate physical blocks for
+            // the hole; Phase 2's pwrites populate them. For N==0 we leave
+            // the file at 32 bytes (header only) — same on-disk size as the
+            // classic path.
+            if (N > 0) {
+                const off_t total_size =
+                    static_cast<off_t>(sizeof(header) + N * row_bytes);
+                if (::ftruncate(fd, total_size) < 0) {
+                    throw std::runtime_error(
+                        "generate_packed_batches_partitioned: ftruncate failed for " +
+                        path_str + ": " + safe_strerror(errno));
+                }
+            }
+
+            // Phase 1: bucket each row_id into its partition's inverted list.
+            for (size_t i = 0; i < N; ++i) {
+                const uint64_t fmat_row = row_ids[i];
+                if (fmat_row >= total_rows) {
+                    throw std::out_of_range(
+                        "generate_packed_batches_partitioned: row " +
+                        std::to_string(fmat_row) +
+                        " out of range [0, " + std::to_string(total_rows) + ")");
+                }
+                const uint64_t partition_id = fmat_row / partition_rows;
+                inverted[partition_id].push_back({
+                    static_cast<uint32_t>(b),
+                    static_cast<uint32_t>(i),
+                    fmat_row
+                });
+            }
+            // FdGuard closes the fd; row_ids vector is freed at end of scope.
+        }
+    }
+
+    auto t_phase01_end = std::chrono::steady_clock::now();
+
+    uint64_t total_refs = 0;
+    for (const auto& bucket : inverted) total_refs += bucket.size();
+    std::cout << "[Materialize] phase 0+1 done in "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase01_end - t_phase01_start).count()
+              << "s — inverted index: " << total_refs << " refs across "
+              << num_partitions << " partitions ("
+              << (total_refs * sizeof(RowRef) / (1024 * 1024)) << " MB)"
+              << std::endl;
+
+    // ----- Phase 2: sequential scan + scatter pwrites -----
+    auto t_phase2_start = std::chrono::steady_clock::now();
+
+    // Phase 2 reads each partition in row order via FeatureMatrix::row(),
+    // which returns a pointer into the mmap'd .fmat past the header. The
+    // pointer is stable for the lifetime of the FeatureMatrix; we use it as
+    // a byte-arithmetic base for memcpy. Kernel default readahead handles
+    // sequential I/O — a future optimization can expose a public
+    // madvise_sequential() helper on FeatureMatrix to widen the window.
+    std::vector<char> partition_buf;
+    partition_buf.reserve(partition_rows * row_bytes);
+
+    const uint64_t progress_step = std::max<uint64_t>(num_partitions / 20, 4);
+
+    for (uint64_t p = 0; p < num_partitions; ++p) {
+        auto& refs = inverted[p];
+        if (refs.empty()) continue;
+
+        const uint64_t row_start = p * partition_rows;
+        const uint64_t row_end   = std::min(row_start + partition_rows, total_rows);
+        const uint64_t this_rows = row_end - row_start;
+        const size_t   this_bytes = static_cast<size_t>(this_rows * row_bytes);
+
+        // Sequential read: memcpy the partition from mmap into local buf.
+        // features.row(row_start) yields a pointer into the mmap'd .fmat at
+        // the start of this partition (byte offset row_start * row_bytes
+        // past the data section). Kernel default readahead handles I/O.
+        partition_buf.resize(this_bytes);
+        std::memcpy(partition_buf.data(),
+                    features.row(row_start),
+                    this_bytes);
+
+        // Sort refs by batch_id so each output file is opened/closed exactly
+        // once per partition. Writes within a batch group are random offsets
+        // (bounded by N[b] * row_bytes), but the BATCH file handle is reused.
+        std::sort(refs.begin(), refs.end(),
+                  [](const RowRef& a, const RowRef& b) {
+                      return a.batch_id < b.batch_id;
+                  });
+
+        size_t i = 0;
+        while (i < refs.size()) {
+            const uint32_t bid = refs[i].batch_id;
+            size_t j = i + 1;
+            while (j < refs.size() && refs[j].batch_id == bid) ++j;
+
+            auto path = output_dir / make_batch_filename(bid);
+            std::string path_str = path.string();
+
+            int fd = ::open(path.c_str(), O_WRONLY);
+            if (fd < 0) {
+                throw std::runtime_error(
+                    "generate_packed_batches_partitioned: cannot open " +
+                    path_str + " for scatter: " + safe_strerror(errno));
+            }
+            FdGuard guard(fd);
+
+            for (size_t k = i; k < j; ++k) {
+                const auto& ref = refs[k];
+                const size_t buf_offset =
+                    static_cast<size_t>((ref.fmat_row - row_start) * row_bytes);
+                off_t off_curr = static_cast<off_t>(
+                    sizeof(PackedBatchHeader) + ref.pos_in_batch * row_bytes);
+
+                // pwrite loop: handle EINTR + partial writes.
+                size_t remaining  = static_cast<size_t>(row_bytes);
+                const char* src   = partition_buf.data() + buf_offset;
+                while (remaining > 0) {
+                    ssize_t n = ::pwrite(fd, src, remaining, off_curr);
+                    if (n < 0) {
+                        if (errno == EINTR) continue;
+                        throw std::runtime_error(
+                            "generate_packed_batches_partitioned: pwrite failed at " +
+                            path_str + ": " + safe_strerror(errno));
+                    }
+                    if (n == 0) {
+                        throw std::runtime_error(
+                            "generate_packed_batches_partitioned: pwrite returned 0 at " +
+                            path_str);
+                    }
+                    src       += n;
+                    off_curr  += n;
+                    remaining -= static_cast<size_t>(n);
+                }
+            }
+
+            i = j;
+        }
+
+        // Free the partition's inverted bucket to release memory before the
+        // next partition. swap-with-empty forces deallocation.
+        std::vector<RowRef>().swap(refs);
+
+        if ((p + 1) % progress_step == 0 || p + 1 == num_partitions) {
+            auto t_now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(
+                t_now - t_phase2_start).count();
+            double rate = (p + 1) / elapsed;
+            double eta  = (num_partitions - p - 1) / rate;
+            std::cout << "[Materialize] phase 2 partition " << (p + 1) << "/"
+                      << num_partitions
+                      << " (" << std::fixed << std::setprecision(1)
+                      << (100.0 * (p + 1) / num_partitions) << "%)"
+                      << "  elapsed=" << std::fixed << std::setprecision(0)
+                      << elapsed << "s"
+                      << "  ETA=" << std::fixed << std::setprecision(0)
+                      << eta << "s"
+                      << std::endl;
+        }
+    }
+
+    auto t_phase2_end = std::chrono::steady_clock::now();
+
+    // ----- Phase 3: fsync all batch files for crash-consistent durability -----
+    auto t_phase3_start = std::chrono::steady_clock::now();
+    for (uint64_t b = 0; b < num_batches; ++b) {
+        auto path = output_dir / make_batch_filename(b);
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) continue;  // non-fatal: file may be 0-row empty
+        FdGuard guard(fd);
+        if (::fsync(fd) < 0) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: fsync failed for " +
+                path.string() + ": " + safe_strerror(errno));
+        }
+    }
+    if (num_batches > 0) {
+        fsync_directory(output_dir / make_batch_filename(0));
+    }
+    auto t_phase3_end = std::chrono::steady_clock::now();
+
+    std::cout << "[Materialize] partitioned packer DONE — total "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase3_end - t_phase01_start).count() << "s ("
+              << "phase01=" << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase01_end - t_phase01_start).count() << "s, "
+              << "phase2=" << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase2_end - t_phase2_start).count() << "s, "
+              << "phase3=" << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase3_end - t_phase3_start).count() << "s)"
+              << std::endl;
+}
+
 } // namespace mdb::gnn
