@@ -1196,7 +1196,7 @@ void ProjectionStorage::build_nodes_index_() {
     node_count = GQL::sort_and_build_index<1>(
         *node_records_buffer_,
         projection_dir + "/nodes",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/node_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<1>& sorter, const std::string& path) {
             return build_index_streaming<1>(sorter, path);
         },
@@ -1212,7 +1212,7 @@ void ProjectionStorage::build_from_to_edge_index_() {
     GQL::sort_and_build_index<3>(
         *from_to_records_buffer_,
         projection_dir + "/from_to_edge",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/from_to_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1257,7 +1257,7 @@ void ProjectionStorage::build_to_from_edge_index_() {
     GQL::sort_and_build_index<3>(
         *to_from_records_buffer_,
         projection_dir + "/to_from_edge",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/to_from_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1294,7 +1294,7 @@ void ProjectionStorage::build_edge_direction_index_() {
     GQL::sort_and_build_index<2>(
         *direction_records_buffer_,
         projection_dir + "/edge_direction",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/direction_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1310,7 +1310,7 @@ void ProjectionStorage::build_edge_from_to_index_() {
     GQL::sort_and_build_index<3>(
         *edge_from_to_records_buffer_,
         projection_dir + "/edge_from_to",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/edge_from_to_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1326,7 +1326,7 @@ void ProjectionStorage::build_edge_n1_n2_index_() {
     GQL::sort_and_build_index<3>(
         *edge_n1_n2_records_buffer_,
         projection_dir + "/edge_n1_n2",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/edge_n1_n2_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1343,7 +1343,7 @@ void ProjectionStorage::build_node_label_index_() {
     GQL::sort_and_build_index<2>(
         *node_label_records_buffer_,
         projection_dir + "/node_label",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/node_label_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1360,7 +1360,7 @@ void ProjectionStorage::build_label_node_index_() {
     GQL::sort_and_build_index<2>(
         *label_node_records_buffer_,
         projection_dir + "/label_node",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/label_node_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1377,7 +1377,7 @@ void ProjectionStorage::build_edge_label_index_() {
     GQL::sort_and_build_index<2>(
         *edge_label_records_buffer_,
         projection_dir + "/edge_label",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/edge_label_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1394,7 +1394,7 @@ void ProjectionStorage::build_label_edge_index_() {
     GQL::sort_and_build_index<2>(
         *label_edge_records_buffer_,
         projection_dir + "/label_edge",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/label_edge_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1411,7 +1411,7 @@ void ProjectionStorage::build_node_key_value_index_() {
     GQL::sort_and_build_index<3>(
         *node_key_value_records_buffer_,
         projection_dir + "/node_key_value",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/node_key_value_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1428,7 +1428,7 @@ void ProjectionStorage::build_key_value_node_index_() {
     GQL::sort_and_build_index<3>(
         *key_value_node_records_buffer_,
         projection_dir + "/key_value_node",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/key_value_node_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1445,7 +1445,7 @@ void ProjectionStorage::build_edge_key_value_index_() {
     GQL::sort_and_build_index<3>(
         *edge_key_value_records_buffer_,
         projection_dir + "/edge_key_value",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/edge_key_value_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1462,7 +1462,7 @@ void ProjectionStorage::build_key_value_edge_index_() {
     GQL::sort_and_build_index<3>(
         *key_value_edge_records_buffer_,
         projection_dir + "/key_value_edge",
-        /*estimated_count=*/0,  // Unused by CLASSIC; RADIX wires this in Task 12.
+        /*estimated_count=*/key_value_edge_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },

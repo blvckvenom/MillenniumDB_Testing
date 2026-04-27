@@ -1,7 +1,10 @@
 #include "native_scanner.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -426,18 +429,20 @@ static bool resolve_edge_endpoints(
     return false;
 }
 
-// Sequential helper: scan a single sub-range [lo_edge, hi_edge] of edge ids
-// for the given type, resolving each edge's endpoints inline and pushing
-// successful (edge_id, from, to) triples into `sink`. Used by both the
-// sequential path and each parallel worker — endpoint lookups are pure
-// reads on the secondary B+Tree, so they are safe to issue concurrently.
+// Triple type used by the parallel-branch streaming queues.
 struct EdgeEndpointTriple {
     ObjectId edge_id;
     ObjectId from_node;
     ObjectId to_node;
 };
 
-static uint64_t scan_label_edge_with_endpoints_subrange(
+// Callback variant of the sub-range scan: invokes `cb(edge_id, from, to)`
+// for each successfully-resolved edge in [lo_edge, hi_edge]. Used by each
+// parallel worker (callback pushes to a bounded queue) and could equally
+// be used from the sequential path (in this file the sequential path
+// inlines the same loop directly because its callback is the user's).
+template <typename Callback>
+static uint64_t scan_label_edge_with_endpoints_subrange_cb(
     BPlusTree<2>* label_edge_index,
     BPlusTree<3>* edge_from_to_index,
     BPlusTree<3>* from_to_edge_index,
@@ -446,7 +451,7 @@ static uint64_t scan_label_edge_with_endpoints_subrange(
     uint64_t search_type_id,
     uint64_t lo_edge,
     uint64_t hi_edge,
-    std::vector<EdgeEndpointTriple>& sink)
+    Callback cb)
 {
     Record<2> min_record;
     min_record[0] = search_type_id;
@@ -473,7 +478,7 @@ static uint64_t scan_label_edge_with_endpoints_subrange(
             // Edge not found in endpoint index — skip, matching legacy semantics.
             continue;
         }
-        sink.push_back(EdgeEndpointTriple{edge_id, from_node, to_node});
+        cb(edge_id, from_node, to_node);
         ++count;
     }
     return count;
@@ -497,19 +502,39 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
 #endif
 
     if (!parallel_enabled || num_partitions < 2) {
-        std::vector<EdgeEndpointTriple> sink;
-        sink.reserve(64);
-        scan_label_edge_with_endpoints_subrange(
-            label_edge_index,
-            edge_from_to_index, from_to_edge_index,
-            edge_n1_n2_index,   n1_n2_edge_index,
-            search_type_id,
-            /*lo_edge=*/0, /*hi_edge=*/UINT64_MAX,
-            sink);
-        for (const auto& t : sink) {
-            callback(t.edge_id, t.from_node, t.to_node);
+        // Inline callback path — never accumulates into a vector. This matches
+        // the pre-Spec-#16 behavior, where each edge was emitted to the
+        // callback as soon as it was scanned. Required for large datasets
+        // (papers100M: 1.6B edges × 24 B = 36 GB if accumulated) where the
+        // collect-then-replay sink would exceed RAM.
+        Record<2> min_record;
+        min_record[0] = search_type_id;
+        min_record[1] = 0;
+
+        Record<2> max_record;
+        max_record[0] = search_type_id;
+        max_record[1] = UINT64_MAX;
+
+        bool interruption_requested = false;
+        auto iter = label_edge_index->get_range(
+            &interruption_requested, min_record, max_record);
+
+        uint64_t count = 0;
+        const Record<2>* record;
+        while ((record = iter.next()) != nullptr) {
+            ObjectId edge_id((*record)[1]);
+            ObjectId from_node, to_node;
+            if (!resolve_edge_endpoints(
+                    edge_from_to_index, from_to_edge_index,
+                    edge_n1_n2_index, n1_n2_edge_index,
+                    edge_id, from_node, to_node))
+            {
+                continue;
+            }
+            callback(edge_id, from_node, to_node);
+            ++count;
         }
-        return sink.size();
+        return count;
     }
 
 #ifdef HAS_TBB
@@ -522,66 +547,136 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
     // is idempotent and cheap.
     QueryContext* parent_ctx = QueryContext::_query_ctx;
 
-    // ---- Range partition strategy (Option A: uniform split of edge-id range)
-    //
-    // The label_edge B+Tree is sorted lexicographically on (label_id, edge_id);
-    // within a fixed label, records are ordered by the full 64-bit edge_id.
-    // GQL edge ObjectIds carry a constant 8-bit type prefix in the high byte
-    // (MASK_DIRECTED_EDGE = 0xE0'.., MASK_UNDIRECTED_EDGE = 0xE4'..) and a
-    // monotonically increasing 56-bit counter in the low bytes — exactly the
-    // same shape the node-id case uses, so a uniform split of [0, UINT64_MAX]
-    // produces sub-ranges with roughly balanced record counts without paying
-    // for a histogram prepass.
+    // Range partition strategy: same uniform split as Spec #16 original.
     auto ranges = build_uniform_subranges(num_partitions);
 
-    // Phase 1: each worker writes into its own per-partition vector. No
-    // shared mutable state across workers, so no locks. The B+Tree
-    // BufferManager is thread-safe for concurrent reads, so concurrent
-    // get_range iterators on the label_edge tree AND on the secondary
-    // endpoint trees (edge_from_to / edge_n1_n2 / fallback scans) are safe.
-    // Per-edge endpoint lookups stay sequential within each worker — the
-    // win is from N partitions running concurrently, not from batching the
-    // lookups themselves (deferred to a follow-up if profiling justifies it).
-    std::vector<std::vector<EdgeEndpointTriple>> per_partition(num_partitions);
-    for (auto& vec : per_partition) {
-        vec.reserve(64);
+    // ---- Streaming producer-consumer with bounded per-partition queues.
+    //
+    // Original Spec #16 design (collect-then-replay) accumulated all
+    // per-partition triples in std::vector<std::vector<EdgeEndpointTriple>>
+    // before invoking the user callback. For papers100M (1.6 B edges ×
+    // 24 B/triple = 36 GB) this exceeds the 32 GB host RAM and OOMs.
+    //
+    // Streaming fix: each partition has a bounded queue (kQueueMax slots).
+    // Workers push triples; if the queue is full they block on cv_not_full.
+    // The main thread consumes queues in ascending partition order so the
+    // callback sees the bit-identical sequence that the legacy single-
+    // threaded scan would emit. Consumer wakes the worker via cv_not_full
+    // after each drain. Worker batching (kFlushBatch triples per acquire)
+    // amortizes mutex cost — a 64-triple batch = 64× fewer locks than per-
+    // edge synchronization.
+    //
+    // Memory bound: num_partitions × (kQueueMax + kFlushBatch) × 24 B.
+    // With 16 partitions × 1024 + 64 = ~26 KB/partition × 16 = ~420 KB.
+    constexpr std::size_t kQueueMax   = 1024;
+    constexpr std::size_t kFlushBatch = 64;
+
+    struct EdgeQueue {
+        std::mutex              mu;
+        std::condition_variable cv_not_empty;
+        std::condition_variable cv_not_full;
+        std::vector<EdgeEndpointTriple> buffer;
+        bool finished = false;
+    };
+
+    // unique_ptr because std::mutex / std::condition_variable are not
+    // movable — std::vector<EdgeQueue> would not compile.
+    std::vector<std::unique_ptr<EdgeQueue>> queues(num_partitions);
+    for (std::size_t i = 0; i < num_partitions; ++i) {
+        queues[i] = std::make_unique<EdgeQueue>();
+        queues[i]->buffer.reserve(kQueueMax);
     }
 
-    tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, num_partitions, 1),
-        [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
-            // Inherit the parent thread's QueryContext into this worker.
-            // BPT leaf decode requires it (bplus_tree_leaf.cc:301,345);
-            // without this, worker threads dereference a null
-            // thread_local pointer.
-            if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
-                QueryContext::set_query_ctx(parent_ctx);
-            }
-            for (std::size_t p = r.begin(); p < r.end(); ++p) {
-                scan_label_edge_with_endpoints_subrange(
-                    label_edge_index,
-                    edge_from_to_index, from_to_edge_index,
-                    edge_n1_n2_index,   n1_n2_edge_index,
-                    search_type_id,
-                    ranges[p].first, ranges[p].second,
-                    per_partition[p]);
-            }
-        });
+    // Producer thread: launches all workers via TBB parallel_for. Runs in
+    // its own std::thread so the main thread is free to consume in parallel.
+    std::thread producer([&, parent_ctx]() {
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, num_partitions, 1),
+            [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
+                if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
+                    QueryContext::set_query_ctx(parent_ctx);
+                }
+                for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                    EdgeQueue& q = *queues[p];
 
-    // Phase 2 (serial merge): replay collected triples through the user
-    // callback in ascending partition order. The legacy sequential path
-    // visits records in B+Tree key order, and our partitions are disjoint
-    // sub-ranges of that key order, so the merged sequence is bit-identical
-    // to the legacy ordering. Single-threaded replay also means the user
-    // callback (which mutates ParallelEdgeDetector aggregation state in
-    // native_projection_builder.cc) does NOT have to be thread-safe.
+                    // Worker-local batch — accumulated then flushed under one
+                    // lock acquire. Cuts mutex traffic by kFlushBatch×.
+                    std::vector<EdgeEndpointTriple> local_batch;
+                    local_batch.reserve(kFlushBatch);
+
+                    auto flush_batch = [&]() {
+                        if (local_batch.empty()) return;
+                        {
+                            std::unique_lock<std::mutex> lk(q.mu);
+                            q.cv_not_full.wait(lk, [&] {
+                                return q.buffer.size() < kQueueMax;
+                            });
+                            for (auto& t : local_batch) {
+                                q.buffer.push_back(t);
+                            }
+                        }
+                        q.cv_not_empty.notify_one();
+                        local_batch.clear();
+                    };
+
+                    scan_label_edge_with_endpoints_subrange_cb(
+                        label_edge_index,
+                        edge_from_to_index, from_to_edge_index,
+                        edge_n1_n2_index,   n1_n2_edge_index,
+                        search_type_id,
+                        ranges[p].first, ranges[p].second,
+                        [&](ObjectId eid, ObjectId fn, ObjectId tn) {
+                            local_batch.push_back(
+                                EdgeEndpointTriple{eid, fn, tn});
+                            if (local_batch.size() >= kFlushBatch) {
+                                flush_batch();
+                            }
+                        });
+
+                    // Drain remainder, then signal finished so the consumer
+                    // can advance past this partition.
+                    flush_batch();
+                    {
+                        std::lock_guard<std::mutex> lk(q.mu);
+                        q.finished = true;
+                    }
+                    q.cv_not_empty.notify_all();
+                }
+            });
+    });
+
+    // Consumer (main thread): drain each partition queue in order. Each
+    // drain swaps the queue buffer out (so workers can keep producing) and
+    // then invokes the user callback outside the lock — preserves the
+    // single-callback-thread guarantee that ParallelEdgeDetector relies on
+    // (native_projection_builder.cc).
     uint64_t count = 0;
-    for (auto& vec : per_partition) {
-        for (const auto& t : vec) {
-            callback(t.edge_id, t.from_node, t.to_node);
+    std::vector<EdgeEndpointTriple> drained;
+    drained.reserve(kQueueMax);
+    for (std::size_t p = 0; p < num_partitions; ++p) {
+        EdgeQueue& q = *queues[p];
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(q.mu);
+                q.cv_not_empty.wait(lk, [&] {
+                    return !q.buffer.empty() || q.finished;
+                });
+                if (q.buffer.empty() && q.finished) {
+                    break;
+                }
+                drained.swap(q.buffer);
+                q.buffer.reserve(kQueueMax);
+            }
+            q.cv_not_full.notify_all();
+            for (const auto& t : drained) {
+                callback(t.edge_id, t.from_node, t.to_node);
+                ++count;
+            }
+            drained.clear();
         }
-        count += vec.size();
     }
+
+    producer.join();
     return count;
 #else
     // Unreachable (parallel_enabled forced false above when !HAS_TBB).
