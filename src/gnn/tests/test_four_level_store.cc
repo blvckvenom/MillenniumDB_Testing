@@ -1283,11 +1283,19 @@ TEST_F(FourLevelStoreCoordTest, Stats_ResetClears) {
     store.reset_stats();
 
     const auto& stats = store.get_stats();
+    // Existing per-tier node-count counters
     EXPECT_EQ(stats.l1_hits.load(), 0u);
     EXPECT_EQ(stats.l2_hits.load(), 0u);
     EXPECT_EQ(stats.l3_reads.load(), 0u);
     EXPECT_EQ(stats.l4_reads.load(), 0u);
     EXPECT_EQ(stats.total_requests.load(), 0u);
+    // Spec A1 (2026-04-27): byte-level counters must also clear.
+    EXPECT_EQ(stats.l1_bytes_served.load(), 0u);
+    EXPECT_EQ(stats.l2_bytes_served.load(), 0u);
+    EXPECT_EQ(stats.l3_bytes_wanted.load(), 0u);
+    EXPECT_EQ(stats.l3_bytes_disk.load(),   0u);
+    EXPECT_EQ(stats.l4_bytes_wanted.load(), 0u);
+    EXPECT_EQ(stats.l4_bytes_disk.load(),   0u);
 }
 
 // =============================================================================
@@ -1321,6 +1329,78 @@ TEST_F(FourLevelStoreCoordTest, Stats_AccumulateAcrossBatches) {
     uint64_t sum = stats.l1_hits.load() + stats.l2_hits.load()
                  + stats.l3_reads.load() + stats.l4_reads.load();
     EXPECT_EQ(sum, total_nodes);
+}
+
+// =============================================================================
+// Spec A1 (2026-04-27): byte-level counters track served / wanted / disk
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Stats_ByteCountersAccumulate) {
+    auto samples = create_frequency_samples("fls_bytes");
+    auto config = make_config(/*cpu_budget_nodes=*/1, /*reorder=*/false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_bytes"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    // Load all 5 batches so each tier has chances to fire.
+    for (uint64_t b = 0; b < 5; ++b) {
+        store.load_batch_features(b);
+    }
+
+    const auto& stats = store.get_stats();
+    const uint64_t row_bytes = D * sizeof(float);   // 16 B in this fixture
+
+    // Invariant 1: bytes_served / bytes_wanted are exact multiples of row_bytes
+    // — we add row_bytes once per resolved node.
+    EXPECT_EQ(stats.l1_bytes_served.load(), stats.l1_hits.load()         * row_bytes);
+    EXPECT_EQ(stats.l2_bytes_served.load(), stats.l2_hits.load()         * row_bytes);
+    EXPECT_EQ(stats.l4_bytes_wanted.load(), stats.l4_reads.load()        * row_bytes);
+    // l3_bytes_wanted excludes misses; l3_reads counts both hits and misses.
+    // So the row-bytes equivalent of bytes_wanted is <= l3_reads * row_bytes.
+    EXPECT_LE(stats.l3_bytes_wanted.load(), stats.l3_reads.load()        * row_bytes);
+    EXPECT_EQ(stats.l3_bytes_wanted.load() % row_bytes,                   0u);
+
+    // Invariant 2: l4_bytes_disk >= l4_bytes_wanted because the slim file
+    // also holds the per-batch header + OID table, which the per-node
+    // wanted counter doesn't include.
+    EXPECT_GE(stats.l4_bytes_disk.load(), stats.l4_bytes_wanted.load());
+}
+
+// =============================================================================
+// Spec A1: L3 bytes_disk is monotonically >= bytes_wanted (alignment overhead)
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Stats_L3DiskAmplificationMonotone) {
+    auto samples = create_frequency_samples("fls_amp");
+    auto config = make_config(/*cpu_budget_nodes=*/1, /*reorder=*/false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_amp"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    for (uint64_t b = 0; b < 5; ++b) {
+        store.load_batch_features(b);
+    }
+
+    const auto& stats = store.get_stats();
+    // Whether O_DIRECT is active or mmap fallback is used, the wire-up
+    // never under-counts: bytes_disk >= bytes_wanted always.
+    // - O_DIRECT: aligned-up reads inflate bytes_disk by 0..2*(blk-1) per row.
+    // - mmap fallback: bytes_disk == bytes_wanted (no alignment visibility).
+    // - tmpfs (CI): O_DIRECT may transparently fall back; either case keeps
+    //   the invariant.
+    EXPECT_GE(stats.l3_bytes_disk.load(), stats.l3_bytes_wanted.load());
 }
 
 // =============================================================================

@@ -543,3 +543,77 @@ TEST_F(DirectIoReaderTest, NonAlignedRowSizeCora) {
     EXPECT_FLOAT_EQ(r9[0], 10000.0f);    // row 9, dim 0
     EXPECT_FLOAT_EQ(r9[1432], 11432.0f); // row 9, last dim
 }
+
+// =============================================================================
+// Spec A1 (2026-04-27): bytes_disk in ReadResult — paper-comparable accounting
+// =============================================================================
+
+TEST_F(DirectIoReaderTest, BytesDiskMonotone_ReadRows) {
+    // Cora-like row size (5732 B) is intentionally non-aligned so O_DIRECT
+    // padding shows up clearly. With 4 KB blocks, each scattered row needs
+    // ceil((skip + 5732) / 4096) * 4096 bytes — usually 8192, sometimes 12288.
+    constexpr uint64_t HEADER    = 64;
+    constexpr uint64_t DIMS      = 1433;
+    constexpr uint64_t ROW_BYTES = DIMS * sizeof(float);  // 5732
+    constexpr uint64_t ROWS      = 16;
+
+    std::vector<char> data(HEADER + ROWS * ROW_BYTES, 0);
+    auto path = create_raw_file("amp.bin", data);
+
+    DirectIoReader reader(path);
+    auto result = reader.read_rows({0, 3, 7, 11, 15}, ROW_BYTES, HEADER);
+
+    EXPECT_GE(result.bytes_disk, result.size)
+        << "bytes_disk must always be >= size (alignment is monotone overhead)";
+    if (reader.is_direct()) {
+        EXPECT_EQ(result.bytes_disk % 4096u, 0u)
+            << "Under O_DIRECT every read is block-aligned";
+    } else {
+        // Fallback path: bytes_disk should equal the wanted bytes exactly
+        // (plain pread, no alignment inflation).
+        EXPECT_EQ(result.bytes_disk, result.size);
+    }
+}
+
+TEST_F(DirectIoReaderTest, BytesDiskZero_EmptyInput) {
+    auto path = create_raw_file("empty.bin", std::vector<char>(4096, 0));
+    DirectIoReader reader(path);
+
+    // Empty row list — no read should happen.
+    auto r1 = reader.read_rows({}, 16, 0);
+    EXPECT_EQ(r1.size, 0u);
+    EXPECT_EQ(r1.num_rows, 0u);
+    EXPECT_EQ(r1.bytes_disk, 0u);
+
+    // Zero row_bytes — same.
+    auto r2 = reader.read_rows({0}, 0, 0);
+    EXPECT_EQ(r2.bytes_disk, 0u);
+
+    // read_range with size=0 — same.
+    auto r3 = reader.read_range(0, 0);
+    EXPECT_EQ(r3.size, 0u);
+    EXPECT_EQ(r3.bytes_disk, 0u);
+}
+
+TEST_F(DirectIoReaderTest, BytesDiskMonotone_ReadRange) {
+    // Allocate a file large enough that requesting a sub-range from the
+    // middle forces alignment expansion in both directions under O_DIRECT.
+    constexpr uint64_t FILE_SIZE = 64 * 1024;
+    std::vector<char> data(FILE_SIZE, static_cast<char>(0xCD));
+    auto path = create_raw_file("range.bin", data);
+
+    DirectIoReader reader(path);
+    // Read 100 bytes starting at offset 1234 — neither end aligned.
+    auto result = reader.read_range(1234, 100);
+
+    EXPECT_EQ(result.size, 100u);
+    EXPECT_GE(result.bytes_disk, result.size);
+    if (reader.is_direct()) {
+        EXPECT_EQ(result.bytes_disk % 4096u, 0u);
+        // 100 bytes spanning [1234, 1334) lives entirely inside page [0, 4096),
+        // so a single 4 KB aligned read is sufficient.
+        EXPECT_EQ(result.bytes_disk, 4096u);
+    } else {
+        EXPECT_EQ(result.bytes_disk, 100u);
+    }
+}
