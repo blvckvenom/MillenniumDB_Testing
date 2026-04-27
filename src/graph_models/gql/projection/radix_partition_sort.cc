@@ -22,6 +22,7 @@
 
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
+#include "misc/available_ram.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 #include "storage/page/page.h"
@@ -124,22 +125,33 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
     // Stream across all partitions in order. Each partition is already sorted,
     // and radix partitioning ensures partition_i < partition_{i+1} key-wise,
     // so the concatenation is globally sorted.
+    //
+    // Spec #25 fix #4: bulk-read partition records into a 4096-record batch
+    // to amortize per-record fread() overhead.
+    constexpr std::size_t kReadBatch = 4096;
+    std::vector<Record<N>> batch(kReadBatch);
+
     for (const auto& path : sorted_partition_paths) {
         if (!fs::exists(path)) continue;
         typename PartitionFile<N>::Reader reader(path);
-        Record<N> r{};
-        while (reader.next(r)) {
-            if (has_prev && r == prev_record) {
-                continue;  // dedup
-            }
-            prev_record = r;
-            has_prev    = true;
-            ++unique_count;
+        while (true) {
+            std::size_t got = reader.read_batch(batch.data(), kReadBatch);
+            if (got == 0) break;
+            for (std::size_t i = 0; i < got; ++i) {
+                const Record<N>& r = batch[i];
+                if (has_prev && r == prev_record) {
+                    continue;  // dedup
+                }
+                prev_record = r;
+                has_prev    = true;
+                ++unique_count;
 
-            page_records.push_back(r);
-            if (page_records.size() >= max_records_per_leaf) {
-                write_leaf_page(/*is_last_page=*/false);
+                page_records.push_back(r);
+                if (page_records.size() >= max_records_per_leaf) {
+                    write_leaf_page(/*is_last_page=*/false);
+                }
             }
+            if (got < kReadBatch) break;
         }
     }
 
@@ -179,30 +191,39 @@ static std::size_t write_btree_from_sorted_partitions_delta_varint_(
     std::size_t unique_count = 0;
     std::size_t page_count   = 0;   // number of completed page boundary crossings
 
+    // Spec #25 fix #4: bulk-read partition records into a 4096-record batch
+    // (~96 KB at N=3). Pre-fix called PartitionFile::Reader::next() per
+    // record, which routes each call through a function-pointer chain into
+    // libc fread() for a 24-byte read — significant overhead for billions
+    // of records. Bulk-read amortizes the call cost ~4000×.
+    constexpr std::size_t kReadBatch = 4096;
+    std::vector<Record<N>> batch(kReadBatch);
+
     for (const auto& path : sorted_partition_paths) {
         if (!fs::exists(path)) continue;
         typename PartitionFile<N>::Reader reader(path);
-        Record<N> r{};
-        while (reader.next(r)) {
-            if (has_prev && r == prev_record) {
-                continue;  // dedup
-            }
-            prev_record = r;
-            has_prev    = true;
-            ++unique_count;
+        while (true) {
+            std::size_t got = reader.read_batch(batch.data(), kReadBatch);
+            if (got == 0) break;
+            for (std::size_t i = 0; i < got; ++i) {
+                const Record<N>& r = batch[i];
+                if (has_prev && r == prev_record) {
+                    continue;  // dedup
+                }
+                prev_record = r;
+                has_prev    = true;
+                ++unique_count;
 
-            const bool started_new_page = leaf_writer.append_record(r);
-            if (started_new_page) {
-                // `r` is now the first record of page index
-                // current_page_index(). B+Tree convention: the very first
-                // leaf (index 0) does not get a dir entry. Every boundary
-                // crossing happens at page_count >= 1, so we always emit.
-                ++page_count;
-                dir_writer.bulk_insert(
-                    &r,
-                    0,
-                    static_cast<int32_t>(leaf_writer.current_page_index()));
+                const bool started_new_page = leaf_writer.append_record(r);
+                if (started_new_page) {
+                    ++page_count;
+                    dir_writer.bulk_insert(
+                        &r,
+                        0,
+                        static_cast<int32_t>(leaf_writer.current_page_index()));
+                }
             }
+            if (got < kReadBatch) break;  // partial read = EOF
         }
     }
 
@@ -255,16 +276,25 @@ static std::size_t write_btree_from_sorted_partitions_csr_(
         bool        has_prev     = false;
         std::size_t unique_count = 0;
 
+        // Spec #25 fix #4: bulk-read for amortized fread cost.
+        constexpr std::size_t kReadBatch = 4096;
+        std::vector<Record<N>> batch(kReadBatch);
+
         for (const auto& path : sorted_partition_paths) {
             if (!fs::exists(path)) continue;
             typename PartitionFile<N>::Reader reader(path);
-            Record<N> r{};
-            while (reader.next(r)) {
-                if (has_prev && r == prev_record) continue;
-                prev_record = r;
-                has_prev    = true;
-                ++unique_count;
-                leaf_writer.append(r);
+            while (true) {
+                std::size_t got = reader.read_batch(batch.data(), kReadBatch);
+                if (got == 0) break;
+                for (std::size_t i = 0; i < got; ++i) {
+                    const Record<N>& r = batch[i];
+                    if (has_prev && r == prev_record) continue;
+                    prev_record = r;
+                    has_prev    = true;
+                    ++unique_count;
+                    leaf_writer.append(r);
+                }
+                if (got < kReadBatch) break;
             }
         }
 
@@ -351,12 +381,36 @@ RadixPartitionSort<N>::~RadixPartitionSort() {
 
 template<std::size_t N>
 std::uint32_t RadixPartitionSort<N>::radix_bucket(const Record<N>& r) const {
-    // Top bits of record[0] → bucket index.
+    // Bucket from the high COUNTER bits of record[0], skipping the 8-bit
+    // ObjectId type prefix.
+    //
+    // Pre-fix bug: a naïve `r[0] >> (64 - bit_width)` reads the TOP bits of
+    // the id, but ObjectIds in this codebase reserve bits 56-63 for the
+    // type prefix (MASK_NODE = 0xD4, MASK_DIRECTED_EDGE = 0xE0,
+    // MASK_UNDIRECTED_EDGE = 0xE4, etc. — see object_id.h). All records in a
+    // given index share the same type byte, so the top bits are constant
+    // and every record collapses to a single bucket. Phase 2 sort then runs
+    // on a single populated partition, defeating the parallel design.
+    //
+    // Fix: mask off the type prefix and bucket on the next-most-significant
+    // bits of the 56-bit counter. This is still an ORDER-PRESERVING radix
+    // (records that bucket to b are all < records that bucket to b+1 in
+    // sort key order *within the index's homogeneous type space*), so the
+    // Phase 3 concatenation invariant ("walk partitions in bucket order =
+    // globally sorted output") still holds. For indexes where r[0] is a
+    // label_id with very few distinct values (e.g. label_node, label_edge),
+    // this fix doesn't help — partitioning is fundamentally bounded by the
+    // distinct-value count there. The vast majority of edge / node indexes
+    // benefit fully.
     if (num_partitions_ <= 1) return 0;
-    // bit_width(x) = 64 - __builtin_clzll(x) for x > 0 (portable C++17 alt).
     int bit_width = 64 - __builtin_clzll(static_cast<unsigned long long>(num_partitions_ - 1));
-    int shift = 64 - bit_width;
-    return static_cast<std::uint32_t>(r[0] >> shift);
+    // Strip the 8-bit type prefix; counter occupies bits 0-55. Shift so the
+    // top `bit_width` bits of the 56-bit counter become the bucket index.
+    constexpr std::uint64_t kCounterMask = 0x00FFFFFFFFFFFFFFULL;
+    std::uint64_t counter_only = r[0] & kCounterMask;
+    int shift = 56 - bit_width;
+    if (shift < 0) shift = 0;  // safety for num_partitions > 2^56 (unreachable)
+    return static_cast<std::uint32_t>(counter_only >> shift);
 }
 
 template<std::size_t N>
@@ -421,12 +475,21 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
 {
     std::size_t total_written = 0;
 
+    // Spec #25 fix: use adaptive memory budget instead of hardcoded 4 GB.
+    // Pre-fix bug: a hardcoded 4 GB budget capped Phase 2 worker count to
+    // `min(cores - scan_threads, 4 GB / 512 MB) = min(20-10, 8) = 8`
+    // workers on celebi (20 cores). Adaptive sizes to whatever fraction of
+    // MemAvailable is free at sort-phase entry, after the scan phase has
+    // released its streaming buffers. compute_adaptive_sort_buffer respects
+    // the MDB_SORT_BUFFER_MB env override too, so operators can pin a value
+    // for benchmarking without code changes.
+    std::size_t adaptive_memory_budget = compute_adaptive_sort_buffer();
     std::size_t num_workers = compute_num_workers(
         std::thread::hardware_concurrency(),
         (config_.num_scan_threads > 0)
             ? config_.num_scan_threads
             : std::thread::hardware_concurrency() / 2,
-        4ULL * 1024 * 1024 * 1024,  // 4 GB default memory budget
+        adaptive_memory_budget,
         config_.worker_memory_budget,
         config_.num_workers);
     (void)num_workers;  // passed to TBB via default arena; grain 1 already set
@@ -515,10 +578,17 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
 {
     std::vector<Record<N>> buffer;
     {
+        // Spec #25 fix #4: bulk-read into batches, then bulk-append. This
+        // amortizes fread overhead and uses vector::insert (memcpy under the
+        // hood) instead of per-element push_back checks.
+        constexpr std::size_t kReadBatch = 4096;
+        std::vector<Record<N>> batch(kReadBatch);
         typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
-        Record<N> r{};
-        while (reader.next(r)) {
-            buffer.push_back(r);
+        while (true) {
+            std::size_t got = reader.read_batch(batch.data(), kReadBatch);
+            if (got == 0) break;
+            buffer.insert(buffer.end(), batch.begin(), batch.begin() + got);
+            if (got < kReadBatch) break;
         }
     }
 
@@ -588,19 +658,30 @@ void RadixPartitionSort<N>::sort_partition_external(
 
     std::vector<std::string> run_paths;
     {
+        // Spec #25 fix #4: bulk-read instead of per-record fread. Note this
+        // path is for partitions that exceed worker_memory_budget; with
+        // fix #1 (real estimated_count) most partitions hit the in-memory
+        // path instead, so this code is exercised only on degenerate inputs.
         typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
-        Record<N> r{};
+        constexpr std::size_t kReadBatch = 4096;
+        std::vector<Record<N>> batch(kReadBatch);
         std::size_t run_idx = 0;
-        while (reader.next(r)) {
-            chunk.push_back(r);
-            if (chunk.size() >= chunk_cap) {
-                std::sort(chunk.begin(), chunk.end());
-                std::string run_path = sorted_output_path + ".run_" + std::to_string(run_idx++);
-                std::ofstream run_out(run_path, std::ios::binary);
-                run_out.write(reinterpret_cast<const char*>(chunk.data()),
-                              chunk.size() * sizeof(Record<N>));
-                run_paths.push_back(run_path);
-                chunk.clear();
+        bool eof = false;
+        while (!eof) {
+            std::size_t got = reader.read_batch(batch.data(), kReadBatch);
+            if (got == 0) break;
+            if (got < kReadBatch) eof = true;
+            for (std::size_t i = 0; i < got; ++i) {
+                chunk.push_back(batch[i]);
+                if (chunk.size() >= chunk_cap) {
+                    std::sort(chunk.begin(), chunk.end());
+                    std::string run_path = sorted_output_path + ".run_" + std::to_string(run_idx++);
+                    std::ofstream run_out(run_path, std::ios::binary);
+                    run_out.write(reinterpret_cast<const char*>(chunk.data()),
+                                  chunk.size() * sizeof(Record<N>));
+                    run_paths.push_back(run_path);
+                    chunk.clear();
+                }
             }
         }
         if (!chunk.empty()) {

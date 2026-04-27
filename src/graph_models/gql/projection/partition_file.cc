@@ -74,6 +74,18 @@ bool PartitionFile<N>::Reader::next(Record<N>& out) {
     return true;
 }
 
+template<std::size_t N>
+std::size_t PartitionFile<N>::Reader::read_batch(
+    Record<N>* out, std::size_t max_records)
+{
+    if (eof_ || !fp_ || max_records == 0) return 0;
+    std::size_t n = std::fread(out, sizeof(Record<N>), max_records, fp_);
+    if (n < max_records) {
+        eof_ = true;  // hit EOF or short read
+    }
+    return n;
+}
+
 template class PartitionFile<1>;
 template class PartitionFile<2>;
 template class PartitionFile<3>;
