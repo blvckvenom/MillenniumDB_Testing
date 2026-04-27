@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstring>
 #include <thread>
 
@@ -735,4 +736,151 @@ TEST_F(PackedBatchTest, ReaderSkipsOidTableCorrectly) {
     EXPECT_FLOAT_EQ(out[3], 4.0f);
     EXPECT_FLOAT_EQ(out[4], 5.0f);
     EXPECT_FLOAT_EQ(out[5], 6.0f);
+}
+
+// ===========================================================================
+// Spec B1 (2026-04-27): partitioned packer bit-identical to classic
+// ===========================================================================
+
+namespace {
+
+// Helper: assert that two batch directories contain the same set of files
+// and each pair of files is byte-identical. Throws an EXPECT failure on
+// mismatch with a descriptive message. Used by the B1 golden-compare tests.
+void expect_packed_dirs_byte_identical(const fs::path& dir_a,
+                                       const fs::path& dir_b,
+                                       uint64_t expected_batches)
+{
+    for (uint64_t b = 0; b < expected_batches; ++b) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "batch_%06" PRIu64 ".bin", b);
+        auto path_a = dir_a / buf;
+        auto path_b = dir_b / buf;
+
+        ASSERT_TRUE(fs::exists(path_a)) << path_a;
+        ASSERT_TRUE(fs::exists(path_b)) << path_b;
+
+        const auto size_a = fs::file_size(path_a);
+        const auto size_b = fs::file_size(path_b);
+        ASSERT_EQ(size_a, size_b)
+            << "Batch " << b << " size mismatch: " << path_a.string()
+            << " (" << size_a << " B) vs " << path_b.string() << " (" << size_b << " B)";
+
+        std::ifstream fa(path_a, std::ios::binary);
+        std::ifstream fb(path_b, std::ios::binary);
+        std::vector<char> ba(size_a), bb(size_b);
+        if (size_a > 0) {
+            fa.read(ba.data(), static_cast<std::streamsize>(size_a));
+            fb.read(bb.data(), static_cast<std::streamsize>(size_b));
+        }
+        ASSERT_EQ(std::memcmp(ba.data(), bb.data(), size_a), 0)
+            << "Batch " << b << " byte mismatch between classic and partitioned outputs";
+    }
+}
+
+} // anonymous namespace
+
+TEST_F(PackedBatchTest, Partitioned_BitIdenticalToClassic) {
+    // Simple dataset that exercises multiple partitions:
+    // 64 rows × 4 dim → 64 × 16 B = 1024 B total.
+    // Partition size 256 B → 16 rows per partition → 4 partitions.
+    const uint64_t N = 64, D = 4;
+    std::vector<float> features(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) features[i] = static_cast<float>(i);
+
+    auto fmat_path = test_path("b1_iden.fmat");
+    auto fm = FeatureMatrix::create(
+        fmat_path, N, D, GnnDtype::FLOAT32, features.data());
+
+    // 8 batches with mixed-locality assignments (some adjacent, some spread).
+    std::vector<std::vector<uint64_t>> assignments = {
+        {0, 1, 2, 3},        // dense in partition 0
+        {16, 17, 18, 19},    // dense in partition 1
+        {0, 16, 32, 48},     // one row per partition
+        {3, 19, 35, 51},     // one row per partition (different positions)
+        {63, 0, 31, 32},     // wrap and cross
+        {7, 7, 7},           // duplicate row indices in one batch
+        {15, 16},            // straddle partition boundary 0/1
+        {47, 48}             // straddle partition boundary 2/3
+    };
+
+    auto classic_dir     = test_path("b1_iden_classic");
+    auto partitioned_dir = test_path("b1_iden_partitioned");
+
+    generate_packed_batches(fm, assignments, classic_dir);
+
+    // Force partition_bytes = 256 → 16 rows per partition → 4 partitions.
+    generate_packed_batches_partitioned(
+        fm, assignments.size(),
+        [&](uint64_t bid) { return assignments.at(bid); },
+        partitioned_dir, /*partition_bytes=*/256);
+
+    expect_packed_dirs_byte_identical(
+        classic_dir, partitioned_dir, assignments.size());
+}
+
+TEST_F(PackedBatchTest, Partitioned_HandlesEmptyBatches) {
+    const uint64_t N = 16, D = 2;
+    std::vector<float> features(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) features[i] = static_cast<float>(i + 1);
+
+    auto fmat_path = test_path("b1_empty.fmat");
+    auto fm = FeatureMatrix::create(
+        fmat_path, N, D, GnnDtype::FLOAT32, features.data());
+
+    // Mix of empty and populated batches — empty batches should produce
+    // header-only files, identical between paths.
+    std::vector<std::vector<uint64_t>> assignments = {
+        {0, 5, 10},
+        {},                   // empty
+        {3, 7, 11, 15},
+        {},                   // empty
+        {0}                   // single row
+    };
+
+    auto classic_dir     = test_path("b1_empty_classic");
+    auto partitioned_dir = test_path("b1_empty_partitioned");
+
+    generate_packed_batches(fm, assignments, classic_dir);
+    generate_packed_batches_partitioned(
+        fm, assignments.size(),
+        [&](uint64_t bid) { return assignments.at(bid); },
+        partitioned_dir, /*partition_bytes=*/64);  // 8 rows per partition
+
+    expect_packed_dirs_byte_identical(
+        classic_dir, partitioned_dir, assignments.size());
+
+    // Sanity: empty batch files are exactly header_size on disk.
+    EXPECT_EQ(fs::file_size(partitioned_dir / "batch_000001.bin"),
+              PackedBatchHeader::SIZE);
+}
+
+TEST_F(PackedBatchTest, Partitioned_PartitionSmallerThanSingleRow) {
+    // partition_bytes < row_bytes triggers the "round up to 1 row" branch.
+    // Each partition holds exactly 1 row → maximum number of partitions.
+    const uint64_t N = 8, D = 4;   // row_bytes = 16
+    std::vector<float> features(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) features[i] = static_cast<float>(100 + i);
+
+    auto fmat_path = test_path("b1_tiny.fmat");
+    auto fm = FeatureMatrix::create(
+        fmat_path, N, D, GnnDtype::FLOAT32, features.data());
+
+    std::vector<std::vector<uint64_t>> assignments = {
+        {7, 0, 4, 1},
+        {2, 5, 3, 6}
+    };
+
+    auto classic_dir     = test_path("b1_tiny_classic");
+    auto partitioned_dir = test_path("b1_tiny_partitioned");
+
+    generate_packed_batches(fm, assignments, classic_dir);
+    // partition_bytes = 8 < row_bytes = 16 → 1 row per partition, 8 partitions
+    generate_packed_batches_partitioned(
+        fm, assignments.size(),
+        [&](uint64_t bid) { return assignments.at(bid); },
+        partitioned_dir, /*partition_bytes=*/8);
+
+    expect_packed_dirs_byte_identical(
+        classic_dir, partitioned_dir, assignments.size());
 }
