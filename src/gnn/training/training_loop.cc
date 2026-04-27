@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -74,10 +76,28 @@ TrainingLoop::Result TrainingLoop::train()
 
     auto wall_start = std::chrono::steady_clock::now();
 
+    // === Training start banner ============================================
+    const std::string device_str = device.is_cpu() ? "CPU" : "CUDA";
+    std::cout << "\n"
+              << "========================================================\n"
+              << "[TrainingLoop] STARTING TRAINING\n"
+              << "========================================================\n"
+              << "  device:           " << device_str                     << "\n"
+              << "  start_epoch:      " << config_.start_epoch            << "\n"
+              << "  total_epochs:     " << config_.epochs                 << "\n"
+              << "  patience:         " << config_.patience               << "\n"
+              << "  train_batches:    " << train_batches                  << "\n"
+              << "  val_batches:      " << val_batches                    << "\n"
+              << "  seed_best_val:    " << config_.start_best_val         << "\n"
+              << "  seed_patience:    " << config_.start_patience         << "\n"
+              << "========================================================\n"
+              << std::flush;
+
     for (uint64_t epoch = config_.start_epoch;
          epoch < config_.start_epoch + config_.epochs;
          ++epoch)
     {
+        auto epoch_start = std::chrono::steady_clock::now();
 
         // === Training phase ===
         model_.train();
@@ -159,8 +179,32 @@ TrainingLoop::Result TrainingLoop::train()
             });
         }
 
+        // === Per-epoch progress print =====================================
+        auto epoch_end = std::chrono::steady_clock::now();
+        double epoch_seconds = std::chrono::duration<double>(
+            epoch_end - epoch_start).count();
+        auto wall_so_far = std::chrono::duration<double>(
+            epoch_end - wall_start).count();
+        std::cout << "[TrainingLoop] epoch=" << std::setw(3) << (epoch + 1)
+                  << "/" << config_.epochs
+                  << "  loss=" << std::fixed << std::setprecision(4) << avg_loss
+                  << "  val_acc=" << std::fixed << std::setprecision(4) << val_accuracy
+                  << "  best_val=" << std::fixed << std::setprecision(4) << best_val_acc
+                  << "  patience=" << patience_counter << "/" << config_.patience
+                  << "  epoch_t=" << std::fixed << std::setprecision(1) << epoch_seconds << "s"
+                  << "  total_t=" << std::fixed << std::setprecision(0) << wall_so_far << "s"
+                  << (is_best ? "  ★" : "")
+                  << std::endl;
+
         // === Patience check ===
         if (!is_best && patience_counter >= config_.patience) {
+            std::cout << "[TrainingLoop] EARLY STOP — patience "
+                      << patience_counter << " >= " << config_.patience
+                      << " (no val improvement for " << patience_counter
+                      << " epochs).\n"
+                      << "  best_val_acc reached: " << best_val_acc << "\n"
+                      << std::flush;
+
             result.converged = false;
             ++epoch;  // account for this epoch before break
             result.ran_epochs = epoch - config_.start_epoch;
@@ -179,6 +223,13 @@ TrainingLoop::Result TrainingLoop::train()
                 result.epoch_losses[n - 1] - result.epoch_losses[n - 2]
             );
             if (delta < config_.tolerance) {
+                std::cout << "[TrainingLoop] CONVERGED — loss delta "
+                          << std::scientific << delta
+                          << " < tolerance " << config_.tolerance << "\n"
+                          << "  best_val_acc reached: "
+                          << std::fixed << std::setprecision(4) << best_val_acc << "\n"
+                          << std::flush;
+
                 result.converged  = true;
                 result.ran_epochs = (epoch - config_.start_epoch) + 1;
                 result.best_val_accuracy = best_val_acc;
@@ -192,6 +243,12 @@ TrainingLoop::Result TrainingLoop::train()
     }
 
     // Completed all epochs without early stopping
+    std::cout << "[TrainingLoop] EPOCHS COMPLETED — ran all "
+              << config_.epochs << " epochs without early-stop or convergence.\n"
+              << "  best_val_acc reached: "
+              << std::fixed << std::setprecision(4) << best_val_acc << "\n"
+              << std::flush;
+
     result.ran_epochs        = config_.epochs;
     result.best_val_accuracy = best_val_acc;
 

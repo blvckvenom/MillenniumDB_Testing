@@ -1,8 +1,12 @@
 #include "gnn/storage/packed_batch_store.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -236,6 +240,13 @@ void generate_packed_batches(
     size_t row_bytes = features.row_bytes();
     std::vector<char> buffer;
 
+    // Progress reporting cadence: print every 5% of batches or 100 batches.
+    const uint64_t progress_step = std::max<uint64_t>(num_batches / 20, 100);
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::cout << "[Materialize] packing " << num_batches
+              << " batches → " << output_dir.string() << "\n" << std::flush;
+
     for (uint64_t b = 0; b < num_batches; ++b) {
         auto row_ids = batch_provider(b);
         uint64_t N = row_ids.size();
@@ -260,6 +271,21 @@ void generate_packed_batches(
 
         features.extract_rows(row_ids, buffer.data());
         writer.write_batch(b, buffer.data(), N);
+
+        if ((b + 1) % progress_step == 0 || b + 1 == num_batches) {
+            auto t1 = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(t1 - t0).count();
+            double rate = (b + 1) / elapsed;
+            double eta = (num_batches - b - 1) / rate;
+            std::cout << "[Materialize] packed " << (b + 1) << "/"
+                      << num_batches
+                      << " (" << std::fixed << std::setprecision(1)
+                      << (100.0 * (b + 1) / num_batches) << "%)"
+                      << "  rate=" << std::fixed << std::setprecision(1) << rate << "/s"
+                      << "  elapsed=" << std::fixed << std::setprecision(0) << elapsed << "s"
+                      << "  ETA=" << std::fixed << std::setprecision(0) << eta << "s"
+                      << std::endl;
+        }
     }
 }
 

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -66,6 +68,20 @@ BatchMaterializer::Result BatchMaterializer::materialize(
     uint64_t num_batches  = catalog.total_batches;
     uint64_t N            = features.num_rows();
 
+    std::cout << "\n"
+              << "========================================================\n"
+              << "[Materialize] STARTING\n"
+              << "========================================================\n"
+              << "  sample_name:  " << catalog.sample_name      << "\n"
+              << "  feature_name: " << feature_name             << "\n"
+              << "  num_batches:  " << num_batches              << "\n"
+              << "  feature_rows: " << N                        << "\n"
+              << "  feature_cols: " << features.num_cols()      << "\n"
+              << "  reorder:      " << (config.reorder ? "yes" : "no") << "\n"
+              << "  numHashes:    " << config.minhash.num_hashes << "\n"
+              << "========================================================\n"
+              << std::flush;
+
     // --- Output paths ---
     auto gnn_dir        = db_folder / "gnn_features";
     auto reordered_fmat = gnn_dir / (feature_name + "_reordered.fmat");
@@ -112,6 +128,9 @@ BatchMaterializer::Result BatchMaterializer::materialize(
     if (config.reorder) {
         auto l3_start = std::chrono::high_resolution_clock::now();
 
+        std::cout << "[Materialize] L3 reorder phase: building MinHash access graph from "
+                  << num_batches << " batches...\n" << std::flush;
+
         // Step 1: Build access graph from all batches
         MinHashReorderer reorderer(config.minhash);
         reorderer.build_access_graph(num_batches,
@@ -129,9 +148,18 @@ BatchMaterializer::Result BatchMaterializer::materialize(
                 return row_ids;
             });
 
+        std::cout << "[Materialize] computing MinHash permutation over "
+                  << N << " rows..." << std::flush;
+        auto perm_t0 = std::chrono::steady_clock::now();
         // Step 2: Compute permutation + inverse
         auto permutation = reorderer.compute_permutation(N);
         inverse = MinHashReorderer::compute_inverse(permutation);
+        auto perm_t1 = std::chrono::steady_clock::now();
+        std::cout << " done in "
+                  << std::chrono::duration_cast<std::chrono::seconds>(perm_t1 - perm_t0).count()
+                  << "s\n[Materialize] writing reordered feature matrix ("
+                  << (features.num_rows() * features.num_cols() * sizeof(float) / (1024ULL * 1024ULL))
+                  << " MB) → " << reordered_fmat.string() << "\n" << std::flush;
 
         // Step 3a: Create reordered FeatureMatrix
         auto reordered = FeatureMatrix::create_reordered(features, permutation, reordered_fmat);
@@ -189,6 +217,12 @@ BatchMaterializer::Result BatchMaterializer::materialize(
     auto total_end = std::chrono::high_resolution_clock::now();
     result.total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         total_end - total_start).count();
+
+    std::cout << "[Materialize] DONE — total "
+              << (result.total_time_ms / 1000) << "s ("
+              << "reorder=" << (result.reorder_time_ms / 1000) << "s, "
+              << "pack=" << (result.pack_time_ms / 1000) << "s)\n"
+              << std::flush;
 
     return result;
 }
