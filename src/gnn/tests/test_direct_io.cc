@@ -617,3 +617,107 @@ TEST_F(DirectIoReaderTest, BytesDiskMonotone_ReadRange) {
         EXPECT_EQ(result.bytes_disk, 100u);
     }
 }
+
+// =============================================================================
+// Spec A2 (2026-04-27): page-level dedup — merge overlapping aligned regions
+// =============================================================================
+
+TEST_F(DirectIoReaderTest, Dedup_SamePageMultipleRows) {
+    // 4 rows of 512 B each, no header, all sharing the same 4 KB page.
+    // Pre-A2: 4 × 4096 = 16 KB physical reads.
+    // Post-A2: 1 × 4096 = 4 KB (4× reduction in disk traffic).
+    constexpr uint64_t HEADER    = 0;
+    constexpr uint64_t ROW_BYTES = 512;
+    constexpr uint64_t ROWS      = 8;
+
+    auto path = create_test_file("dedup_same_page.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    auto result = reader.read_rows({0, 1, 2, 3}, ROW_BYTES, HEADER);
+
+    EXPECT_EQ(result.num_rows, 4u);
+    EXPECT_EQ(result.size, 4u * ROW_BYTES);  // 2048 B wanted
+
+    if (reader.is_direct()) {
+        // All 4 rows share the same aligned [0, 4096) region — single read.
+        EXPECT_EQ(result.bytes_disk, 4096u)
+            << "Dedup must collapse same-page rows into one 4 KB read";
+    } else {
+        // tmpfs / fallback: pread per row, no alignment overhead.
+        EXPECT_EQ(result.bytes_disk, 4u * ROW_BYTES);
+    }
+
+    // Output data correctness: each row must have its expected pattern.
+    for (uint64_t r = 0; r < 4; ++r) {
+        auto* row = reinterpret_cast<const float*>(
+            result.data.get() + r * ROW_BYTES);
+        EXPECT_FLOAT_EQ(row[0], static_cast<float>((r + 1) * 100 + 1));
+    }
+}
+
+TEST_F(DirectIoReaderTest, Dedup_DisjointRowsNotMerged) {
+    // 2 rows in distant pages — aligned regions do not touch, so dedup
+    // produces 2 separate spans of 4 KB each.
+    constexpr uint64_t HEADER    = 0;
+    constexpr uint64_t ROW_BYTES = 512;
+    constexpr uint64_t ROWS      = 32;  // 4 pages worth of rows (8 rows/page)
+
+    auto path = create_test_file("dedup_disjoint.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    // Row 0 is in page [0, 4096); row 16 is in page [8192, 12288).
+    auto result = reader.read_rows({0, 16}, ROW_BYTES, HEADER);
+
+    EXPECT_EQ(result.num_rows, 2u);
+    EXPECT_EQ(result.size, 2u * ROW_BYTES);
+
+    if (reader.is_direct()) {
+        // Two disjoint pages — no merging, 2 × 4096 = 8 KB.
+        EXPECT_EQ(result.bytes_disk, 8192u);
+    } else {
+        EXPECT_EQ(result.bytes_disk, 2u * ROW_BYTES);
+    }
+
+    // Output correctness.
+    auto* r0 = reinterpret_cast<const float*>(result.data.get());
+    auto* r1 = reinterpret_cast<const float*>(result.data.get() + ROW_BYTES);
+    EXPECT_FLOAT_EQ(r0[0], 101.0f);            // row 0
+    EXPECT_FLOAT_EQ(r1[0], 17.0f * 100 + 1);   // row 16 = 1701
+}
+
+TEST_F(DirectIoReaderTest, Dedup_StraddlePageBoundary) {
+    // Cora-like row size (5732 B) — each row spans ~1.4 pages, so adjacent
+    // rows have aligned regions that touch but do not overlap with one row.
+    // Two adjacent rows share their boundary page → merge into one span.
+    constexpr uint64_t HEADER    = 64;
+    constexpr uint64_t DIMS      = 1433;
+    constexpr uint64_t ROW_BYTES = DIMS * sizeof(float);  // 5732
+    constexpr uint64_t ROWS      = 4;
+
+    auto path = create_test_file("dedup_straddle.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    // Read consecutive rows — their aligned regions span overlapping pages.
+    auto result = reader.read_rows({0, 1}, ROW_BYTES, HEADER);
+
+    EXPECT_EQ(result.num_rows, 2u);
+    EXPECT_EQ(result.size, 2u * ROW_BYTES);
+
+    if (reader.is_direct()) {
+        // Row 0: file_offset=64, end=5796 → aligned [0, 8192).
+        // Row 1: file_offset=5796, end=11528 → aligned [4096, 12288).
+        // Merged: [0, 12288) = 12 KB. Pre-A2 would be 8 + 8 = 16 KB.
+        EXPECT_EQ(result.bytes_disk, 12288u)
+            << "Adjacent rows on shared page must merge to single span";
+    } else {
+        EXPECT_EQ(result.bytes_disk, 2u * ROW_BYTES);
+    }
+
+    // Output correctness — row 0 starts with 101.0, row 1 with 201.0.
+    auto* r0 = reinterpret_cast<const float*>(result.data.get());
+    auto* r1 = reinterpret_cast<const float*>(result.data.get() + ROW_BYTES);
+    EXPECT_FLOAT_EQ(r0[0], 101.0f);
+    EXPECT_FLOAT_EQ(r0[DIMS - 1], static_cast<float>(100 + DIMS));   // 1533
+    EXPECT_FLOAT_EQ(r1[0], 201.0f);
+    EXPECT_FLOAT_EQ(r1[DIMS - 1], static_cast<float>(200 + DIMS));   // 1633
+}
