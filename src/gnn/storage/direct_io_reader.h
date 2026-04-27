@@ -49,9 +49,15 @@ public:
 
     /// Result of a read operation.
     struct ReadResult {
-        AlignedBuffer data;      ///< aligned buffer containing the read data
-        size_t        size;      ///< total bytes in data
-        size_t        num_rows;  ///< number of rows read (0 for read_range)
+        AlignedBuffer data;        ///< aligned buffer containing the read data
+        size_t        size;        ///< useful bytes in data (rows * row_bytes, or `size` for read_range)
+        size_t        num_rows;    ///< number of rows read (0 for read_range)
+        /// Physical bytes read from disk. With O_DIRECT this counts the
+        /// aligned-up read regions, so bytes_disk >= size; the difference
+        /// is read amplification due to block alignment (typically 4 KB).
+        /// With non-O_DIRECT (mmap fallback / tmpfs / NFS), bytes_disk
+        /// equals size — page-cache hits are not measured.
+        size_t        bytes_disk;
     };
 
     /// Read specific rows from a feature file.
@@ -110,7 +116,10 @@ private:
 
     /// Internal: read a single aligned region and copy the relevant sub-range
     /// into the destination buffer. Used when O_DIRECT is active.
-    void read_aligned_region(
+    /// Returns the number of bytes actually read at OS level (== aligned_size
+    /// in O_DIRECT mode, == wanted_bytes otherwise). Caller sums these into
+    /// ReadResult::bytes_disk for paper-comparable disk-traffic accounting.
+    size_t read_aligned_region(
         char* dest,
         uint64_t file_offset,
         uint64_t wanted_bytes

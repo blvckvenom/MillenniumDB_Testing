@@ -147,18 +147,18 @@ void DirectIoReader::advise_dontneed(off_t offset, size_t len) {
 // read_aligned_region — O_DIRECT single-region helper
 // =============================================================================
 
-void DirectIoReader::read_aligned_region(
+size_t DirectIoReader::read_aligned_region(
     char* dest,
     uint64_t file_offset,
     uint64_t wanted_bytes)
 {
-    if (wanted_bytes == 0) return;
+    if (wanted_bytes == 0) return 0;
 
     if (!direct_) {
         // No alignment needed — just pread directly
         pread_all(dest, wanted_bytes, static_cast<off_t>(file_offset));
         advise_dontneed(static_cast<off_t>(file_offset), wanted_bytes);
-        return;
+        return wanted_bytes;
     }
 
     // O_DIRECT path: align offset down, size up
@@ -177,11 +177,12 @@ void DirectIoReader::read_aligned_region(
     }
     uint64_t aligned_size = aligned_end - aligned_off;
 
-    if (aligned_size == 0) return;
+    if (aligned_size == 0) return 0;
 
     auto tmp = alloc_aligned(aligned_size, block_align_);
     pread_all(tmp.get(), aligned_size, static_cast<off_t>(aligned_off));
     std::memcpy(dest, tmp.get() + skip, wanted_bytes);
+    return static_cast<size_t>(aligned_size);
 }
 
 // =============================================================================
@@ -288,7 +289,7 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
     uint64_t data_offset)
 {
     if (row_indices.empty() || row_bytes == 0) {
-        return {AlignedBuffer(nullptr), 0, 0};
+        return {AlignedBuffer(nullptr), 0, 0, 0};
     }
 
     size_t total_bytes = row_indices.size() * row_bytes;
@@ -353,19 +354,26 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
         auto scratch = alloc_aligned(scratch_offset, block_align_);
         submit_io_uring(io_ops, scratch.get(), out.get());
 
-        return {std::move(out), total_bytes, row_indices.size()};
+        // bytes_disk = scratch_offset (sum of all aligned read sizes
+        // submitted to io_uring). Equals total_bytes only if every row
+        // happened to be block-aligned and contiguous; otherwise reflects
+        // alignment overhead — exactly the metric Spec A2 will reduce.
+        return {std::move(out), total_bytes, row_indices.size(), scratch_offset};
     }
 #endif
 
-    // Synchronous path: pread (with alignment handling if O_DIRECT)
+    // Synchronous path: pread (with alignment handling if O_DIRECT).
+    // read_aligned_region returns the OS-level bytes read per call; sum
+    // them for paper-comparable bytes_disk accounting.
+    size_t bytes_disk_total = 0;
     for (const auto& op : ops) {
-        read_aligned_region(
+        bytes_disk_total += read_aligned_region(
             out.get() + op.out_offset,
             op.file_offset,
             row_bytes);
     }
 
-    return {std::move(out), total_bytes, row_indices.size()};
+    return {std::move(out), total_bytes, row_indices.size(), bytes_disk_total};
 }
 
 // =============================================================================
@@ -374,16 +382,16 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
 
 DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t size) {
     if (size == 0) {
-        return {AlignedBuffer(nullptr), 0, 0};
+        return {AlignedBuffer(nullptr), 0, 0, 0};
     }
 
     auto out = alloc_aligned(size, block_align_);
 
     if (!direct_) {
-        // Simple pread path
+        // Simple pread path — no alignment overhead, bytes_disk == size.
         pread_all(out.get(), size, static_cast<off_t>(offset));
         advise_dontneed(static_cast<off_t>(offset), size);
-        return {std::move(out), size, 0};
+        return {std::move(out), size, 0, size};
     }
 
     // O_DIRECT path: read aligned region, extract wanted bytes
@@ -432,7 +440,7 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
         ::io_uring_cqe_seen(&ring_, cqe);
 
         std::memcpy(out.get(), scratch.get() + skip, size);
-        return {std::move(out), size, 0};
+        return {std::move(out), size, 0, static_cast<size_t>(aligned_size)};
     }
 #endif
 
@@ -441,7 +449,7 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
     pread_all(scratch.get(), aligned_size, static_cast<off_t>(aligned_off));
     std::memcpy(out.get(), scratch.get() + skip, size);
 
-    return {std::move(out), size, 0};
+    return {std::move(out), size, 0, static_cast<size_t>(aligned_size)};
 }
 
 } // namespace mdb::gnn
