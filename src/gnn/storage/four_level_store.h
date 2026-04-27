@@ -177,9 +177,31 @@ public:
     torch::Tensor load_batch_features(uint64_t batch_id);
 
     struct Stats {
+        // Per-tier node-count counters (existing).
         std::atomic<uint64_t> l1_hits{0}, l2_hits{0};
         std::atomic<uint64_t> l3_reads{0}, l4_reads{0};
         std::atomic<uint64_t> total_requests{0};
+
+        // Spec A1 (2026-04-27): byte-level counters for paper-comparable
+        // disk-traffic accounting (cf. DiskGNN SIGMOD'25 Table 1
+        // "Disk access volume (GB)").
+        //
+        // *_bytes_served — bytes copied from RAM/GPU caches into output.
+        //                  Useful for hit-rate by data volume vs node count.
+        // l3_bytes_wanted — feature payload bytes extracted from L3.
+        // l3_bytes_disk   — physical bytes read from disk via O_DIRECT.
+        //                   Equals l3_bytes_wanted only if every row was
+        //                   block-aligned and adjacent; otherwise reflects
+        //                   alignment overhead (Spec A2 will reduce it).
+        // l4_bytes_wanted — feature payload bytes extracted from L4 slim.
+        // l4_bytes_disk   — bytes read from slim files (header + OID table
+        //                   + feature data); counted once per batch read.
+        std::atomic<uint64_t> l1_bytes_served{0};
+        std::atomic<uint64_t> l2_bytes_served{0};
+        std::atomic<uint64_t> l3_bytes_wanted{0};
+        std::atomic<uint64_t> l3_bytes_disk{0};
+        std::atomic<uint64_t> l4_bytes_wanted{0};
+        std::atomic<uint64_t> l4_bytes_disk{0};
     };
     Stats& get_stats() { return stats_; }
     const Stats& get_stats() const { return stats_; }
@@ -190,6 +212,12 @@ public:
         stats_.l3_reads.store(0);
         stats_.l4_reads.store(0);
         stats_.total_requests.store(0);
+        stats_.l1_bytes_served.store(0);
+        stats_.l2_bytes_served.store(0);
+        stats_.l3_bytes_wanted.store(0);
+        stats_.l3_bytes_disk.store(0);
+        stats_.l4_bytes_wanted.store(0);
+        stats_.l4_bytes_disk.store(0);
     }
 
     uint64_t feature_dim() const { return feature_dim_; }

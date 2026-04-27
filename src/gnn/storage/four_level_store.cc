@@ -499,6 +499,7 @@ torch::Tensor FourLevelStore::load_features(const std::vector<ObjectId>& oids) {
                             cpu_feats.data_ptr(),
                             row_bytes);
                 stats_.l1_hits++;
+                stats_.l1_bytes_served += row_bytes;
                 continue;
             }
         }
@@ -511,6 +512,7 @@ torch::Tensor FourLevelStore::load_features(const std::vector<ObjectId>& oids) {
                             lr.features.data(),
                             row_bytes);
                 stats_.l2_hits++;
+                stats_.l2_bytes_served += row_bytes;
                 continue;
             }
         }
@@ -524,18 +526,24 @@ torch::Tensor FourLevelStore::load_features(const std::vector<ObjectId>& oids) {
                     std::vector<uint64_t> single_row = {*row};
                     auto result = l3_reader_->read_rows(single_row, row_bytes, l3_header_size_);
                     std::memcpy(out_ptr + i * row_bytes, result.data.get(), row_bytes);
+                    stats_.l3_bytes_disk += result.bytes_disk;
                 } else if (l3_mmap_fb_.has_value()) {
-                    // Mmap fallback path
+                    // Mmap fallback path: page cache mediates, count row_bytes
+                    // as approximation (no aligned-region amplification here).
                     std::memcpy(out_ptr + i * row_bytes,
                                 l3_mmap_fb_->row(*row),
                                 row_bytes);
+                    stats_.l3_bytes_disk += row_bytes;
                 }
                 stats_.l3_reads++;
+                stats_.l3_bytes_wanted += row_bytes;
                 continue;
             }
         }
 
-        // Node not found in any level; leave as zeros
+        // Node not found in any level; leave as zeros (no read happened,
+        // so bytes_wanted/bytes_disk remain unchanged — only l3_reads
+        // increments, mirroring legacy "miss counts as read" semantics).
         stats_.l3_reads++;
     }
 
@@ -600,6 +608,14 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                     read_all(fd, slim_data.data(), data_bytes,
                              slim_path.string());
                 }
+
+                // Spec A1: account for the batch-wide disk traffic of this
+                // slim file (header + OID table + features). Per-node L4
+                // payload bytes (l4_bytes_wanted) are accumulated inside the
+                // partition loop below; this is the actual physical read.
+                stats_.l4_bytes_disk += sizeof(hdr)
+                                      + slim_nodes * sizeof(uint64_t)
+                                      + data_bytes;
             }
         }
     }
@@ -624,6 +640,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             l1_input_positions.push_back(i);
             l1_input_oids.push_back(oid);
             stats_.l1_hits++;
+            stats_.l1_bytes_served += row_bytes;
             continue;
         }
 
@@ -631,6 +648,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         if (cpu_cache_ && cpu_cache_->contains(oid)) {
             l2_positions.push_back(i);
             stats_.l2_hits++;
+            stats_.l2_bytes_served += row_bytes;
             continue;
         }
 
@@ -643,6 +661,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                 l4_positions.push_back(i);
                 l4_slim_indices.push_back(idx);
                 stats_.l4_reads++;
+                stats_.l4_bytes_wanted += row_bytes;
                 continue;
             }
         }
@@ -654,11 +673,13 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                 l3_positions.push_back(i);
                 l3_row_indices.push_back(*row);
                 stats_.l3_reads++;
+                stats_.l3_bytes_wanted += row_bytes;
                 continue;
             }
         }
 
-        // Node not resolved -- leave as zeros, count as L3 miss
+        // Node not resolved -- leave as zeros, count as L3 miss.
+        // No bytes_wanted increment: nothing was actually read.
         stats_.l3_reads++;
     }
 
@@ -669,9 +690,15 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         if (l3_reader_) {
             auto result = l3_reader_->read_rows(l3_row_indices, row_bytes, l3_header_size_);
             l3_buf.assign(result.data.get(), result.data.get() + result.size);
+            // Spec A1: capture O_DIRECT physical bytes (>= wanted due to
+            // 4 KB block alignment overhead — Spec A2 will reduce this).
+            stats_.l3_bytes_disk += result.bytes_disk;
         } else if (l3_mmap_fb_.has_value()) {
             l3_buf.resize(l3_row_indices.size() * row_bytes);
             l3_mmap_fb_->extract_rows(l3_row_indices, l3_buf.data());
+            // Mmap fallback: page cache mediates, so we count row-level
+            // bytes as approximation (no aligned-region amplification visible).
+            stats_.l3_bytes_disk += l3_row_indices.size() * row_bytes;
         }
     }
 
