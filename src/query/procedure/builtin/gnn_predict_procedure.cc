@@ -204,7 +204,8 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     }
 
     // ----- Snapshot cache stats -----
-    // Stats contains atomics (non-copyable); bind by reference.
+    // Stats contains atomics (non-copyable); bind by reference and snapshot
+    // each counter once for a consistent view in the YIELD row.
     const auto& stats = feature_store.get_stats();
     uint64_t l1h = stats.l1_hits.load();
     uint64_t l2h = stats.l2_hits.load();
@@ -213,6 +214,15 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     uint64_t tot = stats.total_requests.load();
     double l1r = tot > 0 ? double(l1h) / double(tot) : 0.0;
     double l2r = tot > 0 ? double(l2h) / double(tot) : 0.0;
+
+    // Spec A1 (2026-04-27): byte-level disk-traffic accounting.
+    uint64_t l3_bytes_disk   = stats.l3_bytes_disk.load();
+    uint64_t l4_bytes_disk   = stats.l4_bytes_disk.load();
+    uint64_t l3_bytes_wanted = stats.l3_bytes_wanted.load();
+    uint64_t total_bytes_disk = l3_bytes_disk + l4_bytes_disk;
+    double l3_amp = l3_bytes_wanted > 0
+        ? double(l3_bytes_disk) / double(l3_bytes_wanted)
+        : 0.0;
 
     // ----- Yields -----
     ctx.yield("checkpointPath",        ctx.create_string(std::filesystem::absolute(ckpt_basename).string()));
@@ -229,6 +239,11 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",            ctx.create_float(static_cast<float>(l2r)));
     ctx.yield("l3Reads",               ctx.create_int(static_cast<int64_t>(l3r_count)));
     ctx.yield("l4Reads",               ctx.create_int(static_cast<int64_t>(l4r_count)));
+    // Spec A1: byte-level disk-traffic surface — paper comparable.
+    ctx.yield("l3BytesDisk",           ctx.create_int(static_cast<int64_t>(l3_bytes_disk)));
+    ctx.yield("l4BytesDisk",           ctx.create_int(static_cast<int64_t>(l4_bytes_disk)));
+    ctx.yield("totalBytesDisk",        ctx.create_int(static_cast<int64_t>(total_bytes_disk)));
+    ctx.yield("l3ReadAmplification",   ctx.create_float(static_cast<float>(l3_amp)));
     ctx.yield_row();
 }
 

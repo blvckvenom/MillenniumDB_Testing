@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -46,19 +47,36 @@ namespace GQL::Procedures {
 // Snapshot of FourLevelStore::Stats values. The Stats struct itself uses
 // std::atomic so it cannot be copied; this POD is the safe transport.
 struct CacheStatsSnapshot {
+    // Per-tier node-count counters (existing).
     uint64_t l1_hits        = 0;
     uint64_t l2_hits        = 0;
     uint64_t l3_reads       = 0;
     uint64_t l4_reads       = 0;
     uint64_t total_requests = 0;
 
+    // Spec A1 (2026-04-27): byte-level counters for paper-comparable
+    // disk-traffic accounting (cf. DiskGNN SIGMOD'25 Table 1
+    // "Disk access volume (GB)").
+    uint64_t l1_bytes_served = 0;
+    uint64_t l2_bytes_served = 0;
+    uint64_t l3_bytes_wanted = 0;
+    uint64_t l3_bytes_disk   = 0;
+    uint64_t l4_bytes_wanted = 0;
+    uint64_t l4_bytes_disk   = 0;
+
     static CacheStatsSnapshot from(const mdb::gnn::FourLevelStore::Stats& s) {
         CacheStatsSnapshot snap;
-        snap.l1_hits        = s.l1_hits.load();
-        snap.l2_hits        = s.l2_hits.load();
-        snap.l3_reads       = s.l3_reads.load();
-        snap.l4_reads       = s.l4_reads.load();
-        snap.total_requests = s.total_requests.load();
+        snap.l1_hits         = s.l1_hits.load();
+        snap.l2_hits         = s.l2_hits.load();
+        snap.l3_reads        = s.l3_reads.load();
+        snap.l4_reads        = s.l4_reads.load();
+        snap.total_requests  = s.total_requests.load();
+        snap.l1_bytes_served = s.l1_bytes_served.load();
+        snap.l2_bytes_served = s.l2_bytes_served.load();
+        snap.l3_bytes_wanted = s.l3_bytes_wanted.load();
+        snap.l3_bytes_disk   = s.l3_bytes_disk.load();
+        snap.l4_bytes_wanted = s.l4_bytes_wanted.load();
+        snap.l4_bytes_disk   = s.l4_bytes_disk.load();
         return snap;
     }
 
@@ -70,6 +88,23 @@ struct CacheStatsSnapshot {
     double l2_hit_ratio() const {
         return total_requests > 0
             ? static_cast<double>(l2_hits) / static_cast<double>(total_requests)
+            : 0.0;
+    }
+
+    // Total physical disk traffic across L3 + L4 — the headline number
+    // comparable to DiskGNN Table 1 column "Disk access volume (GB)".
+    uint64_t total_bytes_disk() const {
+        return l3_bytes_disk + l4_bytes_disk;
+    }
+    // Total useful feature payload extracted from disk tiers.
+    uint64_t total_bytes_wanted() const {
+        return l3_bytes_wanted + l4_bytes_wanted;
+    }
+    // Read amplification on the L3 path: bytes_disk / bytes_wanted.
+    // 1.0 = no overhead. Higher = alignment cost (Spec A2 will reduce it).
+    double l3_read_amplification() const {
+        return l3_bytes_wanted > 0
+            ? static_cast<double>(l3_bytes_disk) / static_cast<double>(l3_bytes_wanted)
             : 0.0;
     }
 };
@@ -140,14 +175,26 @@ static void write_training_log(
     // l1_hit_ratio + l2_hit_ratio + (l3_reads + l4_reads) / total_requests = 1.0
     // when every requested node was resolved (note that l3 also accumulates
     // misses where the node was outside the projection — see four_level_store.cc).
+    //
+    // Spec A1 (2026-04-27): byte-level fields added for paper-comparable
+    // disk-traffic accounting (DiskGNN SIGMOD'25 Table 1 column
+    // "Disk access volume (GB)" = total_bytes_disk).
     f << "  \"cache_stats\": {\n";
-    f << "    \"l1_hits\": "        << cache_stats.l1_hits        << ",\n";
-    f << "    \"l2_hits\": "        << cache_stats.l2_hits        << ",\n";
-    f << "    \"l3_reads\": "       << cache_stats.l3_reads       << ",\n";
-    f << "    \"l4_reads\": "       << cache_stats.l4_reads       << ",\n";
-    f << "    \"total_requests\": " << cache_stats.total_requests << ",\n";
-    f << "    \"l1_hit_ratio\": "   << cache_stats.l1_hit_ratio() << ",\n";
-    f << "    \"l2_hit_ratio\": "   << cache_stats.l2_hit_ratio() << "\n";
+    f << "    \"l1_hits\": "              << cache_stats.l1_hits              << ",\n";
+    f << "    \"l2_hits\": "              << cache_stats.l2_hits              << ",\n";
+    f << "    \"l3_reads\": "             << cache_stats.l3_reads             << ",\n";
+    f << "    \"l4_reads\": "             << cache_stats.l4_reads             << ",\n";
+    f << "    \"total_requests\": "       << cache_stats.total_requests       << ",\n";
+    f << "    \"l1_hit_ratio\": "         << cache_stats.l1_hit_ratio()       << ",\n";
+    f << "    \"l2_hit_ratio\": "         << cache_stats.l2_hit_ratio()       << ",\n";
+    f << "    \"l1_bytes_served\": "      << cache_stats.l1_bytes_served      << ",\n";
+    f << "    \"l2_bytes_served\": "      << cache_stats.l2_bytes_served      << ",\n";
+    f << "    \"l3_bytes_wanted\": "      << cache_stats.l3_bytes_wanted      << ",\n";
+    f << "    \"l3_bytes_disk\": "        << cache_stats.l3_bytes_disk        << ",\n";
+    f << "    \"l4_bytes_wanted\": "      << cache_stats.l4_bytes_wanted      << ",\n";
+    f << "    \"l4_bytes_disk\": "        << cache_stats.l4_bytes_disk        << ",\n";
+    f << "    \"total_bytes_disk\": "     << cache_stats.total_bytes_disk()   << ",\n";
+    f << "    \"l3_read_amplification\": "<< cache_stats.l3_read_amplification() << "\n";
     f << "  }\n";
     f << "}\n";
 
@@ -741,6 +788,21 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     auto cache_stats = CacheStatsSnapshot::from(feature_store.get_stats());
 
+    // Spec A1: headline disk-traffic print so the user sees the
+    // paper-comparable number directly in their server terminal
+    // (alongside the per-epoch lines from training_loop.cc).
+    {
+        constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+        double total_gb = static_cast<double>(cache_stats.total_bytes_disk()) / GB;
+        double l3_gb    = static_cast<double>(cache_stats.l3_bytes_disk)      / GB;
+        double l4_gb    = static_cast<double>(cache_stats.l4_bytes_disk)      / GB;
+        std::cout << "[gnn_train] disk traffic total="
+                  << std::fixed << std::setprecision(2) << total_gb << " GB"
+                  << " (l3=" << l3_gb << ", l4=" << l4_gb << ")"
+                  << "  l3_amplification=" << std::setprecision(3)
+                  << cache_stats.l3_read_amplification() << "x\n";
+    }
+
     // =========================================================================
     // Step 12: Write training log
     // =========================================================================
@@ -762,6 +824,15 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
     ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
     ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
+    // Spec A1: byte-level disk-traffic surface — paper comparable.
+    ctx.yield("l3BytesDisk",
+              ctx.create_int(static_cast<int64_t>(cache_stats.l3_bytes_disk)));
+    ctx.yield("l4BytesDisk",
+              ctx.create_int(static_cast<int64_t>(cache_stats.l4_bytes_disk)));
+    ctx.yield("totalBytesDisk",
+              ctx.create_int(static_cast<int64_t>(cache_stats.total_bytes_disk())));
+    ctx.yield("l3ReadAmplification",
+              ctx.create_float(static_cast<float>(cache_stats.l3_read_amplification())));
     ctx.yield("nodesWritten",    ctx.create_int(static_cast<int64_t>(nodes_written)));
     ctx.yield("nodesInferred",   ctx.create_int(static_cast<int64_t>(nodes_inferred)));
     ctx.yield("inferenceMillis", ctx.create_float(static_cast<float>(inference_ms)));
