@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <stdexcept>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -83,12 +86,16 @@ DirectIoReader::DirectIoReader(const fs::path& file_path) {
     }
 
 #ifdef ENABLE_IO_URING
-    if (::io_uring_queue_init(QUEUE_DEPTH, &ring_, 0) == 0) {
-        ring_initialized_ = true;
-        io_uring_active_  = true;
+    // Spec A3: initialize NUM_RINGS rings (DiskGNN config: 4 rings × 1024 SQEs).
+    // Each ring is independent — one may fail (e.g., RLIMIT_MEMLOCK on old
+    // kernels) while others succeed. We use whichever rings init'd; if zero,
+    // fall back to pread silently.
+    for (auto& slot : rings_) {
+        if (::io_uring_queue_init(QUEUE_DEPTH, &slot.ring, 0) == 0) {
+            slot.initialized  = true;
+            io_uring_active_  = true;
+        }
     }
-    // If io_uring_queue_init fails (e.g., kernel too old, seccomp), fall back
-    // silently to pread. This is not an error.
 #endif
 }
 
@@ -98,8 +105,10 @@ DirectIoReader::DirectIoReader(const fs::path& file_path) {
 
 DirectIoReader::~DirectIoReader() {
 #ifdef ENABLE_IO_URING
-    if (ring_initialized_) {
-        ::io_uring_queue_exit(&ring_);
+    for (auto& slot : rings_) {
+        if (slot.initialized) {
+            ::io_uring_queue_exit(&slot.ring);
+        }
     }
 #endif
     if (fd_ >= 0) {
@@ -191,40 +200,41 @@ size_t DirectIoReader::read_aligned_region(
 
 #ifdef ENABLE_IO_URING
 
-void DirectIoReader::submit_io_uring_spans(
+void DirectIoReader::submit_to_ring(
+    struct io_uring& ring,
     const std::vector<AlignedSpan>& spans,
-    char* scratch_buf)
+    char* scratch_buf,
+    size_t begin,
+    size_t end)
 {
-    size_t submitted = 0;
-    const size_t total_spans = spans.size();
+    size_t submitted = begin;
 
-    while (submitted < total_spans) {
+    while (submitted < end) {
         // Submit up to QUEUE_DEPTH SQEs at a time. One span per SQE.
-        size_t batch_end  = std::min(submitted + QUEUE_DEPTH, total_spans);
+        size_t batch_end  = std::min(submitted + QUEUE_DEPTH, end);
         size_t batch_size = batch_end - submitted;
 
         for (size_t i = submitted; i < batch_end; ++i) {
             const auto& s = spans[i];
-            struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
+            struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring);
             if (!sqe) {
                 // Queue full — should not happen within QUEUE_DEPTH, but handle it
-                ::io_uring_submit(&ring_);
-                // Drain completions for what we submitted so far in this batch
+                ::io_uring_submit(&ring);
                 for (size_t j = submitted; j < i; ++j) {
                     struct io_uring_cqe* cqe;
-                    if (::io_uring_wait_cqe(&ring_, &cqe) < 0) {
+                    if (::io_uring_wait_cqe(&ring, &cqe) < 0) {
                         throw std::runtime_error(
                             "DirectIoReader: io_uring_wait_cqe failed");
                     }
                     if (cqe->res < 0) {
-                        ::io_uring_cqe_seen(&ring_, cqe);
+                        ::io_uring_cqe_seen(&ring, cqe);
                         throw std::runtime_error(
                             "DirectIoReader: io_uring read failed: " +
                             std::string(std::strerror(-cqe->res)));
                     }
-                    ::io_uring_cqe_seen(&ring_, cqe);
+                    ::io_uring_cqe_seen(&ring, cqe);
                 }
-                sqe = ::io_uring_get_sqe(&ring_);
+                sqe = ::io_uring_get_sqe(&ring);
                 if (!sqe) {
                     throw std::runtime_error(
                         "DirectIoReader: io_uring_get_sqe failed after drain");
@@ -238,7 +248,7 @@ void DirectIoReader::submit_io_uring_spans(
             sqe->user_data = static_cast<uint64_t>(i);
         }
 
-        int ret = ::io_uring_submit(&ring_);
+        int ret = ::io_uring_submit(&ring);
         if (ret < 0) {
             throw std::runtime_error(
                 "DirectIoReader: io_uring_submit failed: " +
@@ -247,23 +257,81 @@ void DirectIoReader::submit_io_uring_spans(
 
         for (size_t i = 0; i < batch_size; ++i) {
             struct io_uring_cqe* cqe;
-            if (::io_uring_wait_cqe(&ring_, &cqe) < 0) {
+            if (::io_uring_wait_cqe(&ring, &cqe) < 0) {
                 throw std::runtime_error(
                     "DirectIoReader: io_uring_wait_cqe failed");
             }
             if (cqe->res < 0) {
                 int err = -cqe->res;
-                ::io_uring_cqe_seen(&ring_, cqe);
+                ::io_uring_cqe_seen(&ring, cqe);
                 throw std::runtime_error(
                     "DirectIoReader: io_uring read error: " +
                     std::string(std::strerror(err)));
             }
-            ::io_uring_cqe_seen(&ring_, cqe);
+            ::io_uring_cqe_seen(&ring, cqe);
         }
 
         submitted = batch_end;
     }
-    // No copy step here — caller scatters from scratch via CopyOps.
+}
+
+void DirectIoReader::submit_io_uring_spans(
+    const std::vector<AlignedSpan>& spans,
+    char* scratch_buf)
+{
+    if (spans.empty()) return;
+
+    // Spec A3: collect active rings, partition spans into contiguous chunks
+    // (preserving sequential file_offset ordering within each ring), and
+    // dispatch one std::async thread per ring. Each ring is driven by
+    // exactly one thread — io_uring rings are not internally thread-safe.
+    std::vector<struct io_uring*> active_rings;
+    active_rings.reserve(NUM_RINGS);
+    for (auto& slot : rings_) {
+        if (slot.initialized) active_rings.push_back(&slot.ring);
+    }
+    if (active_rings.empty()) {
+        // Should not happen: io_uring_active_ would be false.
+        throw std::runtime_error(
+            "DirectIoReader: submit_io_uring_spans called without active rings");
+    }
+
+    const size_t N           = active_rings.size();
+    const size_t total_spans = spans.size();
+
+    // Single-ring fast path — avoids the std::async overhead for small reads.
+    if (N == 1 || total_spans <= QUEUE_DEPTH) {
+        submit_to_ring(*active_rings[0], spans, scratch_buf, 0, total_spans);
+        return;
+    }
+
+    // Partition spans into N contiguous chunks. Contiguous (not round-robin)
+    // preserves sequential file_offset ordering within each ring — the
+    // kernel sees N separate sequential streams, each prefetch-friendly.
+    std::vector<std::future<void>> futures;
+    futures.reserve(N);
+    for (size_t r = 0; r < N; ++r) {
+        size_t begin =  r        * total_spans / N;
+        size_t end   = (r + 1)   * total_spans / N;
+        if (begin == end) continue;
+        struct io_uring* ring_ptr = active_rings[r];
+        futures.push_back(std::async(std::launch::async,
+            [this, ring_ptr, &spans, scratch_buf, begin, end]() {
+                submit_to_ring(*ring_ptr, spans, scratch_buf, begin, end);
+            }));
+    }
+
+    // Wait for all rings, propagate the first exception (others continue
+    // safely — each writes to a disjoint slice of scratch, no shared state).
+    std::exception_ptr first_exception = nullptr;
+    for (auto& f : futures) {
+        try {
+            f.get();
+        } catch (...) {
+            if (!first_exception) first_exception = std::current_exception();
+        }
+    }
+    if (first_exception) std::rethrow_exception(first_exception);
 }
 
 #endif // ENABLE_IO_URING
@@ -431,9 +499,20 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
 
 #ifdef ENABLE_IO_URING
     if (io_uring_active_) {
+        // read_range is a single contiguous read — no parallelism benefit.
+        // Use the first available ring; the others stay idle for this call.
+        struct io_uring* ring = nullptr;
+        for (auto& slot : rings_) {
+            if (slot.initialized) { ring = &slot.ring; break; }
+        }
+        if (!ring) {
+            throw std::runtime_error(
+                "DirectIoReader: read_range called without active rings");
+        }
+
         auto scratch = alloc_aligned(aligned_size, block_align_);
 
-        struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
+        struct io_uring_sqe* sqe = ::io_uring_get_sqe(ring);
         if (!sqe) {
             throw std::runtime_error(
                 "DirectIoReader: io_uring_get_sqe failed");
@@ -445,7 +524,7 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
             static_cast<off_t>(aligned_off));
         sqe->user_data = 0;
 
-        int ret = ::io_uring_submit(&ring_);
+        int ret = ::io_uring_submit(ring);
         if (ret < 0) {
             throw std::runtime_error(
                 "DirectIoReader: io_uring_submit failed: " +
@@ -453,18 +532,18 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
         }
 
         struct io_uring_cqe* cqe;
-        if (::io_uring_wait_cqe(&ring_, &cqe) < 0) {
+        if (::io_uring_wait_cqe(ring, &cqe) < 0) {
             throw std::runtime_error(
                 "DirectIoReader: io_uring_wait_cqe failed");
         }
         if (cqe->res < 0) {
             int err = -cqe->res;
-            ::io_uring_cqe_seen(&ring_, cqe);
+            ::io_uring_cqe_seen(ring, cqe);
             throw std::runtime_error(
                 "DirectIoReader: io_uring range read error: " +
                 std::string(std::strerror(err)));
         }
-        ::io_uring_cqe_seen(&ring_, cqe);
+        ::io_uring_cqe_seen(ring, cqe);
 
         std::memcpy(out.get(), scratch.get() + skip, size);
         return {std::move(out), size, 0, static_cast<size_t>(aligned_size)};

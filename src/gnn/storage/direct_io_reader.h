@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -93,9 +94,19 @@ private:
     size_t block_align_ = 4096;
 
 #ifdef ENABLE_IO_URING
-    struct io_uring ring_;
-    bool ring_initialized_ = false;
-    static constexpr unsigned QUEUE_DEPTH = 64;
+    /// Spec A3 (2026-04-27): multiple io_uring rings for parallel submission.
+    /// Each ring is used by exactly one thread (no internal locking) — spans
+    /// are partitioned across rings, then std::async dispatches per-ring
+    /// submit/wait loops. DiskGNN paper config: 4 rings × 1024 SQEs.
+    /// QUEUE_DEPTH=1024 keeps ~4096 SQEs in-flight, saturating NVMe Gen4.
+    static constexpr unsigned NUM_RINGS   = 4;
+    static constexpr unsigned QUEUE_DEPTH = 1024;
+
+    struct RingSlot {
+        struct io_uring ring;
+        bool            initialized = false;
+    };
+    std::array<RingSlot, NUM_RINGS> rings_;
 #endif
 
     /// Allocate aligned memory (required for O_DIRECT).
@@ -147,9 +158,22 @@ private:
     /// Batch-submit reads via io_uring (one read per AlignedSpan) and
     /// collect completions. Caller is responsible for the subsequent
     /// scatter copies via the matching CopyOp list.
+    /// Spec A3: distributes spans across all initialized rings via
+    /// std::async; each ring is driven by a single thread.
     void submit_io_uring_spans(
         const std::vector<AlignedSpan>& spans,
         char* scratch_buf
+    );
+
+    /// Spec A3: per-ring submit/wait loop. Submits spans[begin..end) to
+    /// the given ring in batches of QUEUE_DEPTH SQEs, waits for all
+    /// completions, returns. Throws on ring/IO errors.
+    void submit_to_ring(
+        struct io_uring& ring,
+        const std::vector<AlignedSpan>& spans,
+        char* scratch_buf,
+        size_t begin,
+        size_t end
     );
 #endif
 };
