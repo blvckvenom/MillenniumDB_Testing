@@ -685,6 +685,47 @@ TEST_F(DirectIoReaderTest, Dedup_DisjointRowsNotMerged) {
     EXPECT_FLOAT_EQ(r1[0], 17.0f * 100 + 1);   // row 16 = 1701
 }
 
+// =============================================================================
+// Spec A3 (2026-04-27): multi-ring parallel submission stress test
+// =============================================================================
+
+TEST_F(DirectIoReaderTest, MultiRing_StressManySpans) {
+    // Each row is exactly one 4 KB page, so dedup cannot merge any spans —
+    // 2048 rows produce 2048 distinct spans, exceeding QUEUE_DEPTH=1024.
+    // This forces submit_io_uring_spans to leave the single-ring fast path
+    // and dispatch across multiple rings via std::async.
+    constexpr uint64_t HEADER    = 0;
+    constexpr uint64_t ROW_BYTES = 4096;
+    constexpr uint64_t ROWS      = 2048;
+
+    auto path = create_test_file("multi_ring.bin", HEADER, ROWS, ROW_BYTES);
+    DirectIoReader reader(path);
+
+    std::vector<uint64_t> all_indices(ROWS);
+    for (uint64_t i = 0; i < ROWS; ++i) all_indices[i] = i;
+
+    auto result = reader.read_rows(all_indices, ROW_BYTES, HEADER);
+
+    EXPECT_EQ(result.num_rows, ROWS);
+    EXPECT_EQ(result.size, ROWS * ROW_BYTES);
+
+    if (reader.is_direct()) {
+        // Each row exactly fills one aligned 4 KB block — total bytes_disk
+        // equals the wanted bytes (no alignment overhead per row).
+        EXPECT_EQ(result.bytes_disk, ROWS * ROW_BYTES);
+    }
+
+    // Output correctness across all 2048 rows — verifies the multi-ring
+    // scatter assembled them in original-row order with no cross-thread
+    // data corruption.
+    for (uint64_t r = 0; r < ROWS; ++r) {
+        auto* row = reinterpret_cast<const float*>(
+            result.data.get() + r * ROW_BYTES);
+        EXPECT_FLOAT_EQ(row[0], static_cast<float>((r + 1) * 100 + 1))
+            << "Row " << r << " first float mismatch — multi-ring scatter bug?";
+    }
+}
+
 TEST_F(DirectIoReaderTest, Dedup_StraddlePageBoundary) {
     // Cora-like row size (5732 B) — each row spans ~1.4 pages, so adjacent
     // rows have aligned regions that touch but do not overlap with one row.
