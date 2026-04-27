@@ -207,27 +207,43 @@ void ParallelScanPartitioner<N>::run_parallel_chunked(
 template<std::size_t N>
 std::vector<std::string>
 ParallelScanPartitioner<N>::collect_merged_partition_paths() {
-    // For each partition p, concatenate thread_*/part_p.bin into
-    // scratch_dir_/partition_p.bin.
-    std::vector<std::string> out;
-    out.reserve(num_partitions_);
-    for (std::size_t p = 0; p < num_partitions_; ++p) {
-        std::string merged = fs::path(scratch_dir_) /
-                             ("partition_" + std::to_string(p) + ".bin");
-        std::ofstream sink(merged, std::ios::binary);
-        for (std::size_t t = 0; t < num_scan_threads_; ++t) {
-            std::string src = fs::path(scratch_dir_) /
-                              ("thread_" + std::to_string(t)) /
-                              ("part_" + std::to_string(p) + ".bin");
-            std::ifstream in(src, std::ios::binary);
-            sink << in.rdbuf();
-            fs::remove(src);  // reclaim disk
-        }
-        out.push_back(merged);
-    }
-    // Cleanup per-thread dirs
+    // Pre-fix: this loop concatenated thread_*/part_p.bin into
+    // partition_p.bin sequentially across `num_partitions_ * num_scan_threads_`
+    // (file_open + read + write + remove) operations. For papers100M with
+    // 128 partitions × 10 scan threads = 1280 files (~38 GB total I/O),
+    // the merge alone took ~10 min on a single thread, leaving 9 cores idle.
+    //
+    // Fix: dispatch one TBB task per partition. Each task does its own
+    // open/read/write/remove on its sub-tree. The output paths array is
+    // pre-sized so each worker writes to its own slot — no shared mutable
+    // state, no locks. Per-thread dir cleanup remains serial (cheap, just
+    // rmdir on N empty directories).
+    std::vector<std::string> out(num_partitions_);
+
+    tbb::parallel_for(
+        tbb::blocked_range<std::size_t>(0, num_partitions_, 1),
+        [&](const tbb::blocked_range<std::size_t>& r) {
+            for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                std::string merged = fs::path(scratch_dir_) /
+                                     ("partition_" + std::to_string(p) + ".bin");
+                std::ofstream sink(merged, std::ios::binary);
+                for (std::size_t t = 0; t < num_scan_threads_; ++t) {
+                    std::string src = fs::path(scratch_dir_) /
+                                      ("thread_" + std::to_string(t)) /
+                                      ("part_" + std::to_string(p) + ".bin");
+                    std::ifstream in(src, std::ios::binary);
+                    sink << in.rdbuf();
+                    std::error_code ec;
+                    fs::remove(src, ec);  // reclaim disk; ignore missing-file races
+                }
+                out[p] = merged;
+            }
+        });
+
+    // Cleanup per-thread dirs (now empty after parallel removes above).
     for (std::size_t t = 0; t < num_scan_threads_; ++t) {
-        fs::remove_all(fs::path(scratch_dir_) / ("thread_" + std::to_string(t)));
+        std::error_code ec;
+        fs::remove_all(fs::path(scratch_dir_) / ("thread_" + std::to_string(t)), ec);
     }
     return out;
 }
