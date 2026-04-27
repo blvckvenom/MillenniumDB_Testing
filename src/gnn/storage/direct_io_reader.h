@@ -125,20 +125,31 @@ private:
         uint64_t wanted_bytes
     );
 
-#ifdef ENABLE_IO_URING
-    /// Batch-submit reads via io_uring and collect completions.
-    struct IoOp {
-        uint64_t file_offset;   ///< aligned offset in file
-        uint64_t aligned_size;  ///< aligned read size
-        size_t   buf_offset;    ///< offset in aligned scratch buffer
-        size_t   dest_offset;   ///< offset in output buffer
-        uint64_t skip;          ///< bytes to skip from start of aligned read
-        uint64_t wanted;        ///< actual bytes needed
+    /// Spec A2 (2026-04-27): aligned span used by the read_rows dedup path.
+    /// Multiple wanted rows can share a single AlignedSpan when their
+    /// aligned regions overlap or are adjacent — typical for papers100M
+    /// where 8 rows of 512 B share a single 4 KB page after MinHash reorder.
+    struct AlignedSpan {
+        uint64_t aligned_off;   ///< block-aligned start offset in file
+        uint64_t aligned_size;  ///< block-aligned size (always multiple of block_align_)
+        size_t   buf_offset;    ///< offset within scratch buffer
     };
-    void submit_io_uring(
-        const std::vector<IoOp>& ops,
-        char* aligned_buf,
-        char* out_buf
+
+    /// Spec A2: per-row scatter copy from a deduped scratch span to output.
+    struct CopyOp {
+        size_t   span_idx;      ///< index into AlignedSpan vector
+        size_t   src_in_span;   ///< byte offset within the merged span
+        size_t   dest_offset;   ///< byte offset in output buffer
+        size_t   wanted;        ///< bytes to copy (equals row_bytes)
+    };
+
+#ifdef ENABLE_IO_URING
+    /// Batch-submit reads via io_uring (one read per AlignedSpan) and
+    /// collect completions. Caller is responsible for the subsequent
+    /// scatter copies via the matching CopyOp list.
+    void submit_io_uring_spans(
+        const std::vector<AlignedSpan>& spans,
+        char* scratch_buf
     );
 #endif
 };

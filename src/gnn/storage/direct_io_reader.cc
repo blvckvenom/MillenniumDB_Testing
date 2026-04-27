@@ -191,21 +191,20 @@ size_t DirectIoReader::read_aligned_region(
 
 #ifdef ENABLE_IO_URING
 
-void DirectIoReader::submit_io_uring(
-    const std::vector<IoOp>& ops,
-    char* aligned_buf,
-    char* out_buf)
+void DirectIoReader::submit_io_uring_spans(
+    const std::vector<AlignedSpan>& spans,
+    char* scratch_buf)
 {
     size_t submitted = 0;
-    size_t total_ops = ops.size();
+    const size_t total_spans = spans.size();
 
-    while (submitted < total_ops) {
-        // Submit up to QUEUE_DEPTH at a time
-        size_t batch_end = std::min(submitted + QUEUE_DEPTH, total_ops);
+    while (submitted < total_spans) {
+        // Submit up to QUEUE_DEPTH SQEs at a time. One span per SQE.
+        size_t batch_end  = std::min(submitted + QUEUE_DEPTH, total_spans);
         size_t batch_size = batch_end - submitted;
 
         for (size_t i = submitted; i < batch_end; ++i) {
-            const auto& op = ops[i];
+            const auto& s = spans[i];
             struct io_uring_sqe* sqe = ::io_uring_get_sqe(&ring_);
             if (!sqe) {
                 // Queue full — should not happen within QUEUE_DEPTH, but handle it
@@ -225,7 +224,6 @@ void DirectIoReader::submit_io_uring(
                     }
                     ::io_uring_cqe_seen(&ring_, cqe);
                 }
-                // Retry getting SQE
                 sqe = ::io_uring_get_sqe(&ring_);
                 if (!sqe) {
                     throw std::runtime_error(
@@ -234,9 +232,9 @@ void DirectIoReader::submit_io_uring(
             }
             ::io_uring_prep_read(
                 sqe, fd_,
-                aligned_buf + op.buf_offset,
-                static_cast<unsigned>(op.aligned_size),
-                static_cast<off_t>(op.file_offset));
+                scratch_buf + s.buf_offset,
+                static_cast<unsigned>(s.aligned_size),
+                static_cast<off_t>(s.aligned_off));
             sqe->user_data = static_cast<uint64_t>(i);
         }
 
@@ -247,7 +245,6 @@ void DirectIoReader::submit_io_uring(
                 std::string(std::strerror(-ret)));
         }
 
-        // Collect completions
         for (size_t i = 0; i < batch_size; ++i) {
             struct io_uring_cqe* cqe;
             if (::io_uring_wait_cqe(&ring_, &cqe) < 0) {
@@ -264,17 +261,9 @@ void DirectIoReader::submit_io_uring(
             ::io_uring_cqe_seen(&ring_, cqe);
         }
 
-        // Copy wanted bytes from aligned scratch to output
-        for (size_t i = submitted; i < batch_end; ++i) {
-            const auto& op = ops[i];
-            std::memcpy(
-                out_buf + op.dest_offset,
-                aligned_buf + op.buf_offset + op.skip,
-                op.wanted);
-        }
-
         submitted = batch_end;
     }
+    // No copy step here — caller scatters from scratch via CopyOps.
 }
 
 #endif // ENABLE_IO_URING
@@ -316,64 +305,102 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
                   return a.file_offset < b.file_offset;
               });
 
-#ifdef ENABLE_IO_URING
-    if (io_uring_active_ && direct_) {
-        // Build aligned I/O operations for io_uring batch submission
-        std::vector<IoOp> io_ops;
-        io_ops.reserve(ops.size());
-        size_t scratch_offset = 0;
-
+    // ----- Non-direct: per-row pread (no alignment overhead, no dedup) -----
+    // tmpfs / NFS / older kernels fall here. bytes_disk == size in this mode
+    // because the OS hides page-cache reads behind pread.
+    if (!direct_) {
+        size_t bytes_disk_total = 0;
         for (const auto& op : ops) {
-            uint64_t aligned_off  = align_down(op.file_offset, block_align_);
-            uint64_t skip         = op.file_offset - aligned_off;
-            uint64_t end          = op.file_offset + row_bytes;
-            uint64_t aligned_end  = align_up(end, block_align_);
-            // Clamp to aligned file size
-            uint64_t aligned_fs   = align_up(file_size_, block_align_);
-            if (aligned_end > aligned_fs) aligned_end = aligned_fs;
-            uint64_t aligned_size = aligned_end - aligned_off;
-
-            // C3: Overflow check before accumulating scratch_offset
-            if (scratch_offset > SIZE_MAX - aligned_size) {
-                throw std::overflow_error(
-                    "DirectIoReader: scratch buffer size overflow");
-            }
-
-            io_ops.push_back({
-                aligned_off,
-                aligned_size,
-                scratch_offset,
-                op.out_offset,
-                skip,
-                row_bytes
-            });
-            scratch_offset += aligned_size;
+            bytes_disk_total += read_aligned_region(
+                out.get() + op.out_offset,
+                op.file_offset,
+                row_bytes);
         }
-
-        // Allocate a single aligned scratch buffer for all aligned reads
-        auto scratch = alloc_aligned(scratch_offset, block_align_);
-        submit_io_uring(io_ops, scratch.get(), out.get());
-
-        // bytes_disk = scratch_offset (sum of all aligned read sizes
-        // submitted to io_uring). Equals total_bytes only if every row
-        // happened to be block-aligned and contiguous; otherwise reflects
-        // alignment overhead — exactly the metric Spec A2 will reduce.
-        return {std::move(out), total_bytes, row_indices.size(), scratch_offset};
+        return {std::move(out), total_bytes, row_indices.size(), bytes_disk_total};
     }
-#endif
 
-    // Synchronous path: pread (with alignment handling if O_DIRECT).
-    // read_aligned_region returns the OS-level bytes read per call; sum
-    // them for paper-comparable bytes_disk accounting.
-    size_t bytes_disk_total = 0;
+    // ----- O_DIRECT: page-level dedup (Spec A2, 2026-04-27) -----
+    // Walk sorted ops, merging consecutive aligned regions when they overlap
+    // or are adjacent. Each merged AlignedSpan becomes one io_uring/pread
+    // read; CopyOps record where to scatter wanted bytes back to output.
+    std::vector<AlignedSpan> spans;
+    std::vector<CopyOp>      copies;
+    spans.reserve(ops.size());
+    copies.reserve(ops.size());
+
+    const uint64_t aligned_fs = align_up(file_size_, block_align_);
+
     for (const auto& op : ops) {
-        bytes_disk_total += read_aligned_region(
-            out.get() + op.out_offset,
-            op.file_offset,
-            row_bytes);
+        uint64_t aligned_off = align_down(op.file_offset, block_align_);
+        uint64_t end         = op.file_offset + row_bytes;
+        if (end > file_size_) end = file_size_;
+        uint64_t aligned_end = align_up(end, block_align_);
+        if (aligned_end > aligned_fs) aligned_end = aligned_fs;
+
+        if (!spans.empty()) {
+            auto& last = spans.back();
+            uint64_t last_end = last.aligned_off + last.aligned_size;
+            if (aligned_off <= last_end) {
+                // Merge: extend the existing span to cover this row's region.
+                // The `<=` (not `<`) collapses adjacent spans where one ends
+                // exactly where the next begins — common after sort + MinHash
+                // reorder, when hot rows cluster within / across page borders.
+                uint64_t new_end = std::max(last_end, aligned_end);
+                last.aligned_size = new_end - last.aligned_off;
+                size_t src = static_cast<size_t>(op.file_offset - last.aligned_off);
+                copies.push_back({spans.size() - 1, src, op.out_offset,
+                                  static_cast<size_t>(row_bytes)});
+                continue;
+            }
+        }
+        // Disjoint — open a new span.
+        spans.push_back({aligned_off, aligned_end - aligned_off, 0});
+        size_t src = static_cast<size_t>(op.file_offset - aligned_off);
+        copies.push_back({spans.size() - 1, src, op.out_offset,
+                          static_cast<size_t>(row_bytes)});
     }
 
-    return {std::move(out), total_bytes, row_indices.size(), bytes_disk_total};
+    // Assign cumulative buf_offset to each span (overflow-checked).
+    size_t scratch_total = 0;
+    for (auto& s : spans) {
+        if (scratch_total > SIZE_MAX - s.aligned_size) {
+            throw std::overflow_error(
+                "DirectIoReader: scratch buffer size overflow");
+        }
+        s.buf_offset = scratch_total;
+        scratch_total += s.aligned_size;
+    }
+
+    auto scratch = alloc_aligned(scratch_total, block_align_);
+
+#ifdef ENABLE_IO_URING
+    if (io_uring_active_) {
+        submit_io_uring_spans(spans, scratch.get());
+    } else
+#endif
+    {
+        // Synchronous direct: pread per merged span.
+        for (const auto& s : spans) {
+            pread_all(scratch.get() + s.buf_offset,
+                      static_cast<size_t>(s.aligned_size),
+                      static_cast<off_t>(s.aligned_off));
+        }
+    }
+
+    // Scatter wanted bytes from scratch to output positions.
+    for (const auto& c : copies) {
+        const auto& s = spans[c.span_idx];
+        std::memcpy(out.get() + c.dest_offset,
+                    scratch.get() + s.buf_offset + c.src_in_span,
+                    c.wanted);
+    }
+
+    // bytes_disk == scratch_total == sum of merged aligned sizes. With
+    // perfect dedup (all rows share one page) this approaches one block;
+    // without dedup (rows in distinct pages) it equals the per-row sum.
+    // The l3_read_amplification metric (bytes_disk / bytes_wanted)
+    // typically moves from ~8× pre-A2 to ~2-4× after MinHash clustering.
+    return {std::move(out), total_bytes, row_indices.size(), scratch_total};
 }
 
 // =============================================================================
