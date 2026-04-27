@@ -49,14 +49,14 @@ if(CUDAToolkit_FOUND)
         ops/gpu_transform.cu
         tests/benchmark_gpu_kernels.cu
     )
-    target_link_libraries(mdb_gpu PRIVATE CUDA::cudart)
+    target_link_libraries(mdb_gpu PUBLIC CUDA::cudart)
     target_compile_definitions(mdb_gpu PUBLIC MDB_GPU_ENABLED)
 
-    # Multi-architecture: Turing through Hopper + PTX forward-compat
+    # Multi-architecture: Turing through Hopper + Blackwell + PTX forward-compat
     set_target_properties(mdb_gpu PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
-        CUDA_ARCHITECTURES "75;80;86;89;90"
+        CUDA_ARCHITECTURES "75;80;86;89;90;120"
     )
 
     message(STATUS "GPU module: CUDA enabled (${CUDAToolkit_VERSION})")
