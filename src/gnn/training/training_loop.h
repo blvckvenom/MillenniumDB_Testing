@@ -72,6 +72,17 @@ public:
         uint64_t             start_patience  = 0;
         double               start_best_val  = 0.0;
         std::vector<double>  seed_losses;
+
+        // Spec B2 (2026-04-27): optional cumulative-disk-bytes provider.
+        // If set, train() invokes it once before the first epoch and once
+        // at the end of each epoch, computes the per-epoch delta, and
+        // prints the L3+L4 disk-traffic delta inline on the per-epoch
+        // progress line. Returns a single uint64_t (not a struct) to keep
+        // the Config struct's ABI stable across translation units —
+        // CacheStatsSnapshot lives in a separate header that callers
+        // can include without forcing TrainingLoop's TU to depend on
+        // the four-level cache implementation.
+        std::function<uint64_t()> cumulative_disk_bytes_provider;
     };
 
     // =========================================================================

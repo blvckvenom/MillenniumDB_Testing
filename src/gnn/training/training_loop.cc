@@ -66,6 +66,15 @@ TrainingLoop::Result TrainingLoop::train()
     double   best_val_acc     = config_.start_best_val;
     uint64_t patience_counter = config_.start_patience;
 
+    // Spec B2 (2026-04-27): seed prev_disk before the loop so the first
+    // epoch's delta == bytes accrued during epoch 0 (not since process start).
+    // When provider is unset, prev/cur/delta stay zero and the conditional
+    // print below is suppressed, preserving pre-B2 line format.
+    uint64_t prev_disk = 0;
+    if (config_.cumulative_disk_bytes_provider) {
+        prev_disk = config_.cumulative_disk_bytes_provider();
+    }
+
     // Prepend seed_losses into result so epoch_losses history is contiguous
     for (double l : config_.seed_losses) {
         result.epoch_losses.push_back(l);
@@ -152,6 +161,17 @@ TrainingLoop::Result TrainingLoop::train()
         // === Validation phase ===
         double val_accuracy = evaluate(train_batches, val_batches);
 
+        // Spec B2: capture cumulative L3+L4 disk bytes post-validation so
+        // the delta covers train + eval activity for this epoch. The
+        // single uint64_t return keeps the Config callback ABI-stable.
+        uint64_t cur_disk = 0;
+        uint64_t delta_disk = 0;
+        if (config_.cumulative_disk_bytes_provider) {
+            cur_disk    = config_.cumulative_disk_bytes_provider();
+            delta_disk  = cur_disk - prev_disk;
+            prev_disk   = cur_disk;
+        }
+
         // === Check if this epoch improved (BEFORE updating best_val_acc) ===
         // Capture is_best with the same strict comparator used below to update
         // best_val_acc, so callback consumers see a consistent "improved?" flag.
@@ -192,9 +212,18 @@ TrainingLoop::Result TrainingLoop::train()
                   << "  best_val=" << std::fixed << std::setprecision(4) << best_val_acc
                   << "  patience=" << patience_counter << "/" << config_.patience
                   << "  epoch_t=" << std::fixed << std::setprecision(1) << epoch_seconds << "s"
-                  << "  total_t=" << std::fixed << std::setprecision(0) << wall_so_far << "s"
-                  << (is_best ? "  ★" : "")
-                  << std::endl;
+                  << "  total_t=" << std::fixed << std::setprecision(0) << wall_so_far << "s";
+        // Spec B2: per-epoch L3+L4 disk-traffic delta inline. Suppressed
+        // when provider is unset (delta stays zero) or the delta is
+        // < 1 MB (dominant case for small datasets where the line would
+        // just clutter).
+        if (delta_disk >= (1ULL << 20)) {  // >= 1 MB
+            constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+            std::cout << "  io_disk="
+                      << std::fixed << std::setprecision(2)
+                      << (static_cast<double>(delta_disk) / GB) << "GB";
+        }
+        std::cout << (is_best ? "  ★" : "") << std::endl;
 
         // === Patience check ===
         if (!is_best && patience_counter >= config_.patience) {

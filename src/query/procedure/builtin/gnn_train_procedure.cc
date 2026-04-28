@@ -22,6 +22,7 @@
 #include "gnn/projection/gnn_meta.h"
 #include "gnn/sampling/sample_catalog.h"
 #include "gnn/sampling/sample_storage.h"
+#include "gnn/storage/cache_stats_snapshot.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
@@ -44,70 +45,11 @@ namespace GQL::Procedures {
 // Helper: write training_log.json
 // =============================================================================
 
-// Snapshot of FourLevelStore::Stats values. The Stats struct itself uses
-// std::atomic so it cannot be copied; this POD is the safe transport.
-struct CacheStatsSnapshot {
-    // Per-tier node-count counters (existing).
-    uint64_t l1_hits        = 0;
-    uint64_t l2_hits        = 0;
-    uint64_t l3_reads       = 0;
-    uint64_t l4_reads       = 0;
-    uint64_t total_requests = 0;
-
-    // Spec A1 (2026-04-27): byte-level counters for paper-comparable
-    // disk-traffic accounting (cf. DiskGNN SIGMOD'25 Table 1
-    // "Disk access volume (GB)").
-    uint64_t l1_bytes_served = 0;
-    uint64_t l2_bytes_served = 0;
-    uint64_t l3_bytes_wanted = 0;
-    uint64_t l3_bytes_disk   = 0;
-    uint64_t l4_bytes_wanted = 0;
-    uint64_t l4_bytes_disk   = 0;
-
-    static CacheStatsSnapshot from(const mdb::gnn::FourLevelStore::Stats& s) {
-        CacheStatsSnapshot snap;
-        snap.l1_hits         = s.l1_hits.load();
-        snap.l2_hits         = s.l2_hits.load();
-        snap.l3_reads        = s.l3_reads.load();
-        snap.l4_reads        = s.l4_reads.load();
-        snap.total_requests  = s.total_requests.load();
-        snap.l1_bytes_served = s.l1_bytes_served.load();
-        snap.l2_bytes_served = s.l2_bytes_served.load();
-        snap.l3_bytes_wanted = s.l3_bytes_wanted.load();
-        snap.l3_bytes_disk   = s.l3_bytes_disk.load();
-        snap.l4_bytes_wanted = s.l4_bytes_wanted.load();
-        snap.l4_bytes_disk   = s.l4_bytes_disk.load();
-        return snap;
-    }
-
-    double l1_hit_ratio() const {
-        return total_requests > 0
-            ? static_cast<double>(l1_hits) / static_cast<double>(total_requests)
-            : 0.0;
-    }
-    double l2_hit_ratio() const {
-        return total_requests > 0
-            ? static_cast<double>(l2_hits) / static_cast<double>(total_requests)
-            : 0.0;
-    }
-
-    // Total physical disk traffic across L3 + L4 — the headline number
-    // comparable to DiskGNN Table 1 column "Disk access volume (GB)".
-    uint64_t total_bytes_disk() const {
-        return l3_bytes_disk + l4_bytes_disk;
-    }
-    // Total useful feature payload extracted from disk tiers.
-    uint64_t total_bytes_wanted() const {
-        return l3_bytes_wanted + l4_bytes_wanted;
-    }
-    // Read amplification on the L3 path: bytes_disk / bytes_wanted.
-    // 1.0 = no overhead. Higher = alignment cost (Spec A2 will reduce it).
-    double l3_read_amplification() const {
-        return l3_bytes_wanted > 0
-            ? static_cast<double>(l3_bytes_disk) / static_cast<double>(l3_bytes_wanted)
-            : 0.0;
-    }
-};
+// Spec B2 (2026-04-27): CacheStatsSnapshot moved to a public header so
+// TrainingLoop can take it as a callback return type. Re-export under the
+// GQL::Procedures namespace via using-alias to keep this file's internal
+// references unqualified.
+using CacheStatsSnapshot = mdb::gnn::CacheStatsSnapshot;
 
 static void write_training_log(
     const fs::path&                          output_dir,
@@ -675,6 +617,17 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     auto ckpt_dir = output_dir / "checkpoints";
     mdb::gnn::AutoCheckpointer autockpt(
         model, optimizer, ckpt_dir, base_state, ac_policy);
+
+    // Spec B2 (2026-04-27): wire cumulative L3+L4 disk-bytes provider so
+    // the training loop can compute per-epoch deltas inline. Returns a
+    // single uint64_t (not a struct) to keep TrainingLoop::Config ABI
+    // stable across translation units. Captured by reference —
+    // feature_store outlives the lambda.
+    loop_config.cumulative_disk_bytes_provider =
+        [&feature_store]() -> uint64_t {
+            const auto& s = feature_store.get_stats();
+            return s.l3_bytes_disk.load() + s.l4_bytes_disk.load();
+        };
 
     loop_config.on_epoch_end = [&autockpt](const mdb::gnn::TrainingLoop::EpochEvent& e) {
         autockpt.on_epoch_end(e);
