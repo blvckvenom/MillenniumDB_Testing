@@ -38,19 +38,36 @@ void Jaccard::_reset()
     std::array<uint64_t, 3> min_ids = { 0, 0, 0 };
     std::array<uint64_t, 3> max_ids = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
 
-    auto edge_iter = gql_model.get_n1_n2_edge().get_range(
+    std::map<uint64_t, std::set<uint64_t>> adjacency;
+
+    auto undirected_edge_iter = gql_model.get_n1_n2_edge().get_range(
         &get_query_ctx().thread_info.interruption_requested,
         min_ids,
         max_ids
     );
-
-    std::map<uint64_t, std::set<uint64_t>> adjacency;
-    while (const auto* current_record = edge_iter.next()) {
+    while (const auto* current_record = undirected_edge_iter.next()) {
         const auto node1 = (*current_record)[0];
         const auto node2 = (*current_record)[1];
+
+        // Undirected edge contributes both ways: node1~node2 => neighbors(node1)+=node2 and neighbors(node2)+=node1
         adjacency[node1].insert(node2);
         adjacency[node2].insert(node1);
     }
+
+    auto directed_edge_iter = gql_model.get_from_to_edge().get_range(
+        &get_query_ctx().thread_info.interruption_requested,
+        min_ids,
+        max_ids
+    );
+    while (const auto* current_record = directed_edge_iter.next()) {
+        const auto from = (*current_record)[0];
+        const auto to   = (*current_record)[1];
+
+        // Directed edge contributes only in outgoing direction: from->to => neighbors(from)+=to
+        adjacency[from].insert(to);
+    }
+    // Note: Self-loop indexes (equal_u_edge/equal_d_edge) are intentionally not scanned here yet.
+    // They are not projection-aware, and calling their getters under USE projection throws.
 
     if (adjacency.size() < 2) {
         return;
