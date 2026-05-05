@@ -69,14 +69,17 @@ void Jaccard::_reset()
     // Note: Self-loop indexes (equal_u_edge/equal_d_edge) are intentionally not scanned here yet.
     // They are not projection-aware, and calling their getters under USE projection throws.
 
-    if (adjacency.size() < 2) {
-        return;
-    }
-
     std::vector<uint64_t> nodes;
     nodes.reserve(adjacency.size());
-    for (const auto& [node, _] : adjacency) {
-        nodes.push_back(node);
+    for (const auto& [node, neighbors] : adjacency) {
+        const auto degree = static_cast<uint64_t>(neighbors.size());
+        if (degree >= degree_cutoff && degree <= upper_degree_cutoff) {
+            nodes.push_back(node);
+        }
+    }
+
+    if (nodes.size() < 2) {
+        return;
     }
 
     for (std::size_t i = 0; i < nodes.size(); ++i) {
