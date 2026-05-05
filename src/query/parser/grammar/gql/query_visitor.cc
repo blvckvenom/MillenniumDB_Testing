@@ -2222,8 +2222,11 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             visit(procedure_argument_ctx->expression());
             current_call_argument_exprs.emplace_back(std::move(current_expr));
         }
-        if (current_call_argument_exprs.size() > 1) {
-            throw QueryException("CALL jaccard(...) expects at most one argument: similarityCutoff");
+        if (current_call_argument_exprs.size() > 5) {
+            throw QueryException(
+                "CALL jaccard(...) expects at most five positional arguments: "
+                "similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
+            );
         }
     }
 

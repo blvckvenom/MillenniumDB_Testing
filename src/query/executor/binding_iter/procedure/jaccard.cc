@@ -19,7 +19,7 @@ Jaccard::Jaccard(
     argument_binding_exprs { std::move(argument_binding_exprs_) },
     yield_vars { std::move(yield_vars_) }
 {
-    assert(argument_binding_exprs.size() <= 1);
+    assert(argument_binding_exprs.size() <= 5);
     assert(yield_vars.size() == 3);
 }
 
@@ -113,24 +113,78 @@ void Jaccard::_reset()
 void Jaccard::eval_arguments()
 {
     similarity_cutoff = 0.0;
-    if (argument_binding_exprs.empty()) {
-        return;
+    degree_cutoff = 1;
+    upper_degree_cutoff = UINT64_MAX;
+    top_n.reset();
+    bottom_n.reset();
+
+    auto eval_numeric = [&](std::size_t arg_pos, const char* arg_name) -> ObjectId {
+        const ObjectId oid = argument_binding_exprs[arg_pos]->eval(*parent_binding);
+        switch (oid.get_sub_type()) {
+        case ObjectId::MASK_INT:
+        case ObjectId::MASK_DECIMAL:
+        case ObjectId::MASK_FLOAT:
+        case ObjectId::MASK_DOUBLE:
+            return oid;
+        default:
+            throw QueryExecutionException(
+                std::string("CALL jaccard(...): ") + arg_name + " must be numeric"
+            );
+        }
+    };
+
+    auto eval_non_negative_integer = [&](std::size_t arg_pos, const char* arg_name) -> uint64_t {
+        const ObjectId oid = argument_binding_exprs[arg_pos]->eval(*parent_binding);
+        if (oid.get_sub_type() != ObjectId::MASK_INT) {
+            throw QueryExecutionException(
+                std::string("CALL jaccard(...): ") + arg_name + " must be an integer >= 0"
+            );
+        }
+
+        const int64_t value = GQL::Conversions::to_integer(oid);
+        if (value < 0) {
+            throw QueryExecutionException(
+                std::string("CALL jaccard(...): ") + arg_name + " must be an integer >= 0"
+            );
+        }
+        return static_cast<uint64_t>(value);
+    };
+
+    if (argument_binding_exprs.size() >= 1) {
+        const ObjectId cutoff_oid = eval_numeric(0, "similarityCutoff");
+        similarity_cutoff = GQL::Conversions::to_double(cutoff_oid);
     }
 
-    const ObjectId cutoff_oid = argument_binding_exprs[0]->eval(*parent_binding);
-    switch (cutoff_oid.get_sub_type()) {
-    case ObjectId::MASK_INT:
-    case ObjectId::MASK_DECIMAL:
-    case ObjectId::MASK_FLOAT:
-    case ObjectId::MASK_DOUBLE:
-        similarity_cutoff = GQL::Conversions::to_double(cutoff_oid);
-        break;
-    default:
-        throw QueryExecutionException("CALL jaccard(similarityCutoff): similarityCutoff must be numeric");
+    if (argument_binding_exprs.size() >= 2) {
+        degree_cutoff = eval_non_negative_integer(1, "degreeCutoff");
+    }
+
+    if (argument_binding_exprs.size() >= 3) {
+        upper_degree_cutoff = eval_non_negative_integer(2, "upperDegreeCutoff");
+    }
+
+    if (argument_binding_exprs.size() >= 4) {
+        top_n = eval_non_negative_integer(3, "topN");
+    }
+
+    if (argument_binding_exprs.size() >= 5) {
+        bottom_n = eval_non_negative_integer(4, "bottomN");
     }
 
     if (!std::isfinite(similarity_cutoff) || similarity_cutoff < 0.0 || similarity_cutoff > 1.0) {
-        throw QueryExecutionException("CALL jaccard(similarityCutoff): similarityCutoff must be in range [0, 1]");
+        throw QueryExecutionException("CALL jaccard(...): similarityCutoff must be in range [0, 1]");
+    }
+
+    if (degree_cutoff > upper_degree_cutoff) {
+        throw QueryExecutionException(
+            "CALL jaccard(...): degreeCutoff must be <= upperDegreeCutoff"
+        );
+    }
+
+    if (top_n.has_value() && bottom_n.has_value()) {
+        throw QueryExecutionException(
+            "CALL jaccard(...): topN and bottomN cannot be used together"
+        );
     }
 }
 
