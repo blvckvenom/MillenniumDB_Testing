@@ -217,9 +217,18 @@ BatchMaterializer::Result BatchMaterializer::materialize(
                           << mb_env << "' invalid, using default 256 MB\n";
             }
         }
+        // OID provider: feed sample.all_unique_nodes so the partitioned
+        // packer can write a v2 OID table alongside the data section. The
+        // OID table is required for downstream consumers to map physical
+        // file row → ObjectId, since the partitioned packer writes rows in
+        // partition iteration order (not sample-input order).
+        auto oid_provider_lambda = [&](uint64_t batch_id) -> std::vector<ObjectId> {
+            auto sample = samples.read_sample(batch_id);
+            return sample.all_unique_nodes;
+        };
         generate_packed_batches_partitioned(
             *active_fm, num_batches, batch_provider_lambda,
-            packed_dir, partition_bytes);
+            packed_dir, partition_bytes, oid_provider_lambda);
     } else {
         std::cout << "[Materialize] L4 packer mode: classic\n" << std::flush;
         generate_packed_batches(

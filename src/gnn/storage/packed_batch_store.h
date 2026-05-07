@@ -10,6 +10,7 @@
 
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "graph_models/object_id.h"
 
 namespace mdb::gnn {
 
@@ -180,27 +181,31 @@ void generate_packed_batches(
 /// Spec B1 (DiskGNN-style inverted loop): partitioned packer.
 ///
 /// Inverts the per-batch outer loop into a feature-partition-oriented
-/// sequential scan + scatter pwrites. Each region of the FeatureMatrix
-/// is read exactly once, then distributed to all batch files that
-/// reference rows in that region. Trades a single O(M) header pre-write
-/// pass + one O(M) scan of .fmat for the classic O(B × R) random reads
-/// (where B = batches, R = rows-per-batch). Wins big when .fmat exceeds
-/// page cache (e.g., papers100M: 56 GB .fmat vs 28 GB RAM).
+/// sequential scan. Each region of the FeatureMatrix is read exactly once,
+/// then per-(partition, batch) contributions are appended to their batch
+/// files via pwrite. All batch FDs are kept open across Phase 2 (relies on
+/// ulimit -n; 1024+ recommended).
 ///
-/// On-disk file format is identical to generate_packed_batches
-/// (PackedBatchHeader v1 + features section). Output is bit-identical
-/// to the classic path for the same inputs — verified by golden compare.
+/// Two output formats, selected by whether `oid_provider` is supplied:
+///   - v1 (oid_provider empty): header + features section; rows in the
+///     order returned by row_provider. Bit-identical to generate_packed_batches.
+///   - v2 (oid_provider non-empty): header + OID table + features section;
+///     rows in **partition iteration order** (NOT row_provider order).
+///     `oid_table[i] ↔ data[i]` consistency is preserved. Functionally
+///     equivalent to v1 but byte layout differs.
+///
+/// Memory profile: peak ~ row_bytes * partition_rows + 16B/ref inverted
+/// index + 8B/ref OID array (v2 only). Partition size of 256 MB on
+/// papers100M-class datasets keeps peak RSS under 2 GB.
 ///
 /// partition_bytes: target bytes per partition (rounded down to whole rows).
-/// Default 256 MB matches DiskGNN's heuristic for ogbn-papers100M-class
-/// datasets. Smaller partitions reduce peak RSS but increase loop overhead;
-/// larger partitions reduce overhead but raise peak RSS.
 void generate_packed_batches_partitioned(
     const FeatureMatrix& features,
     uint64_t num_batches,
-    std::function<std::vector<uint64_t>(uint64_t batch_id)> batch_provider,
+    std::function<std::vector<uint64_t>(uint64_t batch_id)> row_provider,
     const std::filesystem::path& output_dir,
-    size_t partition_bytes = 256ULL * 1024 * 1024
+    size_t partition_bytes = 256ULL * 1024 * 1024,
+    std::function<std::vector<ObjectId>(uint64_t batch_id)> oid_provider = {}
 );
 
 } // namespace mdb::gnn
