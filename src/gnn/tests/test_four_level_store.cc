@@ -1754,3 +1754,65 @@ TEST_F(FourLevelStoreCoordTest, Build_BudgetExactlyFitsAll) {
         }
     }
 }
+
+// =============================================================================
+// Spec D telemetry (2026-05-07): on-disk byte accounting
+// Validates that BuildResult populates the new size fields and that
+// over_budget triggers correctly when disk_budget_bytes is set.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, SpecD_TelemetryFieldsPopulated) {
+    auto samples = create_samples("fls_spec_d_a", {{0,1,2,3,4,5,6,7}});
+    auto config = make_config(/*cpu_budget_nodes=*/2, /*reorder=*/false);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // Telemetry fields must be populated: at least slim must be > 0
+    // (we have at least one batch with non-cached nodes).
+    EXPECT_GT(result.slim_bytes, 0u)
+        << "slim_bytes must be > 0 with at least one batch";
+    // reorder=false means no reordered.fmat
+    EXPECT_EQ(result.reordered_bytes, 0u)
+        << "reordered_bytes must be 0 when config.reorder=false";
+    // total = slim + gpu_cache + cpu_cache + reordered
+    EXPECT_EQ(result.total_disk_bytes,
+              result.slim_bytes + result.gpu_cache_bytes
+              + result.cpu_cache_bytes + result.reordered_bytes)
+        << "total_disk_bytes must equal sum of components";
+    // No budget set => over_budget must be false
+    EXPECT_FALSE(result.over_budget)
+        << "over_budget must be false when disk_budget_bytes=0";
+}
+
+TEST_F(FourLevelStoreCoordTest, SpecD_OverBudgetTriggers) {
+    auto samples = create_samples("fls_spec_d_b", {{0,1,2,3,4,5,6,7}});
+    auto config = make_config(/*cpu_budget_nodes=*/2, /*reorder=*/false);
+    config.disk_budget_bytes = 1; // Impossibly small — must trigger warning
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    EXPECT_GT(result.total_disk_bytes, 1u)
+        << "actual size must exceed 1-byte budget";
+    EXPECT_TRUE(result.over_budget)
+        << "over_budget must be true when total exceeds budget";
+}
+
+TEST_F(FourLevelStoreCoordTest, SpecD_ReorderedBytesNonzero) {
+    auto samples = create_samples("fls_spec_d_c", {{0,1,2,3,4,5,6,7}});
+    auto config = make_config(/*cpu_budget_nodes=*/2, /*reorder=*/true);
+
+    auto result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    // With reorder=true, the reordered.fmat must exist and be > 0 bytes.
+    EXPECT_GT(result.reordered_bytes, 0u)
+        << "reordered_bytes must be > 0 when config.reorder=true";
+}

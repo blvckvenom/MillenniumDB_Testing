@@ -141,6 +141,14 @@ public:
         // GBs. Default true; set to false only for debugging or backward
         // compatibility with a training path that still reads packed/.
         bool   cleanup_materialize_scratch = true;
+
+        // Spec D (telemetry, 2026-05-07): disk space budget for the feature
+        // store. 0 = unlimited (current behavior). When > 0, build() emits
+        // a warning if the actual usage exceeds the budget. Future Spec C2
+        // will use this to drive the heuristic search for segment_size that
+        // satisfies the constraint. Mirrors DiskGNN's `disk_size` parameter
+        // (cf. SIGMOD'25 §6 API `DiskGNN_train(..., disk_size, ...)`).
+        size_t disk_budget_bytes = 0;
         MinHashReorderer::Config minhash;
     };
 
@@ -151,6 +159,22 @@ public:
         bool     gpu_available = false;
         int64_t  build_time_ms = 0;
         std::string packed_slim_dir;
+
+        // Spec D telemetry: per-tier on-disk byte accounting. All values are
+        // post-build, measured from the actual filesystem (NOT estimated).
+        // - slim_bytes:       sum of packed_slim/*.bin file sizes
+        // - reordered_bytes:  size of *_reordered.fmat (0 if reorder=false)
+        // - gpu_cache_bytes:  size of *_gpu_cache.bin
+        // - cpu_cache_bytes:  size of *_cpu_cache.bin
+        // - total_disk_bytes: sum of the above (== feature store on-disk footprint)
+        // - over_budget:      true iff config.disk_budget_bytes > 0 AND
+        //                     total_disk_bytes > config.disk_budget_bytes.
+        uint64_t slim_bytes       = 0;
+        uint64_t reordered_bytes  = 0;
+        uint64_t gpu_cache_bytes  = 0;
+        uint64_t cpu_cache_bytes  = 0;
+        uint64_t total_disk_bytes = 0;
+        bool     over_budget      = false;
     };
 
     /// Preprocessing: classify nodes by frequency, build caches, re-pack L4 slim.

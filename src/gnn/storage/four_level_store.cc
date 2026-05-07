@@ -241,6 +241,10 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // L4 features come directly from the slim file data section.
     fs::create_directories(packed_slim_dir);
 
+    // Spec D telemetry: accumulate slim bytes during the write loop instead
+    // of re-scanning the directory after. Same value, no second I/O pass.
+    uint64_t slim_bytes_acc = 0;
+
     for (uint64_t b = 0; b < catalog.total_batches; ++b) {
         auto sample = samples.read_sample(b);
 
@@ -299,6 +303,43 @@ FourLevelStore::BuildResult FourLevelStore::build(
             throw std::runtime_error(
                 "FourLevelStore::build: fsync failed: " + safe_strerror(errno));
         }
+
+        // Spec D: per-batch contribution to slim total. The file consists of
+        // a 32-byte header + N * 8 bytes of OID table + N * row_bytes of data.
+        slim_bytes_acc += sizeof(PackedBatchHeader)
+                       + slim_oids.size() * sizeof(uint64_t)
+                       + slim_oids.size() * row_bytes;
+    }
+
+    // --- Step 5b: Spec D telemetry — measure on-disk footprint ---
+    // We measure files that ALREADY exist on disk (caches were written in
+    // Step 3, slim was just written in Step 5, reordered.fmat was written
+    // in Step 4 if reorder=true). All measurements are post-fsync.
+    auto safe_size = [](const fs::path& p) -> uint64_t {
+        std::error_code ec;
+        if (!fs::exists(p, ec)) return 0;
+        auto sz = fs::file_size(p, ec);
+        return ec ? 0 : static_cast<uint64_t>(sz);
+    };
+    result.slim_bytes      = slim_bytes_acc;
+    result.gpu_cache_bytes = safe_size(gpu_cache_path);
+    result.cpu_cache_bytes = safe_size(cpu_cache_path);
+    result.reordered_bytes = config.reorder ? safe_size(reordered_fmat) : 0;
+    result.total_disk_bytes = result.slim_bytes
+                            + result.gpu_cache_bytes
+                            + result.cpu_cache_bytes
+                            + result.reordered_bytes;
+
+    if (config.disk_budget_bytes > 0 &&
+        result.total_disk_bytes > config.disk_budget_bytes)
+    {
+        result.over_budget = true;
+        std::cerr << "FourLevelStore::build: warning, on-disk footprint "
+                  << result.total_disk_bytes << " B"
+                  << " exceeds disk_budget " << config.disk_budget_bytes << " B."
+                  << " Future Spec C2 will adjust segment_size automatically;"
+                  << " for now, retry with a smaller fanout, smaller batch,"
+                  << " or larger disk budget.\n";
     }
 
     // --- Step 6: Write metadata ---

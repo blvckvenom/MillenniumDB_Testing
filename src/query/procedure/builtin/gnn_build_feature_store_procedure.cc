@@ -108,6 +108,15 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
             if (*v <= 0) throw std::runtime_error("segmentSize must be positive, got: " + std::to_string(*v));
             config.minhash.segment_size = static_cast<uint32_t>(*v);
         }
+        // Spec D telemetry (2026-05-07): expose disk_budget as a procedure
+        // parameter. 0 (default) = unlimited; otherwise a soft constraint
+        // that triggers a warning when actual footprint exceeds it.
+        // Future Spec C2 will use this value to drive heuristic search of
+        // segment_size that satisfies the constraint without warning.
+        if (auto v = opts.get_int("diskBudgetMb")) {
+            if (*v < 0) throw std::runtime_error("diskBudgetMb must be non-negative, got: " + std::to_string(*v));
+            config.disk_budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
+        }
     }
 
     // =========================================================================
@@ -163,6 +172,10 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     // Step 5: Yield results
     // =========================================================================
+    auto bytes_to_mb = [](uint64_t b) -> int64_t {
+        return static_cast<int64_t>(b / (1024ULL * 1024));
+    };
+
     ctx.yield("sampleName",   ctx.create_string(sample_name));
     ctx.yield("featureName",  ctx.create_string(feature_name));
     ctx.yield("l1Nodes",      ctx.create_int(static_cast<int64_t>(result.l1_nodes)));
@@ -171,6 +184,13 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l4Nodes",      ctx.create_int(static_cast<int64_t>(result.l4_nodes)));
     ctx.yield("gpuAvailable", ctx.create_bool(result.gpu_available));
     ctx.yield("buildTimeMs",  ctx.create_int(result.build_time_ms));
+    // Spec D telemetry yields (post-build, measured from filesystem)
+    ctx.yield("slimMb",       ctx.create_int(bytes_to_mb(result.slim_bytes)));
+    ctx.yield("reorderedMb",  ctx.create_int(bytes_to_mb(result.reordered_bytes)));
+    ctx.yield("gpuCacheMb",   ctx.create_int(bytes_to_mb(result.gpu_cache_bytes)));
+    ctx.yield("cpuCacheMb",   ctx.create_int(bytes_to_mb(result.cpu_cache_bytes)));
+    ctx.yield("totalDiskMb",  ctx.create_int(bytes_to_mb(result.total_disk_bytes)));
+    ctx.yield("overBudget",   ctx.create_bool(result.over_budget));
     ctx.yield_row();
 }
 
