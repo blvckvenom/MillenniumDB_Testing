@@ -125,6 +125,23 @@ Four new GQL procedures: `gnn_predict(sample, feature, ckptName [, opts])` runs 
 
 Implementation: `src/gnn/output/model_checkpoint.{h,cc}` (stateless utility: save_full/save_weights/load_*/validate_compat/list/exists/delete) + `src/gnn/output/auto_checkpointer.{h,cc}` (stateful policy observer wired into `TrainingLoop::Config::on_epoch_end`). Checkpoints use `GNNCKPT\0` magic, atomic write via `.tmp` → fsync → rename → fsync-dir sequence. See `docs/superpowers/specs/2026-04-16-model-checkpoint-design.md` for full design rationale. Validated by unit tests (23 ModelCheckpoint + 8 AutoCheckpointer + 8 TrainingLoop resume), E2E Step 10 (12 checks), and invariant tests in gnn_training suite (bit-identical predict reproducibility + resume parity within 0.03 testAcc delta).
 
+### GNN dataset access-skew profile — scope guidance for disk-cache work (DiskGNN SIGMOD'25 §5.1, §7)
+
+DiskGNN's segmented-disk-cache + heuristic-search machinery is **dataset-shape-dependent**. The access-frequency skew of the seed-node neighborhood (i.e., what fraction of total feature accesses go to the top-K% most popular nodes) determines whether pure packed-feature chunks fit in any reasonable disk budget or whether a disk cache layer must be activated to deduplicate features across mini-batches.
+
+| Dataset (paper abbr.)  | Top-1% access | 1-5% | 5-10% | >10% | Pure-pack blowup vs feature size | Disk cache needed? |
+|---|---|---|---|---|---|---|
+| Papers100M (PS)        | 43.2% | 36.5% | 11.2% | 9.1%  | ≤1× (fits) | No |
+| MAG240M    (MG)        | 56.4% | 32.3% | 7.3%  | 4.0%  | <1× (fits) | No |
+| Friendster (FS)        | 14.1% | 25.5% | 18.2% | 42.1% | 5.39×      | Yes |
+| IGB260M    (IG)        | 22.5% | 30.0% | 20.8% | 26.7% | 10.19×     | Yes |
+
+The disk_cache layer in DiskGNN is **opt-in** (activated only when `disk_size` constraint is exceeded by pure packing). Their heuristic for choosing segment size `s` (with `m=1` fixed) runs in seconds vs. brute-force in minutes-to-hours: at IG 7× blowup, 4.61 s vs. 3261 s = **707× speedup** at equal/better I/O amplification (paper §7 Table 7). Triggered only when `disk_size` constraint is set AND the dataset's natural blowup exceeds it.
+
+**Implication for our roadmap (2026-05-07):** Spec C2 (heuristic search for `s` under `disk_size`) and the budget-driven activation logic in Spec D would only pay off if we target FS/IG-class datasets (low access skew). For PS/MG-class datasets where the top-1% nodes already dominate accesses, pure packing already fits in ≤1× feature size and our existing `Strategy::SEGMENTED` MinHash via composite hash (the GLOBAL `_reordered.fmat` consolidates DiskGNN's per-segment caches into a single file via `(segment_id<<32) | hash` ordering) is functionally sufficient. Priority for further work should therefore be **pipeline overlap (paper §5.3)** — the 4-stage producer-consumer overlap of feature loading, feature assembling, graph loading, and model training — which benefits all dataset shapes uniformly.
+
+The Spec D telemetry (`gnn_build_feature_store` yields `slimMb`, `reorderedMb`, `gpuCacheMb`, `cpuCacheMb`, `totalDiskMb`, `overBudget`) lets us empirically verify whether the actual blowup of a given (sample, feature_dim) configuration matches the paper's prediction before deciding whether to invest in C2.
+
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
