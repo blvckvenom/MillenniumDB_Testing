@@ -161,6 +161,9 @@ add_library(mdb_gnn_core STATIC
     # Task 9: Training Loop
     training/training_loop.cc
 
+    # Spec C3 stage 1: Async batch prefetcher
+    training/async_batch_prefetcher.cc
+
     # Phase 6: Output / Embedding Writer
     output/embedding_writer.cc
     output/model_checkpoint.cc
@@ -500,6 +503,28 @@ if(BUILD_TESTING)
             add_test(NAME TrainingLoopTests COMMAND test_training_loop)
             if(EXISTS "${ASAN_SUPP_FILE}")
                 set_property(TEST TrainingLoopTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
+        endif()
+
+        # Spec C3 stage 1: AsyncBatchPrefetcher tests
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_async_batch_prefetcher.cc")
+            add_executable(test_async_batch_prefetcher tests/test_async_batch_prefetcher.cc)
+            target_link_libraries(test_async_batch_prefetcher
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_async_batch_prefetcher PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME AsyncBatchPrefetcherTests COMMAND test_async_batch_prefetcher)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST AsyncBatchPrefetcherTests PROPERTY
                     ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
             endif()
         endif()
