@@ -83,6 +83,17 @@ public:
         // can include without forcing TrainingLoop's TU to depend on
         // the four-level cache implementation.
         std::function<uint64_t()> cumulative_disk_bytes_provider;
+
+        // Spec C3 stage 1.B (2026-05-07): opt-in async batch prefetcher.
+        // When true, the inner train loop uses AsyncBatchPrefetcher to run
+        // BatchAssembler::assemble() on a background thread. The validation
+        // phase remains sequential (its assemble cost is small). queue size
+        // matches DiskGNN paper §6 default of 2.
+        //
+        // Default false to preserve byte-identical legacy behaviour. Tests
+        // verify both paths produce identical loss curves with the same seed.
+        bool        use_async_prefetcher = false;
+        size_t      prefetch_queue_size  = 2;
     };
 
     // =========================================================================

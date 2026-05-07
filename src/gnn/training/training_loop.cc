@@ -6,10 +6,13 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
 #include <torch/torch.h>
+
+#include "gnn/training/async_batch_prefetcher.h"
 
 namespace mdb::gnn {
 
@@ -114,11 +117,42 @@ TrainingLoop::Result TrainingLoop::train()
         double   total_loss       = 0.0;
         uint64_t num_train_batches = 0;
 
+        // Spec C3 stage 1.B: optional async prefetcher fronted by a single
+        // worker thread (DiskGNN paper §5.3 producer-consumer pattern).
+        // The prefetcher is per-epoch — destroyed at scope exit, joining
+        // its worker. Cost is ~100 μs per epoch (Linux thread spawn),
+        // negligible vs the per-batch assembly cost it hides.
+        std::unique_ptr<AsyncBatchPrefetcher> prefetcher;
+        if (config_.use_async_prefetcher) {
+            prefetcher = std::make_unique<AsyncBatchPrefetcher>(
+                assembler_, config_.prefetch_queue_size);
+            const size_t prime = std::min<size_t>(
+                config_.prefetch_queue_size, train_batches);
+            for (size_t i = 0; i < prime; ++i) {
+                prefetcher->prefetch(i);
+            }
+        }
+
         for (uint64_t bid = 0; bid < train_batches; ++bid) {
             // Spec C3 stage 0: assemble + device transfer is the work an
             // async prefetcher (stage 1) would hide behind compute.
+            // When the prefetcher is on, this measurement reflects only
+            // the wait-for-ready-batch + device transfer time, not the
+            // actual disk + CPU assembly which has overlapped.
             auto t_assem_start = std::chrono::steady_clock::now();
-            MiniBatch mini = assembler_.assemble(bid);
+
+            MiniBatch mini;
+            if (prefetcher) {
+                // Look-ahead submit BEFORE blocking on next() so the worker
+                // always has at least queue_size batches in its pipeline.
+                const uint64_t lookahead = bid + config_.prefetch_queue_size;
+                if (lookahead < train_batches) {
+                    prefetcher->prefetch(lookahead);
+                }
+                mini = prefetcher->next();
+            } else {
+                mini = assembler_.assemble(bid);
+            }
 
             if (!device.is_cpu()) {
                 mini.features = mini.features.to(device);

@@ -311,6 +311,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
     bool        save_final       = true;
+    // Spec C3 stage 1.B (2026-05-07): toggle async prefetcher.
+    bool        use_async_prefetcher = false;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -351,6 +353,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_double("tolerance")) {
             if (*v < 0.0) throw std::runtime_error("tolerance must be non-negative, got: " + std::to_string(*v));
             tolerance = *v;
+        }
+        // Spec C3 stage 1.B: opt-in async batch prefetcher.
+        if (auto v = opts.get_bool("useAsyncPrefetcher")) {
+            use_async_prefetcher = *v;
         }
         if (auto v = opts.get_bool("normalize")) {
             normalize = *v;
@@ -559,6 +565,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.tolerance     = tolerance;
     loop_config.patience      = patience;
     loop_config.random_seed   = random_seed;
+    loop_config.use_async_prefetcher = use_async_prefetcher;
     loop_config.output_dir    = output_dir.string();
 
     // =========================================================================
