@@ -361,3 +361,74 @@ TEST_F(TrainingLoopTest, PatienceStops)
         << "Loop ran more epochs than expected with patience="
         << loop_cfg.patience;
 }
+
+// =============================================================================
+// Spec C3 stage 0 (2026-05-07): per-stage timing instrumentation
+//
+// Validates that the new assemble_seconds, forward_seconds, backward_seconds
+// fields populate non-zero values during a real training run, and that their
+// sum is bounded above by train_seconds (since train_seconds also includes
+// the validation phase, the inequality is strict in general).
+// =============================================================================
+
+TEST_F(TrainingLoopTest, SpecC3_PerStageTimingPopulated)
+{
+    const std::string sname = "spec_c3_timing";
+    auto cat = create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+
+    GraphSAGEConfig cfg{
+        .input_dim   = static_cast<int64_t>(D),
+        .hidden_dim  = 16,
+        .num_classes = static_cast<int64_t>(NUM_CLASSES),
+        .num_layers  = 1,
+        .dropout     = 0.0,
+        .normalize   = false,
+    };
+    GraphSAGEModel model(cfg);
+
+    TrainingLoop::Config loop_cfg;
+    loop_cfg.epochs        = 3;
+    loop_cfg.learning_rate = 0.01;
+    loop_cfg.weight_decay  = 0.0;
+    loop_cfg.tolerance     = 1e-9;
+    loop_cfg.patience      = 100;
+    loop_cfg.random_seed   = 42;
+
+    torch::optim::Adam opt(
+        model.parameters(),
+        torch::optim::AdamOptions(loop_cfg.learning_rate)
+            .weight_decay(loop_cfg.weight_decay)
+    );
+    TrainingLoop loop(model, assembler, cat, opt, loop_cfg);
+    auto result = loop.train();
+
+    // All three stages should have measured non-zero time. Even on a tiny
+    // toy fixture, each stage takes at least microseconds, well above the
+    // 1e-9 noise floor of steady_clock.
+    EXPECT_GT(result.assemble_seconds, 0.0)
+        << "assemble_seconds must be > 0 after a real run";
+    EXPECT_GT(result.forward_seconds, 0.0)
+        << "forward_seconds must be > 0 after a real run";
+    EXPECT_GT(result.backward_seconds, 0.0)
+        << "backward_seconds must be > 0 after a real run";
+
+    // Sum of stages should be bounded above by train_seconds (the latter
+    // also covers validation, callbacks, and per-batch zero_grad/loss-mask
+    // checks that aren't bucketed into the three stages).
+    const double stage_sum = result.assemble_seconds
+                           + result.forward_seconds
+                           + result.backward_seconds;
+    EXPECT_LE(stage_sum, result.train_seconds + 1e-6)
+        << "stage_sum=" << stage_sum
+        << " > train_seconds=" << result.train_seconds
+        << "; stages should be a strict subset of total train wall-time";
+}

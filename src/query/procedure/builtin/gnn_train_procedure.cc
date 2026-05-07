@@ -100,7 +100,13 @@ static void write_training_log(
     f << "    \"converged\": " << (result.converged ? "true" : "false") << ",\n";
     f << "    \"best_val_accuracy\": " << result.best_val_accuracy << ",\n";
     f << "    \"test_accuracy\": " << test_accuracy << ",\n";
-    f << "    \"train_seconds\": " << result.train_seconds << "\n";
+    f << "    \"train_seconds\": " << result.train_seconds << ",\n";
+    // Spec C3 stage 0: per-stage timing breakdown (sum across all train
+    // batches across all epochs). Per-session, NOT accumulated across
+    // resume_from continuations.
+    f << "    \"assemble_seconds\": " << result.assemble_seconds << ",\n";
+    f << "    \"forward_seconds\": "  << result.forward_seconds  << ",\n";
+    f << "    \"backward_seconds\": " << result.backward_seconds << "\n";
     f << "  },\n";
 
     // Per-epoch losses
@@ -773,6 +779,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("bestValAccuracy", ctx.create_float(static_cast<float>(result.best_val_accuracy)));
     ctx.yield("testAccuracy",    ctx.create_float(static_cast<float>(test_accuracy)));
     ctx.yield("trainSeconds",    ctx.create_float(static_cast<float>(result.train_seconds)));
+    // Spec C3 stage 0 (2026-05-07): per-stage cumulative timings for
+    // baselining the upcoming async-prefetcher / pipeline-overlap work.
+    // assemble + forward + backward should sum to ≈ train phase wall time
+    // (excluding eval). On a typical run, asssembleSeconds is the upper
+    // bound on what stage 1 prefetcher can hide behind compute.
+    ctx.yield("assembleSeconds", ctx.create_float(static_cast<float>(result.assemble_seconds)));
+    ctx.yield("forwardSeconds",  ctx.create_float(static_cast<float>(result.forward_seconds)));
+    ctx.yield("backwardSeconds", ctx.create_float(static_cast<float>(result.backward_seconds)));
     ctx.yield("l1HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l1_hit_ratio())));
     ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
     ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));

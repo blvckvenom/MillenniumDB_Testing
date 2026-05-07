@@ -95,6 +95,24 @@ public:
         double               best_val_accuracy= 0.0;
         std::vector<double>  epoch_losses;
         double               train_seconds    = 0.0;
+
+        // Spec C3 stage 0 (2026-05-07): per-stage cumulative wall-time
+        // breakdown of the inner training loop. All values are summed
+        // across all train batches across all epochs; validation/eval
+        // time is NOT counted here (only the train phase). Used to
+        // baseline the gain of subsequent pipeline-overlap stages.
+        //
+        // Invariant: assemble_seconds + forward_seconds + backward_seconds
+        // ≈ time spent inside the inner train loop (i.e., excluding
+        // validation, callbacks, and stoppage logic).
+        //
+        // - assemble_seconds: BatchAssembler::assemble() + per-batch
+        //                     CPU→GPU device transfer
+        // - forward_seconds:  model_.forward() (logits computation)
+        // - backward_seconds: loss.backward() + optimizer.step()
+        double               assemble_seconds = 0.0;
+        double               forward_seconds  = 0.0;
+        double               backward_seconds = 0.0;
     };
 
     // =========================================================================

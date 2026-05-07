@@ -115,9 +115,11 @@ TrainingLoop::Result TrainingLoop::train()
         uint64_t num_train_batches = 0;
 
         for (uint64_t bid = 0; bid < train_batches; ++bid) {
+            // Spec C3 stage 0: assemble + device transfer is the work an
+            // async prefetcher (stage 1) would hide behind compute.
+            auto t_assem_start = std::chrono::steady_clock::now();
             MiniBatch mini = assembler_.assemble(bid);
 
-            // Move all batch tensors to the training device
             if (!device.is_cpu()) {
                 mini.features = mini.features.to(device);
                 for (auto& ei : mini.edge_indices) {
@@ -126,14 +128,21 @@ TrainingLoop::Result TrainingLoop::train()
                 mini.labels     = mini.labels.to(device);
                 mini.label_mask = mini.label_mask.to(device);
             }
+            auto t_assem_end = std::chrono::steady_clock::now();
+            result.assemble_seconds += std::chrono::duration<double>(
+                t_assem_end - t_assem_start).count();
 
             optimizer.zero_grad();
 
+            auto t_fwd_start = std::chrono::steady_clock::now();
             auto logits = model_.forward(
                 mini.features,
                 mini.edge_indices,
                 static_cast<int64_t>(mini.num_seeds)
             );
+            auto t_fwd_end = std::chrono::steady_clock::now();
+            result.forward_seconds += std::chrono::duration<double>(
+                t_fwd_end - t_fwd_start).count();
 
             // Only back-prop if at least one labeled seed exists in this batch
             if (mini.label_mask.any().item<bool>()) {
@@ -144,8 +153,12 @@ TrainingLoop::Result TrainingLoop::train()
                     masked_logits, masked_labels
                 );
 
+                auto t_bwd_start = std::chrono::steady_clock::now();
                 loss.backward();
                 optimizer.step();
+                auto t_bwd_end = std::chrono::steady_clock::now();
+                result.backward_seconds += std::chrono::duration<double>(
+                    t_bwd_end - t_bwd_start).count();
 
                 total_loss += loss.item<double>();
             }
