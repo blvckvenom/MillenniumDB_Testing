@@ -143,13 +143,16 @@ TrainingLoop::Result TrainingLoop::train()
 
             MiniBatch mini;
             if (prefetcher) {
-                // Look-ahead submit BEFORE blocking on next() so the worker
-                // always has at least queue_size batches in its pipeline.
+                // Order matters: next() FIRST to free a queue slot. The prime
+                // loop above filled the queue to its full capacity, so calling
+                // prefetch(lookahead) before next() would block on backpressure
+                // (in_flight == queue_size, no space to enqueue). After next()
+                // releases one slot, prefetch(lookahead) is non-blocking.
+                mini = prefetcher->next();
                 const uint64_t lookahead = bid + config_.prefetch_queue_size;
                 if (lookahead < train_batches) {
                     prefetcher->prefetch(lookahead);
                 }
-                mini = prefetcher->next();
             } else {
                 mini = assembler_.assemble(bid);
             }
