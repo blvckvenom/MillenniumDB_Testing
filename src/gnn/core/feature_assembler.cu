@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include <c10/cuda/CUDAStream.h>
+
 namespace mdb::gnn {
 
 // ============================================================================
@@ -101,7 +103,17 @@ torch::Tensor FeatureAssembler::assemble_cuda(
     const float* gpu_data_ptr = (gpu_features.defined() && gpu_features.numel() > 0)
         ? gpu_features.data_ptr<float>() : nullptr;
 
-    assemble_kernel<<<blocks, threads_per_block>>>(
+    // Spec C3 stage 3 (2026-05-08): use the current CUDA stream rather than
+    // the default stream so callers can drive this kernel onto a non-default
+    // stream via c10::cuda::CUDAStreamGuard. With a guard set by the worker
+    // thread, the kernel ends up on the worker's stream and can run
+    // concurrently with model.forward+backward on a different stream.
+    //
+    // If no guard is set, getCurrentCUDAStream() returns the default stream,
+    // preserving pre-2026-05-08 behaviour byte-for-byte.
+    auto current_stream = c10::cuda::getCurrentCUDAStream();
+
+    assemble_kernel<<<blocks, threads_per_block, 0, current_stream.stream()>>>(
         output.data_ptr<float>(),
         gpu_data_ptr,
         cpu_data,
@@ -112,8 +124,11 @@ torch::Tensor FeatureAssembler::assemble_cuda(
         total_entries
     );
 
-    // Synchronize default stream only (not all GPU work)
-    cudaStreamSynchronize(0);
+    // Synchronize the current stream only — keeps the host-blocking semantics
+    // of the legacy implementation while letting the stream itself be any
+    // pool stream. Module 4 will add an async variant that returns without
+    // syncing and lets the caller handle ordering via at::cuda::CUDAEvent.
+    cudaStreamSynchronize(current_stream.stream());
 
     return output;
 }

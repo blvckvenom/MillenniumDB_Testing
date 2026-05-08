@@ -433,5 +433,51 @@ TEST(FeatureAssemblerTest, CudaKernelMatchesFallback) {
     auto diff = (cuda_result.cpu() - fb_result).abs().max().item<float>();
     EXPECT_LT(diff, 1e-5f);
 }
+
+// ===========================================================================
+// Spec C3 stage 3 module 2 (2026-05-08): assemble_cuda honours the current
+// CUDA stream set via c10::cuda::CUDAStreamGuard.
+// ===========================================================================
+
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+
+TEST(FeatureAssemblerTest, AssembleCuda_BitIdenticalAcrossStreams) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    const int64_t N = 64, D = 32;
+    FeatureAssembler assembler(D);
+
+    // Build a small synthetic input: 16 nodes from GPU, 16 from CPU pinned.
+    auto gpu_features = torch::arange(0.0f, 16.0f * D,
+        torch::TensorOptions().dtype(torch::kFloat32))
+        .reshape({16, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos;
+    for (int i = 0; i < 16; ++i) gpu_pos.push_back(i);
+
+    std::vector<float> cpu_buf(16 * D);
+    for (size_t i = 0; i < cpu_buf.size(); ++i) cpu_buf[i] = static_cast<float>(i + 1000);
+    std::vector<uint32_t> cpu_pos;
+    for (int i = 16; i < 32; ++i) cpu_pos.push_back(i);
+
+    // Run on default stream (no guard).
+    auto out_default = assembler.assemble(N, gpu_features, gpu_pos,
+                                           cpu_buf.data(), 16, cpu_pos);
+
+    // Run on a non-default stream from the pool.
+    auto custom_stream = c10::cuda::getStreamFromPool();
+    torch::Tensor out_custom;
+    {
+        c10::cuda::CUDAStreamGuard guard(custom_stream);
+        out_custom = assembler.assemble(N, gpu_features, gpu_pos,
+                                         cpu_buf.data(), 16, cpu_pos);
+    }
+
+    auto diff = (out_default - out_custom).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-6f)
+        << "assemble_cuda must produce bit-identical output regardless of"
+           " which stream is active when called";
+}
 #endif
 
