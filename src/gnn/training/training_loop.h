@@ -97,6 +97,17 @@ public:
         // debugging or to compare against the legacy serial path.
         bool        use_async_prefetcher = true;
         size_t      prefetch_queue_size  = 2;
+
+        // Spec C3 stage 3 (started 2026-05-08): split assemble_kernel and
+        // model.forward+backward onto separate CUDA streams so the GPU can
+        // execute them concurrently when SMs are free (DiskGNN SIGMOD'25
+        // §5.3 "we run the model trainer and feature assembler on separate
+        // CUDA streams to improve GPU utilization").
+        //
+        // Effective only when use_async_prefetcher=true AND CUDA is available.
+        // Default false until empirical validation completes; flip to true
+        // once Module 6 confirms speedup + bit-identical accuracy.
+        bool        use_cuda_streams = false;
     };
 
     // =========================================================================

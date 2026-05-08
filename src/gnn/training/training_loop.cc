@@ -14,6 +14,11 @@
 
 #include "gnn/training/async_batch_prefetcher.h"
 
+#ifdef ENABLE_CUDA_ASSEMBLER
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
+
 namespace mdb::gnn {
 
 // =============================================================================
@@ -122,10 +127,28 @@ TrainingLoop::Result TrainingLoop::train()
         // The prefetcher is per-epoch — destroyed at scope exit, joining
         // its worker. Cost is ~100 μs per epoch (Linux thread spawn),
         // negligible vs the per-batch assembly cost it hides.
+        //
+        // Spec C3 stage 3: when stage3_active, the prefetcher worker uses
+        // its own pool stream and records a CUDAEvent into MiniBatch.
+        // The training thread (this loop) uses a separate train_stream and
+        // event.block()s on it before forward — letting the GPU schedule
+        // assemble_kernel and forward+backward concurrently when SMs allow.
+#ifdef ENABLE_CUDA_ASSEMBLER
+        const bool stage3_active = config_.use_async_prefetcher
+                                && config_.use_cuda_streams
+                                && !device.is_cpu();
+        std::optional<c10::cuda::CUDAStream> train_stream;
+        if (stage3_active) {
+            train_stream.emplace(c10::cuda::getStreamFromPool());
+        }
+#else
+        constexpr bool stage3_active = false;
+#endif
+
         std::unique_ptr<AsyncBatchPrefetcher> prefetcher;
         if (config_.use_async_prefetcher) {
             prefetcher = std::make_unique<AsyncBatchPrefetcher>(
-                assembler_, config_.prefetch_queue_size);
+                assembler_, config_.prefetch_queue_size, stage3_active);
             const size_t prime = std::min<size_t>(
                 config_.prefetch_queue_size, train_batches);
             for (size_t i = 0; i < prime; ++i) {
@@ -156,6 +179,34 @@ TrainingLoop::Result TrainingLoop::train()
             } else {
                 mini = assembler_.assemble(bid);
             }
+
+            // Spec C3 stage 3: cross-stream sync + record_stream BEFORE any
+            // tensor reads on the train stream. event.block makes train
+            // stream wait for worker's assemble_kernel + .to(device); it
+            // does NOT block the host. record_stream prevents the caching
+            // allocator from freeing the worker-allocated tensors while
+            // train_stream is still using them.
+#ifdef ENABLE_CUDA_ASSEMBLER
+            std::optional<c10::cuda::CUDAStreamGuard> stage3_guard;
+            if (stage3_active && train_stream) {
+                if (mini.ready_event.isCreated()) {
+                    mini.ready_event.block(*train_stream);
+                }
+                stage3_guard.emplace(*train_stream);
+                if (mini.features.is_cuda()) {
+                    mini.features.record_stream(*train_stream);
+                }
+                for (auto& ei : mini.edge_indices) {
+                    if (ei.is_cuda()) ei.record_stream(*train_stream);
+                }
+                if (mini.labels.is_cuda()) {
+                    mini.labels.record_stream(*train_stream);
+                }
+                if (mini.label_mask.is_cuda()) {
+                    mini.label_mask.record_stream(*train_stream);
+                }
+            }
+#endif
 
             if (!device.is_cpu()) {
                 mini.features = mini.features.to(device);
@@ -202,6 +253,15 @@ TrainingLoop::Result TrainingLoop::train()
 
             ++num_train_batches;
         }
+
+        // Spec C3 stage 3: synchronize train_stream before validation reads
+        // any tensors. evaluate() runs on the default stream (sequentially)
+        // and may read tensors that were last written on train_stream.
+#ifdef ENABLE_CUDA_ASSEMBLER
+        if (train_stream) {
+            train_stream->synchronize();
+        }
+#endif
 
         double avg_loss = (num_train_batches > 0)
             ? (total_loss / static_cast<double>(num_train_batches))

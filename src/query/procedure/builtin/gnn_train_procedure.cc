@@ -314,6 +314,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // Spec C3 stage 1 (default true since 2026-05-07): async prefetcher.
     // 1.609× speedup measured on papers100M, bit-identical accuracy.
     bool        use_async_prefetcher = true;
+    // Spec C3 stage 3 (started 2026-05-08): split assemble_kernel and
+    // model.forward+backward onto separate CUDA streams. Default false
+    // until empirical validation in Module 6.
+    bool        use_cuda_streams     = false;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -358,6 +362,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         // Spec C3 stage 1.B: opt-in async batch prefetcher.
         if (auto v = opts.get_bool("useAsyncPrefetcher")) {
             use_async_prefetcher = *v;
+        }
+        // Spec C3 stage 3: opt-in CUDA streams for assemble vs train overlap.
+        if (auto v = opts.get_bool("useCudaStreams")) {
+            use_cuda_streams = *v;
         }
         if (auto v = opts.get_bool("normalize")) {
             normalize = *v;
@@ -567,6 +575,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.patience      = patience;
     loop_config.random_seed   = random_seed;
     loop_config.use_async_prefetcher = use_async_prefetcher;
+    loop_config.use_cuda_streams     = use_cuda_streams;
     loop_config.output_dir    = output_dir.string();
 
     // =========================================================================
