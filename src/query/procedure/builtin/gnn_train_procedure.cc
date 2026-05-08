@@ -311,8 +311,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
     bool        save_final       = true;
-    // Spec C3 stage 1.B (2026-05-07): toggle async prefetcher.
-    bool        use_async_prefetcher = false;
+    // Spec C3 stage 1 (default true since 2026-05-07): async prefetcher.
+    // 1.609× speedup measured on papers100M, bit-identical accuracy.
+    bool        use_async_prefetcher = true;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));

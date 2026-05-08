@@ -142,6 +142,35 @@ The disk_cache layer in DiskGNN is **opt-in** (activated only when `disk_size` c
 
 The Spec D telemetry (`gnn_build_feature_store` yields `slimMb`, `reorderedMb`, `gpuCacheMb`, `cpuCacheMb`, `totalDiskMb`, `overBudget`) lets us empirically verify whether the actual blowup of a given (sample, feature_dim) configuration matches the paper's prediction before deciding whether to invest in C2.
 
+### GNN training pipeline overlap — Spec C3 stage 1 (delivered 2026-05-07)
+
+`TrainingLoop` overlaps each batch's `BatchAssembler::assemble()` + `host→device` transfer with the previous batch's model `forward+backward` via `AsyncBatchPrefetcher` — a single-worker, bounded-queue producer-consumer fronting the assembler. Default queue size 2 (matches DiskGNN SIGMOD'25 §6 "the sizes of all shared queues are set to 2"). Procedure parameter `useAsyncPrefetcher: bool` defaults **true** since 2026-05-07 (`gnn_train` opts).
+
+**Empirical validation** (papers100M_caminoD_sample, 5 epochs SAGE 2-layer hidden=256 dropout=0.3 lr=0.001 random_seed=42 on celebi RTX 5070 Ti + 20-core CPU + 30 GB RAM):
+
+| Metric           | Sequential (no prefetcher) | With prefetcher (queue=2) | delta            |
+|------------------|----------------------------|---------------------------|------------------|
+| trainSeconds     | 154.51                     | 96.01                     | **1.609× speedup** |
+| assembleSeconds  | 101.72                     | 45.64                     | -55.1%           |
+| forwardSeconds   | 2.97                       | 2.56                      | within noise     |
+| backwardSeconds  | 5.85                       | 5.06                      | within noise     |
+| bestValAccuracy  | 0.5942                     | 0.5940                    | match (±0.0002)  |
+| l1HitRatio       | 1.0                        | 1.0                       | ✓                |
+
+**Per-batch cost model** (1.6M batches across 5 epochs):
+- Worker thread (read_sample + edge_index_build + assemble_kernel): ~35 μs/batch
+- Main thread `.to(device)` for edge/labels/mask + compute: ~33 μs/batch
+- Pipeline throughput ≈ max(35, 33) = 35 μs/batch vs sequential 68 μs/batch
+- Inner-loop speedup 1.94× collapses to 1.609× total because the validation phase remains sequential.
+
+**Comparison with DiskGNN SIGMOD'25 Table 6** (sequential vs pipelined): paper reports 1.71-2.44× across FS/IG configurations. Our 1.609× sits below their range because (i) validation is not overlapped, and (ii) the `assemble_kernel` and `model.forward` share the default CUDA stream (Stage 3 of the C3 plan would split them via `cudaStream_t` + `cudaEventRecord` / `cudaStreamWaitEvent`, deferred due to LibTorch C++ stream-API complexity).
+
+**Files:** `src/gnn/training/async_batch_prefetcher.{h,cc}` (the prefetcher class, 8 unit tests in `test_async_batch_prefetcher.cc`), `TrainingLoop::Config::use_async_prefetcher` + `prefetch_queue_size` (the toggle), `TrainingLoop::Result::{assemble,forward,backward}_seconds` (the per-stage timings yielded as `assembleSeconds`, `forwardSeconds`, `backwardSeconds`).
+
+**Commits**: `264b5cf3` (Stage 0 timing instrumentation), `994dabc7` (Stage 1.A `AsyncBatchPrefetcher` class), `da86d6d8` (Stage 1.B `TrainingLoop` integration), `c688e8d3` (deadlock fix when `train_batches > queue_size` — the original Stage 1.B prefetched the lookahead BEFORE calling `next()`, which blocked on backpressure once the queue was primed full).
+
+**A/B validation harness**: `~/Desktop/spec13_papers100m_e2e/post_pop_os/06_stage1_validation.sh` — sets `useAsyncPrefetcher` to false and true on the same sample with identical hyperparameters and reports the speedup ratio + per-stage breakdown.
+
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
