@@ -1,0 +1,2 @@
+ranEpochs,bestValAccuracy,trainSeconds,assembleSeconds,forwardSeconds,backwardSeconds,l1HitRatio
+5,5.9403664E-1,9.6014015E1,4.563546E1,2.5625277E0,5.062232E0,1.0E0

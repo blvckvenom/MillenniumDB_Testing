@@ -126,6 +126,16 @@ Tesis/
 !docs/MillenniumDB.wiki/
 !docs/MillenniumDB.wiki/**
 
+# Empirical-research notes + raw bench outputs (Spec C3 etc.). Small text/CSV
+# files documenting why design decisions were made. Persisted in-repo so
+# they survive a celebi disk failure without depending on Desktop scratch dirs.
+# To allow nested patterns, first un-ignore the parent dir, then re-ignore
+# everything inside, then carve out specific date-prefixed subdirs.
+!docs/research/
+docs/research/*
+!docs/research/2026-05-*/
+!docs/research/2026-05-*/**
+
 # Ideas y borradores locales
 /Partial_Idea/
 

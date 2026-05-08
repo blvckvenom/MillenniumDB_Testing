@@ -1,0 +1,13 @@
+=== Stage 1 A/B comparison ===
+TS:       20260507_151218
+git HEAD: c688e8d36c0b2c731fc64aef635054581d299f81
+
+                   BASELINE     PREFETCHER   delta
+                   ----------   ----------   -----
+trainSeconds:      1.5451225E2   9.6014015E1   1.609x
+assembleSeconds:   1.0172431E2   4.563546E1   55.1% reduction
+forwardSeconds:    2.965442E0   2.5625277E0
+backwardSeconds:   5.8469844E0   5.062232E0
+
+Speedup (train wall-clock): 1.609x
+Decision:                    STAGE 1 CONFIRMED — proceed to Stage 2 / Stage 3

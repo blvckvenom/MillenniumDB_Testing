@@ -1,0 +1,2 @@
+ranEpochs,bestValAccuracy,trainSeconds,assembleSeconds,forwardSeconds,backwardSeconds,l1HitRatio,l2HitRatio,l3Reads,l4Reads,totalBytesDisk
+5,5.912905E-1,1.5357578E2,1.0084427E2,2.9997833E0,5.980981E0,1.0E0,0.0E0,0,0,360224

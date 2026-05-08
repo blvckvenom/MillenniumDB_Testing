@@ -1,0 +1,22 @@
+=== Stage 3 A/B/C comparison ===
+TS:       20260508_084722
+git HEAD: 3cb4be3e68058c964f17aa61e4553394dab3ee6c
+
+                   A SEQUENTIAL    B STAGE 1      C STAGE 1+3
+                   ------------    ----------     -----------
+trainSeconds:       1.4388013E2    9.7394646E1      9.605144E1
+assembleSeconds:     9.258529E1    4.679835E1      4.568609E1
+forwardSeconds:     2.9681382E0    1.7350736E0     1.8936723E0
+backwardSeconds:    5.8257284E0    5.1662917E0      4.961865E0
+bestValAccuracy:   6.0086215E-1    6.00934E-1     5.907237E-1
+
+Speedups (lower train time = better):
+  A → B (Stage 1):       1.477x
+  B → C (Stage 3 add):   1.014x
+  A → C (full pipeline): 1.498x
+
+Accuracy parity (must be < 0.01 for safe defaults):
+  |A_val - B_val|: 0.000072
+  |B_val - C_val|: 0.010210
+
+Decision (B→C):  STAGE 3 NEUTRAL — investigate stream sharing on this hardware

@@ -169,7 +169,23 @@ The Spec D telemetry (`gnn_build_feature_store` yields `slimMb`, `reorderedMb`, 
 
 **Commits**: `264b5cf3` (Stage 0 timing instrumentation), `994dabc7` (Stage 1.A `AsyncBatchPrefetcher` class), `da86d6d8` (Stage 1.B `TrainingLoop` integration), `c688e8d3` (deadlock fix when `train_batches > queue_size` — the original Stage 1.B prefetched the lookahead BEFORE calling `next()`, which blocked on backpressure once the queue was primed full).
 
-**A/B validation harness**: `~/Desktop/spec13_papers100m_e2e/post_pop_os/06_stage1_validation.sh` — sets `useAsyncPrefetcher` to false and true on the same sample with identical hyperparameters and reports the speedup ratio + per-stage breakdown.
+**A/B validation harness**: `~/Desktop/spec13_papers100m_e2e/post_pop_os/06_stage1_validation.sh` — sets `useAsyncPrefetcher` to false and true on the same sample with identical hyperparameters and reports the speedup ratio + per-stage breakdown. Raw outputs persisted in `docs/research/2026-05-07-stage1-empirical/`.
+
+### Spec C3 stage 3 — CUDA streams (validated NEUTRAL on celebi, 2026-05-08)
+
+Stage 3 splits `assemble_kernel` (worker stream) and `model.forward + backward` (train stream) onto separate CUDA streams via `c10::cuda::CUDAStream` + `at::cuda::CUDAEvent`, following DiskGNN paper §5.3. All five sub-modules landed (commits `98c6302e`, `74b159ba`, `51ed0523`, `980c311a`, `3cb4be3e`) with 14 unit tests covering: stream pool acquisition, event lifecycle, cross-stream sync via `event.block`, model forward/backward stream consistency, prefetcher event recording, and end-to-end training-loop completion. Procedure parameter `useCudaStreams: bool` defaults **false**.
+
+**Empirical A/B/C** (papers100M_caminoD_sample, 5 epochs SAGE 2-layer, git HEAD `3cb4be3e`):
+
+| Run | trainSeconds | A→B | B→C | A→C |
+|---|---|---|---|---|
+| A — sequential (no prefetcher, no streams) | 143.88 |  |  |  |
+| B — Stage 1 only                            |  97.39 | **1.477×** |  | |
+| C — Stage 1+3 (dual stream)                 |  96.05 |  | **1.014×** | **1.498×** |
+
+**Stage 3 dual-stream gives only 1.4% over Stage 1**. Reasons: (i) `assemble_kernel` is small (microseconds, ~5000 blocks/batch) so GPU contention isn't the bottleneck; (ii) PyTorch `loss.item()` / `label_mask.any().item()` introduce per-batch host-blocking syncs that consume the cross-stream concurrency window; (iii) RTX 5070 Ti's 70 SMs are already heavily utilized by either kernel alone, leaving no idle SMs for parallel work; (iv) `.to(device)` for small int64 tensors is PCIe-bandwidth-bound, not stream-parallelizable. Larger models (3 layers, hidden=512+, GAT) on bigger GPUs would likely benefit more — flipping the default is a one-line change when a workload that justifies it appears.
+
+Raw outputs in `docs/research/2026-05-08-stage3-empirical/`. Bench script: `~/Desktop/spec13_papers100m_e2e/post_pop_os/07_stage3_validation.sh`.
 
 ## Development Notes
 
