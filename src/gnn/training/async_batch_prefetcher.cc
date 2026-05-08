@@ -1,14 +1,22 @@
 #include "gnn/training/async_batch_prefetcher.h"
 
+#include <optional>
 #include <stdexcept>
 #include <utility>
+
+#ifdef ENABLE_CUDA_ASSEMBLER
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
 
 namespace mdb::gnn {
 
 AsyncBatchPrefetcher::AsyncBatchPrefetcher(BatchAssembler& assembler,
-                                           size_t queue_size)
+                                           size_t queue_size,
+                                           bool use_cuda_streams)
     : assembler_(assembler)
     , queue_size_(queue_size)
+    , use_cuda_streams_(use_cuda_streams)
 {
     if (queue_size_ == 0) {
         throw std::invalid_argument(
@@ -96,6 +104,20 @@ bool AsyncBatchPrefetcher::is_shutdown() const {
 }
 
 void AsyncBatchPrefetcher::worker_loop() {
+    // Spec C3 stage 3: when use_cuda_streams_ is true, the worker keeps a
+    // single pool stream for its lifetime. All assemblies run under
+    // CUDAStreamGuard(worker_stream); we record a CUDAEvent into the
+    // produced MiniBatch so the consumer can sync via event.block().
+    //
+    // Acquired lazily here (not in constructor) to keep CUDA dependencies
+    // off the constructor path when use_cuda_streams_ is false.
+#ifdef ENABLE_CUDA_ASSEMBLER
+    std::optional<c10::cuda::CUDAStream> worker_stream;
+    if (use_cuda_streams_) {
+        worker_stream.emplace(c10::cuda::getStreamFromPool());
+    }
+#endif
+
     while (true) {
         uint64_t bid = 0;
         {
@@ -115,7 +137,21 @@ void AsyncBatchPrefetcher::worker_loop() {
 
         // Assemble OUTSIDE the lock — this is the expensive work.
         try {
-            MiniBatch batch = assembler_.assemble(bid);
+            MiniBatch batch;
+#ifdef ENABLE_CUDA_ASSEMBLER
+            if (use_cuda_streams_ && worker_stream.has_value()) {
+                c10::cuda::CUDAStreamGuard guard(*worker_stream);
+                batch = assembler_.assemble(bid);
+                // Record the event AFTER assemble so the consumer's
+                // event.block() correctly waits for assemble's GPU kernels
+                // (assemble_kernel + any .to(device) issued inside).
+                batch.ready_event.record(*worker_stream);
+            } else {
+                batch = assembler_.assemble(bid);
+            }
+#else
+            batch = assembler_.assemble(bid);
+#endif
             std::lock_guard<std::mutex> lk(mu_);
             resp_queue_.push(std::move(batch));
             item_cv_.notify_one();

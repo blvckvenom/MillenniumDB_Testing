@@ -31,6 +31,10 @@
 #include "gnn/training/batch_assembler.h"
 #include "gnn/training/mini_batch.h"
 
+#ifdef ENABLE_CUDA_ASSEMBLER
+#include <c10/cuda/CUDAStream.h>
+#endif
+
 namespace mdb::gnn {
 
 class AsyncBatchPrefetcher {
@@ -39,7 +43,16 @@ public:
     /// (queued + being assembled + completed-not-yet-consumed) batches.
     /// queue_size=2 matches DiskGNN SIGMOD'25 §6 ("the sizes of all shared
     /// queues are set to 2").
-    explicit AsyncBatchPrefetcher(BatchAssembler& assembler, size_t queue_size = 2);
+    ///
+    /// `use_cuda_streams` (Stage 3, default false): when true, the worker
+    /// thread acquires its own pool stream, runs assembly under
+    /// CUDAStreamGuard, and records a CUDAEvent into MiniBatch.ready_event
+    /// after each assembly. Consumers MUST call ready_event.block() on
+    /// their training stream before reading GPU tensors.
+    /// Has no effect when ENABLE_CUDA_ASSEMBLER is undefined.
+    explicit AsyncBatchPrefetcher(BatchAssembler& assembler,
+                                  size_t queue_size = 2,
+                                  bool use_cuda_streams = false);
 
     /// Destructor calls shutdown() then joins the worker. Always succeeds.
     ~AsyncBatchPrefetcher();
@@ -79,6 +92,7 @@ private:
 
     BatchAssembler& assembler_;
     const size_t    queue_size_;
+    const bool      use_cuda_streams_;
 
     mutable std::mutex      mu_;
     std::condition_variable space_cv_;  // notified when in_flight decreases

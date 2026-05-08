@@ -253,6 +253,125 @@ TEST_F(AsyncBatchPrefetcherTest, ZeroQueueSize_Rejected) {
 }
 
 // -----------------------------------------------------------------------------
+// Spec C3 stage 3 module 4 tests: prefetcher with use_cuda_streams=true
+// records a CUDAEvent into MiniBatch.ready_event.
+// -----------------------------------------------------------------------------
+
+#ifdef ENABLE_CUDA_ASSEMBLER
+#include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+
+TEST_F(AsyncBatchPrefetcherTest, Stage3_StreamsDisabled_NoEventRecorded) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    const std::string sname = "asynccp_streams_off";
+    create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+    AsyncBatchPrefetcher prefetcher(assembler, /*queue_size=*/2,
+                                    /*use_cuda_streams=*/false);
+
+    prefetcher.prefetch(0);
+    auto batch = prefetcher.next();
+
+    // With streams disabled, the event must remain uncreated (legacy path).
+    EXPECT_FALSE(batch.ready_event.isCreated())
+        << "use_cuda_streams=false must not record an event";
+}
+
+TEST_F(AsyncBatchPrefetcherTest, Stage3_StreamsEnabled_EventRecordedAndQueryable) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    const std::string sname = "asynccp_streams_on";
+    create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+    AsyncBatchPrefetcher prefetcher(assembler, /*queue_size=*/2,
+                                    /*use_cuda_streams=*/true);
+
+    prefetcher.prefetch(0);
+    auto batch = prefetcher.next();
+
+    // The ready_event must be created (recorded) by the worker.
+    EXPECT_TRUE(batch.ready_event.isCreated())
+        << "use_cuda_streams=true must record an event after assembly";
+
+    // Synchronously wait for the event — must return without error.
+    if (batch.ready_event.isCreated()) {
+        cudaEventSynchronize(batch.ready_event.event());
+        EXPECT_TRUE(batch.ready_event.query())
+            << "event must report completed after host synchronize";
+    }
+}
+
+TEST_F(AsyncBatchPrefetcherTest, Stage3_StreamsEnabled_FeaturesContentMatchesSync) {
+    // The most important correctness test: assembling with streams must
+    // produce numerically identical features to assembling without streams,
+    // assuming the consumer correctly blocks on the event.
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    const std::string sname = "asynccp_streams_match";
+    create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    // Reference: synchronous assembly on default stream.
+    BatchAssembler asm_sync(fm, storage, &ls, &ss, rm);
+    auto reference = asm_sync.assemble(0);
+
+    // With streams: prefetcher worker uses a pool stream.
+    BatchAssembler asm_async(fm, storage, &ls, &ss, rm);
+    AsyncBatchPrefetcher prefetcher(asm_async, /*queue_size=*/2,
+                                    /*use_cuda_streams=*/true);
+    prefetcher.prefetch(0);
+    auto batch = prefetcher.next();
+
+    // Consumer-side sync via event — get the consumer onto a fresh train
+    // stream and block it on the producer event.
+    auto train_stream = c10::cuda::getStreamFromPool();
+    {
+        c10::cuda::CUDAStreamGuard guard(train_stream);
+        if (batch.ready_event.isCreated()) {
+            batch.ready_event.block(train_stream);
+        }
+        // Use the tensor: read into CPU. Without proper sync this could be
+        // garbage; with sync it must match the reference.
+        auto features_host = batch.features.cpu();
+        auto reference_host = reference.features.cpu();
+
+        ASSERT_EQ(features_host.sizes(), reference_host.sizes());
+        EXPECT_TRUE(torch::equal(features_host, reference_host))
+            << "stream-assembled features must match sync-assembled features"
+               " (proper event sync should guarantee correctness)";
+    }
+    train_stream.synchronize();
+}
+#endif // ENABLE_CUDA_ASSEMBLER
+
+// -----------------------------------------------------------------------------
 // Test 8: Destructor properly shuts down + joins worker even with batches in flight.
 // -----------------------------------------------------------------------------
 TEST_F(AsyncBatchPrefetcherTest, Destructor_CleanShutdown_WithBatchesInFlight) {
