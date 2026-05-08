@@ -507,6 +507,28 @@ if(BUILD_TESTING)
             endif()
         endif()
 
+        # Spec C3 stage 3: CUDA streams (Module 1) tests
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stage3_streams.cc")
+            add_executable(test_stage3_streams tests/test_stage3_streams.cc)
+            target_link_libraries(test_stage3_streams
+                GTest::gtest_main
+                mdb_gnn_core
+                millenniumdb
+                antlr4_cpp_runtime
+                ssl crypto
+                ${TORCH_LIBRARIES}
+            )
+            set_target_properties(test_stage3_streams PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME Stage3StreamsTests COMMAND test_stage3_streams)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST Stage3StreamsTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
+        endif()
+
         # Spec C3 stage 1: AsyncBatchPrefetcher tests
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_async_batch_prefetcher.cc")
             add_executable(test_async_batch_prefetcher tests/test_async_batch_prefetcher.cc)
