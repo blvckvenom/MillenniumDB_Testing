@@ -200,8 +200,19 @@ Plan E inserts a cheap random-walk profile pass between the sampler constructor 
 Opt-out: `autoProfileOnColdStart: false` config flag + procedure parameter. No-op when the sidecar is absent, `node_counts.bin` already exists, or the projection dir isn't resolvable. Telemetry exposed via new procedure yields: `phase0Triggered`, `phase0Succeeded`, `phase0WalksDone`, `phase0LookupsDone`, `phase0Millis`.
 
 **Files**: `src/gnn/projection/topology_walk_profiler.{h,cc}` (Vose alias + walk loop), `src/gnn/sampling/node_counts_io.{h,cc}` (atomic writer for `node_counts.bin`), `src/gnn/sampling/basic_khop_sampler.{h,cc}` (Phase 0 integration), `src/gnn/sampling/sampling_config.h` (3 new flags), `src/gnn/sampling/offline_sampling_engine.{h,cc}` (telemetry plumbing), `src/query/procedure/builtin/gnn_offline_sample_procedure.{h,cc}` (yields + parse).
-**Tests**: `src/tests/topology_walk_profiler_test.cc` (8 unit tests covering empty reader, deterministic seeds, isolated-node skip via alias weights, lookup bounds, defaults).
-**Commits**: `6e6776fc` (core implementation, 14 files, 921 insertions), `42c6970b` (degree-weighted seed fix after first papers100M live trial revealed uniform sampling produced 100 000 walks × 0 useful steps).
+**Tests**: `src/tests/topology_walk_profiler_test.cc` (9 unit tests covering empty reader, deterministic seeds, isolated-node skip via alias weights, lookup bounds, defaults, and the papers100M regression fixture of 1-hub + many leaves).
+
+**Commit cluster** (each fixed a distinct papers100M bug surfaced by live runs):
+
+| SHA | What it fixes |
+|---|---|
+| `6e6776fc` | Plan E core implementation: `TopologyWalkProfiler` + `node_counts_io` + integration in `BasicKHopSampler::Impl` + procedure yields + 8 unit tests. 14 files, 921 insertions. |
+| `42c6970b` | Degree-weighted seed selection (Vose alias). Uniform seed selection over [0,N) landed ~99% of walks on isolated leaves on papers100M, producing all-zero counts useless to the warm-start path. |
+| `a05f7687` | Eligible-only alias domain. Even with degree-weighted alias, leftover-large cleanup left `alias_[i]=0` pointing at an isolated node 0; the fix builds the alias only over nodes with `degree>0` (mapping draws back through an `eligible_nodes` index). Added a 1-hub-19-leaves regression test. |
+| `f71b3bf0` | Strip `ObjectId` type tag when following sidecar neighbors. The sidecar stores `dst` as the raw `ObjectId.id` (top 8 bits = type tag); my defensive `if (next >= n)` was correctly flagging all results as out-of-range but wrongly treating them as corruption. Mask with `0x00FFFFFFFFFFFFFFULL` first. |
+| `c426e1b3` | Tier-assignment `avg_degree` must reflect real graph degree, not access-count frequency. `compute_tier_assignment` uses `avg_degree` to estimate bytes-per-node; deriving it from sparse Phase-0 counts (mean 0.003 on papers100M) collapsed per-node cost to fixed-overhead-only and packed the entire 111M-node graph into L1+L2 with L3 empty. Fix: read `num_edges/num_nodes` from the Spec #4-B sidecar reader when available. |
+
+**Operational note**: on celebi (30 GB RAM) the default L1/L2 budgets (5 GB + 15 GB) still fit the full papers100M topology in RAM after the `c426e1b3` fix, so L3 only exercises when the user passes explicit `l1CacheMb` + `l2CacheMb` smaller than the graph fits in. To replicate the DiskGNN paper's 10%-cache configuration: pass `l1CacheMb: 1024, l2CacheMb: 2048` — that puts the top 21M nodes in RAM caches and 90M in the L3 mmap tier where the MinHash reorder permutation is actually consulted.
 
 ## Development Notes
 
