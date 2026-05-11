@@ -65,6 +65,37 @@ public:
      */
     BasicKHopSampler(GQL::ProjectionStorage& storage, const SamplingConfig& config);
 
+    /**
+     * @brief Construct a worker sampler that shares a pre-built TopologyAccessor.
+     *
+     * Plan F (2026-05-11) — parallel sampling. Each worker thread builds its
+     * own `BasicKHopSampler` with private RNG + per-node access counts, but
+     * borrows the topology (FourLevelTopologyStore + adjacency caches) from
+     * a primary instance. The primary owns the topology; workers reference
+     * it through the raw pointer. The shared topology must outlive every
+     * worker.
+     *
+     * Worker ctors skip Phase 0 auto-profile, `enable_four_level_store`,
+     * and `prebuild_adjacency_cache` — those are assumed to have already
+     * happened on the primary. RNG is seeded from `config.random_seed` plus
+     * the worker_offset, but the recommended usage is to call
+     * `reseed_for_batch(batch_id)` before each batch so output is invariant
+     * to thread scheduling.
+     *
+     * @param storage           Reference to projection storage (read-only)
+     * @param config            Sampling configuration (RNG seed + fanouts)
+     * @param shared_topology   Non-owning pointer to a built TopologyAccessor
+     *                          (typically `&primary.get_topology()`)
+     * @param worker_offset     Worker index (>=1); used as additional RNG
+     *                          seed material so workers start from distinct
+     *                          but reproducible states.
+     */
+    BasicKHopSampler(
+        GQL::ProjectionStorage& storage,
+        const SamplingConfig& config,
+        TopologyAccessor* shared_topology,
+        uint32_t worker_offset);
+
     ~BasicKHopSampler();
 
     // Disable copy
@@ -170,6 +201,41 @@ public:
      * `gnn_offline_sample` run (warm start).
      */
     const std::vector<uint64_t>& node_access_counts() const;
+
+    // =========================================================================
+    // Plan F — parallel sampling support
+    // =========================================================================
+
+    /**
+     * @brief Borrow this sampler's TopologyAccessor (non-owning).
+     *
+     * Plan F (2026-05-11) — used by the parallel scheduler to share the
+     * expensive FourLevelTopologyStore + adjacency caches across worker
+     * sampler instances. The returned reference is valid for the lifetime
+     * of this sampler.
+     */
+    TopologyAccessor& get_topology();
+
+    /**
+     * @brief Re-seed all internal RNGs deterministically for a batch.
+     *
+     * Plan F (2026-05-11) — call before `sample(batch_seeds, batch_id, split)`
+     * inside a parallel scheduler to make each batch's output invariant to
+     * which worker thread picks it up. Seeds = `config.random_seed XOR
+     * batch_id` mixing function, applied to the BasicKHopSampler's own
+     * `rng`, the LeapfrogGnnSampler, and the SeekBasedGnnSampler.
+     */
+    void reseed_for_batch(uint64_t batch_id);
+
+    /**
+     * @brief Merge per-node access counts from a worker sampler.
+     *
+     * Plan F (2026-05-11) — after all workers finish sampling, the
+     * scheduler reduces their per-thread `node_access_counts()` vectors
+     * into the primary's tally so the warm-start `node_counts.bin`
+     * reflects the entire run.
+     */
+    void merge_counts_from(const std::vector<uint64_t>& other);
 
     /**
      * @brief Plan E Phase 0 telemetry (2026-05-11).

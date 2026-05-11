@@ -3,6 +3,7 @@
 #include <fcntl.h>     // open
 #include <unistd.h>    // fsync, close
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>      // rename
@@ -10,10 +11,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include "gnn/projection/gnn_meta.h"
+#include "gnn/projection/topology_accessor.h"
 #include "gnn/sampling/basic_khop_sampler.h"
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/seed_selector.h"
@@ -275,8 +279,42 @@ struct OfflineSamplingEngine::Impl {
             // Using epoch=0 for initial shuffle; training will shuffle batch ORDER
             EpochBatches batches = seed_selector->generate_epoch_batches(0);
 
-            // Lambda to process batches for a split
-            auto process_batches = [&](
+            // -----------------------------------------------------------------
+            // Plan F (2026-05-11) — parallel-vs-legacy dispatch.
+            //
+            // `num_workers == 0`: preserve the pre-Plan-F single-threaded path
+            //   bit-identically. The legacy lambda below loops sequentially
+            //   through (train, val, test) batches and uses the primary
+            //   sampler's persistent RNG. Outputs from earlier sessions stay
+            //   reproducible.
+            //
+            // `num_workers >= 1`: parallel path. Each batch is re-seeded as
+            //   `random_seed XOR batch_id` before sampling, so the output
+            //   depends only on `(random_seed, batch_id)` and is identical
+            //   across `num_workers ∈ {1, 2, 4, 20}`. Workers borrow the
+            //   primary's TopologyAccessor (FourLevelTopologyStore + caches
+            //   are read-only post-build) and own private LeapfrogGnnSampler,
+            //   SeekBasedGnnSampler, RNG, and node_access_counts vector.
+            //   `sample_storage.write_sample` is serialized via a single
+            //   mutex; per-batch sampling work runs concurrently.
+            // -----------------------------------------------------------------
+
+            // Resolve effective worker count. 0 = legacy path; otherwise cap
+            // at hardware_concurrency() so misconfiguration can't oversubscribe.
+            uint32_t effective_workers = config.num_workers;
+            if (effective_workers > 0) {
+                const unsigned hw = std::thread::hardware_concurrency();
+                if (hw > 0 && effective_workers > hw) {
+                    effective_workers = static_cast<uint32_t>(hw);
+                }
+            }
+            result.num_workers_used = effective_workers == 0
+                ? 1
+                : effective_workers;
+
+            // Lambda to process batches for a split — LEGACY single-threaded
+            // path. Used when config.num_workers == 0.
+            auto process_batches_legacy = [&](
                 const std::vector<std::vector<ObjectId>>& split_batches,
                 SplitType split_type
             ) -> bool {
@@ -324,10 +362,129 @@ struct OfflineSamplingEngine::Impl {
                 return true;
             };
 
-            // Process all splits (single pass, no epoch loop)
-            if (process_batches(batches.train_batches, SplitType::TRAIN) &&
-                process_batches(batches.validation_batches, SplitType::VALIDATION)) {
-                process_batches(batches.test_batches, SplitType::TEST);
+            // -----------------------------------------------------------------
+            // Plan F parallel path. Builds a flat work-queue across all three
+            // splits (train, val, test) tagged with the destination split, so
+            // a single atomic counter can dispatch any batch to any worker
+            // and the `batch_id` assigned matches the legacy monotonic order
+            // (train batches first, then val, then test).
+            // -----------------------------------------------------------------
+            auto process_batches_parallel = [&]() -> bool {
+                struct WorkItem {
+                    const std::vector<ObjectId>* seeds;
+                    SplitType                    split;
+                    uint64_t                     batch_id;
+                };
+
+                std::vector<WorkItem> work;
+                work.reserve(
+                    batches.train_batches.size()
+                    + batches.validation_batches.size()
+                    + batches.test_batches.size());
+
+                auto append_split = [&](
+                    const std::vector<std::vector<ObjectId>>& split_batches,
+                    SplitType split_type)
+                {
+                    for (const auto& batch : split_batches) {
+                        work.push_back({&batch, split_type, batch_id});
+                        ++batch_id;
+                    }
+                };
+                append_split(batches.train_batches,      SplitType::TRAIN);
+                append_split(batches.validation_batches, SplitType::VALIDATION);
+                append_split(batches.test_batches,       SplitType::TEST);
+
+                const std::size_t total_work = work.size();
+
+                // Build worker samplers. Worker 0 reuses the primary
+                // `khop_sampler` (already through Phase 0 + four-level
+                // enable). Workers 1..N-1 borrow the topology and own their
+                // own Leapfrog/Seek samplers + RNG + tally vector.
+                std::vector<std::unique_ptr<BasicKHopSampler>> worker_samplers;
+                if (effective_workers > 1) {
+                    worker_samplers.reserve(effective_workers - 1);
+                    for (uint32_t w = 1; w < effective_workers; ++w) {
+                        worker_samplers.push_back(
+                            std::make_unique<BasicKHopSampler>(
+                                storage,
+                                config,
+                                &khop_sampler->get_topology(),
+                                w));
+                    }
+                }
+
+                std::atomic<std::size_t> next_idx{0};
+                std::mutex               write_mutex;
+
+                auto worker_fn = [&](BasicKHopSampler* sampler) {
+                    while (true) {
+                        if (cancel_requested.load(std::memory_order_relaxed)) {
+                            return;
+                        }
+                        const std::size_t idx =
+                            next_idx.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= total_work) return;
+
+                        const WorkItem& item = work[idx];
+                        sampler->reseed_for_batch(item.batch_id);
+                        GraphSample sample = sampler->sample(
+                            *item.seeds, item.batch_id, item.split);
+
+                        std::lock_guard<std::mutex> lk(write_mutex);
+                        sample_storage.write_sample(sample);
+                        progress.samples_written++;
+                        progress.current_batch  = item.batch_id + 1;
+                        progress.current_split  = item.split;
+
+                        if (progress.samples_written % progress_interval == 0) {
+                            auto now = std::chrono::steady_clock::now();
+                            progress.elapsed_seconds =
+                                std::chrono::duration<double>(now - start_time).count();
+                            double rate = progress.throughput();
+                            uint64_t remaining =
+                                total_batches - progress.samples_written;
+                            progress.estimated_remaining =
+                                rate > 0 ? remaining / rate : 0;
+                            if (!report_progress(progress)) {
+                                cancel_requested.store(true);
+                            }
+                        }
+                    }
+                };
+
+                // Spawn workers. Primary runs in-thread to keep one fewer
+                // OS thread alive and to match the legacy path's behavior
+                // when num_workers == 1.
+                std::vector<std::thread> threads;
+                threads.reserve(effective_workers - 1);
+                for (auto& w : worker_samplers) {
+                    threads.emplace_back(worker_fn, w.get());
+                }
+                worker_fn(khop_sampler.get());
+                for (auto& t : threads) t.join();
+
+                // Merge per-worker tallies into the primary's vector so the
+                // node_counts.bin write at the end of do_run reflects every
+                // worker's contribution.
+                for (const auto& w : worker_samplers) {
+                    khop_sampler->merge_counts_from(w->node_access_counts());
+                }
+
+                return !cancel_requested.load();
+            };
+
+            if (effective_workers == 0) {
+                // Process all splits (single pass, no epoch loop)
+                if (process_batches_legacy(batches.train_batches, SplitType::TRAIN) &&
+                    process_batches_legacy(batches.validation_batches, SplitType::VALIDATION)) {
+                    process_batches_legacy(batches.test_batches, SplitType::TEST);
+                }
+            } else {
+                process_batches_parallel();
+                if (cancel_requested.load()) {
+                    result.cancelled = true;
+                }
             }
 
             // Finalize storage

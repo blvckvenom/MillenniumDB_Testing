@@ -290,6 +290,56 @@ struct SamplingConfig {
     std::size_t profile_walk_length = 0;
 
     // =========================================================================
+    // Parallel sampling (Plan F, 2026-05-11)
+    // =========================================================================
+
+    /**
+     * @brief Number of worker threads for the outer per-batch sampling loop.
+     *
+     * Plan F (2026-05-11) — SALIENT-style shared-memory parallelization of
+     * the per-batch `khop_sampler->sample()` calls in
+     * `OfflineSamplingEngine::do_run`. Each worker thread owns a private
+     * `BasicKHopSampler` + `LeapfrogGnnSampler` + `SeekBasedGnnSampler`
+     * with its own RNG and per-node access-counts vector, while all of
+     * them borrow the primary's `TopologyAccessor` (FourLevelTopologyStore
+     * + adjacency caches) by reference — that part is read-only post-build.
+     *
+     * Determinism is preserved bit-identically across `num_workers` values
+     * because each batch is re-seeded as `random_seed XOR batch_id` before
+     * sampling, so output depends only on `(random_seed, batch_id, split)`
+     * regardless of which thread executes it.
+     *
+     * Special values:
+     *   - 0 (default): single-threaded mode, identical to pre-Plan-F path.
+     *   - 1: parallel infrastructure runs with a single worker — useful for
+     *        A/B benchmarks against the legacy single-threaded path
+     *        (verifies the worker-pool overhead is negligible).
+     *   - >=2: spawn that many workers. Capped at
+     *        `std::thread::hardware_concurrency()` at engine startup.
+     *
+     * Expected speedup on celebi 20-core for papers100M 3-layer: 6-12×
+     * (SALIENT MLSys 2022, NextDoor EuroSys 2021 empirical range — sync
+     * overhead + cache contention limits linear scaling).
+     *
+     * **Thread-safety prerequisite.** `num_workers >= 2` requires the
+     * Spec #13 four-level path (`use_four_level_topology_store=true`), the
+     * default since 2026-04-25. The post-build FourLevelTopologyStore is
+     * read-only and supports concurrent `get_neighbors` from any number of
+     * threads. The legacy "BPT direct" path (when Spec #13 + Spec #11 are
+     * both disabled) is NOT thread-safe: the underlying `BufferManager`
+     * page pool mutates pin counters and frame replacement without
+     * external locking, and concurrent `BPlusTree::get_range` calls
+     * trigger a use-after-free that crashes the server silently. Setting
+     * `num_workers >= 2` while `use_four_level_topology_store=false` and
+     * `use_adjacency_cache=false` is therefore unsupported — the engine
+     * still attempts the parallel dispatch, but the run will SIGSEGV
+     * within seconds. Use `num_workers=1` (single-worker parallel
+     * infrastructure) or `num_workers=0` (legacy sequential path) for
+     * BPT-direct workloads.
+     */
+    std::uint32_t num_workers = 0;
+
+    // =========================================================================
     // Output
     // =========================================================================
 

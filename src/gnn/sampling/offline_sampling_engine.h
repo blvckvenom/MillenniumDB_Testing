@@ -73,6 +73,12 @@ struct SamplingResult {
     uint64_t    phase0_walks_done    = 0;
     uint64_t    phase0_lookups_done  = 0;
     double      phase0_elapsed_seconds = 0.0;
+
+    // Plan F (2026-05-11) — number of worker threads actually used. 1 when
+    // running the legacy single-threaded path (num_workers=0 in config);
+    // matches the resolved worker count otherwise (capped at
+    // std::thread::hardware_concurrency()).
+    std::uint32_t num_workers_used = 1;
 };
 
 /**

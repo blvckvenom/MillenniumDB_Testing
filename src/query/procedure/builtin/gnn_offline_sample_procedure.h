@@ -180,7 +180,8 @@ private:
         bool& use_l3_mmap_sidecar,
         bool& auto_profile_on_cold_start,
         uint64_t& profile_num_walks,
-        uint64_t& profile_walk_length
+        uint64_t& profile_walk_length,
+        uint64_t& num_workers
     );
 };
 

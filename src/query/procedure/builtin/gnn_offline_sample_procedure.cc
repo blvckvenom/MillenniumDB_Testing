@@ -112,6 +112,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     bool auto_profile_on_cold_start = true;
     uint64_t profile_num_walks = 0;
     uint64_t profile_walk_length = 0;
+    uint64_t num_workers = 0;
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -122,7 +123,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                           l1_cache_mb, l2_cache_mb,
                           use_l3_mmap_sidecar,
                           auto_profile_on_cold_start,
-                          profile_num_walks, profile_walk_length);
+                          profile_num_walks, profile_walk_length,
+                          num_workers);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -221,6 +223,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.auto_profile_on_cold_start = auto_profile_on_cold_start;
     config.profile_num_walks   = static_cast<std::size_t>(profile_num_walks);
     config.profile_walk_length = static_cast<std::size_t>(profile_walk_length);
+    config.num_workers = static_cast<std::uint32_t>(num_workers);
 
     // Validate config
     try {
@@ -273,6 +276,11 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("phase0LookupsDone", ctx.create_int(static_cast<int64_t>(result.phase0_lookups_done)));
     ctx.yield("phase0Millis",      ctx.create_int(
         static_cast<int64_t>(result.phase0_elapsed_seconds * 1000.0)));
+
+    // Plan F (2026-05-11) — resolved worker count. 1 for legacy single-thread
+    // path (numWorkers=0); matches the parallel pool size otherwise.
+    ctx.yield("numWorkersUsed", ctx.create_int(
+        static_cast<int64_t>(result.num_workers_used)));
 
     ctx.yield_row();
 }
@@ -348,7 +356,8 @@ void GnnOfflineSampleProcedure::parse_options(
     bool& use_l3_mmap_sidecar,
     bool& auto_profile_on_cold_start,
     uint64_t& profile_num_walks,
-    uint64_t& profile_walk_length
+    uint64_t& profile_walk_length,
+    uint64_t& num_workers
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -454,5 +463,14 @@ void GnnOfflineSampleProcedure::parse_options(
                 "profileWalkLength must be non-negative, got: " + std::to_string(*v));
         }
         profile_walk_length = static_cast<uint64_t>(*v);
+    }
+
+    // Plan F (2026-05-11) — parallel sampling worker count.
+    if (auto v = opts.get_int("numWorkers")) {
+        if (*v < 0) {
+            throw std::runtime_error(
+                "numWorkers must be non-negative, got: " + std::to_string(*v));
+        }
+        num_workers = static_cast<uint64_t>(*v);
     }
 }

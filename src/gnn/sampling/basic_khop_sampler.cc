@@ -26,7 +26,13 @@ namespace mdb::gnn {
 struct BasicKHopSampler::Impl {
     GQL::ProjectionStorage& storage;
     SamplingConfig config;
-    std::unique_ptr<TopologyAccessor> topology;
+    // Plan F (2026-05-11) — split ownership: `owned_topology` is non-null
+    // on the primary sampler and null on workers; `topology` is the raw
+    // pointer used throughout the code, so existing call sites keep using
+    // `topology->...` regardless of who actually owns it. Workers must
+    // not destroy their borrowed topology; that's the primary's job.
+    std::unique_ptr<TopologyAccessor> owned_topology;
+    TopologyAccessor* topology = nullptr;
     std::unique_ptr<LeapfrogGnnSampler> leapfrog_sampler;    ///< Sweep-based sampler
     std::unique_ptr<SeekBasedGnnSampler> seek_sampler;       ///< Seek-based sampler
     std::mt19937_64 rng;
@@ -60,11 +66,12 @@ struct BasicKHopSampler::Impl {
     Impl(GQL::ProjectionStorage& storage_, const SamplingConfig& config_)
         : storage(storage_)
         , config(config_)
-        , topology(std::make_unique<TopologyAccessor>(storage_))
+        , owned_topology(std::make_unique<TopologyAccessor>(storage_))
         , leapfrog_sampler(std::make_unique<LeapfrogGnnSampler>(storage_))
         , seek_sampler(std::make_unique<SeekBasedGnnSampler>(storage_))
         , rng(config_.random_seed)
     {
+        topology = owned_topology.get();
         config.validate();
         // Sync random seed with all samplers
         leapfrog_sampler->set_random_seed(config_.random_seed);
@@ -115,6 +122,44 @@ struct BasicKHopSampler::Impl {
             topology->prebuild_adjacency_cache(config_.orientation);
             // Force PER_NODE: the cache makes per-node sampling
             // unconditionally optimal compared to Leapfrog/Seek.
+            use_leapfrog = false;
+        }
+    }
+
+    // Plan F (2026-05-11) — worker ctor. Borrows the primary's
+    // TopologyAccessor (already through Phase 0 + four-level enable +
+    // adjacency cache build) and creates fresh Leapfrog/Seek samplers
+    // owning their own RNG state. Skip the expensive Phase 0 / cache
+    // setup since the primary did all that work.
+    Impl(GQL::ProjectionStorage& storage_,
+         const SamplingConfig& config_,
+         TopologyAccessor* shared_topology,
+         uint32_t worker_offset)
+        : storage(storage_)
+        , config(config_)
+        , owned_topology(nullptr)
+        , leapfrog_sampler(std::make_unique<LeapfrogGnnSampler>(storage_))
+        , seek_sampler(std::make_unique<SeekBasedGnnSampler>(storage_))
+        // Seed workers with `random_seed XOR worker_offset` so they start
+        // from distinct but deterministic states. Callers are expected to
+        // re-seed via `reseed_for_batch()` before each batch anyway, which
+        // makes the output invariant to scheduling; this initial seed is a
+        // safety net for callers that forget.
+        , rng(config_.random_seed ^ static_cast<uint64_t>(worker_offset))
+    {
+        topology = shared_topology;
+        config.validate();
+        const uint64_t worker_seed =
+            config_.random_seed ^ static_cast<uint64_t>(worker_offset);
+        leapfrog_sampler->set_random_seed(worker_seed);
+        seek_sampler->set_random_seed(worker_seed);
+        // Mirror the primary's strategy choice. The primary forced
+        // PER_NODE iff Spec #13 four-level or Spec #11 adjacency cache is
+        // active; workers inherit the same toggle by inspecting the same
+        // config flags. We never rebuild the cache or re-enable the four-
+        // level store here — that's the primary's responsibility.
+        if (config_.use_four_level_topology_store ||
+            config_.use_adjacency_cache) {
             use_leapfrog = false;
         }
     }
@@ -507,6 +552,15 @@ BasicKHopSampler::BasicKHopSampler(GQL::ProjectionStorage& storage, const Sampli
 {
 }
 
+BasicKHopSampler::BasicKHopSampler(
+    GQL::ProjectionStorage& storage,
+    const SamplingConfig& config,
+    TopologyAccessor* shared_topology,
+    uint32_t worker_offset)
+    : impl_(std::make_unique<Impl>(storage, config, shared_topology, worker_offset))
+{
+}
+
 BasicKHopSampler::~BasicKHopSampler() = default;
 
 BasicKHopSampler::BasicKHopSampler(BasicKHopSampler&&) noexcept = default;
@@ -554,6 +608,31 @@ bool BasicKHopSampler::get_use_leapfrog() const {
 
 const std::vector<uint64_t>& BasicKHopSampler::node_access_counts() const {
     return impl_->node_access_counts;
+}
+
+TopologyAccessor& BasicKHopSampler::get_topology() {
+    return *impl_->topology;
+}
+
+void BasicKHopSampler::reseed_for_batch(uint64_t batch_id) {
+    // Mix `random_seed` with `batch_id` so each batch's RNG state is
+    // deterministic regardless of which worker thread picks it up.
+    // Plain XOR is fine here: `batch_id` is small and dense, so the
+    // mt19937_64 warmup masks any low-bit correlation in the seed.
+    const uint64_t batch_seed = impl_->config.random_seed ^ batch_id;
+    impl_->rng.seed(batch_seed);
+    impl_->leapfrog_sampler->set_random_seed(batch_seed);
+    impl_->seek_sampler->set_random_seed(batch_seed);
+}
+
+void BasicKHopSampler::merge_counts_from(const std::vector<uint64_t>& other) {
+    if (other.empty()) return;
+    if (impl_->node_access_counts.size() < other.size()) {
+        impl_->node_access_counts.resize(other.size(), 0);
+    }
+    for (std::size_t i = 0; i < other.size(); ++i) {
+        impl_->node_access_counts[i] += other[i];
+    }
 }
 
 BasicKHopSampler::Phase0Report BasicKHopSampler::phase0_report() const {
