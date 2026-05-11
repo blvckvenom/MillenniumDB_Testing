@@ -629,12 +629,37 @@ void FourLevelTopologyStore::build() {
 
         const auto& freq = profiler.frequency();
         const std::size_t n = freq.size();
-        uint64_t total_freq = 0;
-        for (uint64_t f : freq) total_freq += f;
-        const double avg_degree =
-            (n > 0)
-                ? static_cast<double>(total_freq) / static_cast<double>(n)
-                : 0.0;
+
+        // The `avg_degree` passed to `compute_tier_assignment` is used
+        // ONLY to estimate bytes-per-node when packing the L1/L2
+        // budgets. It must reflect actual graph degree, NOT access
+        // frequency: when the `frequency` vector is sparse (e.g. the
+        // Plan E walk-profiler counts after a cold start, where many
+        // entries are 0 or 1), `total_freq/N` collapses to near zero
+        // and the heuristic mistakenly believes every node costs only
+        // its fixed overhead — packing the entire graph into L1/L2 and
+        // leaving L3 empty. Real per-node cost is then 10-100× higher,
+        // causing populate_direction_ to overrun the intended RAM
+        // envelope and dominate the build phase.
+        //
+        // Prefer the Spec #4-B sidecar's `num_edges` / `num_nodes`
+        // ratio when available (constant-time read from the mmap'd
+        // header). Fall back to the access-count proxy only when no
+        // sidecar is open — in that case the cold-start path is
+        // already running with limited info and the heuristic can
+        // misestimate (callers can override via explicit budgets).
+        double avg_degree = 0.0;
+        if (l3_rev_ != nullptr && l3_rev_->has_data() && l3_rev_->num_nodes() > 0) {
+            avg_degree = static_cast<double>(l3_rev_->num_edges()) /
+                         static_cast<double>(l3_rev_->num_nodes());
+        } else if (l3_fwd_ != nullptr && l3_fwd_->has_data() && l3_fwd_->num_nodes() > 0) {
+            avg_degree = static_cast<double>(l3_fwd_->num_edges()) /
+                         static_cast<double>(l3_fwd_->num_nodes());
+        } else if (n > 0) {
+            uint64_t total_freq = 0;
+            for (uint64_t f : freq) total_freq += f;
+            avg_degree = static_cast<double>(total_freq) / static_cast<double>(n);
+        }
 
         owned_tier_assignment_ = compute_tier_assignment(
             freq, l1_bytes, l2_bytes, avg_degree);
