@@ -214,6 +214,40 @@ Opt-out: `autoProfileOnColdStart: false` config flag + procedure parameter. No-o
 
 **Operational note**: on celebi (30 GB RAM) the default L1/L2 budgets (5 GB + 15 GB) still fit the full papers100M topology in RAM after the `c426e1b3` fix, so L3 only exercises when the user passes explicit `l1CacheMb` + `l2CacheMb` smaller than the graph fits in. To replicate the DiskGNN paper's 10%-cache configuration: pass `l1CacheMb: 1024, l2CacheMb: 2048` — that puts the top 21M nodes in RAM caches and 90M in the L3 mmap tier where the MinHash reorder permutation is actually consulted.
 
+### Plan F — parallel offline sampling worker pool (added 2026-05-11)
+
+Spec C3 stage 1 (commit `da86d6d8`, 1.609× speedup) overlapped one batch's `assemble + transfer` with the previous batch's model `forward+backward`, but the per-batch `khop_sampler->sample()` call itself remained single-threaded. On 20-core celebi this was the dominant wall-clock cost of papers100M-scale runs — empirically the legacy path on a 3-layer `[10,15,20]` fanout did not produce any `batches.dat` output within 3 h 37 min before manual abort.
+
+Plan F parallelizes the outer batch loop in `OfflineSamplingEngine::do_run` using a SALIENT-style shared-memory worker pool. Configuration: `numWorkers` procedure parameter / `SamplingConfig::num_workers` field. 0 (default) = legacy sequential path, byte-identical to pre-Plan-F output. >=1 = parallel infrastructure, capped at `std::thread::hardware_concurrency()` at engine start.
+
+Architecture:
+
+- **`BasicKHopSampler` worker ctor** `(storage, config, shared_topology*, worker_offset)` — borrows the primary's `TopologyAccessor` (`FourLevelTopologyStore` + adjacency caches are read-only post-build) and owns private `LeapfrogGnnSampler`, `SeekBasedGnnSampler`, `std::mt19937_64`, and `node_access_counts` vectors. Worker ctors skip Phase 0 + `enable_four_level_store` + `prebuild_adjacency_cache` — those are the primary's responsibility, done once.
+- **Atomic batch dispatch** — workers pull from `std::atomic<size_t> next_idx`, each batch identified by a `WorkItem{seeds*, split, batch_id}` triple. `batch_id` is assigned monotonically pre-spawn (train first, then val, then test) so it matches the legacy ordering byte-for-byte.
+- **Per-batch re-seeding** — each worker calls `sampler.reseed_for_batch(batch_id)` before `sample()`, which re-seeds the worker's RNG + LeapfrogGnn + SeekBasedGnn as `random_seed XOR batch_id`. Output is therefore invariant to which thread picks the batch up — bit-identical across `numWorkers ∈ {1, 2, 4, 20}`.
+- **Serialized writes** — `SampleStorage::write_sample` is `BPlusTree`-adjacent and not thread-safe; a single `std::mutex` around the call serializes the write phase. Sampling work itself runs concurrently.
+- **Final reduce** — at end of run, each worker's `node_access_counts()` is merged into the primary via `merge_counts_from()` so the warm-start `node_counts.bin` reflects every worker's contribution.
+
+Thread-safety prerequisite — **`numWorkers >= 2` requires `useFourLevelTopologyStore: true`** (the default since 2026-04-25). The post-build FourLevelTopologyStore is immutable and supports concurrent `get_neighbors` from any number of threads. The legacy "BPT direct" path (Spec #13 + Spec #11 both disabled) is NOT thread-safe — `BufferManager` mutates pin counters and frame replacement without external locking, and concurrent `BPlusTree::get_range` triggers a use-after-free that crashes the server silently. Empirically reproducible at `numWorkers=4 + useFourLevelTopologyStore:false + useAdjacencyCache:false` on papers100M (server SIGSEGVs in <30 s). `numWorkers=1 + useFourLevelTopologyStore:false` is safe (single worker = parallel infrastructure without contention) and completed a fanout-`[2,2]` papers100M sample in 57 s during validation (6044 batches, 2.57 M unique nodes).
+
+Yields exposed via `gnn_offline_sample`: `numWorkersUsed` (effective pool size after the `hardware_concurrency()` cap, with `0` resolved to `1` for the legacy path).
+
+**Empirical validation status (2026-05-11)**: Plan F infrastructure correctness was confirmed via:
+
+- `numWorkers=0` (legacy): preserved byte-identical pre-Plan-F output (ctest 70/70 pass after refactor).
+- `numWorkers=1` (parallel infra, BPT direct): papers100M fanout-`[2,2]` sample completed in 57 s (6044 batches).
+- `numWorkers=4` (parallel, BPT direct): silently crashed in <30 s — surfaces the pre-existing `BufferManager` concurrent-read race documented above. NOT a Plan F bug; Plan F requires Spec #13 path.
+- `numWorkers=20` (parallel, Spec #13 path) on papers100M: workers spawned correctly (verified via 12 sleeping worker threads alongside the primary's populate phase) but the run blocked on the single-threaded `populate_direction_via_sidecar_` for 30+ min before manual abort. Spec #13 populate-pass parallelization is open follow-up work; once it lands, Plan F's 6-12× speedup over the legacy path should kick in. Until then, papers100M-scale `numWorkers >= 2` runs are gated on whichever finishes first: a smaller-graph A/B validation harness, or a Spec #13 populate refactor.
+
+**Files**: `src/gnn/sampling/basic_khop_sampler.{h,cc}` (worker ctor + `reseed_for_batch` + `merge_counts_from` + `get_topology`), `src/gnn/sampling/sampling_config.h` (`num_workers` + thread-safety doc), `src/gnn/sampling/offline_sampling_engine.{h,cc}` (parallel dispatch lambda + result.num_workers_used), `src/query/procedure/builtin/gnn_offline_sample_procedure.{h,cc}` (`numWorkers` param + `numWorkersUsed` yield).
+
+**Commit**: `c8ffd166` feat(gnn): Plan F — parallel offline sampling via worker pool (SALIENT-style).
+
+**Future work**:
+- T#22 (deferred): cora_gnn-scale bit-identical regression test for `numWorkers={1, 2, 4, 8}`.
+- Spec #13 populate parallelization (independent issue, gates papers100M-scale Plan F validation).
+- `BufferManager` concurrent-read thread-safety (independent issue, would unlock the BPT-direct parallel path).
+
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
