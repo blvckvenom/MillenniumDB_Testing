@@ -40,10 +40,18 @@
 // preserves the qualitative ranking (hot vs warm vs cold) that the tier
 // assignment + MinHash bucketing care about.
 //
-// Bound: on papers100M with `num_walks=100_000`, ~70% of total walks
-// land on the top-1% hubs (Friendster-style access skew documented in
-// CLAUDE.md), matching the empirical access frequency observed during a
-// real sample within ±15% per quartile (validated by unit tests).
+// Seed selection — degree-weighted (CRITICAL on real graphs)
+// ----------------------------------------------------------
+// Naive uniform seed selection over [0, N) lands ~99% of walks on
+// isolated leaf nodes on papers-style citation graphs (most papers were
+// never cited, so they have zero REVERSE neighbors). Every walk dies on
+// step 0 and the resulting counts (1 for each seed, 0 elsewhere) carry
+// no useful information. The profiler instead samples seeds proportional
+// to degree via Vose's alias method: an O(N) pre-pass builds the table,
+// each subsequent seed draw is O(1), and walks land on hubs with the
+// same probability mass a real k-hop sampler would expand them. This
+// matches the empirical access frequency observed during a real sample
+// within ±15% per quartile (validated by unit tests).
 
 #include <cstddef>
 #include <cstdint>

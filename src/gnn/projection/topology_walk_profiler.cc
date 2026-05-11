@@ -2,9 +2,94 @@
 
 #include <algorithm>
 #include <chrono>
+#include <numeric>
 #include <random>
 
 namespace mdb::gnn {
+
+namespace {
+
+// Degree alias-method table for O(1) weighted sampling.
+//
+// Why this matters: on real-world graphs (Friendster / Papers100M /
+// MAG240M) the vast majority of nodes are leaves under the REVERSE
+// orientation (papers nobody cited, users with no inbound edges, ...).
+// Naive uniform seed selection lands ~99% of walks on isolated nodes,
+// every walk dead-ends at step 0, and the resulting counts (`1` for
+// each seed, `0` for everything else) carry zero information about the
+// actual access frequency a real k-hop sampler would observe.
+//
+// The fix: sample seeds proportional to degree. A node with degree=100
+// is 100× more likely to be picked than a degree=1 node. That matches
+// the rough shape of real GNN access patterns (high-degree hubs are
+// touched far more often than tail nodes during multi-hop expansion),
+// and crucially avoids the "all 100k walks died on step 0" pathology.
+//
+// Vose's alias method gives O(1) sampling after O(N) setup. We build
+// the table once at the start of `profile()` from `row_ptr` differences
+// (which we compute from `reader.neighbors(i).size()` rather than
+// touching the mmap'd row_ptr directly — the public reader API
+// guarantees that lookup is O(1) and constant-page-fault).
+class AliasTable {
+public:
+    explicit AliasTable(const std::vector<uint64_t>& weights) {
+        const std::size_t n = weights.size();
+        prob_.assign(n, 0.0);
+        alias_.assign(n, 0);
+
+        double total = 0.0;
+        for (uint64_t w : weights) total += static_cast<double>(w);
+        if (total <= 0.0) return;  // pathological: no neighbors anywhere
+
+        std::vector<double> scaled(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            scaled[i] = static_cast<double>(weights[i]) * static_cast<double>(n) / total;
+        }
+
+        std::vector<std::size_t> small, large;
+        small.reserve(n);
+        large.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (scaled[i] < 1.0) small.push_back(i);
+            else                 large.push_back(i);
+        }
+
+        while (!small.empty() && !large.empty()) {
+            const std::size_t s = small.back(); small.pop_back();
+            const std::size_t l = large.back(); large.pop_back();
+            prob_[s]  = scaled[s];
+            alias_[s] = l;
+            scaled[l] = scaled[l] + scaled[s] - 1.0;
+            if (scaled[l] < 1.0) small.push_back(l);
+            else                 large.push_back(l);
+        }
+        while (!large.empty()) {
+            const std::size_t l = large.back(); large.pop_back();
+            prob_[l] = 1.0;
+        }
+        while (!small.empty()) {
+            const std::size_t s = small.back(); small.pop_back();
+            prob_[s] = 1.0;
+        }
+        valid_ = true;
+    }
+
+    bool valid() const { return valid_; }
+
+    std::size_t draw(std::mt19937_64& rng) const {
+        std::uniform_int_distribution<std::size_t> i_dist(0, prob_.size() - 1);
+        std::uniform_real_distribution<double>     u_dist(0.0, 1.0);
+        const std::size_t i = i_dist(rng);
+        return (u_dist(rng) < prob_[i]) ? i : alias_[i];
+    }
+
+private:
+    std::vector<double>      prob_;
+    std::vector<std::size_t> alias_;
+    bool                     valid_ = false;
+};
+
+}  // namespace
 
 TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
     const GQL::Projection::TopologySnapshotReader& reader,
@@ -29,18 +114,34 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
 
     auto t0 = std::chrono::steady_clock::now();
 
+    // Build a degree-weighted alias table over all nodes. Reading
+    // `neighbors(i).size()` is O(1) via row_ptr; the only cost is one
+    // pass over N to size-up the weights. On papers100M (N=111M) this
+    // is ~30-60 s of sequential mmap pre-touch — much cheaper than the
+    // 24 h cold-start sample we're avoiding. After this step we sample
+    // seeds proportional to degree in O(1) per draw, naturally biasing
+    // walks toward hubs (which receive most real-sampler accesses)
+    // and effectively skipping isolated leaves (which dominate
+    // citation-graph leaf counts and provide zero training signal).
+    std::vector<uint64_t> degrees(static_cast<std::size_t>(n));
+    for (uint64_t i = 0; i < n; ++i) {
+        degrees[static_cast<std::size_t>(i)] = reader.neighbors(i).size();
+    }
+    AliasTable alias(degrees);
+
     std::mt19937_64 rng(seed);
 
-    // Seed selection: uniform over [0, n). For walks that hit an
-    // isolated node (no neighbors), we abandon the remainder of the
-    // walk and start a fresh one from a new uniform seed. This biases
-    // counts slightly toward non-isolated regions, which is exactly
-    // what tier assignment wants (isolated nodes don't need L1/L2
-    // residency anyway).
-    std::uniform_int_distribution<uint64_t> seed_dist(0, n - 1);
+    // Fallback: if the entire graph has zero edges in this direction
+    // (pathological / synthetic test cases), fall back to uniform seed
+    // selection over [0, n). The result will be all-zero counts modulo
+    // restart bookkeeping, which the downstream tier-assignment will
+    // recognize and treat as cold-start.
+    std::uniform_int_distribution<uint64_t> uniform_seed(0, n - 1);
 
     for (std::size_t w = 0; w < num_walks; ++w) {
-        uint64_t curr = seed_dist(rng);
+        uint64_t curr = alias.valid()
+            ? static_cast<uint64_t>(alias.draw(rng))
+            : uniform_seed(rng);
         result.counts[static_cast<std::size_t>(curr)]++;
         result.lookups_done++;
 

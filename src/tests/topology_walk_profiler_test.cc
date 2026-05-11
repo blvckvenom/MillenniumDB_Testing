@@ -193,25 +193,35 @@ TEST_F(TopologyWalkProfilerTest, DifferentSeedsProduceDifferentCounts) {
 }
 
 // =========================================================================
-// 5. Isolated node forces walk restarts.
+// 5. Degree-weighted seed selection skips the isolated node.
+//
+// With the alias-method seed sampler, an isolated node (degree=0) has
+// zero probability mass. Across many walks it should be selected as
+// seed approximately zero times, so its count stays at 0 and the
+// `restarts` counter does NOT receive contributions from seed-time
+// dead-ends originating at that node.
 // =========================================================================
-TEST_F(TopologyWalkProfilerTest, IsolatedNodeTriggersRestart) {
+TEST_F(TopologyWalkProfilerTest, DegreeWeightedSkipsIsolatedSeeds) {
     constexpr uint64_t N = 10;
     build_with_isolated_zero_(N);
     auto reader = open_reverse_();
     ASSERT_TRUE(reader.has_data());
 
-    // Run many walks to virtually guarantee at least one starts on node 0.
+    // Run many walks. Each non-isolated node has degree=1 in this
+    // fixture, so the alias table puts uniform weight on nodes 1..N-1
+    // and zero on node 0. Node 0 should never be picked.
     auto result = TopologyWalkProfiler::profile(
         reader, /*num_walks=*/500, /*walk_length=*/3, /*seed=*/42);
 
-    EXPECT_GT(result.restarts, 0u)
-        << "at least one walk should have started on the isolated node";
+    EXPECT_EQ(result.counts[0], 0u)
+        << "isolated node must not be selected by degree-weighted seed sampler";
 
-    // Node 0 should appear in counts (was visited as a seed) but its
-    // count should be exactly the number of times it was picked, with
-    // no follow-up step bumping it.
-    EXPECT_GT(result.counts[0], 0u);
+    // Sanity: non-isolated nodes accumulated counts.
+    uint64_t non_zero = 0;
+    for (std::size_t i = 1; i < result.counts.size(); ++i) {
+        if (result.counts[i] > 0) non_zero++;
+    }
+    EXPECT_GT(non_zero, 0u);
 }
 
 // =========================================================================
