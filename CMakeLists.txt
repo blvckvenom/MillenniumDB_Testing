@@ -1287,6 +1287,42 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
+# TopologyWalkProfiler unit tests (Plan E Phase 0, 2026-05-11)
+# ============================================================================
+# EXISTS-gated on both the new test file AND the profiler source so the
+# target only configures once the Plan E implementation lands.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_walk_profiler_test.cc" AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/gnn/projection/topology_walk_profiler.cc")
+    add_executable(topology_walk_profiler_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_walk_profiler_test.cc
+    )
+    set_target_properties(topology_walk_profiler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(topology_walk_profiler_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        mdb_gnn_core
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyWalkProfilerTests
+        COMMAND $<TARGET_FILE:topology_walk_profiler_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # NativeProjectionBuilder × TopologySnapshot integration test (Spec #4-B T4.6)
 # ============================================================================
 # EXISTS-gated so the target is only configured once the integration source

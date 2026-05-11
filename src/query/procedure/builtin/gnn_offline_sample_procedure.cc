@@ -109,6 +109,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     uint64_t l1_cache_mb = 0;
     uint64_t l2_cache_mb = 0;
     bool use_l3_mmap_sidecar = true;
+    bool auto_profile_on_cold_start = true;
+    uint64_t profile_num_walks = 0;
+    uint64_t profile_walk_length = 0;
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -117,7 +120,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                           use_predefined_splits, use_adjacency_cache,
                           use_four_level_topology_store,
                           l1_cache_mb, l2_cache_mb,
-                          use_l3_mmap_sidecar);
+                          use_l3_mmap_sidecar,
+                          auto_profile_on_cold_start,
+                          profile_num_walks, profile_walk_length);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -213,6 +218,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.l1_cache_mb = static_cast<std::size_t>(l1_cache_mb);
     config.l2_cache_mb = static_cast<std::size_t>(l2_cache_mb);
     config.use_l3_mmap_sidecar = use_l3_mmap_sidecar;
+    config.auto_profile_on_cold_start = auto_profile_on_cold_start;
+    config.profile_num_walks   = static_cast<std::size_t>(profile_num_walks);
+    config.profile_walk_length = static_cast<std::size_t>(profile_walk_length);
 
     // Validate config
     try {
@@ -257,6 +265,15 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("uniqueNodes", ctx.create_int(static_cast<int64_t>(result.catalog.unique_nodes)));
     ctx.yield("storagePath", ctx.create_string(storage_path.string()));
     ctx.yield("computeMillis", ctx.create_int(compute_millis));
+
+    // Plan E Phase 0 telemetry (2026-05-11).
+    ctx.yield("phase0Triggered", ctx.create_bool(result.phase0_triggered));
+    ctx.yield("phase0Succeeded", ctx.create_bool(result.phase0_succeeded));
+    ctx.yield("phase0WalksDone",   ctx.create_int(static_cast<int64_t>(result.phase0_walks_done)));
+    ctx.yield("phase0LookupsDone", ctx.create_int(static_cast<int64_t>(result.phase0_lookups_done)));
+    ctx.yield("phase0Millis",      ctx.create_int(
+        static_cast<int64_t>(result.phase0_elapsed_seconds * 1000.0)));
+
     ctx.yield_row();
 }
 
@@ -328,7 +345,10 @@ void GnnOfflineSampleProcedure::parse_options(
     bool& use_four_level_topology_store,
     uint64_t& l1_cache_mb,
     uint64_t& l2_cache_mb,
-    bool& use_l3_mmap_sidecar
+    bool& use_l3_mmap_sidecar,
+    bool& auto_profile_on_cold_start,
+    uint64_t& profile_num_walks,
+    uint64_t& profile_walk_length
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -415,5 +435,24 @@ void GnnOfflineSampleProcedure::parse_options(
     }
     if (auto v = opts.get_bool("useL3MmapSidecar")) {
         use_l3_mmap_sidecar = *v;
+    }
+
+    // Plan E (2026-05-11) — Phase 0 auto-profile opt-out + tuning.
+    if (auto v = opts.get_bool("autoProfileOnColdStart")) {
+        auto_profile_on_cold_start = *v;
+    }
+    if (auto v = opts.get_int("profileNumWalks")) {
+        if (*v < 0) {
+            throw std::runtime_error(
+                "profileNumWalks must be non-negative, got: " + std::to_string(*v));
+        }
+        profile_num_walks = static_cast<uint64_t>(*v);
+    }
+    if (auto v = opts.get_int("profileWalkLength")) {
+        if (*v < 0) {
+            throw std::runtime_error(
+                "profileWalkLength must be non-negative, got: " + std::to_string(*v));
+        }
+        profile_walk_length = static_cast<uint64_t>(*v);
     }
 }

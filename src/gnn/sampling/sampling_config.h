@@ -252,6 +252,43 @@ struct SamplingConfig {
      */
     bool use_l3_mmap_sidecar = true;
 
+    /**
+     * @brief Phase 0 auto-profile when Spec #13 cold-starts (Plan E,
+     *        2026-05-11).
+     *
+     * When true (default) AND `use_four_level_topology_store=true` AND
+     * the Spec #4-B `topology_rev.csr` sidecar exists AND no prior
+     * `node_counts.bin` is present, the sampler runs a cheap random-walk
+     * profiler (`TopologyWalkProfiler`) before `enable_four_level_store`,
+     * persisting `node_counts.bin` so the four-level store activates its
+     * warm-start L3 MinHash reorder on the very first run.
+     *
+     * Resolves the chicken-and-egg: the warm-start file is normally
+     * written AT THE END of a sample build (acumulating real counts), so
+     * the first build is forced into the slow cold path. On graphs whose
+     * topology sidecar exceeds RAM (e.g. papers100M `topology_*.csr` =
+     * 53 GB on a 30 GB host) the cold path thrashes the page cache
+     * indefinitely. Phase 0 prevents that by approximating counts with
+     * ~500k random-walk lookups (vs ~5 B for a full 3-layer sample).
+     *
+     * Set false to A/B compare vs the legacy "cold start = no reorder"
+     * behavior, or when you have an external `node_counts.bin` source
+     * you want to preserve.
+     */
+    bool auto_profile_on_cold_start = true;
+
+    /**
+     * @brief Number of random walks performed by Phase 0 profiler. 0 ⇒
+     *        `TopologyWalkProfiler::kDefaultNumWalks` (100k).
+     */
+    std::size_t profile_num_walks = 0;
+
+    /**
+     * @brief Steps per walk in Phase 0 profiler. 0 ⇒
+     *        `TopologyWalkProfiler::kDefaultWalkLength` (5).
+     */
+    std::size_t profile_walk_length = 0;
+
     // =========================================================================
     // Output
     // =========================================================================

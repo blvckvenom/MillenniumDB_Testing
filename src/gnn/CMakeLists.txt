@@ -89,6 +89,10 @@ add_library(mdb_gnn_core STATIC
     # Spec #13 Phase 1: Frequency profiler for Four-Level Topology Store
     projection/topology_frequency_profiler.cc
 
+    # Plan E Phase 0 (2026-05-11): random-walk profiler to bootstrap
+    # node_counts.bin on first run (resolves cold-start L3 thrashing).
+    projection/topology_walk_profiler.cc
+
     # Spec #13 Phase 2: L1/L2 caches + dispatcher (T13.4 / T13.5 / T13.6)
     projection/l1_hash_cache.cc
     projection/l2_compact_csr.cc
@@ -102,6 +106,7 @@ add_library(mdb_gnn_core STATIC
     sampling/reservoir_sampler.cc
     sampling/sample_storage.cc
     sampling/offline_sampling_engine.cc
+    sampling/node_counts_io.cc
     sampling/minhash_reorderer.cc
 
     # Phase 7: Leapfrog Triejoin Optimization

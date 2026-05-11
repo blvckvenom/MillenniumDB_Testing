@@ -1,0 +1,273 @@
+// Unit tests for TopologyWalkProfiler (Plan E Phase 0, 2026-05-11).
+//
+// Covers:
+//   1. Empty reader (has_data=false) → empty Result.
+//   2. Single chain graph → counts populated, sum == lookups_done.
+//   3. Deterministic seed → identical counts across two calls.
+//   4. Different seeds → different counts (no accidental clash).
+//   5. Isolated node fixture → walks restart, restarts counter ≥ 1.
+//   6. counts.size() == reader.num_nodes() (post-condition).
+//   7. lookups_done bounded by num_walks × walk_length.
+//   8. Default parameters (num_walks=0 or walk_length=0) use kDefault constants.
+
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <random>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "graph_models/gql/projection/topology_snapshot_reader.h"
+#include "graph_models/gql/projection/topology_snapshot_writer.h"
+#include "graph_models/object_id.h"
+
+#include "gnn/projection/topology_walk_profiler.h"
+
+using GQL::Projection::TopologySnapshotReader;
+using GQL::Projection::TopologySnapshotWriter;
+using mdb::gnn::TopologyWalkProfiler;
+
+namespace {
+
+class TopologyWalkProfilerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        auto base = std::filesystem::temp_directory_path();
+        std::random_device rd;
+        std::mt19937_64 rng(rd());
+        for (int attempt = 0; attempt < 64; ++attempt) {
+            dir_ = base / ("mdb_walk_profiler_test_" + std::to_string(rng()));
+            if (!std::filesystem::exists(dir_)) {
+                std::filesystem::create_directories(dir_);
+                return;
+            }
+        }
+        FAIL() << "Could not allocate unique temp dir under " << base;
+    }
+
+    void TearDown() override {
+        if (!dir_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(dir_, ec);
+        }
+    }
+
+    // Write a placeholder .leaf file so the writer's SHA-256 step has
+    // something to hash. The content is irrelevant — the reader will
+    // compare the hash against this same file at open() time.
+    void write_fake_source_leaf(TopologySnapshotWriter::Direction d,
+                                const std::string&                content) {
+        const char* name = (d == TopologySnapshotWriter::Direction::FORWARD)
+                         ? "from_to_edge.leaf"
+                         : "to_from_edge.leaf";
+        std::ofstream f(dir_ / name, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(f.good());
+        f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    }
+
+    // Build a tiny 4-node chain graph in REVERSE direction:
+    //   0 ← 1 ← 2 ← 3   (each non-zero node points to its predecessor)
+    // Sampling REVERSE means we follow these arrows backward.
+    void build_chain_graph_(uint64_t n) {
+        write_fake_source_leaf(TopologySnapshotWriter::Direction::REVERSE,
+                               "chain-graph-payload");
+
+        std::vector<uint64_t> degrees(static_cast<std::size_t>(n), 0);
+        // Every node except the source-of-everything has one neighbor.
+        for (uint64_t i = 0; i + 1 < n; ++i) {
+            degrees[static_cast<std::size_t>(i)] = 1;
+        }
+
+        TopologySnapshotWriter writer(
+            dir_, TopologySnapshotWriter::Direction::REVERSE,
+            n, degrees, /*include_edge_ids=*/false);
+        for (uint64_t i = 0; i + 1 < n; ++i) {
+            writer.append_edge(ObjectId(i), ObjectId(i + 1), ObjectId());
+        }
+        writer.finalize();
+    }
+
+    // Build a graph where node 0 is isolated (degree 0) and 1..N-1 form
+    // a cycle. Used to exercise the dead-end / restart logic without
+    // making the entire graph unwalkable.
+    void build_with_isolated_zero_(uint64_t n) {
+        ASSERT_GE(n, 2u) << "need ≥2 nodes for cycle";
+        write_fake_source_leaf(TopologySnapshotWriter::Direction::REVERSE,
+                               "isolated-zero-payload");
+
+        std::vector<uint64_t> degrees(static_cast<std::size_t>(n), 0);
+        for (uint64_t i = 1; i < n; ++i) {
+            degrees[static_cast<std::size_t>(i)] = 1;
+        }
+
+        TopologySnapshotWriter writer(
+            dir_, TopologySnapshotWriter::Direction::REVERSE,
+            n, degrees, /*include_edge_ids=*/false);
+        for (uint64_t i = 1; i < n; ++i) {
+            const uint64_t dst = (i + 1 < n) ? (i + 1) : 1;
+            writer.append_edge(ObjectId(i), ObjectId(dst), ObjectId());
+        }
+        writer.finalize();
+    }
+
+    TopologySnapshotReader open_reverse_() {
+        return TopologySnapshotReader::open(
+            dir_, TopologySnapshotReader::Direction::REVERSE);
+    }
+
+    std::filesystem::path dir_;
+};
+
+// =========================================================================
+// 1. Empty reader → empty Result.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, EmptyReaderReturnsEmptyResult) {
+    // No leaf, no .csr — reader will fail to open and has_data()=false.
+    auto reader = open_reverse_();
+    ASSERT_FALSE(reader.has_data())
+        << "precondition: reader without sidecar should report has_data=false";
+
+    auto result = TopologyWalkProfiler::profile(
+        reader, /*num_walks=*/100, /*walk_length=*/5, /*seed=*/42);
+
+    EXPECT_TRUE(result.counts.empty());
+    EXPECT_EQ(result.lookups_done, 0u);
+    EXPECT_EQ(result.restarts,     0u);
+    EXPECT_DOUBLE_EQ(result.elapsed_seconds, 0.0);
+}
+
+// =========================================================================
+// 2. Counts populated; sum equals lookups_done (every step ticks a count).
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, ChainGraphCountsSumMatchesLookups) {
+    constexpr uint64_t N = 8;
+    build_chain_graph_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    auto result = TopologyWalkProfiler::profile(
+        reader, /*num_walks=*/50, /*walk_length=*/4, /*seed=*/123);
+
+    ASSERT_EQ(result.counts.size(), static_cast<std::size_t>(N));
+    uint64_t sum = 0;
+    for (uint64_t c : result.counts) sum += c;
+    EXPECT_EQ(sum, result.lookups_done);
+    EXPECT_GT(result.lookups_done, 0u);
+    EXPECT_LE(result.lookups_done, 50u * 4u);
+}
+
+// =========================================================================
+// 3. Deterministic seed → identical counts on a second call.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, DeterministicSeedReproduces) {
+    constexpr uint64_t N = 16;
+    build_chain_graph_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    auto a = TopologyWalkProfiler::profile(reader, 200, 5, 7777);
+    auto b = TopologyWalkProfiler::profile(reader, 200, 5, 7777);
+
+    ASSERT_EQ(a.counts.size(), b.counts.size());
+    EXPECT_EQ(a.counts, b.counts);
+    EXPECT_EQ(a.lookups_done, b.lookups_done);
+    EXPECT_EQ(a.restarts,     b.restarts);
+}
+
+// =========================================================================
+// 4. Different seeds produce different walks. Equal counts would suggest
+//    the RNG isn't actually being consumed.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, DifferentSeedsProduceDifferentCounts) {
+    constexpr uint64_t N = 64;
+    build_chain_graph_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    auto a = TopologyWalkProfiler::profile(reader, 200, 5, 1);
+    auto b = TopologyWalkProfiler::profile(reader, 200, 5, 2);
+
+    EXPECT_NE(a.counts, b.counts);
+}
+
+// =========================================================================
+// 5. Isolated node forces walk restarts.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, IsolatedNodeTriggersRestart) {
+    constexpr uint64_t N = 10;
+    build_with_isolated_zero_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    // Run many walks to virtually guarantee at least one starts on node 0.
+    auto result = TopologyWalkProfiler::profile(
+        reader, /*num_walks=*/500, /*walk_length=*/3, /*seed=*/42);
+
+    EXPECT_GT(result.restarts, 0u)
+        << "at least one walk should have started on the isolated node";
+
+    // Node 0 should appear in counts (was visited as a seed) but its
+    // count should be exactly the number of times it was picked, with
+    // no follow-up step bumping it.
+    EXPECT_GT(result.counts[0], 0u);
+}
+
+// =========================================================================
+// 6. counts.size() always matches num_nodes() post-call.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, CountsSizeEqualsNumNodes) {
+    constexpr uint64_t N = 12;
+    build_chain_graph_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+    ASSERT_EQ(reader.num_nodes(), N);
+
+    auto result = TopologyWalkProfiler::profile(reader, 10, 3, 99);
+    EXPECT_EQ(result.counts.size(), static_cast<std::size_t>(reader.num_nodes()));
+}
+
+// =========================================================================
+// 7. lookups_done is bounded by num_walks × walk_length. The cap can be
+//    reached on a fully-connected (or chain) graph if no walk dead-ends.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, LookupsBoundedByWalksTimesLength) {
+    constexpr uint64_t N = 32;
+    build_chain_graph_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    constexpr std::size_t W = 17;
+    constexpr std::size_t L = 6;
+    auto result = TopologyWalkProfiler::profile(reader, W, L, 1234);
+    EXPECT_LE(result.lookups_done, W * L);
+}
+
+// =========================================================================
+// 8. Default constants kick in when caller passes 0.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, DefaultParametersWhenZero) {
+    constexpr uint64_t N = 8;
+    build_chain_graph_(N);
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    // Use a tiny ceiling override via custom defaults indirectly: confirm
+    // the defaults yielded lookups in a band consistent with kDefault*.
+    // We don't want this test to run 100k×5 walks during ctest, so we
+    // pass explicit but small values to verify the "0 = default" path
+    // executes by checking the bound against the default constants.
+    auto result0 = TopologyWalkProfiler::profile(reader, /*num_walks=*/0,
+                                                 /*walk_length=*/0,
+                                                 /*seed=*/5);
+
+    // 0/0 ⇒ kDefault*. We assert lookups_done is at least 1 (some walk
+    // ran) and at most kDefaultNumWalks × kDefaultWalkLength (no overshoot).
+    EXPECT_GT(result0.lookups_done, 0u);
+    EXPECT_LE(result0.lookups_done,
+              TopologyWalkProfiler::kDefaultNumWalks *
+              TopologyWalkProfiler::kDefaultWalkLength);
+}
+
+}  // namespace

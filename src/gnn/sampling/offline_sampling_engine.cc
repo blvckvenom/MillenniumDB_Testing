@@ -357,6 +357,20 @@ struct OfflineSamplingEngine::Impl {
             result.total_samples = batch_id;
             result.catalog = sample_storage.get_catalog();
 
+            // Plan E (2026-05-11) — pull Phase 0 telemetry out of the
+            // sampler so the procedure can yield it. Populated even when
+            // the auto-profiler chose not to run (triggered=false) so
+            // bench harnesses can tell apart "warm-start ready" from
+            // "profiler ran and succeeded".
+            if (khop_sampler) {
+                auto rep = khop_sampler->phase0_report();
+                result.phase0_triggered       = rep.triggered;
+                result.phase0_succeeded       = rep.succeeded;
+                result.phase0_walks_done      = static_cast<uint64_t>(rep.walks_done);
+                result.phase0_lookups_done    = static_cast<uint64_t>(rep.lookups_done);
+                result.phase0_elapsed_seconds = rep.elapsed_seconds;
+            }
+
             if (!result.cancelled) {
                 result.success = true;
             }

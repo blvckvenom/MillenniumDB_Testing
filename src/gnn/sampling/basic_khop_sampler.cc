@@ -7,9 +7,15 @@
 
 #include "gnn/projection/four_level_topology_store.h"
 #include "gnn/projection/topology_accessor.h"
+#include "gnn/projection/topology_walk_profiler.h"
 #include "gnn/sampling/leapfrog_gnn_sampler.h"
+#include "gnn/sampling/node_counts_io.h"
 #include "gnn/sampling/seek_based_gnn_sampler.h"
 #include "graph_models/gql/projection/projection_storage.h"
+#include "graph_models/gql/projection/topology_snapshot_reader.h"
+
+#include <filesystem>
+#include <iostream>
 
 namespace mdb::gnn {
 
@@ -70,6 +76,21 @@ struct BasicKHopSampler::Impl {
         // L4 BPT fallback) and disable the legacy single-tier cache to
         // avoid double-RAM accounting.
         if (config_.use_four_level_topology_store) {
+            // Plan E Phase 0 (2026-05-11) — bootstrap `node_counts.bin`
+            // via a cheap random-walk profile when no warm-start file
+            // exists yet and the Spec #4-B reverse sidecar is on disk.
+            // Without this, Spec #13's cold-start path skips the L3
+            // MinHash reorder, and on graphs whose sidecar exceeds RAM
+            // (e.g. papers100M `topology_*.csr` at 53 GB / 30 GB host)
+            // the resulting random mmap access pattern thrashes the page
+            // cache and the sample never completes. The profiler issues
+            // ~500k lookups (vs ~5 B for a full 3-layer sample) and
+            // produces counts good enough to activate the warm-start
+            // reorder on this very build. Setting
+            // `auto_profile_on_cold_start:false` preserves the legacy
+            // cold path for A/B benchmarks.
+            run_phase0_auto_profile_if_needed_();
+
             FourLevelTopologyStore::Config tcfg;
             tcfg.l1_budget_mb        = config_.l1_cache_mb;
             tcfg.l2_budget_mb        = config_.l2_cache_mb;
@@ -96,6 +117,94 @@ struct BasicKHopSampler::Impl {
             // unconditionally optimal compared to Leapfrog/Seek.
             use_leapfrog = false;
         }
+    }
+
+    // Plan E Phase 0 (2026-05-11) — see comment in the Spec #13 branch
+    // above. Runs `TopologyWalkProfiler` over the Spec #4-B reverse
+    // sidecar and persists `node_counts.bin`. No-op when:
+    //   - `auto_profile_on_cold_start` is false (user opt-out)
+    //   - `node_counts.bin` already exists (warm-start ready)
+    //   - the sidecar is absent (projection built without
+    //     `buildTopologySnapshot:true`)
+    //   - the projection_dir cannot be resolved (synthetic test paths
+    //     that don't have a real on-disk projection)
+    //
+    // Outcomes are also surfaced via the public `last_phase0_result_`
+    // member so `gnn_offline_sample_procedure` can yield them.
+    struct Phase0Telemetry {
+        bool          triggered     = false;
+        bool          succeeded     = false;
+        std::size_t   walks_done    = 0;
+        std::size_t   lookups_done  = 0;
+        double        elapsed_seconds = 0.0;
+    };
+    Phase0Telemetry last_phase0_result;
+
+    void run_phase0_auto_profile_if_needed_() {
+        if (!config.auto_profile_on_cold_start) return;
+
+        std::filesystem::path proj_dir;
+        try {
+            proj_dir = std::filesystem::path(storage.get_projection_dir());
+        } catch (...) {
+            return;  // synthetic test path with no real storage
+        }
+        if (proj_dir.empty()) return;
+
+        std::error_code ec;
+        const auto counts_file = proj_dir / "node_counts.bin";
+        if (std::filesystem::exists(counts_file, ec) && !ec) {
+            // Warm-start ready; nothing to do.
+            return;
+        }
+
+        // Try to open the REVERSE sidecar (the direction used by the
+        // typical GraphSAGE in-neighbor sampling). The reader is
+        // fallback-first: open() never throws, has_data() reports if
+        // the sidecar is usable.
+        auto reader = GQL::Projection::TopologySnapshotReader::open(
+            proj_dir,
+            GQL::Projection::TopologySnapshotReader::Direction::REVERSE);
+
+        if (!reader.has_data()) {
+            // No sidecar → can't profile cheaply. Fall through to legacy
+            // cold-start path (FourLevelTopologyStore will log its own
+            // "skipping L3 MinHash reorder" message).
+            return;
+        }
+
+        last_phase0_result.triggered = true;
+
+        std::cerr << "[BasicKHopSampler] Phase 0 auto-profile: "
+                  << "no node_counts.bin found, running "
+                  << (config.profile_num_walks
+                          ? config.profile_num_walks
+                          : TopologyWalkProfiler::kDefaultNumWalks)
+                  << " random walks over Spec #4-B sidecar to bootstrap "
+                  << "warm-start...\n";
+
+        auto result = TopologyWalkProfiler::profile(
+            reader,
+            config.profile_num_walks,
+            config.profile_walk_length,
+            config.random_seed);
+
+        last_phase0_result.walks_done      = config.profile_num_walks
+            ? config.profile_num_walks
+            : TopologyWalkProfiler::kDefaultNumWalks;
+        last_phase0_result.lookups_done    = result.lookups_done;
+        last_phase0_result.elapsed_seconds = result.elapsed_seconds;
+
+        node_counts_io::persist(proj_dir, result.counts,
+                                config.orientation);
+        last_phase0_result.succeeded = true;
+
+        std::cerr << "[BasicKHopSampler] Phase 0 done: "
+                  << result.lookups_done << " lookups in "
+                  << result.elapsed_seconds << "s ("
+                  << result.restarts << " restarts). "
+                  << "node_counts.bin persisted; warm-start activates "
+                  << "on enable_four_level_store().\n";
     }
 
     /**
@@ -445,6 +554,16 @@ bool BasicKHopSampler::get_use_leapfrog() const {
 
 const std::vector<uint64_t>& BasicKHopSampler::node_access_counts() const {
     return impl_->node_access_counts;
+}
+
+BasicKHopSampler::Phase0Report BasicKHopSampler::phase0_report() const {
+    Phase0Report out;
+    out.triggered       = impl_->last_phase0_result.triggered;
+    out.succeeded       = impl_->last_phase0_result.succeeded;
+    out.walks_done      = impl_->last_phase0_result.walks_done;
+    out.lookups_done    = impl_->last_phase0_result.lookups_done;
+    out.elapsed_seconds = impl_->last_phase0_result.elapsed_seconds;
+    return out;
 }
 
 } // namespace mdb::gnn

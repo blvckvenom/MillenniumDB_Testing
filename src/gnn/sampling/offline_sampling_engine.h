@@ -64,6 +64,15 @@ struct SamplingResult {
     double total_seconds;         ///< Total time taken
     uint64_t total_samples;       ///< Total samples generated
     bool cancelled;               ///< True if cancelled via callback
+
+    // Plan E Phase 0 telemetry (2026-05-11) — populated only when
+    // `auto_profile_on_cold_start=true` AND the profiler actually ran.
+    // See `BasicKHopSampler::Impl::Phase0Telemetry` for definitions.
+    bool        phase0_triggered     = false;
+    bool        phase0_succeeded     = false;
+    uint64_t    phase0_walks_done    = 0;
+    uint64_t    phase0_lookups_done  = 0;
+    double      phase0_elapsed_seconds = 0.0;
 };
 
 /**

@@ -171,6 +171,25 @@ public:
      */
     const std::vector<uint64_t>& node_access_counts() const;
 
+    /**
+     * @brief Plan E Phase 0 telemetry (2026-05-11).
+     *
+     * Reports whether the cold-start auto-profiler ran during this
+     * sampler's construction, how many walks it performed, and how long
+     * it took. Always populated (with `triggered=false` when the
+     * auto-profiler decided not to run — typically because
+     * `node_counts.bin` already existed or the user opted out via
+     * `auto_profile_on_cold_start=false`).
+     */
+    struct Phase0Report {
+        bool        triggered     = false;
+        bool        succeeded     = false;
+        std::size_t walks_done    = 0;
+        std::size_t lookups_done  = 0;
+        double      elapsed_seconds = 0.0;
+    };
+    Phase0Report phase0_report() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

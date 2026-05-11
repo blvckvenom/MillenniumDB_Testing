@@ -125,7 +125,17 @@ public:
             YieldField{"storagePath", YieldType::STRING,
                 "Path where samples are stored"},
             YieldField{"computeMillis", YieldType::INT,
-                "Time taken to compute samples (milliseconds)"}
+                "Time taken to compute samples (milliseconds)"},
+            YieldField{"phase0Triggered", YieldType::BOOL,
+                "Plan E (2026-05-11): true iff cold-start auto-profiler ran"},
+            YieldField{"phase0Succeeded", YieldType::BOOL,
+                "Plan E (2026-05-11): true iff Phase 0 persisted node_counts.bin"},
+            YieldField{"phase0WalksDone", YieldType::INT,
+                "Plan E (2026-05-11): random walks issued by Phase 0 profiler"},
+            YieldField{"phase0LookupsDone", YieldType::INT,
+                "Plan E (2026-05-11): total neighbor lookups during Phase 0"},
+            YieldField{"phase0Millis", YieldType::INT,
+                "Plan E (2026-05-11): Phase 0 elapsed time in milliseconds"}
         };
     }
 
@@ -167,7 +177,10 @@ private:
         bool& use_four_level_topology_store,
         uint64_t& l1_cache_mb,
         uint64_t& l2_cache_mb,
-        bool& use_l3_mmap_sidecar
+        bool& use_l3_mmap_sidecar,
+        bool& auto_profile_on_cold_start,
+        uint64_t& profile_num_walks,
+        uint64_t& profile_walk_length
     );
 };
 
