@@ -114,34 +114,54 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Build a degree-weighted alias table over all nodes. Reading
-    // `neighbors(i).size()` is O(1) via row_ptr; the only cost is one
-    // pass over N to size-up the weights. On papers100M (N=111M) this
-    // is ~30-60 s of sequential mmap pre-touch — much cheaper than the
-    // 24 h cold-start sample we're avoiding. After this step we sample
-    // seeds proportional to degree in O(1) per draw, naturally biasing
-    // walks toward hubs (which receive most real-sampler accesses)
-    // and effectively skipping isolated leaves (which dominate
-    // citation-graph leaf counts and provide zero training signal).
-    std::vector<uint64_t> degrees(static_cast<std::size_t>(n));
+    // Pre-filter eligible seeds: only nodes with degree > 0 can start a
+    // useful walk. On papers-style graphs ~99% of nodes are leaves under
+    // REVERSE (papers nobody cites), so without this filter the
+    // alias-method draw can land on a leftover node whose alias slot
+    // points to another isolated node, producing 100% restarts (observed
+    // empirically as the "100k walks → 100k restarts" pathology of
+    // commit 42c6970b's first attempt). Building the eligibility list
+    // costs one O(N) pass over row_ptr (sequential mmap reads); after
+    // it, every alias draw is guaranteed to land on a node with at
+    // least one neighbor.
+    //
+    // Memory cost on papers100M: 2 × N × 8 B = 1.77 GB temporary. We
+    // could compress to (node_id, degree) tuples with a non-zero-only
+    // filter making this much smaller, but the eligibility list itself
+    // is the simpler primitive and the alias table is freed before
+    // the rest of the sample build starts. Free at end of profile().
+    std::vector<uint64_t> eligible_nodes;
+    std::vector<uint64_t> eligible_weights;
+    eligible_nodes.reserve(static_cast<std::size_t>(n));
+    eligible_weights.reserve(static_cast<std::size_t>(n));
     for (uint64_t i = 0; i < n; ++i) {
-        degrees[static_cast<std::size_t>(i)] = reader.neighbors(i).size();
+        const uint64_t deg =
+            static_cast<uint64_t>(reader.neighbors(i).size());
+        if (deg > 0) {
+            eligible_nodes.push_back(i);
+            eligible_weights.push_back(deg);
+        }
     }
-    AliasTable alias(degrees);
+
+    AliasTable alias(eligible_weights);
 
     std::mt19937_64 rng(seed);
 
-    // Fallback: if the entire graph has zero edges in this direction
-    // (pathological / synthetic test cases), fall back to uniform seed
-    // selection over [0, n). The result will be all-zero counts modulo
-    // restart bookkeeping, which the downstream tier-assignment will
-    // recognize and treat as cold-start.
-    std::uniform_int_distribution<uint64_t> uniform_seed(0, n - 1);
+    // Fallback: if no node in this direction has any neighbor at all,
+    // we cannot produce useful counts. Return what we have (all zeros)
+    // — caller treats this as cold-start.
+    if (eligible_nodes.empty() || !alias.valid()) {
+        auto t1 = std::chrono::steady_clock::now();
+        result.elapsed_seconds =
+            std::chrono::duration<double>(t1 - t0).count();
+        return result;
+    }
 
     for (std::size_t w = 0; w < num_walks; ++w) {
-        uint64_t curr = alias.valid()
-            ? static_cast<uint64_t>(alias.draw(rng))
-            : uniform_seed(rng);
+        // alias.draw() returns an index INTO eligible_nodes — map back
+        // to the global node id.
+        const std::size_t e_idx = alias.draw(rng);
+        uint64_t curr = eligible_nodes[e_idx];
         result.counts[static_cast<std::size_t>(curr)]++;
         result.lookups_done++;
 

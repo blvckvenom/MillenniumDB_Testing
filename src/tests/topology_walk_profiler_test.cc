@@ -193,13 +193,72 @@ TEST_F(TopologyWalkProfilerTest, DifferentSeedsProduceDifferentCounts) {
 }
 
 // =========================================================================
-// 5. Degree-weighted seed selection skips the isolated node.
+// 5a. Papers100M-style pathology: 1 hub + many isolated leaves.
 //
-// With the alias-method seed sampler, an isolated node (degree=0) has
-// zero probability mass. Across many walks it should be selected as
-// seed approximately zero times, so its count stays at 0 and the
-// `restarts` counter does NOT receive contributions from seed-time
-// dead-ends originating at that node.
+// Replicates the empirically-observed access skew in citation graphs:
+// the vast majority of nodes (papers nobody ever cited) have degree=0
+// in REVERSE direction. Naive uniform seed selection would land 99%
+// of walks on isolated nodes; even a buggy alias-method (e.g. one
+// whose leftover-large cleanup leaves alias_[i]=0 pointing at an
+// isolated node 0) would silently degrade to 100% restarts. The
+// post-fix degree-weighted alias MUST land 100% of walks on the hub
+// (the only node with neighbors) on this fixture.
+//
+// This test is the regression guard for commit 42c6970b's papers100M
+// failure mode.
+// =========================================================================
+TEST_F(TopologyWalkProfilerTest, MostlyIsolatedGraphLandsOnHub) {
+    // 20 nodes: node 5 has degree 19 (cites all others), the rest are
+    // isolated under REVERSE direction. Without the eligible-only
+    // filter, leftover-large bucket entries can leave alias slots
+    // pointing at node 0 (which is isolated here), reproducing the
+    // papers100M pathology.
+    constexpr uint64_t N    = 20;
+    constexpr uint64_t HUB  = 5;
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::REVERSE,
+                           "hub-fixture-payload");
+    std::vector<uint64_t> degrees(static_cast<std::size_t>(N), 0);
+    degrees[HUB] = N - 1;  // hub points to every other node
+    TopologySnapshotWriter writer(
+        dir_, TopologySnapshotWriter::Direction::REVERSE,
+        N, degrees, /*include_edge_ids=*/false);
+    for (uint64_t j = 0; j < N; ++j) {
+        if (j == HUB) continue;
+        writer.append_edge(ObjectId(HUB), ObjectId(j), ObjectId());
+    }
+    writer.finalize();
+
+    auto reader = open_reverse_();
+    ASSERT_TRUE(reader.has_data());
+
+    constexpr std::size_t W = 2000;
+    constexpr std::size_t L = 4;
+    auto result = TopologyWalkProfiler::profile(
+        reader, /*num_walks=*/W, /*walk_length=*/L, /*seed=*/2026);
+
+    // Every walk MUST seed on the hub (only eligible node). The
+    // walk then bounces hub → leaf and dead-ends (leaves have no
+    // reverse-neighbors), so each walk performs exactly 2 lookups
+    // (seed + 1 step) and accumulates 1 restart.
+    EXPECT_EQ(result.counts[HUB], W)
+        << "hub must be selected as seed for every walk under the "
+        << "eligible-only alias filter";
+    EXPECT_EQ(result.restarts, W)
+        << "each walk should dead-end on its first step (leaves are isolated)";
+    EXPECT_EQ(result.lookups_done, W * 2u)
+        << "two lookups per walk: seed + one bounce to a leaf";
+
+    // Sanity: leaf counts sum to W (one bounce per walk distributed
+    // uniformly across the N-1 leaves).
+    uint64_t leaf_total = 0;
+    for (std::size_t i = 0; i < result.counts.size(); ++i) {
+        if (i != HUB) leaf_total += result.counts[i];
+    }
+    EXPECT_EQ(leaf_total, W);
+}
+
+// =========================================================================
+// 5b. Cycle-with-isolated-zero fixture (degree-weighted alias version).
 // =========================================================================
 TEST_F(TopologyWalkProfilerTest, DegreeWeightedSkipsIsolatedSeeds) {
     constexpr uint64_t N = 10;

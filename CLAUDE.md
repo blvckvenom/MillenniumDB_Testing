@@ -187,6 +187,22 @@ Stage 3 splits `assemble_kernel` (worker stream) and `model.forward + backward` 
 
 Raw outputs in `docs/research/2026-05-08-stage3-empirical/`. Bench script: `~/Desktop/spec13_papers100m_e2e/post_pop_os/07_stage3_validation.sh`.
 
+### Plan E Phase 0 — auto-profile to unblock Spec #13 cold-start (added 2026-05-11)
+
+Spec #13's `FourLevelTopologyStore` requires `<projection_dir>/node_counts.bin` to enable the L3 MinHash reorder. The file is normally produced as a side-effect of `gnn_offline_sample` *at the end* of a sample build (accumulating real access counts during sampling), which creates a chicken-and-egg dependency: the very first sample on a projection cold-starts without the reorder, falling back to random mmap access over the Spec #4-B `topology_*.csr` sidecar. On graphs whose sidecar exceeds available RAM (papers100M `topology_*.csr` ≈ 53 GB on celebi's 30 GB host) the cold path thrashes the page cache and the sample never completes — observed empirically as a 24 h+ `curl` timeout with zero output produced.
+
+Plan E inserts a cheap random-walk profile pass between the sampler constructor and the four-level store's `build()`:
+
+1. **`TopologyWalkProfiler::profile()`** issues N random walks of L steps each over the Spec #4-B reverse sidecar via the reader's O(1) `neighbors()` slice. Seeds are drawn from a **Vose alias-method table weighted by in-degree** — uniform seed selection on real citation graphs lands ~99% of walks on leaves (papers nobody cited) and produces unusable counts; degree-weighting matches the access pattern a real k-hop sampler would generate. Default: 100k walks × 5 steps = 500k lookups vs ~4.8 B for a full 3-layer `[10,15,20]` sample (~10 000× less work, ~10-30 s wall-clock on papers100M).
+2. **`node_counts_io::persist()`** writes the resulting per-node counts to `<projection_dir>/node_counts.bin` using the existing `NODECNT0` format already consumed by `TopologyFrequencyProfiler::compute_from_node_counts_`.
+3. **`BasicKHopSampler::Impl::run_phase0_auto_profile_if_needed_()`** runs steps 1+2 before `topology->enable_four_level_store(tcfg)`. The four-level store then activates its warm-start path on its very first build, performing the MinHash reorder of L3 with usable counts.
+
+Opt-out: `autoProfileOnColdStart: false` config flag + procedure parameter. No-op when the sidecar is absent, `node_counts.bin` already exists, or the projection dir isn't resolvable. Telemetry exposed via new procedure yields: `phase0Triggered`, `phase0Succeeded`, `phase0WalksDone`, `phase0LookupsDone`, `phase0Millis`.
+
+**Files**: `src/gnn/projection/topology_walk_profiler.{h,cc}` (Vose alias + walk loop), `src/gnn/sampling/node_counts_io.{h,cc}` (atomic writer for `node_counts.bin`), `src/gnn/sampling/basic_khop_sampler.{h,cc}` (Phase 0 integration), `src/gnn/sampling/sampling_config.h` (3 new flags), `src/gnn/sampling/offline_sampling_engine.{h,cc}` (telemetry plumbing), `src/query/procedure/builtin/gnn_offline_sample_procedure.{h,cc}` (yields + parse).
+**Tests**: `src/tests/topology_walk_profiler_test.cc` (8 unit tests covering empty reader, deterministic seeds, isolated-node skip via alias weights, lookup bounds, defaults).
+**Commits**: `6e6776fc` (core implementation, 14 files, 921 insertions), `42c6970b` (degree-weighted seed fix after first papers100M live trial revealed uniform sampling produced 100 000 walks × 0 useful steps).
+
 ## Development Notes
 
 - **Language:** C++17 with `-std=c++17` required
