@@ -142,7 +142,6 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
             eligible_weights.push_back(deg);
         }
     }
-
     AliasTable alias(eligible_weights);
 
     std::mt19937_64 rng(seed);
@@ -175,11 +174,21 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
             }
             std::uniform_int_distribution<std::size_t> nb_dist(
                 0, neighbors.size() - 1);
-            const uint64_t next = neighbors[nb_dist(rng)];
+            const std::size_t picked = nb_dist(rng);
+            // The sidecar stores `dst` as ObjectId values (top 8 bits
+            // are the type tag set by `Node`/`Edge` encoding). Strip
+            // the tag to get the dense row_idx in [0, n) that
+            // row_ptr is keyed by. Verified empirically on papers100M
+            // 2026-05-11 where un-stripped values surfaced as
+            // 15276209936111918080 (= 0xD4 << 56 | 0x2A2EFC0), causing
+            // 100% of walks to falsely restart on the out-of-range
+            // defensive check.
+            constexpr uint64_t kObjectIdValueMask = 0x00FFFFFFFFFFFFFFULL;
+            const uint64_t next = neighbors[picked] & kObjectIdValueMask;
 
-            // Guard against malformed sidecars that contain
-            // out-of-range neighbor ids (defensive — the writer
-            // validates this, but we never trust mmap data blindly).
+            // Guard against malformed sidecars whose row_idx exceeds
+            // the declared num_nodes. Genuine corruption only — the
+            // ObjectId tag has already been masked off above.
             if (next >= n) {
                 result.restarts++;
                 break;
