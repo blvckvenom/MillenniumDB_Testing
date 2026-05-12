@@ -321,21 +321,22 @@ struct SamplingConfig {
      * (SALIENT MLSys 2022, NextDoor EuroSys 2021 empirical range — sync
      * overhead + cache contention limits linear scaling).
      *
-     * **Thread-safety prerequisite.** `num_workers >= 2` requires the
-     * Spec #13 four-level path (`use_four_level_topology_store=true`), the
-     * default since 2026-04-25. The post-build FourLevelTopologyStore is
-     * read-only and supports concurrent `get_neighbors` from any number of
-     * threads. The legacy "BPT direct" path (when Spec #13 + Spec #11 are
-     * both disabled) is NOT thread-safe: the underlying `BufferManager`
-     * page pool mutates pin counters and frame replacement without
-     * external locking, and concurrent `BPlusTree::get_range` calls
-     * trigger a use-after-free that crashes the server silently. Setting
-     * `num_workers >= 2` while `use_four_level_topology_store=false` and
-     * `use_adjacency_cache=false` is therefore unsupported — the engine
-     * still attempts the parallel dispatch, but the run will SIGSEGV
-     * within seconds. Use `num_workers=1` (single-worker parallel
-     * infrastructure) or `num_workers=0` (legacy sequential path) for
-     * BPT-direct workloads.
+     * **Thread-safety.** Workers borrow the primary's `TopologyAccessor`
+     * (the FourLevelTopologyStore + adjacency caches are read-only
+     * post-build) and own private RNG + access-counts vectors. The
+     * legacy "BPT direct" path (Spec #13 + Spec #11 both disabled) routes
+     * through `BufferManager::get_page_readonly`, which is already
+     * serialized by `vp_mutex` on the shared buffer pool — concurrent
+     * reads are safe.
+     *
+     * The only prerequisite is that each worker thread has a valid
+     * `QueryContext::_query_ctx` pointer installed before any sampler
+     * call. `OfflineSamplingEngine` handles this automatically by
+     * propagating the primary's `QueryContext` via
+     * `QueryContext::set_query_ctx(primary_ctx)` inside the worker
+     * lambda. Sampling reads only the shared buffer (not the worker-
+     * indexed private buffer `pp_map` / `tmp_info`), so workers may
+     * share a single `QueryContext` without contention.
      */
     std::uint32_t num_workers = 0;
 

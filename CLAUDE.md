@@ -228,25 +228,26 @@ Architecture:
 - **Serialized writes** — `SampleStorage::write_sample` is `BPlusTree`-adjacent and not thread-safe; a single `std::mutex` around the call serializes the write phase. Sampling work itself runs concurrently.
 - **Final reduce** — at end of run, each worker's `node_access_counts()` is merged into the primary via `merge_counts_from()` so the warm-start `node_counts.bin` reflects every worker's contribution.
 
-Thread-safety prerequisite — **`numWorkers >= 2` requires `useFourLevelTopologyStore: true`** (the default since 2026-04-25). The post-build FourLevelTopologyStore is immutable and supports concurrent `get_neighbors` from any number of threads. The legacy "BPT direct" path (Spec #13 + Spec #11 both disabled) is NOT thread-safe — `BufferManager` mutates pin counters and frame replacement without external locking, and concurrent `BPlusTree::get_range` triggers a use-after-free that crashes the server silently. Empirically reproducible at `numWorkers=4 + useFourLevelTopologyStore:false + useAdjacencyCache:false` on papers100M (server SIGSEGVs in <30 s). `numWorkers=1 + useFourLevelTopologyStore:false` is safe (single worker = parallel infrastructure without contention) and completed a fanout-`[2,2]` papers100M sample in 57 s during validation (6044 batches, 2.57 M unique nodes).
+Thread-safety — the four-level path is read-only post-build (FourLevelTopologyStore + L1/L2/L3 caches), and the legacy BPT-direct path serializes shared-buffer reads through `BufferManager::vp_mutex`, so both are safe for concurrent workers. The only Plan F-specific requirement is that each worker thread carries a valid `QueryContext::_query_ctx` pointer — `_query_ctx` is `thread_local`, and `std::thread`-spawned workers default it to `nullptr`, so the first BPT access null-derefs inside `BufferManager::get_page_readonly` and SIGSEGVs the server. `OfflineSamplingEngine` handles this by capturing the primary's `QueryContext*` and calling `QueryContext::set_query_ctx(primary_ctx)` at the top of each worker lambda before any sampling. Sampling reads only the shared buffer (`vp_map`) and never touches the worker-indexed private pool (`pp_map`, `tmp_info`), so workers safely share a single `QueryContext`. Validation 2026-05-12 on papers100M fanout `[2,2]` BPT-direct path:
+
+| `numWorkers` | wall-clock | batches | uniqueNodes | freq dict |
+|---|---|---|---|---|
+| 1            | 62.4 s     | 6044    | 2 575 871   | reference |
+| 4            | 37.7 s     | 6044    | 2 575 871   | identical |
+| 20           | 39.6 s     | 6044    | 2 575 871   | identical |
+
+`frequency.dat` v1 sparse format iterates `node_frequencies: std::unordered_map<uint64_t, uint64_t>` non-deterministically — raw bytes differ between runs (even at constant N) due to hash bucket ordering, but the dict-equality check confirms the (node_id, count) set is identical across N. `uniqueNodes`, `totalBatches`, and per-split counters match bit-for-bit. Determinism is therefore preserved at the semantic level (every batch is reseeded as `random_seed XOR batch_id`, so each batch's output depends only on `(seed, batch_id)`). The fix that made this work landed in commit `03ed201f`.
 
 Yields exposed via `gnn_offline_sample`: `numWorkersUsed` (effective pool size after the `hardware_concurrency()` cap, with `0` resolved to `1` for the legacy path).
 
-**Empirical validation status (2026-05-11)**: Plan F infrastructure correctness was confirmed via:
+**Files**: `src/gnn/sampling/basic_khop_sampler.{h,cc}` (worker ctor + `reseed_for_batch` + `merge_counts_from` + `get_topology`), `src/gnn/sampling/sampling_config.h` (`num_workers` + thread-safety doc), `src/gnn/sampling/offline_sampling_engine.{h,cc}` (parallel dispatch lambda + result.num_workers_used + per-worker `QueryContext::set_query_ctx`), `src/query/procedure/builtin/gnn_offline_sample_procedure.{h,cc}` (`numWorkers` param + `numWorkersUsed` yield).
 
-- `numWorkers=0` (legacy): preserved byte-identical pre-Plan-F output (ctest 70/70 pass after refactor).
-- `numWorkers=1` (parallel infra, BPT direct): papers100M fanout-`[2,2]` sample completed in 57 s (6044 batches).
-- `numWorkers=4` (parallel, BPT direct): silently crashed in <30 s — surfaces the pre-existing `BufferManager` concurrent-read race documented above. NOT a Plan F bug; Plan F requires Spec #13 path.
-- `numWorkers=20` (parallel, Spec #13 path) on papers100M: workers spawned correctly (verified via 12 sleeping worker threads alongside the primary's populate phase) but the run blocked on the single-threaded `populate_direction_via_sidecar_` for 30+ min before manual abort. Spec #13 populate-pass parallelization is open follow-up work; once it lands, Plan F's 6-12× speedup over the legacy path should kick in. Until then, papers100M-scale `numWorkers >= 2` runs are gated on whichever finishes first: a smaller-graph A/B validation harness, or a Spec #13 populate refactor.
-
-**Files**: `src/gnn/sampling/basic_khop_sampler.{h,cc}` (worker ctor + `reseed_for_batch` + `merge_counts_from` + `get_topology`), `src/gnn/sampling/sampling_config.h` (`num_workers` + thread-safety doc), `src/gnn/sampling/offline_sampling_engine.{h,cc}` (parallel dispatch lambda + result.num_workers_used), `src/query/procedure/builtin/gnn_offline_sample_procedure.{h,cc}` (`numWorkers` param + `numWorkersUsed` yield).
-
-**Commit**: `c8ffd166` feat(gnn): Plan F — parallel offline sampling via worker pool (SALIENT-style).
+**Commits**: `c8ffd166` feat(gnn): Plan F core. `03ed201f` fix(gnn): propagate QueryContext to workers (the SIGSEGV root cause).
 
 **Future work**:
-- T#22 (deferred): cora_gnn-scale bit-identical regression test for `numWorkers={1, 2, 4, 8}`.
-- Spec #13 populate parallelization (independent issue, gates papers100M-scale Plan F validation).
-- `BufferManager` concurrent-read thread-safety (independent issue, would unlock the BPT-direct parallel path).
+- T#22 (deferred): cora-scale bit-identical regression test for `numWorkers={1, 2, 4, 8}` as a CI gate.
+- Spec #13 populate parallelization — `populate_direction_via_sidecar_` is single-threaded today; with l1/l2 budgets tuned for papers100M scale it runs 15-30+ min on celebi. Independent of Plan F; once landed it unblocks the four-level path for papers100M-scale runs (where Plan F's 6-12× speedup will compound with the four-level cache-hit ratio).
+- Speedup on small fanouts (`[2,2]`) is modest (1.4-1.5×) because each batch is too cheap to amortize the per-batch `assemble + sort + edge-index build`; the paper's 3-layer `[10,15,20]` fanout has ~30× more work per batch and should see speedups closer to the SALIENT 6-12× range.
 
 ## Development Notes
 
