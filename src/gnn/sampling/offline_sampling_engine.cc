@@ -24,6 +24,7 @@
 #include "gnn/sampling/sorted_batch_sampler.h"
 #include "gnn/storage/row_mapping.h"
 #include "graph_models/gql/projection/projection_storage.h"
+#include "query/query_context.h"
 
 namespace mdb::gnn {
 
@@ -417,7 +418,21 @@ struct OfflineSamplingEngine::Impl {
                 std::atomic<std::size_t> next_idx{0};
                 std::mutex               write_mutex;
 
+                // QueryContext is a thread_local pointer initialized only
+                // for server-managed threads. Workers spawned via std::thread
+                // start with _query_ctx == nullptr, so the first BPT access
+                // (BufferManager::get_page_readonly reads
+                // get_query_ctx().start_version) null-derefs and SIGSEGVs
+                // the server. Capture the primary's ctx and install it on
+                // each worker thread before any sampler call. Sampling reads
+                // only the shared buffer (vp_map, protected by vp_mutex)
+                // and does not touch the worker-indexed private buffer
+                // (pp_map / tmp_info), so all workers can share the same
+                // QueryContext without contention on the worker_index slot.
+                QueryContext* primary_ctx = &get_query_ctx();
+
                 auto worker_fn = [&](BasicKHopSampler* sampler) {
+                    QueryContext::set_query_ctx(primary_ctx);
                     while (true) {
                         if (cancel_requested.load(std::memory_order_relaxed)) {
                             return;
