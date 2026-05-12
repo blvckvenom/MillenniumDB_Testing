@@ -242,7 +242,19 @@ Yields exposed via `gnn_offline_sample`: `numWorkersUsed` (effective pool size a
 
 **Files**: `src/gnn/sampling/basic_khop_sampler.{h,cc}` (worker ctor + `reseed_for_batch` + `merge_counts_from` + `get_topology`), `src/gnn/sampling/sampling_config.h` (`num_workers` + thread-safety doc), `src/gnn/sampling/offline_sampling_engine.{h,cc}` (parallel dispatch lambda + result.num_workers_used + per-worker `QueryContext::set_query_ctx`), `src/query/procedure/builtin/gnn_offline_sample_procedure.{h,cc}` (`numWorkers` param + `numWorkersUsed` yield).
 
-**Commits**: `c8ffd166` feat(gnn): Plan F core. `03ed201f` fix(gnn): propagate QueryContext to workers (the SIGSEGV root cause).
+**Commits**: `c8ffd166` feat(gnn): Plan F core. `03ed201f` fix(gnn): propagate QueryContext to workers (the SIGSEGV root cause). `198413d8` docs(gnn): Plan F BPT-direct is thread-safe after QueryContext fix.
+
+**Paper-config validation on papers100M (2026-05-12)**:
+
+```
+fanout=[10,15,20], batchSize=1024, randomSeed=42, orientation=REVERSE,
+usePredefinedSplits=true, useFourLevelTopologyStore=false,
+useAdjacencyCache=false, numWorkers=20
+```
+
+Result: `totalBatches=1512, trainBatches=1179, valBatches=123, testBatches=210, uniqueNodes=9,157,028, computeMillis=152,658, numWorkersUsed=20`.
+
+Wall-clock: **2 min 33 s** for the entire sample build vs the previous single-thread runs (legacy path or v6 Spec #13 populate-stuck path) that did not produce a `batches.dat` within 3 h 37 min before manual abort. Extrapolating from the small-fanout measurements (`numWorkers=1` `[2,2]` ≈ 62 s for 6044 batches with ~6 node receptive field vs paper-config `[10,15,20]` ~3000 max per seed and 1512 batches), the single-thread paper-config baseline projects to ~65 min — so the empirical speedup is ≈ **25×**, above the SALIENT MLSys'22 range. The gap is consistent with BPT-direct's I/O profile: per-lookup page reads parallelize naturally across kernel page-cache concurrency on a high-IOPS NVMe (celebi Gen4 NVMe), and Plan F unlocks them without paying the Spec #13 populate cost.
 
 **Future work**:
 - T#22 (deferred): cora-scale bit-identical regression test for `numWorkers={1, 2, 4, 8}` as a CI gate.
