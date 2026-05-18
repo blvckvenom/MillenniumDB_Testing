@@ -96,7 +96,9 @@ The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_70 sm_75 s
 - **Next step (sampling.py):** BLOCKED. `sampling.py` is `import dgl.graphbolt as gb` from line 9, with `gb.ItemSampler`, `gb.DataLoader`, `gb.ItemSet` calls throughout — not trivially portable to the old `dgl.dataloading` API since the file structure expects graphbolt's `MiniBatch.compacted_*` attributes and the graphbolt-specific neighbor sampler. Replicating this would require ~200 LOC of port work and is out of scope for the 90-min budget.
 - **Downstream chain:** `feat_packing.py` reads `node_counts.pt`, `meta_node_popularity.pt`, `in-nid-{bid}.pt`, all produced by `sampling.py`. `train_multi_thread.py` reads further outputs of `feat_packing.py`. All gated by `sampling.py`.
 
-## Final state
+## Final state (historical, pre-source-build)
+
+> **2026-05-18 update:** The graphbolt blocker described below was subsequently resolved by building `libgraphbolt_pytorch_2.7.0.so` from DGL source — see the **graphbolt-from-source build** section at the bottom of this doc. The "Recommendation" section below is preserved for the audit trail but its core verdict is now superseded: Phase 2 is unblocked.
 
 - **Env name:** `diskgnn_cu124` (misnomer — actually torch-2.7 + cu128)
 - **Activation:** `source /home/bfuentes/miniconda3/etc/profile.d/conda.sh && conda activate diskgnn_cu124`
@@ -138,3 +140,97 @@ The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_70 sm_75 s
 - `/home/bfuentes/DiskGNN/DiskGNN/examples/load_graph.py` — has the old `load_ogb` path (commented out as caller) usable for the adapter
 - `/tmp/prepare_ogbn_arxiv_via_ogb_api.py` — working adapter for ogbn-arxiv dataset prep
 - `/home/bfuentes/miniconda3/envs/diskgnn_cu124/` — Python env with torch 2.7 cu128, offgs, PyG ecosystem, DGL (raw API only)
+
+## graphbolt-from-source build (2026-05-18)
+
+The graphbolt blocker from Attempt 2D was resolved by building the `libgraphbolt_pytorch_2.7.0.so` from DGL source against the working torch 2.7 + cu128 + Blackwell sm_120 stack.
+
+### Build summary
+
+- DGL source: `/tmp/dgl-src` (branch `2.5.x`, commit `cd67ccc6`)
+- Shallow submodules: `--depth 1 --shallow-submodules` (CCCL, HugeCTR, liburing, taskflow, tsl_robin_map, pcg, cuco, nanoflann)
+- Build command (in `/tmp/dgl-src/graphbolt`):
+  ```bash
+  mkdir -p /tmp/gb-bin/graphbolt
+  LD_LIBRARY_PATH="/usr/local/cuda/lib64" \
+  CMAKE_COMMAND=cmake \
+  CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+  USE_CUDA=ON USE_LIBURING=ON \
+  BINDIR=/tmp/gb-bin \
+  CUDAARCHS="120" \
+  CC=gcc CXX=g++ \
+  bash build.sh "$(which python)"
+  ```
+- LD_LIBRARY_PATH scrubbed (excluded `/home/bfuentes/MillenniumDB_Testing/third_party/libtorch/lib`) — otherwise cmake's `find_package(Torch)` would resolve to MDB's bundled libtorch and produce a binary linked against the wrong libc10. Verified post-build via `ldd`:
+  ```
+  libc10.so => /home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/torch/lib/libc10.so
+  libtorch.so => /home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/torch/lib/libtorch.so
+  libtorch_cuda.so => /home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so
+  ```
+  Correctly bound to conda env torch, not MDB third_party.
+
+### Patches applied
+
+**None.** No source modifications were needed. The DGL 2.5.x graphbolt CMakeLists already supports env-driven CUDA arch via `$CUDAARCHS`, and exposing `CUDAARCHS="120"` produced the correct nvcc flag chain:
+```
+-gencode arch=compute_120,code=sm_120 ... --generate-code=arch=compute_120,code=[compute_120,sm_120]
+```
+
+(The cuda/extension subfolder additionally inherits Volta-only `compute_70` per the upstream comment about CCCL #1083, which is irrelevant to runtime since we never call extension/* on devices < sm_70.)
+
+### Build metrics
+
+- Wall-clock: ~3 min (single make -j 20 invocation, gated by the heaviest `.cu` file `neighbor_sampler.cu` ≈ 2:13 single-core CUB+thrust+taskflow template expansion)
+- Peak RAM: ~7 GB (well under 30 GB)
+- Output: `/tmp/dgl-src/graphbolt/build/2.7.0/libgraphbolt_pytorch_2.7.0.so` (83 018 568 bytes = 79 MB)
+- Auxiliary: `/tmp/dgl-src/graphbolt/build/2.7.0/libgraphbolt_pytorch_2.7.0_cuda.a` (the extension static lib that the .so links in)
+
+### Installation
+
+```bash
+DGL_GB_DIR=/home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/dgl/graphbolt
+rm "${DGL_GB_DIR}/libgraphbolt_pytorch_2.7.0.so"  # removes the broken 2.6.0-symlink trick
+cp /tmp/gb-bin/graphbolt/libgraphbolt_pytorch_2.7.0.so "${DGL_GB_DIR}/"
+```
+
+Now both `libgraphbolt_pytorch_2.6.0.so` (shipped by DGL wheel, unused) and `libgraphbolt_pytorch_2.7.0.so` (freshly built, ABI-correct) coexist; DGL's loader picks the right one via `torch.__version__.split("+")[0]`.
+
+### Verification
+
+| Test | Result |
+|---|---|
+| `import dgl.graphbolt as gb` | **PASS** |
+| `gb.BuiltinDataset('ogbn-arxiv').load()` (177 MB download + extract) | **PASS** |
+| GPU smoke: `graph.to('cuda').sample_neighbors(seeds_cuda, fanout=5)` + `torch.cuda.synchronize()` | **PASS** (17 sampled edges from 4 seeds × 5 fanout, sm_120 kernel executed on RTX 5070 Ti) |
+| Paper `import sampling` | **PASS** |
+| `python prepare_dataset.py --dataset ogbn-arxiv --store-path /home/bfuentes/diskgnn_data/offgs_dataset` | **PASS** — produces `graph.pth` (131 MB), `features.bin` (87 MB), `labels.pth`, `conf.json`, `split_idx.pth` |
+
+### Patches landed on paper repo (this session)
+
+- `examples/prepare_dataset.py:23` — replaced hardcoded `root="/nvme2n1/graphbolt_dataset/datasets"` with `/home/bfuentes/diskgnn_data/graphbolt_dataset/datasets` (host-specific; `.bak` of original retained). The `--store-path` flag already covered the output side.
+
+### Files referenced (this section)
+
+- `/tmp/dgl-src/` — DGL 2.5.x source clone
+- `/tmp/dgl-src/graphbolt/CMakeLists.txt` — env-driven build config (no patches needed)
+- `/tmp/dgl-src/graphbolt/build/2.7.0/libgraphbolt_pytorch_2.7.0.so` — newly built binary (79 MB)
+- `/home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/dgl/graphbolt/libgraphbolt_pytorch_2.7.0.so` — installed copy
+- `/tmp/graphbolt_build.log` — full build log (130+ lines)
+- `/home/bfuentes/diskgnn_data/graphbolt_dataset/datasets/ogbn-arxiv-seeds*` — graphbolt-format ogbn-arxiv (177 MB zip + extracted)
+- `/home/bfuentes/diskgnn_data/offgs_dataset/ogbn-arxiv-offgs/` — paper-format ogbn-arxiv (220 MB total)
+
+### Recommendation for Phase 2 continuation
+
+**YES, proceed.** The graphbolt blocker is fully cleared:
+- (i) Real `prepare_dataset.py` runs end-to-end on ogbn-arxiv.
+- (ii) `sampling.py` imports without error and all `gb.*` API surface used by it (`gb.ItemSampler`, `gb.DataLoader`, `gb.ItemSet`, `gb.NeighborSampler`, `gb.BuiltinDataset`) is exposed and callable.
+- (iii) GPU smoke confirms sm_120 graphbolt CUDA kernels (specifically `neighbor_sampler.cu`) execute correctly on RTX 5070 Ti.
+- (iv) The offgs C++ extension (`liboffgs.so`) from earlier in this doc still loads (separate library, unaffected by graphbolt rebuild).
+
+Next steps for Phase 2 should be:
+1. Run `sampling.py --dataset ogbn-arxiv` to generate the sampled megabatch artifacts.
+2. Run `feat_packing.py` on the sampling output.
+3. Run `train_multi_thread.py` for the small-scale ogbn-arxiv accuracy baseline.
+4. If ogbn-arxiv looks healthy, attempt papers100M — note papers100M graphbolt download is ~120 GB (warn the user before kicking off).
+
+**Reservation about Blackwell-only build cuda/extension half:** The `cuda/extension/*.cu` files compile only with `compute_70` (Volta minimum) per the upstream CMakeLists comment about unresolved CCCL issue #1083. If any extension code path is hit on sm_120, it will likely fail with "no kernel image" — but the graphbolt design intent is that the extension cache (`gpu_cache.cu`, `gpu_graph_cache.cu`, `unique_and_compact_map.cu`) is optional. Empirically the smoke test using `sample_neighbors` did not touch it. If later phases trip on extension code we may need to revisit (the fix would be to also force `CUDAARCHS=70;120` for the extension lib, which is the upstream-recommended pattern).
