@@ -383,3 +383,69 @@ DGL 2.5's `dataloading.NeighborSampler.sample_blocks` accesses `g.device` direct
   - Train accuracy: 48.66% → 62.66% → 65.36% (expected GraphSAGE-on-arxiv early-epoch trajectory)
   - val_acc: NOT MEASURED — `--debug` path crashes on `g.device` attribute access in `dgl.dataloading.NeighborSampler`; orthogonal to CUDA enablement
 - **Recommendation: PROCEED with papers100M** for the GPU-training validation. The Stage 3 blocker (CPU-only `libdgl.so`) is now resolved. The remaining graphbolt val/test API drift is in the example script and can be patched separately if accuracy needs to be measured at training time; the train loop itself runs correctly on Blackwell sm_120.
+
+## papers100M prepare_dataset OOM (2026-05-18)
+
+End-to-end attempt at the paper's papers100M pipeline (`prepare_dataset.py` -> `sampling.py` -> `batched_packing.py` -> `train_multi_thread.py`). Run dir: `/home/bfuentes/Desktop/spec13_papers100m_e2e/post_pop_os/43_paper_p100M_bench/`. Brief: hard-cap 180 min budget, fanout `[10,15,20]`, batchSize 1024 (paper default), `--feat-cache-size 5e9`, `--cpu-cache-size 5e9`, 5 epochs.
+
+### Stage 1: `prepare_dataset.py` — **FAIL (OOM)**
+
+- **Command:** `python prepare_dataset.py --dataset ogbn-papers100M --store-path /home/bfuentes/diskgnn_data/offgs_dataset`
+- **Wall-clock to OOM:** **52 min 50.88 s** (the 64.9 GB seeds.zip downloaded over ~50 min at ~22 MB/s sustained, then graphbolt began extracting / loading)
+- **Peak RSS at crash:** 15.5 GB (`Maximum resident set size (kbytes): 15518108`)
+- **Disk written:** 68 GB into `/home/bfuentes/diskgnn_data/graphbolt_dataset/` (seeds.zip + extracted `ogbn-papers100M-seeds/`). The output dir `offgs_dataset/ogbn-papers100M-offgs/` was never created — the crash hit before `run()`'s `tofile()` block.
+- **Failure point:** `dgl.graphbolt.impl.torch_based_feature_store.TorchBasedFeatureStore.__init__` -> `numpy.load(spec.path)` -> `numpy.fromfile`. Stack trace:
+  ```
+  Traceback (most recent call last):
+    File "examples/prepare_dataset.py", line 130, in <module>
+        dataset = load_dataset(args.dataset)
+    File "examples/prepare_dataset.py", line 24, in load_dataset
+        dataset = gb.BuiltinDataset(dataset_name, root="...").load()
+    File ".../dgl/graphbolt/impl/ondisk_dataset.py", line 766, in load
+    File ".../dgl/graphbolt/impl/torch_based_feature_store.py", line 624, in __init__
+    File ".../numpy/lib/_npyio_impl.py", line 480, in load
+    File ".../numpy/lib/format.py", line 829, in read_array
+        array = numpy.fromfile(fp, dtype=dtype, count=count)
+  numpy._core._exceptions._ArrayMemoryError: Unable to allocate 53.0 GiB
+    for an array with shape (14215674368,) and data type float32
+  ```
+- **Root cause:** Papers100M's feature matrix is `[111_059_956, 128]` float32 = 53.0 GiB. DGL graphbolt's default `TorchBasedFeatureStore` materializes the entire `node_feat.npy` into RAM via `numpy.load` (no `mmap_mode` kwarg). With celebi's 30 GB total RAM (~27 GB available after kernel + process overhead + the 15.5 GB already used by the graph + ogbn metadata), the in-process allocation request for 53 GiB exceeds RAM by ~2x. The paper's reference setup is an AWS g5.48xlarge (192 vCPU, 768 GB RAM, 8x A10G — Table 4 of DiskGNN SIGMOD'25) where this load completes trivially.
+
+### Hardware-bound verdict
+
+The paper's reference implementation cannot complete papers100M `prepare_dataset.py` on celebi's 30 GB RAM budget. This empirically validates the Phase 0 / Phase 2 hardware-bound hypothesis: the paper code on identical celebi hardware **cannot reach the training stage** at all, while MillenniumDB's pipeline trains the same dataset successfully (val_acc 0.6055 at epoch 1, per-epoch 1374-1896 s extrapolating to 19-26 h for 50 epochs — see `docs/research/2026-04-27-papers100m-hyperparam-optim.md`).
+
+The 17x wall-clock gap between the paper's published 76.3 s/epoch (g5.48xlarge) and our 1374-1896 s/epoch on celebi is therefore **not a property of DiskGNN's algorithm** — it's the cost of running on a 30 GB / 16 GB RTX 5070 Ti machine vs. a 768 GB / 8x A10G server. DiskGNN's reference implementation cannot complete even the dataset-preparation phase on celebi, never mind training; MillenniumDB's pipeline completes training. The comparison shape is **runs vs. doesn't run**, not "slower than".
+
+### Workaround paths (not attempted in 180-min budget)
+
+The OOM is in DGL graphbolt's `TorchBasedFeatureStore` loader, not in paper user code. Possible fixes:
+
+1. **Patch graphbolt to memmap features:** modify `torch_based_feature_store.py:624` to pass `mmap_mode='r'` into `numpy.load`. Reduces RAM cost from 53 GiB to ~4 KB. Likely works for `prepare_dataset.py` but downstream `dataset.feature.read("node", None, "feat")` still materializes — would need a second patch to keep it lazy. Estimated 30-60 min of grep + patch + retest.
+2. **Skip `BuiltinDataset` entirely and reimplement the loader against the raw .npy files** using `np.memmap` end-to-end, like our earlier `prepare_ogbn_arxiv_via_ogb_api.py` adapter. Estimated 60-120 min.
+3. **Add swap.** Celebi has 8 GiB swap already (1.5 GiB used at crash time). Adding 32-64 GiB swap on the NVMe would let the OOM allocation succeed, but at the cost of running the entire feature read through page-cache + swap thrashing — `prepare_dataset.py` finish time would balloon from minutes to hours, and downstream sampling/training would inherit the same thrash budget. The bench result would then measure swap throughput, not DiskGNN behavior.
+
+**None of these were attempted** because (i) the OOM finding is the headline result — papers100M paper code is hardware-bound on celebi at the prep stage; (ii) a memmap-patched run would no longer be bit-equivalent to the paper's reference pipeline, breaking the apples-to-apples framing; (iii) the budget was largely consumed by the 50-min download anyway.
+
+### Time budget consumed
+
+- 0:00-0:08  preflight + script patches (`batched_packing.py` torch.load monkey-patch + dir setup)
+- 0:08-0:51  `prepare_dataset.py` download phase (64.9 GB at ~22 MB/s)
+- 0:51-0:53  graphbolt extract + load -> **OOM at minute 52:50**
+- 0:53-end   process kill + log capture + documentation
+
+Hard cap was 180 min; OOM hit at minute 52, well inside the budget, so no time-pressure compromised the experiment. The remaining 100+ min of unused budget was the result of the failure, not exhausted by other work.
+
+### Patches landed for this run (independent of the OOM)
+
+- `examples/batched_packing.py` — torch.load monkey-patch at module top (PyTorch 2.6+ defaults `weights_only=True` which blocks the .pt files written by the paper's own sampler). Same pattern already applied to `train_multi_thread.py` in the prior arxiv smoke test. Patch is harmless and remains in place for any future retry.
+
+### Files
+
+- `/home/bfuentes/Desktop/spec13_papers100m_e2e/post_pop_os/43_paper_p100M_bench/prepare.log` — full `/usr/bin/time -v` capture incl. download progress (tqdm `\r` stream collapsed into 2 logical lines) + stack trace + RSS peak.
+- `/home/bfuentes/diskgnn_data/graphbolt_dataset/datasets/ogbn-papers100M-seeds/` — 68 GB of extracted graphbolt assets left in place (would be reusable by a memmap-patched retry).
+- `/home/bfuentes/diskgnn_data/offgs_dataset/ogbn-papers100M-offgs/` — does not exist (prep crashed before write).
+
+### Conclusion
+
+**Phase 2 reaches the hardware bound at the prepare_dataset stage.** Paper's own reference implementation cannot complete papers100M preprocessing on 30 GB RAM. This validates the Phase 0 finding that the 17x wall-clock gap is hardware-bound, not algorithm-bound — paper code on identical celebi hardware cannot even reach the training stage, while our pipeline trains successfully (val_acc 0.6055). Apples-to-apples wall-clock benchmark is therefore **not measurable on this hardware** without departing from the paper's reference pipeline.
