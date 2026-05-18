@@ -246,6 +246,17 @@ public:
 
     uint64_t feature_dim() const { return feature_dim_; }
 
+    // Phase 0 (2026-05-17) profile instrumentation getters. Each returns the
+    // per-tier microseconds captured during the most recent
+    // load_batch_features() call. last_rmap_us() is a SUB-counter and its time
+    // is already included inside the L1/L2/L3/L4 totals; it is tracked
+    // separately to quantify the Phase 1 address-table candidate.
+    uint64_t last_l1_us() const   { return last_l1_us_; }
+    uint64_t last_l2_us() const   { return last_l2_us_; }
+    uint64_t last_l3_us() const   { return last_l3_us_; }
+    uint64_t last_l4_us() const   { return last_l4_us_; }
+    uint64_t last_rmap_us() const { return last_rmap_us_; }
+
 private:
     std::unique_ptr<GpuCache> gpu_cache_;
     std::unique_ptr<CpuCache> cpu_cache_;
@@ -265,6 +276,18 @@ private:
     GnnDtype       dtype_       = GnnDtype::FLOAT32;
     uint64_t       l3_header_size_ = FeatureMatrixHeader::SIZE; // data offset past header
     Stats          stats_;
+
+    // Phase 0 (2026-05-17) profile instrumentation. Per-call sub-timers in
+    // microseconds. Set during load_batch_features(), read via public
+    // accessors. rmap_lookup_us is a SUB-counter: it is already included
+    // inside the L1/L2/L3/L4 totals; tracked separately to quantify Phase 1
+    // address-table candidate. Mutable so const-callers of load_batch_features
+    // (none today, future-proofing) still update them.
+    mutable uint64_t last_l1_us_   = 0;
+    mutable uint64_t last_l2_us_   = 0;
+    mutable uint64_t last_l3_us_   = 0;
+    mutable uint64_t last_l4_us_   = 0;
+    mutable uint64_t last_rmap_us_ = 0;
 
     /// Map GnnDtype to torch scalar type.
     static torch::ScalarType to_torch_dtype(GnnDtype dt);

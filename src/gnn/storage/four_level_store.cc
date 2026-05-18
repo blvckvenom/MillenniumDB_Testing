@@ -608,9 +608,21 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
 
     stats_.total_requests += total;
 
+    // Phase 0 (2026-05-17): reset per-call profile timers. Each tier wraps its
+    // own block with steady_clock::now() and accumulates microseconds into the
+    // corresponding last_*_us_ member. last_rmap_us_ is a SUB-counter that
+    // tracks the (single, on the L3-fallback path) reordered_rm_->find() call
+    // and is also already included inside last_l3_us_.
+    last_l1_us_   = 0;
+    last_l2_us_   = 0;
+    last_l3_us_   = 0;
+    last_l4_us_   = 0;
+    last_rmap_us_ = 0;
+
     size_t row_bytes = feature_dim_ * elem_size_;
 
     // Step 1: Read L4 packed_slim for this batch to get OID table
+    auto t_l4_step1_start = std::chrono::steady_clock::now();
     char fname[32];
     std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
                   static_cast<unsigned long>(batch_id));
@@ -660,6 +672,12 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             }
         }
     }
+    {
+        auto t_l4_step1_end = std::chrono::steady_clock::now();
+        last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_l4_step1_end - t_l4_step1_start)
+                           .count();
+    }
 
     // Step 2: Partition nodes into L1/L2/L3/L4 buckets.
     // Each bucket stores (output_position, source_data) for later assembly.
@@ -677,70 +695,126 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         const auto& oid = oids[i];
 
         // Try L1 (GPU cache)
-        if (gpu_cache_ && gpu_cache_->contains(oid)) {
-            l1_input_positions.push_back(i);
-            l1_input_oids.push_back(oid);
-            stats_.l1_hits++;
-            stats_.l1_bytes_served += row_bytes;
-            continue;
+        // Phase 0 (2026-05-17): time the L1 lookup independently of L2/L3/L4.
+        if (gpu_cache_) {
+            auto t_l1_lookup_start = std::chrono::steady_clock::now();
+            bool hit = gpu_cache_->contains(oid);
+            auto t_l1_lookup_end = std::chrono::steady_clock::now();
+            last_l1_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l1_lookup_end - t_l1_lookup_start)
+                               .count();
+            if (hit) {
+                l1_input_positions.push_back(i);
+                l1_input_oids.push_back(oid);
+                stats_.l1_hits++;
+                stats_.l1_bytes_served += row_bytes;
+                continue;
+            }
         }
 
         // Try L2 (CPU cache)
-        if (cpu_cache_ && cpu_cache_->contains(oid)) {
-            l2_positions.push_back(i);
-            stats_.l2_hits++;
-            stats_.l2_bytes_served += row_bytes;
-            continue;
+        // Phase 0 (2026-05-17): time the L2 lookup independently.
+        if (cpu_cache_) {
+            auto t_l2_lookup_start = std::chrono::steady_clock::now();
+            bool hit = cpu_cache_->contains(oid);
+            auto t_l2_lookup_end = std::chrono::steady_clock::now();
+            last_l2_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l2_lookup_end - t_l2_lookup_start)
+                               .count();
+            if (hit) {
+                l2_positions.push_back(i);
+                stats_.l2_hits++;
+                stats_.l2_bytes_served += row_bytes;
+                continue;
+            }
         }
 
         // Try L4 (slim file data -- check first since slim has exact data)
-        auto slim_it = slim_oid_to_idx.find(oid.id);
-        if (slim_it != slim_oid_to_idx.end()) {
-            uint32_t idx = slim_it->second;
-            size_t offset = static_cast<size_t>(idx) * row_bytes;
-            if (offset + row_bytes <= slim_data.size()) {
-                l4_positions.push_back(i);
-                l4_slim_indices.push_back(idx);
-                stats_.l4_reads++;
-                stats_.l4_bytes_wanted += row_bytes;
+        // Phase 0 (2026-05-17): time the L4 slim-table classification.
+        {
+            auto t_l4_cls_start = std::chrono::steady_clock::now();
+            auto slim_it = slim_oid_to_idx.find(oid.id);
+            bool l4_hit = false;
+            if (slim_it != slim_oid_to_idx.end()) {
+                uint32_t idx = slim_it->second;
+                size_t offset = static_cast<size_t>(idx) * row_bytes;
+                if (offset + row_bytes <= slim_data.size()) {
+                    l4_positions.push_back(i);
+                    l4_slim_indices.push_back(idx);
+                    stats_.l4_reads++;
+                    stats_.l4_bytes_wanted += row_bytes;
+                    l4_hit = true;
+                }
+            }
+            auto t_l4_cls_end = std::chrono::steady_clock::now();
+            last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l4_cls_end - t_l4_cls_start)
+                               .count();
+            if (l4_hit) {
                 continue;
             }
         }
 
         // Fallback to L3 (reordered FeatureMatrix)
-        if (reordered_rm_.has_value()) {
-            auto row = reordered_rm_->find(oid);
-            if (row.has_value()) {
-                l3_positions.push_back(i);
-                l3_row_indices.push_back(*row);
-                stats_.l3_reads++;
-                stats_.l3_bytes_wanted += row_bytes;
-                continue;
+        // Phase 0 (2026-05-17): time the L3 reordered_rm_->find() call. This
+        // is the only RowMapping lookup in this function — last_rmap_us_ is a
+        // SUB-counter that captures it, and the same elapsed is also rolled
+        // into last_l3_us_.
+        {
+            auto t_l3_cls_start = std::chrono::steady_clock::now();
+            bool l3_hit = false;
+            if (reordered_rm_.has_value()) {
+                auto t_rmap_start = std::chrono::steady_clock::now();
+                auto row = reordered_rm_->find(oid);
+                auto t_rmap_end = std::chrono::steady_clock::now();
+                last_rmap_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                     t_rmap_end - t_rmap_start)
+                                     .count();
+                if (row.has_value()) {
+                    l3_positions.push_back(i);
+                    l3_row_indices.push_back(*row);
+                    stats_.l3_reads++;
+                    stats_.l3_bytes_wanted += row_bytes;
+                    l3_hit = true;
+                }
             }
+            if (!l3_hit) {
+                // Node not resolved -- leave as zeros, count as L3 miss.
+                // No bytes_wanted increment: nothing was actually read.
+                stats_.l3_reads++;
+            }
+            auto t_l3_cls_end = std::chrono::steady_clock::now();
+            last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l3_cls_end - t_l3_cls_start)
+                               .count();
         }
-
-        // Node not resolved -- leave as zeros, count as L3 miss.
-        // No bytes_wanted increment: nothing was actually read.
-        stats_.l3_reads++;
     }
 
     // Step 3: Batch-read L3 rows via DirectIoReader (zero page cache)
     // or mmap fallback. Result is a contiguous buffer of l3_row_indices.size() rows.
+    // Phase 0 (2026-05-17): time the L3 disk read.
     std::vector<char> l3_buf;
-    if (!l3_row_indices.empty()) {
-        if (l3_reader_) {
-            auto result = l3_reader_->read_rows(l3_row_indices, row_bytes, l3_header_size_);
-            l3_buf.assign(result.data.get(), result.data.get() + result.size);
-            // Spec A1: capture O_DIRECT physical bytes (>= wanted due to
-            // 4 KB block alignment overhead — Spec A2 will reduce this).
-            stats_.l3_bytes_disk += result.bytes_disk;
-        } else if (l3_mmap_fb_.has_value()) {
-            l3_buf.resize(l3_row_indices.size() * row_bytes);
-            l3_mmap_fb_->extract_rows(l3_row_indices, l3_buf.data());
-            // Mmap fallback: page cache mediates, so we count row-level
-            // bytes as approximation (no aligned-region amplification visible).
-            stats_.l3_bytes_disk += l3_row_indices.size() * row_bytes;
+    {
+        auto t_l3_read_start = std::chrono::steady_clock::now();
+        if (!l3_row_indices.empty()) {
+            if (l3_reader_) {
+                auto result = l3_reader_->read_rows(l3_row_indices, row_bytes, l3_header_size_);
+                l3_buf.assign(result.data.get(), result.data.get() + result.size);
+                // Spec A1: capture O_DIRECT physical bytes (>= wanted due to
+                // 4 KB block alignment overhead — Spec A2 will reduce this).
+                stats_.l3_bytes_disk += result.bytes_disk;
+            } else if (l3_mmap_fb_.has_value()) {
+                l3_buf.resize(l3_row_indices.size() * row_bytes);
+                l3_mmap_fb_->extract_rows(l3_row_indices, l3_buf.data());
+                // Mmap fallback: page cache mediates, so we count row-level
+                // bytes as approximation (no aligned-region amplification visible).
+                stats_.l3_bytes_disk += l3_row_indices.size() * row_bytes;
+            }
         }
+        auto t_l3_read_end = std::chrono::steady_clock::now();
+        last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_l3_read_end - t_l3_read_start)
+                           .count();
     }
 
     // Step 4: Assemble output tensor.
@@ -758,10 +832,16 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         // --- GPU-accelerated assembly path ---
 
         // L1: batch lookup returns [K1_hits, D] tensor on GPU
+        // Phase 0 (2026-05-17): time the L1 GPU batch lookup.
         torch::Tensor gpu_features;
         std::vector<uint32_t> gpu_positions;
         if (!l1_input_oids.empty()) {
+            auto t_l1_gather_start = std::chrono::steady_clock::now();
             auto lr = gpu_cache_->lookup(l1_input_oids);
+            auto t_l1_gather_end = std::chrono::steady_clock::now();
+            last_l1_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l1_gather_end - t_l1_gather_start)
+                               .count();
             gpu_features = lr.features;
             // Map hit_positions (indices into l1_input_oids) back to output positions
             gpu_positions.reserve(lr.hit_positions.size());
@@ -779,7 +859,9 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         cpu_combined_positions.reserve(cpu_total);
 
         // L2 features
+        // Phase 0 (2026-05-17): time the L2 lookup + copy.
         if (!l2_positions.empty()) {
+            auto t_l2_copy_start = std::chrono::steady_clock::now();
             std::vector<ObjectId> l2_oids;
             l2_oids.reserve(l2_positions.size());
             for (auto pos : l2_positions) l2_oids.push_back(oids[pos]);
@@ -791,10 +873,16 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                                     l2_data + h * feature_dim_,
                                     l2_data + (h + 1) * feature_dim_);
             }
+            auto t_l2_copy_end = std::chrono::steady_clock::now();
+            last_l2_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l2_copy_end - t_l2_copy_start)
+                               .count();
         }
 
         // L3 features (already in l3_buf, in order of l3_row_indices)
+        // Phase 0 (2026-05-17): time the L3 copy into the combined buffer.
         if (!l3_positions.empty() && !l3_buf.empty()) {
+            auto t_l3_copy_start = std::chrono::steady_clock::now();
             const float* l3_data = reinterpret_cast<const float*>(l3_buf.data());
             for (size_t j = 0; j < l3_positions.size(); ++j) {
                 cpu_combined_positions.push_back(l3_positions[j]);
@@ -802,10 +890,16 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                                     l3_data + j * feature_dim_,
                                     l3_data + (j + 1) * feature_dim_);
             }
+            auto t_l3_copy_end = std::chrono::steady_clock::now();
+            last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l3_copy_end - t_l3_copy_start)
+                               .count();
         }
 
         // L4 features (from slim_data)
+        // Phase 0 (2026-05-17): time the L4 copy into the combined buffer.
         if (!l4_positions.empty()) {
+            auto t_l4_copy_start = std::chrono::steady_clock::now();
             const float* slim_float = reinterpret_cast<const float*>(slim_data.data());
             for (size_t j = 0; j < l4_positions.size(); ++j) {
                 cpu_combined_positions.push_back(l4_positions[j]);
@@ -814,6 +908,10 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                                     slim_float + idx * feature_dim_,
                                     slim_float + (idx + 1) * feature_dim_);
             }
+            auto t_l4_copy_end = std::chrono::steady_clock::now();
+            last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                               t_l4_copy_end - t_l4_copy_start)
+                               .count();
         }
 
         // C2: Pin the CPU combined buffer for UVA access from the CUDA
@@ -858,36 +956,68 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     char* out_ptr = static_cast<char*>(output.data_ptr());
 
     // L1 features (GPU cache -> CPU copy, one-by-one)
-    for (size_t k = 0; k < l1_input_oids.size(); ++k) {
-        auto lr = gpu_cache_->lookup({l1_input_oids[k]});
-        if (!lr.hit_positions.empty()) {
-            auto cpu_feats = lr.features.cpu().contiguous();
-            std::memcpy(out_ptr + l1_input_positions[k] * row_bytes,
-                        cpu_feats.data_ptr(), row_bytes);
+    // Phase 0 (2026-05-17): time the CPU-path L1 gather+copy.
+    if (!l1_input_oids.empty()) {
+        auto t_l1_cpu_start = std::chrono::steady_clock::now();
+        for (size_t k = 0; k < l1_input_oids.size(); ++k) {
+            auto lr = gpu_cache_->lookup({l1_input_oids[k]});
+            if (!lr.hit_positions.empty()) {
+                auto cpu_feats = lr.features.cpu().contiguous();
+                std::memcpy(out_ptr + l1_input_positions[k] * row_bytes,
+                            cpu_feats.data_ptr(), row_bytes);
+            }
         }
+        auto t_l1_cpu_end = std::chrono::steady_clock::now();
+        last_l1_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_l1_cpu_end - t_l1_cpu_start)
+                           .count();
     }
 
     // L2 features
-    for (auto pos : l2_positions) {
-        auto lr = cpu_cache_->lookup({oids[pos]});
-        if (!lr.hit_positions.empty()) {
-            std::memcpy(out_ptr + pos * row_bytes,
-                        lr.features.data(), row_bytes);
+    // Phase 0 (2026-05-17): time the CPU-path L2 copy.
+    if (!l2_positions.empty()) {
+        auto t_l2_cpu_start = std::chrono::steady_clock::now();
+        for (auto pos : l2_positions) {
+            auto lr = cpu_cache_->lookup({oids[pos]});
+            if (!lr.hit_positions.empty()) {
+                std::memcpy(out_ptr + pos * row_bytes,
+                            lr.features.data(), row_bytes);
+            }
         }
+        auto t_l2_cpu_end = std::chrono::steady_clock::now();
+        last_l2_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_l2_cpu_end - t_l2_cpu_start)
+                           .count();
     }
 
     // L3 features (from batched read in l3_buf)
-    for (size_t j = 0; j < l3_positions.size(); ++j) {
-        std::memcpy(out_ptr + l3_positions[j] * row_bytes,
-                    l3_buf.data() + j * row_bytes, row_bytes);
+    // Phase 0 (2026-05-17): time the CPU-path L3 copy.
+    if (!l3_positions.empty()) {
+        auto t_l3_cpu_start = std::chrono::steady_clock::now();
+        for (size_t j = 0; j < l3_positions.size(); ++j) {
+            std::memcpy(out_ptr + l3_positions[j] * row_bytes,
+                        l3_buf.data() + j * row_bytes, row_bytes);
+        }
+        auto t_l3_cpu_end = std::chrono::steady_clock::now();
+        last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_l3_cpu_end - t_l3_cpu_start)
+                           .count();
     }
 
     // L4 features (from slim_data)
-    for (size_t j = 0; j < l4_positions.size(); ++j) {
-        uint32_t idx = l4_slim_indices[j];
-        size_t offset = static_cast<size_t>(idx) * row_bytes;
-        std::memcpy(out_ptr + l4_positions[j] * row_bytes,
-                    slim_data.data() + offset, row_bytes);
+    // Phase 0 (2026-05-17): time the CPU-path L4 copy.
+    if (!l4_positions.empty()) {
+        auto t_l4_cpu_start = std::chrono::steady_clock::now();
+        for (size_t j = 0; j < l4_positions.size(); ++j) {
+            uint32_t idx = l4_slim_indices[j];
+            size_t offset = static_cast<size_t>(idx) * row_bytes;
+            std::memcpy(out_ptr + l4_positions[j] * row_bytes,
+                        slim_data.data() + offset, row_bytes);
+        }
+        auto t_l4_cpu_end = std::chrono::steady_clock::now();
+        last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                           t_l4_cpu_end - t_l4_cpu_start)
+                           .count();
     }
 
     return output;
