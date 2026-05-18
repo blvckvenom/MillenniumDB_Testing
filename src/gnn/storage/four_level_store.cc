@@ -609,15 +609,15 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     stats_.total_requests += total;
 
     // Phase 0 (2026-05-17): reset per-call profile timers. Each tier wraps its
-    // own block with steady_clock::now() and accumulates microseconds into the
-    // corresponding last_*_us_ member. last_rmap_us_ is a SUB-counter that
+    // own block with steady_clock::now() and accumulates nanoseconds into the
+    // corresponding last_*_ns_ member. last_rmap_ns_ is a SUB-counter that
     // tracks the (single, on the L3-fallback path) reordered_rm_->find() call
-    // and is also already included inside last_l3_us_.
-    last_l1_us_   = 0;
-    last_l2_us_   = 0;
-    last_l3_us_   = 0;
-    last_l4_us_   = 0;
-    last_rmap_us_ = 0;
+    // and is also already included inside last_l3_ns_.
+    last_l1_ns_   = 0;
+    last_l2_ns_   = 0;
+    last_l3_ns_   = 0;
+    last_l4_ns_   = 0;
+    last_rmap_ns_ = 0;
 
     size_t row_bytes = feature_dim_ * elem_size_;
 
@@ -674,7 +674,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     }
     {
         auto t_l4_step1_end = std::chrono::steady_clock::now();
-        last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l4_step1_end - t_l4_step1_start)
                            .count();
     }
@@ -700,7 +700,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             auto t_l1_lookup_start = std::chrono::steady_clock::now();
             bool hit = gpu_cache_->contains(oid);
             auto t_l1_lookup_end = std::chrono::steady_clock::now();
-            last_l1_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l1_lookup_end - t_l1_lookup_start)
                                .count();
             if (hit) {
@@ -718,7 +718,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             auto t_l2_lookup_start = std::chrono::steady_clock::now();
             bool hit = cpu_cache_->contains(oid);
             auto t_l2_lookup_end = std::chrono::steady_clock::now();
-            last_l2_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l2_lookup_end - t_l2_lookup_start)
                                .count();
             if (hit) {
@@ -747,7 +747,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                 }
             }
             auto t_l4_cls_end = std::chrono::steady_clock::now();
-            last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l4_cls_end - t_l4_cls_start)
                                .count();
             if (l4_hit) {
@@ -757,9 +757,9 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
 
         // Fallback to L3 (reordered FeatureMatrix)
         // Phase 0 (2026-05-17): time the L3 reordered_rm_->find() call. This
-        // is the only RowMapping lookup in this function — last_rmap_us_ is a
+        // is the only RowMapping lookup in this function — last_rmap_ns_ is a
         // SUB-counter that captures it, and the same elapsed is also rolled
-        // into last_l3_us_.
+        // into last_l3_ns_.
         {
             auto t_l3_cls_start = std::chrono::steady_clock::now();
             bool l3_hit = false;
@@ -767,7 +767,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                 auto t_rmap_start = std::chrono::steady_clock::now();
                 auto row = reordered_rm_->find(oid);
                 auto t_rmap_end = std::chrono::steady_clock::now();
-                last_rmap_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                last_rmap_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                      t_rmap_end - t_rmap_start)
                                      .count();
                 if (row.has_value()) {
@@ -784,7 +784,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                 stats_.l3_reads++;
             }
             auto t_l3_cls_end = std::chrono::steady_clock::now();
-            last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l3_cls_end - t_l3_cls_start)
                                .count();
         }
@@ -812,7 +812,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             }
         }
         auto t_l3_read_end = std::chrono::steady_clock::now();
-        last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l3_read_end - t_l3_read_start)
                            .count();
     }
@@ -839,7 +839,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             auto t_l1_gather_start = std::chrono::steady_clock::now();
             auto lr = gpu_cache_->lookup(l1_input_oids);
             auto t_l1_gather_end = std::chrono::steady_clock::now();
-            last_l1_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l1_gather_end - t_l1_gather_start)
                                .count();
             gpu_features = lr.features;
@@ -874,7 +874,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                                     l2_data + (h + 1) * feature_dim_);
             }
             auto t_l2_copy_end = std::chrono::steady_clock::now();
-            last_l2_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l2_copy_end - t_l2_copy_start)
                                .count();
         }
@@ -891,7 +891,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                                     l3_data + (j + 1) * feature_dim_);
             }
             auto t_l3_copy_end = std::chrono::steady_clock::now();
-            last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l3_copy_end - t_l3_copy_start)
                                .count();
         }
@@ -909,7 +909,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                                     slim_float + (idx + 1) * feature_dim_);
             }
             auto t_l4_copy_end = std::chrono::steady_clock::now();
-            last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+            last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l4_copy_end - t_l4_copy_start)
                                .count();
         }
@@ -968,7 +968,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             }
         }
         auto t_l1_cpu_end = std::chrono::steady_clock::now();
-        last_l1_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l1_cpu_end - t_l1_cpu_start)
                            .count();
     }
@@ -985,7 +985,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             }
         }
         auto t_l2_cpu_end = std::chrono::steady_clock::now();
-        last_l2_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l2_cpu_end - t_l2_cpu_start)
                            .count();
     }
@@ -999,7 +999,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                         l3_buf.data() + j * row_bytes, row_bytes);
         }
         auto t_l3_cpu_end = std::chrono::steady_clock::now();
-        last_l3_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l3_cpu_end - t_l3_cpu_start)
                            .count();
     }
@@ -1015,7 +1015,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
                         slim_data.data() + offset, row_bytes);
         }
         auto t_l4_cpu_end = std::chrono::steady_clock::now();
-        last_l4_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l4_cpu_end - t_l4_cpu_start)
                            .count();
     }

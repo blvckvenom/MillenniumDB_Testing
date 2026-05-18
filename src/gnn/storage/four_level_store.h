@@ -251,11 +251,15 @@ public:
     // load_batch_features() call. last_rmap_us() is a SUB-counter and its time
     // is already included inside the L1/L2/L3/L4 totals; it is tracked
     // separately to quantify the Phase 1 address-table candidate.
-    uint64_t last_l1_us() const   { return last_l1_us_; }
-    uint64_t last_l2_us() const   { return last_l2_us_; }
-    uint64_t last_l3_us() const   { return last_l3_us_; }
-    uint64_t last_l4_us() const   { return last_l4_us_; }
-    uint64_t last_rmap_us() const { return last_rmap_us_; }
+    //
+    // Phase 0 (2026-05-17): public API still in microseconds (matches the
+    // `_us` fields of BatchTiming). Internal storage uses nanoseconds for
+    // precision; conversion happens here, once per batch (not per node).
+    uint64_t last_l1_us() const   { return last_l1_ns_ / 1000; }
+    uint64_t last_l2_us() const   { return last_l2_ns_ / 1000; }
+    uint64_t last_l3_us() const   { return last_l3_ns_ / 1000; }
+    uint64_t last_l4_us() const   { return last_l4_ns_ / 1000; }
+    uint64_t last_rmap_us() const { return last_rmap_ns_ / 1000; }
 
 private:
     std::unique_ptr<GpuCache> gpu_cache_;
@@ -278,16 +282,15 @@ private:
     Stats          stats_;
 
     // Phase 0 (2026-05-17) profile instrumentation. Per-call sub-timers in
-    // microseconds. Set during load_batch_features(), read via public
-    // accessors. rmap_lookup_us is a SUB-counter: it is already included
-    // inside the L1/L2/L3/L4 totals; tracked separately to quantify Phase 1
-    // address-table candidate. Mutable so const-callers of load_batch_features
-    // (none today, future-proofing) still update them.
-    mutable uint64_t last_l1_us_   = 0;
-    mutable uint64_t last_l2_us_   = 0;
-    mutable uint64_t last_l3_us_   = 0;
-    mutable uint64_t last_l4_us_   = 0;
-    mutable uint64_t last_rmap_us_ = 0;
+    // nanoseconds (high precision to avoid integer-microsecond truncation of
+    // sub-μs hash lookups). Accessors below convert to μs at the API boundary.
+    // rmap_lookup_ns is a SUB-counter: already included in the L3 total;
+    // tracked separately to quantify Phase 1 address-table candidate.
+    mutable uint64_t last_l1_ns_   = 0;
+    mutable uint64_t last_l2_ns_   = 0;
+    mutable uint64_t last_l3_ns_   = 0;
+    mutable uint64_t last_l4_ns_   = 0;
+    mutable uint64_t last_rmap_ns_ = 0;
 
     /// Map GnnDtype to torch scalar type.
     static torch::ScalarType to_torch_dtype(GnnDtype dt);
