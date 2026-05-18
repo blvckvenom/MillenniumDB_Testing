@@ -94,6 +94,17 @@ public:
      */
     MiniBatch assemble_from_sample(const GraphSample& sample);
 
+    /**
+     * @brief Read-only access to the underlying FourLevelStore, if any.
+     *
+     * Returns nullptr in FeatureMatrix-fallback mode. Used by TrainingLoop's
+     * Phase 0 profile instrumentation (`BatchTimingLog`) to pull per-tier
+     * timings off the store after each batch assemble. Const-correct: the
+     * timings are advertised via const accessors and the store is not
+     * mutated through this pointer.
+     */
+    const FourLevelStore* feature_store() const { return feature_store_; }
+
 private:
     /**
      * @brief Remap layer-local indices to global subgraph indices per GNN layer.

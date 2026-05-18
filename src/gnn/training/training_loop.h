@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,7 @@
 #include "gnn/models/graphsage_model.h"
 #include "gnn/sampling/sample_catalog.h"
 #include "gnn/training/batch_assembler.h"
+#include "gnn/training/batch_timing_log.h"
 
 namespace mdb::gnn {
 
@@ -108,6 +110,19 @@ public:
         // Default false until empirical validation completes; flip to true
         // once Module 6 confirms speedup + bit-identical accuracy.
         bool        use_cuda_streams = false;
+
+        // Phase 0 (2026-05-17) profile instrumentation: when non-empty,
+        // per-batch timings are persisted to this CSV path (train + val +
+        // test). Disabled when empty (default). Captures: forward / backward
+        // wall-times always; per-tier L1/L2/L3/L4/rmap sub-counters only on
+        // the sequential (non-prefetcher) path where the FourLevelStore's
+        // last_*_us() values can be safely attributed to the current batch.
+        // Under the AsyncBatchPrefetcher (default-on since 2026-05-07) tier
+        // sub-counters are left at 0 — the prefetcher's worker has already
+        // begun assembling batch N+1 by the time the consumer reads N, so
+        // last_*_us() is racy/unattributable without MiniBatch-level
+        // propagation (deferred refactor).
+        std::string profile_log_path = "";
     };
 
     // =========================================================================
@@ -197,6 +212,11 @@ private:
     const SampleCatalog& catalog_;
     torch::optim::Adam&  optimizer_;
     Config               config_;
+
+    // Phase 0 (2026-05-17): per-batch CSV profile log. Constructed only when
+    // config_.profile_log_path is non-empty; nullptr otherwise. Owned by
+    // TrainingLoop; flushed on epoch boundaries and on destruction.
+    std::unique_ptr<BatchTimingLog> profile_log_;
 };
 
 } // namespace mdb::gnn

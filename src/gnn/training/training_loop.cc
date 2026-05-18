@@ -37,6 +37,14 @@ TrainingLoop::TrainingLoop(
     , optimizer_(optimizer)
     , config_(std::move(config))
 {
+    // Phase 0 (2026-05-17): open per-batch profile CSV iff user opted in via
+    // Config::profile_log_path. BatchTimingLog truncates the target, writes
+    // the CSV header, and flushes on each `flush_interval` records (default
+    // 64). The unique_ptr lifetime matches TrainingLoop's, so the destructor
+    // flushes any tail records.
+    if (!config_.profile_log_path.empty()) {
+        profile_log_ = std::make_unique<BatchTimingLog>(config_.profile_log_path);
+    }
 }
 
 // =============================================================================
@@ -157,6 +165,15 @@ TrainingLoop::Result TrainingLoop::train()
         }
 
         for (uint64_t bid = 0; bid < train_batches; ++bid) {
+            // Phase 0 (2026-05-17) profile record. Populated incrementally
+            // through the per-batch stages; appended once at end-of-iteration
+            // when profile_log_ is active. Zero-initialised so fields we
+            // can't cleanly time on the prefetcher path (per-tier counters,
+            // sample_read_us / active_us / edge_us / h2d_us) stay at 0.
+            BatchTiming bt{};
+            bt.batch_id = bid;
+            bt.split    = 0;  // TRAIN
+
             // Spec C3 stage 0: assemble + device transfer is the work an
             // async prefetcher (stage 1) would hide behind compute.
             // When the prefetcher is on, this measurement reflects only
@@ -178,6 +195,24 @@ TrainingLoop::Result TrainingLoop::train()
                 }
             } else {
                 mini = assembler_.assemble(bid);
+            }
+
+            // Phase 0: per-tier sub-counters are attributable ONLY on the
+            // sequential (non-prefetcher) path. With the prefetcher on, by
+            // the time next() returns batch N the worker has already begun
+            // load_batch_features() for batch N+1 (which resets last_*_ns_),
+            // so the FourLevelStore's per-call timers race silently and
+            // cannot be associated with this batch. Leaving at 0 is the
+            // documented Phase 0 contract; per-batch tier propagation would
+            // require attaching the timings to MiniBatch (deferred refactor).
+            if (!prefetcher) {
+                if (const auto* fs = assembler_.feature_store()) {
+                    bt.l1_us         = fs->last_l1_us();
+                    bt.l2_us         = fs->last_l2_us();
+                    bt.l3_us         = fs->last_l3_us();
+                    bt.l4_us         = fs->last_l4_us();
+                    bt.rmap_lookup_us= fs->last_rmap_us();
+                }
             }
 
             // Spec C3 stage 3: cross-stream sync + record_stream BEFORE any
@@ -219,6 +254,11 @@ TrainingLoop::Result TrainingLoop::train()
             auto t_assem_end = std::chrono::steady_clock::now();
             result.assemble_seconds += std::chrono::duration<double>(
                 t_assem_end - t_assem_start).count();
+            // Phase 0: assemble + (optional) host→device transfer rolled into
+            // a single bucket. sample_read / active / edge / h2d are subsumed
+            // here until BatchAssembler exposes finer-grained sub-timers.
+            bt.load_features_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                t_assem_end - t_assem_start).count();
 
             optimizer.zero_grad();
 
@@ -230,6 +270,8 @@ TrainingLoop::Result TrainingLoop::train()
             );
             auto t_fwd_end = std::chrono::steady_clock::now();
             result.forward_seconds += std::chrono::duration<double>(
+                t_fwd_end - t_fwd_start).count();
+            bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_fwd_end - t_fwd_start).count();
 
             // Only back-prop if at least one labeled seed exists in this batch
@@ -247,11 +289,19 @@ TrainingLoop::Result TrainingLoop::train()
                 auto t_bwd_end = std::chrono::steady_clock::now();
                 result.backward_seconds += std::chrono::duration<double>(
                     t_bwd_end - t_bwd_start).count();
+                bt.backward_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    t_bwd_end - t_bwd_start).count();
 
                 total_loss += loss.item<double>();
             }
 
             ++num_train_batches;
+
+            // Phase 0: emit this batch's timing record. No-op when
+            // profile_log_path was empty (profile_log_ is nullptr).
+            if (profile_log_) {
+                profile_log_->append(bt);
+            }
         }
 
         // Spec C3 stage 3: synchronize train_stream before validation reads
@@ -270,6 +320,14 @@ TrainingLoop::Result TrainingLoop::train()
 
         // === Validation phase ===
         double val_accuracy = evaluate(train_batches, val_batches);
+
+        // Phase 0: flush per-batch CSV at epoch boundary so partial logs
+        // survive an early termination (Ctrl-C, OOM, etc.) and post-hoc
+        // analysis sees epoch-N records even if the process never reached
+        // the destructor.
+        if (profile_log_) {
+            profile_log_->flush();
+        }
 
         // Spec B2: capture cumulative L3+L4 disk bytes post-validation so
         // the delta covers train + eval activity for this epoch. The
@@ -413,8 +471,33 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
     int64_t correct = 0;
     int64_t total   = 0;
 
+    // Phase 0 (2026-05-17): infer split from start_batch using the catalog
+    // layout (train batches first, then validation, then test). Anything
+    // landing at or after train+validation counts as TEST; otherwise VAL.
+    // Matches the procedure-level convention used by gnn_train_procedure.
+    const uint8_t eval_split =
+        (start_batch >= catalog_.train_batches + catalog_.validation_batches)
+            ? 2u   // TEST
+            : 1u;  // VAL
+
     for (uint64_t i = 0; i < count; ++i) {
+        BatchTiming bt{};
+        bt.batch_id = start_batch + i;
+        bt.split    = eval_split;
+
+        auto t_load_start = std::chrono::steady_clock::now();
         auto mini = assembler_.assemble(start_batch + i);
+
+        // Phase 0: per-tier sub-counters — evaluate() does not use the
+        // prefetcher, so the FourLevelStore's last_*_us() can be attributed
+        // directly to this batch.
+        if (const auto* fs = assembler_.feature_store()) {
+            bt.l1_us         = fs->last_l1_us();
+            bt.l2_us         = fs->last_l2_us();
+            bt.l3_us         = fs->last_l3_us();
+            bt.l4_us         = fs->last_l4_us();
+            bt.rmap_lookup_us= fs->last_rmap_us();
+        }
 
         // Move all batch tensors to the model's device
         auto dev = model_.parameters().begin()->device();
@@ -426,12 +509,19 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
             mini.labels     = mini.labels.to(dev);
             mini.label_mask = mini.label_mask.to(dev);
         }
+        auto t_load_end = std::chrono::steady_clock::now();
+        bt.load_features_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            t_load_end - t_load_start).count();
 
+        auto t_fwd_start = std::chrono::steady_clock::now();
         auto logits = model_.forward(
             mini.features,
             mini.edge_indices,
             static_cast<int64_t>(mini.num_seeds)
         );
+        auto t_fwd_end = std::chrono::steady_clock::now();
+        bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            t_fwd_end - t_fwd_start).count();
 
         if (mini.label_mask.any().item<bool>()) {
             auto masked_logits = logits.index({mini.label_mask});
@@ -441,6 +531,20 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
             correct += (predicted == masked_labels).sum().item<int64_t>();
             total   += masked_labels.size(0);
         }
+
+        // Phase 0: emit this val/test batch's timing record. backward_us
+        // stays 0 (no backward in eval). Guarded by profile_log_ so
+        // tests / standalone evaluate() calls without an opt-in path are
+        // unaffected.
+        if (profile_log_) {
+            profile_log_->append(bt);
+        }
+    }
+
+    // Phase 0: flush after the val/test loop so the eval records are durable
+    // even if a later phase (e.g., callback, test cleanup) throws.
+    if (profile_log_) {
+        profile_log_->flush();
     }
 
     // Restore training mode for subsequent use
