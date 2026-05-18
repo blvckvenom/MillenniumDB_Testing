@@ -284,3 +284,102 @@ End-to-end attempt at the paper's three-stage pipeline (`sampling.py` -> `batche
 - `/tmp/diskgnn_patched/feat_packing.py` — copy of original, unused (we used batched_packing.py)
 - `/tmp/diskgnn_patched/train_multi_thread.py` — torch.load monkey-patch
 - `/home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/offgs/dataset.py` — `weights_only=False` on three torch.load calls (env-local; not packaged back upstream)
+
+## Full DGL CUDA build (2026-05-18)
+
+Built DGL 2.5.x from `/tmp/dgl-src` against torch 2.7.0+cu128, CUDA 12.8, with CUDA archs `sm_80;sm_86;sm_89;sm_90;sm_120` (Blackwell RTX 5070 Ti is sm_120). The PyPI wheel's `libdgl.so` is CPU-only — this build replaces it with a full CUDA-enabled binary.
+
+### Build config
+
+```bash
+cd /tmp/dgl-src && rm -rf build && mkdir build && cd build
+export CUDAToolkit_ROOT=/usr/local/cuda
+TORCH_DIR=$(python -c "import torch; print(torch.utils.cmake_prefix_path)")
+cmake .. \
+  -DUSE_CUDA=ON \
+  -DCMAKE_PREFIX_PATH="${TORCH_DIR}" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TYPE=release \
+  -DBUILD_TORCH=ON \
+  -DUSE_LIBURING=ON \
+  -DUSE_OPENMP=ON \
+  -DCUDA_ARCH_NAME=Manual \
+  -DCUDA_ARCH_BIN="80;86;89;90;120" \
+  -DCUDA_ARCH_PTX="90"
+make -j8
+```
+
+### Built libraries
+
+| Library | Size before | Size after | Notes |
+|---|---|---|---|
+| `libdgl.so`                                | 11.9 MB (CPU-only PyPI) | **196 MB** (CUDA) | full sm_80..sm_120 fat binary |
+| `libgraphbolt_pytorch_2.7.0.so`            | 83 MB  (sm_120 only, prior subagent) | **198 MB** (sm_80..sm_120) | rebuilt for arch parity |
+| `libdgl_sparse_pytorch_2.7.0.so`           | absent (only `_2.6.0.so` shipped)    | **977 KB** | adapter shim |
+| `libtensoradapter_pytorch_2.7.0.so`        | absent (only `_2.6.0.so` shipped)    | **168 KB** | torch 2.7 ABI shim |
+
+Build wall-clock: 8 min 30 s from cmake-configure to final link (graphbolt + dgl + dgl_sparse + tensoradapter targets sequentially complete; see `/tmp/dgl_build.log`).
+
+### Installation
+
+Replaced in `~/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/dgl/`:
+- `libdgl.so` (CPU-only 11.9 MB → CUDA 196 MB; backup kept in `/tmp/dgl_backup/libdgl.so`)
+- `tensoradapter/pytorch/libtensoradapter_pytorch_2.7.0.so` (added new)
+- `dgl_sparse/libdgl_sparse_pytorch_2.7.0.so` (added new)
+- `graphbolt/libgraphbolt_pytorch_2.7.0.so` (replaced 83 MB → 198 MB)
+
+### Verification
+
+`g.to('cuda')` smoke test:
+```
+DGL version: 2.5.0
+Torch version: 2.7.0+cu128
+Torch CUDA available: True, device count: 1
+CUDA arch: (12, 0)
+DGL CPU graph: cpu
+DGL CUDA graph: cuda:0
+g.num_nodes: 4 g.num_edges: 3
+PASS: DGL g.to('cuda') works
+```
+
+### ogbn-arxiv `train_multi_thread.py` re-run (after DGL CUDA build)
+
+Stage 3, which previously failed with `Device API cuda is not enabled`, now completes the training loop on GPU.
+
+- Command: `python train_multi_thread.py --dataset ogbn-arxiv --fanout "10,15,20" --hidden 256 --dropout 0.2 --model SAGE --gpu-cache-size 1e7 --cpu-cache-size 2e7 --dir /home/bfuentes/diskgnn_data/offgs_dataset --ratio 1.0 --blowup -1`
+- Cache pack used: `cache-size-3e+07/blowup--1.0` (the matching pack from `batched_packing.py --feat-cache-size 3e7`).
+- **Wall-clock:** 4.75 s for 3 epochs end-to-end.
+- **Peak RSS:** 1.94 GB (Maximum resident set size).
+- Per-epoch (train acc, epoch time):
+
+| Epoch | Train acc | Graph Load (s) | Epoch Time (s) | Input Feature Num |
+|---|---|---|---|---|
+| 0 | 48.66% | 0.229 | 1.229 | 1,105,275,520 |
+| 1 | 62.66% | 0.123 | 0.652 | 1,105,275,520 |
+| 2 | 65.36% | 0.093 | 0.649 | 1,105,275,520 |
+
+Avg epoch time: 0.651 s. The training loop runs the full DiskGNN data path (CPU + GPU feature cache, threaded prefetch, GPU model forward/backward). Logs in `/home/bfuentes/Desktop/spec13_papers100m_e2e/post_pop_os/42_paper_arxiv_smoke/train_cuda.log`.
+
+### Caveat — val/test accuracy not captured (DGL 2.5 graphbolt API drift)
+
+Re-running with `--debug` (which triggers per-epoch val/test eval) crashes on the very first val batch:
+
+```
+AttributeError: 'FusedCSCSamplingGraph' object has no attribute 'device'
+  File ".../dgl/dataloading/neighbor_sampler.py", line 158, in sample_blocks
+    cpu = F.device_type(g.device) == "cpu"
+```
+
+DGL 2.5's `dataloading.NeighborSampler.sample_blocks` accesses `g.device` directly on the graph object passed into the sampler. The training-loop dataloader (paper's custom `OffgsDataLoader`) wraps a different graphbolt object that exposes device through a getter (`g.csc_indptr.device`). This is purely an API-drift problem inside the paper's example script — unrelated to whether DGL's CUDA dispatch works. Run dir: `train_cuda_debug.log`. Patching the val/test loop to use the paper's custom wrapper instead of `dgl.dataloading.NeighborSampler` is the fix (out of scope for this CUDA-unblock task).
+
+### Summary
+
+- **libdgl.so size: 196 MB** (vs 11.9 MB CPU-only PyPI)
+- **libtensoradapter_pytorch_2.7.0.so: 168 KB** (newly installed for torch 2.7 ABI)
+- **DGL CUDA smoke (`g.to('cuda')`): PASS**
+- **ogbn-arxiv `train_multi_thread.py`: PASS**
+  - Status: train loop runs on GPU; 3 epochs in 4.75 s wall-clock
+  - Per-epoch time (epochs 1-2 steady state): 0.65 s
+  - Train accuracy: 48.66% → 62.66% → 65.36% (expected GraphSAGE-on-arxiv early-epoch trajectory)
+  - val_acc: NOT MEASURED — `--debug` path crashes on `g.device` attribute access in `dgl.dataloading.NeighborSampler`; orthogonal to CUDA enablement
+- **Recommendation: PROCEED with papers100M** for the GPU-training validation. The Stage 3 blocker (CPU-only `libdgl.so`) is now resolved. The remaining graphbolt val/test API drift is in the example script and can be patched separately if accuracy needs to be measured at training time; the train loop itself runs correctly on Blackwell sm_120.
