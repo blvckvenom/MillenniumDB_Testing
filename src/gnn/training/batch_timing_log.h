@@ -37,7 +37,8 @@ struct BatchTiming {
  * @brief Append-only CSV logger for per-batch timings.
  *
  * Thread-safe via internal mutex. Flushes every flush_interval entries
- * and on destruction. Atomic temp-file-then-rename for final write.
+ * and on destruction. Writes directly to the user-supplied path (truncate +
+ * append); partial CSVs after a crash are tolerated by the analysis pipeline.
  */
 class BatchTimingLog {
 public:
