@@ -234,3 +234,53 @@ Next steps for Phase 2 should be:
 4. If ogbn-arxiv looks healthy, attempt papers100M — note papers100M graphbolt download is ~120 GB (warn the user before kicking off).
 
 **Reservation about Blackwell-only build cuda/extension half:** The `cuda/extension/*.cu` files compile only with `compute_70` (Volta minimum) per the upstream CMakeLists comment about unresolved CCCL issue #1083. If any extension code path is hit on sm_120, it will likely fail with "no kernel image" — but the graphbolt design intent is that the extension cache (`gpu_cache.cu`, `gpu_graph_cache.cu`, `unique_and_compact_map.cu`) is optional. Empirically the smoke test using `sample_neighbors` did not touch it. If later phases trip on extension code we may need to revisit (the fix would be to also force `CUDAARCHS=70;120` for the extension lib, which is the upstream-recommended pattern).
+
+---
+
+## ogbn-arxiv smoke test (2026-05-18)
+
+End-to-end attempt at the paper's three-stage pipeline (`sampling.py` -> `batched_packing.py` -> `train_multi_thread.py`). Run dir `/home/bfuentes/Desktop/spec13_papers100m_e2e/post_pop_os/42_paper_arxiv_smoke/` holds the full `/usr/bin/time -v` logs.
+
+### Stage 1: `sampling.py` — PASS (after CPU patches)
+- **Wall-clock:** 4.01 s elapsed, script-reported `Sampling Time 1.731 s + Save Block 0.842 s + Save Rank 0.005 s = Total 2.578 s` (the 1.4 s gap is python startup + dataset load).
+- **Peak RSS:** 797.5 MB.
+- **Output files:** 89 train batches (`train-{0..88}.pt` 1024-seed each) + `in-nid-*.pt` + `out-nid-*.pt` + `node_counts.pt` + `meta_node_popularity.pt` under `/home/bfuentes/diskgnn_data/offgs_dataset/ogbn-arxiv-1024-10,15,20-1.0/`.
+- **Patches required** (all in a copy at `/tmp/diskgnn_patched/sampling.py`, paper repo untouched):
+  1. Force `device = torch.device("cpu")` and skip `g.pin_memory_()`. Root cause: the DGL wheel shipped on PyPI bundles a CPU-only `libdgl.so` (11.9 MB; CUDA builds are ~100 MB). The custom graphbolt-cuda `.so` I built earlier does GPU sampling, but the resulting `DGLBlock` cannot be `.cpu()`'d or moved because `libdgl.so` itself has no CUDA dispatch. Forcing the entire sampler datapipe to CPU avoids the cross-library boundary.
+  2. Pass `device=device` (torch.device object) into `create_dataloader` instead of the int `args.device`.
+  3. `mkdir -p /tmp/diskgnn_patched/logs/` so the CSV writer at `args.log='logs/sample_decompose.csv'` has a target dir.
+  4. **Conda-env site-packages patch:** `/home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/offgs/dataset.py` — three `torch.load(...)` calls (`labels`, `split_idx`, `graph`) got `weights_only=False` appended. Required by PyTorch 2.6+ default of `weights_only=True` which rejects DGL's `FusedCSCSamplingGraph` pickle.
+
+### Stage 2: `batched_packing.py` — PASS (NOT `feat_packing.py`)
+- **Wall-clock:** 3.79 s elapsed, script-reported `Total Time 2.951 s`.
+- **Peak RSS:** 1.12 GB.
+- **Cache config:** `--feat-cache-size 3e7` (30 MB = ~34.6% of the 82 MB feature dataset; the original task brief's 5e8 forces 100% caching which makes the disk-cache assert in the script fire because there's nothing left to put on disk).
+- **Key gotcha — the task brief calls the wrong script.** The brief specifies `feat_packing.py`. That script writes `cached_feats.pt` (torch.save). `train_multi_thread.py` then calls `torch.ops.offgs._CAPI_LoadFeats_Direct("cached_feats.bin", ...)` — a different file, written by `batched_packing.py`. `feat_packing.py` is an older/companion script; `batched_packing.py` is the paired packer for `train_multi_thread.py`. After running the latter, `cached_feats.bin` + `cache_rev_idx.pt` appear and stage 3 advances.
+
+### Stage 3: `train_multi_thread.py` — **FAIL** at `block.to(cuda)`
+- **Wall-clock to failure:** 2.78 s elapsed.
+- **Failure point:** `train_multi_thread.py:281` — `blocks = [block.to(device, non_blocking=True) for block in blocks]`. Fatal error:
+  ```
+  dgl._ffi.base.DGLError: Check failed: allow_missing:
+    Device API cuda is not enabled. Please install the cuda version of dgl.
+  ```
+- **Same root cause as stage 1's needed patch:** the CPU-only `libdgl.so` has no CUDA dispatch. The training loop unconditionally moves DGLBlocks to GPU before forward pass, and there is no env-var or argument switch in the script to keep them on CPU. Patching the training loop to be fully CPU-resident would require rewriting the cuda-stream-based feature-loader threads (`feat_transfer` uses `torch.cuda.Stream`, `torch.ops.offgs._CAPI_GatherInGPU`, etc.) and would no longer be the paper's pipeline.
+- **Patches applied** (`/tmp/diskgnn_patched/train_multi_thread.py`):
+  1. `torch.load = lambda *a, **kw: orig_load(*a, weights_only=False, **kw)` monkey-patch at module load so the four DGLBlock-pickle calls in `load_graph`/`load_meta`/etc. work under PyTorch 2.6+.
+  This patch was sufficient to unblock the script init; it then crashed at `block.to(device)`.
+
+### What `/proc/sys/vm/drop_caches` line was skipped
+- All three paper scripts have commented-out `with open("/proc/sys/vm/drop_caches", "w") as stream: stream.write("1\n")` blocks. Not reachable without sudo and explicitly skipped in the task brief. No-op on this run; cold-cache timing measurements would need a separate kernel-cache-flush mechanism.
+
+### Conclusion
+- **Pipeline functional on celebi as configured:** NO. Stages 1 + 2 PASS via documented patches. Stage 3 fails on the very first `block.to(cuda)` because the upstream DGL wheel's `libdgl.so` is CPU-only. The custom graphbolt-cuda build cleared the import path but does not provide a CUDA DGL runtime.
+- **What it would take to unblock stage 3:**
+  1. Build full DGL from source with `USE_CUDA=ON` against torch 2.7 + cu128, sm_120 (the same path used to produce the graphbolt `.so`, but now for the core `libdgl.so` ~100 MB binary including all the CUDA `array/cuda/`, `runtime/cuda/`, `kernel/cuda/` translation units). Estimated 30-90 min if `data.dgl.ai`'s `wheels-internal/torch-2.7` channel does not surface a prebuild between now and then.
+  2. Alternative: rewrite `train_multi_thread.py` for pure-CPU training. This drops the paper's GPU-bandwidth saturating design (CUDA streams, GPU feature cache, pinned-memory DMA) and stops being a parity test.
+- **Recommendation for papers100M:** **DO NOT proceed** with papers100M on the current stack. We cannot validate even the small ogbn-arxiv accuracy baseline. A papers100M run would burn the ~120 GB download + multi-hour sampling pass and then crash at the same `block.to(cuda)` line. Next session should land the DGL-from-source build first (the same way graphbolt was built), then re-attempt this smoke test as a gating check.
+
+### Patched files (all outside the protected working tree)
+- `/tmp/diskgnn_patched/sampling.py` — CPU device, no pin_memory
+- `/tmp/diskgnn_patched/feat_packing.py` — copy of original, unused (we used batched_packing.py)
+- `/tmp/diskgnn_patched/train_multi_thread.py` — torch.load monkey-patch
+- `/home/bfuentes/miniconda3/envs/diskgnn_cu124/lib/python3.10/site-packages/offgs/dataset.py` — `weights_only=False` on three torch.load calls (env-local; not packaged back upstream)
