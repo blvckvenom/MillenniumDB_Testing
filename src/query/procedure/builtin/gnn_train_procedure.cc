@@ -179,13 +179,16 @@ static void export_embeddings(
             for (auto& ei : mini.edge_indices) {
                 ei = ei.to(model_device);
             }
+            for (auto& ai : mini.active_indices_per_layer) {
+                ai = ai.to(model_device);
+            }
         }
 
         // Get embeddings (hidden representation before classifier)
         auto emb = model.get_embeddings(
             mini.features,
             mini.edge_indices,
-            static_cast<int64_t>(mini.num_seeds)
+            mini.active_sizes_per_layer
         );
         // emb is [num_seeds, hidden_dim]
 
@@ -227,10 +230,19 @@ static void export_embeddings(
     // Re-collect embeddings without node_ids for simplicity
     for (uint64_t bid = 0; bid < catalog.total_batches; ++bid) {
         auto mini = assembler.assemble(bid);
+        if (!model_device.is_cpu()) {
+            mini.features = mini.features.to(model_device);
+            for (auto& ei : mini.edge_indices) {
+                ei = ei.to(model_device);
+            }
+            for (auto& ai : mini.active_indices_per_layer) {
+                ai = ai.to(model_device);
+            }
+        }
         auto emb = model.get_embeddings(
             mini.features,
             mini.edge_indices,
-            static_cast<int64_t>(mini.num_seeds)
+            mini.active_sizes_per_layer
         );
         all_embeddings.push_back(emb.cpu());
     }
@@ -311,6 +323,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
     bool        save_final       = true;
+    std::string profile_log_path = "";  // Phase 0 per-batch timing CSV (empty = disabled)
     // Spec C3 stage 1 (default true since 2026-05-07): async prefetcher.
     // 1.609× speedup measured on papers100M, bit-identical accuracy.
     bool        use_async_prefetcher = true;
@@ -318,6 +331,12 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // model.forward+backward onto separate CUDA streams. Default false
     // until empirical validation in Module 6.
     bool        use_cuda_streams     = false;
+    // Round 3B (2026-05-15): number of worker threads in AsyncBatchPrefetcher.
+    // Default 1 = byte-identical to Stage 1 behavior. >1 has effect only
+    // when the BatchAssembler runs in FeatureMatrix-fallback mode (see
+    // TrainingLoop::Config::prefetch_num_workers for thread-safety notes
+    // and the FourLevelStore clamp).
+    uint64_t    prefetch_num_workers = 1;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -367,6 +386,15 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_bool("useCudaStreams")) {
             use_cuda_streams = *v;
         }
+        // Round 3B (2026-05-15): multi-worker AsyncBatchPrefetcher.
+        if (auto v = opts.get_int("prefetchNumWorkers")) {
+            if (*v < 1) {
+                throw std::runtime_error(
+                    "prefetchNumWorkers must be >= 1, got: " +
+                    std::to_string(*v));
+            }
+            prefetch_num_workers = static_cast<uint64_t>(*v);
+        }
         if (auto v = opts.get_bool("normalize")) {
             normalize = *v;
         }
@@ -405,6 +433,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         }
         if (auto v = opts.get_bool("saveFinal")) {
             save_final = *v;
+        }
+        // Phase 0 (2026-05-17): per-batch profile CSV path. Empty disables.
+        if (auto v = opts.get_string("profileLog")) {
+            profile_log_path = *v;
         }
     }
 
@@ -510,6 +542,36 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         splits = std::make_unique<SplitStore>(SplitStore::open(splits_path));
     }
 
+    // Consistency guard: labels.bin and splits.bin must agree on row indexing
+    // (both indexed by rmap row). If labels.bin was built against an older
+    // rmap and the rmap was later rewritten, TRAIN rows in splits.bin will
+    // map to -1 labels — model trains on noise. Scan first N rmap rows and
+    // verify the invariant; abort with remediation hint if violated.
+    if (labels && splits) {
+        constexpr uint64_t SCAN_LIMIT = 100000;
+        const uint64_t scan_n = std::min<uint64_t>(SCAN_LIMIT, splits->num_nodes());
+        uint64_t train_seen = 0;
+        uint64_t train_with_label = 0;
+        for (uint64_t r = 0; r < scan_n; ++r) {
+            if (splits->get(r) == SplitStore::TRAIN) {
+                train_seen++;
+                if (labels->get(r) >= 0) train_with_label++;
+            }
+        }
+        if (train_seen >= 16 && train_with_label * 4 < train_seen) {
+            throw std::runtime_error(
+                "gnn_train: labels.bin appears mis-indexed against rmap. "
+                "Scanned " + std::to_string(scan_n) + " rmap rows, found " +
+                std::to_string(train_seen) + " marked TRAIN but only " +
+                std::to_string(train_with_label) + " have a valid (non -1) label. "
+                "Likely cause: rmap was rewritten after labels.bin was built. "
+                "Fix: regenerate labels.bin + splits.bin against the current rmap "
+                "(scripts/regenerate_labels_splits.py) or rebuild the projection "
+                "with graph_project."
+            );
+        }
+    }
+
     // =========================================================================
     // Step 5: Configure model and training
     // =========================================================================
@@ -576,7 +638,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.random_seed   = random_seed;
     loop_config.use_async_prefetcher = use_async_prefetcher;
     loop_config.use_cuda_streams     = use_cuda_streams;
+    loop_config.prefetch_num_workers = static_cast<unsigned>(prefetch_num_workers);
     loop_config.output_dir    = output_dir.string();
+    loop_config.profile_log_path = profile_log_path;  // Phase 0 instrumentation
 
     // =========================================================================
     // Step 8a: Build base TrainingState (identifying fields) for checkpoints
@@ -824,6 +888,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("bestCheckpointPath",  ctx.create_string(best_checkpoint_str));
     ctx.yield("finalCheckpointPath", ctx.create_string(final_checkpoint_str));
     ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
+    ctx.yield("effectivePrefetchWorkers",
+              ctx.create_int(static_cast<int64_t>(result.effective_prefetch_workers)));
     ctx.yield_row();
 }
 
