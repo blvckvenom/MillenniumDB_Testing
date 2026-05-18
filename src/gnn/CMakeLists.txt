@@ -445,6 +445,11 @@ if(BUILD_TESTING)
             add_test(NAME LabelStoreTests COMMAND test_label_store)
         endif()
 
+        # BatchTimingLog tests (DiskGNN parity: per-batch CSV instrumentation)
+        add_executable(test_batch_timing_log tests/test_batch_timing_log.cc)
+        target_link_libraries(test_batch_timing_log PRIVATE mdb_gnn_core gtest gtest_main)
+        add_test(NAME BatchTimingLogTests COMMAND test_batch_timing_log)
+
         # SplitStore tests (Task 3: split assignments for training)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_split_store.cc")
             add_executable(test_split_store tests/test_split_store.cc)
