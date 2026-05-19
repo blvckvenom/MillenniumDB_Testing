@@ -1760,6 +1760,20 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     last_addr_load_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              t_addr_end - t_addr_start).count();
 
+    // C3: validate that the addr_table was built for this exact sample.
+    // If gnn_offline_sample was re-run without rebuilding addr_tables, the
+    // header total will disagree with the sample's actual node count — the
+    // resulting tensor would silently have the wrong shape.  Throw
+    // AddrTableStaleException so the dispatcher logs "stale" and falls back
+    // to legacy cleanly.
+    if (addr.header.total != static_cast<uint32_t>(sample.all_unique_nodes.size())) {
+        throw AddrTableStaleException(
+            "v2: addr_table total " + std::to_string(addr.header.total)
+            + " != sample.all_unique_nodes.size() "
+            + std::to_string(sample.all_unique_nodes.size())
+            + " — sample regenerated without rebuilding addr_tables");
+    }
+
     const uint64_t total    = addr.header.total;
     const size_t   row_bytes = feature_dim_ * elem_size_;
 
@@ -1781,48 +1795,63 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     auto t_l4_read_start = std::chrono::steady_clock::now();
     std::vector<char> slim_data;
     if (addr.header.num_l4 > 0) {
+        // C1: any failure here is a hard error — slim_data must be populated
+        // when num_l4 > 0, otherwise the L4 copy loop reads an empty buffer
+        // (UB).  Throw std::runtime_error so the dispatcher catches, logs
+        // "read failed", and falls back to legacy.
         char fname[32];
         std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
                       static_cast<unsigned long>(sample.batch_id));
         auto slim_path = fs::path(packed_slim_dir_) / fname;
-        if (fs::exists(slim_path)) {
-            int fd = ::open(slim_path.c_str(), O_RDONLY);
-            if (fd >= 0) {
-                FdGuard guard(fd);
-                struct stat st{};
-                if (::fstat(fd, &st) == 0) {
-                    const size_t file_size = static_cast<size_t>(st.st_size);
-                    if (file_size >= sizeof(PackedBatchHeader)) {
-                        ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
-                                        POSIX_FADV_SEQUENTIAL);
-                        std::vector<char> file_buf(file_size);
-                        read_all(fd, file_buf.data(), file_size,
-                                 slim_path.string());
-                        PackedBatchHeader hdr{};
-                        std::memcpy(&hdr, file_buf.data(), sizeof(hdr));
-                        if (hdr.is_valid() && hdr.has_oid_table()) {
-                            uint64_t hdr_nodes  = hdr.num_nodes;
-                            size_t   data_bytes = hdr.data_bytes();
-                            size_t   oid_bytes  = hdr_nodes * sizeof(uint64_t);
-                            bool sizes_ok = (sizeof(hdr) + oid_bytes + data_bytes)
-                                            <= file_size;
-                            if (sizes_ok) {
-                                const char* p = file_buf.data()
-                                              + sizeof(hdr) + oid_bytes;
-                                if (data_bytes > 0) {
-                                    slim_data.assign(p, p + data_bytes);
-                                }
-                                stats_.l4_bytes_disk += sizeof(hdr)
-                                                      + oid_bytes
-                                                      + data_bytes;
-                            }
-                        }
-                        fadvise_dontneed(fd, 0,
-                                         static_cast<off_t>(file_size));
-                    }
-                }
-            }
+
+        int fd = ::open(slim_path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            throw std::runtime_error("v2: cannot open slim file "
+                                     + slim_path.string()
+                                     + ": " + std::strerror(errno));
         }
+        FdGuard guard(fd);
+
+        struct stat st{};
+        if (::fstat(fd, &st) != 0) {
+            throw std::runtime_error("v2: fstat failed on "
+                                     + slim_path.string()
+                                     + ": " + std::strerror(errno));
+        }
+        const size_t file_size = static_cast<size_t>(st.st_size);
+        if (file_size <= sizeof(PackedBatchHeader)) {
+            throw std::runtime_error("v2: slim file too small: "
+                                     + slim_path.string());
+        }
+
+        // Fix #22: SEQUENTIAL hint before read, DONTNEED after (page-cache
+        // relief so late-phase L4 throughput does not collapse on 30 GB hosts).
+        ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
+                        POSIX_FADV_SEQUENTIAL);
+
+        std::vector<char> file_buf(file_size);
+        read_all(fd, file_buf.data(), file_size, slim_path.string());
+
+        PackedBatchHeader hdr{};
+        std::memcpy(&hdr, file_buf.data(), sizeof(hdr));
+        if (!hdr.is_valid() || !hdr.has_oid_table()) {
+            throw std::runtime_error("v2: invalid slim header in "
+                                     + slim_path.string());
+        }
+
+        const size_t oid_bytes   = hdr.num_nodes * sizeof(uint64_t);
+        const size_t data_offset = sizeof(hdr) + oid_bytes;
+        const size_t data_bytes  = hdr.data_bytes();
+        if (data_offset + data_bytes > file_size) {
+            throw std::runtime_error(
+                "v2: slim file size invariant violated: " + slim_path.string());
+        }
+
+        slim_data.assign(file_buf.begin() + static_cast<ptrdiff_t>(data_offset),
+                         file_buf.begin() + static_cast<ptrdiff_t>(data_offset + data_bytes));
+        stats_.l4_bytes_disk += sizeof(hdr) + oid_bytes + data_bytes;
+
+        fadvise_dontneed(fd, 0, static_cast<off_t>(file_size));
     }
     {
         auto t_l4_read_end = std::chrono::steady_clock::now();
@@ -1940,14 +1969,25 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     // L4: addr.l4_indices are packed_slim file slot indices.
     if (addr.header.num_l4 > 0) {
         auto t_l4_copy_start = std::chrono::steady_clock::now();
-        const float* slim_float =
-            reinterpret_cast<const float*>(slim_data.data());
+        // C2: bounds-check every L4 index.  A stale-but-format-valid addr_table
+        // can carry l4_indices that exceed the slim file's row count; an unchecked
+        // read would silently walk past the end of slim_data (UB).
+        const float*  slim_float           = reinterpret_cast<const float*>(slim_data.data());
+        const size_t  slim_capacity_floats = slim_data.size() / sizeof(float);
         for (uint32_t j = 0; j < addr.header.num_l4; ++j) {
             cpu_combined_positions.push_back(addr.l4_positions[j]);
-            uint32_t idx = addr.l4_indices[j];
+            uint32_t     idx           = addr.l4_indices[j];
+            size_t       row_end_floats = static_cast<size_t>(idx + 1) * feature_dim_;
+            if (row_end_floats > slim_capacity_floats) {
+                throw std::runtime_error(
+                    "v2: L4 index " + std::to_string(idx)
+                    + " out of bounds for slim file ("
+                    + std::to_string(slim_capacity_floats / feature_dim_)
+                    + " rows)");
+            }
             cpu_combined.insert(cpu_combined.end(),
                                 slim_float + idx * feature_dim_,
-                                slim_float + (idx + 1) * feature_dim_);
+                                slim_float + idx * feature_dim_ + feature_dim_);
         }
         auto t_l4_copy_end = std::chrono::steady_clock::now();
         last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1966,16 +2006,18 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     }
 #endif
 
-    // Flag is set here — only true when we reach the final assembler call,
-    // never on exception paths that fall back to legacy in the dispatcher.
-    last_used_v2_ = true;
-    return assembler_->assemble(
+    // I1: set the flag AFTER assemble() returns successfully.  If assemble()
+    // throws, the flag stays false so the dispatcher's catch block and any
+    // telemetry consumer see the correct "legacy actually served" state.
+    auto result = assembler_->assemble(
         static_cast<int64_t>(total),
         gpu_features, gpu_positions,
         assembler_data,
         static_cast<int64_t>(cpu_combined_positions.size()),
         cpu_combined_positions
     );
+    last_used_v2_ = true;
+    return result;
 }
 
 } // namespace mdb::gnn
