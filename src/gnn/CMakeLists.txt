@@ -79,6 +79,7 @@ add_library(mdb_gnn_core STATIC
     storage/cpu_cache.cc
     storage/gpu_cache.cc
     storage/four_level_store.cc
+    storage/addr_table.cc
     storage/direct_io_reader.cc
 
     # Phase 1: Projection Integration
@@ -449,6 +450,11 @@ if(BUILD_TESTING)
         add_executable(test_batch_timing_log tests/test_batch_timing_log.cc)
         target_link_libraries(test_batch_timing_log PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME BatchTimingLogTests COMMAND test_batch_timing_log)
+
+        # AddrTable format header tests (Path 4 Task 1: on-disk format + header invariants)
+        add_executable(test_addr_table_format tests/test_addr_table_format.cc)
+        target_link_libraries(test_addr_table_format PRIVATE mdb_gnn_core gtest gtest_main)
+        add_test(NAME AddrTableFormatTests COMMAND test_addr_table_format)
 
         # SplitStore tests (Task 3: split assignments for training)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_split_store.cc")
