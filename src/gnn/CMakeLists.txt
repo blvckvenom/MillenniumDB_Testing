@@ -80,6 +80,7 @@ add_library(mdb_gnn_core STATIC
     storage/gpu_cache.cc
     storage/four_level_store.cc
     storage/addr_table.cc
+    storage/addr_table_writer.cc
     storage/direct_io_reader.cc
 
     # Phase 1: Projection Integration
@@ -312,7 +313,7 @@ if(BUILD_TESTING)
         )
         # Note: ObjectId is header-only for construction/comparison;
         # operator<< lives in query/id.cc (linked via millenniumdb) but tests don't need it
-        target_link_libraries(test_gnn_storage mdb_gnn_core GTest::gtest_main)
+        target_link_libraries(test_gnn_storage mdb_gnn_core GTest::gtest_main ${TBB_LIBS})
         set_target_properties(test_gnn_storage PROPERTIES
             BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
@@ -456,6 +457,11 @@ if(BUILD_TESTING)
         target_link_libraries(test_addr_table_format PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME AddrTableFormatTests COMMAND test_addr_table_format)
 
+        # AddrTable writer tests (Path 4 Task 2: classify + serialize per-batch sidecar)
+        add_executable(test_addr_table_writer tests/test_addr_table_writer.cc)
+        target_link_libraries(test_addr_table_writer PRIVATE mdb_gnn_core gtest gtest_main)
+        add_test(NAME AddrTableWriterTests COMMAND test_addr_table_writer)
+
         # SplitStore tests (Task 3: split assignments for training)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_split_store.cc")
             add_executable(test_split_store tests/test_split_store.cc)
@@ -568,6 +574,26 @@ if(BUILD_TESTING)
             endif()
         endif()
 
+        add_executable(pipeline_overlap_test
+            ${CMAKE_SOURCE_DIR}/src/tests/pipeline_overlap_test.cc
+        )
+        target_link_libraries(pipeline_overlap_test mdb_gnn_core GTest::gtest_main ${TBB_LIBS})
+        set_target_properties(pipeline_overlap_test PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME PipelineOverlapTests COMMAND pipeline_overlap_test)
+
+        add_executable(page_cache_hint_test
+            ${CMAKE_SOURCE_DIR}/src/tests/page_cache_hint_test.cc
+        )
+        target_link_libraries(page_cache_hint_test mdb_gnn_core GTest::gtest_main)
+        set_target_properties(page_cache_hint_test PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME PageCacheHintTests COMMAND page_cache_hint_test)
+
         # TrainingLoop resume / callback tests (Phase 6 Sub-2 Task 4.3)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_training_loop_resume.cc")
             add_executable(test_training_loop_resume tests/test_training_loop_resume.cc)
@@ -609,6 +635,15 @@ if(BUILD_TESTING)
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
         add_test(NAME GraphSAGEModelTests COMMAND test_graphsage_model)
+
+        # Active-set-shrinking refactor: determinism + shape regression gate
+        add_executable(test_active_set_equivalence tests/test_active_set_equivalence.cc)
+        target_link_libraries(test_active_set_equivalence mdb_gnn_core GTest::gtest_main)
+        set_target_properties(test_active_set_equivalence PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME ActiveSetEquivalenceTests COMMAND test_active_set_equivalence)
 
         # EmbeddingWriter tests (Task 8: Phase A/B logic in isolation)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_embedding_writer.cc")
