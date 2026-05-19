@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <cstring>
 #include <type_traits>
 
 namespace mdb::gnn {
@@ -11,7 +10,7 @@ namespace mdb::gnn {
 /**
  * @brief On-disk header for AddrTable sidecar files (40 bytes, little-endian).
  *
- * File layout: [AddrTableHeader: 40 bytes][8 arrays back-to-back, no padding]
+ * File layout: [AddrTableHeader: 40 bytes][9 arrays back-to-back, no padding]
  *   l1_positions  [num_l1] uint32  — positions in output tensor for L1 nodes
  *   l1_indices    [num_l1] uint32  — gpu_cache row indices
  *   l2_positions  [num_l2] uint32  — positions in output tensor for L2 nodes
@@ -23,7 +22,7 @@ namespace mdb::gnn {
  *   zero_positions[num_zero] uint32 — positions left as zeros (unresolved)
  */
 struct AddrTableHeader {
-    static constexpr uint32_t MAGIC   = 0x41444452u;  // "ADDR" little-endian
+    static constexpr uint32_t MAGIC   = 0x41444452u;  // "ADDR" (MSB-first, matches storage/ convention)
     static constexpr uint32_t VERSION = 1u;
     static constexpr size_t   SIZE    = 40u;
 
@@ -37,12 +36,15 @@ struct AddrTableHeader {
     uint32_t total;
     uint64_t meta_sha256_head;
 
+    /// Build a valid header. Precondition: l1 + l2 + l3 + l4 + zero <= UINT32_MAX
+    /// (no runtime check — per-batch tier counts cannot realistically approach
+    /// 2^32). is_valid() recomputes the same sum, so a wrapped total will not be
+    /// detected by validation; callers must ensure this holds.
     static AddrTableHeader make(
         uint32_t l1, uint32_t l2, uint32_t l3, uint32_t l4, uint32_t zero,
         uint64_t meta_sha_head)
     {
         AddrTableHeader h{};
-        std::memset(&h, 0, sizeof(h));
         h.magic            = MAGIC;
         h.version          = VERSION;
         h.num_l1           = l1;
