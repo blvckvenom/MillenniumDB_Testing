@@ -1759,7 +1759,6 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     auto t_addr_end = std::chrono::steady_clock::now();
     last_addr_load_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              t_addr_end - t_addr_start).count();
-    last_used_v2_ = true;
 
     const uint64_t total    = addr.header.total;
     const size_t   row_bytes = feature_dim_ * elem_size_;
@@ -1967,6 +1966,9 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     }
 #endif
 
+    // Flag is set here — only true when we reach the final assembler call,
+    // never on exception paths that fall back to legacy in the dispatcher.
+    last_used_v2_ = true;
     return assembler_->assemble(
         static_cast<int64_t>(total),
         gpu_features, gpu_positions,
