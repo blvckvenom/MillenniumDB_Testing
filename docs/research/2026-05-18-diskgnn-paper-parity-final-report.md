@@ -9,21 +9,56 @@
 
 The MillenniumDB GNN pipeline trains GraphSAGE-MEAN on `ogbn-papers100M` to
 `val_acc = 0.6055` (epoch 1) in ~23-32 min/epoch on celebi. The DiskGNN paper
-reports `65.91% / 1.09 hr` on AWS g5.48xlarge (748 GB RAM). When the paper's
-own reference implementation is run on celebi for apples-to-apples comparison,
-**it cannot complete dataset preprocessing** — it crashes with
-`numpy._core._exceptions._ArrayMemoryError: Unable to allocate 53.0 GiB`
-because DGL graphbolt's `TorchBasedFeatureStore` materializes the full feature
-matrix via `np.load` (no `mmap_mode`) on a 30 GB RAM host.
+reports `65.91% / 1.09 hr` on AWS g5.48xlarge (748 GB RAM).
 
-This empirically confirms the **hardware-bound hypothesis**: the 17× wall-clock
-gap vs paper's numbers is hardware-locked. The paper code on the same celebi
-cannot even reach the training stage. Our pipeline does — because the Spec D
-Four-Level Feature Store (L1 GPU + L2 CPU pinned + L3 mmap'd disk + L4
-packed_slim) was designed precisely for memory-constrained scenarios where the
-paper's reference implementation does not function.
+### REVISION 2026-05-18 — prior "hardware-bound" claim falsified
 
-Comparison shape: **"runs vs doesn't run"**, not "X× slower".
+An initial Phase 2 attempt crashed paper's code with `_ArrayMemoryError: 53 GiB`
+and led me to conclude the gap was hardware-bound. That was wrong on two counts:
+
+1. The OOM was a 1-character default in graphbolt's preprocessed metadata yaml
+   (`in_memory: true`). Flipping to `false` makes `np.load` use `mmap_mode='r+'`,
+   keeping the 53 GB feature tensor on disk. Peak RSS drops from OOM to 25.5 GB.
+
+2. The prior session's "wrong dataset variant" theory (`-seeds`) was also wrong.
+   DGL graphbolt auto-appends `-seeds` regardless (`ondisk_dataset.py:1057-1058`).
+
+With the `in_memory: false` patch applied, paper code completes the full
+pipeline on celebi in 10:12 wall:
+
+| Stage | Wall-clock | Peak RSS |
+|---|---|---|
+| prepare_dataset (mmap patch) | 3:13 | 25.5 GB |
+| sampling (fanout 10,10,10) | 2:00 | 16.9 GB |
+| batched_packing (5 GB cache) | 2:39 | 28.8 GB |
+| train_multi_thread (3 epochs SAGE) | 2:20 | 22.0 GB |
+| **Pipeline total** | **10:12** | — |
+
+Training throughput: **42.34 sec/epoch** (average of epochs 1+2 on celebi).
+Train acc reached 65.24% by epoch 2.
+
+### Revised conclusion: algorithm-bound, NOT hardware-bound
+
+| System | Hardware | Per-epoch | Reaches training? |
+|---|---|---|---|
+| **MillenniumDB (ours)** | celebi 30 GB | **1374-1896 sec** (fanout 10,15,20) | yes |
+| **Paper code on celebi** | celebi 30 GB | **42.34 sec** (fanout 10,10,10) | **yes** (after metadata patch) |
+| Paper claim (paper §7.6) | AWS g5.48xlarge 748 GB | 76.3 sec | yes |
+
+Normalizing for fanout (paper's `[10,10,10]` is ~3× cheaper than our `[10,15,20]`):
+- Paper code equivalent at our fanout: ~127 sec/epoch
+- Our pipeline: 1374-1896 sec/epoch
+- **Real gap: ~10-15× slower**
+
+That gap is algorithm/implementation, not hardware. Paper code on identical
+celebi hardware is an order of magnitude faster per epoch even when adjusted
+for the lighter sampling config. The Spec D Four-Level Feature Store + B+Tree
+backend that we built is correct and functional but is not competitive in
+throughput with paper's offgs iouring engine + flat sequential features.bin.
+
+Phase 0's separate finding that `rmap_pct = 0` (paper §6 address tables not
+applicable to our C++ pipeline) remains valid — the address-table optimization
+specifically does not address where our gap is.
 
 ## Phase 0 — Profile findings
 
@@ -143,17 +178,17 @@ We have not pursued these because the OOM itself is **the empirical answer
 to the Phase 2 question**: the paper's reference implementation requires a
 high-RAM host. On celebi's 30 GB, it cannot start.
 
-## Final comparison
+## Final comparison (revised)
 
-| System | Hardware | Stage reached on papers100M | val_acc | Wall-clock |
+| System | Hardware | Stage reached | val_acc | Per-epoch |
 |---|---|---|---|---|
-| **MillenniumDB (ours)** | celebi 30 GB | **training successful** | **0.6055** (epoch 1) | 23-32 min/epoch |
-| DiskGNN paper claim | AWS g5.48xlarge 748 GB | training | 0.6591 (50 ep) | 76.3 sec/epoch |
-| DiskGNN paper code (this task) | celebi 30 GB | **dataset prep FAIL** (OOM) | — | — |
+| **MillenniumDB (ours)** | celebi 30 GB | training successful | 0.6055 (1 ep) | 1374-1896 sec |
+| **DiskGNN paper code (corrected)** | celebi 30 GB | training successful | 65.24% (2 ep, fanout 10,10,10) | **42.34 sec** |
+| DiskGNN paper claim | AWS g5.48 748 GB | training | 0.6591 (50 ep) | 76.3 sec/epoch |
 
-The paper's algorithm + DGL backend reference does NOT function on celebi-class
-hardware. Our pipeline does. The hardware-bound conclusion is empirically
-confirmed.
+The paper algorithm + DGL backend reference RUNS on celebi after a 1-character
+metadata patch (`in_memory: false`). The 17-44× wall-clock gap is real and is
+algorithm/implementation-bound, not hardware-bound as I initially claimed.
 
 ## Phase 1 was NOT implemented
 
@@ -163,34 +198,51 @@ not justified. No code changes were made for address tables. The Phase 0
 profile infrastructure (`BatchTimingLog`, FourLevelStore tier timers,
 `profileLog` parameter) IS implemented and committed.
 
-## Recommendation
+## Recommendation (revised)
 
 ### For the MillenniumDB GNN pipeline
 
-The pipeline is **production-ready for the celebi hardware class** (30 GB RAM
-+ mid-range GPU). val_acc 0.6055 at epoch 1 on `papers100M_paper_und` is
-within the paper's published range. The remaining gap to 65.91% (paper full
-50 epochs) is purely an epoch budget question — running 50 epochs on celebi
-projects to ~25 hours, achievable with patience.
+The pipeline is **functionally correct on celebi** (val_acc 0.6055 epoch 1,
+within paper's range). It is NOT throughput-competitive — paper code is
+~10-15× faster per epoch on identical hardware. Calling it "production-ready"
+without a throughput optimization round would be misleading.
 
 ### For the DiskGNN paper comparison
 
-Cannot complete apples-to-apples wall-clock comparison on celebi due to paper's
-OOM at preprocessing. The hardware delta (25× less RAM) prevents the
-comparison entirely. The published 1.09 hr / 65.91% is from AWS g5.48xlarge
-(748 GB RAM, A10G 24 GB GPU) and remains the paper's reference.
+Comparison now possible because paper code runs on celebi after metadata
+patch. Per-epoch is the metric: **paper 42.34 sec vs ours 1374-1896 sec**,
+~10-15× normalized for fanout.
+
+The Spec D Four-Level Feature Store is sound in design but the implementation
+has substantial overhead vs paper's flatter approach. Suspect sources of the
+gap (need empirical profiling to validate):
+
+| Suspect | Estimated factor | How to verify |
+|---|---|---|
+| B+Tree backend overhead (vs paper's flat `features.bin` mmap) | 2-5× | Profile: time of `RowMapping::find` per batch + buffer pool hit ratio |
+| Per-batch feature_assembler kernel + h→d transfer (uninstrumented 50% in Phase 0) | unknown | Phase 0 follow-up: instrument feature_assembler + h→d as separate stages |
+| Batched packing layout differences | 1.5-3× | Compare on-disk layout of paper's `pack/` dir vs our `packed_slim/` |
+| DGL graphbolt's C++ sampler vs our BPT-direct path | 1.5-2× | Bench sampling alone, side-by-side on same celebi |
+
+The Phase 0 finding that paper §6 address tables don't help (rmap_pct=0)
+remains valid. The gap is elsewhere — most likely in the feature-load path.
 
 ### For future work
 
-If apples-to-apples wall-clock comparison is required:
-1. Run our pipeline on AWS g5.48xlarge to match paper's hardware → fair epoch
-   time vs paper's 76.3 sec
-2. Patch DGL graphbolt to use `mmap_mode='r'` for feature load → run paper code
-   on celebi (~1-3 hr engineering)
-3. Compile DiskGNN-equivalent stack with a different framework (e.g.,
-   GroupCache/Marius, which paper §7 lists as baseline)
+If closing the gap is in scope:
+1. **Instrument the uninstrumented 50%** of `load_features_us` (kernel + h→d).
+   That's where Phase 0 ran out of measurable stages and is the most likely
+   place for the algorithm gap to manifest.
+2. **Compare packed_slim layout** with paper's `pack/` output for the same
+   batch to identify access-pattern differences.
+3. **Bench sampling and packing alone** (without train) on same celebi to
+   isolate which stage is dominating the gap.
+4. **Consider whether the B+Tree backend should be bypassed** for the feature
+   path on read-only training scenarios — paper's flat sequential file is
+   fundamentally faster than B+Tree key lookups when the access pattern is
+   known in advance (which Phase 0 / offline sampling DOES provide).
 
-None are in scope for this work.
+None of these are in the current spec; they would be follow-up work.
 
 ## Artifacts
 
