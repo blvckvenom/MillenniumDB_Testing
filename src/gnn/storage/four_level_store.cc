@@ -27,6 +27,7 @@
 #include "gnn/common/posix_io.h"
 #include "gnn/core/feature_assembler.h"
 #include "gnn/storage/addr_table.h"
+#include "gnn/storage/addr_table_reader.h"
 #include "gnn/storage/addr_table_writer.h"
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/direct_io_reader.h"
@@ -1016,6 +1017,19 @@ FourLevelStore::FourLevelStore(
     dtype_           = meta.get_dtype();
     elem_size_       = static_cast<uint8_t>(dtype_size(dtype_));
 
+    // Path 4 (2026-05-19): probe for addr_tables sidecar directory.
+    // sample_dir_ is one level up from packed_slim_dir_. addr_tables/ is a
+    // sibling of packed_slim/.
+    sample_dir_ = fs::path(packed_slim_dir_).parent_path();
+    auto addr_dir = sample_dir_ / "addr_tables";
+    use_addr_tables_ = fs::exists(addr_dir) && fs::is_directory(addr_dir);
+
+    if (use_addr_tables_) {
+        // Compute the same FNV-64 hash over gnn_meta.bin that build_addr_tables_
+        // used at build time. 0 disables the staleness check.
+        expected_meta_sha_head_ = compute_meta_sha_head(db_folder / "gnn_meta.bin");
+    }
+
     // Load GPU cache (L1)
     if (fs::exists(gpu_path)) {
         gpu_cache_ = std::make_unique<GpuCache>(gpu_path);
@@ -1167,7 +1181,47 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     return load_batch_features(sample);
 }
 
+// Public dispatcher: attempts v2 path (addr_table sidecar) when eligible;
+// falls through to legacy on miss/stale/error or when the GPU assembler
+// gate is not met (CPU-only, non-float32).
 torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample) {
+    // Reset per-call v2 telemetry. The legacy path resets its own per-tier
+    // timers internally (at the top of load_batch_features_legacy_).
+    last_addr_load_ns_ = 0;
+    last_used_v2_ = false;
+
+    // Gate: v2 only when the GPU assembler path is active. The CPU-only path
+    // (no gpu_cache, or non-float32 dtype) is served by legacy_ to avoid
+    // duplicating the memcpy assembly logic.
+    bool assembler_gate = (assembler_ != nullptr)
+                          && (dtype_ == GnnDtype::FLOAT32)
+                          && gpu_cache_
+                          && gpu_cache_->is_on_gpu();
+
+    if (use_addr_tables_ && assembler_gate) {
+        char fname[32];
+        std::snprintf(fname, sizeof(fname), "batch_%06lu.addr",
+                      static_cast<unsigned long>(sample.batch_id));
+        auto addr_path = sample_dir_ / "addr_tables" / fname;
+        if (fs::exists(addr_path)) {
+            try {
+                return load_batch_features_v2_(sample, addr_path);
+            } catch (const AddrTableStaleException& e) {
+                std::cerr << "[FourLevelStore] addr_table stale for batch "
+                          << sample.batch_id << " (" << e.what()
+                          << ") — falling back to legacy\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[FourLevelStore] addr_table read failed for batch "
+                          << sample.batch_id << " (" << e.what()
+                          << ") — falling back to legacy\n";
+            }
+        }
+    }
+
+    return load_batch_features_legacy_(sample);
+}
+
+torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sample) {
     const auto& oids = sample.all_unique_nodes;
     const uint64_t batch_id = sample.batch_id;
     uint64_t total = oids.size();
@@ -1669,6 +1723,257 @@ torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample) {
     }
 
     return output;
+}
+
+// =============================================================================
+// load_batch_features_v2_() — Path 4 fast path (2026-05-19)
+// =============================================================================
+//
+// Reads the pre-classified addr_table sidecar for this batch and assembles
+// the output tensor using the same GPU assembler path as legacy_ — but
+// without the per-node hash lookup loop (Steps 1-2 of legacy_).
+//
+// Only called when assembler_ is active and gpu_cache_->is_on_gpu() (the
+// dispatcher enforces this gate). On meta_sha mismatch throws
+// AddrTableStaleException so the dispatcher catches and falls back cleanly.
+//
+// Stats accounting matches legacy_ for paper-comparable I/O reporting.
+// =============================================================================
+
+torch::Tensor FourLevelStore::load_batch_features_v2_(
+    const GraphSample& sample,
+    const fs::path&    addr_path)
+{
+    // Reset per-tier timers (v2 does not time individual hash lookups, but
+    // we zero them so stale ns values from a previous batch do not bleed
+    // through if the caller inspects last_l?_us() after a v2 serve).
+    last_l1_ns_   = 0;
+    last_l2_ns_   = 0;
+    last_l3_ns_   = 0;
+    last_l4_ns_   = 0;
+    last_rmap_ns_ = 0;
+
+    // --- Open and validate the addr_table sidecar ---
+    auto t_addr_start = std::chrono::steady_clock::now();
+    auto addr = AddrTableReader::open(addr_path, expected_meta_sha_head_);
+    auto t_addr_end = std::chrono::steady_clock::now();
+    last_addr_load_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             t_addr_end - t_addr_start).count();
+    last_used_v2_ = true;
+
+    const uint64_t total    = addr.header.total;
+    const size_t   row_bytes = feature_dim_ * elem_size_;
+
+    if (total == 0) {
+        return torch::empty(
+            {0, static_cast<int64_t>(feature_dim_)},
+            torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
+    }
+
+    stats_.total_requests += total;
+
+    // --- Step 1 (v2): Read L4 packed_slim file for this batch ---
+    //
+    // Same as legacy_ Step 1: read the entire .bin file, parse header + OID
+    // table, extract slim_data. We need slim_data to supply L4 features by
+    // their pre-classified l4_indices. The OID table lookup is not needed
+    // (addr table already has indices), but we still read the file for the
+    // feature payload and for l4_bytes_disk accounting parity with legacy_.
+    auto t_l4_read_start = std::chrono::steady_clock::now();
+    std::vector<char> slim_data;
+    if (addr.header.num_l4 > 0) {
+        char fname[32];
+        std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
+                      static_cast<unsigned long>(sample.batch_id));
+        auto slim_path = fs::path(packed_slim_dir_) / fname;
+        if (fs::exists(slim_path)) {
+            int fd = ::open(slim_path.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                FdGuard guard(fd);
+                struct stat st{};
+                if (::fstat(fd, &st) == 0) {
+                    const size_t file_size = static_cast<size_t>(st.st_size);
+                    if (file_size >= sizeof(PackedBatchHeader)) {
+                        ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
+                                        POSIX_FADV_SEQUENTIAL);
+                        std::vector<char> file_buf(file_size);
+                        read_all(fd, file_buf.data(), file_size,
+                                 slim_path.string());
+                        PackedBatchHeader hdr{};
+                        std::memcpy(&hdr, file_buf.data(), sizeof(hdr));
+                        if (hdr.is_valid() && hdr.has_oid_table()) {
+                            uint64_t hdr_nodes  = hdr.num_nodes;
+                            size_t   data_bytes = hdr.data_bytes();
+                            size_t   oid_bytes  = hdr_nodes * sizeof(uint64_t);
+                            bool sizes_ok = (sizeof(hdr) + oid_bytes + data_bytes)
+                                            <= file_size;
+                            if (sizes_ok) {
+                                const char* p = file_buf.data()
+                                              + sizeof(hdr) + oid_bytes;
+                                if (data_bytes > 0) {
+                                    slim_data.assign(p, p + data_bytes);
+                                }
+                                stats_.l4_bytes_disk += sizeof(hdr)
+                                                      + oid_bytes
+                                                      + data_bytes;
+                            }
+                        }
+                        fadvise_dontneed(fd, 0,
+                                         static_cast<off_t>(file_size));
+                    }
+                }
+            }
+        }
+    }
+    {
+        auto t_l4_read_end = std::chrono::steady_clock::now();
+        last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l4_read_end - t_l4_read_start).count();
+    }
+
+    // --- Step 2 (v2): Read L3 rows from disk ---
+    //
+    // Use addr.l3_row_idxs (pre-resolved row indices in the reordered FM)
+    // directly — skips the per-node RowMapping::find() call.
+    std::vector<char> l3_buf;
+    {
+        auto t_l3_read_start = std::chrono::steady_clock::now();
+        if (addr.header.num_l3 > 0) {
+            // Convert ConstView<uint64_t> -> vector<uint64_t> for read_rows.
+            std::vector<uint64_t> l3_row_indices(
+                addr.l3_row_idxs.data,
+                addr.l3_row_idxs.data + addr.header.num_l3);
+            if (l3_reader_) {
+                auto result = l3_reader_->read_rows(
+                    l3_row_indices, row_bytes, l3_header_size_);
+                l3_buf.assign(result.data.get(),
+                              result.data.get() + result.size);
+                stats_.l3_bytes_disk += result.bytes_disk;
+            } else if (l3_mmap_fb_.has_value()) {
+                l3_buf.resize(addr.header.num_l3 * row_bytes);
+                l3_mmap_fb_->extract_rows(l3_row_indices, l3_buf.data());
+                stats_.l3_bytes_disk += addr.header.num_l3 * row_bytes;
+            }
+        }
+        auto t_l3_read_end = std::chrono::steady_clock::now();
+        last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l3_read_end - t_l3_read_start).count();
+    }
+
+    // --- Step 3 (v2): GPU gather for L1 ---
+    //
+    // l1_indices from the addr_table are gpu_cache row indices; gather_by_indices
+    // returns a GPU tensor of shape [num_l1, D].
+    torch::Tensor gpu_features;
+    std::vector<uint32_t> gpu_positions;
+    if (addr.header.num_l1 > 0) {
+        auto t_l1_start = std::chrono::steady_clock::now();
+        std::vector<uint32_t> l1_indices(
+            addr.l1_indices.data,
+            addr.l1_indices.data + addr.header.num_l1);
+        gpu_features = gpu_cache_->gather_by_indices(l1_indices);
+        gpu_positions.assign(addr.l1_positions.data,
+                             addr.l1_positions.data + addr.header.num_l1);
+        auto t_l1_end = std::chrono::steady_clock::now();
+        last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l1_end - t_l1_start).count();
+        stats_.l1_hits        += addr.header.num_l1;
+        stats_.l1_bytes_served += addr.header.num_l1 * row_bytes;
+    }
+
+    // --- Step 4 (v2): Combine L2 + L3 + L4 into cpu_combined ---
+    //
+    // Mirror legacy_ lines 1482-1555 exactly: build one contiguous float
+    // buffer + positions vector, then pin and hand to assembler_.assemble().
+    std::vector<float>    cpu_combined;
+    std::vector<uint32_t> cpu_combined_positions;
+
+    size_t cpu_total = addr.header.num_l2
+                     + addr.header.num_l3
+                     + addr.header.num_l4;
+    cpu_combined.reserve(cpu_total * feature_dim_);
+    cpu_combined_positions.reserve(cpu_total);
+
+    // L2: copy rows from cpu_cache_ by pre-resolved cache indices.
+    if (addr.header.num_l2 > 0) {
+        auto t_l2_start = std::chrono::steady_clock::now();
+        for (uint32_t h = 0; h < addr.header.num_l2; ++h) {
+            cpu_combined_positions.push_back(addr.l2_positions[h]);
+            const float* row_ptr_f = static_cast<const float*>(
+                cpu_cache_->row_ptr(addr.l2_indices[h]));
+            cpu_combined.insert(cpu_combined.end(),
+                                row_ptr_f,
+                                row_ptr_f + feature_dim_);
+        }
+        auto t_l2_end = std::chrono::steady_clock::now();
+        last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l2_end - t_l2_start).count();
+        stats_.l2_hits        += addr.header.num_l2;
+        stats_.l2_bytes_served += addr.header.num_l2 * row_bytes;
+    }
+
+    // L3: rows are in l3_buf in the order of l3_row_idxs (same order as
+    // addr.l3_positions), so we append them in sequence.
+    if (addr.header.num_l3 > 0 && !l3_buf.empty()) {
+        auto t_l3_copy_start = std::chrono::steady_clock::now();
+        const float* l3_data = reinterpret_cast<const float*>(l3_buf.data());
+        for (uint32_t j = 0; j < addr.header.num_l3; ++j) {
+            cpu_combined_positions.push_back(addr.l3_positions[j]);
+            cpu_combined.insert(cpu_combined.end(),
+                                l3_data + j * feature_dim_,
+                                l3_data + (j + 1) * feature_dim_);
+        }
+        auto t_l3_copy_end = std::chrono::steady_clock::now();
+        last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l3_copy_end - t_l3_copy_start).count();
+        stats_.l3_reads       += addr.header.num_l3;
+        stats_.l3_bytes_wanted += addr.header.num_l3 * row_bytes;
+    } else if (addr.header.num_l3 > 0 && l3_buf.empty()) {
+        // L3 rows requested but nothing was readable (no reader + no mmap).
+        // Count as reads with no data — same semantics as legacy_ line 1414.
+        stats_.l3_reads += addr.header.num_l3;
+    }
+
+    // Zero-classified misses (unresolved nodes): just count as l3_reads with
+    // no data, matching legacy_'s "leave as zeros" path (line 1414).
+    stats_.l3_reads += addr.header.num_zero;
+
+    // L4: addr.l4_indices are packed_slim file slot indices.
+    if (addr.header.num_l4 > 0) {
+        auto t_l4_copy_start = std::chrono::steady_clock::now();
+        const float* slim_float =
+            reinterpret_cast<const float*>(slim_data.data());
+        for (uint32_t j = 0; j < addr.header.num_l4; ++j) {
+            cpu_combined_positions.push_back(addr.l4_positions[j]);
+            uint32_t idx = addr.l4_indices[j];
+            cpu_combined.insert(cpu_combined.end(),
+                                slim_float + idx * feature_dim_,
+                                slim_float + (idx + 1) * feature_dim_);
+        }
+        auto t_l4_copy_end = std::chrono::steady_clock::now();
+        last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l4_copy_end - t_l4_copy_start).count();
+        stats_.l4_reads       += addr.header.num_l4;
+        stats_.l4_bytes_wanted += addr.header.num_l4 * row_bytes;
+    }
+
+    // --- Step 5 (v2): Pin + assemble --- mirror legacy_ lines 1557-1585.
+    const float* assembler_data = cpu_combined.data();
+#ifdef GNN_CUDA_ENABLED
+    size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
+    if (cpu_combined_bytes > 0 && ensure_pinned_capacity(cpu_combined_bytes)) {
+        std::memcpy(pinned_ptr_, cpu_combined.data(), cpu_combined_bytes);
+        assembler_data = reinterpret_cast<const float*>(pinned_ptr_);
+    }
+#endif
+
+    return assembler_->assemble(
+        static_cast<int64_t>(total),
+        gpu_features, gpu_positions,
+        assembler_data,
+        static_cast<int64_t>(cpu_combined_positions.size()),
+        cpu_combined_positions
+    );
 }
 
 } // namespace mdb::gnn

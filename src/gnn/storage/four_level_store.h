@@ -302,6 +302,14 @@ public:
     uint64_t last_l4_us() const   { return last_l4_ns_ / 1000; }
     uint64_t last_rmap_us() const { return last_rmap_ns_ / 1000; }
 
+    // Path 4 (2026-05-19): v2 runtime path telemetry.
+    // last_addr_load_us() — microseconds to open + parse the addr_table sidecar
+    //   for the most recent batch. 0 if the v2 path was not taken.
+    // last_used_addr_tables() — whether the most recent load_batch_features
+    //   was served by the v2 (addr_table) path.
+    uint64_t last_addr_load_us() const { return last_addr_load_ns_ / 1000; }
+    bool last_used_addr_tables() const { return last_used_v2_; }
+
 private:
     std::unique_ptr<GpuCache> gpu_cache_;
     std::unique_ptr<CpuCache> cpu_cache_;
@@ -347,6 +355,28 @@ private:
     mutable uint64_t last_l4_ns_   = 0;
     mutable uint64_t last_rmap_ns_ = 0;
 
+    // Path 4 (2026-05-19): v2 path dispatch state.
+    //
+    // use_addr_tables_ — set true at construction when addr_tables/ directory
+    //   exists alongside the packed_slim/ dir. Controls whether the dispatcher
+    //   probes for batch_NNNNNN.addr before falling back to legacy.
+    //
+    // expected_meta_sha_head_ — FNV-64 of gnn_meta.bin at construction time.
+    //   Matches the hash written by build_addr_tables_ at build time.
+    //   AddrTableReader::open rejects sidecars with a different hash
+    //   (AddrTableStaleException). 0 disables staleness check.
+    //
+    // sample_dir_ — parent of packed_slim_dir_; addr_tables/ lives here.
+    //
+    // Per-call v2 telemetry:
+    //   last_addr_load_ns_ — nanoseconds to open + parse the addr sidecar.
+    //   last_used_v2_      — true if the most recent batch went through v2.
+    bool                  use_addr_tables_    = false;
+    uint64_t              expected_meta_sha_head_ = 0;
+    std::filesystem::path sample_dir_;
+    mutable uint64_t      last_addr_load_ns_  = 0;
+    mutable bool          last_used_v2_       = false;
+
     /// Ensure the persistent pinned buffer is at least `bytes` long.
     /// Returns true on success, false if cudaHostAlloc failed (caller falls
     /// back to unpinned memory). No-op when GNN_CUDA_ENABLED is undefined.
@@ -354,6 +384,21 @@ private:
 
     /// Map GnnDtype to torch scalar type.
     static torch::ScalarType to_torch_dtype(GnnDtype dt);
+
+    /// Legacy path: per-node hash classification across L1/L2/L4/L3, scatter
+    /// via FeatureAssembler. Preserves pre-Path-4 behavior bit-identically.
+    /// Public dispatcher falls through to this when the addr_table sidecar is
+    /// missing, stale, or unreadable, or when the assembler gate is not met.
+    torch::Tensor load_batch_features_legacy_(const GraphSample& sample);
+
+    /// Path 4 fast path (2026-05-19): read addr_tables/batch_<bid>.addr,
+    /// dispatch scatter-from-tier without per-node classification.
+    /// Only called when assembler_ is active and gpu_cache_->is_on_gpu() —
+    /// the CPU-only assembly case is served by legacy_ to avoid duplicating
+    /// that path's memcpy logic. Throws AddrTableStaleException on meta_sha
+    /// mismatch so the dispatcher can catch and fall back cleanly.
+    torch::Tensor load_batch_features_v2_(const GraphSample& sample,
+                                           const std::filesystem::path& addr_path);
 };
 
 } // namespace mdb::gnn
