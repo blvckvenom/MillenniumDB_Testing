@@ -123,13 +123,51 @@ TEST(AddrTableWriterWrite, RoundTripsViaTempFile) {
     ASSERT_TRUE(fs::exists(tmp));
     EXPECT_EQ(fs::file_size(tmp), buf.total_bytes());
 
-    // Read header back
     std::ifstream f(tmp, std::ios::binary);
     AddrTableHeader hdr_back{};
     f.read(reinterpret_cast<char*>(&hdr_back), sizeof(hdr_back));
     EXPECT_EQ(hdr_back.magic, AddrTableHeader::MAGIC);
     EXPECT_EQ(hdr_back.num_l1, 2u);
     EXPECT_EQ(hdr_back.meta_sha256_head, 0xABCDull);
+
+    // Read body arrays back and compare to the in-memory buffers.
+    // Order per spec §4.1: l1_positions, l1_indices, l2_*, l3_*, l4_*, zero.
+    auto read_u32 = [&](size_t n) {
+        std::vector<uint32_t> v(n);
+        f.read(reinterpret_cast<char*>(v.data()),
+               static_cast<std::streamsize>(n * sizeof(uint32_t)));
+        return v;
+    };
+
+    auto l1p = read_u32(hdr_back.num_l1);
+    EXPECT_EQ(l1p, (std::vector<uint32_t>{0, 1}));
+    auto l1i = read_u32(hdr_back.num_l1);
+    EXPECT_EQ(l1i, (std::vector<uint32_t>{100, 101}));
+
+    fs::remove(tmp);
+}
+
+TEST(AddrTableWriterWrite, EmptyTableRoundTrip) {
+    auto tmp = tmp_path("empty");
+    fs::remove(tmp);
+
+    std::vector<ObjectId> empty;
+    MockCache l1, l2;
+    std::unordered_map<uint64_t, uint32_t> slim;
+    auto noop = [](ObjectId) -> std::optional<uint64_t> { return std::nullopt; };
+
+    AddrTableBuffers buf;
+    AddrTableWriter::build(empty, &l1, &l2, slim, noop, 0xFEED, buf);
+    AddrTableWriter::write_atomic(tmp, buf);
+
+    EXPECT_EQ(fs::file_size(tmp), AddrTableHeader::SIZE);
+
+    std::ifstream f(tmp, std::ios::binary);
+    AddrTableHeader hdr_back{};
+    f.read(reinterpret_cast<char*>(&hdr_back), sizeof(hdr_back));
+    EXPECT_EQ(hdr_back.total, 0u);
+    EXPECT_EQ(hdr_back.meta_sha256_head, 0xFEEDull);
+    EXPECT_TRUE(hdr_back.is_valid());
 
     fs::remove(tmp);
 }

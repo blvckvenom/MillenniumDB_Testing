@@ -103,6 +103,14 @@ void AddrTableWriter::build(
         }
         // L4 — packed_slim (disk, random-access by slot index)
         {
+            // L4 classification: presence in slim_oid_to_idx is sufficient.
+            // FourLevelStore::load_batch_features additionally bounds-checks
+            // (offset + row_bytes <= slim_data.size()) before treating as L4
+            // hit; the assumption here is that slim_oid_to_idx and slim_data
+            // come from the same packed_slim file and the OID-table parse is
+            // consistent with the data block size. If a future refactor changes
+            // how slim_data is populated, this classifier may silently mark a
+            // node L4 that the runtime would reject — keep them in sync.
             auto slim_it = slim_oid_to_idx.find(oid.id);
             if (slim_it != slim_oid_to_idx.end()) {
                 out.l4_positions.push_back(i);
