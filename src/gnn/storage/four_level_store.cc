@@ -145,21 +145,31 @@ std::unordered_map<uint64_t, uint32_t> read_slim_oid_table(const fs::path& slim_
 // returns 0 (which disables staleness detection in AddrTableReader::open).
 uint64_t compute_meta_sha_head(const fs::path& gnn_meta_path)
 {
+    // FNV-64 over the full file contents — detects any byte-level change
+    // including same-size rewrites. The plan (Task 4 Step 3 helper notes)
+    // explicitly allows FNV-64 in lieu of SHA-256 because the hash is only
+    // used as a staleness marker, not for cryptographic integrity.
     if (!fs::exists(gnn_meta_path)) return 0;
-
-    std::error_code ec;
-    auto file_size = fs::file_size(gnn_meta_path, ec);
-    if (ec) return 0;
-
     int fd = ::open(gnn_meta_path.c_str(), O_RDONLY);
     if (fd < 0) return 0;
-    struct FdCleanup { int fd; ~FdCleanup() { if (fd >= 0) ::close(fd); } } cleanup{fd};
+    struct FdCleanup { int fd; ~FdCleanup() { if (fd >= 0) ::close(fd); } } c{fd};
 
-    uint64_t first8 = 0;
-    ssize_t n = ::read(fd, &first8, sizeof(first8));
-    if (n < static_cast<ssize_t>(sizeof(first8))) return 0;
+    constexpr uint64_t FNV_PRIME  = 0x00000100000001B3ULL;
+    constexpr uint64_t FNV_OFFSET = 0xCBF29CE484222325ULL;
+    uint64_t hash = FNV_OFFSET;
+    unsigned char buf[4096];
+    ssize_t n;
+    while ((n = ::read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            hash ^= static_cast<uint64_t>(buf[i]);
+            hash *= FNV_PRIME;
+        }
+    }
+    if (n < 0) return 0;  // read error — disable staleness check at runtime
 
-    return first8 ^ static_cast<uint64_t>(file_size);
+    // 0 is the sentinel for "staleness check disabled" in AddrTableReader::open.
+    // FNV-64 of a non-empty file basically never hashes to 0, but guard anyway.
+    return hash == 0 ? 1 : hash;
 }
 
 // Format an addr_table filename for a given batch_id.
@@ -198,7 +208,9 @@ void build_addr_tables_(
 {
     fs::create_directories(addr_tables_dir);
 
-    unsigned num_workers = 4;
+    unsigned num_workers = std::thread::hardware_concurrency();
+    if (num_workers == 0) num_workers = 4;
+    if (num_workers > 20) num_workers = 20;
     if (const char* env = std::getenv("MDB_GNN_ADDR_TABLE_WORKERS")) {
         try {
             int v = std::stoi(env);
