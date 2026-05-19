@@ -890,6 +890,11 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
     ctx.yield("effectivePrefetchWorkers",
               ctx.create_int(static_cast<int64_t>(result.effective_prefetch_workers)));
+    // Path 4 (2026-05-19): v2 addr_table fast-path telemetry from TrainingLoop::Result.
+    ctx.yield("useAddrTablesEffective",
+              ctx.create_bool(result.addr_tables_used_ever));
+    ctx.yield("addrTableLoadUs",
+              ctx.create_double(result.addr_table_load_us_mean));
     ctx.yield_row();
 }
 

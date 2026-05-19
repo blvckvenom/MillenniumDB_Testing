@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -17,6 +18,10 @@
 #ifdef ENABLE_CUDA_ASSEMBLER
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#endif
+
+#ifdef GNN_CUDA_ENABLED
+#include <c10/cuda/CUDACachingAllocator.h>
 #endif
 
 namespace mdb::gnn {
@@ -118,6 +123,32 @@ TrainingLoop::Result TrainingLoop::train()
               << "========================================================\n"
               << std::flush;
 
+    // Round 3B (2026-05-15): resolve effective worker count ONCE before the
+    // epoch loop so the stderr warning (if any) and the result yield are
+    // emitted exactly once per train() invocation rather than per-epoch.
+    // Multi-worker (N>1) is supported ONLY for FeatureMatrix-fallback
+    // BatchAssemblers; the FourLevelStore path has shared state inside
+    // load_batch_features (DirectIoReader io_uring rings + pinned host
+    // buffer) that races silently under concurrent calls. CLAMP to 1
+    // rather than throw — keeping the API "more is fine, we just may not
+    // honor it" so callers can pass aggressive defaults without
+    // per-deployment branching.
+    unsigned effective_workers = config_.prefetch_num_workers;
+    if (effective_workers == 0) {
+        effective_workers = 1;
+    }
+    if (assembler_.uses_feature_store() && effective_workers > 1) {
+        std::cerr
+            << "[TrainingLoop] prefetchNumWorkers=" << effective_workers
+            << " requested, but FourLevelStore feature path is not yet"
+               " multi-worker-safe (DirectIoReader io_uring rings + shared"
+               " pinned host buffer would race silently). Clamping to 1."
+               " Use the FeatureMatrix-fallback BatchAssembler ctor to"
+               " unlock N>1." << std::endl;
+        effective_workers = 1;
+    }
+    result.effective_prefetch_workers = effective_workers;
+
     for (uint64_t epoch = config_.start_epoch;
          epoch < config_.start_epoch + config_.epochs;
          ++epoch)
@@ -127,8 +158,20 @@ TrainingLoop::Result TrainingLoop::train()
         // === Training phase ===
         model_.train();
 
-        double   total_loss       = 0.0;
-        uint64_t num_train_batches = 0;
+        // Round 1E (2026-05-15): on-device loss accumulator. Replaces the
+        // per-batch `loss.item<double>()` (GPU→CPU sync) with a single
+        // `.item()` at end-of-epoch. Stays on `device` so loss.detach()
+        // accumulates without crossing the PCIe bus.
+        torch::Tensor epoch_loss_sum;
+        if (device.is_cpu()) {
+            epoch_loss_sum = torch::zeros({}, torch::kFloat64);
+        } else {
+            epoch_loss_sum = torch::zeros(
+                {},
+                torch::TensorOptions().dtype(torch::kFloat64).device(device));
+        }
+        uint64_t num_labeled_batches = 0;
+        uint64_t num_train_batches   = 0;
 
         // Spec C3 stage 1.B: optional async prefetcher fronted by a single
         // worker thread (DiskGNN paper §5.3 producer-consumer pattern).
@@ -156,7 +199,8 @@ TrainingLoop::Result TrainingLoop::train()
         std::unique_ptr<AsyncBatchPrefetcher> prefetcher;
         if (config_.use_async_prefetcher) {
             prefetcher = std::make_unique<AsyncBatchPrefetcher>(
-                assembler_, config_.prefetch_queue_size, stage3_active);
+                assembler_, config_.prefetch_queue_size, stage3_active,
+                effective_workers);
             const size_t prime = std::min<size_t>(
                 config_.prefetch_queue_size, train_batches);
             for (size_t i = 0; i < prime; ++i) {
@@ -197,14 +241,22 @@ TrainingLoop::Result TrainingLoop::train()
                 mini = assembler_.assemble(bid);
             }
 
-            // Phase 0: per-tier sub-counters are attributable ONLY on the
-            // sequential (non-prefetcher) path. With the prefetcher on, by
-            // the time next() returns batch N the worker has already begun
-            // load_batch_features() for batch N+1 (which resets last_*_ns_),
-            // so the FourLevelStore's per-call timers race silently and
-            // cannot be associated with this batch. Leaving at 0 is the
-            // documented Phase 0 contract; per-batch tier propagation would
-            // require attaching the timings to MiniBatch (deferred refactor).
+            // Phase A (2026-05-19): sub-stage timings populated by
+            // BatchAssembler are now propagated via MiniBatch::timing on
+            // BOTH paths (sequential and async prefetcher). The worker
+            // stamps mini.timing before pushing into the queue, so the
+            // consumer reads safely after next() returns.
+            bt.sample_read_us      = mini.timing.sample_read_ns      / 1000;
+            bt.active_us           = mini.timing.active_ns           / 1000;
+            bt.assembler_kernel_us = mini.timing.assembler_kernel_ns / 1000;
+            bt.edge_us             = mini.timing.edge_ns             / 1000;
+
+            // Per-tier sub-counters are still ONLY attributable on the
+            // sequential path — FourLevelStore::last_*_ns_ is reset by the
+            // next batch's load, so by the time we read it on the prefetcher
+            // path the values would belong to the lookahead batch. With the
+            // prefetcher, l1/l2/l3/l4/rmap stay at 0 (the assembler_kernel_us
+            // value above is the umbrella replacement).
             if (!prefetcher) {
                 if (const auto* fs = assembler_.feature_store()) {
                     bt.l1_us         = fs->last_l1_us();
@@ -212,6 +264,22 @@ TrainingLoop::Result TrainingLoop::train()
                     bt.l3_us         = fs->last_l3_us();
                     bt.l4_us         = fs->last_l4_us();
                     bt.rmap_lookup_us= fs->last_rmap_us();
+
+                    // Path 4 (2026-05-19): v2 addr_table fast-path telemetry.
+                    // Safely attributable only on the sequential path where
+                    // last_used_addr_tables() / last_addr_load_us() still
+                    // refer to this batch (the prefetcher would have already
+                    // begun the next batch's load, making the values racy).
+                    if (fs->last_used_addr_tables()) {
+                        result.addr_tables_used_ever = true;
+                        ++result.addr_table_load_us_count;
+                        // Welford-style running mean — avoids overflow vs. sum.
+                        const double load_us =
+                            static_cast<double>(fs->last_addr_load_us());
+                        result.addr_table_load_us_mean +=
+                            (load_us - result.addr_table_load_us_mean) /
+                            static_cast<double>(result.addr_table_load_us_count);
+                    }
                 }
             }
 
@@ -234,6 +302,9 @@ TrainingLoop::Result TrainingLoop::train()
                 for (auto& ei : mini.edge_indices) {
                     if (ei.is_cuda()) ei.record_stream(*train_stream);
                 }
+                for (auto& ai : mini.active_indices_per_layer) {
+                    if (ai.is_cuda()) ai.record_stream(*train_stream);
+                }
                 if (mini.labels.is_cuda()) {
                     mini.labels.record_stream(*train_stream);
                 }
@@ -243,10 +314,14 @@ TrainingLoop::Result TrainingLoop::train()
             }
 #endif
 
+            auto t_h2d_start = std::chrono::steady_clock::now();
             if (!device.is_cpu()) {
                 mini.features = mini.features.to(device);
                 for (auto& ei : mini.edge_indices) {
                     ei = ei.to(device);
+                }
+                for (auto& ai : mini.active_indices_per_layer) {
+                    ai = ai.to(device);
                 }
                 mini.labels     = mini.labels.to(device);
                 mini.label_mask = mini.label_mask.to(device);
@@ -254,11 +329,13 @@ TrainingLoop::Result TrainingLoop::train()
             auto t_assem_end = std::chrono::steady_clock::now();
             result.assemble_seconds += std::chrono::duration<double>(
                 t_assem_end - t_assem_start).count();
-            // Phase 0: assemble + (optional) host→device transfer rolled into
-            // a single bucket. sample_read / active / edge / h2d are subsumed
-            // here until BatchAssembler exposes finer-grained sub-timers.
+            // load_features_us = umbrella for (assemble + h→d) — same as Phase 0.
+            // Phase A now attributes its 50% uninstrumented mass via
+            // sample_read/active/assembler_kernel/edge/h2d sub-stages above.
             bt.load_features_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_assem_end - t_assem_start).count();
+            bt.h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                t_assem_end - t_h2d_start).count();
 
             optimizer.zero_grad();
 
@@ -266,7 +343,7 @@ TrainingLoop::Result TrainingLoop::train()
             auto logits = model_.forward(
                 mini.features,
                 mini.edge_indices,
-                static_cast<int64_t>(mini.num_seeds)
+                mini.active_sizes_per_layer
             );
             auto t_fwd_end = std::chrono::steady_clock::now();
             result.forward_seconds += std::chrono::duration<double>(
@@ -274,8 +351,10 @@ TrainingLoop::Result TrainingLoop::train()
             bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_fwd_end - t_fwd_start).count();
 
-            // Only back-prop if at least one labeled seed exists in this batch
-            if (mini.label_mask.any().item<bool>()) {
+            // Round 1E (2026-05-15): guard backward on CPU-side num_labeled
+            // (computed in BatchAssembler) instead of `label_mask.any().item<bool>()`
+            // — the latter incurs a per-batch GPU→CPU sync.
+            if (mini.num_labeled > 0) {
                 auto masked_logits = logits.index({mini.label_mask});
                 auto masked_labels = mini.labels.index({mini.label_mask});
 
@@ -286,13 +365,18 @@ TrainingLoop::Result TrainingLoop::train()
                 auto t_bwd_start = std::chrono::steady_clock::now();
                 loss.backward();
                 optimizer.step();
+
                 auto t_bwd_end = std::chrono::steady_clock::now();
                 result.backward_seconds += std::chrono::duration<double>(
                     t_bwd_end - t_bwd_start).count();
                 bt.backward_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     t_bwd_end - t_bwd_start).count();
 
-                total_loss += loss.item<double>();
+                // Round 1E: defer .item() to end-of-epoch. loss.detach() keeps
+                // the scalar on-device; the add is a tiny GPU kernel. One sync
+                // per epoch instead of ~train_batches per epoch.
+                epoch_loss_sum += loss.detach().to(epoch_loss_sum.dtype());
+                ++num_labeled_batches;
             }
 
             ++num_train_batches;
@@ -302,6 +386,19 @@ TrainingLoop::Result TrainingLoop::train()
             if (profile_log_) {
                 profile_log_->append(bt);
             }
+
+            // Periodic fragmentation reclaim. Variable batch receptive
+            // fields leak holes into the caching allocator pool; without
+            // this call the OOM at ~12 min observed on UNDIRECTED 16 GB
+            // GPUs hits well before epoch boundaries.
+#ifdef GNN_CUDA_ENABLED
+            if (config_.empty_cache_every_n_batches > 0 &&
+                num_train_batches % config_.empty_cache_every_n_batches == 0 &&
+                !device.is_cpu())
+            {
+                c10::cuda::CUDACachingAllocator::emptyCache();
+            }
+#endif
         }
 
         // Spec C3 stage 3: synchronize train_stream before validation reads
@@ -313,6 +410,24 @@ TrainingLoop::Result TrainingLoop::train()
         }
 #endif
 
+#ifdef GNN_CUDA_ENABLED
+        // End-of-epoch reclaim so validation runs against a defragged pool
+        // and the next epoch starts clean.
+        if (!device.is_cpu()) {
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        }
+#endif
+
+        // Round 1E (2026-05-15): single end-of-epoch sync to read accumulated
+        // loss off-device. The .item() fires exactly once per epoch instead
+        // of once per labeled batch (~1300× on papers100M scale). Division
+        // by num_train_batches preserves the previous behavior exactly —
+        // total_loss only accrues from labeled batches, but the average is
+        // computed across all batches (including those skipped due to no
+        // labels).
+        const double total_loss = (num_labeled_batches > 0)
+            ? epoch_loss_sum.item<double>()
+            : 0.0;
         double avg_loss = (num_train_batches > 0)
             ? (total_loss / static_cast<double>(num_train_batches))
             : 0.0;
@@ -471,6 +586,62 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
     int64_t correct = 0;
     int64_t total   = 0;
 
+    // Hoist device probe out of the inner loop. Mirrors train()'s pattern at
+    // lines 63-66 — model_ is already on its final device by the time
+    // train() reaches the validation phase (probe + .to() happens once at
+    // the top of train()). When evaluate() is called standalone (e.g.,
+    // tests) the model's first parameter still carries the canonical device.
+    const torch::Device device = model_.parameters().begin()->device();
+
+    // Round 1D (2026-05-15): mirror train()'s AsyncBatchPrefetcher to hide
+    // validation-batch assemble + host→device cost behind the model forward
+    // on GPU. evaluate() is called once per epoch from train() AFTER the
+    // training prefetcher has drained (last train batch consumed, no more
+    // prefetch() calls issued), so the train prefetcher's worker is idle
+    // on its req_queue cv and there is no concurrent BatchAssembler access.
+    // The eval prefetcher owns its own worker that is destructed (join) at
+    // scope exit.
+    //
+    // Spec C3 stage 3: when enabled, the eval prefetcher's worker runs
+    // assemble on a pool stream and records a CUDAEvent into MiniBatch;
+    // this thread uses a separate eval_stream and event.block()s before
+    // forward, mirroring train()'s lines 193-216 exactly.
+#ifdef ENABLE_CUDA_ASSEMBLER
+    const bool stage3_active = config_.use_async_prefetcher
+                            && config_.use_cuda_streams
+                            && !device.is_cpu();
+    std::optional<c10::cuda::CUDAStream> eval_stream;
+    if (stage3_active) {
+        eval_stream.emplace(c10::cuda::getStreamFromPool());
+    }
+#else
+    constexpr bool stage3_active = false;
+#endif
+
+    // Round 3B (2026-05-15): same FourLevelStore guard as train(). See
+    // train()'s comment for rationale. evaluate() is called once per epoch
+    // so the warning would be spammy — we suppress it here (train() already
+    // emitted it once on the first epoch).
+    unsigned effective_eval_workers = config_.prefetch_num_workers;
+    if (effective_eval_workers == 0) {
+        effective_eval_workers = 1;
+    }
+    if (assembler_.uses_feature_store() && effective_eval_workers > 1) {
+        effective_eval_workers = 1;
+    }
+
+    std::unique_ptr<AsyncBatchPrefetcher> prefetcher;
+    if (config_.use_async_prefetcher) {
+        prefetcher = std::make_unique<AsyncBatchPrefetcher>(
+            assembler_, config_.prefetch_queue_size, stage3_active,
+            effective_eval_workers);
+        const size_t prime = std::min<size_t>(
+            config_.prefetch_queue_size, count);
+        for (size_t i = 0; i < prime; ++i) {
+            prefetcher->prefetch(start_batch + i);
+        }
+    }
+
     // Phase 0 (2026-05-17): infer split from start_batch using the catalog
     // layout (train batches first, then validation, then test). Anything
     // landing at or after train+validation counts as TEST; otherwise VAL.
@@ -486,49 +657,107 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         bt.split    = eval_split;
 
         auto t_load_start = std::chrono::steady_clock::now();
-        auto mini = assembler_.assemble(start_batch + i);
 
-        // Phase 0: per-tier sub-counters — evaluate() does not use the
-        // prefetcher, so the FourLevelStore's last_*_us() can be attributed
-        // directly to this batch.
-        if (const auto* fs = assembler_.feature_store()) {
-            bt.l1_us         = fs->last_l1_us();
-            bt.l2_us         = fs->last_l2_us();
-            bt.l3_us         = fs->last_l3_us();
-            bt.l4_us         = fs->last_l4_us();
-            bt.rmap_lookup_us= fs->last_rmap_us();
-        }
-
-        // Move all batch tensors to the model's device
-        auto dev = model_.parameters().begin()->device();
-        if (!dev.is_cpu()) {
-            mini.features = mini.features.to(dev);
-            for (auto& ei : mini.edge_indices) {
-                ei = ei.to(dev);
+        MiniBatch mini;
+        if (prefetcher) {
+            // Same backpressure-safe ordering as train(): next() first to
+            // free a queue slot, then prefetch the next-after-lookahead
+            // batch (if any). The prime loop above filled the queue to
+            // capacity, so prefetching before next() would block.
+            mini = prefetcher->next();
+            const uint64_t lookahead = i + config_.prefetch_queue_size;
+            if (lookahead < count) {
+                prefetcher->prefetch(start_batch + lookahead);
             }
-            mini.labels     = mini.labels.to(dev);
-            mini.label_mask = mini.label_mask.to(dev);
+        } else {
+            mini = assembler_.assemble(start_batch + i);
         }
+
+        // Phase A (2026-05-19): sub-stage timings propagated via mini.timing
+        // on both paths — see train()'s sibling comment.
+        bt.sample_read_us      = mini.timing.sample_read_ns      / 1000;
+        bt.active_us           = mini.timing.active_ns           / 1000;
+        bt.assembler_kernel_us = mini.timing.assembler_kernel_ns / 1000;
+        bt.edge_us             = mini.timing.edge_ns             / 1000;
+
+        if (!prefetcher) {
+            if (const auto* fs = assembler_.feature_store()) {
+                bt.l1_us         = fs->last_l1_us();
+                bt.l2_us         = fs->last_l2_us();
+                bt.l3_us         = fs->last_l3_us();
+                bt.l4_us         = fs->last_l4_us();
+                bt.rmap_lookup_us= fs->last_rmap_us();
+            }
+        }
+
+        // Spec C3 stage 3: cross-stream sync + record_stream BEFORE any
+        // tensor reads on the eval stream. Mirrors train()'s lines 193-216.
+#ifdef ENABLE_CUDA_ASSEMBLER
+        std::optional<c10::cuda::CUDAStreamGuard> stage3_guard;
+        if (stage3_active && eval_stream) {
+            if (mini.ready_event.isCreated()) {
+                mini.ready_event.block(*eval_stream);
+            }
+            stage3_guard.emplace(*eval_stream);
+            if (mini.features.is_cuda()) {
+                mini.features.record_stream(*eval_stream);
+            }
+            for (auto& ei : mini.edge_indices) {
+                if (ei.is_cuda()) ei.record_stream(*eval_stream);
+            }
+            for (auto& ai : mini.active_indices_per_layer) {
+                if (ai.is_cuda()) ai.record_stream(*eval_stream);
+            }
+            if (mini.labels.is_cuda()) {
+                mini.labels.record_stream(*eval_stream);
+            }
+            if (mini.label_mask.is_cuda()) {
+                mini.label_mask.record_stream(*eval_stream);
+            }
+        }
+#endif
+
+        // Move all batch tensors to the model's device (Phase A: time h→d)
+        auto t_h2d_start = std::chrono::steady_clock::now();
+        if (!device.is_cpu()) {
+            mini.features = mini.features.to(device);
+            for (auto& ei : mini.edge_indices) {
+                ei = ei.to(device);
+            }
+            for (auto& ai : mini.active_indices_per_layer) {
+                ai = ai.to(device);
+            }
+            mini.labels     = mini.labels.to(device);
+            mini.label_mask = mini.label_mask.to(device);
+        }
+
         auto t_load_end = std::chrono::steady_clock::now();
         bt.load_features_us = std::chrono::duration_cast<std::chrono::microseconds>(
             t_load_end - t_load_start).count();
+        bt.h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            t_load_end - t_h2d_start).count();
 
         auto t_fwd_start = std::chrono::steady_clock::now();
         auto logits = model_.forward(
             mini.features,
             mini.edge_indices,
-            static_cast<int64_t>(mini.num_seeds)
+            mini.active_sizes_per_layer
         );
         auto t_fwd_end = std::chrono::steady_clock::now();
         bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
             t_fwd_end - t_fwd_start).count();
 
-        if (mini.label_mask.any().item<bool>()) {
+        // Round 1E (2026-05-15): guard on CPU-side num_labeled (computed in
+        // BatchAssembler) to avoid the `label_mask.any().item<bool>()`
+        // per-batch GPU→CPU sync. The remaining `.sum().item<int64_t>()`
+        // collects validation accuracy — out of scope for Round 1E.
+        if (mini.num_labeled > 0) {
             auto masked_logits = logits.index({mini.label_mask});
             auto masked_labels = mini.labels.index({mini.label_mask});
 
             auto predicted = masked_logits.argmax(1);
-            correct += (predicted == masked_labels).sum().item<int64_t>();
+            int64_t batch_correct = (predicted == masked_labels).sum().item<int64_t>();
+            correct += batch_correct;
             total   += masked_labels.size(0);
         }
 
@@ -547,7 +776,23 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         profile_log_->flush();
     }
 
-    // Restore training mode for subsequent use
+    // Spec C3 stage 3: synchronize eval_stream before returning so any
+    // tensor reads following this call (e.g., the next epoch's train
+    // prefetcher reading model state) observe a coherent view. The
+    // per-batch .item<int64_t>() on `correct` is already an implicit sync
+    // point, but the explicit synchronize matches train()'s lines 283-287
+    // and survives future refactors that might remove the .item() calls.
+#ifdef ENABLE_CUDA_ASSEMBLER
+    if (eval_stream) {
+        eval_stream->synchronize();
+    }
+#endif
+
+    // Restore training mode for subsequent use. Note: not RAII — an
+    // exception escaping the loop would leave model_ in eval mode. The
+    // AsyncBatchPrefetcher destructor still runs (unique_ptr) and joins
+    // the worker, but the training-mode flip is the caller's problem in
+    // the exception path. Out of scope for this change.
     model_.train();
 
     return (total > 0) ? (static_cast<double>(correct) / static_cast<double>(total)) : 0.0;

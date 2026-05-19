@@ -100,6 +100,22 @@ public:
         bool        use_async_prefetcher = true;
         size_t      prefetch_queue_size  = 2;
 
+        // Round 3B (2026-05-15): number of background worker threads inside
+        // AsyncBatchPrefetcher. Default 1 preserves Stage 1 semantics
+        // exactly. >1 lets multiple BatchAssembler::assemble() calls run
+        // concurrently (CPU-side prep work overlaps with the previous
+        // batch's GPU forward+backward).
+        //
+        // IMPORTANT: multi-worker mode is correct ONLY when the
+        // BatchAssembler runs in FeatureMatrix-fallback mode. In
+        // FourLevelStore (full) mode, shared state inside
+        // load_batch_features (DirectIoReader io_uring rings + the
+        // pinned_ptr_ host-pinned buffer reused across calls) makes
+        // concurrent calls race silently. TrainingLoop enforces
+        // num_workers=1 in that case via the runtime guard below.
+        // See async_batch_prefetcher.h for full constraints.
+        unsigned    prefetch_num_workers = 1;
+
         // Spec C3 stage 3 (started 2026-05-08): split assemble_kernel and
         // model.forward+backward onto separate CUDA streams so the GPU can
         // execute them concurrently when SMs are free (DiskGNN SIGMOD'25
@@ -110,6 +126,17 @@ public:
         // Default false until empirical validation completes; flip to true
         // once Module 6 confirms speedup + bit-identical accuracy.
         bool        use_cuda_streams = false;
+
+        // Periodic CUDA caching-allocator reclaim. When the receptive
+        // field size varies across batches (e.g., fanout [10,15,20] on
+        // UNDIRECTED orientation produces L3 layers swinging from 1M to
+        // 3M nodes), the allocator pool fragments and "reserved but
+        // unallocated" memory grows until the next alloc OOMs. Calling
+        // c10::cuda::CUDACachingAllocator::emptyCache() periodically
+        // releases unused blocks back to CUDA. Cost: ~1-2 ms per call on
+        // RTX 5070 Ti; default 100 ⇒ ~24 ms overhead per 1200-batch
+        // epoch (<0.05%). Set to 0 to disable.
+        uint64_t empty_cache_every_n_batches = 100;
 
         // Phase 0 (2026-05-17) profile instrumentation: when non-empty,
         // per-batch timings are persisted to this CSV path (train + val +
@@ -153,6 +180,26 @@ public:
         double               assemble_seconds = 0.0;
         double               forward_seconds  = 0.0;
         double               backward_seconds = 0.0;
+
+        // Round 3B (2026-05-15): the actual number of AsyncBatchPrefetcher
+        // workers used during train(). Equals config.prefetch_num_workers
+        // unless (a) it was 0 (resolved to 1) or (b) the BatchAssembler runs
+        // in FourLevelStore mode and N>1 was requested (clamped to 1; a
+        // stderr warning is also emitted, see train() implementation).
+        //
+        // Surface this from procedures (e.g., gnn_train) to make the
+        // multi-worker activation diagnostic without parsing stderr.
+        unsigned             effective_prefetch_workers = 1;
+
+        // Path 4 (2026-05-19): Track whether the v2 addr_table fast path was
+        // used at least once during the run, and the mean per-batch cost of
+        // reading+parsing the addr_table sidecar (μs).  Only attributable on
+        // the sequential (non-prefetcher) path — see the sampling site in
+        // training_loop.cc.  With the async prefetcher on, both fields stay at
+        // their zero-initialized defaults (false / 0.0).
+        bool                 addr_tables_used_ever    = false;
+        double               addr_table_load_us_mean  = 0.0;
+        uint64_t             addr_table_load_us_count = 0;
     };
 
     // =========================================================================
