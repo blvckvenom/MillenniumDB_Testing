@@ -38,6 +38,13 @@ public:
     struct Result {
         AddrTableHeader              header{};
         std::vector<unsigned char>   data;
+        /// Owned, properly-aligned backing storage for l3_row_idxs. The
+        /// in-buffer offset (40 + 8*num_l1 + 8*num_l2 + 4*num_l3) is not
+        /// 8-aligned when num_l3 is odd, so a direct reinterpret_cast over
+        /// `data` would be undefined behavior on strict-alignment platforms
+        /// and UBSan-instrumented Debug builds. Copy into this aligned
+        /// vector at parse time; ConstView l3_row_idxs points here.
+        std::vector<uint64_t>        l3_row_idxs_storage;
         ConstView<uint32_t> l1_positions   {nullptr, 0};
         ConstView<uint32_t> l1_indices     {nullptr, 0};
         ConstView<uint32_t> l2_positions   {nullptr, 0};

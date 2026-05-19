@@ -77,18 +77,24 @@ AddrTableReader::open(const fs::path& path, uint64_t expected_meta_sha_head)
         p += static_cast<size_t>(n) * sizeof(uint32_t);
         return r;
     };
-    auto take_u64 = [&](uint32_t n) -> const uint64_t* {
-        const auto* r = reinterpret_cast<const uint64_t*>(p);
-        p += static_cast<size_t>(n) * sizeof(uint64_t);
-        return r;
-    };
-
+    // l3_row_idxs is the only uint64 array. Its byte offset is
+    //   40 + 8*num_l1 + 8*num_l2 + 4*num_l3
+    // which is 4-aligned but only 8-aligned when num_l3 is even.
+    // Copy into an owned, properly-aligned vector to avoid UB.
     res.l1_positions   = {take_u32(res.header.num_l1), res.header.num_l1};
     res.l1_indices     = {take_u32(res.header.num_l1), res.header.num_l1};
     res.l2_positions   = {take_u32(res.header.num_l2), res.header.num_l2};
     res.l2_indices     = {take_u32(res.header.num_l2), res.header.num_l2};
     res.l3_positions   = {take_u32(res.header.num_l3), res.header.num_l3};
-    res.l3_row_idxs    = {take_u64(res.header.num_l3), res.header.num_l3};
+
+    res.l3_row_idxs_storage.resize(res.header.num_l3);
+    if (res.header.num_l3 > 0) {
+        std::memcpy(res.l3_row_idxs_storage.data(), p,
+                    static_cast<size_t>(res.header.num_l3) * sizeof(uint64_t));
+    }
+    p += static_cast<size_t>(res.header.num_l3) * sizeof(uint64_t);
+    res.l3_row_idxs = {res.l3_row_idxs_storage.data(), res.header.num_l3};
+
     res.l4_positions   = {take_u32(res.header.num_l4), res.header.num_l4};
     res.l4_indices     = {take_u32(res.header.num_l4), res.header.num_l4};
     res.zero_positions = {take_u32(res.header.num_zero), res.header.num_zero};

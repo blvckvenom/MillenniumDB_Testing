@@ -106,3 +106,24 @@ TEST(AddrTableReaderOpen, RejectsTruncatedFile) {
     EXPECT_THROW(AddrTableReader::open(p, 0), std::runtime_error);
     fs::remove(p);
 }
+
+TEST(AddrTableReaderOpen, ParsesOddL3AlignmentSafely) {
+    // num_l3 = 1 (odd) puts l3_row_idxs at a 4-byte-aligned but not
+    // 8-byte-aligned offset within the read buffer. The aligned-storage
+    // path in open() should copy into Result::l3_row_idxs_storage so
+    // the uint64 load is well-defined.
+    auto p = tmp_addrtab("odd_l3");
+    fs::remove(p);
+
+    AddrTableBuffers buf;
+    buf.header = AddrTableHeader::make(0, 0, 1, 0, 0, 0xDEAD);
+    buf.l3_positions = {7};
+    buf.l3_row_idxs  = {0x0123456789ABCDEFull};
+    AddrTableWriter::write_atomic(p, buf);
+
+    auto res = AddrTableReader::open(p, 0xDEAD);
+    ASSERT_EQ(res.l3_row_idxs.size(), 1u);
+    EXPECT_EQ(res.l3_row_idxs[0], 0x0123456789ABCDEFull);
+
+    fs::remove(p);
+}
