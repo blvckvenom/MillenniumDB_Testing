@@ -81,6 +81,7 @@ add_library(mdb_gnn_core STATIC
     storage/four_level_store.cc
     storage/addr_table.cc
     storage/addr_table_writer.cc
+    storage/addr_table_reader.cc
     storage/direct_io_reader.cc
 
     # Phase 1: Projection Integration
@@ -461,6 +462,11 @@ if(BUILD_TESTING)
         add_executable(test_addr_table_writer tests/test_addr_table_writer.cc)
         target_link_libraries(test_addr_table_writer PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME AddrTableWriterTests COMMAND test_addr_table_writer)
+
+        # AddrTable reader tests (Path 4 Task 3: open + validate + parse 9 arrays)
+        add_executable(test_addr_table_reader tests/test_addr_table_reader.cc)
+        target_link_libraries(test_addr_table_reader PRIVATE mdb_gnn_core gtest gtest_main)
+        add_test(NAME AddrTableReaderTests COMMAND test_addr_table_reader)
 
         # SplitStore tests (Task 3: split assignments for training)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_split_store.cc")
