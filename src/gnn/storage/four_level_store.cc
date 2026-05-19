@@ -1,21 +1,33 @@
 #include "gnn/storage/four_level_store.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 
 #ifdef GNN_CUDA_ENABLED
 #include <cuda_runtime.h>
 #endif
 
+#include "gnn/common/page_cache_hint.h"
+#include "gnn/common/pipeline_overlap.h"
 #include "gnn/common/posix_io.h"
 #include "gnn/core/feature_assembler.h"
+#include "gnn/storage/addr_table.h"
+#include "gnn/storage/addr_table_writer.h"
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/direct_io_reader.h"
 #include "gnn/storage/feature_matrix.h"
@@ -27,10 +39,259 @@
 #include "gnn/sampling/minhash_reorderer.h"
 #include "gnn/sampling/sample_storage.h"
 #include "graph_models/object_id.h"
+// query_context.h must be included after liburing (via four_level_store.h ->
+// direct_io_reader.h -> liburing.h -> linux/fs.h) which defines BLOCK_SIZE
+// as a macro.  string_manager.h (included by query_context.h) uses the same
+// name as a constexpr member, which causes a parse error unless we undef the
+// macro first.
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
+#include "query/query_context.h"
 
 namespace fs = std::filesystem;
 
 namespace mdb::gnn {
+
+// =============================================================================
+// Phase 5 helpers (anonymous namespace — internal to this TU)
+// =============================================================================
+namespace {
+
+// ---------------------------------------------------------------------------
+// OidIdxAdapter — satisfies AddrTableWriter::build<CacheA,CacheB> contract.
+//
+// AddrTableWriter::build is templated on CacheA/CacheB and calls only
+// find_index(oid) -> std::optional<uint32_t>. We need the mapping from
+// an OID to its row index in the cache file. GpuCache/CpuCache::build()
+// sorts entries by FeatureMatrix row before writing to disk, so the cache
+// file's OID table (not the original l1_nodes/l2_nodes input order) is
+// the ground truth for what find_index() returns. We read that table
+// directly at Phase 5 build time rather than loading the full cache
+// (which would allocate GPU memory and take seconds).
+// ---------------------------------------------------------------------------
+struct OidIdxAdapter {
+    std::unordered_map<uint64_t, uint32_t> oid_to_idx;
+
+    std::optional<uint32_t> find_index(ObjectId oid) const {
+        auto it = oid_to_idx.find(oid.id);
+        if (it == oid_to_idx.end()) return std::nullopt;
+        return it->second;
+    }
+};
+
+// Build an OidIdxAdapter by reading a GNNC cache file's OID table.
+// Returns an empty adapter (zero entries) when the path does not exist.
+OidIdxAdapter build_oid_idx_adapter(const fs::path& cache_path)
+{
+    OidIdxAdapter adapter;
+    if (!fs::exists(cache_path)) return adapter;
+
+    int fd = ::open(cache_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "FourLevelStore Phase 5: cannot open cache file " +
+            cache_path.string() + ": " + safe_strerror(errno));
+    }
+    struct FdCleanup { int fd; ~FdCleanup() { if (fd >= 0) ::close(fd); } } cleanup{fd};
+
+    CacheFileHeader hdr{};
+    read_all(fd, &hdr, sizeof(hdr), cache_path.string());
+    if (!hdr.is_valid() || hdr.num_nodes == 0) return adapter;
+
+    std::vector<uint64_t> oid_table(hdr.num_nodes);
+    read_all(fd, oid_table.data(), hdr.num_nodes * sizeof(uint64_t), cache_path.string());
+
+    adapter.oid_to_idx.reserve(hdr.num_nodes);
+    for (uint32_t i = 0; i < static_cast<uint32_t>(hdr.num_nodes); ++i) {
+        adapter.oid_to_idx[oid_table[i]] = i;
+    }
+    return adapter;
+}
+
+// Read the OID table from a packed_slim v2 file and return a map
+// oid.id -> slot_index (position in file, 0-based). Used as the L4
+// lookup map passed to AddrTableWriter::build.
+// Returns an empty map for v1 files (no OID table) or missing files.
+std::unordered_map<uint64_t, uint32_t> read_slim_oid_table(const fs::path& slim_path)
+{
+    std::unordered_map<uint64_t, uint32_t> result;
+    if (!fs::exists(slim_path)) return result;
+
+    int fd = ::open(slim_path.c_str(), O_RDONLY);
+    if (fd < 0) return result;
+    struct FdCleanup { int fd; ~FdCleanup() { if (fd >= 0) ::close(fd); } } cleanup{fd};
+
+    PackedBatchHeader hdr{};
+    ssize_t r = ::read(fd, &hdr, sizeof(hdr));
+    if (r != static_cast<ssize_t>(sizeof(hdr)) || !hdr.is_valid()) return result;
+    if (!hdr.has_oid_table() || hdr.num_nodes == 0) return result;
+
+    std::vector<uint64_t> oid_table(hdr.num_nodes);
+    read_all(fd, oid_table.data(), hdr.num_nodes * sizeof(uint64_t), slim_path.string());
+
+    result.reserve(hdr.num_nodes);
+    for (uint32_t i = 0; i < static_cast<uint32_t>(hdr.num_nodes); ++i) {
+        result[oid_table[i]] = i;
+    }
+    return result;
+}
+
+// Compute meta_sha_head: first 8 bytes of gnn_meta.bin XOR file size.
+// This is a fast content-derived identifier used to detect stale addr_table
+// sidecars at runtime (AddrTableReader::open validates it when != 0).
+// The same formula must be used both here (build) and in the runtime
+// consumer. Convention: if the file does not exist or cannot be read,
+// returns 0 (which disables staleness detection in AddrTableReader::open).
+uint64_t compute_meta_sha_head(const fs::path& gnn_meta_path)
+{
+    if (!fs::exists(gnn_meta_path)) return 0;
+
+    std::error_code ec;
+    auto file_size = fs::file_size(gnn_meta_path, ec);
+    if (ec) return 0;
+
+    int fd = ::open(gnn_meta_path.c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+    struct FdCleanup { int fd; ~FdCleanup() { if (fd >= 0) ::close(fd); } } cleanup{fd};
+
+    uint64_t first8 = 0;
+    ssize_t n = ::read(fd, &first8, sizeof(first8));
+    if (n < static_cast<ssize_t>(sizeof(first8))) return 0;
+
+    return first8 ^ static_cast<uint64_t>(file_size);
+}
+
+// Format an addr_table filename for a given batch_id.
+// Mirrors the packed_slim naming: "batch_%06lu.addr".
+fs::path addr_table_filename(const fs::path& addr_tables_dir, uint64_t batch_id)
+{
+    char fname[32];
+    std::snprintf(fname, sizeof(fname), "batch_%06lu.addr",
+                  static_cast<unsigned long>(batch_id));
+    return addr_tables_dir / fname;
+}
+
+// ---------------------------------------------------------------------------
+// build_addr_tables_ — Phase 5 of FourLevelStore::build()
+//
+// For each batch in [0, total_batches):
+//   1. Read sample.all_unique_nodes (classify input).
+//   2. Read packed_slim OID table (L4 lookup map).
+//   3. Classify all_unique_nodes into {L1,L2,L4,L3,zero}.
+//   4. Atomically write batch_NNNNNN.addr to addr_tables/.
+//
+// Workers are dispatched via a SALIENT-style atomic counter. QueryContext
+// is propagated from the primary thread so BPT lookups inside read_sample
+// do not null-deref the thread_local context pointer.
+// ---------------------------------------------------------------------------
+void build_addr_tables_(
+    SampleStorage&                              samples,
+    const fs::path&                             addr_tables_dir,
+    const fs::path&                             packed_slim_dir,
+    const OidIdxAdapter&                        l1_adapter,
+    const OidIdxAdapter&                        l2_adapter,
+    const std::optional<RowMapping>&            reordered_rm_holder,
+    uint64_t                                    meta_sha_head,
+    uint64_t                                    total_batches,
+    uint64_t&                                   out_addr_tables_bytes)
+{
+    fs::create_directories(addr_tables_dir);
+
+    unsigned num_workers = 4;
+    if (const char* env = std::getenv("MDB_GNN_ADDR_TABLE_WORKERS")) {
+        try {
+            int v = std::stoi(env);
+            if (v > 0) num_workers = static_cast<unsigned>(v);
+        } catch (...) {}
+    }
+    if (num_workers > std::thread::hardware_concurrency() &&
+        std::thread::hardware_concurrency() > 0)
+    {
+        num_workers = std::thread::hardware_concurrency();
+    }
+    if (num_workers > total_batches && total_batches > 0)
+        num_workers = static_cast<unsigned>(total_batches);
+    if (num_workers == 0) num_workers = 1;
+
+    // Build rmap_find closure from the reordered RowMapping.
+    // Falls back to returning nullopt (L3 treated as zero) when absent.
+    AddrTableWriter::RmapFind rmap_find;
+    if (reordered_rm_holder.has_value()) {
+        const RowMapping* rm_ptr = &*reordered_rm_holder;
+        rmap_find = [rm_ptr](ObjectId oid) -> std::optional<uint64_t> {
+            return rm_ptr->find(oid);
+        };
+        // Warm the RowMapping lazy index before workers spawn.
+        if (reordered_rm_holder->size() > 0) {
+            (void) rm_ptr->find(rm_ptr->get(0));
+        }
+    } else {
+        rmap_find = [](ObjectId) -> std::optional<uint64_t> { return std::nullopt; };
+    }
+
+    std::atomic<uint64_t> next_bid{0};
+    std::atomic<uint64_t> total_bytes_acc{0};
+    std::exception_ptr    first_exc;
+    std::mutex            exc_mutex;
+
+    // Capture the primary thread's QueryContext so workers can propagate it.
+    QueryContext* primary_ctx = QueryContext::_query_ctx;
+
+    auto worker_fn = [&]() {
+        QueryContext::set_query_ctx(primary_ctx);
+
+        try {
+            while (true) {
+                uint64_t b = next_bid.fetch_add(1, std::memory_order_relaxed);
+                if (b >= total_batches) break;
+
+                // 1. Read sample for the classify-input list.
+                auto sample = samples.read_sample(b);
+
+                // 2. Build L4 lookup map from packed_slim OID table.
+                char fname[32];
+                std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
+                              static_cast<unsigned long>(b));
+                auto slim_path = packed_slim_dir / fname;
+                auto slim_oid_to_idx = read_slim_oid_table(slim_path);
+
+                // 3. Classify each unique node into a tier.
+                AddrTableBuffers buf;
+                AddrTableWriter::build(
+                    sample.all_unique_nodes,
+                    &l1_adapter,
+                    &l2_adapter,
+                    slim_oid_to_idx,
+                    rmap_find,
+                    meta_sha_head,
+                    buf);
+
+                // 4. Atomically write the addr_table sidecar.
+                auto addr_path = addr_table_filename(addr_tables_dir, b);
+                AddrTableWriter::write_atomic(addr_path, buf);
+
+                total_bytes_acc.fetch_add(buf.total_bytes(), std::memory_order_relaxed);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(exc_mutex);
+            if (!first_exc) first_exc = std::current_exception();
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_workers);
+    for (unsigned i = 0; i < num_workers; ++i) {
+        workers.emplace_back(worker_fn);
+    }
+    for (auto& t : workers) t.join();
+    if (first_exc) std::rethrow_exception(first_exc);
+
+    fsync_directory(addr_tables_dir);
+    out_addr_tables_bytes = total_bytes_acc.load(std::memory_order_relaxed);
+}
+
+} // anonymous namespace
 
 // =============================================================================
 // Helper: Map GnnDtype -> torch::ScalarType
@@ -47,6 +308,63 @@ torch::ScalarType FourLevelStore::to_torch_dtype(GnnDtype dt) {
     }
     throw std::invalid_argument(
         "FourLevelStore: unknown GnnDtype " + std::to_string(static_cast<int>(dt)));
+}
+
+// =============================================================================
+// Persistent pinned-host buffer pool (Round 1A, 2026-05-15)
+// =============================================================================
+//
+// load_batch_features() previously did cudaHostAlloc + cudaFreeHost per
+// batch. Each call is a synchronous driver entry (~100-500 us); on
+// papers100M training (1300+ batches/epoch) that burned 150-600 ms/epoch
+// purely on alloc churn. The fix is to keep one persistent pinned buffer
+// that grows monotonically and is released once in the destructor.
+//
+// Growth policy: when the request exceeds capacity we allocate
+// max(requested, 1.5 x current) so consecutive growths amortize like
+// std::vector. Thread-safety is via pinned_mutex_; the prefetcher worker
+// + main thread can both touch this path.
+// =============================================================================
+
+bool FourLevelStore::ensure_pinned_capacity(size_t bytes) {
+#ifdef GNN_CUDA_ENABLED
+    if (bytes == 0) return true;
+    std::lock_guard<std::mutex> lock(pinned_mutex_);
+    if (bytes <= pinned_capacity_) return true;
+
+    // Geometric grow: at least 1.5x current to amortize repeated growth.
+    size_t new_cap = bytes;
+    size_t grown = pinned_capacity_ + (pinned_capacity_ >> 1);
+    if (grown > new_cap) new_cap = grown;
+
+    void* new_ptr = nullptr;
+    cudaError_t err = cudaHostAlloc(&new_ptr, new_cap, cudaHostAllocDefault);
+    if (err != cudaSuccess || new_ptr == nullptr) {
+        // Keep the old buffer; caller will fall back to unpinned memory.
+        return false;
+    }
+
+    if (pinned_ptr_ != nullptr) {
+        cudaFreeHost(pinned_ptr_);
+    }
+    pinned_ptr_      = new_ptr;
+    pinned_capacity_ = new_cap;
+    return true;
+#else
+    (void)bytes;
+    return false;
+#endif
+}
+
+FourLevelStore::~FourLevelStore() {
+#ifdef GNN_CUDA_ENABLED
+    std::lock_guard<std::mutex> lock(pinned_mutex_);
+    if (pinned_ptr_ != nullptr) {
+        cudaFreeHost(pinned_ptr_);
+        pinned_ptr_      = nullptr;
+        pinned_capacity_ = 0;
+    }
+#endif
 }
 
 // =============================================================================
@@ -74,26 +392,39 @@ FourLevelStore::BuildResult FourLevelStore::build(
     const auto& catalog  = samples.get_catalog();
     auto sample_dir      = SampleStorage::get_storage_path(
                                db_folder.string(), catalog.sample_name);
-    auto packed_slim_dir = fs::path(sample_dir) / "packed_slim";
+    auto packed_slim_dir  = fs::path(sample_dir) / "packed_slim";
+    auto addr_tables_dir  = fs::path(sample_dir) / "addr_tables";
     result.packed_slim_dir = packed_slim_dir.string();
 
     // --- Force cleanup ---
+    // Fix #15: granular flags let callers preserve specific outputs.
+    // Pre-Fix-#15 callers (force=true only) get unchanged behaviour
+    // because the new flags default to true.
     if (config.force) {
         std::error_code ec;
-        fs::remove_all(packed_slim_dir, ec);
-        fs::remove(gpu_cache_path, ec);
-        fs::remove(cpu_cache_path, ec);
-        fs::remove(meta_path, ec);
-        fs::remove(reordered_fmat, ec);
-        fs::remove(reordered_rmap, ec);
+        if (config.force_packed_slim) fs::remove_all(packed_slim_dir, ec);
+        if (config.force_packed_slim) fs::remove_all(addr_tables_dir, ec);
+        if (config.force_caches)      fs::remove(gpu_cache_path, ec);
+        if (config.force_caches)      fs::remove(cpu_cache_path, ec);
+        if (config.force_meta)        fs::remove(meta_path, ec);
+        if (config.force_reorder)     fs::remove(reordered_fmat, ec);
+        if (config.force_reorder)     fs::remove(reordered_rmap, ec);
     }
 
     // --- Pre-condition checks ---
     if (fs::exists(meta_path)) {
         throw std::runtime_error(
             "Feature store already exists at: " + meta_path.string() + "\n"
-            "Use force:1 to overwrite.");
+            "Use force:1 to overwrite (or set force_meta:false to preserve).");
     }
+
+    auto log_phase = [&total_start](const std::string& tag) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double t = std::chrono::duration<double>(now - total_start).count();
+        std::cerr << "[FourLevelStore] T+" << std::fixed << std::setprecision(1)
+                  << t << "s " << tag << "\n" << std::flush;
+    };
+    log_phase("build() start");
 
     // --- Step 1: Read frequencies ---
     std::vector<uint64_t> freq_dense;
@@ -191,8 +522,12 @@ FourLevelStore::BuildResult FourLevelStore::build(
 
     // --- Step 3: Build cache files ---
     fs::create_directories(gnn_dir);
+    log_phase("L1 GpuCache::build start (" + std::to_string(l1_nodes.size()) + " nodes)");
     GpuCache::build(l1_nodes, features, row_mapping, gpu_cache_path);
+    log_phase("L1 GpuCache::build done");
+    log_phase("L2 CpuCache::build start (" + std::to_string(l2_nodes.size()) + " nodes)");
     CpuCache::build(l2_nodes, features, row_mapping, cpu_cache_path);
+    log_phase("L2 CpuCache::build done");
 
     // --- Step 4: Ensure L3 reordered FM exists ---
     const FeatureMatrix* active_fm = &features;
@@ -201,6 +536,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
     std::optional<RowMapping> reordered_rm_holder;
 
     if (config.reorder && !fs::exists(reordered_fmat)) {
+        log_phase("L3 MinHash build_access_graph start");
         MinHashReorderer reorderer(config.minhash);
         reorderer.build_access_graph(catalog.total_batches,
             [&](uint64_t batch_id) -> std::vector<uint64_t> {
@@ -213,16 +549,26 @@ FourLevelStore::BuildResult FourLevelStore::build(
                 }
                 return rows;
             });
+        log_phase("L3 MinHash compute_permutation start");
         auto perm = reorderer.compute_permutation(N);
+        log_phase("L3 MinHash compute_permutation done");
 
+        log_phase("L3 FeatureMatrix::create_reordered start (Fix #12)");
         FeatureMatrix::create_reordered(features, perm, reordered_fmat);
+        log_phase("L3 FeatureMatrix::create_reordered done");
 
         // Create reordered RowMapping
+        log_phase("L3 RowMapping::create start");
         std::vector<ObjectId> reordered_ids(N);
         for (uint64_t i = 0; i < N; ++i) {
             reordered_ids[i] = row_mapping.get(perm[i]);
         }
         RowMapping::create(reordered_rmap, reordered_ids);
+        log_phase("L3 RowMapping::create done");
+    } else if (config.reorder) {
+        log_phase("L3 reorder skipped — reordered.fmat already exists");
+    } else {
+        log_phase("L3 reorder disabled");
     }
 
     if (config.reorder && fs::exists(reordered_fmat)) {
@@ -241,74 +587,277 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // L4 features come directly from the slim file data section.
     fs::create_directories(packed_slim_dir);
 
-    // Spec D telemetry: accumulate slim bytes during the write loop instead
-    // of re-scanning the directory after. Same value, no second I/O pass.
-    uint64_t slim_bytes_acc = 0;
+    // Per-entry pair so we can sort by row ascending. Reading the reordered
+    // FM in row-monotone order keeps mmap access sequential and avoids
+    // page-cache thrash when the FM exceeds host RAM (papers100M: 56 GB
+    // FM vs 30 GB host saw the writeback collapse with random reads).
+    struct SlimEntry { uint64_t row; ObjectId oid; };
 
-    for (uint64_t b = 0; b < catalog.total_batches; ++b) {
-        auto sample = samples.read_sample(b);
+    log_phase("L4 packed_slim start");
+    auto l4_start = std::chrono::high_resolution_clock::now();
+    std::atomic<uint64_t> batches_done{0};
+    // Parallel L4 materialisation: each batch writes its own .bin file, so
+    // workers can run independently. Default 4 workers — caps at
+    // hardware_concurrency() and is overridable via env MDB_GNN_L4_WORKERS
+    // for tuning. The reads from `samples` (per-call ifstream) and
+    // `active_fm` (mmap) and `active_rm` (built-once index then read-only)
+    // are all thread-safe.
+    unsigned num_l4_workers = 4;
+    if (const char* env = std::getenv("MDB_GNN_L4_WORKERS")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed > 0) num_l4_workers = static_cast<unsigned>(parsed);
+        } catch (...) {
+            // ignore malformed env value, keep default
+        }
+    }
+    if (num_l4_workers > std::thread::hardware_concurrency() &&
+        std::thread::hardware_concurrency() > 0)
+    {
+        num_l4_workers = std::thread::hardware_concurrency();
+    }
+    if (num_l4_workers > catalog.total_batches) {
+        num_l4_workers = static_cast<unsigned>(catalog.total_batches);
+    }
+    if (num_l4_workers == 0) num_l4_workers = 1;
 
-        // Partition: keep only non-cached nodes (not in L1/L2)
-        std::vector<ObjectId> slim_oids;
-        slim_oids.reserve(sample.all_unique_nodes.size());
-        for (const auto& oid : sample.all_unique_nodes) {
-            if (cached_oid_set.count(oid.id) == 0) {
-                slim_oids.push_back(oid);
+    std::atomic<uint64_t> next_batch{0};
+    std::atomic<uint64_t> shared_slim_bytes{0};
+    std::exception_ptr first_exception;
+    std::mutex exception_mutex;
+
+    // Touch RowMapping index once before workers spawn — RowMapping::find()
+    // lazy-builds a sorted index under std::call_once on first call. If we
+    // didn't force-init here, the first worker pays an O(N log N) sort
+    // while the rest stall on the call_once barrier.
+    if (N > 0) {
+        (void) active_rm->find(active_rm->get(0));
+    }
+
+    bool use_pipeline_overlap = false;
+    if (const char* env = std::getenv("MDB_GNN_PIPELINE_OVERLAP")) {
+        std::string s(env);
+        if (s == "1" || s == "true" || s == "yes") use_pipeline_overlap = true;
+    }
+
+    auto worker_fn = [&]() {
+        // PackedBatch and pipeline state live OUTSIDE the try so the RAII
+        // guard below can reach them on any unwind path.
+        struct PackedBatch {
+            std::vector<char>     out_buf;
+            std::filesystem::path batch_path;
+            uint64_t              batch_id;
+        };
+
+        ChunkPipeline<PackedBatch> pipe(2);
+        std::thread                writer;
+
+        // RAII guard: when the lambda returns by any path (normal return,
+        // throw, or stack unwinding), close the pipe and join the writer.
+        // Skipping this would leave a joinable std::thread to be destroyed,
+        // which invokes std::terminate() per [thread.thread.destr].
+        struct WriterGuard {
+            ChunkPipeline<PackedBatch>* pipe;
+            std::thread*                writer;
+            bool                        active;
+            ~WriterGuard() {
+                if (!active) return;
+                try {
+                    pipe->close();
+                } catch (...) { /* swallow — destructors must not throw */ }
+                if (writer->joinable()) {
+                    try { writer->join(); } catch (...) {}
+                }
             }
-        }
+        };
+        WriterGuard guard{&pipe, &writer, false};
 
-        // Translate to row indices in active FM
-        std::vector<uint64_t> slim_rows;
-        slim_rows.reserve(slim_oids.size());
-        for (const auto& oid : slim_oids) {
-            auto row = active_rm->find(oid);
-            if (row.has_value()) {
-                slim_rows.push_back(*row);
+        try {
+            if (use_pipeline_overlap) {
+                writer = std::thread([&]() {
+                    try {
+                        while (auto pb_opt = pipe.pop()) {
+                            auto& pb = *pb_opt;
+                            int wfd = ::open(pb.batch_path.c_str(),
+                                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                            if (wfd < 0) {
+                                throw std::runtime_error(
+                                    "FourLevelStore::build: cannot create " +
+                                    pb.batch_path.string() + ": " +
+                                    safe_strerror(errno));
+                            }
+                            FdGuard fdg(wfd);
+                            write_all(wfd, pb.out_buf.data(),
+                                      pb.out_buf.size(), pb.batch_path.string());
+                            // Fix #22: hint kernel that this .bin's pages can
+                            // leave the cache. write_all has already triggered
+                            // writeback; this only frees the clean copies.
+                            fadvise_dontneed(wfd, 0,
+                                static_cast<off_t>(pb.out_buf.size()));
+                        }
+                    } catch (...) {
+                        pipe.set_error(std::current_exception());
+                    }
+                });
+                guard.active = true;  // arm the guard now that writer exists
             }
+
+            while (true) {
+                uint64_t b = next_batch.fetch_add(1, std::memory_order_relaxed);
+                if (b >= catalog.total_batches) break;
+
+                auto sample = samples.read_sample(b);
+
+                std::vector<SlimEntry> entries;
+                entries.reserve(sample.all_unique_nodes.size());
+                for (const auto& oid : sample.all_unique_nodes) {
+                    if (cached_oid_set.count(oid.id) != 0) continue;
+                    auto row = active_rm->find(oid);
+                    if (row.has_value()) {
+                        entries.push_back({*row, oid});
+                    }
+                }
+                std::sort(entries.begin(), entries.end(),
+                          [](const SlimEntry& a, const SlimEntry& b) {
+                              return a.row < b.row;
+                          });
+
+                const size_t n = entries.size();
+                const size_t oid_block  = n * sizeof(uint64_t);
+                const size_t data_block = n * row_bytes;
+
+                auto header = PackedBatchHeader::make_v2(n, D, dt);
+
+                std::vector<char> out_buf(sizeof(header) + oid_block + data_block);
+                std::memcpy(out_buf.data(), &header, sizeof(header));
+
+                auto* oid_ptr  = reinterpret_cast<uint64_t*>(
+                    out_buf.data() + sizeof(header));
+                char*  feat_ptr = out_buf.data() + sizeof(header) + oid_block;
+                for (size_t i = 0; i < n; ++i) {
+                    oid_ptr[i] = entries[i].oid.id;
+                    std::memcpy(feat_ptr + i * row_bytes,
+                                active_fm->row(entries[i].row),
+                                row_bytes);
+                }
+
+                char fname[32];
+                std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
+                              static_cast<unsigned long>(b));
+                auto batch_path = packed_slim_dir / fname;
+
+                const size_t this_bytes = out_buf.size();
+
+                if (use_pipeline_overlap) {
+                    pipe.push(PackedBatch{std::move(out_buf), batch_path, b});
+                } else {
+                    int fd = ::open(batch_path.c_str(),
+                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd < 0) {
+                        throw std::runtime_error(
+                            "FourLevelStore::build: cannot create " +
+                            batch_path.string() + ": " + safe_strerror(errno));
+                    }
+                    FdGuard guard(fd);
+                    write_all(fd, out_buf.data(), out_buf.size(), batch_path.string());
+                    // Fix #22: same hint as in the pipeline writer branch.
+                    fadvise_dontneed(fd, 0, static_cast<off_t>(out_buf.size()));
+                }
+
+                shared_slim_bytes.fetch_add(this_bytes, std::memory_order_relaxed);
+
+                uint64_t done = batches_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (done % 100 == 0 || done == catalog.total_batches) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double dt = std::chrono::duration<double>(now - l4_start).count();
+                    std::cerr << "[L4] " << done << "/" << catalog.total_batches
+                              << " (" << std::fixed << std::setprecision(1)
+                              << dt << "s, "
+                              << (done / dt) << " batches/s)\n" << std::flush;
+                }
+            }
+
+            // Normal-exit cleanup: close + join is now redundant with the
+            // guard, but explicit close() lets the writer exit promptly so
+            // we can observe any writer-side error before disarming. If
+            // join() succeeds cleanly, disarm so the destructor is a no-op.
+            if (use_pipeline_overlap) {
+                pipe.close();
+                if (writer.joinable()) writer.join();
+                guard.active = false;  // disarm — already joined cleanly
+            }
+        } catch (...) {
+            // Guard destructor will close + join. Just record the exception.
+            std::lock_guard<std::mutex> lk(exception_mutex);
+            if (!first_exception) first_exception = std::current_exception();
         }
+    };
 
-        // Write v2 packed file: header + OID table + features
-        char fname[32];
-        std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
-                      static_cast<unsigned long>(b));
-        auto batch_path = packed_slim_dir / fname;
+    std::vector<std::thread> workers;
+    workers.reserve(num_l4_workers);
+    for (unsigned i = 0; i < num_l4_workers; ++i) {
+        workers.emplace_back(worker_fn);
+    }
+    for (auto& t : workers) t.join();
+    if (first_exception) std::rethrow_exception(first_exception);
 
-        auto header = PackedBatchHeader::make_v2(slim_oids.size(), D, dt);
+    uint64_t slim_bytes_acc = shared_slim_bytes.load(std::memory_order_relaxed);
 
-        int fd = ::open(batch_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
-            throw std::runtime_error(
-                "FourLevelStore::build: cannot create " + batch_path.string() +
-                ": " + safe_strerror(errno));
+    log_phase("L4 packed_slim done, fsync_directory next");
+    // Single directory fsync amortises durability across all batch files.
+    // ext4 commits the file data via writeback; the dir entry sync ensures
+    // the names appear post-crash so partial output is detectable.
+    fsync_directory(packed_slim_dir);
+    log_phase("L4 fsync_directory done");
+
+    // --- Phase 5: Build AddrTable sidecars ---
+    // Pre-classify every batch's unique nodes into {L1, L2, L4, L3, zero}
+    // and write addr_tables/batch_NNNNNN.addr next to packed_slim/. This
+    // lets runtime load_batch_features() skip the per-node hash lookups on
+    // the hot path, amortising them to build time instead.
+    //
+    // We reconstruct OidIdxAdapters by reading the already-written GNNC cache
+    // files' OID tables rather than loading them into GPU/CPU memory.
+    // GpuCache/CpuCache::build() sorts entries by FeatureMatrix row before
+    // writing, so the on-disk OID table is the ground truth for find_index().
+    if (config.build_addr_tables) {
+        log_phase("Phase 5 addr_tables start");
+        try {
+            auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
+            auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
+
+            auto meta_sha_head = compute_meta_sha_head(db_folder / "gnn_meta.bin");
+
+            build_addr_tables_(
+                samples,
+                addr_tables_dir,
+                packed_slim_dir,
+                l1_adapter,
+                l2_adapter,
+                reordered_rm_holder,
+                meta_sha_head,
+                catalog.total_batches,
+                result.addr_tables_bytes);
+
+            result.addr_tables_built_ok = true;
+            log_phase("Phase 5 addr_tables done");
+        } catch (const std::exception& ex) {
+            // Phase 5 is best-effort: a failure logs a warning but does not
+            // abort the feature store build. The runtime consumer falls back
+            // to the legacy per-batch hash-lookup path.
+            std::cerr << "FourLevelStore::build: WARNING Phase 5 addr_tables failed: "
+                      << ex.what() << " — runtime will use per-batch lookup fallback.\n";
+            result.addr_tables_built_ok = false;
         }
-        FdGuard guard(fd);
+    }
 
-        // Write header
-        write_all(fd, &header, sizeof(header), batch_path.string());
-
-        // Write ObjectId table
-        for (const auto& oid : slim_oids) {
-            uint64_t id = oid.id;
-            write_all(fd, &id, sizeof(id), batch_path.string());
-        }
-
-        // Write feature data
-        std::vector<char> buf(row_bytes);
-        for (auto row : slim_rows) {
-            std::memcpy(buf.data(), active_fm->row(row), row_bytes);
-            write_all(fd, buf.data(), row_bytes, batch_path.string());
-        }
-
-        if (::fsync(fd) < 0) {
-            throw std::runtime_error(
-                "FourLevelStore::build: fsync failed: " + safe_strerror(errno));
-        }
-
-        // Spec D: per-batch contribution to slim total. The file consists of
-        // a 32-byte header + N * 8 bytes of OID table + N * row_bytes of data.
-        slim_bytes_acc += sizeof(PackedBatchHeader)
-                       + slim_oids.size() * sizeof(uint64_t)
-                       + slim_oids.size() * row_bytes;
+    // Fix #22: source FM and reordered FM are no longer needed by this
+    // procedure. Hint the kernel so the next caller (typically gnn_train
+    // running back-to-back) starts with a clean page-cache budget instead
+    // of inheriting ~110 GB of stale source+reordered pages.
+    features.release_cache();
+    if (config.reorder && reordered_holder.has_value()) {
+        reordered_holder->release_cache();
     }
 
     // --- Step 5b: Spec D telemetry — measure on-disk footprint ---
@@ -368,6 +917,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
         // Best-effort cleanup of partial outputs
         std::error_code ec;
         fs::remove_all(packed_slim_dir, ec);
+        fs::remove_all(addr_tables_dir, ec);
         fs::remove(gpu_cache_path, ec);
         fs::remove(cpu_cache_path, ec);
         fs::remove(meta_path, ec);
@@ -596,8 +1146,18 @@ torch::Tensor FourLevelStore::load_features(const std::vector<ObjectId>& oids) {
 // =============================================================================
 
 torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
+    // Round 2B (2026-05-15): legacy path — read the sample here and dispatch
+    // to the GraphSample overload. Hot callers (BatchAssembler) skip this and
+    // call the overload directly with their already-deserialized sample to
+    // avoid the double-deserialize that previously cost ~55 MB read + parse
+    // per batch on papers100M-scale runs.
     auto sample = samples_->read_sample(batch_id);
+    return load_batch_features(sample);
+}
+
+torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample) {
     const auto& oids = sample.all_unique_nodes;
+    const uint64_t batch_id = sample.batch_id;
     uint64_t total = oids.size();
 
     if (total == 0) {
@@ -637,38 +1197,89 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         int fd = ::open(slim_path.c_str(), O_RDONLY);
         if (fd >= 0) {
             FdGuard guard(fd);
-            PackedBatchHeader hdr{};
-            read_all(fd, &hdr, sizeof(hdr), slim_path.string());
 
-            if (hdr.is_valid() && hdr.has_oid_table()) {
-                slim_nodes = hdr.num_nodes;
+            // Round 3A (2026-05-15): single bulk read of the entire .bin file
+            // into a stack-local buffer, then parse header/OID-table/features
+            // from it. Eliminates 2 syscalls per batch (3 reads -> 1) and the
+            // two intervening kernel/user copies. At 1300+ batches × 50 epochs
+            // = 65k+ batch-loads per E2E run, the saved syscall round-trips
+            // accumulate to several seconds of wall-clock.
+            //
+            // The kernel SEQUENTIAL hint pre-fetches aggressively for the
+            // single bulk read; the DONTNEED hint after consume tells the
+            // kernel these pages are no longer hot, preventing the L4 working
+            // set from squeezing out productive pages (FeatureMatrix /
+            // batches.dat) on memory-pressured runs (papers100M scale).
+            //
+            // Follow-up (deferred): we could elide the `slim_data` copy by
+            // moving `file_buf` into scope and indexing into it at the
+            // post-header offset; that's a bigger refactor for marginal gain.
 
-                // Read OID table
-                std::vector<uint64_t> oid_table(slim_nodes);
-                if (slim_nodes > 0) {
-                    read_all(fd, oid_table.data(),
-                             slim_nodes * sizeof(uint64_t),
-                             slim_path.string());
+            struct stat st{};
+            if (::fstat(fd, &st) < 0) {
+                throw std::runtime_error(
+                    "FourLevelStore: fstat failed on " + slim_path.string() +
+                    ": " + safe_strerror(errno));
+            }
+            const size_t file_size = static_cast<size_t>(st.st_size);
+
+            if (file_size >= sizeof(PackedBatchHeader)) {
+                // Hint sequential access pattern for the single bulk read.
+                ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
+                                POSIX_FADV_SEQUENTIAL);
+
+                std::vector<char> file_buf(file_size);
+                read_all(fd, file_buf.data(), file_size, slim_path.string());
+
+                PackedBatchHeader hdr{};
+                std::memcpy(&hdr, file_buf.data(), sizeof(hdr));
+
+                if (hdr.is_valid() && hdr.has_oid_table()) {
+                    uint64_t hdr_nodes  = hdr.num_nodes;
+                    size_t   data_bytes = hdr.data_bytes();
+                    size_t   oid_bytes  = hdr_nodes * sizeof(uint64_t);
+
+                    // Bounds-check the header's claims against the actual
+                    // file size — a truncated/corrupted file would have
+                    // tripped read_all's "unexpected EOF" in the old 3-read
+                    // path; we replicate that safety here without throwing
+                    // (treat as missing, identical to the no-file branch).
+                    bool sizes_ok = (sizeof(hdr) + oid_bytes + data_bytes)
+                                    <= file_size;
+                    if (sizes_ok) {
+                        slim_nodes = hdr_nodes;
+
+                        // Parse OID table (memcpy from file_buf).
+                        const char* p = file_buf.data() + sizeof(hdr);
+                        std::vector<uint64_t> oid_table(slim_nodes);
+                        if (slim_nodes > 0) {
+                            std::memcpy(oid_table.data(), p, oid_bytes);
+                            p += oid_bytes;
+                        }
+                        for (uint32_t j = 0; j < slim_nodes; ++j) {
+                            slim_oid_to_idx[oid_table[j]] = j;
+                        }
+
+                        // Parse feature data (memcpy from file_buf).
+                        if (data_bytes > 0) {
+                            slim_data.assign(p, p + data_bytes);
+                        }
+
+                        // Spec A1: account for the batch-wide disk traffic
+                        // of this slim file (header + OID table + features).
+                        // Per-node L4 payload bytes (l4_bytes_wanted) are
+                        // accumulated inside the partition loop below; this
+                        // is the actual physical read.
+                        stats_.l4_bytes_disk += sizeof(hdr)
+                                              + oid_bytes
+                                              + data_bytes;
+                    }
                 }
-                for (uint32_t j = 0; j < slim_nodes; ++j) {
-                    slim_oid_to_idx[oid_table[j]] = j;
-                }
 
-                // Read feature data
-                size_t data_bytes = hdr.data_bytes();
-                if (data_bytes > 0) {
-                    slim_data.resize(data_bytes);
-                    read_all(fd, slim_data.data(), data_bytes,
-                             slim_path.string());
-                }
-
-                // Spec A1: account for the batch-wide disk traffic of this
-                // slim file (header + OID table + features). Per-node L4
-                // payload bytes (l4_bytes_wanted) are accumulated inside the
-                // partition loop below; this is the actual physical read.
-                stats_.l4_bytes_disk += sizeof(hdr)
-                                      + slim_nodes * sizeof(uint64_t)
-                                      + data_bytes;
+                // Hint kernel that these pages can be evicted now — same
+                // hygiene as line 510 (cache-warm path) and the rest of
+                // Fix #22's DONTNEED policy in this file.
+                fadvise_dontneed(fd, 0, static_cast<off_t>(file_size));
             }
         }
     }
@@ -681,10 +1292,16 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
 
     // Step 2: Partition nodes into L1/L2/L3/L4 buckets.
     // Each bucket stores (output_position, source_data) for later assembly.
+    //
+    // Round 1C (2026-05-15): store cache row indices directly (l1_indices,
+    // l2_indices) instead of re-hashing later. The classification loop now
+    // performs one hash per oid (via find_index) on the L1/L2 hit path,
+    // down from two (contains() + lookup()/lookup_uva()).
     std::vector<uint32_t> l1_input_positions;    // positions in oids[] for L1 lookup
-    std::vector<ObjectId> l1_input_oids;
+    std::vector<uint32_t> l1_indices;            // L1 cache row indices for the hits
 
     std::vector<uint32_t> l2_positions;          // output positions resolved from L2
+    std::vector<uint32_t> l2_indices;            // L2 cache row indices for the hits
     std::vector<uint32_t> l3_positions;          // output positions resolved from L3
     std::vector<uint64_t> l3_row_indices;        // corresponding row indices in reordered FM
 
@@ -694,35 +1311,36 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     for (uint32_t i = 0; i < total; ++i) {
         const auto& oid = oids[i];
 
-        // Try L1 (GPU cache)
+        // Try L1 (GPU cache) — single hash via find_index (Round 1C).
         // Phase 0 (2026-05-17): time the L1 lookup independently of L2/L3/L4.
         if (gpu_cache_) {
             auto t_l1_lookup_start = std::chrono::steady_clock::now();
-            bool hit = gpu_cache_->contains(oid);
+            auto idx = gpu_cache_->find_index(oid);
             auto t_l1_lookup_end = std::chrono::steady_clock::now();
             last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l1_lookup_end - t_l1_lookup_start)
                                .count();
-            if (hit) {
+            if (idx.has_value()) {
                 l1_input_positions.push_back(i);
-                l1_input_oids.push_back(oid);
+                l1_indices.push_back(*idx);
                 stats_.l1_hits++;
                 stats_.l1_bytes_served += row_bytes;
                 continue;
             }
         }
 
-        // Try L2 (CPU cache)
+        // Try L2 (CPU cache) — single hash via find_index (Round 1C).
         // Phase 0 (2026-05-17): time the L2 lookup independently.
         if (cpu_cache_) {
             auto t_l2_lookup_start = std::chrono::steady_clock::now();
-            bool hit = cpu_cache_->contains(oid);
+            auto idx = cpu_cache_->find_index(oid);
             auto t_l2_lookup_end = std::chrono::steady_clock::now();
             last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l2_lookup_end - t_l2_lookup_start)
                                .count();
-            if (hit) {
+            if (idx.has_value()) {
                 l2_positions.push_back(i);
+                l2_indices.push_back(*idx);
                 stats_.l2_hits++;
                 stats_.l2_bytes_served += row_bytes;
                 continue;
@@ -831,23 +1449,22 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     if (use_assembler) {
         // --- GPU-accelerated assembly path ---
 
-        // L1: batch lookup returns [K1_hits, D] tensor on GPU
-        // Phase 0 (2026-05-17): time the L1 GPU batch lookup.
+        // L1: gather rows by pre-computed cache indices (Round 1C).
+        // The classification loop already validated each L1 hit, so
+        // every l1_indices[k] is in-range -- skip the second hash pass.
+        // Phase 0 (2026-05-17): time the L1 GPU gather.
         torch::Tensor gpu_features;
         std::vector<uint32_t> gpu_positions;
-        if (!l1_input_oids.empty()) {
+        if (!l1_indices.empty()) {
             auto t_l1_gather_start = std::chrono::steady_clock::now();
-            auto lr = gpu_cache_->lookup(l1_input_oids);
+            gpu_features = gpu_cache_->gather_by_indices(l1_indices);
             auto t_l1_gather_end = std::chrono::steady_clock::now();
             last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                t_l1_gather_end - t_l1_gather_start)
                                .count();
-            gpu_features = lr.features;
-            // Map hit_positions (indices into l1_input_oids) back to output positions
-            gpu_positions.reserve(lr.hit_positions.size());
-            for (auto hp : lr.hit_positions) {
-                gpu_positions.push_back(l1_input_positions[hp]);
-            }
+            // Every entry in l1_indices was already a hit; positions
+            // match 1:1 with l1_input_positions.
+            gpu_positions = l1_input_positions;
         }
 
         // Combine L2 + L3 + L4 CPU features into one contiguous float buffer
@@ -859,19 +1476,30 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         cpu_combined_positions.reserve(cpu_total);
 
         // L2 features
-        // Phase 0 (2026-05-17): time the L2 lookup + copy.
+        //
+        // Round 1B (2026-05-15): use CpuCache::lookup_uva() to avoid the
+        // per-batch std::vector<char> allocation + memcpy that the standard
+        // lookup() does. lookup_uva() returns pointers into the already-
+        // pinned feature region; we still memcpy from those pointers into
+        // cpu_combined here (so the assembler kernel sees one contiguous
+        // pinned buffer), but the row data is copied exactly once (pinned
+        // L2 region -> cpu_combined growth -> pinned_ptr_) instead of twice
+        // (pinned L2 region -> lr.features heap vector -> cpu_combined ->
+        // pinned_ptr_). Saves ~num_l2_hits row-byte memcpys per batch.
+        //
+        // Round 1C (2026-05-15): use pre-computed l2_indices via row_ptr()
+        // directly -- skip the lookup_uva() find loop. Each L2 hit was
+        // already validated in the classification loop.
+        // Phase 0 (2026-05-17): time the L2 pinned-row copy.
         if (!l2_positions.empty()) {
             auto t_l2_copy_start = std::chrono::steady_clock::now();
-            std::vector<ObjectId> l2_oids;
-            l2_oids.reserve(l2_positions.size());
-            for (auto pos : l2_positions) l2_oids.push_back(oids[pos]);
-            auto lr = cpu_cache_->lookup(l2_oids);
-            const float* l2_data = reinterpret_cast<const float*>(lr.features.data());
-            for (size_t h = 0; h < lr.hit_positions.size(); ++h) {
-                cpu_combined_positions.push_back(l2_positions[lr.hit_positions[h]]);
+            for (size_t h = 0; h < l2_positions.size(); ++h) {
+                cpu_combined_positions.push_back(l2_positions[h]);
+                const float* row_ptr_f = static_cast<const float*>(
+                    cpu_cache_->row_ptr(l2_indices[h]));
                 cpu_combined.insert(cpu_combined.end(),
-                                    l2_data + h * feature_dim_,
-                                    l2_data + (h + 1) * feature_dim_);
+                                    row_ptr_f,
+                                    row_ptr_f + feature_dim_);
             }
             auto t_l2_copy_end = std::chrono::steady_clock::now();
             last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -917,19 +1545,19 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         // C2: Pin the CPU combined buffer for UVA access from the CUDA
         // assembler kernel.  Unpinned heap memory forces the GPU to read
         // through UVA at ~120 MB/s; pinned memory achieves ~12 GB/s.
+        //
+        // Round 1A (2026-05-15): use the persistent pinned-host buffer pool
+        // instead of cudaHostAlloc+cudaFreeHost per batch. The buffer grows
+        // geometrically and is freed once in ~FourLevelStore().
         const float* assembler_data = cpu_combined.data();
-        float* pinned_buf = nullptr;
 #ifdef GNN_CUDA_ENABLED
         size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
-        if (cpu_combined_bytes > 0) {
-            if (cudaHostAlloc(reinterpret_cast<void**>(&pinned_buf),
-                              cpu_combined_bytes,
-                              cudaHostAllocDefault) == cudaSuccess) {
-                std::memcpy(pinned_buf, cpu_combined.data(), cpu_combined_bytes);
-                assembler_data = pinned_buf;
-            } else {
-                pinned_buf = nullptr;  // fallback to unpinned
-            }
+        if (cpu_combined_bytes > 0 && ensure_pinned_capacity(cpu_combined_bytes)) {
+            // pinned_ptr_ is grow-only and never reallocated under us inside
+            // a single call site (we just ensured capacity above); the lock
+            // is only contended across concurrent grow attempts.
+            std::memcpy(pinned_ptr_, cpu_combined.data(), cpu_combined_bytes);
+            assembler_data = reinterpret_cast<const float*>(pinned_ptr_);
         }
 #endif
 
@@ -941,11 +1569,7 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
             cpu_combined_positions
         );
 
-#ifdef GNN_CUDA_ENABLED
-        if (pinned_buf) {
-            cudaFreeHost(pinned_buf);
-        }
-#endif
+        // No per-batch cudaFreeHost — pinned_ptr_ is reused; freed in dtor.
         return result_tensor;
     }
 
@@ -955,17 +1579,22 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
         torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
     char* out_ptr = static_cast<char*>(output.data_ptr());
 
-    // L1 features (GPU cache -> CPU copy, one-by-one)
+    // L1 features (GPU cache -> CPU copy)
+    //
+    // Round 1C (2026-05-15): batch via gather_by_indices(l1_indices) +
+    // single .cpu().contiguous() + strided memcpy. Pre-Round-1C this loop
+    // did one gpu_cache_->lookup({l1_input_oids[k]}) per hit -- each call
+    // built a one-element index tensor, ran index_select on GPU, and
+    // copied back to host. Now one gather/copy serves all L1 hits.
     // Phase 0 (2026-05-17): time the CPU-path L1 gather+copy.
-    if (!l1_input_oids.empty()) {
+    if (!l1_indices.empty()) {
         auto t_l1_cpu_start = std::chrono::steady_clock::now();
-        for (size_t k = 0; k < l1_input_oids.size(); ++k) {
-            auto lr = gpu_cache_->lookup({l1_input_oids[k]});
-            if (!lr.hit_positions.empty()) {
-                auto cpu_feats = lr.features.cpu().contiguous();
-                std::memcpy(out_ptr + l1_input_positions[k] * row_bytes,
-                            cpu_feats.data_ptr(), row_bytes);
-            }
+        auto l1_feats = gpu_cache_->gather_by_indices(l1_indices)
+                            .cpu().contiguous();
+        const char* l1_src = static_cast<const char*>(l1_feats.data_ptr());
+        for (size_t k = 0; k < l1_indices.size(); ++k) {
+            std::memcpy(out_ptr + l1_input_positions[k] * row_bytes,
+                        l1_src + k * row_bytes, row_bytes);
         }
         auto t_l1_cpu_end = std::chrono::steady_clock::now();
         last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -974,15 +1603,22 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
     }
 
     // L2 features
+    //
+    // Round 1B (2026-05-15): batch + zero-copy via lookup_uva. Pre-fix did
+    // one cpu_cache_->lookup({oids[pos]}) per L2 hit, each call allocating
+    // a fresh std::vector<char>(row_bytes) and memcpying the row into it,
+    // then we memcpyed from that vector into out_ptr. Now we ask for all
+    // L2 oids in one call, get UVA pointers back, and memcpy directly from
+    // the pinned region into out_ptr.
+    //
+    // Round 1C (2026-05-15): use the pre-computed l2_indices + row_ptr()
+    // directly so we skip the find loop inside lookup_uva.
     // Phase 0 (2026-05-17): time the CPU-path L2 copy.
     if (!l2_positions.empty()) {
         auto t_l2_cpu_start = std::chrono::steady_clock::now();
-        for (auto pos : l2_positions) {
-            auto lr = cpu_cache_->lookup({oids[pos]});
-            if (!lr.hit_positions.empty()) {
-                std::memcpy(out_ptr + pos * row_bytes,
-                            lr.features.data(), row_bytes);
-            }
+        for (size_t h = 0; h < l2_positions.size(); ++h) {
+            std::memcpy(out_ptr + l2_positions[h] * row_bytes,
+                        cpu_cache_->row_ptr(l2_indices[h]), row_bytes);
         }
         auto t_l2_cpu_end = std::chrono::steady_clock::now();
         last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(

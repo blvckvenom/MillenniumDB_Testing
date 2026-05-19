@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@
 #include "gnn/storage/gnn_dtype.h"
 #include "gnn/storage/packed_batch_store.h"
 #include "gnn/storage/row_mapping.h"
+#include "gnn/sampling/graph_sample.h"
 #include "gnn/sampling/minhash_reorderer.h"
 #include "gnn/sampling/sample_storage.h"
 #include "graph_models/object_id.h"
@@ -135,6 +137,29 @@ public:
         CpuCache::Config cpu;
         bool   reorder = true;
         bool   force   = false;
+
+        // Fix #15 (2026-05-13): granular force flags. When `force=true`,
+        // these toggles let callers preserve specific outputs across a
+        // rebuild. Useful for validating individual phases without
+        // paying the cost of recomputing parts that are still valid.
+        //
+        // Each defaults to `true` so legacy callers passing only `force`
+        // get the historical full-clobber behaviour. Set to `false` to
+        // keep that output across a force rebuild — the matching build
+        // phase will skip if the file already exists with the right
+        // header (Fix #14 idempotency in L1/L2; existing reordered.fmat
+        // bypasses the MinHash recompute in L3).
+        bool   force_caches      = true;  // delete L1 gpu_cache + L2 cpu_cache
+        bool   force_reorder     = true;  // delete reordered.fmat + .rmap
+        bool   force_packed_slim = true;  // delete packed_slim/
+        bool   force_meta        = true;  // delete store.meta
+
+        // Phase 5 (2026-05-19): pre-classify every batch's unique nodes into
+        // {L1, L2, L4, L3, zero} and persist the results as
+        // addr_tables/batch_NNNNNN.addr sidecars next to packed_slim/.
+        // Set to false only to skip Phase 5 (e.g., when rebuilding caches only).
+        bool   build_addr_tables = true;
+
         // After build() succeeds, delete the non-slim packed/ directory left
         // over by materialize_batches. This scratch is never read at runtime
         // (training reads packed_slim/) and on large graphs wastes tens of
@@ -175,6 +200,12 @@ public:
         uint64_t cpu_cache_bytes  = 0;
         uint64_t total_disk_bytes = 0;
         bool     over_budget      = false;
+
+        // Phase 5 (2026-05-19): addr_table sidecar telemetry.
+        // addr_tables_bytes — total bytes written to addr_tables/*.addr files.
+        // addr_tables_built_ok — true iff Phase 5 completed without error.
+        uint64_t addr_tables_bytes    = 0;
+        bool     addr_tables_built_ok = false;
     };
 
     /// Preprocessing: classify nodes by frequency, build caches, re-pack L4 slim.
@@ -194,11 +225,21 @@ public:
         SampleStorage&               samples
     );
 
+    /// Destructor: releases the persistent pinned host buffer (if any).
+    ~FourLevelStore();
+
     /// Primitive: features for a set of nodes (L1 -> L2 -> L3 fallback, no L4).
     torch::Tensor load_features(const std::vector<ObjectId>& oids);
 
     /// Convenience: features for a batch (all 4 levels including L4).
+    /// Legacy: looks up the sample by batch_id via SampleStorage, then dispatches
+    /// to the overload below. Pays the deserialize cost once.
     torch::Tensor load_batch_features(uint64_t batch_id);
+
+    /// Round 2B (2026-05-15): Load batch features given an already-deserialized
+    /// GraphSample. Avoids re-reading + re-parsing the sample when the caller
+    /// (e.g., BatchAssembler::assemble_from_sample) already has it in hand.
+    torch::Tensor load_batch_features(const GraphSample& sample);
 
     struct Stats {
         // Per-tier node-count counters (existing).
@@ -281,6 +322,20 @@ private:
     uint64_t       l3_header_size_ = FeatureMatrixHeader::SIZE; // data offset past header
     Stats          stats_;
 
+    // Round 1A optimization (2026-05-15): persistent pinned host buffer reused
+    // across load_batch_features() calls. Replaces per-batch
+    // cudaHostAlloc + cudaFreeHost (each is a synchronous driver call
+    // ~100-500 us). On papers100M with 1300+ batches/epoch the old path
+    // burned ~150-600 ms/epoch on alloc churn alone.
+    //
+    // ensure_pinned_capacity(bytes) grows the buffer if needed (geometric
+    // x1.5 plus 64-byte alignment headroom) and is thread-safe via
+    // pinned_mutex_. The buffer outlives any single batch and is freed
+    // exactly once in the destructor.
+    mutable std::mutex pinned_mutex_;
+    void*              pinned_ptr_      = nullptr;
+    size_t             pinned_capacity_ = 0;
+
     // Phase 0 (2026-05-17) profile instrumentation. Per-call sub-timers in
     // nanoseconds (high precision to avoid integer-microsecond truncation of
     // sub-μs hash lookups). Accessors below convert to μs at the API boundary.
@@ -291,6 +346,11 @@ private:
     mutable uint64_t last_l3_ns_   = 0;
     mutable uint64_t last_l4_ns_   = 0;
     mutable uint64_t last_rmap_ns_ = 0;
+
+    /// Ensure the persistent pinned buffer is at least `bytes` long.
+    /// Returns true on success, false if cudaHostAlloc failed (caller falls
+    /// back to unpinned memory). No-op when GNN_CUDA_ENABLED is undefined.
+    bool ensure_pinned_capacity(size_t bytes);
 
     /// Map GnnDtype to torch scalar type.
     static torch::ScalarType to_torch_dtype(GnnDtype dt);
