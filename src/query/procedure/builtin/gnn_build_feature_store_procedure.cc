@@ -83,6 +83,23 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_bool("force")) {
             config.force = *v;
         }
+        // Fix #15: granular force flags. Each defaults to true, so passing
+        // `force: true` alone preserves legacy behaviour. Set to false to
+        // preserve a specific output across a force rebuild. Examples:
+        //   {force: true, force_reorder: false}
+        //       Rebuild L1/L2 caches + packed_slim, KEEP reordered.fmat.
+        //       Skips the MinHash recompute (typically the L3 wall-clock
+        //       leader on papers100M-scale graphs).
+        //   {force: true, force_caches: false, force_reorder: false}
+        //       Rebuild only packed_slim + meta. Useful to re-bench Fix #1-4.
+        if (auto v = opts.get_bool("force_caches"))      config.force_caches = *v;
+        if (auto v = opts.get_bool("force_reorder"))     config.force_reorder = *v;
+        if (auto v = opts.get_bool("force_packed_slim")) config.force_packed_slim = *v;
+        if (auto v = opts.get_bool("force_meta"))        config.force_meta = *v;
+        // Path 4 (2026-05-19): pre-resolve per-batch classification offline.
+        // Default true — enables the fast runtime path in gnn_train via
+        // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip Phase 5.
+        if (auto v = opts.get_bool("buildAddrTables")) config.build_addr_tables = *v;
         // cleanupIntermediate: delete the non-slim packed/ from materialize_batches
         // after build succeeds. Default true. Set false only for debugging.
         if (auto v = opts.get_bool("cleanupIntermediate")) {
@@ -191,6 +208,11 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("cpuCacheMb",   ctx.create_int(bytes_to_mb(result.cpu_cache_bytes)));
     ctx.yield("totalDiskMb",  ctx.create_int(bytes_to_mb(result.total_disk_bytes)));
     ctx.yield("overBudget",   ctx.create_bool(result.over_budget));
+    // Path 4 (2026-05-19): Phase 5 telemetry.
+    ctx.yield("addrTablesMb",
+              ctx.create_int(bytes_to_mb(result.addr_tables_bytes)));
+    ctx.yield("addrTablesBuiltOk",
+              ctx.create_bool(result.addr_tables_built_ok));
     ctx.yield_row();
 }
 
