@@ -835,7 +835,16 @@ bindingVariableReferenceList
    ;
 
 namedProcedureCall
-   : procedureReference LEFT_PAREN procedureArgumentList? RIGHT_PAREN yieldClause?
+   : procedureReference LEFT_PAREN procedureCallArgumentList? RIGHT_PAREN yieldClause?
+   ;
+
+procedureCallArgumentList
+   : procedureCallArgument (COMMA procedureCallArgument)*
+   ;
+
+procedureCallArgument
+   : identifier COLON expression
+   | expression
    ;
 
 procedureArgumentList

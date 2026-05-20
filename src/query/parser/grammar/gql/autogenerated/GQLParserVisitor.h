@@ -379,6 +379,10 @@ public:
 
     virtual std::any visitNamedProcedureCall(GQLParser::NamedProcedureCallContext *context) = 0;
 
+    virtual std::any visitProcedureCallArgumentList(GQLParser::ProcedureCallArgumentListContext *context) = 0;
+
+    virtual std::any visitProcedureCallArgument(GQLParser::ProcedureCallArgumentContext *context) = 0;
+
     virtual std::any visitProcedureArgumentList(GQLParser::ProcedureArgumentListContext *context) = 0;
 
     virtual std::any visitProcedureArgument(GQLParser::ProcedureArgumentContext *context) = 0;

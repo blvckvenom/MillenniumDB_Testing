@@ -735,6 +735,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitProcedureCallArgumentList(GQLParser::ProcedureCallArgumentListContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitProcedureCallArgument(GQLParser::ProcedureCallArgumentContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitProcedureArgumentList(GQLParser::ProcedureArgumentListContext *ctx) override {
     return visitChildren(ctx);
   }
