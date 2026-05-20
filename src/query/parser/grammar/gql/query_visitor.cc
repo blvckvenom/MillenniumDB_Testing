@@ -2211,14 +2211,16 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
     }
 
     current_call_argument_exprs.clear();
-    if (named_procedure_call->procedureArgumentList()) {
+    if (named_procedure_call->procedureCallArgumentList()) {
         if (procedure_type != OpProcedure::ProcedureType::JACCARD) {
             throw QueryException(
                 "CALL statement procedure \"" + procedure_name
                 + "\" does not support arguments yet"
             );
         }
-        for (auto* procedure_argument_ctx : named_procedure_call->procedureArgumentList()->procedureArgument()) {
+        for (auto* procedure_argument_ctx :
+             named_procedure_call->procedureCallArgumentList()->procedureCallArgument())
+        {
             visit(procedure_argument_ctx->expression());
             current_call_argument_exprs.emplace_back(std::move(current_expr));
         }
