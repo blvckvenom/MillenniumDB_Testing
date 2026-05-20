@@ -1,5 +1,6 @@
 #include "jaccard.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -109,6 +110,48 @@ void Jaccard::_reset()
                     GQL::Conversions::pack_double(similarity)
                 );
             }
+        }
+    }
+
+    if (top_n.has_value()) {
+        std::sort(results.begin(), results.end(), [](const auto& lhs, const auto& rhs) {
+            const auto& [lhs_node1, lhs_node2, lhs_similarity_oid] = lhs;
+            const auto& [rhs_node1, rhs_node2, rhs_similarity_oid] = rhs;
+
+            const double lhs_similarity = GQL::Conversions::to_double(lhs_similarity_oid);
+            const double rhs_similarity = GQL::Conversions::to_double(rhs_similarity_oid);
+
+            if (lhs_similarity != rhs_similarity) {
+                return lhs_similarity > rhs_similarity;
+            }
+            if (lhs_node1.id != rhs_node1.id) {
+                return lhs_node1.id < rhs_node1.id;
+            }
+            return lhs_node2.id < rhs_node2.id;
+        });
+
+        if (*top_n < results.size()) {
+            results.resize(static_cast<std::size_t>(*top_n));
+        }
+    } else if (bottom_n.has_value()) {
+        std::sort(results.begin(), results.end(), [](const auto& lhs, const auto& rhs) {
+            const auto& [lhs_node1, lhs_node2, lhs_similarity_oid] = lhs;
+            const auto& [rhs_node1, rhs_node2, rhs_similarity_oid] = rhs;
+
+            const double lhs_similarity = GQL::Conversions::to_double(lhs_similarity_oid);
+            const double rhs_similarity = GQL::Conversions::to_double(rhs_similarity_oid);
+
+            if (lhs_similarity != rhs_similarity) {
+                return lhs_similarity < rhs_similarity;
+            }
+            if (lhs_node1.id != rhs_node1.id) {
+                return lhs_node1.id < rhs_node1.id;
+            }
+            return lhs_node2.id < rhs_node2.id;
+        });
+
+        if (*bottom_n < results.size()) {
+            results.resize(static_cast<std::size_t>(*bottom_n));
         }
     }
 }
