@@ -164,8 +164,18 @@ void Jaccard::eval_arguments()
     top_n.reset();
     bottom_n.reset();
 
-    auto eval_numeric = [&](std::size_t arg_pos, const char* arg_name) -> ObjectId {
+    auto eval_optional_oid = [&](std::size_t arg_pos) -> std::optional<ObjectId> {
+        if (arg_pos >= argument_binding_exprs.size()) {
+            return std::nullopt;
+        }
         const ObjectId oid = argument_binding_exprs[arg_pos]->eval(*parent_binding);
+        if (oid.is_null()) {
+            return std::nullopt;
+        }
+        return oid;
+    };
+
+    auto eval_numeric = [&](const ObjectId oid, const char* arg_name) -> ObjectId {
         switch (oid.get_sub_type()) {
         case ObjectId::MASK_INT:
         case ObjectId::MASK_DECIMAL:
@@ -179,8 +189,7 @@ void Jaccard::eval_arguments()
         }
     };
 
-    auto eval_non_negative_integer = [&](std::size_t arg_pos, const char* arg_name) -> uint64_t {
-        const ObjectId oid = argument_binding_exprs[arg_pos]->eval(*parent_binding);
+    auto eval_non_negative_integer = [&](const ObjectId oid, const char* arg_name) -> uint64_t {
         if (oid.get_sub_type() != ObjectId::MASK_INT) {
             throw QueryExecutionException(
                 std::string("CALL jaccard(...): ") + arg_name + " must be an integer >= 0"
@@ -196,25 +205,25 @@ void Jaccard::eval_arguments()
         return static_cast<uint64_t>(value);
     };
 
-    if (argument_binding_exprs.size() >= 1) {
-        const ObjectId cutoff_oid = eval_numeric(0, "similarityCutoff");
+    if (auto maybe_cutoff_oid = eval_optional_oid(0); maybe_cutoff_oid.has_value()) {
+        const ObjectId cutoff_oid = eval_numeric(*maybe_cutoff_oid, "similarityCutoff");
         similarity_cutoff = GQL::Conversions::to_double(cutoff_oid);
     }
 
-    if (argument_binding_exprs.size() >= 2) {
-        degree_cutoff = eval_non_negative_integer(1, "degreeCutoff");
+    if (auto maybe_degree_cutoff_oid = eval_optional_oid(1); maybe_degree_cutoff_oid.has_value()) {
+        degree_cutoff = eval_non_negative_integer(*maybe_degree_cutoff_oid, "degreeCutoff");
     }
 
-    if (argument_binding_exprs.size() >= 3) {
-        upper_degree_cutoff = eval_non_negative_integer(2, "upperDegreeCutoff");
+    if (auto maybe_upper_degree_cutoff_oid = eval_optional_oid(2); maybe_upper_degree_cutoff_oid.has_value()) {
+        upper_degree_cutoff = eval_non_negative_integer(*maybe_upper_degree_cutoff_oid, "upperDegreeCutoff");
     }
 
-    if (argument_binding_exprs.size() >= 4) {
-        top_n = eval_non_negative_integer(3, "topN");
+    if (auto maybe_top_n_oid = eval_optional_oid(3); maybe_top_n_oid.has_value()) {
+        top_n = eval_non_negative_integer(*maybe_top_n_oid, "topN");
     }
 
-    if (argument_binding_exprs.size() >= 5) {
-        bottom_n = eval_non_negative_integer(4, "bottomN");
+    if (auto maybe_bottom_n_oid = eval_optional_oid(4); maybe_bottom_n_oid.has_value()) {
+        bottom_n = eval_non_negative_integer(*maybe_bottom_n_oid, "bottomN");
     }
 
     if (!std::isfinite(similarity_cutoff) || similarity_cutoff < 0.0 || similarity_cutoff > 1.0) {

@@ -2218,18 +2218,63 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
                 + "\" does not support arguments yet"
             );
         }
-        for (auto* procedure_argument_ctx :
-             named_procedure_call->procedureCallArgumentList()->procedureCallArgument())
-        {
-            visit(procedure_argument_ctx->expression());
-            current_call_argument_exprs.emplace_back(std::move(current_expr));
-        }
-        if (current_call_argument_exprs.size() > 5) {
+        auto* argument_list_ctx = named_procedure_call->procedureCallArgumentList();
+        const auto argument_count = argument_list_ctx->procedureCallArgument().size();
+
+        if (argument_count > 5) {
             throw QueryException(
-                "CALL jaccard(...) expects at most five positional arguments: "
+                "CALL jaccard(...) expects at most five named arguments: "
                 "similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
             );
         }
+
+        std::vector<bool> seen_named_args(5, false);
+        std::vector<std::unique_ptr<Expr>> named_args;
+        named_args.reserve(5);
+        for (size_t i = 0; i < 5; ++i) {
+            named_args.emplace_back(std::make_unique<ExprTerm>(ObjectId::get_null()));
+        }
+
+        for (auto* argument_ctx : argument_list_ctx->procedureCallArgument()) {
+            if (!argument_ctx->identifier()) {
+                throw QueryException(
+                    "CALL jaccard(...) only supports named arguments: "
+                    "similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
+                );
+            }
+
+            const std::string argument_name = argument_ctx->identifier()->getText();
+
+            size_t argument_pos = 0;
+            if (argument_name == "similarityCutoff") {
+                argument_pos = 0;
+            } else if (argument_name == "degreeCutoff") {
+                argument_pos = 1;
+            } else if (argument_name == "upperDegreeCutoff") {
+                argument_pos = 2;
+            } else if (argument_name == "topN") {
+                argument_pos = 3;
+            } else if (argument_name == "bottomN") {
+                argument_pos = 4;
+            } else {
+                throw QueryException(
+                    "CALL jaccard(...): unknown named argument \"" + argument_name
+                    + "\". Allowed names are: similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
+                );
+            }
+
+            if (seen_named_args[argument_pos]) {
+                throw QueryException(
+                    "CALL jaccard(...): named argument \"" + argument_name + "\" cannot be repeated"
+                );
+            }
+            seen_named_args[argument_pos] = true;
+
+            visit(argument_ctx->expression());
+            named_args[argument_pos] = std::move(current_expr);
+        }
+
+        current_call_argument_exprs = std::move(named_args);
     }
 
     // TODO: procesar YIELD
