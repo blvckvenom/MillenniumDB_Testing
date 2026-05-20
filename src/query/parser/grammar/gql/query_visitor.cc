@@ -2274,6 +2274,10 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             named_args[argument_pos] = std::move(current_expr);
         }
 
+        if (seen_named_args[3] && seen_named_args[4]) {
+            throw QueryException("CALL jaccard(...): topN and bottomN cannot be used together");
+        }
+
         current_call_argument_exprs = std::move(named_args);
     }
 
