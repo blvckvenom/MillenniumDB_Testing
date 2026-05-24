@@ -42,7 +42,16 @@ void L2CompactCsr::add_node(uint64_t                     src_node_id,
     // ObjectId payload occupies the lower 56 bits; we drop only the
     // 8-bit type tag here. uint32 truncation safety is enforced at
     // freeze() time.
-    col_idx_.reserve(col_idx_.size() + neighbors.size());
+    //
+    // NOTE (2026-05-21 fix): the previous version called
+    //   col_idx_.reserve(col_idx_.size() + neighbors.size());
+    // before each push_back loop. That defeats vector's geometric
+    // growth strategy: every reserve(N+k) with N+k > capacity forces
+    // a fresh allocation + copy of all N existing elements, making
+    // add_node O(N) and the populate phase O(E_l2²) overall. On
+    // papers100M (~210M tier-2 edges) this caused a >19 h hang in
+    // populate_via_sidecar. Plain push_back amortizes to O(1) via
+    // vector's exponential capacity growth, restoring linear total.
     for (const auto& nb : neighbors) {
         col_idx_.push_back(static_cast<uint32_t>(nb.node_id));
     }
