@@ -181,3 +181,9 @@ void PushLabels::visit(OpCallProcedure& op)
 {
     tmp = op.clone();
 }
+
+void PushLabels::visit(OpOptional& op_optional)
+{
+    op_optional.op->accept_visitor(*this);
+    tmp = std::make_unique<OpOptional>(std::move(tmp));
+}

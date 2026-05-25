@@ -89,3 +89,8 @@ void AddStartingEnum::visit(OpUnitTable&) { }
 void AddStartingEnum::visit(OpEmpty&) { }
 
 void AddStartingEnum::visit(OpCallProcedure&) { }
+
+void AddStartingEnum::visit(OpOptional& op)
+{
+    op.op->accept_visitor(*this);
+}

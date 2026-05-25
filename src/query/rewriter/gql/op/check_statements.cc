@@ -54,3 +54,9 @@ void CheckStatements::visit(OpCallProcedure&)
     // and precede RETURN, just like MATCH and LET
     has_match_or_let = true;
 }
+
+void CheckStatements::visit(OpOptional& op_optional)
+{
+    has_match_or_let = true;
+    op_optional.op->accept_visitor(*this);
+}

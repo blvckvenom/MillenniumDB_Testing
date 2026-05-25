@@ -139,3 +139,15 @@ void RewriteRuleVisitor::visit(OpPathUnion& op)
         pattern->accept_visitor(*this);
     }
 }
+
+void RewriteRuleVisitor::visit(OpOptional& op_optional)
+{
+    for (auto& rule : rules) {
+        if (rule->is_possible_to_regroup(op_optional.op)) {
+            op_optional.op = rule->regroup(std::move(op_optional.op));
+            has_rewritten = true;
+        }
+    }
+
+    op_optional.op->accept_visitor(*this);
+}

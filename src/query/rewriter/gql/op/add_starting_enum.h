@@ -32,5 +32,6 @@ public:
     void visit(OpNode&) override;
     void visit(OpEdge&) override;
     void visit(OpCallProcedure&) override;
+    void visit(OpOptional& op) override;
 };
 } // namespace GQL

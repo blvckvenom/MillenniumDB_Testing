@@ -89,3 +89,8 @@ void CheckUnboundedRepetition::visit(OpUnitTable&) { }
 void CheckUnboundedRepetition::visit(OpEmpty&) { }
 
 void CheckUnboundedRepetition::visit(OpCallProcedure&) { }
+
+void CheckUnboundedRepetition::visit(OpOptional& op)
+{
+    op.op->accept_visitor(*this);
+}

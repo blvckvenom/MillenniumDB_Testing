@@ -17,6 +17,7 @@
 #include "query/executor/binding_iter/gql/path_to_binding.h"
 #include "query/executor/binding_iter/gql/repetition.h"
 #include "query/executor/binding_iter/gql/union_path.h"
+#include "query/executor/binding_iter/index_left_outer_join.h"
 #include "query/executor/binding_iter/index_nested_loop_join.h"
 #include "query/executor/binding_iter/object_enum.h"
 #include "query/executor/binding_iter/order_by.h"
@@ -325,6 +326,33 @@ void PathBindingIterConstructor::visit(OpGraphPatternList& op)
     } else {
         tmp_iter = std::move(current_tmp);
     }
+}
+
+void PathBindingIterConstructor::visit(OpOptional& op_optional)
+{
+    auto previous_iter = std::move(tmp_iter);
+    auto previous_assigned_vars = assigned_vars;
+
+    op_optional.op->accept_visitor(*this);
+    auto optional_iter = std::move(tmp_iter);
+
+    if (previous_iter == nullptr) {
+        tmp_iter = std::move(optional_iter);
+        return;
+    }
+
+    std::vector<VarId> rhs_only_vars;
+    for (auto& var : op_optional.op->get_all_vars()) {
+        if (!previous_assigned_vars.count(var)) {
+            rhs_only_vars.push_back(var);
+        }
+    }
+
+    tmp_iter = std::make_unique<IndexLeftOuterJoin>(
+        std::move(previous_iter),
+        std::move(optional_iter),
+        std::move(rhs_only_vars)
+    );
 }
 
 void PathBindingIterConstructor::visit(OpGraphPattern& op_graph_pattern)

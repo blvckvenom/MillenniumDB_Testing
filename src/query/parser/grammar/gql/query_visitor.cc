@@ -118,6 +118,13 @@ std::any QueryVisitor::visitMatchStatement(GQLParser::MatchStatementContext* ctx
     return 0;
 }
 
+std::any QueryVisitor::visitOptionalMatchStatement(GQLParser::OptionalMatchStatementContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->optionalOperand());
+    return 0;
+}
+
 std::any QueryVisitor::visitLetStatement(GQLParser::LetStatementContext* ctx)
 {
     LOG_VISITOR
@@ -2774,9 +2781,18 @@ std::any QueryVisitor::visitNextStatement(GQLParser::NextStatementContext*)
     throw NotSupportedException("Composite query");
 }
 
-std::any QueryVisitor::visitOptionalOperand(GQLParser::OptionalOperandContext*)
+std::any QueryVisitor::visitOptionalOperand(GQLParser::OptionalOperandContext* ctx)
 {
-    throw NotSupportedException("Optional match");
+    LOG_VISITOR
+
+    auto simple_match_statement = ctx->simpleMatchStatement();
+    if (simple_match_statement == nullptr) {
+        throw NotSupportedException("Optional block");
+    }
+
+    visit(simple_match_statement);
+    current_op = std::make_unique<OpOptional>(std::move(current_op));
+    return 0;
 }
 
 std::any QueryVisitor::visitGraphPatternYieldClause(GQLParser::GraphPatternYieldClauseContext*)

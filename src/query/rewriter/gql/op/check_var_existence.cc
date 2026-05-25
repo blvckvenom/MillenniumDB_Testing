@@ -250,4 +250,9 @@ void CheckVarExistence::visit(OpCallProcedure& op_call_procedure)
     }
 }
 
+void CheckVarExistence::visit(OpOptional& op)
+{
+    op.op->accept_visitor(*this);
+}
+
 } // namespace GQL
