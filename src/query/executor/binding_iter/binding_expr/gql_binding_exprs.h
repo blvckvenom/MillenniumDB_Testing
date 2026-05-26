@@ -42,6 +42,7 @@
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_floor.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_ceil.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_length.h" // IWYU pragma: export
+#include "query/executor/binding_iter/binding_expr/gql/binding_expr_list_comprehension.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_list_size.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_nodes_of_path.h" // IWYU pragma: export
 #include "query/executor/binding_iter/binding_expr/gql/binding_expr_relationships_of_path.h" // IWYU pragma: export

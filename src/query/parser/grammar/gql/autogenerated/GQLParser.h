@@ -278,10 +278,10 @@ public:
     RuleDateString = 481, RuleTimeString = 482, RuleDatetimeString = 483, 
     RuleDurationFunction = 484, RuleDurationFunctionParameters = 485, RuleDurationString = 486, 
     RuleGeneralFunction = 487, RuleCollectionValueConstructor = 488, RuleTrimSpecification = 489, 
-    RuleNormalForm = 490, RuleListValueConstructor = 491, RuleRecordValueConstructor = 492, 
-    RuleField = 493, RulePathValueConstructor = 494, RuleUnsignedLiteral = 495, 
-    RuleGeneralLiteral = 496, RuleListLiteral = 497, RuleRecordLiteral = 498, 
-    RuleRecordFieldLiteral = 499, RuleKeyword = 500
+    RuleNormalForm = 490, RuleListValueConstructor = 491, RuleListComprehension = 492, 
+    RuleRecordValueConstructor = 493, RuleField = 494, RulePathValueConstructor = 495, 
+    RuleUnsignedLiteral = 496, RuleGeneralLiteral = 497, RuleListLiteral = 498, 
+    RuleRecordLiteral = 499, RuleRecordFieldLiteral = 500, RuleKeyword = 501
   };
 
   explicit GQLParser(antlr4::TokenStream *input);
@@ -793,6 +793,7 @@ public:
   class TrimSpecificationContext;
   class NormalFormContext;
   class ListValueConstructorContext;
+  class ListComprehensionContext;
   class RecordValueConstructorContext;
   class FieldContext;
   class PathValueConstructorContext;
@@ -9170,6 +9171,7 @@ public:
     ListValueConstructorContext(antlr4::ParserRuleContext *parent, size_t invokingState);
     virtual size_t getRuleIndex() const override;
     antlr4::tree::TerminalNode *LEFT_BRACKET();
+    ListComprehensionContext *listComprehension();
     antlr4::tree::TerminalNode *RIGHT_BRACKET();
     ListValueTypeNameContext *listValueTypeName();
     std::vector<ExpressionContext *> expression();
@@ -9183,6 +9185,28 @@ public:
   };
 
   ListValueConstructorContext* listValueConstructor();
+
+  class  ListComprehensionContext : public antlr4::ParserRuleContext {
+  public:
+    GQLParser::BindingVariableContext *compVar = nullptr;
+    GQLParser::ExpressionContext *sourceList = nullptr;
+    GQLParser::ExpressionContext *predicate = nullptr;
+    GQLParser::ExpressionContext *projection = nullptr;
+    ListComprehensionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *IN();
+    antlr4::tree::TerminalNode *VERTICAL_BAR();
+    BindingVariableContext *bindingVariable();
+    std::vector<ExpressionContext *> expression();
+    ExpressionContext* expression(size_t i);
+    antlr4::tree::TerminalNode *WHERE();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  ListComprehensionContext* listComprehension();
 
   class  RecordValueConstructorContext : public antlr4::ParserRuleContext {
   public:

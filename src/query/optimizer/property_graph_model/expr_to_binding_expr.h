@@ -89,6 +89,7 @@ public:
     void visit(ExprFloor&) override;
     void visit(ExprCeil&) override;
     void visit(ExprLength&) override;
+    void visit(ExprListComprehension&) override;
     void visit(ExprListSize&) override;
     void visit(ExprNodesOfPath&) override;
     void visit(ExprRelationshipsOfPath&) override;

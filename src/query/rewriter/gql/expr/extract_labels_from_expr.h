@@ -263,6 +263,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(GQL::ExprListComprehension& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(GQL::ExprListSize& expr)
     {
         tmp = expr.clone();

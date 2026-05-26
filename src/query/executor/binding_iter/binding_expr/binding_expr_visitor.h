@@ -153,6 +153,7 @@ class BindingExprSqrt;
 class BindingExprFloor;
 class BindingExprCeil;
 class BindingExprLength;
+class BindingExprListComprehension;
 class BindingExprListSize;
 class BindingExprNodesOfPath;
 class BindingExprRelationshipsOfPath;
@@ -322,6 +323,7 @@ public:
     virtual void visit(GQL::BindingExprFloor&) { throw LogicException("visit GQL::BindingExprFloor not implemented"); }
     virtual void visit(GQL::BindingExprCeil&) { throw LogicException("visit GQL::BindingExprCeil not implemented"); }
     virtual void visit(GQL::BindingExprLength&) { throw LogicException("visit GQL::BindingExprLength not implemented"); }
+    virtual void visit(GQL::BindingExprListComprehension&) { throw LogicException("visit GQL::BindingExprListComprehension not implemented"); }
     virtual void visit(GQL::BindingExprListSize&) { throw LogicException("visit GQL::BindingExprListSize not implemented"); }
     virtual void visit(GQL::BindingExprNodesOfPath&) { throw LogicException("visit GQL::BindingExprNodesOfPath not implemented"); }
     virtual void visit(GQL::BindingExprRelationshipsOfPath&) { throw LogicException("visit GQL::BindingExprRelationshipsOfPath not implemented"); }

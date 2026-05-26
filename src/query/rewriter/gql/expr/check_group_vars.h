@@ -349,6 +349,22 @@ public:
         expr.expr->accept_visitor(*this);
     }
 
+    void visit(ExprListComprehension& expr) override
+    {
+        expr.list_expr->accept_visitor(*this);
+
+        bool inserted = group_vars.insert(expr.local_var).second;
+
+        if (expr.where_expr != nullptr) {
+            expr.where_expr->accept_visitor(*this);
+        }
+        expr.projection_expr->accept_visitor(*this);
+
+        if (inserted) {
+            group_vars.erase(expr.local_var);
+        }
+    }
+
     void visit(ExprListSize& expr) override
     {
         expr.expr->accept_visitor(*this);

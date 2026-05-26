@@ -2412,7 +2412,12 @@ normalForm
    ;
 
 listValueConstructor
-   : listValueTypeName? LEFT_BRACKET (expression (COMMA expression)*)? RIGHT_BRACKET
+   : listValueTypeName? LEFT_BRACKET listComprehension RIGHT_BRACKET
+   | listValueTypeName? LEFT_BRACKET (expression (COMMA expression)*)? RIGHT_BRACKET
+   ;
+
+listComprehension
+   : compVar = bindingVariable IN sourceList = expression (WHERE predicate = expression)? VERTICAL_BAR projection = expression
    ;
 
 recordValueConstructor

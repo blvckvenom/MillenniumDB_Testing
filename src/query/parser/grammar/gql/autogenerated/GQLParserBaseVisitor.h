@@ -2227,6 +2227,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitListComprehension(GQLParser::ListComprehensionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitRecordValueConstructor(GQLParser::RecordValueConstructorContext *ctx) override {
     return visitChildren(ctx);
   }

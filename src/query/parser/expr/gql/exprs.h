@@ -45,6 +45,7 @@
 #include "query/parser/expr/gql/expr_floor.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_ceil.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_length.h" // IWYU pragma: export
+#include "query/parser/expr/gql/expr_list_comprehension.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_list_size.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_nodes_of_path.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_relationships_of_path.h" // IWYU pragma: export

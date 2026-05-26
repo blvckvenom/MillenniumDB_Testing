@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "query/parser/expr/gql/agg/expr_agg_project.h"
@@ -77,6 +78,7 @@ private:
     // Helper methods for parsing DataConfig parameter
     DataConfig parse_data_config(GQLParser::RecordLiteralContext* ctx);
     std::vector<std::string> parse_string_list(GQLParser::ListLiteralContext* ctx);
+    VarId resolve_var_id(const std::string& var_name);
 
     std::vector<std::unique_ptr<Expr>> filter_items;
     std::vector<OpReturn::Item> return_items;
@@ -91,6 +93,8 @@ private:
 
     // Projection options for PROJECT() function
     ProjectionOptions current_projection_options;
+
+    std::vector<std::unordered_map<std::string, VarId>> local_variable_scopes;
 
 public:
     std::unique_ptr<Op> current_op;
@@ -209,6 +213,7 @@ public:
     std::any visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx) override;
     std::any visitListLiteral(GQLParser::ListLiteralContext* ctx) override;
     std::any visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx) override;
+    std::any visitListComprehension(GQLParser::ListComprehensionContext* ctx) override;
     std::any visitRecordLiteral(GQLParser::RecordLiteralContext* ctx) override;
     std::any visitGqlCollectionExpression(GQLParser::GqlCollectionExpressionContext* ctx) override;
     std::any visitRecordValueConstructor(GQLParser::RecordValueConstructorContext* ctx) override;

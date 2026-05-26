@@ -375,6 +375,28 @@ void ExprToBindingExpr::visit(ExprLength& expr)
     tmp = std::make_unique<BindingExprLength>(std::move(tmp));
 }
 
+void ExprToBindingExpr::visit(ExprListComprehension& expr)
+{
+    expr.list_expr->accept_visitor(*this);
+    auto source_list = std::move(tmp);
+
+    std::unique_ptr<BindingExpr> predicate = nullptr;
+    if (expr.where_expr != nullptr) {
+        expr.where_expr->accept_visitor(*this);
+        predicate = std::move(tmp);
+    }
+
+    expr.projection_expr->accept_visitor(*this);
+    auto projection = std::move(tmp);
+
+    tmp = std::make_unique<BindingExprListComprehension>(
+        expr.local_var,
+        std::move(source_list),
+        std::move(predicate),
+        std::move(projection)
+    );
+}
+
 void ExprToBindingExpr::visit(ExprListSize& expr)
 {
     expr.expr->accept_visitor(*this);

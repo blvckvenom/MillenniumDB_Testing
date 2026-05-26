@@ -189,6 +189,30 @@ public:
         visit_expr_with_expr<ExprLength>(expr);
     }
 
+    void visit(GQL::ExprListComprehension& expr) override
+    {
+        for (auto& rule : rules) {
+            if (rule->is_possible_to_regroup(expr.list_expr)) {
+                expr.list_expr = rule->regroup(std::move(expr.list_expr));
+                has_rewritten = true;
+            }
+            if (expr.where_expr != nullptr && rule->is_possible_to_regroup(expr.where_expr)) {
+                expr.where_expr = rule->regroup(std::move(expr.where_expr));
+                has_rewritten = true;
+            }
+            if (rule->is_possible_to_regroup(expr.projection_expr)) {
+                expr.projection_expr = rule->regroup(std::move(expr.projection_expr));
+                has_rewritten = true;
+            }
+        }
+
+        expr.list_expr->accept_visitor(*this);
+        if (expr.where_expr != nullptr) {
+            expr.where_expr->accept_visitor(*this);
+        }
+        expr.projection_expr->accept_visitor(*this);
+    }
+
     void visit(GQL::ExprListSize& expr) override
     {
         visit_expr_with_expr<ExprListSize>(expr);

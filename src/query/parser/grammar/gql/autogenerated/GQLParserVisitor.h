@@ -1125,6 +1125,8 @@ public:
 
     virtual std::any visitListValueConstructor(GQLParser::ListValueConstructorContext *context) = 0;
 
+    virtual std::any visitListComprehension(GQLParser::ListComprehensionContext *context) = 0;
+
     virtual std::any visitRecordValueConstructor(GQLParser::RecordValueConstructorContext *context) = 0;
 
     virtual std::any visitField(GQLParser::FieldContext *context) = 0;

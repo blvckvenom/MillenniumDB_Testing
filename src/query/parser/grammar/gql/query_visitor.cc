@@ -1912,13 +1912,24 @@ std::vector<std::string> QueryVisitor::parse_string_list(GQLParser::ListLiteralC
     return result;
 }
 
+VarId QueryVisitor::resolve_var_id(const std::string& var_name)
+{
+    for (auto it = local_variable_scopes.rbegin(); it != local_variable_scopes.rend(); ++it) {
+        auto found = it->find(var_name);
+        if (found != it->end()) {
+            return found->second;
+        }
+    }
+    return get_query_ctx().get_or_create_var(var_name);
+}
+
 std::any QueryVisitor::visitPropertyReference(GQLParser::PropertyReferenceContext* ctx)
 {
     LOG_VISITOR
     std::string var_name = ctx->variable()->getText();
     std::string property_name = ctx->propertyName()->getText();
 
-    VarId var_id = get_query_ctx().get_or_create_var(var_name);
+    VarId var_id = resolve_var_id(var_name);
     VarId property_var = get_query_ctx().get_or_create_var(var_name + "." + property_name);
 
     if (!singleton_types.count(var_id)) {
@@ -2180,6 +2191,10 @@ std::any QueryVisitor::visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx
 
 std::any QueryVisitor::visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx)
 {
+    if (ctx->listComprehension()) {
+        return visit(ctx->listComprehension());
+    }
+
     std::vector<ObjectId> list;
 
     for (auto& expr : ctx->expression()) {
@@ -2192,6 +2207,35 @@ std::any QueryVisitor::visitListValueConstructor(GQLParser::ListValueConstructor
     }
     ObjectId list_oid = Conversions::pack_list(list);
     current_expr = std::make_unique<ExprTerm>(list_oid);
+    return 0;
+}
+
+std::any QueryVisitor::visitListComprehension(GQLParser::ListComprehensionContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->sourceList);
+    auto source_list = std::move(current_expr);
+
+    VarId local_var = get_query_ctx().get_internal_var();
+    local_variable_scopes.push_back({ { ctx->compVar->getText(), local_var } });
+
+    std::unique_ptr<Expr> predicate = nullptr;
+    if (ctx->predicate) {
+        visit(ctx->predicate);
+        predicate = std::move(current_expr);
+    }
+
+    visit(ctx->projection);
+    auto projection = std::move(current_expr);
+
+    local_variable_scopes.pop_back();
+
+    current_expr = std::make_unique<ExprListComprehension>(
+        local_var,
+        std::move(source_list),
+        std::move(predicate),
+        std::move(projection)
+    );
     return 0;
 }
 
@@ -2372,7 +2416,7 @@ std::any QueryVisitor::visitLocalDatetimeFunction(GQLParser::LocalDatetimeFuncti
 std::any QueryVisitor::visitLabelsFunction(GQLParser::LabelsFunctionContext* ctx)
 {
     LOG_VISITOR
-    VarId var = get_query_ctx().get_or_create_var(ctx->variable()->getText());
+    VarId var = resolve_var_id(ctx->variable()->getText());
     VarType::Type type = singleton_types[var];
     current_expr = std::make_unique<ExprLabels>(var, type);
     return 0;
@@ -2381,7 +2425,7 @@ std::any QueryVisitor::visitLabelsFunction(GQLParser::LabelsFunctionContext* ctx
 std::any QueryVisitor::visitPropertiesFunction(GQLParser::PropertiesFunctionContext* ctx)
 {
     LOG_VISITOR
-    VarId var = get_query_ctx().get_or_create_var(ctx->variable()->getText());
+    VarId var = resolve_var_id(ctx->variable()->getText());
     VarType::Type type = singleton_types[var];
     current_expr = std::make_unique<ExprProperties>(var, type);
     return 0;
@@ -2391,7 +2435,7 @@ std::any QueryVisitor::visitGqlVariableExpression(GQLParser::GqlVariableExpressi
 {
     LOG_VISITOR
     std::string var_name = ctx->getText();
-    VarId var_id = get_query_ctx().get_or_create_var(var_name);
+    VarId var_id = resolve_var_id(var_name);
     current_expr = std::make_unique<ExprVar>(var_id);
     return 0;
 }

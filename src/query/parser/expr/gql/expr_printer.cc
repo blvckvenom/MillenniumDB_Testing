@@ -308,6 +308,19 @@ void ExprPrinter::visit(ExprLength& expr)
     os << ")";
 }
 
+void ExprPrinter::visit(ExprListComprehension& expr)
+{
+    os << "[" << expr.local_var << " IN ";
+    expr.list_expr->accept_visitor(*this);
+    if (expr.where_expr != nullptr) {
+        os << " WHERE ";
+        expr.where_expr->accept_visitor(*this);
+    }
+    os << " | ";
+    expr.projection_expr->accept_visitor(*this);
+    os << "]";
+}
+
 void ExprPrinter::visit(ExprListSize& expr)
 {
     os << "SIZE(";
