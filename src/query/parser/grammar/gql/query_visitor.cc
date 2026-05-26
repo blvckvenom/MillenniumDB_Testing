@@ -1453,6 +1453,24 @@ std::any QueryVisitor::visitGqlNormStringFunction(GQLParser::GqlNormStringFuncti
     return 0;
 }
 
+std::any QueryVisitor::visitGqlNodesOfPathFunction(GQLParser::GqlNodesOfPathFunctionContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->expressionAtom());
+    current_expr = std::make_unique<ExprNodesOfPath>(std::move(current_expr));
+    return 0;
+}
+
+std::any QueryVisitor::visitGqlRelationshipsOfPathFunction(
+    GQLParser::GqlRelationshipsOfPathFunctionContext* ctx
+)
+{
+    LOG_VISITOR
+    visit(ctx->expressionAtom());
+    current_expr = std::make_unique<ExprRelationshipsOfPath>(std::move(current_expr));
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext* ctx)
 {
     LOG_VISITOR

@@ -90,6 +90,8 @@ public:
     void visit(ExprCeil&) override;
     void visit(ExprLength&) override;
     void visit(ExprListSize&) override;
+    void visit(ExprNodesOfPath&) override;
+    void visit(ExprRelationshipsOfPath&) override;
     void visit(ExprSubStr&) override;
     void visit(ExprFold&) override;
     void visit(ExprSingleTrim&) override;

@@ -2083,6 +2083,14 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlNodesOfPathFunction(GQLParser::GqlNodesOfPathFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitGqlRelationshipsOfPathFunction(GQLParser::GqlRelationshipsOfPathFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext *ctx) override {
     return visitChildren(ctx);
   }

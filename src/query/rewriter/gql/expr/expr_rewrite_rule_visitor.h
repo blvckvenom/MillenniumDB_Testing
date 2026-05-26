@@ -194,6 +194,16 @@ public:
         visit_expr_with_expr<ExprListSize>(expr);
     }
 
+    void visit(GQL::ExprNodesOfPath& expr) override
+    {
+        visit_expr_with_expr<ExprNodesOfPath>(expr);
+    }
+
+    void visit(GQL::ExprRelationshipsOfPath& expr) override
+    {
+        visit_expr_with_expr<ExprRelationshipsOfPath>(expr);
+    }
+
     void visit(GQL::ExprLn& expr) override
     {
         visit_expr_with_expr<ExprLn>(expr);

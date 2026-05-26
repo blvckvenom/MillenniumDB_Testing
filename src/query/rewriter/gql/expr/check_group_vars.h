@@ -354,6 +354,16 @@ public:
         expr.expr->accept_visitor(*this);
     }
 
+    void visit(ExprNodesOfPath& expr) override
+    {
+        expr.expr->accept_visitor(*this);
+    }
+
+    void visit(ExprRelationshipsOfPath& expr) override
+    {
+        expr.expr->accept_visitor(*this);
+    }
+
     void visit(ExprFold& expr) override
     {
         expr.expr->accept_visitor(*this);

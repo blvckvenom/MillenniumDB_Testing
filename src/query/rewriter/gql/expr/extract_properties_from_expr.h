@@ -311,6 +311,16 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(ExprNodesOfPath& expr)
+    {
+        tmp = expr.clone();
+    }
+
+    void visit(ExprRelationshipsOfPath& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(ExprSubStr& expr)
     {
         tmp = expr.clone();

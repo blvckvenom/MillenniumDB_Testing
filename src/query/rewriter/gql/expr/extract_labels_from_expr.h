@@ -268,6 +268,16 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(GQL::ExprNodesOfPath& expr)
+    {
+        tmp = expr.clone();
+    }
+
+    void visit(GQL::ExprRelationshipsOfPath& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(GQL::ExprSubStr& expr)
     {
         tmp = expr.clone();

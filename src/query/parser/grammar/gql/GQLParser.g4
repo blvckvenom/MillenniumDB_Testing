@@ -2266,6 +2266,8 @@ stringFunction
 listFunction
    : TRIM LEFT_PAREN list = expressionAtom COMMA trim = expressionAtom RIGHT_PAREN                                          #gqlListTrimFunction
    | ELEMENTS LEFT_PAREN expressionAtom RIGHT_PAREN                                                                         #gqlElementsOfPathFunction
+   | NODES LEFT_PAREN expressionAtom RIGHT_PAREN                                                                            #gqlNodesOfPathFunction
+   | EDGES_SYNONYM LEFT_PAREN expressionAtom RIGHT_PAREN                                                                    #gqlRelationshipsOfPathFunction
    | SIZE LEFT_PAREN expressionAtom RIGHT_PAREN                                                                             #gqlListSizeFunction
    ;
 
@@ -2602,6 +2604,7 @@ keyword
    | NFKD
    | NO
    | NODETACH
+   | NODES
    | NORMALIZE
    | NORMALIZED
    | NOT

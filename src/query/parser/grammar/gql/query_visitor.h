@@ -234,6 +234,9 @@ public:
     std::any visitGqlNormStringFunction(GQLParser::GqlNormStringFunctionContext* ctx) override;
 
     // listFunction
+    std::any visitGqlNodesOfPathFunction(GQLParser::GqlNodesOfPathFunctionContext* ctx) override;
+    std::any
+        visitGqlRelationshipsOfPathFunction(GQLParser::GqlRelationshipsOfPathFunctionContext* ctx) override;
     std::any visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext* ctx) override;
 
     // caseFunction

@@ -315,6 +315,20 @@ void ExprPrinter::visit(ExprListSize& expr)
     os << ")";
 }
 
+void ExprPrinter::visit(ExprNodesOfPath& expr)
+{
+    os << "NODES(";
+    expr.expr->accept_visitor(*this);
+    os << ")";
+}
+
+void ExprPrinter::visit(ExprRelationshipsOfPath& expr)
+{
+    os << "RELATIONSHIPS(";
+    expr.expr->accept_visitor(*this);
+    os << ")";
+}
+
 void ExprPrinter::visit(ExprSubStr& expr)
 {
     if (expr.left) {

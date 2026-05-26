@@ -1053,6 +1053,10 @@ public:
 
     virtual std::any visitGqlElementsOfPathFunction(GQLParser::GqlElementsOfPathFunctionContext *context) = 0;
 
+    virtual std::any visitGqlNodesOfPathFunction(GQLParser::GqlNodesOfPathFunctionContext *context) = 0;
+
+    virtual std::any visitGqlRelationshipsOfPathFunction(GQLParser::GqlRelationshipsOfPathFunctionContext *context) = 0;
+
     virtual std::any visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext *context) = 0;
 
     virtual std::any visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext *context) = 0;

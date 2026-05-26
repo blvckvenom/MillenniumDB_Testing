@@ -381,6 +381,18 @@ void ExprToBindingExpr::visit(ExprListSize& expr)
     tmp = std::make_unique<BindingExprListSize>(std::move(tmp));
 }
 
+void ExprToBindingExpr::visit(ExprNodesOfPath& expr)
+{
+    expr.expr->accept_visitor(*this);
+    tmp = std::make_unique<BindingExprNodesOfPath>(std::move(tmp));
+}
+
+void ExprToBindingExpr::visit(ExprRelationshipsOfPath& expr)
+{
+    expr.expr->accept_visitor(*this);
+    tmp = std::make_unique<BindingExprRelationshipsOfPath>(std::move(tmp));
+}
+
 void ExprToBindingExpr::visit(ExprSubStr& expr)
 {
     expr.expr->accept_visitor(*this);

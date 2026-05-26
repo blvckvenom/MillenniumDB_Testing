@@ -744,6 +744,10 @@ NODETACH
    : 'NODETACH'
    ;
 
+NODES
+   : 'NODES'
+   ;
+
 NORMALIZE
    : 'NORMALIZE'
    ;
