@@ -89,6 +89,11 @@ void PushLabels::visit(OpReturn& op)
     );
 }
 
+void PushLabels::visit(OpWith& op)
+{
+    tmp = op.clone();
+}
+
 void PushLabels::visit(OpGroupBy& op)
 {
     op.op->accept_visitor(*this);

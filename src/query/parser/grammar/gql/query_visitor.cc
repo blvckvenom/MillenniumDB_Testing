@@ -93,6 +93,7 @@ std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQuerySta
 
     auto matchStatement = ctx->matchStatement();
     auto letStatement = ctx->letStatement();
+    auto withStatement = ctx->withStatement();
     auto orderByAndPageStatement = ctx->orderByAndPageStatement();
     auto filterStatement = ctx->filterStatement();
 
@@ -100,6 +101,8 @@ std::any QueryVisitor::visitPrimitiveQueryStatement(GQLParser::PrimitiveQuerySta
         matchStatement->accept(this);
     } else if (letStatement) {
         letStatement->accept(this);
+    } else if (withStatement) {
+        withStatement->accept(this);
     } else if (orderByAndPageStatement) {
         orderByAndPageStatement->accept(this);
     } else if (filterStatement) {
@@ -260,6 +263,43 @@ std::any QueryVisitor::visitReturnStatementBody(GQLParser::ReturnStatementBodyCo
     }
 
     current_op = std::make_unique<OpReturn>(std::move(current_op), std::move(return_items), distinct);
+    return 0;
+}
+
+std::any QueryVisitor::visitWithStatement(GQLParser::WithStatementContext* ctx)
+{
+    LOG_VISITOR
+
+    visit(ctx->returnStatementBody());
+    auto op_return = std::move(current_op);
+    auto op_return_ptr = dynamic_cast<OpReturn*>(op_return.get());
+
+    std::vector<std::unique_ptr<Expr>> group_by_items;
+    if (auto op_group_by = dynamic_cast<OpGroupBy*>(op_return_ptr->op.get()); op_group_by != nullptr) {
+        for (auto& expr : op_group_by->exprs) {
+            group_by_items.push_back(expr->clone());
+        }
+    }
+
+    current_op = std::make_unique<OpWith>(
+        std::move(op_return_ptr->return_items),
+        op_return_ptr->distinct,
+        std::move(group_by_items)
+    );
+
+    auto orderByAndPageStatement = ctx->orderByAndPageStatement();
+    if (orderByAndPageStatement) {
+        auto op_with = std::move(current_op);
+        auto op_with_ptr = dynamic_cast<OpWith*>(op_with.get());
+
+        visit(orderByAndPageStatement);
+        current_op = std::make_unique<OpWith>(
+            std::move(op_with_ptr->with_items),
+            op_with_ptr->distinct,
+            std::move(op_with_ptr->group_by_items),
+            std::move(current_op)
+        );
+    }
     return 0;
 }
 

@@ -64,22 +64,110 @@ std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>>
 
 void PathBindingIterConstructor::visit(OpReturn& op_return)
 {
-    for (auto& item : op_return.return_items) {
+    grouping = false;
+    has_group_by = false;
+    group_saved_vars.clear();
+    aggregations.clear();
+    group_vars.clear();
+    return_op_vars.clear();
+
+    op_return.op->accept_visitor(*this);
+    build_projection_pipeline(
+        op_return.return_items,
+        op_return.distinct,
+        nullptr,
+        &op_return.op_order_by,
+        false,
+        false
+    );
+}
+
+void PathBindingIterConstructor::visit(OpWith& op_with)
+{
+    build_projection_pipeline(
+        op_with.with_items,
+        op_with.distinct,
+        &op_with.group_by_items,
+        &op_with.op_order_by,
+        true
+    );
+}
+
+std::vector<VarId> PathBindingIterConstructor::get_projection_vars(
+    const std::vector<OpReturn::Item>& projection_items
+)
+{
+    std::vector<VarId> projection_vars;
+    for (auto& item : projection_items) {
+        if (item.alias.has_value()) {
+            projection_vars.push_back(*item.alias);
+        } else {
+            auto expr_variables = item.expr->get_all_vars();
+            projection_vars.insert(projection_vars.end(), expr_variables.begin(), expr_variables.end());
+        }
+    }
+    return projection_vars;
+}
+
+void PathBindingIterConstructor::build_projection_pipeline(
+    std::vector<OpReturn::Item>& projection_items,
+    bool distinct_projection,
+    std::vector<std::unique_ptr<Expr>>* group_by_items,
+    std::unique_ptr<Op>* op_order_by,
+    bool update_scope,
+    bool reset_group_state
+)
+{
+    if (reset_group_state) {
+        grouping = false;
+        has_group_by = false;
+        group_saved_vars.clear();
+        aggregations.clear();
+        group_vars.clear();
+    }
+    return_op_vars = get_projection_vars(projection_items);
+
+    for (auto& item : projection_items) {
         if (item.expr != nullptr && item.expr->has_aggregation()) {
             grouping = true;
             break;
         }
     }
 
-    for (auto& var : op_return.get_expr_vars()) {
-        return_op_vars.push_back(var);
+    if (group_by_items != nullptr && !group_by_items->empty()) {
+        grouping = true;
+        has_group_by = true;
+        group_vars.clear();
+        for (auto& expr : *group_by_items) {
+            Expr* casted = expr.get();
+            if (auto casted_var = dynamic_cast<ExprVar*>(casted); casted_var != nullptr) {
+                group_vars.insert(casted_var->id);
+            }
+        }
     }
-    op_return.op->accept_visitor(*this);
+
+    // WITH implicit grouping:
+    // when WITH has at least one aggregation and no explicit GROUP BY, every
+    // non-aggregate projected item becomes a grouping key.
+    if (update_scope && grouping && (group_by_items == nullptr || group_by_items->empty())) {
+        group_vars.clear();
+        for (auto& item : projection_items) {
+            if (item.expr != nullptr && !item.expr->has_aggregation()) {
+                if (item.alias.has_value()) {
+                    group_vars.insert(*item.alias);
+                } else {
+                    auto expr_vars = item.expr->get_all_vars();
+                    group_vars.insert(expr_vars.begin(), expr_vars.end());
+                }
+            }
+        }
+        has_group_by = !group_vars.empty();
+    }
 
     std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> exprs_without_agg;
     std::set<VarId> aliases_not_in_group_by;
 
-    for (auto& item : op_return.return_items) {
+    for (auto& item : projection_items) {
         if (item.alias.has_value()) {
             ExprToBindingExpr expr_to_binding_expr(this, *item.alias, true);
             item.expr->accept_visitor(expr_to_binding_expr);
@@ -97,7 +185,7 @@ void PathBindingIterConstructor::visit(OpReturn& op_return)
     tmp_iter = get_pending_properties(std::move(tmp_iter));
 
     auto non_redundant_exprs = get_non_redundant_exprs(exprs_without_agg);
-    if (non_redundant_exprs.size() > 0) {
+    if (!non_redundant_exprs.empty()) {
         tmp_iter = std::make_unique<ExprEvaluator>(std::move(tmp_iter), std::move(non_redundant_exprs));
     }
 
@@ -114,45 +202,54 @@ void PathBindingIterConstructor::visit(OpReturn& op_return)
         );
     }
 
-    if (aggregations.size() > 0 || group_vars.size() > 0) {
+    if (!aggregations.empty() || !group_vars.empty()) {
         tmp_iter = std::make_unique<Aggregation>(
             std::move(tmp_iter),
             std::move(aggregations),
             std::move(group_vars)
         );
 
-        // we need to evaluate properties again if there are any in the return statement
+        // We need to evaluate properties again if there are any in the projected expressions.
         used_properties.clear();
 
-        std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> return_exprs;
-        for (auto& item : op_return.return_items) {
+        std::vector<std::pair<VarId, std::unique_ptr<BindingExpr>>> projection_exprs;
+        for (auto& item : projection_items) {
             if (item.alias.has_value()) {
                 ExprToBindingExpr expr_to_binding_expr(this, *item.alias, false);
                 item.expr->accept_visitor(expr_to_binding_expr);
 
                 if (aliases_not_in_group_by.count(*item.alias)) {
-                    return_exprs.emplace_back(*item.alias, std::move(expr_to_binding_expr.tmp));
+                    projection_exprs.emplace_back(*item.alias, std::move(expr_to_binding_expr.tmp));
                 }
             }
         }
         tmp_iter = get_pending_properties(std::move(tmp_iter));
 
-        non_redundant_exprs = get_non_redundant_exprs(return_exprs);
-        if (non_redundant_exprs.size() > 0) {
+        non_redundant_exprs = get_non_redundant_exprs(projection_exprs);
+        if (!non_redundant_exprs.empty()) {
             tmp_iter = std::make_unique<ExprEvaluator>(std::move(tmp_iter), std::move(non_redundant_exprs));
         }
     }
 
-    if (op_return.distinct) {
-        auto projected_vars_set = op_return.get_expr_vars();
-        std::vector<VarId> projected_vars;
-        std::copy(projected_vars_set.begin(), projected_vars_set.end(), std::back_inserter(projected_vars));
+    if (distinct_projection) {
+        std::vector<VarId> projected_vars = get_projection_vars(projection_items);
         tmp_iter = std::make_unique<DistinctHash>(std::move(tmp_iter), std::move(projected_vars));
     }
 
-    if (op_return.op_order_by != nullptr) {
-        op_return.op_order_by->accept_visitor(*this);
+    if (op_order_by != nullptr && *op_order_by != nullptr) {
+        (*op_order_by)->accept_visitor(*this);
     }
+
+    if (update_scope) {
+        assigned_vars = std::set<VarId>(return_op_vars.begin(), return_op_vars.end());
+    }
+
+    grouping = false;
+    has_group_by = false;
+    group_saved_vars.clear();
+    aggregations.clear();
+    group_vars.clear();
+    return_op_vars.clear();
 }
 
 void PathBindingIterConstructor::visit(OpQueryStatements& op_statements)

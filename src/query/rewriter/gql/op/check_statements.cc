@@ -17,6 +17,11 @@ void CheckStatements::visit(OpReturn& op_return)
     op_return.op->accept_visitor(*this);
 }
 
+void CheckStatements::visit(OpWith&)
+{
+    has_match_or_let = true;
+}
+
 void CheckStatements::visit(OpGroupBy& op_group_by)
 {
     op_group_by.op->accept_visitor(*this);

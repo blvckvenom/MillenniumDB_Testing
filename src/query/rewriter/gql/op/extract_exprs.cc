@@ -25,6 +25,11 @@ void ExtractExprs::visit(OpReturn& op_return)
     );
 }
 
+void ExtractExprs::visit(OpWith& op_with)
+{
+    tmp = op_with.clone();
+}
+
 void ExtractExprs::visit(OpGroupBy& op_group_by)
 {
     op_group_by.op->accept_visitor(*this);

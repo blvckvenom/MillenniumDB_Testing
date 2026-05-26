@@ -659,6 +659,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitWithStatement(GQLParser::WithStatementContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitReturnStatementBody(GQLParser::ReturnStatementBodyContext *ctx) override {
     return visitChildren(ctx);
   }

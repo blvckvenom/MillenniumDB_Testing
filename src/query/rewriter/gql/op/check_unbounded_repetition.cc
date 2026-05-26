@@ -48,6 +48,8 @@ void CheckUnboundedRepetition::visit(OpReturn& op)
     op.op->accept_visitor(*this);
 }
 
+void CheckUnboundedRepetition::visit(OpWith&) { }
+
 void CheckUnboundedRepetition::visit(OpGroupBy& op)
 {
     op.op->accept_visitor(*this);

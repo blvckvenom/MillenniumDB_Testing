@@ -678,6 +678,7 @@ simpleLinearQueryStatement
 primitiveQueryStatement
    : matchStatement
    | letStatement
+   | withStatement
    | forStatement
    | filterStatement
    | orderByAndPageStatement
@@ -757,6 +758,10 @@ primitiveResultStatement
 
 returnStatement
    : RETURN returnStatementBody
+   ;
+
+withStatement
+   : WITH returnStatementBody orderByAndPageStatement?
    ;
 
 returnStatementBody

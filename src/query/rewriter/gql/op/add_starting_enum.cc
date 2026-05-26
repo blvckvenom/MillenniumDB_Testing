@@ -9,6 +9,8 @@ void AddStartingEnum::visit(OpReturn& op)
     op.op->accept_visitor(*this);
 }
 
+void AddStartingEnum::visit(OpWith&) { }
+
 void AddStartingEnum::visit(OpGroupBy& op)
 {
     op.op->accept_visitor(*this);

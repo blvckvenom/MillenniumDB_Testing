@@ -5,6 +5,7 @@
 #include "query/parser/op/gql/op_return.h"
 #include "query/parser/op/gql/op_let.h"
 #include "query/parser/op/gql/op_order_by.h"
+#include "query/parser/op/gql/op_with.h"
 #include "query/rewriter/gql/expr/expr_rewrite_rule_visitor.h"
 #include "query/rewriter/gql/expr/rewrite_rules/flatten_labels.h"
 #include "query/rewriter/gql/expr/rewrite_rules/literal_simplification.h"
@@ -27,12 +28,15 @@ public:
         bool is_filter = false;
         bool is_let = false;
         bool is_return = false;
+        bool is_with = false;
         bool is_order_by = false;
 
         if (is_castable_to<OpWhere>(unknown_op)) {
             is_filter = true;
         } else if (is_castable_to<OpReturn>(unknown_op)) {
             is_return = true;
+        } else if (is_castable_to<OpWith>(unknown_op)) {
+            is_with = true;
         } else if (is_castable_to<OpOrderBy>(unknown_op)) {
             is_order_by = true;
         } else if (is_castable_to<OpLet>(unknown_op)) {
@@ -57,6 +61,19 @@ public:
                 auto op_return = dynamic_cast<OpReturn*>(unknown_op.get());
                 for (auto& item : op_return->return_items) {
                     expr_visitor.start_visit(item.expr);
+                }
+                if (expr_visitor.reset_and_check_if_has_rewritten_a_rule()) {
+                    has_rewritten = true;
+                } else {
+                    break;
+                }
+            } else if (is_with) {
+                auto op_with = dynamic_cast<OpWith*>(unknown_op.get());
+                for (auto& item : op_with->with_items) {
+                    expr_visitor.start_visit(item.expr);
+                }
+                for (auto& group_expr : op_with->group_by_items) {
+                    expr_visitor.start_visit(group_expr);
                 }
                 if (expr_visitor.reset_and_check_if_has_rewritten_a_rule()) {
                     has_rewritten = true;

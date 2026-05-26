@@ -11,6 +11,7 @@ private:
 public:
     void visit(OpQueryStatements&) override;
     void visit(OpReturn&) override;
+    void visit(OpWith&) override;
     void visit(OpWhere&) override;
     void visit(OpFilter&) override;
     void visit(OpGraphPatternList&) override;

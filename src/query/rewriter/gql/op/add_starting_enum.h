@@ -13,6 +13,7 @@ public:
     bool repetition_found = false;
 
     void visit(OpReturn&) override;
+    void visit(OpWith&) override;
 
     void visit(OpQueryStatements& op) override;
     void visit(OpFilter& op) override;

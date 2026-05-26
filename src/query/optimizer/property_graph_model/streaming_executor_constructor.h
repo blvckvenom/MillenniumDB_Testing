@@ -13,6 +13,7 @@ public:
     std::unique_ptr<StreamingQueryExecutor> executor;
 
     void visit(OpReturn&) override;
+    void visit(OpWith&) override { }
 
     void visit(OpGraphPattern&) override { }
     void visit(OpBasicGraphPattern&) override { }

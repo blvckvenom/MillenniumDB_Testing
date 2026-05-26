@@ -8,6 +8,7 @@
 #include "query/optimizer/plan/plan.h"
 #include "query/parser/expr/gql/expr.h"
 #include "query/parser/expr/gql/expr_property.h"
+#include "query/parser/op/gql/op_return.h"
 #include "query/parser/op/gql/op_visitor.h"
 
 namespace GQL {
@@ -27,6 +28,7 @@ public:
     void visit(OpLet& op) override;
     void visit(OpOrderBy&) override;
     void visit(OpGroupBy&) override;
+    void visit(OpWith&) override;
 
     void visit(OpReturn&) override;
     void visit(OpGraphPattern&) override;
@@ -53,6 +55,17 @@ public:
     std::map<ExprProperty, bool> used_properties;
 
 private:
+    void build_projection_pipeline(
+        std::vector<OpReturn::Item>& projection_items,
+        bool distinct,
+        std::vector<std::unique_ptr<Expr>>* group_by_items = nullptr,
+        std::unique_ptr<Op>* op_order_by = nullptr,
+        bool update_scope = false,
+        bool reset_group_state = true
+    );
+
+    static std::vector<VarId> get_projection_vars(const std::vector<OpReturn::Item>& projection_items);
+
     std::unique_ptr<BindingIter> get_pending_properties(std::unique_ptr<BindingIter> binding_iter);
 
     bool is_first_iter = true;

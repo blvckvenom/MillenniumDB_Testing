@@ -341,6 +341,8 @@ public:
 
     virtual std::any visitReturnStatement(GQLParser::ReturnStatementContext *context) = 0;
 
+    virtual std::any visitWithStatement(GQLParser::WithStatementContext *context) = 0;
+
     virtual std::any visitReturnStatementBody(GQLParser::ReturnStatementBodyContext *context) = 0;
 
     virtual std::any visitReturnItemList(GQLParser::ReturnItemListContext *context) = 0;

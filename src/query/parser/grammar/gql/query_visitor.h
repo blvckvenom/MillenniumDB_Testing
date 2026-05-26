@@ -127,6 +127,7 @@ public:
     std::any visitEndTransactionCommand(GQLParser::EndTransactionCommandContext* ctx) override;
 
     std::any visitPrimitiveResultStatement(GQLParser::PrimitiveResultStatementContext* ctx) override;
+    std::any visitWithStatement(GQLParser::WithStatementContext* ctx) override;
     std::any visitReturnStatementBody(GQLParser::ReturnStatementBodyContext* ctx) override;
     std::any visitReturnItemList(GQLParser::ReturnItemListContext* ctx) override;
     std::any visitGroupingElementList(GQLParser::GroupingElementListContext* ctx) override;

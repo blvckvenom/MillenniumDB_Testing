@@ -67,6 +67,9 @@ void CheckVarExistence::visit(GQL::OpGraphPattern& op_graph_pattern)
 
 void CheckVarExistence::visit(GQL::OpReturn& op_return)
 {
+    std::set<VarId> previous_group_vars = group_vars;
+    group_vars.clear();
+
     // we store the op return vars, because the OpGroupBy references them
     std::vector<VarId> op_return_vars_vec = op_return.get_expr_vars();
     op_return_vars = std::set<VarId>(op_return_vars_vec.begin(), op_return_vars_vec.end());
@@ -94,6 +97,52 @@ void CheckVarExistence::visit(GQL::OpReturn& op_return)
     if (op_return.op_order_by != nullptr) {
         op_return.op_order_by->accept_visitor(*this);
     }
+
+    group_vars = std::move(previous_group_vars);
+}
+
+void CheckVarExistence::visit(OpWith& op_with)
+{
+    std::set<VarId> previous_group_vars = group_vars;
+    group_vars.clear();
+
+    std::vector<VarId> op_with_vars_vec = op_with.get_expr_vars();
+    op_return_vars = std::set<VarId>(op_with_vars_vec.begin(), op_with_vars_vec.end());
+
+    for (auto& expr : op_with.group_by_items) {
+        group_vars.merge(expr->get_all_vars());
+    }
+
+    if (!group_vars.empty()) {
+        std::set<VarId> previous_vars = variables;
+        variables.insert(op_return_vars.begin(), op_return_vars.end());
+        check_expr_variables(group_vars);
+        variables = std::move(previous_vars);
+    }
+
+    std::set<VarId> expr_variables;
+    for (auto& item : op_with.with_items) {
+        expr_variables.merge(item.expr->get_all_vars());
+    }
+    check_expr_variables(expr_variables);
+
+    if (!group_vars.empty()) {
+        CheckGroupVars check_group_vars(group_vars);
+        for (auto& item : op_with.with_items) {
+            if (!item.alias.has_value() || (item.alias.has_value() && !group_vars.count(*item.alias))) {
+                item.expr->accept_visitor(check_group_vars);
+            }
+        }
+    }
+
+    variables = op_return_vars;
+
+    if (op_with.op_order_by != nullptr) {
+        op_with.op_order_by->accept_visitor(*this);
+    }
+
+    variables = op_return_vars;
+    group_vars = std::move(previous_group_vars);
 }
 
 void CheckVarExistence::visit(OpGroupBy& op_group_by)

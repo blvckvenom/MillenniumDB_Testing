@@ -51,6 +51,7 @@ public:
     void visit(OpLinearPattern&) override;
     void visit(OpRepetition&) override;
     void visit(OpReturn&) override;
+    void visit(OpWith&) override;
     void visit(OpGroupBy&) override;
 
     void visit(OpLet&) override { }

@@ -29,6 +29,7 @@ public:
     void visit(OpFilter& op) override;
     void visit(OpLet& op) override;
     void visit(OpOrderBy& op) override;
+    void visit(OpWith& op) override;
     void visit(OpQueryStatements& op) override;
     void visit(OpGroupBy& op) override;
     void visit(OpUnitTable&) override;

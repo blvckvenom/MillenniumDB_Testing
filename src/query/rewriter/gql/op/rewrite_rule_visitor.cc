@@ -31,6 +31,8 @@ void RewriteRuleVisitor::visit(OpReturn& op_return)
     op_return.op->accept_visitor(*this);
 }
 
+void RewriteRuleVisitor::visit(OpWith&) { }
+
 void RewriteRuleVisitor::visit(OpGroupBy& op_group_by)
 {
     for (auto& rule : rules) {

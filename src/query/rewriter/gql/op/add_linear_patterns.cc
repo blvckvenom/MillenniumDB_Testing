@@ -26,6 +26,11 @@ void AddLinearPatterns::visit(OpReturn& op_return)
     );
 }
 
+void AddLinearPatterns::visit(OpWith& op_with)
+{
+    tmp = op_with.clone();
+}
+
 void AddLinearPatterns::visit(OpGroupBy& op_group_by)
 {
     op_group_by.op->accept_visitor(*this);

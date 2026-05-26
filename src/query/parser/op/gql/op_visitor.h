@@ -20,6 +20,7 @@ class OpUnitTable;
 class OpEmpty;
 class OpCallProcedure;
 class OpOptional;
+class OpWith;
 
 class OpVisitor {
 public:
@@ -44,5 +45,6 @@ public:
     virtual void visit(OpEmpty&) = 0;
     virtual void visit(OpCallProcedure&) = 0;
     virtual void visit(OpOptional&) = 0;
+    virtual void visit(OpWith&) = 0;
 };
 } // namespace GQL

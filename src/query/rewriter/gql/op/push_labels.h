@@ -29,6 +29,7 @@ public:
     void visit(OpBasicGraphPattern& op) override;
     void visit(OpRepetition& op) override;
     void visit(OpReturn& op) override;
+    void visit(OpWith& op) override;
     void visit(OpOrderBy& op) override;
     void visit(OpWhere& op_filter) override;
     void visit(OpPathUnion& op) override;
