@@ -63,6 +63,7 @@ public:
     void visit(GQL::ExprCeil&) override;
     void visit(GQL::ExprLength&) override;
     void visit(GQL::ExprListComprehension&) override;
+    void visit(GQL::ExprReduce&) override;
     void visit(GQL::ExprListSize&) override;
     void visit(GQL::ExprNodesOfPath&) override;
     void visit(GQL::ExprRelationshipsOfPath&) override;

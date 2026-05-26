@@ -321,6 +321,17 @@ void ExprPrinter::visit(ExprListComprehension& expr)
     os << "]";
 }
 
+void ExprPrinter::visit(ExprReduce& expr)
+{
+    os << "REDUCE(" << expr.accumulator_var << " = ";
+    expr.initial_expr->accept_visitor(*this);
+    os << ", " << expr.loop_var << " IN ";
+    expr.list_expr->accept_visitor(*this);
+    os << " | ";
+    expr.projection_expr->accept_visitor(*this);
+    os << ")";
+}
+
 void ExprPrinter::visit(ExprListSize& expr)
 {
     os << "SIZE(";

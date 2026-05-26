@@ -884,6 +884,10 @@ RECORD
    : 'RECORD'
    ;
 
+REDUCE
+   : 'REDUCE'
+   ;
+
 REMOVE
    : 'REMOVE'
    ;

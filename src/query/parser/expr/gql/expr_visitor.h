@@ -48,6 +48,7 @@ class ExprFloor;
 class ExprCeil;
 class ExprLength;
 class ExprListComprehension;
+class ExprReduce;
 class ExprListSize;
 class ExprNodesOfPath;
 class ExprRelationshipsOfPath;
@@ -130,6 +131,7 @@ public:
     virtual void visit(GQL::ExprCeil&) = 0;
     virtual void visit(GQL::ExprLength&) = 0;
     virtual void visit(GQL::ExprListComprehension&) = 0;
+    virtual void visit(GQL::ExprReduce&) = 0;
     virtual void visit(GQL::ExprListSize&) = 0;
     virtual void visit(GQL::ExprNodesOfPath&) = 0;
     virtual void visit(GQL::ExprRelationshipsOfPath&) = 0;

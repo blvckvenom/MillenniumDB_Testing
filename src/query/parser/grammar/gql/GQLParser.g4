@@ -2193,6 +2193,7 @@ functionCall
    | elementIdFunction
    | datetimeValueFunction
    | durationFunction
+   | reduceFunction
    | listFunction
    | stringFunction
    | tensorFunction
@@ -2386,6 +2387,15 @@ durationFunctionParameters
 
 durationString
    : unbrokenCharacterStringLiteral
+   ;
+
+reduceFunction
+   : REDUCE LEFT_PAREN
+       accVar = bindingVariable EQUALS_OPERATOR initial = expression
+       COMMA
+       loopVar = bindingVariable IN sourceList = expression
+       VERTICAL_BAR projection = expression
+     RIGHT_PAREN                                                                                     #gqlReduceFunction
    ;
 
 generalFunction
@@ -2643,6 +2653,7 @@ keyword
    | READ
    | REAL
    | RECORD
+   | REDUCE
    | REMOVE
    | REPEATABLE
    | REPLACE

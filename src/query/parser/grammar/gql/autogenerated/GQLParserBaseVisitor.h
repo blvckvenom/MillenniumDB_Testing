@@ -2207,6 +2207,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlReduceFunction(GQLParser::GqlReduceFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGeneralFunction(GQLParser::GeneralFunctionContext *ctx) override {
     return visitChildren(ctx);
   }

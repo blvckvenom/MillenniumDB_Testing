@@ -365,6 +365,24 @@ public:
         }
     }
 
+    void visit(ExprReduce& expr) override
+    {
+        expr.initial_expr->accept_visitor(*this);
+        expr.list_expr->accept_visitor(*this);
+
+        bool inserted_acc = group_vars.insert(expr.accumulator_var).second;
+        bool inserted_loop = group_vars.insert(expr.loop_var).second;
+
+        expr.projection_expr->accept_visitor(*this);
+
+        if (inserted_acc) {
+            group_vars.erase(expr.accumulator_var);
+        }
+        if (inserted_loop) {
+            group_vars.erase(expr.loop_var);
+        }
+    }
+
     void visit(ExprListSize& expr) override
     {
         expr.expr->accept_visitor(*this);

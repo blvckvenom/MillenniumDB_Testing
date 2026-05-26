@@ -1453,6 +1453,37 @@ std::any QueryVisitor::visitGqlNormStringFunction(GQLParser::GqlNormStringFuncti
     return 0;
 }
 
+std::any QueryVisitor::visitGqlReduceFunction(GQLParser::GqlReduceFunctionContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->initial);
+    auto initial_expr = std::move(current_expr);
+
+    visit(ctx->sourceList);
+    auto source_list = std::move(current_expr);
+
+    VarId accumulator_var = get_query_ctx().get_internal_var();
+    VarId loop_var = get_query_ctx().get_internal_var();
+
+    local_variable_scopes.push_back(
+        { { ctx->accVar->getText(), accumulator_var }, { ctx->loopVar->getText(), loop_var } }
+    );
+
+    visit(ctx->projection);
+    auto projection_expr = std::move(current_expr);
+
+    local_variable_scopes.pop_back();
+
+    current_expr = std::make_unique<ExprReduce>(
+        accumulator_var,
+        loop_var,
+        std::move(initial_expr),
+        std::move(source_list),
+        std::move(projection_expr)
+    );
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlNodesOfPathFunction(GQLParser::GqlNodesOfPathFunctionContext* ctx)
 {
     LOG_VISITOR

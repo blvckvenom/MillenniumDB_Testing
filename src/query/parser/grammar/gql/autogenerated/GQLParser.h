@@ -54,47 +54,47 @@ public:
     PARAMETERS = 202, PATH = 203, PATH_LENGTH = 204, PATHS = 205, PERCENTILE_CONT = 206, 
     PERCENTILE_DISC = 207, POWER = 208, PRECISION = 209, PROPERTY = 210, 
     PROPERTIES = 211, PROPERTY_EXISTS = 212, PROJECT = 213, RADIANS = 214, 
-    READ = 215, REAL = 216, RECORD = 217, REMOVE = 218, REPEATABLE = 219, 
-    REPLACE = 220, RESET = 221, RETURN = 222, ROLLBACK = 223, RTRIM = 224, 
-    RIGHT = 225, SAME = 226, SCHEMA = 227, SELECT = 228, SESSION = 229, 
-    SET = 230, SHORTEST = 231, SIGNED = 232, SIMPLE = 233, SIZE = 234, SIN = 235, 
-    SINH = 236, SMALL = 237, SMALLINT = 238, SOURCE = 239, SQRT = 240, START = 241, 
-    STDDEV_POP = 242, STDDEV_SAMP = 243, STRING = 244, SUM = 245, TABLE = 246, 
-    TAN = 247, TANH = 248, TEMP = 249, THEN = 250, TIME = 251, TIMESTAMP = 252, 
-    TIMEZONE = 253, TO = 254, TRAIL = 255, TRAILING = 256, TRANSACTION = 257, 
-    TRIM = 258, K_TRUE = 259, TYPE = 260, TYPED = 261, UBIGINT = 262, UINT = 263, 
-    UINT128 = 264, UINT16 = 265, UINT256 = 266, UINT32 = 267, UINT64 = 268, 
-    UINT8 = 269, UNDIRECTED = 270, UNION = 271, UNKNOWN = 272, UNSIGNED = 273, 
-    UPPER = 274, USE = 275, USMALLINT = 276, VALUE = 277, VARBINARY = 278, 
-    VARCHAR = 279, VARIABLE = 280, WALK = 281, WHEN = 282, WHERE = 283, 
-    WITH = 284, WITHOUT = 285, WRITE = 286, XOR = 287, YIELD = 288, ZONE = 289, 
-    ZONED = 290, ZONED_DATETIME = 291, ZONED_TIME = 292, INTERVAL_DAY = 293, 
-    INTERVAL_WEEK = 294, INTERVAL_MONTH = 295, INTERVAL_YEAR = 296, EDGE_SYNONYM = 297, 
-    EDGES_SYNONYM = 298, NODE_SYNONYM = 299, KEY_WORD = 300, RESERVED_WORD = 301, 
-    PRE_RESERVED_WORD = 302, NON_RESERVED_WORD = 303, MULTISET_ALTERNATION_OPERATOR = 304, 
-    CONCATENATION_OPERATOR = 305, DOUBLE_COLON = 306, DOUBLE_PERIOD = 307, 
-    GREATER_THAN_OR_EQUALS_OPERATOR = 308, LEFT_MINUS_RIGHT = 309, LEFT_MINUS_SLASH = 310, 
-    LEFT_TILDE_SLASH = 311, LESS_THAN_OR_EQUALS_OPERATOR = 312, MINUS_SLASH = 313, 
-    NOT_EQUALS_OPERATOR = 314, RIGHT_ARROW = 315, SLASH_MINUS_RIGHT = 316, 
-    SLASH_TILDE_RIGHT = 317, TILDE_RIGHT_ARROW = 318, TILDE_SLASH = 319, 
-    DOUBLE_SOLIDUS = 320, ESCAPED_CHARACTER = 321, ESCAPED_REVERSE_SOLIDUS = 322, 
-    ESCAPED_QUOTE = 323, ESCAPED_DOUBLE_QUOTE = 324, ESCAPED_GRAVE_ACCENT = 325, 
-    ESCAPED_TAB = 326, ESCAPED_BACKSPACE = 327, ESCAPED_NEWLINE = 328, ESCAPED_CARRIAGE_RETURN = 329, 
-    ESCAPED_FORM_FEED = 330, UNICODE_ESCAPE_VALUE = 331, UNICODE_4_DIGIT_ESCAPE_VALUE = 332, 
-    UNICODE_6_DIGIT_ESCAPE_VALUE = 333, UNSIGNED_DECIMAL_INTEGER = 334, 
-    UNSIGNED_HEXADECIMAL_INTEGER = 335, UNSIGNED_OCTAL_INTEGER = 336, UNSIGNED_BINARY_INTEGER = 337, 
-    UNSIGNED_DECIMAL_IN_SCIENTIFIC_NOTATION = 338, UNSIGNED_DECIMAL_IN_COMMON_NOTATION = 339, 
-    FOUR_DIGIT = 340, DOUBLE_DIGIT = 341, SINGLE_QUOTED_STRING_LITERAL = 342, 
-    DOUBLE_QUOTED_STRING_LITERAL = 343, ACCENT_QUOTED_STRING_LITERAL = 344, 
-    BYTE_STRING_LITERAL = 345, QUOTE = 346, DOUBLE_QUOTE = 347, GRAVE_ACCENT = 348, 
-    REGULAR_IDENTIFIER = 349, IDENTIFIER_START = 350, IDENTIFIER_EXTEND = 351, 
-    SP = 352, SEPARATOR = 353, WHITESPACE = 354, Comment = 355, BIDIRECTIONAL_CONTROL_CHARACTER = 356, 
-    COMMENT = 357, SIMPLE_COMMENT = 358, SIMPLE_COMMENT_INTRODUCER = 359, 
-    SIMPLE_COMMENT_CHARACTER = 360, BRACKETED_COMMENT = 361, BRACKETED_COMMENT_INTRODUCER = 362, 
-    BRACKETED_COMMENT_TERMINATOR = 363, BRACKETED_COMMENT_CONTENTS = 364, 
-    GQL_TERMINAL_CHARACTER = 365, GQL_LANGUAGE_CHARACTER = 366, SIMPLE_LATIN_LETTER = 367, 
-    SIMPLE_LATIN_LOWER_CASE_LETTER = 368, SIMPLE_LATIN_UPPER_CASE_LETTER = 369, 
-    OTHER_DIGIT = 370, GQL_SPECIAL_CHARACTER = 371, OTHER_LANGUAGE_CHARACTER = 372
+    READ = 215, REAL = 216, RECORD = 217, REDUCE = 218, REMOVE = 219, REPEATABLE = 220, 
+    REPLACE = 221, RESET = 222, RETURN = 223, ROLLBACK = 224, RTRIM = 225, 
+    RIGHT = 226, SAME = 227, SCHEMA = 228, SELECT = 229, SESSION = 230, 
+    SET = 231, SHORTEST = 232, SIGNED = 233, SIMPLE = 234, SIZE = 235, SIN = 236, 
+    SINH = 237, SMALL = 238, SMALLINT = 239, SOURCE = 240, SQRT = 241, START = 242, 
+    STDDEV_POP = 243, STDDEV_SAMP = 244, STRING = 245, SUM = 246, TABLE = 247, 
+    TAN = 248, TANH = 249, TEMP = 250, THEN = 251, TIME = 252, TIMESTAMP = 253, 
+    TIMEZONE = 254, TO = 255, TRAIL = 256, TRAILING = 257, TRANSACTION = 258, 
+    TRIM = 259, K_TRUE = 260, TYPE = 261, TYPED = 262, UBIGINT = 263, UINT = 264, 
+    UINT128 = 265, UINT16 = 266, UINT256 = 267, UINT32 = 268, UINT64 = 269, 
+    UINT8 = 270, UNDIRECTED = 271, UNION = 272, UNKNOWN = 273, UNSIGNED = 274, 
+    UPPER = 275, USE = 276, USMALLINT = 277, VALUE = 278, VARBINARY = 279, 
+    VARCHAR = 280, VARIABLE = 281, WALK = 282, WHEN = 283, WHERE = 284, 
+    WITH = 285, WITHOUT = 286, WRITE = 287, XOR = 288, YIELD = 289, ZONE = 290, 
+    ZONED = 291, ZONED_DATETIME = 292, ZONED_TIME = 293, INTERVAL_DAY = 294, 
+    INTERVAL_WEEK = 295, INTERVAL_MONTH = 296, INTERVAL_YEAR = 297, EDGE_SYNONYM = 298, 
+    EDGES_SYNONYM = 299, NODE_SYNONYM = 300, KEY_WORD = 301, RESERVED_WORD = 302, 
+    PRE_RESERVED_WORD = 303, NON_RESERVED_WORD = 304, MULTISET_ALTERNATION_OPERATOR = 305, 
+    CONCATENATION_OPERATOR = 306, DOUBLE_COLON = 307, DOUBLE_PERIOD = 308, 
+    GREATER_THAN_OR_EQUALS_OPERATOR = 309, LEFT_MINUS_RIGHT = 310, LEFT_MINUS_SLASH = 311, 
+    LEFT_TILDE_SLASH = 312, LESS_THAN_OR_EQUALS_OPERATOR = 313, MINUS_SLASH = 314, 
+    NOT_EQUALS_OPERATOR = 315, RIGHT_ARROW = 316, SLASH_MINUS_RIGHT = 317, 
+    SLASH_TILDE_RIGHT = 318, TILDE_RIGHT_ARROW = 319, TILDE_SLASH = 320, 
+    DOUBLE_SOLIDUS = 321, ESCAPED_CHARACTER = 322, ESCAPED_REVERSE_SOLIDUS = 323, 
+    ESCAPED_QUOTE = 324, ESCAPED_DOUBLE_QUOTE = 325, ESCAPED_GRAVE_ACCENT = 326, 
+    ESCAPED_TAB = 327, ESCAPED_BACKSPACE = 328, ESCAPED_NEWLINE = 329, ESCAPED_CARRIAGE_RETURN = 330, 
+    ESCAPED_FORM_FEED = 331, UNICODE_ESCAPE_VALUE = 332, UNICODE_4_DIGIT_ESCAPE_VALUE = 333, 
+    UNICODE_6_DIGIT_ESCAPE_VALUE = 334, UNSIGNED_DECIMAL_INTEGER = 335, 
+    UNSIGNED_HEXADECIMAL_INTEGER = 336, UNSIGNED_OCTAL_INTEGER = 337, UNSIGNED_BINARY_INTEGER = 338, 
+    UNSIGNED_DECIMAL_IN_SCIENTIFIC_NOTATION = 339, UNSIGNED_DECIMAL_IN_COMMON_NOTATION = 340, 
+    FOUR_DIGIT = 341, DOUBLE_DIGIT = 342, SINGLE_QUOTED_STRING_LITERAL = 343, 
+    DOUBLE_QUOTED_STRING_LITERAL = 344, ACCENT_QUOTED_STRING_LITERAL = 345, 
+    BYTE_STRING_LITERAL = 346, QUOTE = 347, DOUBLE_QUOTE = 348, GRAVE_ACCENT = 349, 
+    REGULAR_IDENTIFIER = 350, IDENTIFIER_START = 351, IDENTIFIER_EXTEND = 352, 
+    SP = 353, SEPARATOR = 354, WHITESPACE = 355, Comment = 356, BIDIRECTIONAL_CONTROL_CHARACTER = 357, 
+    COMMENT = 358, SIMPLE_COMMENT = 359, SIMPLE_COMMENT_INTRODUCER = 360, 
+    SIMPLE_COMMENT_CHARACTER = 361, BRACKETED_COMMENT = 362, BRACKETED_COMMENT_INTRODUCER = 363, 
+    BRACKETED_COMMENT_TERMINATOR = 364, BRACKETED_COMMENT_CONTENTS = 365, 
+    GQL_TERMINAL_CHARACTER = 366, GQL_LANGUAGE_CHARACTER = 367, SIMPLE_LATIN_LETTER = 368, 
+    SIMPLE_LATIN_LOWER_CASE_LETTER = 369, SIMPLE_LATIN_UPPER_CASE_LETTER = 370, 
+    OTHER_DIGIT = 371, GQL_SPECIAL_CHARACTER = 372, OTHER_LANGUAGE_CHARACTER = 373
   };
 
   enum {
@@ -277,11 +277,12 @@ public:
     RuleTimeFunctionParameters = 479, RuleDatetimeFunctionParameters = 480, 
     RuleDateString = 481, RuleTimeString = 482, RuleDatetimeString = 483, 
     RuleDurationFunction = 484, RuleDurationFunctionParameters = 485, RuleDurationString = 486, 
-    RuleGeneralFunction = 487, RuleCollectionValueConstructor = 488, RuleTrimSpecification = 489, 
-    RuleNormalForm = 490, RuleListValueConstructor = 491, RuleListComprehension = 492, 
-    RuleRecordValueConstructor = 493, RuleField = 494, RulePathValueConstructor = 495, 
-    RuleUnsignedLiteral = 496, RuleGeneralLiteral = 497, RuleListLiteral = 498, 
-    RuleRecordLiteral = 499, RuleRecordFieldLiteral = 500, RuleKeyword = 501
+    RuleReduceFunction = 487, RuleGeneralFunction = 488, RuleCollectionValueConstructor = 489, 
+    RuleTrimSpecification = 490, RuleNormalForm = 491, RuleListValueConstructor = 492, 
+    RuleListComprehension = 493, RuleRecordValueConstructor = 494, RuleField = 495, 
+    RulePathValueConstructor = 496, RuleUnsignedLiteral = 497, RuleGeneralLiteral = 498, 
+    RuleListLiteral = 499, RuleRecordLiteral = 500, RuleRecordFieldLiteral = 501, 
+    RuleKeyword = 502
   };
 
   explicit GQLParser(antlr4::TokenStream *input);
@@ -788,6 +789,7 @@ public:
   class DurationFunctionContext;
   class DurationFunctionParametersContext;
   class DurationStringContext;
+  class ReduceFunctionContext;
   class GeneralFunctionContext;
   class CollectionValueConstructorContext;
   class TrimSpecificationContext;
@@ -8306,6 +8308,7 @@ public:
     ElementIdFunctionContext *elementIdFunction();
     DatetimeValueFunctionContext *datetimeValueFunction();
     DurationFunctionContext *durationFunction();
+    ReduceFunctionContext *reduceFunction();
     ListFunctionContext *listFunction();
     StringFunctionContext *stringFunction();
     TensorFunctionContext *tensorFunction();
@@ -9104,6 +9107,45 @@ public:
 
   DurationStringContext* durationString();
 
+  class  ReduceFunctionContext : public antlr4::ParserRuleContext {
+  public:
+    ReduceFunctionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+   
+    ReduceFunctionContext() = default;
+    void copyFrom(ReduceFunctionContext *context);
+    using antlr4::ParserRuleContext::copyFrom;
+
+    virtual size_t getRuleIndex() const override;
+
+   
+  };
+
+  class  GqlReduceFunctionContext : public ReduceFunctionContext {
+  public:
+    GqlReduceFunctionContext(ReduceFunctionContext *ctx);
+
+    GQLParser::BindingVariableContext *accVar = nullptr;
+    GQLParser::ExpressionContext *initial = nullptr;
+    GQLParser::BindingVariableContext *loopVar = nullptr;
+    GQLParser::ExpressionContext *sourceList = nullptr;
+    GQLParser::ExpressionContext *projection = nullptr;
+    antlr4::tree::TerminalNode *REDUCE();
+    antlr4::tree::TerminalNode *LEFT_PAREN();
+    antlr4::tree::TerminalNode *EQUALS_OPERATOR();
+    antlr4::tree::TerminalNode *COMMA();
+    antlr4::tree::TerminalNode *IN();
+    antlr4::tree::TerminalNode *VERTICAL_BAR();
+    antlr4::tree::TerminalNode *RIGHT_PAREN();
+    std::vector<BindingVariableContext *> bindingVariable();
+    BindingVariableContext* bindingVariable(size_t i);
+    std::vector<ExpressionContext *> expression();
+    ExpressionContext* expression(size_t i);
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+  };
+
+  ReduceFunctionContext* reduceFunction();
+
   class  GeneralFunctionContext : public antlr4::ParserRuleContext {
   public:
     GeneralFunctionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
@@ -9538,6 +9580,7 @@ public:
     antlr4::tree::TerminalNode *READ();
     antlr4::tree::TerminalNode *REAL();
     antlr4::tree::TerminalNode *RECORD();
+    antlr4::tree::TerminalNode *REDUCE();
     antlr4::tree::TerminalNode *REMOVE();
     antlr4::tree::TerminalNode *REPEATABLE();
     antlr4::tree::TerminalNode *REPLACE();

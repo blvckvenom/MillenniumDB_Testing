@@ -238,6 +238,9 @@ public:
     std::any visitGqlMultiTrimStringFunction(GQLParser::GqlMultiTrimStringFunctionContext* ctx) override;
     std::any visitGqlNormStringFunction(GQLParser::GqlNormStringFunctionContext* ctx) override;
 
+    // reduceFunction
+    std::any visitGqlReduceFunction(GQLParser::GqlReduceFunctionContext* ctx) override;
+
     // listFunction
     std::any visitGqlNodesOfPathFunction(GQLParser::GqlNodesOfPathFunctionContext* ctx) override;
     std::any

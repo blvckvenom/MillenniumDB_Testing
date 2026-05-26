@@ -397,6 +397,26 @@ void ExprToBindingExpr::visit(ExprListComprehension& expr)
     );
 }
 
+void ExprToBindingExpr::visit(ExprReduce& expr)
+{
+    expr.initial_expr->accept_visitor(*this);
+    auto initial = std::move(tmp);
+
+    expr.list_expr->accept_visitor(*this);
+    auto source_list = std::move(tmp);
+
+    expr.projection_expr->accept_visitor(*this);
+    auto projection = std::move(tmp);
+
+    tmp = std::make_unique<BindingExprReduce>(
+        expr.accumulator_var,
+        expr.loop_var,
+        std::move(initial),
+        std::move(source_list),
+        std::move(projection)
+    );
+}
+
 void ExprToBindingExpr::visit(ExprListSize& expr)
 {
     expr.expr->accept_visitor(*this);

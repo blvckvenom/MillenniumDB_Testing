@@ -213,6 +213,28 @@ public:
         expr.projection_expr->accept_visitor(*this);
     }
 
+    void visit(GQL::ExprReduce& expr) override
+    {
+        for (auto& rule : rules) {
+            if (rule->is_possible_to_regroup(expr.initial_expr)) {
+                expr.initial_expr = rule->regroup(std::move(expr.initial_expr));
+                has_rewritten = true;
+            }
+            if (rule->is_possible_to_regroup(expr.list_expr)) {
+                expr.list_expr = rule->regroup(std::move(expr.list_expr));
+                has_rewritten = true;
+            }
+            if (rule->is_possible_to_regroup(expr.projection_expr)) {
+                expr.projection_expr = rule->regroup(std::move(expr.projection_expr));
+                has_rewritten = true;
+            }
+        }
+
+        expr.initial_expr->accept_visitor(*this);
+        expr.list_expr->accept_visitor(*this);
+        expr.projection_expr->accept_visitor(*this);
+    }
+
     void visit(GQL::ExprListSize& expr) override
     {
         visit_expr_with_expr<ExprListSize>(expr);

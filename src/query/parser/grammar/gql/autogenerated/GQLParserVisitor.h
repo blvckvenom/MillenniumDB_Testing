@@ -1115,6 +1115,8 @@ public:
 
     virtual std::any visitDurationString(GQLParser::DurationStringContext *context) = 0;
 
+    virtual std::any visitGqlReduceFunction(GQLParser::GqlReduceFunctionContext *context) = 0;
+
     virtual std::any visitGeneralFunction(GQLParser::GeneralFunctionContext *context) = 0;
 
     virtual std::any visitCollectionValueConstructor(GQLParser::CollectionValueConstructorContext *context) = 0;
