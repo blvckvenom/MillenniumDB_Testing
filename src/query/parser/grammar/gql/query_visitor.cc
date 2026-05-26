@@ -1453,6 +1453,14 @@ std::any QueryVisitor::visitGqlNormStringFunction(GQLParser::GqlNormStringFuncti
     return 0;
 }
 
+std::any QueryVisitor::visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext* ctx)
+{
+    LOG_VISITOR
+    visit(ctx->expressionAtom());
+    current_expr = std::make_unique<ExprListSize>(std::move(current_expr));
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext* ctx)
 {
     LOG_VISITOR

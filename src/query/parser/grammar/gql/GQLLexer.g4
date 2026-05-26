@@ -944,6 +944,10 @@ SIMPLE
    : 'SIMPLE'
    ;
 
+SIZE
+   : 'SIZE'
+   ;
+
 SIN
    : 'SIN'
    ;

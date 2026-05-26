@@ -308,6 +308,13 @@ void ExprPrinter::visit(ExprLength& expr)
     os << ")";
 }
 
+void ExprPrinter::visit(ExprListSize& expr)
+{
+    os << "SIZE(";
+    expr.expr->accept_visitor(*this);
+    os << ")";
+}
+
 void ExprPrinter::visit(ExprSubStr& expr)
 {
     if (expr.left) {

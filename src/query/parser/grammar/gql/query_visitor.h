@@ -233,6 +233,9 @@ public:
     std::any visitGqlMultiTrimStringFunction(GQLParser::GqlMultiTrimStringFunctionContext* ctx) override;
     std::any visitGqlNormStringFunction(GQLParser::GqlNormStringFunctionContext* ctx) override;
 
+    // listFunction
+    std::any visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext* ctx) override;
+
     // caseFunction
     std::any visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext* ctx) override;
     std::any visitGqlCoalesceCaseFunction(GQLParser::GqlCoalesceCaseFunctionContext* ctx) override;

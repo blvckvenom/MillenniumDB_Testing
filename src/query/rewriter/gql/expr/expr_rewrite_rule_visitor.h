@@ -189,6 +189,11 @@ public:
         visit_expr_with_expr<ExprLength>(expr);
     }
 
+    void visit(GQL::ExprListSize& expr) override
+    {
+        visit_expr_with_expr<ExprListSize>(expr);
+    }
+
     void visit(GQL::ExprLn& expr) override
     {
         visit_expr_with_expr<ExprLn>(expr);

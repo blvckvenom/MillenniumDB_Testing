@@ -2083,6 +2083,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext *ctx) override {
     return visitChildren(ctx);
   }

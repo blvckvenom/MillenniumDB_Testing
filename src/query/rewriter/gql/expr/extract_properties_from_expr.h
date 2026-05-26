@@ -306,6 +306,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(ExprListSize& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(ExprSubStr& expr)
     {
         tmp = expr.clone();

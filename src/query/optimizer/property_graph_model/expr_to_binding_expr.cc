@@ -375,6 +375,12 @@ void ExprToBindingExpr::visit(ExprLength& expr)
     tmp = std::make_unique<BindingExprLength>(std::move(tmp));
 }
 
+void ExprToBindingExpr::visit(ExprListSize& expr)
+{
+    expr.expr->accept_visitor(*this);
+    tmp = std::make_unique<BindingExprListSize>(std::move(tmp));
+}
+
 void ExprToBindingExpr::visit(ExprSubStr& expr)
 {
     expr.expr->accept_visitor(*this);

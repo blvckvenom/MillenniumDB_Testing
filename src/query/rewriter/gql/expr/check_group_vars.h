@@ -349,6 +349,11 @@ public:
         expr.expr->accept_visitor(*this);
     }
 
+    void visit(ExprListSize& expr) override
+    {
+        expr.expr->accept_visitor(*this);
+    }
+
     void visit(ExprFold& expr) override
     {
         expr.expr->accept_visitor(*this);

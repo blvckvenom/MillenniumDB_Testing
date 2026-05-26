@@ -2266,6 +2266,7 @@ stringFunction
 listFunction
    : TRIM LEFT_PAREN list = expressionAtom COMMA trim = expressionAtom RIGHT_PAREN                                          #gqlListTrimFunction
    | ELEMENTS LEFT_PAREN expressionAtom RIGHT_PAREN                                                                         #gqlElementsOfPathFunction
+   | SIZE LEFT_PAREN expressionAtom RIGHT_PAREN                                                                             #gqlListSizeFunction
    ;
 
 caseFunction
@@ -2650,6 +2651,7 @@ keyword
    | SHORTEST
    | SIGNED
    | SIMPLE
+   | SIZE
    | SIN
    | SINH
    | SMALL

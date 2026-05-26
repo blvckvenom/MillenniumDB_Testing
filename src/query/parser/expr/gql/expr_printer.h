@@ -62,6 +62,7 @@ public:
     void visit(GQL::ExprFloor&) override;
     void visit(GQL::ExprCeil&) override;
     void visit(GQL::ExprLength&) override;
+    void visit(GQL::ExprListSize&) override;
     void visit(GQL::ExprSubStr&) override;
     void visit(GQL::ExprFold&) override;
     void visit(GQL::ExprSingleTrim&) override;

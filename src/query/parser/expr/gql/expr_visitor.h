@@ -47,6 +47,7 @@ class ExprSqrt;
 class ExprFloor;
 class ExprCeil;
 class ExprLength;
+class ExprListSize;
 class ExprSubStr;
 class ExprFold;
 class ExprSingleTrim;
@@ -125,6 +126,7 @@ public:
     virtual void visit(GQL::ExprFloor&) = 0;
     virtual void visit(GQL::ExprCeil&) = 0;
     virtual void visit(GQL::ExprLength&) = 0;
+    virtual void visit(GQL::ExprListSize&) = 0;
     virtual void visit(GQL::ExprSubStr&) = 0;
     virtual void visit(GQL::ExprFold&) = 0;
     virtual void visit(GQL::ExprSingleTrim&) = 0;

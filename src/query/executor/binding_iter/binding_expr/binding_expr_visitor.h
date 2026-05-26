@@ -153,6 +153,7 @@ class BindingExprSqrt;
 class BindingExprFloor;
 class BindingExprCeil;
 class BindingExprLength;
+class BindingExprListSize;
 class BindingExprSubStr;
 class BindingExprFold;
 class BindingExprSingleTrim;
@@ -319,6 +320,7 @@ public:
     virtual void visit(GQL::BindingExprFloor&) { throw LogicException("visit GQL::BindingExprFloor not implemented"); }
     virtual void visit(GQL::BindingExprCeil&) { throw LogicException("visit GQL::BindingExprCeil not implemented"); }
     virtual void visit(GQL::BindingExprLength&) { throw LogicException("visit GQL::BindingExprLength not implemented"); }
+    virtual void visit(GQL::BindingExprListSize&) { throw LogicException("visit GQL::BindingExprListSize not implemented"); }
     virtual void visit(GQL::BindingExprSubStr&) { throw LogicException("visit GQL::BindingExprSubString not implemented"); }
     virtual void visit(GQL::BindingExprFold&) { throw LogicException("visit GQL::BindingExprFold not implemented"); }
     virtual void visit(GQL::BindingExprSingleTrim&) { throw LogicException("visit GQL::BindingExprSingleTrim not implemented"); }
