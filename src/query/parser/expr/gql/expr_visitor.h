@@ -46,6 +46,7 @@ class ExprPower;
 class ExprSqrt;
 class ExprFloor;
 class ExprCeil;
+class ExprRound;
 class ExprLength;
 class ExprListComprehension;
 class ExprReduce;
@@ -129,6 +130,7 @@ public:
     virtual void visit(GQL::ExprSqrt&) = 0;
     virtual void visit(GQL::ExprFloor&) = 0;
     virtual void visit(GQL::ExprCeil&) = 0;
+    virtual void visit(GQL::ExprRound&) = 0;
     virtual void visit(GQL::ExprLength&) = 0;
     virtual void visit(GQL::ExprListComprehension&) = 0;
     virtual void visit(GQL::ExprReduce&) = 0;

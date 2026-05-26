@@ -872,6 +872,10 @@ RADIANS
    : 'RADIANS'
    ;
 
+ROUND
+   : 'ROUND'
+   ;
+
 READ
    : 'READ'
    ;

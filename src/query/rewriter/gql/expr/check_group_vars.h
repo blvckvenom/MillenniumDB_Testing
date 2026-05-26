@@ -344,6 +344,14 @@ public:
         expr.expr->accept_visitor(*this);
     }
 
+    void visit(ExprRound& expr) override
+    {
+        expr.expr->accept_visitor(*this);
+        if (expr.precision != nullptr) {
+            expr.precision->accept_visitor(*this);
+        }
+    }
+
     void visit(ExprLength& expr) override
     {
         expr.expr->accept_visitor(*this);

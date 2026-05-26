@@ -2248,12 +2248,14 @@ oneArgNumericFunctionName
    | FLOOR
    | CEIL
    | CEILING
+   | ROUND
    ;
 
 twoArgNumericFunctionName
    : MOD
    | LOG
    | POWER
+   | ROUND
    ;
 
 stringFunction
@@ -2660,6 +2662,7 @@ keyword
    | RESET
    | RETURN
    | ROLLBACK
+   | ROUND
    | RTRIM
    | RIGHT
    | SAME

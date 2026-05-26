@@ -179,6 +179,25 @@ public:
         visit_expr_with_expr<ExprFloor>(expr);
     }
 
+    void visit(GQL::ExprRound& expr) override
+    {
+        for (auto& rule : rules) {
+            if (rule->is_possible_to_regroup(expr.expr)) {
+                expr.expr = rule->regroup(std::move(expr.expr));
+                has_rewritten = true;
+            }
+            if (expr.precision != nullptr && rule->is_possible_to_regroup(expr.precision)) {
+                expr.precision = rule->regroup(std::move(expr.precision));
+                has_rewritten = true;
+            }
+        }
+
+        expr.expr->accept_visitor(*this);
+        if (expr.precision != nullptr) {
+            expr.precision->accept_visitor(*this);
+        }
+    }
+
     void visit(GQL::ExprFold& expr) override
     {
         visit_expr_with_expr<ExprFold>(expr);

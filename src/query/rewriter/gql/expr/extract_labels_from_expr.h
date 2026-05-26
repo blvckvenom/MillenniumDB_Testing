@@ -258,6 +258,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(GQL::ExprRound& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(GQL::ExprLength& expr)
     {
         tmp = expr.clone();

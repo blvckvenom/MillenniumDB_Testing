@@ -369,6 +369,20 @@ void ExprToBindingExpr::visit(ExprCeil& expr)
     tmp = std::make_unique<BindingExprCeil>(std::move(tmp));
 }
 
+void ExprToBindingExpr::visit(ExprRound& expr)
+{
+    expr.expr->accept_visitor(*this);
+    auto rounded_expr = std::move(tmp);
+
+    std::unique_ptr<BindingExpr> precision = nullptr;
+    if (expr.precision != nullptr) {
+        expr.precision->accept_visitor(*this);
+        precision = std::move(tmp);
+    }
+
+    tmp = std::make_unique<BindingExprRound>(std::move(rounded_expr), std::move(precision));
+}
+
 void ExprToBindingExpr::visit(ExprLength& expr)
 {
     expr.expr->accept_visitor(*this);

@@ -88,6 +88,7 @@ public:
     void visit(ExprSqrt&) override;
     void visit(ExprFloor&) override;
     void visit(ExprCeil&) override;
+    void visit(ExprRound&) override;
     void visit(ExprLength&) override;
     void visit(ExprListComprehension&) override;
     void visit(ExprReduce&) override;

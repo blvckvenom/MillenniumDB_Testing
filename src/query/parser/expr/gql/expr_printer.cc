@@ -301,6 +301,17 @@ void ExprPrinter::visit(ExprCeil& expr)
     os << ")";
 }
 
+void ExprPrinter::visit(ExprRound& expr)
+{
+    os << "ROUND(";
+    expr.expr->accept_visitor(*this);
+    if (expr.precision != nullptr) {
+        os << ", ";
+        expr.precision->accept_visitor(*this);
+    }
+    os << ")";
+}
+
 void ExprPrinter::visit(ExprLength& expr)
 {
     os << "CHAR_LENGTH(";

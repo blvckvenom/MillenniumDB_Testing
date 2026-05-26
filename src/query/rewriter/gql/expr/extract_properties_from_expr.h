@@ -301,6 +301,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(ExprRound& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(ExprLength& expr)
     {
         tmp = expr.clone();

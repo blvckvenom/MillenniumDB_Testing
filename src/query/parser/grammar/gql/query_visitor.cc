@@ -1263,8 +1263,10 @@ std::any QueryVisitor::visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFu
         current_expr = std::make_unique<ExprSqrt>(std::move(expr));
     } else if (ctx->oneArgNumericFunctionName()->FLOOR()) {
         current_expr = std::make_unique<ExprFloor>(std::move(expr));
-    } else if (ctx->oneArgNumericFunctionName()->CEIL()) {
+    } else if (ctx->oneArgNumericFunctionName()->CEIL() || ctx->oneArgNumericFunctionName()->CEILING()) {
         current_expr = std::make_unique<ExprCeil>(std::move(expr));
+    } else if (ctx->oneArgNumericFunctionName()->ROUND()) {
+        current_expr = std::make_unique<ExprRound>(std::move(expr));
     } else if (ctx->oneArgNumericFunctionName()->CHAR_LENGTH()
                || ctx->oneArgNumericFunctionName()->CHARACTER_LENGTH())
     {
@@ -1298,6 +1300,8 @@ std::any QueryVisitor::visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFu
         current_expr = std::make_unique<ExprLog>(std::move(expressions[0]), std::move(expressions[1]));
     } else if (ctx->twoArgNumericFunctionName()->POWER()) {
         current_expr = std::make_unique<ExprPower>(std::move(expressions[0]), std::move(expressions[1]));
+    } else if (ctx->twoArgNumericFunctionName()->ROUND()) {
+        current_expr = std::make_unique<ExprRound>(std::move(expressions[0]), std::move(expressions[1]));
     }
     return 0;
 }
