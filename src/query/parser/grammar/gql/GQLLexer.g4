@@ -360,6 +360,10 @@ DEGREES
    : 'DEGREES'
    ;
 
+DEGREE
+   : 'DEGREE'
+   ;
+
 DELETE
    : 'DELETE'
    ;
@@ -546,6 +550,10 @@ IF
 
 IN
    : 'IN'
+   ;
+
+INDEGREE
+   : 'INDEGREE'
    ;
 
 INCLUDE
@@ -774,6 +782,10 @@ NULLS
 
 OCTET_LENGTH
    : 'OCTET_LENGTH'
+   ;
+
+OUTDEGREE
+   : 'OUTDEGREE'
    ;
 
 OF

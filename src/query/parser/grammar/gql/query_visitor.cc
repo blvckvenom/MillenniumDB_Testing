@@ -1526,6 +1526,72 @@ std::any QueryVisitor::visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionCo
     return 0;
 }
 
+std::any QueryVisitor::visitGqlOutDegreeFunction(GQLParser::GqlOutDegreeFunctionContext* ctx)
+{
+    LOG_VISITOR
+    std::string var_name = ctx->variable()->getText();
+    VarId var_id = resolve_var_id(var_name);
+
+    if (!singleton_types.count(var_id)) {
+        throw QuerySemanticException(
+            "Degree function argument contains the variable \"" + var_name
+            + "\" which does not appear in the pattern expression."
+        );
+    }
+    if (singleton_types[var_id] != VarType::Node) {
+        throw QuerySemanticException(
+            "Degree function argument \"" + var_name + "\" must be a node variable."
+        );
+    }
+
+    current_expr = std::make_unique<ExprNodeDegree>(var_id, NodeDegreeType::OUT);
+    return 0;
+}
+
+std::any QueryVisitor::visitGqlInDegreeFunction(GQLParser::GqlInDegreeFunctionContext* ctx)
+{
+    LOG_VISITOR
+    std::string var_name = ctx->variable()->getText();
+    VarId var_id = resolve_var_id(var_name);
+
+    if (!singleton_types.count(var_id)) {
+        throw QuerySemanticException(
+            "Degree function argument contains the variable \"" + var_name
+            + "\" which does not appear in the pattern expression."
+        );
+    }
+    if (singleton_types[var_id] != VarType::Node) {
+        throw QuerySemanticException(
+            "Degree function argument \"" + var_name + "\" must be a node variable."
+        );
+    }
+
+    current_expr = std::make_unique<ExprNodeDegree>(var_id, NodeDegreeType::IN);
+    return 0;
+}
+
+std::any QueryVisitor::visitGqlDegreeFunction(GQLParser::GqlDegreeFunctionContext* ctx)
+{
+    LOG_VISITOR
+    std::string var_name = ctx->variable()->getText();
+    VarId var_id = resolve_var_id(var_name);
+
+    if (!singleton_types.count(var_id)) {
+        throw QuerySemanticException(
+            "Degree function argument contains the variable \"" + var_name
+            + "\" which does not appear in the pattern expression."
+        );
+    }
+    if (singleton_types[var_id] != VarType::Node) {
+        throw QuerySemanticException(
+            "Degree function argument \"" + var_name + "\" must be a node variable."
+        );
+    }
+
+    current_expr = std::make_unique<ExprNodeDegree>(var_id, NodeDegreeType::BOTH);
+    return 0;
+}
+
 std::any QueryVisitor::visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext* ctx)
 {
     LOG_VISITOR

@@ -600,6 +600,11 @@ void ExprToBindingExpr::visit(ExprLabels& expr)
     }
 }
 
+void ExprToBindingExpr::visit(ExprNodeDegree& expr)
+{
+    tmp = std::make_unique<BindingExprNodeDegree>(expr.var, expr.degree_type);
+}
+
 void ExprToBindingExpr::visit(ExprCast& expr)
 {
     expr.expr->accept_visitor(*this);

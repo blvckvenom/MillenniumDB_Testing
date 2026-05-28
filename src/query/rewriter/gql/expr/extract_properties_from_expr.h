@@ -386,6 +386,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(ExprNodeDegree& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(ExprIn& expr)
     {
         tmp = expr.clone();

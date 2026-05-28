@@ -343,6 +343,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(GQL::ExprNodeDegree& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(GQL::ExprIn& expr)
     {
         tmp = expr.clone();

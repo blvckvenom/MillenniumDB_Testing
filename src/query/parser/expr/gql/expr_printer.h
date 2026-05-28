@@ -79,6 +79,7 @@ public:
     void visit(GQL::ExprSearchedCase&) override;
     void visit(GQL::ExprCast&) override;
     void visit(GQL::ExprLabels&) override;
+    void visit(GQL::ExprNodeDegree&) override;
     void visit(GQL::ExprProperties&) override;
     void visit(GQL::ExprIn&) override;
     void visit(GQL::ExprCosineDistance&) override;

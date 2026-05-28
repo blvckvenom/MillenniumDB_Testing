@@ -62,6 +62,7 @@
 #include "query/parser/expr/gql/expr_searchedcase.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_cast.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_labels.h" // IWYU pragma: export
+#include "query/parser/expr/gql/expr_node_degree.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_properties.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_in.h" // IWYU pragma: export
 #include "query/parser/expr/gql/expr_cosine_distance.h" // IWYU pragma: export

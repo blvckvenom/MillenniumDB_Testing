@@ -28,73 +28,74 @@ public:
     COPY = 68, COSINEDISTANCE = 69, COS = 70, COSH = 71, COT = 72, COUNT = 73, 
     CREATE = 74, CURRENT_DATE = 75, CURRENT_GRAPH = 76, CURRENT_PROPERTY_GRAPH = 77, 
     CURRENT_SCHEMA = 78, CURRENT_TIME = 79, CURRENT_TIMESTAMP = 80, CURRENT_USER = 81, 
-    DATE = 82, DATETIME = 83, DEC = 84, DECIMAL = 85, DEGREES = 86, DELETE = 87, 
-    DESC = 88, DESCENDING = 89, DESTINATION = 90, DETACH = 91, DIFFERENT = 92, 
-    DIRECTED = 93, DISTINCT = 94, DOUBLE = 95, DROP = 96, DURATION = 97, 
-    DURATION_BETWEEN = 98, ELEMENT = 99, ELEMENT_ID = 100, ELEMENTS = 101, 
-    ELSE = 102, END = 103, EXCEPT = 104, EXISTS = 105, EXP = 106, K_FALSE = 107, 
-    FILTER = 108, FINISH = 109, FIRST = 110, FLOAT = 111, FLOAT128 = 112, 
-    FLOAT16 = 113, FLOAT256 = 114, FLOAT32 = 115, FLOAT64 = 116, FLOOR = 117, 
-    FOR = 118, FROM = 119, GRAPH = 120, GROUP = 121, GROUPS = 122, HAVING = 123, 
-    HOME_GRAPH = 124, HOME_PROPERTY_GRAPH = 125, HOME_SCHEMA = 126, I_DONT_KNOW_1 = 127, 
-    I_DONT_KNOW_2 = 128, I_DONT_KNOW_3 = 129, I_DONT_KNOW_4 = 130, I_DONT_KNOW_5 = 131, 
-    IF = 132, IN = 133, INCLUDE = 134, INSERT = 135, INT = 136, INT8 = 137, 
-    INT16 = 138, INT32 = 139, INT64 = 140, INT128 = 141, INT256 = 142, INTEGER = 143, 
-    INTEGER8 = 144, INTEGER16 = 145, INTEGER32 = 146, INTEGER64 = 147, INTEGER128 = 148, 
-    INTEGER256 = 149, INTERSECT = 150, IS = 151, KEEP = 152, LABEL = 153, 
-    LABELED = 154, LABELS = 155, LAST = 156, LEADING = 157, LEFT = 158, 
-    LET = 159, LIKE = 160, LIMIT = 161, LIST = 162, LN = 163, LOCAL = 164, 
-    LOCAL_DATETIME = 165, LOCAL_TIME = 166, LOCAL_TIMESTAMP = 167, LOG = 168, 
-    LOG10 = 169, LOWER = 170, LTRIM = 171, MATCH = 172, MAX = 173, MIN = 174, 
-    MOD = 175, NEXT = 176, NFC = 177, NFD = 178, NFKC = 179, NFKD = 180, 
-    NO = 181, NODETACH = 182, NODES = 183, NORMALIZE = 184, NORMALIZED = 185, 
-    NOT = 186, NULL_ = 187, NULLIF = 188, NULLS = 189, OCTET_LENGTH = 190, 
-    OF = 191, OFFSET = 192, SKIP_ = 193, ONLY = 194, OPEN = 195, OPTIONAL = 196, 
-    OR = 197, ORDER = 198, ORDINALITY = 199, OTHERWISE = 200, PARAMETER = 201, 
-    PARAMETERS = 202, PATH = 203, PATH_LENGTH = 204, PATHS = 205, PERCENTILE_CONT = 206, 
-    PERCENTILE_DISC = 207, POWER = 208, PRECISION = 209, PROPERTY = 210, 
-    PROPERTIES = 211, PROPERTY_EXISTS = 212, PROJECT = 213, RADIANS = 214, 
-    ROUND = 215, READ = 216, REAL = 217, RECORD = 218, REDUCE = 219, REMOVE = 220, 
-    REPEATABLE = 221, REPLACE = 222, RESET = 223, RETURN = 224, ROLLBACK = 225, 
-    RTRIM = 226, RIGHT = 227, SAME = 228, SCHEMA = 229, SELECT = 230, SESSION = 231, 
-    SET = 232, SHORTEST = 233, SIGNED = 234, SIMPLE = 235, SIZE = 236, SIN = 237, 
-    SINH = 238, SMALL = 239, SMALLINT = 240, SOURCE = 241, SQRT = 242, START = 243, 
-    STDDEV_POP = 244, STDDEV_SAMP = 245, STRING = 246, SUM = 247, TABLE = 248, 
-    TAN = 249, TANH = 250, TEMP = 251, THEN = 252, TIME = 253, TIMESTAMP = 254, 
-    TIMEZONE = 255, TO = 256, TOFLOAT = 257, TOINTEGER = 258, TRAIL = 259, 
-    TRAILING = 260, TRANSACTION = 261, TRIM = 262, K_TRUE = 263, TYPE = 264, 
-    TYPED = 265, UBIGINT = 266, UINT = 267, UINT128 = 268, UINT16 = 269, 
-    UINT256 = 270, UINT32 = 271, UINT64 = 272, UINT8 = 273, UNDIRECTED = 274, 
-    UNION = 275, UNKNOWN = 276, UNSIGNED = 277, UPPER = 278, USE = 279, 
-    USMALLINT = 280, VALUE = 281, VARBINARY = 282, VARCHAR = 283, VARIABLE = 284, 
-    WALK = 285, WHEN = 286, WHERE = 287, WITH = 288, WITHOUT = 289, WRITE = 290, 
-    XOR = 291, YIELD = 292, ZONE = 293, ZONED = 294, ZONED_DATETIME = 295, 
-    ZONED_TIME = 296, INTERVAL_DAY = 297, INTERVAL_WEEK = 298, INTERVAL_MONTH = 299, 
-    INTERVAL_YEAR = 300, EDGE_SYNONYM = 301, EDGES_SYNONYM = 302, NODE_SYNONYM = 303, 
-    KEY_WORD = 304, RESERVED_WORD = 305, PRE_RESERVED_WORD = 306, NON_RESERVED_WORD = 307, 
-    MULTISET_ALTERNATION_OPERATOR = 308, CONCATENATION_OPERATOR = 309, DOUBLE_COLON = 310, 
-    DOUBLE_PERIOD = 311, GREATER_THAN_OR_EQUALS_OPERATOR = 312, LEFT_MINUS_RIGHT = 313, 
-    LEFT_MINUS_SLASH = 314, LEFT_TILDE_SLASH = 315, LESS_THAN_OR_EQUALS_OPERATOR = 316, 
-    MINUS_SLASH = 317, NOT_EQUALS_OPERATOR = 318, RIGHT_ARROW = 319, SLASH_MINUS_RIGHT = 320, 
-    SLASH_TILDE_RIGHT = 321, TILDE_RIGHT_ARROW = 322, TILDE_SLASH = 323, 
-    DOUBLE_SOLIDUS = 324, ESCAPED_CHARACTER = 325, ESCAPED_REVERSE_SOLIDUS = 326, 
-    ESCAPED_QUOTE = 327, ESCAPED_DOUBLE_QUOTE = 328, ESCAPED_GRAVE_ACCENT = 329, 
-    ESCAPED_TAB = 330, ESCAPED_BACKSPACE = 331, ESCAPED_NEWLINE = 332, ESCAPED_CARRIAGE_RETURN = 333, 
-    ESCAPED_FORM_FEED = 334, UNICODE_ESCAPE_VALUE = 335, UNICODE_4_DIGIT_ESCAPE_VALUE = 336, 
-    UNICODE_6_DIGIT_ESCAPE_VALUE = 337, UNSIGNED_DECIMAL_INTEGER = 338, 
-    UNSIGNED_HEXADECIMAL_INTEGER = 339, UNSIGNED_OCTAL_INTEGER = 340, UNSIGNED_BINARY_INTEGER = 341, 
-    UNSIGNED_DECIMAL_IN_SCIENTIFIC_NOTATION = 342, UNSIGNED_DECIMAL_IN_COMMON_NOTATION = 343, 
-    FOUR_DIGIT = 344, DOUBLE_DIGIT = 345, SINGLE_QUOTED_STRING_LITERAL = 346, 
-    DOUBLE_QUOTED_STRING_LITERAL = 347, ACCENT_QUOTED_STRING_LITERAL = 348, 
-    BYTE_STRING_LITERAL = 349, QUOTE = 350, DOUBLE_QUOTE = 351, GRAVE_ACCENT = 352, 
-    REGULAR_IDENTIFIER = 353, IDENTIFIER_START = 354, IDENTIFIER_EXTEND = 355, 
-    SP = 356, SEPARATOR = 357, WHITESPACE = 358, Comment = 359, BIDIRECTIONAL_CONTROL_CHARACTER = 360, 
-    COMMENT = 361, SIMPLE_COMMENT = 362, SIMPLE_COMMENT_INTRODUCER = 363, 
-    SIMPLE_COMMENT_CHARACTER = 364, BRACKETED_COMMENT = 365, BRACKETED_COMMENT_INTRODUCER = 366, 
-    BRACKETED_COMMENT_TERMINATOR = 367, BRACKETED_COMMENT_CONTENTS = 368, 
-    GQL_TERMINAL_CHARACTER = 369, GQL_LANGUAGE_CHARACTER = 370, SIMPLE_LATIN_LETTER = 371, 
-    SIMPLE_LATIN_LOWER_CASE_LETTER = 372, SIMPLE_LATIN_UPPER_CASE_LETTER = 373, 
-    OTHER_DIGIT = 374, GQL_SPECIAL_CHARACTER = 375, OTHER_LANGUAGE_CHARACTER = 376
+    DATE = 82, DATETIME = 83, DEC = 84, DECIMAL = 85, DEGREES = 86, DEGREE = 87, 
+    DELETE = 88, DESC = 89, DESCENDING = 90, DESTINATION = 91, DETACH = 92, 
+    DIFFERENT = 93, DIRECTED = 94, DISTINCT = 95, DOUBLE = 96, DROP = 97, 
+    DURATION = 98, DURATION_BETWEEN = 99, ELEMENT = 100, ELEMENT_ID = 101, 
+    ELEMENTS = 102, ELSE = 103, END = 104, EXCEPT = 105, EXISTS = 106, EXP = 107, 
+    K_FALSE = 108, FILTER = 109, FINISH = 110, FIRST = 111, FLOAT = 112, 
+    FLOAT128 = 113, FLOAT16 = 114, FLOAT256 = 115, FLOAT32 = 116, FLOAT64 = 117, 
+    FLOOR = 118, FOR = 119, FROM = 120, GRAPH = 121, GROUP = 122, GROUPS = 123, 
+    HAVING = 124, HOME_GRAPH = 125, HOME_PROPERTY_GRAPH = 126, HOME_SCHEMA = 127, 
+    I_DONT_KNOW_1 = 128, I_DONT_KNOW_2 = 129, I_DONT_KNOW_3 = 130, I_DONT_KNOW_4 = 131, 
+    I_DONT_KNOW_5 = 132, IF = 133, IN = 134, INDEGREE = 135, INCLUDE = 136, 
+    INSERT = 137, INT = 138, INT8 = 139, INT16 = 140, INT32 = 141, INT64 = 142, 
+    INT128 = 143, INT256 = 144, INTEGER = 145, INTEGER8 = 146, INTEGER16 = 147, 
+    INTEGER32 = 148, INTEGER64 = 149, INTEGER128 = 150, INTEGER256 = 151, 
+    INTERSECT = 152, IS = 153, KEEP = 154, LABEL = 155, LABELED = 156, LABELS = 157, 
+    LAST = 158, LEADING = 159, LEFT = 160, LET = 161, LIKE = 162, LIMIT = 163, 
+    LIST = 164, LN = 165, LOCAL = 166, LOCAL_DATETIME = 167, LOCAL_TIME = 168, 
+    LOCAL_TIMESTAMP = 169, LOG = 170, LOG10 = 171, LOWER = 172, LTRIM = 173, 
+    MATCH = 174, MAX = 175, MIN = 176, MOD = 177, NEXT = 178, NFC = 179, 
+    NFD = 180, NFKC = 181, NFKD = 182, NO = 183, NODETACH = 184, NODES = 185, 
+    NORMALIZE = 186, NORMALIZED = 187, NOT = 188, NULL_ = 189, NULLIF = 190, 
+    NULLS = 191, OCTET_LENGTH = 192, OUTDEGREE = 193, OF = 194, OFFSET = 195, 
+    SKIP_ = 196, ONLY = 197, OPEN = 198, OPTIONAL = 199, OR = 200, ORDER = 201, 
+    ORDINALITY = 202, OTHERWISE = 203, PARAMETER = 204, PARAMETERS = 205, 
+    PATH = 206, PATH_LENGTH = 207, PATHS = 208, PERCENTILE_CONT = 209, PERCENTILE_DISC = 210, 
+    POWER = 211, PRECISION = 212, PROPERTY = 213, PROPERTIES = 214, PROPERTY_EXISTS = 215, 
+    PROJECT = 216, RADIANS = 217, ROUND = 218, READ = 219, REAL = 220, RECORD = 221, 
+    REDUCE = 222, REMOVE = 223, REPEATABLE = 224, REPLACE = 225, RESET = 226, 
+    RETURN = 227, ROLLBACK = 228, RTRIM = 229, RIGHT = 230, SAME = 231, 
+    SCHEMA = 232, SELECT = 233, SESSION = 234, SET = 235, SHORTEST = 236, 
+    SIGNED = 237, SIMPLE = 238, SIZE = 239, SIN = 240, SINH = 241, SMALL = 242, 
+    SMALLINT = 243, SOURCE = 244, SQRT = 245, START = 246, STDDEV_POP = 247, 
+    STDDEV_SAMP = 248, STRING = 249, SUM = 250, TABLE = 251, TAN = 252, 
+    TANH = 253, TEMP = 254, THEN = 255, TIME = 256, TIMESTAMP = 257, TIMEZONE = 258, 
+    TO = 259, TOFLOAT = 260, TOINTEGER = 261, TRAIL = 262, TRAILING = 263, 
+    TRANSACTION = 264, TRIM = 265, K_TRUE = 266, TYPE = 267, TYPED = 268, 
+    UBIGINT = 269, UINT = 270, UINT128 = 271, UINT16 = 272, UINT256 = 273, 
+    UINT32 = 274, UINT64 = 275, UINT8 = 276, UNDIRECTED = 277, UNION = 278, 
+    UNKNOWN = 279, UNSIGNED = 280, UPPER = 281, USE = 282, USMALLINT = 283, 
+    VALUE = 284, VARBINARY = 285, VARCHAR = 286, VARIABLE = 287, WALK = 288, 
+    WHEN = 289, WHERE = 290, WITH = 291, WITHOUT = 292, WRITE = 293, XOR = 294, 
+    YIELD = 295, ZONE = 296, ZONED = 297, ZONED_DATETIME = 298, ZONED_TIME = 299, 
+    INTERVAL_DAY = 300, INTERVAL_WEEK = 301, INTERVAL_MONTH = 302, INTERVAL_YEAR = 303, 
+    EDGE_SYNONYM = 304, EDGES_SYNONYM = 305, NODE_SYNONYM = 306, KEY_WORD = 307, 
+    RESERVED_WORD = 308, PRE_RESERVED_WORD = 309, NON_RESERVED_WORD = 310, 
+    MULTISET_ALTERNATION_OPERATOR = 311, CONCATENATION_OPERATOR = 312, DOUBLE_COLON = 313, 
+    DOUBLE_PERIOD = 314, GREATER_THAN_OR_EQUALS_OPERATOR = 315, LEFT_MINUS_RIGHT = 316, 
+    LEFT_MINUS_SLASH = 317, LEFT_TILDE_SLASH = 318, LESS_THAN_OR_EQUALS_OPERATOR = 319, 
+    MINUS_SLASH = 320, NOT_EQUALS_OPERATOR = 321, RIGHT_ARROW = 322, SLASH_MINUS_RIGHT = 323, 
+    SLASH_TILDE_RIGHT = 324, TILDE_RIGHT_ARROW = 325, TILDE_SLASH = 326, 
+    DOUBLE_SOLIDUS = 327, ESCAPED_CHARACTER = 328, ESCAPED_REVERSE_SOLIDUS = 329, 
+    ESCAPED_QUOTE = 330, ESCAPED_DOUBLE_QUOTE = 331, ESCAPED_GRAVE_ACCENT = 332, 
+    ESCAPED_TAB = 333, ESCAPED_BACKSPACE = 334, ESCAPED_NEWLINE = 335, ESCAPED_CARRIAGE_RETURN = 336, 
+    ESCAPED_FORM_FEED = 337, UNICODE_ESCAPE_VALUE = 338, UNICODE_4_DIGIT_ESCAPE_VALUE = 339, 
+    UNICODE_6_DIGIT_ESCAPE_VALUE = 340, UNSIGNED_DECIMAL_INTEGER = 341, 
+    UNSIGNED_HEXADECIMAL_INTEGER = 342, UNSIGNED_OCTAL_INTEGER = 343, UNSIGNED_BINARY_INTEGER = 344, 
+    UNSIGNED_DECIMAL_IN_SCIENTIFIC_NOTATION = 345, UNSIGNED_DECIMAL_IN_COMMON_NOTATION = 346, 
+    FOUR_DIGIT = 347, DOUBLE_DIGIT = 348, SINGLE_QUOTED_STRING_LITERAL = 349, 
+    DOUBLE_QUOTED_STRING_LITERAL = 350, ACCENT_QUOTED_STRING_LITERAL = 351, 
+    BYTE_STRING_LITERAL = 352, QUOTE = 353, DOUBLE_QUOTE = 354, GRAVE_ACCENT = 355, 
+    REGULAR_IDENTIFIER = 356, IDENTIFIER_START = 357, IDENTIFIER_EXTEND = 358, 
+    SP = 359, SEPARATOR = 360, WHITESPACE = 361, Comment = 362, BIDIRECTIONAL_CONTROL_CHARACTER = 363, 
+    COMMENT = 364, SIMPLE_COMMENT = 365, SIMPLE_COMMENT_INTRODUCER = 366, 
+    SIMPLE_COMMENT_CHARACTER = 367, BRACKETED_COMMENT = 368, BRACKETED_COMMENT_INTRODUCER = 369, 
+    BRACKETED_COMMENT_TERMINATOR = 370, BRACKETED_COMMENT_CONTENTS = 371, 
+    GQL_TERMINAL_CHARACTER = 372, GQL_LANGUAGE_CHARACTER = 373, SIMPLE_LATIN_LETTER = 374, 
+    SIMPLE_LATIN_LOWER_CASE_LETTER = 375, SIMPLE_LATIN_UPPER_CASE_LETTER = 376, 
+    OTHER_DIGIT = 377, GQL_SPECIAL_CHARACTER = 378, OTHER_LANGUAGE_CHARACTER = 379
   };
 
   enum {
@@ -268,21 +269,21 @@ public:
     RuleTruthValue = 452, RuleUnaryOperator = 453, RuleFunctionCall = 454, 
     RuleTensorFunction = 455, RuleNumericFunction = 456, RuleFunctionParameter = 457, 
     RulePropertyReference = 458, RuleOneArgNumericFunctionName = 459, RuleTwoArgNumericFunctionName = 460, 
-    RuleStringFunction = 461, RuleListFunction = 462, RuleCaseFunction = 463, 
-    RuleLabelsFunction = 464, RulePropertiesFunction = 465, RuleSimpleWhenClause = 466, 
-    RuleSearchedWhenClause = 467, RuleElseClause = 468, RuleWhenOperand = 469, 
-    RuleCastFunction = 470, RuleElementIdFunction = 471, RuleDatetimeValueFunction = 472, 
-    RuleDateFunction = 473, RuleTimeFunction = 474, RuleLocalTimeFunction = 475, 
-    RuleDatetimeFunction = 476, RuleLocalDatetimeFunction = 477, RuleDateFunctionParameters = 478, 
-    RuleTimeFunctionParameters = 479, RuleDatetimeFunctionParameters = 480, 
-    RuleDateString = 481, RuleTimeString = 482, RuleDatetimeString = 483, 
-    RuleDurationFunction = 484, RuleDurationFunctionParameters = 485, RuleDurationString = 486, 
-    RuleReduceFunction = 487, RuleGeneralFunction = 488, RuleCollectionValueConstructor = 489, 
-    RuleTrimSpecification = 490, RuleNormalForm = 491, RuleListValueConstructor = 492, 
-    RuleListComprehension = 493, RuleRecordValueConstructor = 494, RuleField = 495, 
-    RulePathValueConstructor = 496, RuleUnsignedLiteral = 497, RuleGeneralLiteral = 498, 
-    RuleListLiteral = 499, RuleRecordLiteral = 500, RuleRecordFieldLiteral = 501, 
-    RuleKeyword = 502
+    RuleStringFunction = 461, RuleListFunction = 462, RuleNodeDegreeFunction = 463, 
+    RuleCaseFunction = 464, RuleLabelsFunction = 465, RulePropertiesFunction = 466, 
+    RuleSimpleWhenClause = 467, RuleSearchedWhenClause = 468, RuleElseClause = 469, 
+    RuleWhenOperand = 470, RuleCastFunction = 471, RuleElementIdFunction = 472, 
+    RuleDatetimeValueFunction = 473, RuleDateFunction = 474, RuleTimeFunction = 475, 
+    RuleLocalTimeFunction = 476, RuleDatetimeFunction = 477, RuleLocalDatetimeFunction = 478, 
+    RuleDateFunctionParameters = 479, RuleTimeFunctionParameters = 480, 
+    RuleDatetimeFunctionParameters = 481, RuleDateString = 482, RuleTimeString = 483, 
+    RuleDatetimeString = 484, RuleDurationFunction = 485, RuleDurationFunctionParameters = 486, 
+    RuleDurationString = 487, RuleReduceFunction = 488, RuleGeneralFunction = 489, 
+    RuleCollectionValueConstructor = 490, RuleTrimSpecification = 491, RuleNormalForm = 492, 
+    RuleListValueConstructor = 493, RuleListComprehension = 494, RuleRecordValueConstructor = 495, 
+    RuleField = 496, RulePathValueConstructor = 497, RuleUnsignedLiteral = 498, 
+    RuleGeneralLiteral = 499, RuleListLiteral = 500, RuleRecordLiteral = 501, 
+    RuleRecordFieldLiteral = 502, RuleKeyword = 503
   };
 
   explicit GQLParser(antlr4::TokenStream *input);
@@ -765,6 +766,7 @@ public:
   class TwoArgNumericFunctionNameContext;
   class StringFunctionContext;
   class ListFunctionContext;
+  class NodeDegreeFunctionContext;
   class CaseFunctionContext;
   class LabelsFunctionContext;
   class PropertiesFunctionContext;
@@ -8310,6 +8312,7 @@ public:
     DurationFunctionContext *durationFunction();
     ReduceFunctionContext *reduceFunction();
     ListFunctionContext *listFunction();
+    NodeDegreeFunctionContext *nodeDegreeFunction();
     StringFunctionContext *stringFunction();
     TensorFunctionContext *tensorFunction();
     LabelsFunctionContext *labelsFunction();
@@ -8654,6 +8657,57 @@ public:
   };
 
   ListFunctionContext* listFunction();
+
+  class  NodeDegreeFunctionContext : public antlr4::ParserRuleContext {
+  public:
+    NodeDegreeFunctionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+   
+    NodeDegreeFunctionContext() = default;
+    void copyFrom(NodeDegreeFunctionContext *context);
+    using antlr4::ParserRuleContext::copyFrom;
+
+    virtual size_t getRuleIndex() const override;
+
+   
+  };
+
+  class  GqlInDegreeFunctionContext : public NodeDegreeFunctionContext {
+  public:
+    GqlInDegreeFunctionContext(NodeDegreeFunctionContext *ctx);
+
+    antlr4::tree::TerminalNode *INDEGREE();
+    antlr4::tree::TerminalNode *LEFT_PAREN();
+    VariableContext *variable();
+    antlr4::tree::TerminalNode *RIGHT_PAREN();
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+  };
+
+  class  GqlDegreeFunctionContext : public NodeDegreeFunctionContext {
+  public:
+    GqlDegreeFunctionContext(NodeDegreeFunctionContext *ctx);
+
+    antlr4::tree::TerminalNode *DEGREE();
+    antlr4::tree::TerminalNode *LEFT_PAREN();
+    VariableContext *variable();
+    antlr4::tree::TerminalNode *RIGHT_PAREN();
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+  };
+
+  class  GqlOutDegreeFunctionContext : public NodeDegreeFunctionContext {
+  public:
+    GqlOutDegreeFunctionContext(NodeDegreeFunctionContext *ctx);
+
+    antlr4::tree::TerminalNode *OUTDEGREE();
+    antlr4::tree::TerminalNode *LEFT_PAREN();
+    VariableContext *variable();
+    antlr4::tree::TerminalNode *RIGHT_PAREN();
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+  };
+
+  NodeDegreeFunctionContext* nodeDegreeFunction();
 
   class  CaseFunctionContext : public antlr4::ParserRuleContext {
   public:
@@ -9454,6 +9508,7 @@ public:
     antlr4::tree::TerminalNode *DATETIME();
     antlr4::tree::TerminalNode *DEC();
     antlr4::tree::TerminalNode *DECIMAL();
+    antlr4::tree::TerminalNode *DEGREE();
     antlr4::tree::TerminalNode *DEGREES();
     antlr4::tree::TerminalNode *DELETE();
     antlr4::tree::TerminalNode *DESC();
@@ -9502,6 +9557,7 @@ public:
     antlr4::tree::TerminalNode *I_DONT_KNOW_5();
     antlr4::tree::TerminalNode *IF();
     antlr4::tree::TerminalNode *IN();
+    antlr4::tree::TerminalNode *INDEGREE();
     antlr4::tree::TerminalNode *INSERT();
     antlr4::tree::TerminalNode *INT();
     antlr4::tree::TerminalNode *INT8();
@@ -9567,6 +9623,7 @@ public:
     antlr4::tree::TerminalNode *OR();
     antlr4::tree::TerminalNode *ORDER();
     antlr4::tree::TerminalNode *ORDINALITY();
+    antlr4::tree::TerminalNode *OUTDEGREE();
     antlr4::tree::TerminalNode *OTHERWISE();
     antlr4::tree::TerminalNode *PARAMETER();
     antlr4::tree::TerminalNode *PARAMETERS();

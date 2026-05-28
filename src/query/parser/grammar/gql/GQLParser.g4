@@ -2195,6 +2195,7 @@ functionCall
    | durationFunction
    | reduceFunction
    | listFunction
+   | nodeDegreeFunction
    | stringFunction
    | tensorFunction
    | labelsFunction
@@ -2274,6 +2275,12 @@ listFunction
    | NODES LEFT_PAREN expressionAtom RIGHT_PAREN                                                                            #gqlNodesOfPathFunction
    | EDGES_SYNONYM LEFT_PAREN expressionAtom RIGHT_PAREN                                                                    #gqlRelationshipsOfPathFunction
    | SIZE LEFT_PAREN expressionAtom RIGHT_PAREN                                                                             #gqlListSizeFunction
+   ;
+
+nodeDegreeFunction
+   : OUTDEGREE LEFT_PAREN variable RIGHT_PAREN                                                                              #gqlOutDegreeFunction
+   | INDEGREE LEFT_PAREN variable RIGHT_PAREN                                                                               #gqlInDegreeFunction
+   | DEGREE LEFT_PAREN variable RIGHT_PAREN                                                                                 #gqlDegreeFunction
    ;
 
 caseFunction
@@ -2527,6 +2534,7 @@ keyword
    | DATETIME
    | DEC
    | DECIMAL
+   | DEGREE
    | DEGREES
    | DELETE
    | DESC
@@ -2575,6 +2583,7 @@ keyword
    | I_DONT_KNOW_5
    | IF
    | IN
+   | INDEGREE
    | INSERT
    | INT
    | INT8
@@ -2640,6 +2649,7 @@ keyword
    | OR
    | ORDER
    | ORDINALITY
+   | OUTDEGREE
    | OTHERWISE
    | PARAMETER
    | PARAMETERS

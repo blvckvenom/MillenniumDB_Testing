@@ -64,6 +64,7 @@ class ExprSimpleCase;
 class ExprSearchedCase;
 class ExprCast;
 class ExprLabels;
+class ExprNodeDegree;
 class ExprProperties;
 class ExprIn;
 class ExprCosineDistance;
@@ -160,6 +161,7 @@ public:
     virtual void visit(GQL::ExprAggPercentileDisc&) = 0;
     virtual void visit(GQL::ExprAggProject&) = 0;
     virtual void visit(GQL::ExprLabels&) = 0;
+    virtual void visit(GQL::ExprNodeDegree&) = 0;
     virtual void visit(GQL::ExprProperties&) = 0;
     virtual void visit(GQL::ExprIn&) = 0;
     virtual void visit(GQL::ExprCosineDistance&) = 0;

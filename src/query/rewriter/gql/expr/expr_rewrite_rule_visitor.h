@@ -122,6 +122,8 @@ public:
         visit_expr_with_expr<ExprCast>(expr);
     }
 
+    void visit(GQL::ExprNodeDegree&) override { }
+
     void visit(GQL::ExprCeil& expr) override
     {
         visit_expr_with_expr<ExprCeil>(expr);

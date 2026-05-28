@@ -247,6 +247,9 @@ public:
     std::any
         visitGqlRelationshipsOfPathFunction(GQLParser::GqlRelationshipsOfPathFunctionContext* ctx) override;
     std::any visitGqlListSizeFunction(GQLParser::GqlListSizeFunctionContext* ctx) override;
+    std::any visitGqlOutDegreeFunction(GQLParser::GqlOutDegreeFunctionContext* ctx) override;
+    std::any visitGqlInDegreeFunction(GQLParser::GqlInDegreeFunctionContext* ctx) override;
+    std::any visitGqlDegreeFunction(GQLParser::GqlDegreeFunctionContext* ctx) override;
 
     // caseFunction
     std::any visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext* ctx) override;

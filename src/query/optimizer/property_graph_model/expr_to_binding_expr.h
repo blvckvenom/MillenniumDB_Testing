@@ -106,6 +106,7 @@ public:
     void visit(ExprSearchedCase&) override;
     void visit(ExprCast&) override;
     void visit(ExprLabels&) override;
+    void visit(ExprNodeDegree&) override;
     void visit(ExprProperties&) override;
     void visit(ExprIn&) override;
     void visit(ExprCosineDistance&) override;

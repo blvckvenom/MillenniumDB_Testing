@@ -2095,6 +2095,18 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlOutDegreeFunction(GQLParser::GqlOutDegreeFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitGqlInDegreeFunction(GQLParser::GqlInDegreeFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitGqlDegreeFunction(GQLParser::GqlDegreeFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGqlNullIfCaseFunction(GQLParser::GqlNullIfCaseFunctionContext *ctx) override {
     return visitChildren(ctx);
   }

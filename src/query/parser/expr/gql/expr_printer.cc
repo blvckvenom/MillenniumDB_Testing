@@ -519,6 +519,18 @@ void ExprPrinter::visit(ExprLabels& expr)
     os << "LABELS(" << expr.var << ")";
 }
 
+void ExprPrinter::visit(ExprNodeDegree& expr)
+{
+    if (expr.degree_type == NodeDegreeType::OUT) {
+        os << "OUTDEGREE(";
+    } else if (expr.degree_type == NodeDegreeType::IN) {
+        os << "INDEGREE(";
+    } else {
+        os << "DEGREE(";
+    }
+    os << expr.var << ")";
+}
+
 void ExprPrinter::visit(ExprProperties& expr)
 {
     os << "PROPERTIES(" << expr.var << ")";

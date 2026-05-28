@@ -58,6 +58,11 @@ public:
         check_group_var(expr.var);
     }
 
+    void visit(ExprNodeDegree& expr) override
+    {
+        check_group_var(expr.var);
+    }
+
     void visit(ExprProperties& expr) override
     {
         check_group_var(expr.var);
