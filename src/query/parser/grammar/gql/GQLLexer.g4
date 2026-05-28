@@ -1040,6 +1040,14 @@ TO
    : 'TO'
    ;
 
+TOFLOAT
+   : 'TOFLOAT'
+   ;
+
+TOINTEGER
+   : 'TOINTEGER'
+   ;
+
 TRAIL
    : 'TRAIL'
    ;

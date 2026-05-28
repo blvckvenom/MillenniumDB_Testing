@@ -603,7 +603,7 @@ void ExprToBindingExpr::visit(ExprLabels& expr)
 void ExprToBindingExpr::visit(ExprCast& expr)
 {
     expr.expr->accept_visitor(*this);
-    tmp = std::make_unique<BindingExprCast>(std::move(tmp), std::move(expr.targetType));
+    tmp = std::make_unique<BindingExprCast>(std::move(tmp), expr.targetType, expr.targetNumericSubType);
 }
 
 void ExprToBindingExpr::visit(ExprProperties& expr)

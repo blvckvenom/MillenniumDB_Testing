@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "graph_models/gql/conversions.h"
 #include "query/parser/expr/gql/expr.h"
 
@@ -8,15 +10,21 @@ class ExprCast : public Expr {
 public:
     std::unique_ptr<Expr> expr;
     GQL_OID::GenericType targetType;
+    std::optional<GQL_OID::GenericSubType> targetNumericSubType;
 
-    ExprCast(std::unique_ptr<Expr> operand, GQL_OID::GenericType targetType) :
+    ExprCast(
+        std::unique_ptr<Expr> operand,
+        GQL_OID::GenericType targetType,
+        std::optional<GQL_OID::GenericSubType> targetNumericSubType = std::nullopt
+    ) :
         expr(std::move(operand)),
-        targetType(std::move(targetType))
+        targetType(targetType),
+        targetNumericSubType(targetNumericSubType)
     { }
 
     virtual std::unique_ptr<Expr> clone() const override
     {
-        return std::make_unique<ExprCast>(expr->clone(), targetType);
+        return std::make_unique<ExprCast>(expr->clone(), targetType, targetNumericSubType);
     }
 
     void accept_visitor(ExprVisitor& visitor) override

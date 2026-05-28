@@ -1267,6 +1267,18 @@ std::any QueryVisitor::visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFu
         current_expr = std::make_unique<ExprCeil>(std::move(expr));
     } else if (ctx->oneArgNumericFunctionName()->ROUND()) {
         current_expr = std::make_unique<ExprRound>(std::move(expr));
+    } else if (ctx->oneArgNumericFunctionName()->TOINTEGER()) {
+        current_expr = std::make_unique<ExprCast>(
+            std::move(expr),
+            GQL_OID::GenericType::NUMERIC,
+            GQL_OID::GenericSubType::INTEGER
+        );
+    } else if (ctx->oneArgNumericFunctionName()->TOFLOAT()) {
+        current_expr = std::make_unique<ExprCast>(
+            std::move(expr),
+            GQL_OID::GenericType::NUMERIC,
+            GQL_OID::GenericSubType::FLOAT
+        );
     } else if (ctx->oneArgNumericFunctionName()->CHAR_LENGTH()
                || ctx->oneArgNumericFunctionName()->CHARACTER_LENGTH())
     {
@@ -1635,6 +1647,7 @@ std::any QueryVisitor::visitCastFunction(GQLParser::CastFunctionContext* ctx)
     LOG_VISITOR;
     visit(ctx->expression());
     GQL_OID::GenericType target = GQL_OID::GenericType::NULL_ID; // to avoid warnings
+    std::optional<GQL_OID::GenericSubType> numeric_subtype = std::nullopt;
     if (auto predefTypeCtx = dynamic_cast<GQLParser::PredefTypeContext*>(ctx->valueType())) {
         auto predefinedTypeCtx = dynamic_cast<GQLParser::PredefinedTypeContext*>(predefTypeCtx->children[0]);
 
@@ -1648,6 +1661,16 @@ std::any QueryVisitor::visitCastFunction(GQLParser::CastFunctionContext* ctx)
                     break;
                 } else if (dynamic_cast<GQLParser::NumericTypeContext*>(child)) {
                     target = GQL_OID::GenericType::NUMERIC;
+                    std::string numeric_text = child->getText();
+                    if (numeric_text.find("INT") != std::string::npos) {
+                        numeric_subtype = GQL_OID::GenericSubType::INTEGER;
+                    } else if (numeric_text.find("FLOAT") != std::string::npos
+                               || numeric_text.find("REAL") != std::string::npos)
+                    {
+                        numeric_subtype = GQL_OID::GenericSubType::FLOAT;
+                    } else if (numeric_text.find("DOUBLE") != std::string::npos) {
+                        numeric_subtype = GQL_OID::GenericSubType::DOUBLE;
+                    }
                     break;
                 } else if (dynamic_cast<GQLParser::TemporalTypeContext*>(child)) {
                     target = GQL_OID::GenericType::DATE;
@@ -1657,7 +1680,7 @@ std::any QueryVisitor::visitCastFunction(GQLParser::CastFunctionContext* ctx)
         }
     }
 
-    current_expr = std::make_unique<ExprCast>(std::move(current_expr), std::move(target));
+    current_expr = std::make_unique<ExprCast>(std::move(current_expr), target, numeric_subtype);
     return 0;
 }
 

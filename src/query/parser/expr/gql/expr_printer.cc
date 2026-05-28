@@ -497,7 +497,15 @@ void ExprPrinter::visit(ExprCast& expr)
     if (expr.targetType == GQL_OID::GenericType::BOOL) {
         os << "BOOL";
     } else if (expr.targetType == GQL_OID::GenericType::NUMERIC) {
-        os << "NUMERIC";
+        if (expr.targetNumericSubType == GQL_OID::GenericSubType::INTEGER) {
+            os << "INTEGER";
+        } else if (expr.targetNumericSubType == GQL_OID::GenericSubType::FLOAT) {
+            os << "FLOAT";
+        } else if (expr.targetNumericSubType == GQL_OID::GenericSubType::DOUBLE) {
+            os << "DOUBLE";
+        } else {
+            os << "NUMERIC";
+        }
     } else if (expr.targetType == GQL_OID::GenericType::DATE) {
         os << "DATE";
     } else if (expr.targetType == GQL_OID::GenericType::STRING) {

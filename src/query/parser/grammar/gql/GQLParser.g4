@@ -2249,6 +2249,8 @@ oneArgNumericFunctionName
    | CEIL
    | CEILING
    | ROUND
+   | TOINTEGER
+   | TOFLOAT
    ;
 
 twoArgNumericFunctionName
