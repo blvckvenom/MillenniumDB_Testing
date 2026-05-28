@@ -2224,6 +2224,13 @@ std::any QueryVisitor::visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx
     return 0;
 }
 
+std::any QueryVisitor::visitNullLiteral(GQLParser::NullLiteralContext* ctx)
+{
+    LOG_VISITOR
+    current_expr = std::make_unique<ExprTerm>(ObjectId::get_null());
+    return 0;
+}
+
 std::any QueryVisitor::visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx)
 {
     if (ctx->listComprehension()) {

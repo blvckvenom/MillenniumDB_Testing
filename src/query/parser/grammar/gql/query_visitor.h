@@ -211,6 +211,7 @@ public:
     std::any visitIntegerLiteral(GQLParser::IntegerLiteralContext* ctx) override;
     std::any visitFloatLiteral(GQLParser::FloatLiteralContext* ctx) override;
     std::any visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx) override;
+    std::any visitNullLiteral(GQLParser::NullLiteralContext* ctx) override;
     std::any visitListLiteral(GQLParser::ListLiteralContext* ctx) override;
     std::any visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx) override;
     std::any visitListComprehension(GQLParser::ListComprehensionContext* ctx) override;
