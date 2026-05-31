@@ -264,23 +264,26 @@ TrainingLoop::Result TrainingLoop::train()
                     bt.l3_us         = fs->last_l3_us();
                     bt.l4_us         = fs->last_l4_us();
                     bt.rmap_lookup_us= fs->last_rmap_us();
-
-                    // Path 4 (2026-05-19): v2 addr_table fast-path telemetry.
-                    // Safely attributable only on the sequential path where
-                    // last_used_addr_tables() / last_addr_load_us() still
-                    // refer to this batch (the prefetcher would have already
-                    // begun the next batch's load, making the values racy).
-                    if (fs->last_used_addr_tables()) {
-                        result.addr_tables_used_ever = true;
-                        ++result.addr_table_load_us_count;
-                        // Welford-style running mean — avoids overflow vs. sum.
-                        const double load_us =
-                            static_cast<double>(fs->last_addr_load_us());
-                        result.addr_table_load_us_mean +=
-                            (load_us - result.addr_table_load_us_mean) /
-                            static_cast<double>(result.addr_table_load_us_count);
-                    }
                 }
+            }
+
+            // Path 4 / STEP 6 (2026-05-31): v2 addr_table fast-path telemetry,
+            // read from the MiniBatch (stamped by BatchAssembler immediately
+            // after the load) rather than from the FourLevelStore. This makes it
+            // correct on BOTH the sequential and async-prefetcher paths — under
+            // the prefetcher the store's last_used_addr_tables()/last_addr_load_us()
+            // belong to the lookahead batch, which is why the old code only
+            // recorded it on the sequential path (so useAddrTablesEffective was
+            // always false on the default prefetcher-on config).
+            if (mini.timing.used_addr_tables) {
+                result.addr_tables_used_ever = true;
+                ++result.addr_table_load_us_count;
+                // Welford-style running mean — avoids overflow vs. sum.
+                const double load_us =
+                    static_cast<double>(mini.timing.addr_load_ns / 1000ULL);
+                result.addr_table_load_us_mean +=
+                    (load_us - result.addr_table_load_us_mean) /
+                    static_cast<double>(result.addr_table_load_us_count);
             }
 
             // Spec C3 stage 3: cross-stream sync + record_stream BEFORE any

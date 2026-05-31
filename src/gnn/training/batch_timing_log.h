@@ -25,6 +25,7 @@ struct BatchTiming {
     uint64_t l2_us;
     uint64_t l3_us;
     uint64_t l4_us;
+    uint64_t assembler_kernel_us;  // Phase A: feature_store->load_batch_features (subsumes l1..l4)
     uint64_t rmap_lookup_us;   // sub-counter, NOT additive
     uint64_t active_us;
     uint64_t edge_us;

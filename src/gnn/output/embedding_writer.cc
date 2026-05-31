@@ -146,13 +146,16 @@ std::vector<std::pair<uint64_t, torch::Tensor>> EmbeddingWriter::collect_seed_em
             for (auto& ei : mini.edge_indices) {
                 ei = ei.to(device);
             }
+            for (auto& ai : mini.active_indices_per_layer) {
+                ai = ai.to(device);
+            }
         }
 
         // 4. Forward pass (hidden representation, NOT logits)
         auto emb = model_.get_embeddings(
             mini.features,
             mini.edge_indices,
-            num_seeds
+            mini.active_sizes_per_layer
         );
         // emb shape: [num_seeds, hidden_dim]
 
@@ -262,6 +265,9 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
             for (auto& ei : mini.edge_indices) {
                 ei = ei.to(device);
             }
+            for (auto& ai : mini.active_indices_per_layer) {
+                ai = ai.to(device);
+            }
         }
 
         auto t_step4 = std::chrono::steady_clock::now();
@@ -271,7 +277,7 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
         auto emb = model_.get_embeddings(
             mini.features,
             mini.edge_indices,
-            num_seeds
+            mini.active_sizes_per_layer
         );
         // emb shape: [num_seeds, hidden_dim]
 

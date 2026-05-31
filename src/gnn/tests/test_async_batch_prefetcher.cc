@@ -397,3 +397,189 @@ TEST_F(AsyncBatchPrefetcherTest, Destructor_CleanShutdown_WithBatchesInFlight) {
     // destructor handled the in-flight batches gracefully.
     SUCCEED();
 }
+
+// -----------------------------------------------------------------------------
+// Round 3B (2026-05-15): multi-worker AsyncBatchPrefetcher.
+// -----------------------------------------------------------------------------
+
+// Test 9: num_workers=0 is rejected at construction.
+TEST_F(AsyncBatchPrefetcherTest, ZeroWorkers_Rejected) {
+    const std::string sname = "asynccp_zero_workers";
+    create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+
+    EXPECT_THROW({
+        AsyncBatchPrefetcher prefetcher(assembler, /*queue_size=*/2,
+                                        /*use_cuda_streams=*/false,
+                                        /*num_workers=*/0);
+    }, std::invalid_argument);
+}
+
+// Test 10: num_workers is clamped to queue_size.
+TEST_F(AsyncBatchPrefetcherTest, NumWorkers_ClampedToQueueSize) {
+    const std::string sname = "asynccp_clamp";
+    create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+
+    // Pass num_workers=10 with queue_size=2 → effective should be 2.
+    AsyncBatchPrefetcher prefetcher(assembler, /*queue_size=*/2,
+                                    /*use_cuda_streams=*/false,
+                                    /*num_workers=*/10);
+    EXPECT_EQ(prefetcher.num_workers(), 2u)
+        << "num_workers must be clamped to queue_size";
+}
+
+// Test 11: with num_workers=2 and FeatureMatrix mode, FIFO order is preserved.
+TEST_F(AsyncBatchPrefetcherTest, MultiWorker_FifoOrder_Preserved) {
+    const std::string sname = "asynccp_mw_fifo";
+    auto cat = create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+    AsyncBatchPrefetcher prefetcher(assembler, /*queue_size=*/4,
+                                    /*use_cuda_streams=*/false,
+                                    /*num_workers=*/2);
+
+    const uint64_t total = cat.total_batches;
+    ASSERT_GE(total, 2u);
+
+    // Submit all upfront (with batch_id == submission_position) and consume.
+    for (uint64_t b = 0; b < total; ++b) {
+        prefetcher.prefetch(b);
+    }
+    for (uint64_t b = 0; b < total; ++b) {
+        auto batch = prefetcher.next();
+        EXPECT_EQ(batch.batch_id, b)
+            << "FIFO violated at index " << b << " under num_workers=2";
+    }
+}
+
+// Test 12: bit-identical results between num_workers=1 and num_workers=2.
+// This is the correctness test the advisor flagged as mandatory.
+//
+// Submits with queue_size >= num_to_check so the producer can prime the
+// full set up-front (no backpressure stall, no chance of consumer-side
+// re-ordering hiding a non-deterministic assemble result).
+TEST_F(AsyncBatchPrefetcherTest, MultiWorker_BitIdenticalToSingleWorker) {
+    const std::string sname = "asynccp_mw_identical";
+    auto cat = create_sample_storage(sname);
+    ASSERT_GE(cat.total_batches, 2u);
+
+    const uint64_t num_to_check = std::min<uint64_t>(cat.total_batches, 4u);
+    const size_t   queue_size   = std::max<size_t>(num_to_check, 2u);
+
+    // Reference run: num_workers=1 (single-threaded path).
+    std::vector<torch::Tensor> ref_features;
+    std::vector<torch::Tensor> ref_edges_layer0;
+    std::vector<uint64_t>      ref_batch_ids;
+    {
+        auto fm      = FeatureMatrix::open(fmat_path_);
+        auto rm      = RowMapping::open(rmap_path_);
+        auto ls      = LabelStore::open(labels_path_);
+        auto ss      = SplitStore::open(splits_path_);
+        auto storage = SampleStorage::open(
+            SampleStorage::get_storage_path(db_folder_, sname));
+
+        BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+        AsyncBatchPrefetcher prefetcher(assembler, queue_size,
+                                        /*use_cuda_streams=*/false,
+                                        /*num_workers=*/1);
+
+        for (uint64_t b = 0; b < num_to_check; ++b) prefetcher.prefetch(b);
+        for (uint64_t b = 0; b < num_to_check; ++b) {
+            auto batch = prefetcher.next();
+            ref_batch_ids.push_back(batch.batch_id);
+            ref_features.push_back(batch.features.clone());
+            if (!batch.edge_indices.empty()) {
+                ref_edges_layer0.push_back(batch.edge_indices[0].clone());
+            } else {
+                ref_edges_layer0.emplace_back();
+            }
+        }
+    }
+
+    // Multi-worker run: num_workers=2, same queue_size as reference.
+    {
+        auto fm      = FeatureMatrix::open(fmat_path_);
+        auto rm      = RowMapping::open(rmap_path_);
+        auto ls      = LabelStore::open(labels_path_);
+        auto ss      = SplitStore::open(splits_path_);
+        auto storage = SampleStorage::open(
+            SampleStorage::get_storage_path(db_folder_, sname));
+
+        BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+        AsyncBatchPrefetcher prefetcher(assembler, queue_size,
+                                        /*use_cuda_streams=*/false,
+                                        /*num_workers=*/2);
+
+        for (uint64_t b = 0; b < num_to_check; ++b) prefetcher.prefetch(b);
+        for (uint64_t b = 0; b < num_to_check; ++b) {
+            auto batch = prefetcher.next();
+            EXPECT_EQ(batch.batch_id, ref_batch_ids[b])
+                << "batch_id mismatch at index " << b;
+            ASSERT_EQ(batch.features.sizes(), ref_features[b].sizes())
+                << "feature shape mismatch at batch " << b;
+            EXPECT_TRUE(torch::equal(batch.features, ref_features[b]))
+                << "features tensor differs at batch " << b
+                << " between num_workers=1 and num_workers=2";
+            if (!batch.edge_indices.empty() && ref_edges_layer0[b].defined()) {
+                EXPECT_TRUE(torch::equal(batch.edge_indices[0], ref_edges_layer0[b]))
+                    << "edge_indices[0] differs at batch " << b;
+            }
+        }
+    }
+}
+
+// Test 13: multi-worker error propagation — bad batch_id from any worker
+// surfaces via next() in submission order.
+TEST_F(AsyncBatchPrefetcherTest, MultiWorker_ErrorPropagation) {
+    const std::string sname = "asynccp_mw_error";
+    auto cat = create_sample_storage(sname);
+
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto ls      = LabelStore::open(labels_path_);
+    auto ss      = SplitStore::open(splits_path_);
+    auto storage = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, sname));
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+    AsyncBatchPrefetcher prefetcher(assembler, /*queue_size=*/4,
+                                    /*use_cuda_streams=*/false,
+                                    /*num_workers=*/2);
+
+    // Submit one valid batch then one out-of-range. The valid one should
+    // deliver successfully, then the out-of-range should throw.
+    ASSERT_GE(cat.total_batches, 1u);
+    prefetcher.prefetch(0);
+    prefetcher.prefetch(cat.total_batches + 100);
+
+    auto good = prefetcher.next();
+    EXPECT_EQ(good.batch_id, 0u);
+
+    EXPECT_THROW({
+        (void) prefetcher.next();
+    }, std::exception);
+}

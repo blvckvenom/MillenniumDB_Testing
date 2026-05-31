@@ -46,29 +46,36 @@ GraphSAGEModel::GraphSAGEModel(const GraphSAGEConfig& config) : config_(config) 
 torch::Tensor GraphSAGEModel::sage_conv(
     torch::Tensor x,
     torch::Tensor edge_index,
+    int64_t num_dst,
     torch::nn::Linear& linear)
 {
-    // Move edge_index to the same device as features (enables GPU training
-    // when FeatureAssembler returns a CUDA tensor from L1 cache).
+    // Move edge_index to the same device as features.
     auto ei  = edge_index.to(x.device());
-    auto src = ei[0];            // [E] — message sources
-    auto dst = ei[1];            // [E] — message destinations
-    int64_t N = x.size(0);
+    auto src = ei[0];           // [E] — message sources, local in A_{k+1}
+    auto dst = ei[1];           // [E] — message destinations, local in A_k
 
-    // Gather neighbor features for each edge, then aggregate by destination.
-    auto neighbor_feat = x.index_select(0, src);                     // [E, D_in]
-    auto agg = ops::scatter_sum(neighbor_feat, dst, N);              // [N, D_in]
+    // Gather neighbor features.
+    auto neighbor_feat = x.index_select(0, src);                  // [E, D_in]
 
-    // Normalize by degree (MEAN = SUM / count).  clamp_min(1) avoids divide-by-zero
-    // for isolated nodes; they keep agg = 0.
+    // Sum-aggregate by destination. Output [num_dst, D_in]; positions never
+    // indexed in `dst` stay zero (which is the SAGE-MEAN semantic for nodes
+    // with no sampled neighbors at this hop).
+    auto agg = ops::scatter_sum(neighbor_feat, dst, num_dst);
+
+    // Mean normalization. clamp_min(1) handles isolated dst (agg stays 0).
     auto ones   = torch::ones({src.size(0), 1}, x.options());
-    auto degree = ops::scatter_sum(ones, dst, N).clamp_min(1.0);    // [N, 1]
+    auto degree = ops::scatter_sum(ones, dst, num_dst).clamp_min(1.0);
     agg = agg / degree;
 
-    // Concatenate self embedding with aggregated neighborhood.
-    auto combined = torch::cat({x, agg}, /*dim=*/1);                // [N, 2*D_in]
+    // Self-feature: A_k is a prefix of A_{k+1} (BatchAssembler invariant),
+    // so the first num_dst rows of x are exactly the self-features for A_k.
+    auto x_self = x.slice(/*dim=*/0, /*start=*/0, /*end=*/num_dst);
 
-    return linear->forward(combined);                                // [N, D_out]
+    // Concatenate self + aggregated.
+    auto combined = torch::cat({x_self, agg}, /*dim=*/1);         // [num_dst, 2*D_in]
+
+    auto out = linear->forward(combined);                          // [num_dst, D_out]
+    return out;
 }
 
 // ============================================================================
@@ -78,7 +85,7 @@ torch::Tensor GraphSAGEModel::sage_conv(
 torch::Tensor GraphSAGEModel::forward(
     torch::Tensor x,
     const std::vector<torch::Tensor>& edge_indices,
-    int64_t num_seeds)
+    const std::vector<int64_t>& active_sizes_per_layer)
 {
     if ((int64_t)edge_indices.size() != config_.num_layers) {
         throw std::invalid_argument(
@@ -86,17 +93,32 @@ torch::Tensor GraphSAGEModel::forward(
             + std::to_string(config_.num_layers) + "), got "
             + std::to_string(edge_indices.size()));
     }
-    if (num_seeds <= 0 || num_seeds > x.size(0)) {
+    if ((int64_t)active_sizes_per_layer.size() != config_.num_layers + 1) {
         throw std::invalid_argument(
-            "GraphSAGEModel::forward: num_seeds must be in [1, N], got "
-            + std::to_string(num_seeds));
+            "GraphSAGEModel::forward: active_sizes_per_layer.size() must be "
+            "num_layers+1 (" + std::to_string(config_.num_layers + 1) + "), got "
+            + std::to_string(active_sizes_per_layer.size()));
+    }
+    if (active_sizes_per_layer.back() != x.size(0)) {
+        throw std::invalid_argument(
+            "GraphSAGEModel::forward: active_sizes_per_layer.back() ("
+            + std::to_string(active_sizes_per_layer.back())
+            + ") must equal x.size(0) ("
+            + std::to_string(x.size(0)) + ")");
+    }
+    const int64_t num_seeds = active_sizes_per_layer[0];
+    if (num_seeds <= 0) {
+        throw std::invalid_argument(
+            "GraphSAGEModel::forward: num_seeds (= active_sizes_per_layer[0]) "
+            "must be > 0, got " + std::to_string(num_seeds));
     }
 
-    // Process layers from outermost to innermost.
-    // convs_[num_layers-1] was registered for raw input features (2*input_dim → hidden_dim).
-    // convs_[k < num_layers-1] expect hidden_dim inputs (2*hidden_dim → hidden_dim).
+    // Process layers from outermost (convs_[num_layers-1], deepest applied)
+    // down to innermost (convs_[0], seeds dst).
+    // convs_[k] consumes A_{k+1} features and produces A_k features.
     for (int k = (int)convs_.size() - 1; k >= 0; k--) {
-        x = sage_conv(x, edge_indices[k], convs_[k]);
+        const int64_t num_dst = active_sizes_per_layer[k];
+        x = sage_conv(x, edge_indices[k], num_dst, convs_[k]);
 
         if (k > 0) {
             // Activation + regularization between hidden layers (not after last conv).
@@ -110,9 +132,10 @@ torch::Tensor GraphSAGEModel::forward(
         }
     }
 
-    // Classify only seed nodes (first num_seeds rows after all message-passing rounds).
-    auto seed_embeddings = x.slice(/*dim=*/0, /*start=*/0, /*end=*/num_seeds);
-    return classifier_->forward(seed_embeddings);   // [num_seeds, num_classes]
+    // After the final sage_conv at k=0, x has shape [num_seeds, hidden_dim].
+    // The classifier maps to num_classes.
+    auto logits = classifier_->forward(x);   // [num_seeds, num_classes]
+    return logits;
 }
 
 // ============================================================================
@@ -122,7 +145,7 @@ torch::Tensor GraphSAGEModel::forward(
 torch::Tensor GraphSAGEModel::get_embeddings(
     torch::Tensor x,
     const std::vector<torch::Tensor>& edge_indices,
-    int64_t num_seeds)
+    const std::vector<int64_t>& active_sizes_per_layer)
 {
     if ((int64_t)edge_indices.size() != config_.num_layers) {
         throw std::invalid_argument(
@@ -130,15 +153,15 @@ torch::Tensor GraphSAGEModel::get_embeddings(
             + std::to_string(config_.num_layers) + "), got "
             + std::to_string(edge_indices.size()));
     }
-    if (num_seeds <= 0 || num_seeds > x.size(0)) {
+    if ((int64_t)active_sizes_per_layer.size() != config_.num_layers + 1) {
         throw std::invalid_argument(
-            "GraphSAGEModel::get_embeddings: num_seeds must be in [1, N], got "
-            + std::to_string(num_seeds));
+            "GraphSAGEModel::get_embeddings: active_sizes_per_layer.size() must be num_layers+1");
     }
 
-    // Identical message-passing to forward()
+    // Same message-passing as forward, just no classifier.
     for (int k = (int)convs_.size() - 1; k >= 0; k--) {
-        x = sage_conv(x, edge_indices[k], convs_[k]);
+        const int64_t num_dst = active_sizes_per_layer[k];
+        x = sage_conv(x, edge_indices[k], num_dst, convs_[k]);
 
         if (k > 0) {
             x = torch::relu(x);
@@ -151,8 +174,8 @@ torch::Tensor GraphSAGEModel::get_embeddings(
         }
     }
 
-    // Return hidden-dim embeddings for seed nodes (skip the classifier)
-    return x.slice(/*dim=*/0, /*start=*/0, /*end=*/num_seeds);  // [num_seeds, hidden_dim]
+    // After the final conv at k=0, x has shape [num_seeds, hidden_dim].
+    return x;
 }
 
 } // namespace mdb::gnn

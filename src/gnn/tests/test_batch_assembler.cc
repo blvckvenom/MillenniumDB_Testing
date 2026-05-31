@@ -429,3 +429,166 @@ TEST_F(BatchAssemblerTest, EmptyEdgesLayer) {
     EXPECT_EQ(batch.num_seeds, 1u);
     EXPECT_EQ(batch.num_nodes, 2u);
 }
+
+// Tests for active-set computation (active-set-shrinking refactor).
+TEST_F(BatchAssemblerTest, ActiveIndicesAreCumulative) {
+    // 4-layer sample manually constructed:
+    //   nodes_per_layer[0] = [s1, s2]            (seeds)
+    //   nodes_per_layer[1] = [n3, n4, n5]        (1-hop frontier)
+    //   nodes_per_layer[2] = [n6, n7]            (2-hop frontier)
+    //   nodes_per_layer[3] = [n8, n9, n10]       (3-hop frontier; deepest)
+    //
+    // After rebuild_unique_nodes (layer order, dedup):
+    //   all_unique_nodes = [s1, s2, n3, n4, n5, n6, n7, n8, n9, n10]
+    //   positions:         [0, 1,  2,  3,  4,  5,  6,  7,  8,  9 ]
+    //
+    // Expected active sets (cumulative):
+    //   A_0 = {s1, s2}                     positions [0, 1]
+    //   A_1 = A_0 ∪ {n3,n4,n5}             positions [0, 1, 2, 3, 4]
+    //   A_2 = A_1 ∪ {n6, n7}               positions [0, 1, 2, 3, 4, 5, 6]
+    //   A_3 = A_2 ∪ {n8, n9, n10}          positions [0..9] (all)
+    GraphSample sample;
+    sample.batch_id = 0;
+    sample.split    = SplitType::TRAIN;
+    sample.nodes_per_layer = {
+        { ObjectId(1), ObjectId(2) },
+        { ObjectId(3), ObjectId(4), ObjectId(5) },
+        { ObjectId(6), ObjectId(7) },
+        { ObjectId(8), ObjectId(9), ObjectId(10) }
+    };
+    sample.edges_per_layer.resize(3);  // 3 edge layers, can be empty for this test
+    sample.rebuild_unique_nodes();
+    ASSERT_EQ(sample.all_unique_nodes.size(), 10u);
+
+    // Bypass storage: build an assembler with the FeatureMatrix path. The
+    // assemble_from_sample call does NOT need features for the active-set
+    // logic, but load_features needs a RowMapping that contains the OIDs.
+    // To keep this test focused, use a synthetic feature setup matching
+    // the OIDs we just used.
+    fs::path local_fmat = gnn_dir_ / "active_test.fmat";
+    fs::path local_rmap = gnn_dir_ / "active_test.rmap";
+    constexpr uint64_t LN = 10;
+    constexpr uint64_t LD = 1;
+    std::vector<ObjectId> local_oids;
+    local_oids.reserve(LN);
+    for (uint64_t i = 1; i <= LN; ++i) local_oids.emplace_back(i);
+    std::vector<float> local_feats(LN * LD, 0.0f);
+    FeatureMatrix::create(local_fmat, LN, LD, GnnDtype::FLOAT32, local_feats.data());
+    RowMapping::create(local_rmap, local_oids);
+    auto fm = FeatureMatrix::open(local_fmat);
+    auto rm = RowMapping::open(local_rmap);
+    auto storage = create_sample_storage();
+    BatchAssembler assembler(fm, storage, nullptr, nullptr, rm);
+
+    auto mini = assembler.assemble_from_sample(sample);
+
+    ASSERT_EQ(mini.active_indices_per_layer.size(), 4u);
+    ASSERT_EQ(mini.active_sizes_per_layer.size(),   4u);
+
+    auto check = [&](size_t k, std::vector<int64_t> expected) {
+        const auto& t = mini.active_indices_per_layer[k];
+        ASSERT_EQ(t.dim(), 1);
+        ASSERT_EQ(t.scalar_type(), torch::kInt64);
+        ASSERT_EQ(t.size(0), (int64_t)expected.size());
+        ASSERT_EQ(mini.active_sizes_per_layer[k], (int64_t)expected.size());
+        auto acc = t.accessor<int64_t, 1>();
+        for (size_t i = 0; i < expected.size(); ++i) {
+            EXPECT_EQ(acc[i], expected[i]) << "k=" << k << " i=" << i;
+        }
+    };
+    check(0, {0, 1});
+    check(1, {0, 1, 2, 3, 4});
+    check(2, {0, 1, 2, 3, 4, 5, 6});
+    check(3, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
+}
+
+// Tests for Task 3: edges remapped to local active-set indices.
+TEST_F(BatchAssemblerTest, EdgeIndicesAreLocalToActiveSets) {
+    // 3-layer sample, concrete edges. Seeds = [s1], 1-hop = [n2,n3], 2-hop = [n4].
+    //
+    //   nodes_per_layer[0] = [s1]              global pos 0
+    //   nodes_per_layer[1] = [n2, n3]          global pos 1, 2
+    //   nodes_per_layer[2] = [n4]              global pos 3
+    //   nodes_per_layer[3] = []                (empty deepest)
+    //
+    //   edges_per_layer[0]: src in layer 1, dst in layer 0
+    //                       (n2, s1), (n3, s1)
+    //   edges_per_layer[1]: src in layer 2, dst in layer 1
+    //                       (n4, n2)
+    //   edges_per_layer[2]: empty
+    //
+    // Active sets (cumulative):
+    //   A_0 = [s1]                 = local indices [0]
+    //   A_1 = [s1, n2, n3]         = local indices [0, 1, 2]
+    //   A_2 = [s1, n2, n3, n4]     = local indices [0, 1, 2, 3]
+    //   A_3 = same as A_2 (layer 3 empty)
+    //
+    // Expected edge_indices (LOCAL):
+    //   edge_indices[0]: src local in A_1 = [1, 2] (n2, n3); dst local in A_0 = [0, 0] (s1, s1)
+    //   edge_indices[1]: src local in A_2 = [3] (n4);        dst local in A_1 = [1] (n2)
+    //   edge_indices[2]: empty
+    GraphSample sample;
+    sample.batch_id = 0;
+    sample.split    = SplitType::TRAIN;
+    sample.nodes_per_layer = {
+        { ObjectId(1) },                  // s1
+        { ObjectId(2), ObjectId(3) },     // n2, n3
+        { ObjectId(4) },                  // n4
+        {}                                // empty deepest layer
+    };
+    sample.edges_per_layer.resize(3);
+    // edges_per_layer[0]: layer 1 -> layer 0
+    sample.edges_per_layer[0].src_indices = {0, 1};  // local in layer 1: n2, n3
+    sample.edges_per_layer[0].dst_indices = {0, 0};  // local in layer 0: s1, s1
+    sample.edges_per_layer[0].edge_ids = { ObjectId(100), ObjectId(101) };
+    // edges_per_layer[1]: layer 2 -> layer 1
+    sample.edges_per_layer[1].src_indices = {0};     // local in layer 2: n4
+    sample.edges_per_layer[1].dst_indices = {0};     // local in layer 1: n2
+    sample.edges_per_layer[1].edge_ids = { ObjectId(200) };
+    // edges_per_layer[2]: empty
+    sample.rebuild_unique_nodes();
+    ASSERT_EQ(sample.all_unique_nodes.size(), 4u);
+
+    // Synthetic FeatureMatrix/RowMapping with the OIDs 1..4 used above.
+    fs::path local_fmat = gnn_dir_ / "edge_local_test.fmat";
+    fs::path local_rmap = gnn_dir_ / "edge_local_test.rmap";
+    constexpr uint64_t LN = 4;
+    constexpr uint64_t LD = 1;
+    std::vector<ObjectId> local_oids;
+    local_oids.reserve(LN);
+    for (uint64_t i = 1; i <= LN; ++i) local_oids.emplace_back(i);
+    std::vector<float> local_feats(LN * LD, 0.0f);
+    FeatureMatrix::create(local_fmat, LN, LD, GnnDtype::FLOAT32, local_feats.data());
+    RowMapping::create(local_rmap, local_oids);
+    auto fm = FeatureMatrix::open(local_fmat);
+    auto rm = RowMapping::open(local_rmap);
+    auto storage = create_sample_storage();
+    BatchAssembler assembler(fm, storage, nullptr, nullptr, rm);
+
+    auto mini = assembler.assemble_from_sample(sample);
+
+    ASSERT_EQ(mini.edge_indices.size(), 3u);
+
+    // edge_indices[0] should be src=[1, 2] (local A_1), dst=[0, 0] (local A_0)
+    auto e0 = mini.edge_indices[0];
+    ASSERT_EQ(e0.size(0), 2);  // 2 rows (src + dst)
+    ASSERT_EQ(e0.size(1), 2);  // 2 edges
+    auto a0 = e0.accessor<int64_t, 2>();
+    EXPECT_EQ(a0[0][0], 1);  // src for edge 0: local pos of n2 in A_1
+    EXPECT_EQ(a0[0][1], 2);  // src for edge 1: local pos of n3 in A_1
+    EXPECT_EQ(a0[1][0], 0);  // dst for edge 0: local pos of s1 in A_0
+    EXPECT_EQ(a0[1][1], 0);  // dst for edge 1: local pos of s1 in A_0
+
+    // edge_indices[1] should be src=[3] (local A_2), dst=[1] (local A_1)
+    auto e1 = mini.edge_indices[1];
+    ASSERT_EQ(e1.size(0), 2);
+    ASSERT_EQ(e1.size(1), 1);
+    auto a1 = e1.accessor<int64_t, 2>();
+    EXPECT_EQ(a1[0][0], 3);  // n4 local in A_2
+    EXPECT_EQ(a1[1][0], 1);  // n2 local in A_1
+
+    // edge_indices[2] empty
+    auto e2 = mini.edge_indices[2];
+    ASSERT_EQ(e2.size(0), 2);
+    ASSERT_EQ(e2.size(1), 0);
+}

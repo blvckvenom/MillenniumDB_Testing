@@ -50,8 +50,8 @@ size_t BatchTimingLog::pending() const {
 
 void BatchTimingLog::write_csv_header_() {
     out_ << "batch_id,split,sample_read_us,load_features_us,"
-            "l1_us,l2_us,l3_us,l4_us,rmap_lookup_us,active_us,edge_us,"
-            "h2d_us,forward_us,backward_us\n";
+            "l1_us,l2_us,l3_us,l4_us,assembler_kernel_us,rmap_lookup_us,"
+            "active_us,edge_us,h2d_us,forward_us,backward_us\n";
 }
 
 void BatchTimingLog::write_buffer_locked_() {
@@ -62,6 +62,7 @@ void BatchTimingLog::write_buffer_locked_() {
              << t.load_features_us << ','
              << t.l1_us << ',' << t.l2_us << ','
              << t.l3_us << ',' << t.l4_us << ','
+             << t.assembler_kernel_us << ','
              << t.rmap_lookup_us << ','
              << t.active_us << ',' << t.edge_us << ','
              << t.h2d_us << ',' << t.forward_us << ','

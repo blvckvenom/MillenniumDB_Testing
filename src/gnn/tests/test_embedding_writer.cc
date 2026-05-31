@@ -358,7 +358,7 @@ TEST_F(EmbeddingWriterTest, SeedEmbeddingShapes) {
 
         // get_embeddings returns [num_seeds, hidden_dim]
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
 
         ASSERT_EQ(emb.dim(), 2) << "Embedding tensor not 2D at batch " << bid;
         EXPECT_EQ(emb.size(0), num_seeds)
@@ -443,7 +443,7 @@ TEST_F(EmbeddingWriterTest, DeduplicationAcrossBatches) {
         if (num_seeds == 0) continue;
 
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         emb = emb.cpu().contiguous();
 
         for (int64_t i = 0; i < num_seeds; ++i) {
@@ -509,7 +509,7 @@ TEST_F(EmbeddingWriterTest, MissingNodeDetection) {
         auto num_seeds = static_cast<int64_t>(seed_oids.size());
 
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         emb = emb.cpu().contiguous();
 
         for (int64_t i = 0; i < num_seeds; ++i) {
@@ -572,7 +572,7 @@ TEST_F(EmbeddingWriterTest, AllNodesCoveredNoMissing) {
         if (num_seeds == 0) continue;
 
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         emb = emb.cpu().contiguous();
 
         for (int64_t i = 0; i < num_seeds; ++i) {
@@ -630,7 +630,7 @@ TEST_F(EmbeddingWriterTest, EmptyBatchProducesNoEmbeddings) {
 
         MiniBatch mini = assembler.assemble(bid);
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         emb = emb.cpu().contiguous();
 
         for (int64_t i = 0; i < num_seeds; ++i) {
@@ -678,10 +678,10 @@ TEST_F(EmbeddingWriterTest, EmbeddingsDeterministic) {
     GraphSample sample1 = storage.read_sample(0);
     auto num_seeds = static_cast<int64_t>(sample1.nodes_per_layer[0].size());
 
-    auto emb1 = model.get_embeddings(mini1.features, mini1.edge_indices, num_seeds);
+    auto emb1 = model.get_embeddings(mini1.features, mini1.edge_indices, mini1.active_sizes_per_layer);
 
     MiniBatch mini2 = assembler.assemble(0);
-    auto emb2 = model.get_embeddings(mini2.features, mini2.edge_indices, num_seeds);
+    auto emb2 = model.get_embeddings(mini2.features, mini2.edge_indices, mini2.active_sizes_per_layer);
 
     // Should be identical (eval mode, no dropout, same input)
     auto diff = (emb1 - emb2).abs().max().item<float>();
@@ -721,7 +721,7 @@ TEST_F(EmbeddingWriterTest, DeduplicatedEmbeddingIsFromLastBatch) {
         if (num_seeds == 0) continue;
 
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         emb = emb.cpu().contiguous();
 
         for (int64_t i = 0; i < num_seeds; ++i) {
@@ -771,8 +771,8 @@ TEST_F(EmbeddingWriterTest, ModelGetEmbeddingsVsForward) {
     GraphSample sample = storage.read_sample(0);
     auto num_seeds = static_cast<int64_t>(sample.nodes_per_layer[0].size());
 
-    auto emb = model.get_embeddings(mini.features, mini.edge_indices, num_seeds);
-    auto logits = model.forward(mini.features, mini.edge_indices, num_seeds);
+    auto emb = model.get_embeddings(mini.features, mini.edge_indices, mini.active_sizes_per_layer);
+    auto logits = model.forward(mini.features, mini.edge_indices, mini.active_sizes_per_layer);
 
     // Shapes must differ: embeddings are hidden_dim, logits are num_classes
     EXPECT_EQ(emb.size(0), num_seeds);
@@ -816,7 +816,7 @@ TEST_F(EmbeddingWriterTest, EmbeddingDimensionConsistency) {
         if (num_seeds == 0) continue;
 
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, num_seeds);
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         emb = emb.cpu().contiguous();
 
         EXPECT_EQ(emb.size(1), expected_dim)

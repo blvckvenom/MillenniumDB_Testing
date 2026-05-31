@@ -18,14 +18,22 @@ static GraphSAGEConfig small_config() {
     };
 }
 
-// Two-layer edge index sets used across tests:
-//   outer hop (k=1): nodes 3,4,5 send to nodes 6,7,8
-//   inner hop (k=0): nodes 0,1,2 send to nodes 3,4,5
+// Two-layer edge index sets used across tests, expressed in the new
+// active-set-shrinking convention (src in A_{k+1}, dst in A_k):
+//   inner hop (k=0): 1-hop neighbors {3,4,5} -> seeds {0,1,2}
+//   outer hop (k=1): 2-hop neighbors {6,7,8} -> 1-hop {3,4,5}
+// Active-set sizes used at call sites: {3, 6, 10}
+//   |A_0|=3 (seeds), |A_1|=6 (seeds + 1-hop), |A_2|=10 (full feature matrix).
 static std::vector<torch::Tensor> two_layer_edges() {
     return {
-        torch::tensor({{0, 1, 2}, {3, 4, 5}}, torch::kInt64),  // k=0
-        torch::tensor({{3, 4, 5}, {6, 7, 8}}, torch::kInt64),  // k=1
+        torch::tensor({{3, 4, 5}, {0, 1, 2}}, torch::kInt64),  // k=0: 1-hop -> seeds
+        torch::tensor({{6, 7, 8}, {3, 4, 5}}, torch::kInt64),  // k=1: 2-hop -> 1-hop
     };
+}
+
+// Active-set sizes paired with two_layer_edges(): |A_0|=3, |A_1|=6, |A_2|=10.
+static std::vector<int64_t> two_layer_active_sizes() {
+    return {3, 6, 10};
 }
 
 // ============================================================================
@@ -37,7 +45,7 @@ TEST(GraphSAGEModelTest, ForwardProducesCorrectShape) {
     model.eval();
 
     auto x    = torch::randn({10, 4});
-    auto out  = model.forward(x, two_layer_edges(), /*num_seeds=*/3);
+    auto out  = model.forward(x, two_layer_edges(), two_layer_active_sizes());
 
     EXPECT_EQ(out.size(0), 3);
     EXPECT_EQ(out.size(1), 3);  // num_classes
@@ -56,12 +64,14 @@ TEST(GraphSAGEModelTest, SingleLayerForwardShape) {
     GraphSAGEModel model(cfg);
     model.eval();
 
-    // One edge set only
+    // One edge set only, in active-set convention:
+    //   k=0: 1-hop {2,3} -> seeds {0,1}
     std::vector<torch::Tensor> edges = {
-        torch::tensor({{0, 1}, {2, 3}}, torch::kInt64),
+        torch::tensor({{2, 3}, {0, 1}}, torch::kInt64),
     };
+    std::vector<int64_t> active_sizes = {2, 5};  // |A_0|=2 seeds, |A_1|=5 full
     auto x   = torch::randn({5, 4});
-    auto out = model.forward(x, edges, /*num_seeds=*/2);
+    auto out = model.forward(x, edges, active_sizes);
 
     EXPECT_EQ(out.size(0), 2);
     EXPECT_EQ(out.size(1), 2);
@@ -80,13 +90,19 @@ TEST(GraphSAGEModelTest, ThreeLayerForwardShape) {
     GraphSAGEModel model(cfg);
     model.eval();
 
+    // Three layers in active-set convention (src in A_{k+1}, dst in A_k):
+    //   k=0: 1-hop {2,3} -> seeds {0,1}
+    //   k=1: 2-hop {4,5} -> 1-hop {2,3}
+    //   k=2: 3-hop {6,7} -> 2-hop {4,5}
     std::vector<torch::Tensor> edges = {
-        torch::tensor({{0, 1}, {2, 3}}, torch::kInt64),
-        torch::tensor({{2, 3}, {4, 5}}, torch::kInt64),
-        torch::tensor({{4, 5}, {6, 7}}, torch::kInt64),
+        torch::tensor({{2, 3}, {0, 1}}, torch::kInt64),
+        torch::tensor({{4, 5}, {2, 3}}, torch::kInt64),
+        torch::tensor({{6, 7}, {4, 5}}, torch::kInt64),
     };
+    // |A_0|=2 seeds, |A_1|=4, |A_2|=6, |A_3|=10 full.
+    std::vector<int64_t> active_sizes = {2, 4, 6, 10};
     auto x   = torch::randn({10, 4});
-    auto out = model.forward(x, edges, /*num_seeds=*/2);
+    auto out = model.forward(x, edges, active_sizes);
 
     EXPECT_EQ(out.size(0), 2);
     EXPECT_EQ(out.size(1), 5);
@@ -101,7 +117,7 @@ TEST(GraphSAGEModelTest, GradientsFlow) {
     model.train();
 
     auto x   = torch::randn({10, 4});
-    auto out = model.forward(x, two_layer_edges(), /*num_seeds=*/3);
+    auto out = model.forward(x, two_layer_edges(), two_layer_active_sizes());
     out.sum().backward();
 
     for (auto& p : model.parameters()) {
@@ -128,12 +144,13 @@ TEST(GraphSAGEModelTest, DropoutDiffersBetweenModes) {
 
     auto x     = torch::randn({10, 4});
     auto edges = two_layer_edges();
+    auto sizes = two_layer_active_sizes();
 
     model.train();
-    auto train_out = model.forward(x, edges, 3);
+    auto train_out = model.forward(x, edges, sizes);
 
     model.eval();
-    auto eval_out = model.forward(x, edges, 3);
+    auto eval_out = model.forward(x, edges, sizes);
 
     EXPECT_FALSE(torch::allclose(train_out, eval_out))
         << "Expected train/eval outputs to differ due to dropout";
@@ -177,10 +194,11 @@ TEST(GraphSAGEModelTest, MismatchedEdgeIndicesThrows) {
 
     // Provide only 1 edge set instead of 2
     std::vector<torch::Tensor> one_edge = {
-        torch::tensor({{0, 1}, {2, 3}}, torch::kInt64),
+        torch::tensor({{2, 3}, {0, 1}}, torch::kInt64),
     };
     auto x = torch::randn({10, 4});
-    EXPECT_THROW(model.forward(x, one_edge, 3), std::invalid_argument);
+    EXPECT_THROW(model.forward(x, one_edge, two_layer_active_sizes()),
+                 std::invalid_argument);
 }
 
 // ============================================================================
@@ -198,7 +216,7 @@ TEST(GraphSAGEModelTest, NormalizeOptionDoesNotChangeShape) {
     model.eval();
 
     auto x   = torch::randn({10, 4});
-    auto out = model.forward(x, two_layer_edges(), 3);
+    auto out = model.forward(x, two_layer_edges(), two_layer_active_sizes());
 
     EXPECT_EQ(out.size(0), 3);
     EXPECT_EQ(out.size(1), 3);
@@ -219,7 +237,7 @@ TEST(GraphSAGEModelTest, IsolatedNodesProduceFiniteOutput) {
         torch::zeros({2, 0}, torch::kInt64),
         torch::zeros({2, 0}, torch::kInt64),
     };
-    auto out = model.forward(x, empty_edges, 3);
+    auto out = model.forward(x, empty_edges, two_layer_active_sizes());
 
     EXPECT_TRUE(out.isfinite().all().item<bool>())
         << "Output contains NaN or Inf for isolated nodes";
@@ -235,7 +253,7 @@ TEST(GraphSAGEModelTest, EvalModeOutputRequiresNoGrad) {
 
     torch::NoGradGuard no_grad;
     auto x   = torch::randn({10, 4});
-    auto out = model.forward(x, two_layer_edges(), 3);
+    auto out = model.forward(x, two_layer_edges(), two_layer_active_sizes());
 
     // In eval + no_grad, output should be finite and 2-D
     EXPECT_EQ(out.dim(), 2);
