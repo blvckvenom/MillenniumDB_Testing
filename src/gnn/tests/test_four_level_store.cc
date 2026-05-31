@@ -1816,3 +1816,44 @@ TEST_F(FourLevelStoreCoordTest, SpecD_ReorderedBytesNonzero) {
     EXPECT_GT(result.reordered_bytes, 0u)
         << "reordered_bytes must be > 0 when config.reorder=true";
 }
+
+// =============================================================================
+// STEP 1 regression: addr-table staleness marker resolves the PROJECTION dir.
+//
+// Bug: compute_meta_sha_head() was called on <db_folder>/gnn_meta.bin, but
+// graph_project writes gnn_meta.bin into <db_folder>/projections/<name>/. The
+// db-root path never exists, so the FNV hash was always 0 — the sentinel that
+// DISABLES the addr-table staleness check in AddrTableReader::open(). The check
+// was therefore a permanent no-op. gnn_meta_path_for() now resolves the
+// projection-dir path, where the file actually exists, so the hash is real
+// (non-zero) and staleness can fire.
+// =============================================================================
+TEST(FourLevelStoreMetaSha, ResolvesProjectionDirNotDbRoot) {
+    auto base = fs::temp_directory_path() /
+                ("flsmeta_" + std::to_string(::getpid()));
+    fs::remove_all(base);
+    auto proj_meta = base / "projections" / "p" / "gnn_meta.bin";
+    fs::create_directories(proj_meta.parent_path());
+    {
+        std::ofstream f(proj_meta, std::ios::binary);
+        const char bytes[] = {1, 2, 3, 4, 5, 6, 7, 8};
+        f.write(bytes, sizeof(bytes));
+    }
+
+    // The resolver points at the PROJECTION dir, where gnn_meta.bin actually
+    // lives — NOT the db root.
+    auto resolved = FourLevelStore::gnn_meta_path_for(base, "p");
+    EXPECT_EQ(resolved, proj_meta);
+
+    // The fix's whole point: the resolved file EXISTS, so compute_meta_sha_head
+    // (which returns 0 only when the file is absent/unreadable) yields a real
+    // non-zero marker and the staleness check is ENABLED.
+    EXPECT_TRUE(fs::exists(resolved));
+
+    // The historical buggy target — the db root — does NOT contain gnn_meta.bin,
+    // which is exactly why the old code always hashed a missing file to 0 and
+    // silently disabled the staleness check. Guard against regressing to it.
+    EXPECT_FALSE(fs::exists(base / "gnn_meta.bin"));
+
+    fs::remove_all(base);
+}

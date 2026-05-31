@@ -111,7 +111,27 @@ public:
     size_t      total_bytes() const { return header_.data_bytes(); }
     const std::filesystem::path& path()    const { return path_; }
 
+    /**
+     * @brief Hint the kernel that the mapped region can be evicted from
+     *        the page cache. Useful after a single-pass scan where the
+     *        caller won't read these pages again soon.
+     *
+     * Fix #22: papers100M's 56 GB source + 56 GB reordered + 8 GB caches
+     * exceed the 30 GB host RAM. At the end of gnn_build_feature_store,
+     * downstream callers (e.g. gnn_train running immediately after)
+     * benefit from a clean page-cache budget instead of inheriting 100+ GB
+     * of stale pages competing for eviction.
+     */
+    void release_cache() const;
+
 private:
+    // Fix #15 helper — needs access to private mmap members for source
+    // mmap and to construct the result via the same path as create_reordered.
+    static FeatureMatrix create_reordered_external_sort_(
+        const FeatureMatrix& source,
+        const std::vector<uint64_t>& permutation,
+        const std::filesystem::path& output_path);
+
     FeatureMatrix() = default;
 
     FeatureMatrixHeader header_{};

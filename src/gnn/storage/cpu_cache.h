@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -68,6 +69,38 @@ public:
     /// Lookup a batch of ObjectIds. Returns features for hits and positions
     /// for both hits and misses (to allow the caller to fetch misses from L3/L4).
     LookupResult lookup(const std::vector<ObjectId>& oids) const;
+
+    /// UVA-direct lookup: for each hit oid, returns a pointer into the pinned
+    /// feature region. Caller MUST NOT free or modify the returned pointers;
+    /// they remain valid for the CpuCache lifetime.
+    ///
+    /// Round 1B (2026-05-15): zero-copy variant of lookup() — avoids the
+    /// per-call std::vector<char> allocation + memcpy that the standard
+    /// lookup() performs. The DiskGNN paper accesses L2 features via UVA
+    /// directly from the pinned host region; this method exposes the same
+    /// path. Callers either (a) consume the pointers via memcpy into their
+    /// own destination buffer, or (b) hand the pointers + dst buffer to a
+    /// GPU kernel that reads through UVA.
+    struct UvaLookupResult {
+        std::vector<uint32_t>    hit_positions;  // positions in input oids[]
+        std::vector<const void*> hit_pointers;   // pinned-memory ptrs (UVA-accessible)
+        std::vector<uint32_t>    miss_positions; // positions in input oids[] that missed
+    };
+
+    UvaLookupResult lookup_uva(const std::vector<ObjectId>& oids) const;
+
+    /// Round 1C (2026-05-15): single-hash lookup returning the cache row
+    /// index if present, nullopt otherwise. Used by FourLevelStore to
+    /// eliminate the double hash on the L2 hit path (previously contains()
+    /// then lookup_uva() both call find()).
+    std::optional<uint32_t> find_index(ObjectId oid) const;
+
+    /// Round 1C (2026-05-15): return a UVA-accessible pointer to the row at
+    /// the given pre-validated cache index. Same lifetime contract as
+    /// lookup_uva: pointer is valid for the CpuCache lifetime, caller MUST
+    /// NOT free or modify. No bounds-check is performed; caller is
+    /// responsible for `idx < num_nodes_` (e.g. via prior find_index).
+    const void* row_ptr(uint32_t idx) const;
 
     bool     contains(ObjectId oid) const;
     uint64_t num_nodes() const;

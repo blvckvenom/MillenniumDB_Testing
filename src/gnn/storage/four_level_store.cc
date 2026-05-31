@@ -307,6 +307,19 @@ void build_addr_tables_(
 } // anonymous namespace
 
 // =============================================================================
+// Static: resolve the per-projection gnn_meta.bin path (addr-table staleness
+// marker). gnn_meta.bin is written by graph_project into the PROJECTION dir,
+// not the db root — the historical db-root path never existed, so
+// compute_meta_sha_head() always returned 0 and the staleness check was a
+// silent no-op. Public + static so the contract is unit-testable.
+// =============================================================================
+fs::path FourLevelStore::gnn_meta_path_for(const fs::path&    db_folder,
+                                           const std::string& projection_name)
+{
+    return db_folder / "projections" / projection_name / "gnn_meta.bin";
+}
+
+// =============================================================================
 // Helper: Map GnnDtype -> torch::ScalarType
 // =============================================================================
 
@@ -378,6 +391,62 @@ FourLevelStore::~FourLevelStore() {
         pinned_capacity_ = 0;
     }
 #endif
+}
+
+// =============================================================================
+// Path 4 (2026-05-20): rebuild addr_tables on a loaded runtime instance
+// =============================================================================
+// Used when source FeatureMatrix is unavailable (e.g. placeholder / deleted)
+// but the rest of the feature store (L1/L2/L3/L4 + caches + reordered_rm) is
+// intact. Re-runs Phase 5 against the already-loaded caches and updates this
+// instance's v2-dispatch state so subsequent load_batch_features() calls can
+// immediately use the v2 fast path.
+uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder) {
+    if (!samples_) {
+        throw std::runtime_error(
+            "FourLevelStore::rebuild_addr_tables: no SampleStorage bound");
+    }
+
+    const auto& catalog = samples_->get_catalog();
+    uint64_t total_batches = catalog.total_batches;
+
+    uint64_t meta_sha_head = compute_meta_sha_head(
+        gnn_meta_path_for(db_folder, catalog.projection_name));
+
+    // Reconstruct OidIdxAdapters from the already-written GNNC cache files
+    // (same approach as FourLevelStore::build's Phase 5 step at line 880+).
+    auto gnn_dir       = db_folder / "gnn_features";
+    auto gpu_cache_path = gnn_dir / "node_features_gpu_cache.bin";
+    auto cpu_cache_path = gnn_dir / "node_features_cpu_cache.bin";
+    // Note: feature_name is fixed to "node_features" here — single-feature
+    // pipeline as of 2026-05-20. Generalize if multi-feature lands.
+    auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
+    auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
+
+    // Match the path convention used by FourLevelStore::build() at the Phase 5
+    // wiring (line 460): addr_tables_dir = sample_dir / "addr_tables".
+    auto addr_tables_dir = sample_dir_ / "addr_tables";
+
+    uint64_t out_bytes = 0;
+    build_addr_tables_(
+        *samples_,
+        addr_tables_dir,
+        fs::path(packed_slim_dir_),
+        l1_adapter,
+        l2_adapter,
+        reordered_rm_,
+        meta_sha_head,
+        total_batches,
+        out_bytes);
+
+    // After Phase 5 completes, this instance's v2 dispatch can serve
+    // load_batch_features() immediately. (The runtime ctor would have
+    // disabled use_addr_tables_ if addr_tables/ was absent at construction
+    // time — flip it on now that we've created the sidecars.)
+    use_addr_tables_ = true;
+    expected_meta_sha_head_ = meta_sha_head;
+
+    return out_bytes;
 }
 
 // =============================================================================
@@ -839,7 +908,8 @@ FourLevelStore::BuildResult FourLevelStore::build(
             auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
             auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
 
-            auto meta_sha_head = compute_meta_sha_head(db_folder / "gnn_meta.bin");
+            auto meta_sha_head = compute_meta_sha_head(
+                gnn_meta_path_for(db_folder, catalog.projection_name));
 
             build_addr_tables_(
                 samples,
@@ -1027,7 +1097,8 @@ FourLevelStore::FourLevelStore(
     if (use_addr_tables_) {
         // Compute the same FNV-64 hash over gnn_meta.bin that build_addr_tables_
         // used at build time. 0 disables the staleness check.
-        expected_meta_sha_head_ = compute_meta_sha_head(db_folder / "gnn_meta.bin");
+        expected_meta_sha_head_ = compute_meta_sha_head(
+            gnn_meta_path_for(db_folder, samples.get_catalog().projection_name));
     }
 
     // Load GPU cache (L1)

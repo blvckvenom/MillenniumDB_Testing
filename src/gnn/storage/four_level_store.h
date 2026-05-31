@@ -228,6 +228,27 @@ public:
     /// Destructor: releases the persistent pinned host buffer (if any).
     ~FourLevelStore();
 
+    /// Path 4 (2026-05-20): rebuild addr_tables/ sidecars from this loaded
+    /// runtime instance's already-resolved caches (gpu/cpu/reordered_rm).
+    /// Used when the source FeatureMatrix is unavailable (placeholder /
+    /// deleted), but the rest of the feature store is intact. Idempotent —
+    /// overwrites any existing addr_tables/. Returns total bytes written.
+    ///
+    /// Side-effect: enables use_addr_tables_ and sets expected_meta_sha_head_
+    /// so this instance's load_batch_features() can immediately serve via
+    /// the v2 fast path (no need to re-construct the FourLevelStore).
+    uint64_t rebuild_addr_tables(const std::filesystem::path& db_folder);
+
+    /// Resolve the per-projection gnn_meta.bin path used as the addr-table
+    /// staleness marker. gnn_meta.bin lives in the PROJECTION directory
+    /// (<db_folder>/projections/<projection_name>/gnn_meta.bin), NOT the db
+    /// root. Earlier code hashed <db_folder>/gnn_meta.bin, which never exists,
+    /// so compute_meta_sha_head() always returned 0 and the staleness check was
+    /// a silent no-op. Public + static so the staleness contract is unit-testable.
+    static std::filesystem::path gnn_meta_path_for(
+        const std::filesystem::path& db_folder,
+        const std::string&           projection_name);
+
     /// Primitive: features for a set of nodes (L1 -> L2 -> L3 fallback, no L4).
     torch::Tensor load_features(const std::vector<ObjectId>& oids);
 

@@ -5,6 +5,11 @@
 #include <stdexcept>
 #include <type_traits>
 
+#if __has_include(<execution>)
+#include <execution>
+#define MDB_GNN_HAS_PAR_EXECUTION 1
+#endif
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -63,12 +68,18 @@ RowMapping::RowMapping(RowMapping&& other) noexcept
       mmap_ptr_(other.mmap_ptr_),
       mmap_size_(other.mmap_size_),
       count_(other.count_),
+      idx_mmap_ptr_(other.idx_mmap_ptr_),
+      idx_mmap_size_(other.idx_mmap_size_),
+      idx_data_(other.idx_data_),
       build_index_flag_(std::move(other.build_index_flag_)),
       sorted_index_(std::move(other.sorted_index_))
 {
-    other.mmap_ptr_  = nullptr;
-    other.mmap_size_ = 0;
-    other.count_     = 0;
+    other.mmap_ptr_      = nullptr;
+    other.mmap_size_     = 0;
+    other.count_         = 0;
+    other.idx_mmap_ptr_  = nullptr;
+    other.idx_mmap_size_ = 0;
+    other.idx_data_      = nullptr;
 }
 
 RowMapping& RowMapping::operator=(RowMapping&& other) noexcept {
@@ -76,15 +87,24 @@ RowMapping& RowMapping::operator=(RowMapping&& other) noexcept {
         if (mmap_ptr_ != nullptr) {
             ::munmap(mmap_ptr_, mmap_size_);
         }
+        if (idx_mmap_ptr_ != nullptr) {
+            ::munmap(idx_mmap_ptr_, idx_mmap_size_);
+        }
         path_             = std::move(other.path_);
         mmap_ptr_         = other.mmap_ptr_;
         mmap_size_        = other.mmap_size_;
         count_            = other.count_;
+        idx_mmap_ptr_     = other.idx_mmap_ptr_;
+        idx_mmap_size_    = other.idx_mmap_size_;
+        idx_data_         = other.idx_data_;
         build_index_flag_ = std::move(other.build_index_flag_);
         sorted_index_     = std::move(other.sorted_index_);
-        other.mmap_ptr_  = nullptr;
-        other.mmap_size_ = 0;
-        other.count_     = 0;
+        other.mmap_ptr_      = nullptr;
+        other.mmap_size_     = 0;
+        other.count_         = 0;
+        other.idx_mmap_ptr_  = nullptr;
+        other.idx_mmap_size_ = 0;
+        other.idx_data_      = nullptr;
     }
     return *this;
 }
@@ -93,6 +113,10 @@ RowMapping::~RowMapping() {
     if (mmap_ptr_ != nullptr) {
         ::munmap(mmap_ptr_, mmap_size_);
         mmap_ptr_ = nullptr;
+    }
+    if (idx_mmap_ptr_ != nullptr) {
+        ::munmap(idx_mmap_ptr_, idx_mmap_size_);
+        idx_mmap_ptr_ = nullptr;
     }
 }
 
@@ -229,7 +253,10 @@ RowMapping RowMapping::open(const fs::path& path) {
     rm.mmap_ptr_  = ptr;
     rm.mmap_size_ = file_size;
     rm.count_     = count;
-    // Note: build_index() is NOT called here — it runs lazily on first find().
+    // Fix #17: try to mmap a persisted sorted-index sidecar. If present
+    // and matches (count, magic), find() will use it directly and we
+    // skip the O(N log N) lazy build entirely (~30 s on papers100M).
+    rm.try_load_persisted_index_();
     return rm;
 }
 
@@ -253,7 +280,26 @@ std::optional<uint64_t> RowMapping::find(ObjectId target) const {
     if (mmap_ptr_ == nullptr) {
         throw std::runtime_error("RowMapping::find: not mapped");
     }
-    std::call_once(*build_index_flag_, [this] { build_index(); });
+
+    // Fast path (Fix #17): a mmap'd sidecar `<path>.idx` was loaded at
+    // open() — search it directly without paying the lazy build cost.
+    if (idx_data_ != nullptr) {
+        auto it = std::lower_bound(idx_data_, idx_data_ + count_,
+            std::make_pair(target.id, uint64_t(0)),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (it != idx_data_ + count_ && it->first == target.id) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+
+    std::call_once(*build_index_flag_, [this] {
+        build_index();
+        // Fix #17: best-effort persist after first build, so next open
+        // benefits from the fast path. Ignore failures (the sidecar is
+        // strictly optional — the in-memory sorted_index_ remains valid).
+        try { persist_sorted_index_(); } catch (...) { /* ignore */ }
+    });
 
     auto it = std::lower_bound(sorted_index_.begin(), sorted_index_.end(),
         std::make_pair(target.id, uint64_t(0)),
@@ -273,7 +319,102 @@ void RowMapping::build_index() const {
     for (uint64_t i = 0; i < count_; ++i) {
         sorted_index_[i] = {arr[i].id, i};
     }
+    // Fix #18 (2026-05-13): use parallel sort when TBB is linked. With
+    // libstdc++ ≥ 9 + libtbb the C++17 par_unseq policy speeds the
+    // 111M-entry sort from ~30 s to ~6-8 s on a 20-core host. Falls
+    // back to serial sort when <execution> is unavailable.
+#ifdef MDB_GNN_HAS_PAR_EXECUTION
+    std::sort(std::execution::par_unseq,
+              sorted_index_.begin(), sorted_index_.end());
+#else
     std::sort(sorted_index_.begin(), sorted_index_.end());
+#endif
+}
+
+// --- Fix #17: persistent sorted-index sidecar ---
+
+void RowMapping::persist_sorted_index_() const {
+    if (count_ == 0 || sorted_index_.empty()) return;
+    auto idx_path = fs::path(path_.string() + ".idx");
+    auto tmp_path = fs::path(idx_path.string() + ".tmp");
+
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        // Best-effort — log via runtime_error which the caller swallows
+        throw std::runtime_error(
+            "RowMapping::persist_sorted_index_: cannot create " + tmp_path.string() +
+            ": " + std::strerror(errno));
+    }
+    FdGuard guard(fd);
+
+    // Header: idx_magic(4) + idx_version(4) + count(8) = 16 bytes
+    uint32_t idx_magic   = IDX_MAGIC;
+    uint32_t idx_version = IDX_VERSION;
+    uint64_t count       = sorted_index_.size();
+    write_all(fd, &idx_magic,   sizeof(idx_magic));
+    write_all(fd, &idx_version, sizeof(idx_version));
+    write_all(fd, &count,       sizeof(count));
+
+    // Data: count × (uint64 oid, uint64 row) pairs, sorted by oid
+    size_t data_bytes = count * sizeof(std::pair<uint64_t, uint64_t>);
+    write_all(fd, sorted_index_.data(), data_bytes);
+
+    if (::fsync(fd) < 0) {
+        throw std::runtime_error(
+            "RowMapping::persist_sorted_index_: fsync failed: " +
+            std::string(std::strerror(errno)));
+    }
+    std::error_code ec;
+    fs::rename(tmp_path, idx_path, ec);
+    if (ec) {
+        fs::remove(tmp_path, ec);
+        throw std::runtime_error(
+            "RowMapping::persist_sorted_index_: rename failed: " + ec.message());
+    }
+    int dir_fd = ::open(idx_path.parent_path().c_str(), O_RDONLY);
+    if (dir_fd >= 0) { ::fsync(dir_fd); ::close(dir_fd); }
+}
+
+bool RowMapping::try_load_persisted_index_() {
+    if (count_ == 0) return false;
+    auto idx_path = fs::path(path_.string() + ".idx");
+    if (!fs::exists(idx_path)) return false;
+
+    auto file_size = fs::file_size(idx_path);
+    const size_t header_size = 16;  // idx_magic + idx_version + count
+    if (file_size < header_size) return false;
+
+    int fd = ::open(idx_path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    FdGuard guard(fd);
+
+    void* ptr = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (ptr == MAP_FAILED) return false;
+
+    const char* base = static_cast<const char*>(ptr);
+    uint32_t idx_magic, idx_version;
+    uint64_t idx_count;
+    std::memcpy(&idx_magic,   base,     sizeof(idx_magic));
+    std::memcpy(&idx_version, base + 4, sizeof(idx_version));
+    std::memcpy(&idx_count,   base + 8, sizeof(idx_count));
+
+    if (idx_magic != IDX_MAGIC || idx_version != IDX_VERSION || idx_count != count_) {
+        // Stale or wrong-format sidecar — fall back to lazy build.
+        ::munmap(ptr, file_size);
+        return false;
+    }
+
+    size_t expected = header_size + idx_count * sizeof(std::pair<uint64_t, uint64_t>);
+    if (file_size < expected) {
+        ::munmap(ptr, file_size);
+        return false;
+    }
+
+    idx_mmap_ptr_  = ptr;
+    idx_mmap_size_ = file_size;
+    idx_data_      = reinterpret_cast<const std::pair<uint64_t, uint64_t>*>(
+        base + header_size);
+    return true;
 }
 
 } // namespace mdb::gnn

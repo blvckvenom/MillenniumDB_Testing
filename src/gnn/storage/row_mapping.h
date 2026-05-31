@@ -59,19 +59,35 @@ private:
     static constexpr uint32_t MAGIC   = 0x524D4150; // "RMAP"
     static constexpr uint32_t VERSION = 1;
 
+    // Fix #17: persistent sorted index. Sidecar file `<path>.idx` stores
+    // the (oid, row) pairs already sorted by oid. On open() we mmap it
+    // and find() works directly off the mmap'd region — skipping the
+    // O(N log N) build_index() that takes ~30 s on papers100M-scale.
+    static constexpr uint32_t IDX_MAGIC   = 0x52494458; // "RIDX"
+    static constexpr uint32_t IDX_VERSION = 1;
+
     RowMapping() = default;
 
     void build_index() const;
+    void persist_sorted_index_() const;
+    bool try_load_persisted_index_();
 
     std::filesystem::path path_;
     void*    mmap_ptr_  = nullptr;
     size_t   mmap_size_ = 0;
     uint64_t count_     = 0;
 
+    // Fix #17: separate mmap region for the sidecar index. Non-null iff
+    // we loaded the persisted index successfully.
+    void*    idx_mmap_ptr_  = nullptr;
+    size_t   idx_mmap_size_ = 0;
+    const std::pair<uint64_t, uint64_t>* idx_data_ = nullptr;
+
     /// Lazy init flag for sorted_index_. Built on first find() via std::call_once.
     mutable std::unique_ptr<std::once_flag> build_index_flag_ = std::make_unique<std::once_flag>();
 
     /// (oid.id, row_idx) pairs sorted by oid.id. Built lazily on first find().
+    /// Empty when idx_data_ points to a mmap'd persisted index.
     mutable std::vector<std::pair<uint64_t, uint64_t>> sorted_index_;
 
     const ObjectId* data_ptr() const;

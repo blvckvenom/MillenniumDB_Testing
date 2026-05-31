@@ -1,12 +1,17 @@
 #include "gnn/storage/gpu_cache.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "gnn/storage/cache_file.h"
+#include "gnn/storage/gnn_dtype.h"
 
 namespace mdb::gnn {
 
@@ -86,6 +91,27 @@ torch::ScalarType to_torch_dtype(GnnDtype dt) {
 // build() — write GNNC file
 // ---------------------------------------------------------------------------
 
+// Fix #14 (2026-05-13): skip rebuild if the existing cache file's
+// header matches the requested dims. Same trick as cpu_cache.cc.
+static bool gpu_cache_matches(
+    const fs::path& path,
+    uint64_t        expected_N,
+    uint64_t        expected_D,
+    GnnDtype        expected_dtype)
+{
+    if (!fs::exists(path)) return false;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    CacheFileHeader h{};
+    ssize_t r = ::read(fd, &h, sizeof(h));
+    ::close(fd);
+    if (r != static_cast<ssize_t>(sizeof(h))) return false;
+    if (!h.is_valid()) return false;
+    return h.num_nodes == expected_N
+        && h.feature_dim == expected_D
+        && h.get_dtype() == expected_dtype;
+}
+
 void GpuCache::build(
     const std::vector<ObjectId>& nodes,
     const FeatureMatrix&         features,
@@ -96,7 +122,48 @@ void GpuCache::build(
     const uint64_t D = features.num_cols();
     const GnnDtype dt = features.dtype();
 
+    if (gpu_cache_matches(output_path, N, D, dt)) {
+        // Fix #14: existing cache header matches → reusable. Skip rebuild.
+        return;
+    }
+
     auto header = CacheFileHeader::make(N, D, dt);
+    const size_t row_bytes = features.row_bytes();
+
+    // Resolve OID -> row and sort by row to make the source mmap reads
+    // sequential (Fix #12 trick). The on-disk index is reordered but
+    // oid_table[i] still maps to data[i] so the cache reader is
+    // semantically unchanged.
+    struct Entry { uint64_t row; ObjectId oid; };
+    std::vector<Entry> entries;
+    entries.reserve(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        auto row_idx = row_mapping.find(nodes[i]);
+        if (!row_idx.has_value()) {
+            char hex[17];
+            std::snprintf(hex, sizeof(hex), "%016llx",
+                          static_cast<unsigned long long>(nodes[i].id));
+            throw std::runtime_error(
+                std::string("GpuCache::build: ObjectId 0x") + hex +
+                " has no corresponding row in RowMapping");
+        }
+        entries.push_back({*row_idx, nodes[i]});
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.row < b.row; });
+
+    // Single contiguous output buffer: header + OID table + features.
+    const size_t oid_block  = N * sizeof(uint64_t);
+    const size_t data_block = N * row_bytes;
+    std::vector<char> out_buf(sizeof(header) + oid_block + data_block);
+    std::memcpy(out_buf.data(), &header, sizeof(header));
+    auto* oid_ptr  = reinterpret_cast<uint64_t*>(out_buf.data() + sizeof(header));
+    char*  feat_ptr = out_buf.data() + sizeof(header) + oid_block;
+    for (uint64_t i = 0; i < N; ++i) {
+        oid_ptr[i] = entries[i].oid.id;
+        std::memcpy(feat_ptr + i * row_bytes,
+                    features.row(entries[i].row), row_bytes);
+    }
 
     int fd = ::open(output_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -105,35 +172,7 @@ void GpuCache::build(
             ": " + std::strerror(errno));
     }
     FdGuard guard(fd);
-
-    // Write 32-byte header
-    write_all(fd, &header, sizeof(header));
-
-    // Write ObjectId table (N x 8 bytes)
-    static_assert(sizeof(ObjectId) == sizeof(uint64_t),
-                  "ObjectId must be 8 bytes for direct serialization");
-    if (N > 0) {
-        write_all(fd, nodes.data(), N * sizeof(uint64_t));
-    }
-
-    // Write feature data: for each node, look up its row and write the row bytes
-    const size_t row_bytes = features.row_bytes();
-    for (uint64_t i = 0; i < N; ++i) {
-        auto row_idx = row_mapping.find(nodes[i]);
-        if (!row_idx.has_value()) {
-            throw std::runtime_error(
-                "GpuCache::build: ObjectId 0x" +
-                ([&]{
-                    char hex[17];
-                    std::snprintf(hex, sizeof(hex), "%016llx",
-                                  static_cast<unsigned long long>(nodes[i].id));
-                    return std::string(hex);
-                })() +
-                " has no corresponding row in RowMapping");
-        }
-        const void* row_data = features.row(row_idx.value());
-        write_all(fd, row_data, row_bytes);
-    }
+    write_all(fd, out_buf.data(), out_buf.size());
 
     if (::fsync(fd) < 0) {
         throw std::runtime_error(
@@ -278,6 +317,52 @@ GpuCache::LookupResult GpuCache::lookup(const std::vector<ObjectId>& oids) const
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// find_index() / gather_by_indices() — Round 1C
+// ---------------------------------------------------------------------------
+//
+// Round 1C (2026-05-15): split the work of lookup() into a single-hash
+// find_index() (used in the FourLevelStore classification loop) and a
+// gather_by_indices() that takes pre-validated cache row indices and
+// returns a feature tensor on the cache device. Together these replace
+// the previous double-hash pattern (contains() then lookup()) with one
+// hash per L1 hit.
+
+std::optional<uint32_t> GpuCache::find_index(ObjectId oid) const {
+    auto it = oid_to_idx_.find(oid.id);
+    if (it == oid_to_idx_.end()) return std::nullopt;
+    return it->second;
+}
+
+torch::Tensor GpuCache::gather_by_indices(
+    const std::vector<uint32_t>& cache_indices) const
+{
+    if (cache_indices.empty()) {
+        // Return an empty tensor on the same device/dtype as features_.
+        auto device = (features_.defined() && features_.numel() > 0)
+                          ? features_.device()
+                          : torch::Device(torch::kCPU);
+        auto stype = (features_.defined() && features_.numel() > 0)
+                         ? features_.scalar_type()
+                         : torch::kFloat32;
+        return torch::empty(
+            {0, static_cast<int64_t>(feature_dim_)},
+            torch::TensorOptions().dtype(stype).device(device));
+    }
+
+    // Build int64 index tensor for index_select. Same body as the back
+    // half of lookup() — no find loop needed.
+    std::vector<int64_t> idx64;
+    idx64.reserve(cache_indices.size());
+    for (uint32_t i : cache_indices) idx64.push_back(static_cast<int64_t>(i));
+
+    auto idx_tensor = torch::tensor(idx64, torch::kInt64);
+    if (on_gpu_) {
+        idx_tensor = idx_tensor.to(torch::kCUDA);
+    }
+    return features_.index_select(0, idx_tensor);
 }
 
 // ---------------------------------------------------------------------------
