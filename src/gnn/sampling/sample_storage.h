@@ -193,6 +193,40 @@ public:
      */
     GraphSample read_sample(uint64_t batch_id);
 
+    // =========================================================================
+    // Deserialized-sample cache (train-time hot path)
+    // =========================================================================
+
+    /**
+     * @brief Cache deserialized GraphSamples in RAM, bounded by a byte budget.
+     *
+     * The cost model showed gnn_train re-reads + re-deserializes the entire
+     * batches.dat from disk on EVERY epoch (the per-batch read_sample on the
+     * assemble hot path), and Fix #22's fadvise/madvise DONTNEED evicts those
+     * pages so even a sample set that fits in RAM is re-fetched each epoch.
+     *
+     * With a budget set, read_sample serves a previously-read batch from an
+     * in-RAM LRU of deserialized samples — skipping both the disk read and the
+     * deserialize. When batches.dat fits in the budget (cora/arxiv), epochs
+     * 2..N do zero sample-structure I/O; when it does not (papers100M), the LRU
+     * holds the hot subset and the DONTNEED hints still relieve the cold tail.
+     *
+     * @param budget_bytes Max bytes of cached samples. 0 disables (default).
+     */
+    void set_sample_cache_budget_bytes(size_t budget_bytes);
+
+    struct SampleCacheStats {
+        uint64_t hits = 0;        ///< read_sample served from the RAM cache
+        uint64_t misses = 0;      ///< read_sample fell through to disk
+        uint64_t evictions = 0;   ///< LRU evictions due to budget pressure
+        size_t   bytes = 0;       ///< current cached bytes (estimated)
+        size_t   budget = 0;      ///< configured budget
+        size_t   entries = 0;     ///< cached sample count
+    };
+
+    /// Snapshot of the deserialized-sample cache counters.
+    SampleCacheStats sample_cache_stats() const;
+
     /**
      * @brief Read multiple samples.
      *

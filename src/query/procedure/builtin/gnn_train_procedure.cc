@@ -32,6 +32,7 @@
 #include "gnn/training/npy_writer.h"
 #include "gnn/training/split_store.h"
 #include "gnn/training/training_loop.h"
+#include "misc/available_ram.h"
 #include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
@@ -264,6 +265,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     int64_t     random_seed      = -1;
     std::string output_dir_name  = "default";
     bool        export_emb       = true;
+    int64_t     sample_cache_mb  = -1;  // -1 = auto (RAM/4), 0 = disabled, >0 = MB
     std::string write_property;              // writeProperty option (empty = no write-back)
     uint64_t    inference_batch_size = 0;    // 0 = use EmbeddingWriter default (Phase B chunk size)
     std::string resume_from;       // empty = fresh training
@@ -323,6 +325,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_double("tolerance")) {
             if (*v < 0.0) throw std::runtime_error("tolerance must be non-negative, got: " + std::to_string(*v));
             tolerance = *v;
+        }
+        // Deserialized-sample cache budget (train hot path): -1 auto, 0 off, >0 MB.
+        if (auto v = opts.get_int("sampleCacheMb")) {
+            sample_cache_mb = *v;
         }
         // Spec C3 stage 1.B: opt-in async batch prefetcher.
         if (auto v = opts.get_bool("useAsyncPrefetcher")) {
@@ -452,6 +458,21 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     auto rm = RowMapping::open(rmap_path);
     auto samples = SampleStorage::open(storage_path);
+
+    // Deserialized-sample cache (train hot path): keep sample structure
+    // RAM-resident across epochs so epochs 2..N skip the per-batch disk read +
+    // deserialize that the cost model identified as the dominant train cost.
+    // -1 = auto (MemAvailable/4), 0 = disabled, >0 = explicit MB.
+    {
+        size_t budget = (sample_cache_mb < 0)
+            ? static_cast<size_t>(get_mem_available() / 4)
+            : static_cast<size_t>(sample_cache_mb) * 1024ULL * 1024ULL;
+        samples.set_sample_cache_budget_bytes(budget);
+        std::cerr << "[gnn_train] sample cache budget = "
+                  << (budget / (1024 * 1024)) << " MB ("
+                  << (sample_cache_mb < 0 ? "auto" : "explicit") << ")\n";
+    }
+
     const auto& catalog = samples.get_catalog();
     std::string projection_name = catalog.projection_name;
 
@@ -587,6 +608,17 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             + feature_name + "', {force:true}).");
     }
     BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
+
+    // Structural per-batch cache: reuse the index/label build across epochs
+    // (the cost model showed build_active_indices + build_edge_indices dominate
+    // the assemble worker cost; the feature gather is cheap when L1-resident).
+    // Same budget knob/policy as the sample cache.
+    {
+        size_t budget = (sample_cache_mb < 0)
+            ? static_cast<size_t>(get_mem_available() / 4)
+            : static_cast<size_t>(sample_cache_mb) * 1024ULL * 1024ULL;
+        assembler.set_struct_cache_budget_bytes(budget);
+    }
 
     // =========================================================================
     // Step 8: Run training

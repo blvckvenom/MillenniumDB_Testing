@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <fstream>
+#include <list>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -39,6 +41,24 @@ constexpr uint32_t FREQ_MAGIC = 0x51455246;   // "FREQ"
 // =============================================================================
 // Implementation
 // =============================================================================
+
+// Estimate the in-RAM footprint of a deserialized GraphSample (for the
+// read-mode sample cache budget). Counts the dynamic vector payloads plus
+// per-vector overhead; close enough to bound the cache to a byte budget.
+inline size_t estimate_sample_bytes(const GraphSample& s) {
+    size_t b = sizeof(GraphSample);
+    for (const auto& layer : s.nodes_per_layer) {
+        b += sizeof(layer) + layer.size() * sizeof(ObjectId);
+    }
+    for (const auto& e : s.edges_per_layer) {
+        b += sizeof(e)
+           + e.src_indices.size() * sizeof(int32_t)
+           + e.dst_indices.size() * sizeof(int32_t)
+           + e.edge_ids.size()    * sizeof(ObjectId);
+    }
+    b += s.all_unique_nodes.size() * sizeof(ObjectId);
+    return b;
+}
 
 // Fix #19 (2026-05-13): membuf wrapping an mmap'd region so we can drive
 // GraphSample::deserialize(istream&) without copying batches.dat into a
@@ -133,6 +153,23 @@ struct SampleStorage::Impl {
     // so it is invariant to worker write-completion order (numWorkers>=2); each
     // batch_id contributes exactly once via write_sample_impl.
     uint64_t content_fp_accumulator_ = 0;
+
+    // Deserialized-sample LRU cache (read-mode hot path). 0 budget = disabled.
+    // Guarded by cache_mu_; the disk read + deserialize itself happens OUTSIDE
+    // the lock so concurrent readers don't serialize on I/O.
+    struct CacheEntry {
+        GraphSample sample;
+        std::list<uint64_t>::iterator lru_it;
+        size_t bytes;
+    };
+    mutable std::mutex cache_mu_;
+    size_t cache_budget_ = 0;
+    size_t cache_bytes_  = 0;
+    std::unordered_map<uint64_t, CacheEntry> sample_cache_;
+    std::list<uint64_t> cache_lru_;  // front = most recently used
+    uint64_t cache_hits_ = 0;
+    uint64_t cache_misses_ = 0;
+    uint64_t cache_evictions_ = 0;
 
     Impl() = default;
 
@@ -419,6 +456,21 @@ struct SampleStorage::Impl {
             throw std::runtime_error("Batch ID not found: " + std::to_string(batch_id));
         }
 
+        // Cache fast path: serve a previously-read batch from the in-RAM LRU of
+        // deserialized samples (skips disk read + deserialize). The disk read
+        // below runs OUTSIDE the lock so concurrent readers don't serialize.
+        if (cache_budget_ > 0) {
+            std::lock_guard<std::mutex> lk(cache_mu_);
+            auto it = sample_cache_.find(batch_id);
+            if (it != sample_cache_.end()) {
+                ++cache_hits_;
+                cache_lru_.splice(cache_lru_.begin(), cache_lru_, it->second.lru_it);
+                return it->second.sample;  // copy
+            }
+            ++cache_misses_;
+        }
+
+        GraphSample sample;
         // Fix #19: prefer the mmap'd region (zero-copy parse) when
         // init_read_mode succeeded in mmap'ing batches.dat. Fall back to
         // the legacy ifstream open per call if mmap was unavailable.
@@ -427,35 +479,58 @@ struct SampleStorage::Impl {
         {
             const char* base = static_cast<const char*>(data_mmap_ptr_);
             MmapIStream stream(base + offset, size);
-            auto sample = GraphSample::deserialize(stream);
+            sample = GraphSample::deserialize(stream);
             // Fix #22: release this region of batches.dat from the page cache.
             // The MmapStreamBuf wraps a const-pointer view; the underlying memory
             // is read-only, so the cast away const is safe (madvise doesn't write).
             madvise_dontneed(const_cast<char*>(base + offset), size);
-            return sample;
+        } else {
+            // Legacy path — fresh ifstream per call.
+            auto data_path = storage_path / BATCH_DATA_FILE;
+            std::ifstream data_in(data_path, std::ios::binary);
+            if (!data_in) {
+                throw std::runtime_error("Failed to open batch data file");
+            }
+            data_in.seekg(offset);
+            sample = GraphSample::deserialize(data_in);
+
+            // Fix #22: tell the kernel we're done with [offset, offset+size).
+            // ifstream doesn't expose its underlying fd, so we open a brief
+            // read-only fd just to issue the hint. Adds one open+close per
+            // batch but avoids 87 GB of stale batches.dat pages in the cache
+            // on papers100M-scale runs.
+            int hint_fd = ::open(data_path.c_str(), O_RDONLY);
+            if (hint_fd >= 0) {
+                fadvise_dontneed(hint_fd, static_cast<off_t>(offset),
+                                 static_cast<off_t>(size));
+                ::close(hint_fd);
+            }
         }
 
-        // Legacy path — fresh ifstream per call.
-        auto data_path = storage_path / BATCH_DATA_FILE;
-        std::ifstream data_in(data_path, std::ios::binary);
-        if (!data_in) {
-            throw std::runtime_error("Failed to open batch data file");
-        }
-
-        data_in.seekg(offset);
-
-        auto sample = GraphSample::deserialize(data_in);
-
-        // Fix #22: tell the kernel we're done with [offset, offset+size).
-        // ifstream doesn't expose its underlying fd, so we open a brief
-        // read-only fd just to issue the hint. Adds one open+close per
-        // batch but avoids 87 GB of stale batches.dat pages in the cache
-        // on papers100M-scale runs.
-        int hint_fd = ::open(data_path.c_str(), O_RDONLY);
-        if (hint_fd >= 0) {
-            fadvise_dontneed(hint_fd, static_cast<off_t>(offset),
-                             static_cast<off_t>(size));
-            ::close(hint_fd);
+        // Cache insert (with LRU eviction to stay under budget). We keep our own
+        // deserialized copy in RAM, so the Fix #22 DONTNEED above is fine — the
+        // page cache is freed while our cache retains the hot working set.
+        if (cache_budget_ > 0) {
+            std::lock_guard<std::mutex> lk(cache_mu_);
+            if (sample_cache_.find(batch_id) == sample_cache_.end()) {
+                size_t sz = estimate_sample_bytes(sample);
+                while (cache_bytes_ + sz > cache_budget_ && !cache_lru_.empty()) {
+                    uint64_t victim = cache_lru_.back();
+                    cache_lru_.pop_back();
+                    auto vit = sample_cache_.find(victim);
+                    if (vit != sample_cache_.end()) {
+                        cache_bytes_ -= vit->second.bytes;
+                        sample_cache_.erase(vit);
+                        ++cache_evictions_;
+                    }
+                }
+                if (sz <= cache_budget_) {
+                    cache_lru_.push_front(batch_id);
+                    sample_cache_.emplace(
+                        batch_id, CacheEntry{sample, cache_lru_.begin(), sz});
+                    cache_bytes_ += sz;
+                }
+            }
         }
         return sample;
     }
@@ -659,6 +734,29 @@ void SampleStorage::finalize() {
 
 GraphSample SampleStorage::read_sample(uint64_t batch_id) {
     return impl_->read_sample_impl(batch_id);
+}
+
+void SampleStorage::set_sample_cache_budget_bytes(size_t budget_bytes) {
+    std::lock_guard<std::mutex> lk(impl_->cache_mu_);
+    impl_->cache_budget_ = budget_bytes;
+    if (budget_bytes == 0) {
+        // Disabling: drop everything so we don't pin RAM.
+        impl_->sample_cache_.clear();
+        impl_->cache_lru_.clear();
+        impl_->cache_bytes_ = 0;
+    }
+}
+
+SampleStorage::SampleCacheStats SampleStorage::sample_cache_stats() const {
+    std::lock_guard<std::mutex> lk(impl_->cache_mu_);
+    SampleCacheStats s;
+    s.hits      = impl_->cache_hits_;
+    s.misses    = impl_->cache_misses_;
+    s.evictions = impl_->cache_evictions_;
+    s.bytes     = impl_->cache_bytes_;
+    s.budget    = impl_->cache_budget_;
+    s.entries   = impl_->sample_cache_.size();
+    return s;
 }
 
 std::vector<GraphSample> SampleStorage::read_samples(const std::vector<uint64_t>& batch_ids) {

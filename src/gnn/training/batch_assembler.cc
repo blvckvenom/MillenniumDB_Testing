@@ -47,15 +47,132 @@ BatchAssembler::BatchAssembler(
 // Public: assemble(batch_id)
 // =============================================================================
 
+namespace {
+// Estimated RAM footprint of a cached structural bundle (index tensors only).
+size_t estimate_struct_bytes(const std::vector<torch::Tensor>& edges,
+                             const std::vector<torch::Tensor>& active,
+                             const torch::Tensor& labels,
+                             const torch::Tensor& label_mask) {
+    size_t b = 0;
+    for (const auto& t : edges)  b += static_cast<size_t>(t.numel()) * t.element_size();
+    for (const auto& t : active) b += static_cast<size_t>(t.numel()) * t.element_size();
+    if (labels.defined())     b += static_cast<size_t>(labels.numel()) * labels.element_size();
+    if (label_mask.defined()) b += static_cast<size_t>(label_mask.numel()) * label_mask.element_size();
+    return b + 256;  // small per-entry overhead
+}
+} // namespace
+
 MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
     auto t0 = std::chrono::steady_clock::now();
     GraphSample sample = samples_.read_sample(batch_id);
     auto t1 = std::chrono::steady_clock::now();
-
-    MiniBatch mini = assemble_from_sample(sample);
-    mini.timing.sample_read_ns = static_cast<uint64_t>(
+    uint64_t sample_read_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+
+    // Structural cache fast path: reuse the per-batch index/label build across
+    // epochs (it is a pure function of the sample) and only re-run the feature
+    // load. We copy the cached fields under the lock (torch tensors are
+    // refcounted, so this shares storage — no data copy) and release the lock
+    // before the feature load.
+    bool hit = false;
+    MiniBatch mini;
+    if (struct_budget_ > 0) {
+        std::lock_guard<std::mutex> lk(struct_mu_);
+        auto it = struct_cache_.find(batch_id);
+        if (it != struct_cache_.end()) {
+            ++struct_hits_;
+            struct_lru_.splice(struct_lru_.begin(), struct_lru_, it->second.lru_it);
+            const CachedStruct& c = it->second.s;
+            mini.batch_id                 = sample.batch_id;
+            mini.split                    = sample.split;
+            mini.edge_indices             = c.edge_indices;
+            mini.active_indices_per_layer = c.active_indices_per_layer;
+            mini.active_sizes_per_layer   = c.active_sizes_per_layer;
+            mini.labels                   = c.labels;
+            mini.label_mask               = c.label_mask;
+            mini.num_seeds                = c.num_seeds;
+            mini.num_nodes                = c.num_nodes;
+            mini.num_labeled              = c.num_labeled;
+            hit = true;
+        } else {
+            ++struct_misses_;
+        }
+    }
+
+    if (hit) {
+        auto tl0 = std::chrono::steady_clock::now();
+        mini.features = load_features(sample);
+        auto tl1 = std::chrono::steady_clock::now();
+        mini.timing.sample_read_ns      = sample_read_ns;
+        mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
+        if (feature_store_) {
+            mini.timing.used_addr_tables = feature_store_->last_used_addr_tables();
+            mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
+        }
+        return mini;
+    }
+
+    // Miss: full structural build + feature load, then cache the structural part.
+    mini = assemble_from_sample(sample);
+    mini.timing.sample_read_ns = sample_read_ns;
+
+    if (struct_budget_ > 0) {
+        std::lock_guard<std::mutex> lk(struct_mu_);
+        if (struct_cache_.find(batch_id) == struct_cache_.end()) {
+            size_t sz = estimate_struct_bytes(mini.edge_indices,
+                                              mini.active_indices_per_layer,
+                                              mini.labels, mini.label_mask);
+            while (struct_bytes_ + sz > struct_budget_ && !struct_lru_.empty()) {
+                uint64_t victim = struct_lru_.back();
+                struct_lru_.pop_back();
+                auto vit = struct_cache_.find(victim);
+                if (vit != struct_cache_.end()) {
+                    struct_bytes_ -= vit->second.bytes;
+                    struct_cache_.erase(vit);
+                    ++struct_evictions_;
+                }
+            }
+            if (sz <= struct_budget_) {
+                CachedStruct c;
+                c.edge_indices             = mini.edge_indices;
+                c.active_indices_per_layer = mini.active_indices_per_layer;
+                c.active_sizes_per_layer   = mini.active_sizes_per_layer;
+                c.labels                   = mini.labels;
+                c.label_mask               = mini.label_mask;
+                c.num_seeds                = mini.num_seeds;
+                c.num_nodes                = mini.num_nodes;
+                c.num_labeled              = mini.num_labeled;
+                struct_lru_.push_front(batch_id);
+                struct_cache_.emplace(
+                    batch_id, StructCacheEntry{std::move(c), struct_lru_.begin(), sz});
+                struct_bytes_ += sz;
+            }
+        }
+    }
     return mini;
+}
+
+void BatchAssembler::set_struct_cache_budget_bytes(size_t budget_bytes) {
+    std::lock_guard<std::mutex> lk(struct_mu_);
+    struct_budget_ = budget_bytes;
+    if (budget_bytes == 0) {
+        struct_cache_.clear();
+        struct_lru_.clear();
+        struct_bytes_ = 0;
+    }
+}
+
+BatchAssembler::StructCacheStats BatchAssembler::struct_cache_stats() const {
+    std::lock_guard<std::mutex> lk(struct_mu_);
+    StructCacheStats s;
+    s.hits      = struct_hits_;
+    s.misses    = struct_misses_;
+    s.evictions = struct_evictions_;
+    s.bytes     = struct_bytes_;
+    s.budget    = struct_budget_;
+    s.entries   = struct_cache_.size();
+    return s;
 }
 
 // =============================================================================

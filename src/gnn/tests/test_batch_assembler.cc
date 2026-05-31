@@ -592,3 +592,67 @@ TEST_F(BatchAssemblerTest, EdgeIndicesAreLocalToActiveSets) {
     ASSERT_EQ(e2.size(0), 2);
     ASSERT_EQ(e2.size(1), 0);
 }
+
+// =============================================================================
+// Structural per-batch cache (train hot path)
+//
+// A cache hit must produce structurally-identical tensors to a fresh build —
+// the cache only avoids recomputing the deterministic index/label build, never
+// changes content. Features are still re-loaded each call.
+// =============================================================================
+
+TEST_F(BatchAssemblerTest, StructCacheMatchesFreshBuild) {
+    auto fm  = FeatureMatrix::open(fmat_path_);
+    auto rm  = RowMapping::open(rmap_path_);
+    auto ls  = LabelStore::open(labels_path_);
+    auto ss  = SplitStore::open(splits_path_);
+    auto storage = create_sample_storage();
+
+    BatchAssembler assembler(fm, storage, &ls, &ss, rm);
+
+    // Reference build with the cache disabled.
+    MiniBatch ref = assembler.assemble(0);
+    {
+        auto s = assembler.struct_cache_stats();
+        EXPECT_EQ(s.budget, 0u);
+        EXPECT_EQ(s.hits, 0u);
+        EXPECT_EQ(s.misses, 0u);
+    }
+
+    // Enable the cache: first assemble misses + caches, second hits.
+    assembler.set_struct_cache_budget_bytes(8 * 1024 * 1024);
+    MiniBatch miss = assembler.assemble(0);
+    MiniBatch hit  = assembler.assemble(0);
+
+    auto s = assembler.struct_cache_stats();
+    EXPECT_EQ(s.misses, 1u);
+    EXPECT_EQ(s.hits, 1u);
+    EXPECT_EQ(s.entries, 1u);
+    EXPECT_GT(s.bytes, 0u);
+
+    // Structural content identical across ref / miss / hit.
+    ASSERT_EQ(hit.edge_indices.size(), ref.edge_indices.size());
+    for (size_t k = 0; k < ref.edge_indices.size(); ++k) {
+        EXPECT_TRUE(torch::equal(hit.edge_indices[k], ref.edge_indices[k]));
+        EXPECT_TRUE(torch::equal(miss.edge_indices[k], ref.edge_indices[k]));
+    }
+    ASSERT_EQ(hit.active_indices_per_layer.size(), ref.active_indices_per_layer.size());
+    for (size_t k = 0; k < ref.active_indices_per_layer.size(); ++k) {
+        EXPECT_TRUE(torch::equal(hit.active_indices_per_layer[k],
+                                 ref.active_indices_per_layer[k]));
+    }
+    EXPECT_EQ(hit.active_sizes_per_layer, ref.active_sizes_per_layer);
+    EXPECT_TRUE(torch::equal(hit.labels, ref.labels));
+    EXPECT_TRUE(torch::equal(hit.label_mask, ref.label_mask));
+    EXPECT_EQ(hit.num_seeds, ref.num_seeds);
+    EXPECT_EQ(hit.num_nodes, ref.num_nodes);
+    EXPECT_EQ(hit.num_labeled, ref.num_labeled);
+
+    // Features are still produced on a hit (re-loaded, not cached).
+    ASSERT_TRUE(hit.features.defined());
+    EXPECT_TRUE(torch::equal(hit.features, ref.features));
+
+    // Disable clears.
+    assembler.set_struct_cache_budget_bytes(0);
+    EXPECT_EQ(assembler.struct_cache_stats().entries, 0u);
+}

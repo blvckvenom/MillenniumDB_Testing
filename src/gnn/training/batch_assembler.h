@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <list>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -117,6 +120,36 @@ public:
      */
     const FourLevelStore* feature_store() const { return feature_store_; }
 
+    // =========================================================================
+    // Structural per-batch cache (train hot path)
+    // =========================================================================
+
+    /**
+     * @brief Cache the per-batch STRUCTURAL build (edge indices, active-set
+     *        indices, labels/mask) in RAM, bounded by a byte budget.
+     *
+     * The cost model showed build_active_indices + build_edge_indices dominate
+     * the assemble worker cost (the feature gather itself is cheap when nodes
+     * are L1-resident). These structural tensors are a pure function of the
+     * GraphSample content, so they are identical every epoch. With a budget
+     * set, assemble(batch_id) reuses them across epochs and only re-runs the
+     * (cheap) feature load. int64 index tensors are small and read-only, so
+     * this is safe at scale; an LRU bounds it when batches don't all fit.
+     *
+     * @param budget_bytes Max bytes of cached structural tensors. 0 disables.
+     */
+    void set_struct_cache_budget_bytes(size_t budget_bytes);
+
+    struct StructCacheStats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t evictions = 0;
+        size_t   bytes = 0;
+        size_t   budget = 0;
+        size_t   entries = 0;
+    };
+    StructCacheStats struct_cache_stats() const;
+
 private:
     /**
      * @brief Output bundle from build_active_indices.
@@ -199,6 +232,35 @@ private:
     LabelStore*       labels_;    // nullable
     SplitStore*       splits_;    // nullable
     const RowMapping& row_mapping_;
+
+    // --- Structural per-batch cache (see set_struct_cache_budget_bytes) ---
+    // Holds everything assemble_from_sample produces EXCEPT features (which are
+    // re-loaded each epoch). Tensors are CPU + refcounted, so a cache hit shares
+    // storage (no data copy); TrainingLoop's per-epoch .to(device) creates fresh
+    // device tensors and never mutates the cached CPU originals.
+    struct CachedStruct {
+        std::vector<torch::Tensor> edge_indices;
+        std::vector<torch::Tensor> active_indices_per_layer;
+        std::vector<int64_t>       active_sizes_per_layer;
+        torch::Tensor              labels;
+        torch::Tensor              label_mask;
+        uint64_t                   num_seeds = 0;
+        uint64_t                   num_nodes = 0;
+        uint64_t                   num_labeled = 0;
+    };
+    struct StructCacheEntry {
+        CachedStruct s;
+        std::list<uint64_t>::iterator lru_it;
+        size_t bytes;
+    };
+    mutable std::mutex struct_mu_;
+    size_t struct_budget_ = 0;
+    size_t struct_bytes_  = 0;
+    std::unordered_map<uint64_t, StructCacheEntry> struct_cache_;
+    std::list<uint64_t> struct_lru_;
+    uint64_t struct_hits_ = 0;
+    uint64_t struct_misses_ = 0;
+    uint64_t struct_evictions_ = 0;
 };
 
 } // namespace mdb::gnn

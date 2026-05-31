@@ -390,6 +390,24 @@ if(BUILD_TESTING)
         )
         add_test(NAME BatchMaterializerTests COMMAND test_batch_materializer)
 
+        # SampleStorage deserialized-sample cache tests (train hot path)
+        add_executable(test_sample_storage_cache
+            tests/test_sample_storage_cache.cc
+        )
+        target_link_libraries(test_sample_storage_cache
+            GTest::gtest_main
+            mdb_gnn_core
+            millenniumdb
+            antlr4_cpp_runtime
+            ssl crypto
+            ${TORCH_LIBRARIES}
+        )
+        set_target_properties(test_sample_storage_cache PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME SampleStorageCacheTests COMMAND test_sample_storage_cache)
+
         # FourLevelStore tests (CpuCache L2, later GpuCache L1 + coordinator)
         add_executable(test_four_level_store
             tests/test_four_level_store.cc
