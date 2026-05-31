@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>      // rename
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -329,6 +330,17 @@ struct OfflineSamplingEngine::Impl {
 
                     const auto& batch_seeds = split_batches[i];
 
+                    // Reseed per batch so the legacy (numWorkers=0) path produces
+                    // output that depends ONLY on (random_seed, batch_id) — exactly
+                    // like the parallel (numWorkers>=1) worker path, which calls
+                    // reseed_for_batch() before every sample(). Without this, W=0
+                    // used a single RNG evolving across batches (order-dependent),
+                    // so the sampled subgraph — and therefore the trained model —
+                    // silently DIFFERED between W=0 and any W>=1 run (verified on
+                    // cora: testAcc 0.8722 vs 0.8624). numWorkers must not change
+                    // the sample; gated by scripts/test_plan_f_parity.sh.
+                    khop_sampler->reseed_for_batch(batch_id);
+
                     // Sample k-hop neighborhood (no epoch parameter)
                     GraphSample sample = khop_sampler->sample(
                         batch_seeds,
@@ -415,6 +427,25 @@ struct OfflineSamplingEngine::Impl {
                     }
                 }
 
+                // R1.1 (2026-05-29) — single SHARED atomic access-counts array
+                // for all workers, replacing each worker's private N-sized
+                // `node_access_counts` (0.83 GB each on papers100M — the wall
+                // that capped numWorkers on a 30 GB box). Pre-sized to the
+                // projection node count, zero-initialized (C++17 std::atomic
+                // default-init is indeterminate, so the explicit store-0 loop
+                // is required). Declared on this frame, which outlives every
+                // worker (all joined below before the frame returns).
+                const std::size_t tally_n = static_cast<std::size_t>(
+                    khop_sampler->get_topology().get_node_count());
+                std::vector<std::atomic<uint64_t>> shared_counts(tally_n);
+                for (std::size_t i = 0; i < tally_n; ++i) {
+                    shared_counts[i].store(0, std::memory_order_relaxed);
+                }
+                khop_sampler->set_shared_access_counts(shared_counts.data(), tally_n);
+                for (auto& w : worker_samplers) {
+                    w->set_shared_access_counts(shared_counts.data(), tally_n);
+                }
+
                 std::atomic<std::size_t> next_idx{0};
                 std::mutex               write_mutex;
 
@@ -431,8 +462,19 @@ struct OfflineSamplingEngine::Impl {
                 // QueryContext without contention on the worker_index slot.
                 QueryContext* primary_ctx = &get_query_ctx();
 
+                // R1.1 hardening (2026-05-29): an exception escaping a
+                // std::thread body — or unwinding the primary past the join
+                // below — calls std::terminate(). sampler->sample() can throw
+                // (e.g. the max_layer_nodes cap on dense UNDIRECTED graphs).
+                // Capture the first exception, request cancellation so peers
+                // wind down, and rethrow ONCE after all threads join + the
+                // shared tally array is detached (no use-after-free / abort).
+                std::exception_ptr worker_exception;
+                std::mutex         exception_mutex;
+
                 auto worker_fn = [&](BasicKHopSampler* sampler) {
                     QueryContext::set_query_ctx(primary_ctx);
+                    try {
                     while (true) {
                         if (cancel_requested.load(std::memory_order_relaxed)) {
                             return;
@@ -466,6 +508,13 @@ struct OfflineSamplingEngine::Impl {
                             }
                         }
                     }
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lk(exception_mutex);
+                        if (!worker_exception) {
+                            worker_exception = std::current_exception();
+                        }
+                        cancel_requested.store(true);
+                    }
                 };
 
                 // Spawn workers. Primary runs in-thread to keep one fewer
@@ -479,11 +528,29 @@ struct OfflineSamplingEngine::Impl {
                 worker_fn(khop_sampler.get());
                 for (auto& t : threads) t.join();
 
-                // Merge per-worker tallies into the primary's vector so the
-                // node_counts.bin write at the end of do_run reflects every
-                // worker's contribution.
-                for (const auto& w : worker_samplers) {
-                    khop_sampler->merge_counts_from(w->node_access_counts());
+                // R1.1 — snapshot the single shared atomic tally into the
+                // primary's plain vector (no per-worker merge: there was one
+                // shared array). Detach primary + workers from the shared
+                // array FIRST so the about-to-be-destroyed `shared_counts`
+                // stack object is never referenced after this frame returns.
+                {
+                    std::vector<uint64_t> materialized(tally_n);
+                    for (std::size_t i = 0; i < tally_n; ++i) {
+                        materialized[i] =
+                            shared_counts[i].load(std::memory_order_relaxed);
+                    }
+                    khop_sampler->set_shared_access_counts(nullptr, 0);
+                    for (auto& w : worker_samplers) {
+                        w->set_shared_access_counts(nullptr, 0);
+                    }
+                    khop_sampler->adopt_counts(std::move(materialized));
+                }
+
+                // Rethrow now — threads joined, shared tally detached. The
+                // outer do_run try/catch turns this into a clean error result
+                // instead of std::terminate().
+                if (worker_exception) {
+                    std::rethrow_exception(worker_exception);
                 }
 
                 return !cancel_requested.load();

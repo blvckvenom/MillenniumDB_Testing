@@ -304,7 +304,12 @@ struct GraphSample {
 
     /// Magic number for binary format: "GNSM" (GNN Sample)
     static constexpr uint32_t MAGIC = 0x4D534E47;  // "GNSM" in little-endian
-    static constexpr uint32_t VERSION = 2;
+    /// v1: legacy format with epoch field; v2: element-by-element binary I/O;
+    /// v3: bulk binary I/O (Round 2A hot-path optimization, 2026-05-15).
+    /// Reader accepts v1/v2/v3; writer always emits VERSION.
+    static constexpr uint32_t VERSION_V2 = 2;
+    static constexpr uint32_t VERSION_V3 = 3;
+    static constexpr uint32_t VERSION = VERSION_V3;  // current write version
 
     /**
      * @brief Serialize to binary stream.

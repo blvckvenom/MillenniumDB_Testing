@@ -478,13 +478,22 @@ Neighbors TopologyAccessor::get_neighbors(ObjectId node_id, EdgeOrientation orie
                      && in_neighbors.edge_ids.front().id != 0);
 
             Neighbors result;
-            std::unordered_set<uint64_t> seen;
+            // Per-thread dedup arena reused across UNDIRECTED lookups.
+            // Avoids per-call hash-table reallocation; Plan F workers each
+            // get their own arena via thread_local.
+            thread_local std::unordered_set<uint64_t> seen_arena;
+            seen_arena.clear();
+            const size_t total = out_neighbors.node_ids.size()
+                               + in_neighbors.node_ids.size();
+            seen_arena.reserve(total);
+            result.node_ids.reserve(total);
+            result.edge_ids.reserve(total);
 
             for (size_t i = 0; i < out_neighbors.node_ids.size(); ++i) {
                 const uint64_t key = has_edge_ids
                     ? out_neighbors.edge_ids[i].id
                     : out_neighbors.node_ids[i].id;
-                if (seen.insert(key).second) {
+                if (seen_arena.insert(key).second) {
                     result.node_ids.push_back(out_neighbors.node_ids[i]);
                     result.edge_ids.push_back(out_neighbors.edge_ids[i]);
                 }
@@ -494,7 +503,7 @@ Neighbors TopologyAccessor::get_neighbors(ObjectId node_id, EdgeOrientation orie
                 const uint64_t key = has_edge_ids
                     ? in_neighbors.edge_ids[i].id
                     : in_neighbors.node_ids[i].id;
-                if (seen.insert(key).second) {
+                if (seen_arena.insert(key).second) {
                     result.node_ids.push_back(in_neighbors.node_ids[i]);
                     result.edge_ids.push_back(in_neighbors.edge_ids[i]);
                 }

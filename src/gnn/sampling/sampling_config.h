@@ -340,6 +340,27 @@ struct SamplingConfig {
      */
     std::uint32_t num_workers = 0;
 
+    /**
+     * @brief Per-layer cardinality cap (defensive guard against OOM).
+     *
+     * If > 0, sampling aborts with a clear error message when any BFS
+     * layer's deduped neighbor set exceeds this size. 0 = unlimited
+     * (historical behaviour).
+     *
+     * @details Motivation: UNDIRECTED orientation on dense graphs causes
+     * super-linear layer growth (papers100M fanout [10,15,20] saw layer 2
+     * peak at 5.6M nodes/worker, contributing to the silent SIGSEGV
+     * observed when N=20 workers exhausted RAM). With this cap set to
+     * e.g. `10 * batch_size`, the sampler aborts with an actionable
+     * message (the offending layer index + suggestion to reduce fanout
+     * or batch_size) instead of crashing the whole server.
+     *
+     * @note Truncation would bias the sample; we abort instead so the
+     * user is forced to choose between a smaller fanout/batch and a
+     * higher cap. Default is 0 to preserve byte-identical legacy output.
+     */
+    std::uint64_t max_layer_nodes = 0;
+
     // =========================================================================
     // Output
     // =========================================================================

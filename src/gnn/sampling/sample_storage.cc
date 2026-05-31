@@ -2,9 +2,17 @@
 
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <unordered_map>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "gnn/common/page_cache_hint.h"  // Fix #22
 #include "gnn/storage/row_mapping.h"
 #include "misc/logger.h"
 
@@ -31,6 +39,52 @@ constexpr uint32_t FREQ_MAGIC = 0x51455246;   // "FREQ"
 // Implementation
 // =============================================================================
 
+// Fix #19 (2026-05-13): membuf wrapping an mmap'd region so we can drive
+// GraphSample::deserialize(istream&) without copying batches.dat into a
+// user-space buffer. Eliminates ~87 GB of memcpy on papers100M MinHash.
+class MmapStreamBuf : public std::streambuf {
+public:
+    MmapStreamBuf(const char* data, size_t size) {
+        char* begin = const_cast<char*>(data);
+        setg(begin, begin, begin + size);
+    }
+    MmapStreamBuf(const MmapStreamBuf&) = delete;
+    MmapStreamBuf& operator=(const MmapStreamBuf&) = delete;
+
+protected:
+    // Seekoff/seekpos needed because GraphSample::deserialize sometimes
+    // calls .seekg(); the istream wrapper delegates to this streambuf.
+    pos_type seekoff(off_type off, std::ios_base::seekdir way,
+                     std::ios_base::openmode which) override {
+        if (!(which & std::ios_base::in)) return pos_type(-1);
+        char* base = eback();
+        char* end  = egptr();
+        char* cur  = gptr();
+        char* target;
+        switch (way) {
+            case std::ios_base::beg: target = base + off; break;
+            case std::ios_base::cur: target = cur + off; break;
+            case std::ios_base::end: target = end + off; break;
+            default: return pos_type(-1);
+        }
+        if (target < base || target > end) return pos_type(-1);
+        setg(base, target, end);
+        return pos_type(target - base);
+    }
+    pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+        return seekoff(off_type(pos), std::ios_base::beg, which);
+    }
+};
+
+class MmapIStream : public std::istream {
+public:
+    MmapIStream(const char* data, size_t size)
+        : std::istream(&buf_), buf_(data, size) {}
+
+private:
+    MmapStreamBuf buf_;
+};
+
 struct SampleStorage::Impl {
     std::filesystem::path storage_path;
     SampleCatalog catalog;
@@ -40,6 +94,12 @@ struct SampleStorage::Impl {
     // Write mode streams
     std::unique_ptr<std::ofstream> batch_data_stream;
     std::unique_ptr<std::ofstream> batch_index_stream;
+
+    // Fix #19: read-mode mmap of batches.dat. Populated by init_read_mode
+    // when the file is accessible; falls back to per-call ifstream if
+    // mmap fails (e.g. tmpfs, very large file > address space).
+    void*  data_mmap_ptr_  = nullptr;
+    size_t data_mmap_size_ = 0;
 
     // Index: batch_id -> (file_offset, data_size)
     std::vector<std::pair<uint64_t, uint64_t>> batch_index;
@@ -290,6 +350,42 @@ struct SampleStorage::Impl {
                 split_index[static_cast<int>(split)].push_back(i);
             }
         }
+
+        // Fix #19: mmap batches.dat for zero-copy read_sample. OPT-IN
+        // via env var MDB_GNN_MMAP_BATCHES_DAT=1 because empirical
+        // validation on papers100M (30 GB RAM) showed the mmap'd 87 GB
+        // region competes with reordered.fmat + cache files for page
+        // cache, pushing L4 packed_slim throughput from 5.5 → 3.6
+        // batches/s (+121 s wall-clock penalty) despite saving ~6 s
+        // on MinHash compute. Net loss on memory-constrained systems.
+        // Enable when the host has >> file size in RAM.
+        bool enable_mmap = false;
+        if (const char* env = std::getenv("MDB_GNN_MMAP_BATCHES_DAT")) {
+            std::string s(env);
+            if (s == "1" || s == "true" || s == "yes") enable_mmap = true;
+        }
+        if (enable_mmap) {
+            struct stat st{};
+            if (::stat(data_path.c_str(), &st) == 0 && st.st_size > 0) {
+                int fd = ::open(data_path.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    void* p = ::mmap(nullptr, static_cast<size_t>(st.st_size),
+                                     PROT_READ, MAP_PRIVATE, fd, 0);
+                    ::close(fd);
+                    if (p != MAP_FAILED) {
+                        data_mmap_ptr_  = p;
+                        data_mmap_size_ = static_cast<size_t>(st.st_size);
+                    }
+                }
+            }
+        }
+    }
+
+    ~Impl() {
+        if (data_mmap_ptr_ != nullptr) {
+            ::munmap(data_mmap_ptr_, data_mmap_size_);
+            data_mmap_ptr_ = nullptr;
+        }
     }
 
     GraphSample read_sample_impl(uint64_t batch_id) {
@@ -306,7 +402,23 @@ struct SampleStorage::Impl {
             throw std::runtime_error("Batch ID not found: " + std::to_string(batch_id));
         }
 
-        // Open data file and seek to offset
+        // Fix #19: prefer the mmap'd region (zero-copy parse) when
+        // init_read_mode succeeded in mmap'ing batches.dat. Fall back to
+        // the legacy ifstream open per call if mmap was unavailable.
+        if (data_mmap_ptr_ != nullptr &&
+            offset + size <= data_mmap_size_)
+        {
+            const char* base = static_cast<const char*>(data_mmap_ptr_);
+            MmapIStream stream(base + offset, size);
+            auto sample = GraphSample::deserialize(stream);
+            // Fix #22: release this region of batches.dat from the page cache.
+            // The MmapStreamBuf wraps a const-pointer view; the underlying memory
+            // is read-only, so the cast away const is safe (madvise doesn't write).
+            madvise_dontneed(const_cast<char*>(base + offset), size);
+            return sample;
+        }
+
+        // Legacy path — fresh ifstream per call.
         auto data_path = storage_path / BATCH_DATA_FILE;
         std::ifstream data_in(data_path, std::ios::binary);
         if (!data_in) {
@@ -315,8 +427,20 @@ struct SampleStorage::Impl {
 
         data_in.seekg(offset);
 
-        // Read and deserialize
-        return GraphSample::deserialize(data_in);
+        auto sample = GraphSample::deserialize(data_in);
+
+        // Fix #22: tell the kernel we're done with [offset, offset+size).
+        // ifstream doesn't expose its underlying fd, so we open a brief
+        // read-only fd just to issue the hint. Adds one open+close per
+        // batch but avoids 87 GB of stale batches.dat pages in the cache
+        // on papers100M-scale runs.
+        int hint_fd = ::open(data_path.c_str(), O_RDONLY);
+        if (hint_fd >= 0) {
+            fadvise_dontneed(hint_fd, static_cast<off_t>(offset),
+                             static_cast<off_t>(size));
+            ::close(hint_fd);
+        }
+        return sample;
     }
 
     void load_frequencies_if_needed() {

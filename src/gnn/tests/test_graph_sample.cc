@@ -267,6 +267,129 @@ TEST(GraphSampleTest, DeserializeInvalidMagicThrows) {
     EXPECT_THROW(GraphSample::deserialize(ss), std::runtime_error);
 }
 
+// ---------------------------------------------------------------------------
+// Round 2A — v3 bulk format roundtrip and v2 backward compatibility
+// ---------------------------------------------------------------------------
+
+// Manually write a v2-formatted sample (element-by-element layout) and verify
+// the new bulk-capable deserialize accepts it via the legacy path.
+TEST(GraphSampleTest, DeserializeV2LegacyFormat) {
+    auto reference = make_2hop_sample(7, SplitType::TEST);
+
+    std::stringstream ss;
+    // Header (v2)
+    uint32_t magic = GraphSample::MAGIC;
+    uint32_t v2 = GraphSample::VERSION_V2;
+    ss.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    ss.write(reinterpret_cast<const char*>(&v2), sizeof(v2));
+
+    // batch_id + split
+    uint64_t batch_id = reference.batch_id;
+    uint8_t split = static_cast<uint8_t>(reference.split);
+    ss.write(reinterpret_cast<const char*>(&batch_id), sizeof(batch_id));
+    ss.write(reinterpret_cast<const char*>(&split), sizeof(split));
+
+    auto write_oid_vec_v2 = [&](const std::vector<ObjectId>& vec) {
+        uint64_t n = vec.size();
+        ss.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        for (const auto& o : vec) {
+            ss.write(reinterpret_cast<const char*>(&o.id), sizeof(o.id));
+        }
+    };
+    auto write_i32_vec_v2 = [&](const std::vector<int32_t>& vec) {
+        uint64_t n = vec.size();
+        ss.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        for (int32_t v : vec) {
+            ss.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        }
+    };
+
+    uint64_t nl = reference.nodes_per_layer.size();
+    ss.write(reinterpret_cast<const char*>(&nl), sizeof(nl));
+    for (const auto& layer : reference.nodes_per_layer) {
+        write_oid_vec_v2(layer);
+    }
+
+    uint64_t el = reference.edges_per_layer.size();
+    ss.write(reinterpret_cast<const char*>(&el), sizeof(el));
+    for (const auto& edges : reference.edges_per_layer) {
+        write_i32_vec_v2(edges.src_indices);
+        write_i32_vec_v2(edges.dst_indices);
+        write_oid_vec_v2(edges.edge_ids);
+    }
+    write_oid_vec_v2(reference.all_unique_nodes);
+
+    ss.seekg(0);
+    auto restored = GraphSample::deserialize(ss);
+    EXPECT_EQ(restored.batch_id, reference.batch_id);
+    EXPECT_EQ(restored.split, reference.split);
+    ASSERT_EQ(restored.nodes_per_layer.size(), reference.nodes_per_layer.size());
+    for (size_t k = 0; k < reference.nodes_per_layer.size(); ++k) {
+        ASSERT_EQ(restored.nodes_per_layer[k].size(),
+                  reference.nodes_per_layer[k].size());
+        for (size_t i = 0; i < reference.nodes_per_layer[k].size(); ++i) {
+            EXPECT_EQ(restored.nodes_per_layer[k][i].id,
+                      reference.nodes_per_layer[k][i].id);
+        }
+    }
+    ASSERT_EQ(restored.edges_per_layer.size(), reference.edges_per_layer.size());
+    for (size_t k = 0; k < reference.edges_per_layer.size(); ++k) {
+        EXPECT_EQ(restored.edges_per_layer[k].src_indices,
+                  reference.edges_per_layer[k].src_indices);
+        EXPECT_EQ(restored.edges_per_layer[k].dst_indices,
+                  reference.edges_per_layer[k].dst_indices);
+        ASSERT_EQ(restored.edges_per_layer[k].edge_ids.size(),
+                  reference.edges_per_layer[k].edge_ids.size());
+        for (size_t i = 0; i < reference.edges_per_layer[k].edge_ids.size(); ++i) {
+            EXPECT_EQ(restored.edges_per_layer[k].edge_ids[i].id,
+                      reference.edges_per_layer[k].edge_ids[i].id);
+        }
+    }
+    ASSERT_EQ(restored.all_unique_nodes.size(), reference.all_unique_nodes.size());
+    for (size_t i = 0; i < reference.all_unique_nodes.size(); ++i) {
+        EXPECT_EQ(restored.all_unique_nodes[i].id, reference.all_unique_nodes[i].id);
+    }
+}
+
+// Verify the writer now emits VERSION_V3 by reading the version bytes directly
+// from the stream.
+TEST(GraphSampleTest, SerializeEmitsVersionV3) {
+    auto s = make_2hop_sample(11, SplitType::TRAIN);
+    std::stringstream ss;
+    s.serialize(ss);
+    ss.seekg(0);
+
+    uint32_t magic = 0, version = 0;
+    ss.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    ss.read(reinterpret_cast<char*>(&version), sizeof(version));
+    EXPECT_EQ(magic, GraphSample::MAGIC);
+    EXPECT_EQ(version, GraphSample::VERSION_V3);
+    EXPECT_EQ(version, GraphSample::VERSION);  // current write version
+}
+
+// Empty vectors are a frequent edge case — bulk read must not try to read
+// `size * sizeof(T) = 0` bytes and must leave the stream usable for the next
+// header. Use a 1-layer sample where edges_per_layer is empty.
+TEST(GraphSampleTest, BulkRoundtripEmptyVectors) {
+    GraphSample s;
+    s.batch_id = 1;
+    s.split = SplitType::TRAIN;
+    s.nodes_per_layer.push_back({ObjectId(42)});  // single seed
+    // No edge layers, no all_unique_nodes beyond the seed
+    s.rebuild_unique_nodes();
+
+    std::stringstream ss;
+    s.serialize(ss);
+    ss.seekg(0);
+    auto restored = GraphSample::deserialize(ss);
+    EXPECT_EQ(restored.batch_id, 1u);
+    EXPECT_EQ(restored.nodes_per_layer.size(), 1u);
+    EXPECT_EQ(restored.nodes_per_layer[0].size(), 1u);
+    EXPECT_EQ(restored.nodes_per_layer[0][0].id, 42u);
+    EXPECT_EQ(restored.edges_per_layer.size(), 0u);
+    EXPECT_EQ(restored.all_unique_nodes.size(), 1u);
+}
+
 TEST(GraphSampleTest, ReadSplitWithoutFullDeserialize) {
     auto s = make_2hop_sample(0, SplitType::TEST);
     std::stringstream ss;

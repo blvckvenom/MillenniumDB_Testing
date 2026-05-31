@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <random>
@@ -236,6 +237,36 @@ public:
      * reflects the entire run.
      */
     void merge_counts_from(const std::vector<uint64_t>& other);
+
+    /**
+     * @brief R1.1 (2026-05-29) — install a SHARED atomic access-counts array.
+     *
+     * Replaces the per-worker N-sized `node_access_counts` vector (0.83 GB
+     * each on papers100M) with a single shared `std::atomic<uint64_t>` array
+     * of size `n`, owned by the OfflineSamplingEngine and pointed-to by every
+     * worker sampler. `tally_` then does a relaxed `fetch_add` into it instead
+     * of growing its private vector, so total tally RAM is 0.83 GB regardless
+     * of `numWorkers` (was 0.83 GB × numWorkers — the wall that capped worker
+     * count on a 30 GB box). The array MUST be pre-sized to the projection's
+     * node count and zero-initialized before sampling; it must outlive every
+     * sampler. Correctness: the final per-node count is a commutative sum, so
+     * it is identical regardless of thread interleaving (and `node_counts.bin`
+     * is consumed by dict-equality). Passing `base == nullptr` reverts to the
+     * private-vector path (legacy / single-thread). Does NOT affect the sample
+     * output (batches.dat) — the tally is a side channel only.
+     */
+    void set_shared_access_counts(std::atomic<uint64_t>* base, std::size_t n);
+
+    /**
+     * @brief R1.1 (2026-05-29) — adopt a materialized counts vector.
+     *
+     * After the parallel run, the engine snapshots the shared atomic array
+     * into a plain `std::vector<uint64_t>` and hands it to the primary so the
+     * existing `node_access_counts()` accessor (consumed by
+     * `persist_node_counts_`) returns the full run's tally without a
+     * per-worker merge pass.
+     */
+    void adopt_counts(std::vector<uint64_t> counts);
 
     /**
      * @brief Plan E Phase 0 telemetry (2026-05-11).

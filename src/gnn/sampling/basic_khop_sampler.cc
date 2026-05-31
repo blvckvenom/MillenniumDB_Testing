@@ -44,6 +44,14 @@ struct BasicKHopSampler::Impl {
     // that never query topology->get_node_count() avoid the alloc.
     std::vector<uint64_t> node_access_counts;
 
+    // R1.1 (2026-05-29) — optional SHARED atomic tally. When non-null, all
+    // workers fetch_add into this single N-sized array instead of each
+    // growing its own `node_access_counts` (0.83 GB × numWorkers on
+    // papers100M). Owned by OfflineSamplingEngine; pre-sized + zero-init;
+    // outlives every sampler. nullptr ⇒ legacy private-vector path.
+    std::atomic<uint64_t>* shared_counts_   = nullptr;
+    std::size_t            shared_counts_n_  = 0;
+
     // Increment the access count for `id`, growing the vector on demand.
     // The 8-bit ObjectId type tag is masked off here at the boundary —
     // the same convention the FourLevelTopologyStore uses to align with
@@ -51,6 +59,16 @@ struct BasicKHopSampler::Impl {
     // (commit 2bfad825 fixed the same class of bug for row_lookup_).
     inline void tally_(ObjectId id) {
         const uint64_t row_idx = id.get_value();
+        // R1.1 shared-array fast path (parallel runs). Relaxed is sufficient:
+        // we only need the final per-node sum, which is interleave-invariant
+        // (commutative add); no inter-thread ordering is implied by a tally.
+        if (shared_counts_ != nullptr) {
+            if (row_idx < shared_counts_n_) {
+                shared_counts_[static_cast<std::size_t>(row_idx)]
+                    .fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
         if (row_idx >= node_access_counts.size()) {
             // Lazy growth — start at the projection's node count when we
             // can (the typical path; skips amortised reallocs on the
@@ -526,6 +544,24 @@ struct BasicKHopSampler::Impl {
                 }
             }
 
+            // Defensive cap against unbounded growth. UNDIRECTED on
+            // dense graphs can explode layer-2 to millions of nodes per
+            // worker (papers100M fanout [10,15,20] N=20 silently SIGSEGV
+            // pre-cap). Abort with an actionable error so the user can
+            // reduce fanout or batch_size instead of crashing the server.
+            if (config.max_layer_nodes > 0
+                && next_layer_set.size() > config.max_layer_nodes)
+            {
+                throw std::runtime_error(
+                    "BasicKHopSampler: layer " + std::to_string(k + 1)
+                    + " grew to " + std::to_string(next_layer_set.size())
+                    + " nodes (exceeds max_layer_nodes="
+                    + std::to_string(config.max_layer_nodes) + "). Reduce "
+                    + "fanout[" + std::to_string(k) + "]=" + std::to_string(layer_fanout)
+                    + " or batch_size=" + std::to_string(config.batch_size)
+                    + ", or raise max_layer_nodes if you have RAM headroom.");
+            }
+
             // Convert set to vector for next layer
             sample.nodes_per_layer[k + 1].reserve(next_layer_set.size());
             for (uint64_t node_id : next_layer_set) {
@@ -633,6 +669,16 @@ void BasicKHopSampler::merge_counts_from(const std::vector<uint64_t>& other) {
     for (std::size_t i = 0; i < other.size(); ++i) {
         impl_->node_access_counts[i] += other[i];
     }
+}
+
+void BasicKHopSampler::set_shared_access_counts(std::atomic<uint64_t>* base,
+                                                std::size_t n) {
+    impl_->shared_counts_  = base;
+    impl_->shared_counts_n_ = (base != nullptr) ? n : 0;
+}
+
+void BasicKHopSampler::adopt_counts(std::vector<uint64_t> counts) {
+    impl_->node_access_counts = std::move(counts);
 }
 
 BasicKHopSampler::Phase0Report BasicKHopSampler::phase0_report() const {

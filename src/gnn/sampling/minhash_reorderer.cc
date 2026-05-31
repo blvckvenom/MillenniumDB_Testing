@@ -1,13 +1,17 @@
 #include "gnn/sampling/minhash_reorderer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <climits>
+#include <cstdlib>
+#include <exception>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -94,30 +98,122 @@ void MinHashReorderer::build_access_graph(uint64_t num_batches, const BatchProvi
 // ===========================================================================
 
 void MinHashReorderer::build_segmented(uint64_t num_batches, const BatchProvider& provider) {
-    for (uint64_t batch_id = 0; batch_id < num_batches; ++batch_id) {
-        auto row_ids = provider(batch_id);
+    // Fix (2026-05-13): parallelise the per-batch loop. Each worker owns a
+    // local min-hash array, accumulating updates independently; we merge
+    // post-pass with a sequential reduction. This avoids the CAS-min
+    // contention that would arise from atomic shared-state updates.
+    //
+    // Worker count default 4 (configurable via MDB_GNN_MINHASH_WORKERS),
+    // capped at hardware_concurrency() and num_batches. With 4 workers
+    // each holding an N-sized uint64 array (888 MB at N=111M), heap is
+    // ~3.5 GB — fine on the 30 GB host.
+    unsigned num_workers = 4;
+    if (const char* env = std::getenv("MDB_GNN_MINHASH_WORKERS")) {
+        try {
+            int parsed = std::stoi(env);
+            if (parsed > 0) num_workers = static_cast<unsigned>(parsed);
+        } catch (...) { /* ignore */ }
+    }
+    if (num_workers > std::thread::hardware_concurrency() &&
+        std::thread::hardware_concurrency() > 0)
+    {
+        num_workers = std::thread::hardware_concurrency();
+    }
+    if (num_workers > num_batches) {
+        num_workers = static_cast<unsigned>(num_batches);
+    }
+    if (num_workers == 0) num_workers = 1;
 
-        // Determine segment for this batch
-        uint32_t seg_size = config_.segment_size;
-        uint64_t segment_id = (seg_size > 0 && seg_size < num_batches)
-            ? batch_id / seg_size : 0;
-
-        for (uint64_t row_id : row_ids) {
-            // Grow arrays if needed
-            if (row_id >= hash_values_.size()) {
-                hash_values_.resize(row_id + 1, UINT64_MAX);
-                accessed_.resize(row_id + 1, 0);
+    if (num_workers == 1) {
+        // Serial path — preserves the historical behaviour exactly for
+        // single-thread callers and small workloads (tests).
+        for (uint64_t batch_id = 0; batch_id < num_batches; ++batch_id) {
+            auto row_ids = provider(batch_id);
+            uint32_t seg_size = config_.segment_size;
+            uint64_t segment_id = (seg_size > 0 && seg_size < num_batches)
+                ? batch_id / seg_size : 0;
+            for (uint64_t row_id : row_ids) {
+                if (row_id >= hash_values_.size()) {
+                    hash_values_.resize(row_id + 1, UINT64_MAX);
+                    accessed_.resize(row_id + 1, 0);
+                }
+                accessed_[row_id] = 1;
+                ++total_accesses_;
+                for (uint32_t h = 0; h < config_.num_hashes; ++h) {
+                    uint64_t hval = hash(batch_id, h);
+                    uint64_t composite = (segment_id << 32) | (hval & 0xFFFFFFFF);
+                    hash_values_[row_id] = std::min(hash_values_[row_id], composite);
+                }
             }
-            accessed_[row_id] = 1;
-            ++total_accesses_;
+        }
+        return;
+    }
 
-            // Apply all k hash functions, accumulate min into composite key
-            // Composite: segment_id in high 32 bits, hash value in low 32 bits
-            for (uint32_t h = 0; h < config_.num_hashes; ++h) {
-                uint64_t hval = hash(batch_id, h);
-                uint64_t composite = (segment_id << 32) | (hval & 0xFFFFFFFF);
-                hash_values_[row_id] = std::min(hash_values_[row_id], composite);
+    // Parallel path: workers share atomic batch-dispatch counter; each
+    // accumulates into its own (hash_values, accessed) arrays. Final
+    // reduction merges into the canonical members.
+    //
+    // We pre-size to a conservative upper bound (probe the first batch to
+    // discover the max row_id). Workers grow their local arrays lock-free
+    // because each owns its own.
+    std::atomic<uint64_t> next_batch{0};
+    std::vector<std::vector<uint64_t>> local_hash_values(num_workers);
+    std::vector<std::vector<uint8_t>>  local_accessed(num_workers);
+    std::vector<uint64_t>              local_total(num_workers, 0);
+    std::vector<std::exception_ptr>    errors(num_workers, nullptr);
+
+    auto worker_fn = [&](unsigned w) {
+        try {
+            auto& lh = local_hash_values[w];
+            auto& la = local_accessed[w];
+            while (true) {
+                uint64_t batch_id = next_batch.fetch_add(1, std::memory_order_relaxed);
+                if (batch_id >= num_batches) break;
+                auto row_ids = provider(batch_id);
+                uint32_t seg_size = config_.segment_size;
+                uint64_t segment_id = (seg_size > 0 && seg_size < num_batches)
+                    ? batch_id / seg_size : 0;
+                for (uint64_t row_id : row_ids) {
+                    if (row_id >= lh.size()) {
+                        lh.resize(row_id + 1, UINT64_MAX);
+                        la.resize(row_id + 1, 0);
+                    }
+                    la[row_id] = 1;
+                    ++local_total[w];
+                    for (uint32_t h = 0; h < config_.num_hashes; ++h) {
+                        uint64_t hval = hash(batch_id, h);
+                        uint64_t composite = (segment_id << 32) | (hval & 0xFFFFFFFF);
+                        lh[row_id] = std::min(lh[row_id], composite);
+                    }
+                }
             }
+        } catch (...) {
+            errors[w] = std::current_exception();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_workers);
+    for (unsigned w = 0; w < num_workers; ++w) {
+        threads.emplace_back(worker_fn, w);
+    }
+    for (auto& t : threads) t.join();
+    for (unsigned w = 0; w < num_workers; ++w) {
+        if (errors[w]) std::rethrow_exception(errors[w]);
+    }
+
+    // Reduction: take min across workers' local hash_values_.
+    size_t max_size = 0;
+    for (const auto& l : local_hash_values) max_size = std::max(max_size, l.size());
+    hash_values_.assign(max_size, UINT64_MAX);
+    accessed_.assign(max_size, 0);
+    for (unsigned w = 0; w < num_workers; ++w) {
+        const auto& lh = local_hash_values[w];
+        const auto& la = local_accessed[w];
+        total_accesses_ += local_total[w];
+        for (size_t i = 0; i < lh.size(); ++i) {
+            hash_values_[i] = std::min(hash_values_[i], lh[i]);
+            accessed_[i] |= la[i];
         }
     }
 }
