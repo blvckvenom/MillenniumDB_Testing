@@ -240,13 +240,15 @@ def convert_to_gql(
         edge_type = "directed" if is_directed else "undirected"
         print(f"  Wrote {num_nodes:,} nodes and {edge_count:,} {edge_type} edges")
 
-    # Save full features to numpy file for GNN training
+    # Save full features to numpy file for GNN training.
+    # Force C-order: OGB sometimes hands back a Fortran-ordered array, and the
+    # MillenniumDB mmap tensor importer rejects Fortran-order .npy
+    # ("transposing would defeat streaming"). ascontiguousarray keeps values
+    # identical and only fixes the memory layout.
     if node_feat is not None:
         feat_file = output_path / f"{dataset_name.replace('-', '_')}_features.npy"
-        if max_nodes:
-            np.save(feat_file, node_feat[:max_nodes])
-        else:
-            np.save(feat_file, node_feat)
+        feat_out = node_feat[:max_nodes] if max_nodes else node_feat
+        np.save(feat_file, np.ascontiguousarray(feat_out))
         print(f"  Saved features to {feat_file}")
 
     # Save labels
