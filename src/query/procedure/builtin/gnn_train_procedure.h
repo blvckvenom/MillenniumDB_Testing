@@ -44,6 +44,7 @@ public:
             YieldField{"bestCheckpointPath",  YieldType::STRING, "Absolute path (no extension) to best_model checkpoint; empty if disabled or no improvement"},
             YieldField{"finalCheckpointPath", YieldType::STRING, "Absolute path (no extension) to final_model checkpoint; empty if disabled"},
             YieldField{"resumedFromEpoch",    YieldType::INT,    "Epoch index from which training resumed (0 if fresh training)"},
+            YieldField{"effectivePrefetchWorkers", YieldType::INT, "Actual number of AsyncBatchPrefetcher workers used (clamped to 1 in FourLevelStore mode regardless of prefetchNumWorkers)"},
         };
     }
 

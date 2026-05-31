@@ -219,7 +219,7 @@ void step_optimizer_once(mdb::gnn::GraphSAGEModel& model,
     auto x     = torch::randn({3, 16});
     auto ei    = torch::tensor({{0, 1}, {1, 2}}, torch::kLong);
     auto ei2   = torch::tensor({{0, 1}, {1, 2}}, torch::kLong);
-    auto logits = model.forward(x, {ei, ei2}, 3);
+    auto logits = model.forward(x, {ei, ei2}, std::vector<int64_t>{3, 3, 3});
     auto loss   = logits.sum();
     loss.backward();
     opt.step();

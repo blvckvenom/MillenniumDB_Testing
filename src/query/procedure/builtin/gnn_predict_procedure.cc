@@ -146,6 +146,20 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     auto rmap_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".rmap");
     auto rm        = RowMapping::open(rmap_path);
     FourLevelStore feature_store(db_folder, feature_name, samples);
+
+    // STEP 2 contract guard (mirrors gnn_train): projection gnn_meta.bin and the
+    // feature store's store.meta are independent feature_dim sources; a mismatch
+    // means the feature store is stale for this projection and would otherwise
+    // surface as an opaque torch shape error mid-inference.
+    if (feature_store.feature_dim() != static_cast<uint64_t>(meta.feature_dim)) {
+        throw std::runtime_error(
+            "gnn_predict: feature_dim mismatch — projection gnn_meta.bin reports "
+            + std::to_string(meta.feature_dim) + " but the feature store reports "
+            + std::to_string(feature_store.feature_dim())
+            + ". The feature store is stale for this projection. Rebuild it: "
+              "CALL gnn_build_feature_store('" + sample_name + "', '"
+            + feature_name + "', {force:true}).");
+    }
     BatchAssembler assembler(feature_store, samples,
                              /*labels=*/nullptr, /*splits=*/nullptr, rm);
 
@@ -162,9 +176,10 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
         if (!model_device.is_cpu()) {
             mini.features = mini.features.to(model_device);
             for (auto& ei : mini.edge_indices) ei = ei.to(model_device);
+            for (auto& ai : mini.active_indices_per_layer) ai = ai.to(model_device);
         }
         auto emb = model.get_embeddings(
-            mini.features, mini.edge_indices, static_cast<int64_t>(mini.num_seeds));
+            mini.features, mini.edge_indices, mini.active_sizes_per_layer);
         all_embeddings.push_back(emb.cpu());
         total_seeds += mini.num_seeds;
     }

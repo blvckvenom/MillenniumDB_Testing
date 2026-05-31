@@ -125,6 +125,9 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // analysis doc §3.A for the rationale and safety analysis.
     bool include_label_indexes = true;
     GQL::IndexSet index_set = GQL::IndexSet::ALL;
+    // STEP 3 — track whether the caller explicitly set indexSet, so the
+    // GNN-intent auto-default below only fires when they did NOT.
+    bool index_set_explicit = false;
 
     // Spec #5 T5.11 — user-selectable leaf-page encoding. Defaults to BITSET
     // (pre-Spec-#5 byte-identical behavior); the config key `leafFormat`
@@ -147,6 +150,8 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // pre-Spec-#4-B callers see zero behavior change. The flag is parsed
     // below from the config map; non-bool values raise QueryException.
     bool build_topology_snapshot = false;
+    // STEP 3 — track whether the caller explicitly set buildTopologySnapshot.
+    bool snapshot_explicit = false;
 
     // Keep config_holder alive so config_dict pointer remains valid
     std::unique_ptr<Dictionary> config_holder;
@@ -182,6 +187,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         // preserves the pre-Spec-#3 behavior of materializing every index.
         // Invalid values raise QueryException from parse_index_set().
         {
+            (void) get_value_from_dict(config_dict, "indexSet", index_set_explicit);
             std::string index_set_str =
                 get_string_from_dict(config_dict, "indexSet", "ALL");
             index_set = GQL::parse_index_set(index_set_str);
@@ -255,6 +261,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             bool found = false;
             ObjectId v = get_value_from_dict(
                 config_dict, "buildTopologySnapshot", found);
+            snapshot_explicit = found;
             if (found) {
                 auto t = GQL_OID::get_type(v);
                 if (t != GQL_OID::Type::BOOL) {
@@ -278,6 +285,37 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
                          "CSR supersedes the sidecar (design §3.8 D8)."
                       << std::endl;
             build_topology_snapshot = false;
+        }
+
+        // STEP 3 — GNN-intent default. When the caller asks for GNN outputs
+        // (includeFeatures / labelProperty / splitProperty) but did NOT set an
+        // explicit indexSet, default to GNN_MINIMAL (the 5 indexes the GNN
+        // pipeline consumes) instead of ALL (14) — the single biggest
+        // out-of-box win for GNN projections. Likewise default
+        // buildTopologySnapshot on (O(1) sampling neighbor access) unless the
+        // user set it or CSR_HYBRID already supersedes the sidecar. Explicit
+        // user values always win.
+        {
+            const bool gnn_intent = !include_features.empty()
+                                    || !label_property.empty()
+                                    || !split_property.empty();
+            if (gnn_intent && !index_set_explicit) {
+                index_set = GQL::IndexSet::GNN_MINIMAL;
+                std::cerr << "[graph_project] notice: GNN intent detected and no "
+                             "explicit indexSet — defaulting to "
+                             "indexSet='GNN_MINIMAL' (5 indexes vs ALL's 14). "
+                             "Pass indexSet explicitly to override."
+                          << std::endl;
+                if (!snapshot_explicit
+                    && graph_storage != BPT::GraphStorage::CSR_HYBRID) {
+                    build_topology_snapshot = true;
+                    std::cerr << "[graph_project] notice: also enabling "
+                                 "buildTopologySnapshot=true for O(1) sampling "
+                                 "neighbor access (pass buildTopologySnapshot:false "
+                                 "to override)."
+                              << std::endl;
+                }
+            }
         }
     }
 

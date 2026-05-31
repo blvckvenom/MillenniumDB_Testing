@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <limits>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 
 #include "gnn/sampling/offline_sampling_engine.h"
 #include "gnn/sampling/sample_storage.h"
@@ -112,7 +117,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     bool auto_profile_on_cold_start = true;
     uint64_t profile_num_walks = 0;
     uint64_t profile_walk_length = 0;
-    uint64_t num_workers = 0;
+    uint64_t num_workers = std::numeric_limits<uint64_t>::max();  // F#1 sentinel: unset
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -172,16 +177,39 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // Step 7: Check if sample already exists
     std::string db_folder = get_db_folder();
 
+    // STEP 7 (2026-05-31): `force` opt — when the sample already exists, drop it
+    // and re-sample (matches gnn_materialize_batches / gnn_build_feature_store
+    // force semantics) instead of hard-failing. The sample dir is self-contained,
+    // so remove_all is an atomic-enough drop. Default false preserves the
+    // fail-loud behavior.
+    bool force = false;
+    if (ctx.arguments.size() >= 4) {
+        DictOptions o(ctx.get_argument(3));
+        if (auto v = o.get_bool("force")) force = *v;
+    }
+
     if (SampleStorage::exists(db_folder, sample_name)) {
-        throw std::runtime_error(
-            "Sample set '" + sample_name + "' already exists.\n\n"
-            "Solutions:\n"
-            "  1. Use a different name for the new sample set\n"
-            "  2. Delete the existing one first:\n"
-            "     CALL gnn.sample_drop('" + sample_name + "')\n"
-            "  3. List existing samples:\n"
-            "     CALL gnn.sample_list() YIELD sampleName"
-        );
+        if (force) {
+            std::error_code ec;
+            std::filesystem::remove_all(
+                SampleStorage::get_storage_path(db_folder, sample_name), ec);
+            if (ec) {
+                throw std::runtime_error(
+                    "gnn_offline_sample: force=true could not remove existing "
+                    "sample '" + sample_name + "': " + ec.message());
+            }
+        } else {
+            throw std::runtime_error(
+                "Sample set '" + sample_name + "' already exists.\n\n"
+                "Solutions:\n"
+                "  1. Pass force:true to overwrite it in place\n"
+                "  2. Use a different name for the new sample set\n"
+                "  3. Delete the existing one first:\n"
+                "     CALL gnn.sample_drop('" + sample_name + "')\n"
+                "  4. List existing samples:\n"
+                "     CALL gnn.sample_list() YIELD sampleName"
+            );
+        }
     }
 
     // Step 8: Parse orientation
@@ -201,6 +229,45 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             "Invalid orientation: '" + orientation_str + "'.\n"
             "Must be 'NATURAL', 'REVERSE', or 'UNDIRECTED' (case-insensitive)."
         );
+    }
+
+    // =========================================================================
+    // F (2026-05-31) — environment-adaptive defaults. Both respect explicit
+    // user values; they only fill in a better default when the caller was silent.
+    // =========================================================================
+    // F#1: auto-parallelize the sampler when numWorkers was not specified. The
+    // Plan F determinism fix (reseed in the legacy path) makes numWorkers
+    // irrelevant to the trained model, so a parallel default is a free speedup.
+    // Explicit numWorkers (including 0 = legacy sequential) always wins.
+    if (num_workers == std::numeric_limits<uint64_t>::max()) {
+        unsigned hc = std::thread::hardware_concurrency();
+        num_workers = (hc == 0) ? 4u : std::min<unsigned>(hc, 8u);
+        std::cerr << "[gnn_offline_sample] notice: numWorkers not set — defaulting "
+                     "to " << num_workers << " (min(cores,8)). Pass numWorkers "
+                     "explicitly to override (0 = legacy sequential).\n";
+    }
+
+    // F#2: auto-use predefined splits when the projection has splits.bin and the
+    // caller did not set usePredefinedSplits. Otherwise a random ratio split
+    // silently ignores splits.bin -> validation collapses on labeled-subset
+    // datasets (e.g. OGB). Explicit usePredefinedSplits always wins.
+    {
+        bool splits_explicit = false;
+        if (ctx.arguments.size() >= 4) {
+            DictOptions o(ctx.get_argument(3));
+            splits_explicit = o.get_bool("usePredefinedSplits").has_value();
+        }
+        if (!splits_explicit && !use_predefined_splits) {
+            auto splits_path = std::filesystem::path(db_folder) /
+                               "projections" / projection_name / "splits.bin";
+            if (std::filesystem::exists(splits_path)) {
+                use_predefined_splits = true;
+                std::cerr << "[gnn_offline_sample] notice: projection has splits.bin "
+                             "and usePredefinedSplits was not set — defaulting to "
+                             "true (using the predefined train/val/test split). Pass "
+                             "usePredefinedSplits:false to force a ratio split.\n";
+            }
+        }
     }
 
     // Step 9: Build SamplingConfig

@@ -913,9 +913,55 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     // Write GNN metadata, labels, and splits to the projection directory.
     // These files are consumed by gnn_train and indexed by the same RowMapping
     // row order as the feature matrix.
-    if (!include_features_.empty() && gnn_row_mapping_) {
+    // STEP 4 fail-loud contract guards: when a caller asks for GNN outputs
+    // (features / labels / splits), refuse to silently produce a broken
+    // projection. Each guard covers a misconfiguration that previously caused a
+    // GNN sidecar (gnn_meta.bin / labels.bin / splits.bin) to be skipped without
+    // any error, surfacing only much later as a confusing gnn_train failure.
+    if (!include_features_.empty()) {
         namespace fs = std::filesystem;
         auto proj_dir = fs::path(db_folder) / "projections" / projection_name;
+
+        // Guard 1 — features requested but the prerequisite row mapping is
+        // absent. gnn_features/<feature>.rmap is created only by
+        // `mdb import ... --with-tensors <features.npy>`, never by
+        // graph_project; without it nothing GNN-related can be emitted.
+        if (!gnn_row_mapping_) {
+            throw std::runtime_error(
+                "graph_project: includeFeatures='" + include_features_ +
+                "' was requested but gnn_features/" + include_features_ +
+                ".rmap does not exist. Node features must be imported first via "
+                "`mdb import <data> <db> --with-tensors <features.npy>`; "
+                "graph_project only reads that row mapping, it cannot create it.");
+        }
+
+        // Guard 2 — label property set but no node yielded an integer label
+        // (property-name typo or non-integer values). Without this the labels
+        // buffer stays all-unlabeled and gnn_train silently collapses to ~0 acc.
+        if (!label_property_.empty() && unique_classes_.empty()) {
+            throw std::runtime_error(
+                "graph_project: labelProperty='" + label_property_ +
+                "' was set but no node produced an integer label (every value "
+                "was missing or non-integer). Check the property name and that "
+                "labels are stored as integers.");
+        }
+
+        // Guard 3 — split property set but no node had a recognized split token
+        // (expected train / val / valid / validation / test). Without this the
+        // splits buffer is all-UNLABELED and usePredefinedSplits is unusable.
+        if (!split_property_.empty()) {
+            bool any_split = false;
+            for (uint8_t s : splits_buffer_) {
+                if (s != 255) { any_split = true; break; }
+            }
+            if (!any_split) {
+                throw std::runtime_error(
+                    "graph_project: splitProperty='" + split_property_ +
+                    "' was set but no node had a recognized split value "
+                    "(expected one of: train, val, valid, validation, test). "
+                    "Check the property name and its values.");
+            }
+        }
 
         // Write gnn_meta.bin
         mdb::gnn::GnnMeta meta;

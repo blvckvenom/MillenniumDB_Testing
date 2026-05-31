@@ -166,68 +166,14 @@ static void export_embeddings(
     model.eval();
 
     std::vector<torch::Tensor> all_embeddings;
-    std::vector<int64_t>       all_node_ids;
-
     auto model_device = model.parameters().begin()->device();
 
-    for (uint64_t bid = 0; bid < catalog.total_batches; ++bid) {
-        auto mini = assembler.assemble(bid);
-
-        // Move batch tensors to the model's device (supports GPU training)
-        if (!model_device.is_cpu()) {
-            mini.features = mini.features.to(model_device);
-            for (auto& ei : mini.edge_indices) {
-                ei = ei.to(model_device);
-            }
-            for (auto& ai : mini.active_indices_per_layer) {
-                ai = ai.to(model_device);
-            }
-        }
-
-        // Get embeddings (hidden representation before classifier)
-        auto emb = model.get_embeddings(
-            mini.features,
-            mini.edge_indices,
-            mini.active_sizes_per_layer
-        );
-        // emb is [num_seeds, hidden_dim]
-
-        all_embeddings.push_back(emb.cpu());
-
-        // Collect seed node ObjectIds from the row_mapping for this batch
-        // The first num_seeds rows in mini.features correspond to the seed nodes.
-        // We need to recover the original ObjectIds. The BatchAssembler builds
-        // features from the GraphSample's all_unique_nodes; seeds are layer 0.
-        // Re-read the sample to get the seed ObjectIds.
-        auto sample = assembler.assemble(bid);
-        // Actually, we already have `mini` — but we need the GraphSample for node IDs.
-        // Re-read from storage to get the ObjectIds.
-        // This is slightly wasteful but keeps the code simple.
-    }
-
-    // The above approach requires reading samples again for ObjectIds.
-    // Instead, let's just store sequential indices and let the user map them
-    // via the RowMapping. But the spec says node_ids.npy.
-    //
-    // Better approach: collect node IDs during the embedding loop by reading
-    // the sample directly.
-    all_embeddings.clear();
-    all_node_ids.clear();
-
-    // Use a SampleStorage reference from the assembler — but BatchAssembler
-    // doesn't expose its SampleStorage. We need to read samples separately.
-    // However, we know batch layout: for each batch, seeds are nodes_per_layer[0].
-    // We'll read the raw GraphSample to get the seed ObjectIds.
-    //
-    // Since BatchAssembler::assemble(bid) already reads the sample, we pay the
-    // cost anyway. The MiniBatch doesn't carry ObjectIds, so we must retrieve them
-    // from the sample storage.
-    //
-    // For now, we output only embeddings.npy (the node_ids ordering matches
-    // batch 0 seeds, batch 1 seeds, ... batch N seeds — user can reconstruct
-    // from the sample catalog).
-
-    // Re-collect embeddings without node_ids for simplicity
+    // Single pass: assemble each batch, compute the seed embeddings, accumulate.
+    // (A previous version ran this loop twice — plus a discarded second
+    // assemble() per batch, ~3x the inference work — then cleared the first
+    // pass and recomputed. Output is unchanged: embeddings are laid out
+    // batch 0 seeds, batch 1 seeds, ... batch N seeds; node IDs are
+    // recoverable from the sample catalog.)
     for (uint64_t bid = 0; bid < catalog.total_batches; ++bid) {
         auto mini = assembler.assemble(bid);
         if (!model_device.is_cpu()) {
@@ -624,6 +570,22 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // four tiers are exercised during training — this is the DiskGNN contract.
     // =========================================================================
     mdb::gnn::FourLevelStore feature_store(db_folder, feature_name, samples);
+
+    // STEP 2 contract guard: the projection's gnn_meta.bin and the feature
+    // store's store.meta are two independent sources of feature_dim. If they
+    // disagree (projection re-imported / rebuilt with a different feature width
+    // but the feature store not rebuilt), the model is sized to meta.feature_dim
+    // while assemble() emits store.feature_dim()-wide rows -> an opaque torch
+    // shape error mid-forward. Fail early with a clear remediation message.
+    if (feature_store.feature_dim() != static_cast<uint64_t>(meta.feature_dim)) {
+        throw std::runtime_error(
+            "gnn_train: feature_dim mismatch — projection gnn_meta.bin reports "
+            + std::to_string(meta.feature_dim) + " but the feature store reports "
+            + std::to_string(feature_store.feature_dim())
+            + ". The feature store is stale for this projection. Rebuild it: "
+              "CALL gnn_build_feature_store('" + sample_name + "', '"
+            + feature_name + "', {force:true}).");
+    }
     BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
 
     // =========================================================================

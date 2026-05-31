@@ -82,7 +82,10 @@ uint64_t build_one_snapshot_post_hoc(
         auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
         const Record<3>* rec = nullptr;
         while ((rec = iter.next()) != nullptr) {
-            uint64_t src_idx = (*rec)[0];
+            // B+Tree records store full ObjectIds with the 8-bit type tag.
+            // The CSR ROW_PTR is indexed by dense row id, so strip the tag
+            // via get_value() (matches topology_accessor.cc read convention).
+            uint64_t src_idx = ObjectId{(*rec)[0]}.get_value();
             if (src_idx < num_nodes) {
                 ++degrees[src_idx];
             }
@@ -101,8 +104,11 @@ uint64_t build_one_snapshot_post_hoc(
         auto iter = edge_bpt->get_range(&interrupt, min_rec, max_rec);
         const Record<3>* rec = nullptr;
         while ((rec = iter.next()) != nullptr) {
+            // Pass the dense row id (tag stripped) as the CSR row key; dst and
+            // edge_id stay tag-bearing — COL_IDX/EDGE_IDS store raw ObjectId.id
+            // and the sampler masks on read (Spec #4-B convention, f71b3bf0).
             writer.append_edge(
-                ObjectId{(*rec)[0]},
+                ObjectId{ObjectId{(*rec)[0]}.get_value()},
                 ObjectId{(*rec)[1]},
                 ObjectId{(*rec)[2]});
         }

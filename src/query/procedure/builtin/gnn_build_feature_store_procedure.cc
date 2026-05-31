@@ -152,11 +152,30 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     // Validate FeatureMatrix and RowMapping files exist
     auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
     auto rmap_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".rmap");
-    if (!fs::exists(fmat_path)) {
-        throw std::runtime_error("FeatureMatrix not found at: " + fmat_path.string());
-    }
-    if (!fs::exists(rmap_path)) {
-        throw std::runtime_error("RowMapping not found at: " + rmap_path.string());
+
+    // Path 4 (2026-05-20): Phase-5-only mode — when the caller asks for ONLY
+    // buildAddrTables=true with all force flags off AND the prior feature store
+    // is fully on disk (store.meta exists), we can rebuild addr_tables/
+    // sidecars without re-opening the source FeatureMatrix. This unblocks
+    // re-running Phase 5 when node_features.fmat has been cleaned up but the
+    // gpu_cache/cpu_cache/reordered files remain. The runtime ctor will load
+    // those caches directly; this avoids the FeatureMatrix::open's strict
+    // header-size check on the source fmat.
+    bool phase5_only_mode =
+        config.build_addr_tables &&
+        !config.force && !config.force_caches && !config.force_reorder &&
+        !config.force_packed_slim && !config.force_meta;
+    auto store_meta_path = fs::path(db_folder) / "gnn_features" /
+                            (feature_name + "_store.meta");
+    bool store_already_built = fs::exists(store_meta_path);
+
+    if (!phase5_only_mode || !store_already_built) {
+        if (!fs::exists(fmat_path)) {
+            throw std::runtime_error("FeatureMatrix not found at: " + fmat_path.string());
+        }
+        if (!fs::exists(rmap_path)) {
+            throw std::runtime_error("RowMapping not found at: " + rmap_path.string());
+        }
     }
 
     // Validate sample exists
@@ -179,12 +198,25 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     // Step 4: Open inputs and build feature store
     // =========================================================================
-    auto fm = FeatureMatrix::open(fmat_path);
-    auto rm = RowMapping::open(rmap_path);
     auto samples = SampleStorage::open(storage_path);
 
-    auto result = FourLevelStore::build(
-        fm, rm, samples, config, db_folder, feature_name);
+    FourLevelStore::BuildResult result;
+
+    if (phase5_only_mode && store_already_built) {
+        // Path 4 fast path: rebuild only addr_tables/ via the runtime ctor.
+        // No source FeatureMatrix needed. Tier counts / disk sizes in the
+        // BuildResult stay at their default zero values — only the
+        // addrTablesMb / addrTablesBuiltOk yields are meaningful here.
+        FourLevelStore store(db_folder, feature_name, samples);
+        uint64_t addr_bytes = store.rebuild_addr_tables(db_folder);
+        result.addr_tables_bytes    = addr_bytes;
+        result.addr_tables_built_ok = true;
+    } else {
+        auto fm = FeatureMatrix::open(fmat_path);
+        auto rm = RowMapping::open(rmap_path);
+        result = FourLevelStore::build(
+            fm, rm, samples, config, db_folder, feature_name);
+    }
 
     // =========================================================================
     // Step 5: Yield results
