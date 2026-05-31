@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <vector>
@@ -97,10 +98,14 @@ public:
 
     // --- Reordering (for MinHash L3) ---
     // permutation[i] = source row that goes to position i in output.
+    // STEP 8: `fingerprint` (default 0) is embedded in header.reserved[0..7] so
+    // the feature store can detect a reordered.fmat built for a different sample
+    // and recompute it instead of opening it with the wrong shape.
     static FeatureMatrix create_reordered(
         const FeatureMatrix& source,
         const std::vector<uint64_t>& permutation,
-        const std::filesystem::path& output_path
+        const std::filesystem::path& output_path,
+        uint64_t fingerprint = 0
     );
 
     // --- Metadata ---
@@ -110,6 +115,14 @@ public:
     size_t      row_bytes()   const { return header_.row_bytes(); }
     size_t      total_bytes() const { return header_.data_bytes(); }
     const std::filesystem::path& path()    const { return path_; }
+
+    // STEP 8: content fingerprint embedded in header.reserved[0..7] at
+    // create_reordered() time. 0 = absent (legacy files, or non-reordered FMs).
+    uint64_t fingerprint() const {
+        uint64_t f;
+        std::memcpy(&f, header_.reserved, sizeof(f));
+        return f;
+    }
 
     /**
      * @brief Hint the kernel that the mapped region can be evicted from
@@ -130,7 +143,8 @@ private:
     static FeatureMatrix create_reordered_external_sort_(
         const FeatureMatrix& source,
         const std::vector<uint64_t>& permutation,
-        const std::filesystem::path& output_path);
+        const std::filesystem::path& output_path,
+        uint64_t fingerprint = 0);
 
     FeatureMatrix() = default;
 

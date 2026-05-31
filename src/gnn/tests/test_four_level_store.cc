@@ -960,27 +960,42 @@ TEST_F(FourLevelStoreCoordTest, Build_LargerBudget) {
 }
 
 // =============================================================================
-// Build: Already exists -> error
+// Build: same sample + no force -> reuse (STEP 8 content fingerprint)
+//
+// Pre-STEP-8 this threw "already exists". STEP 8 replaces that with a
+// reuse-or-recompute gate: a second build of the SAME sample without force must
+// detect the matching content fingerprint and REUSE the existing artifacts
+// (return tier counts from store.meta, no throw, no rebuild).
 // =============================================================================
 
-TEST_F(FourLevelStoreCoordTest, Build_AlreadyExistsError) {
+TEST_F(FourLevelStoreCoordTest, Build_SameSampleReuses) {
     auto samples = create_frequency_samples();
     auto config = make_config(1, false);
 
-    FourLevelStore::build(
+    auto r1 = FourLevelStore::build(
         FeatureMatrix::open(fmat_path_),
         RowMapping::open(rmap_path_),
         samples, config, db_folder_, "test_feat");
 
-    // Second build without force should throw
+    // The fingerprint sidecar must have been written next to store.meta.
+    auto store_fp = fs::path(db_folder_) / "gnn_features" / "test_feat_store.fp";
+    EXPECT_TRUE(fs::exists(store_fp));
+
+    // Second build of the SAME sample without force must REUSE, not throw,
+    // and report tier counts identical to the first build.
     auto samples2 = SampleStorage::open(
         SampleStorage::get_storage_path(db_folder_, "fls_sample"));
-    EXPECT_THROW(
-        FourLevelStore::build(
+    FourLevelStore::BuildResult r2;
+    EXPECT_NO_THROW({
+        r2 = FourLevelStore::build(
             FeatureMatrix::open(fmat_path_),
             RowMapping::open(rmap_path_),
-            samples2, config, db_folder_, "test_feat"),
-        std::runtime_error);
+            samples2, config, db_folder_, "test_feat");
+    });
+    EXPECT_EQ(r2.l1_nodes, r1.l1_nodes);
+    EXPECT_EQ(r2.l2_nodes, r1.l2_nodes);
+    EXPECT_EQ(r2.l3_nodes, r1.l3_nodes);
+    EXPECT_EQ(r2.l4_nodes, r1.l4_nodes);
 }
 
 // =============================================================================

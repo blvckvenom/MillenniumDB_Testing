@@ -203,6 +203,18 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     FourLevelStore::BuildResult result;
 
     if (phase5_only_mode && store_already_built) {
+        // STEP 8: refuse to reuse addr_tables built from a DIFFERENT sample.
+        // The fast path skips the source FeatureMatrix, so a content mismatch
+        // here cannot be repaired in-place — surface a clear error instead of
+        // silently serving stale L1/L2/L3 membership.
+        if (!FourLevelStore::store_matches_sample_fp(
+                db_folder, feature_name, samples.get_catalog().sample_content_fp)) {
+            throw std::runtime_error(
+                "gnn_build_feature_store: the existing feature store for '" +
+                feature_name + "' was built from a different sample "
+                "(content fingerprint mismatch). Re-run with force:1 to rebuild "
+                "it (requires " + feature_name + ".fmat).");
+        }
         // Path 4 fast path: rebuild only addr_tables/ via the runtime ctor.
         // No source FeatureMatrix needed. Tier counts / disk sizes in the
         // BuildResult stay at their default zero values — only the

@@ -38,6 +38,7 @@
 #include "gnn/storage/row_mapping.h"
 #include "gnn/sampling/graph_sample.h"
 #include "gnn/sampling/minhash_reorderer.h"
+#include "gnn/sampling/sample_fingerprint.h"  // STEP 8 content fingerprint
 #include "gnn/sampling/sample_storage.h"
 #include "graph_models/object_id.h"
 // query_context.h must be included after liburing (via four_level_store.h ->
@@ -171,6 +172,61 @@ uint64_t compute_meta_sha_head(const fs::path& gnn_meta_path)
     // 0 is the sentinel for "staleness check disabled" in AddrTableReader::open.
     // FNV-64 of a non-empty file basically never hashes to 0, but guard anyway.
     return hash == 0 ? 1 : hash;
+}
+
+// STEP 8: feature-store content fingerprint sidecar ("<feature>_store.fp").
+// A 24-byte sibling record kept next to store.meta so StoreMetaHeader stays
+// byte-identical (no format migration / version bump). Layout:
+//   {uint32 magic 'GFFP', uint32 version 1, uint64 fingerprint, uint64 reserved}
+constexpr uint32_t STORE_FP_MAGIC   = 0x47464650u; // 'GFFP'
+constexpr uint32_t STORE_FP_VERSION = 1u;
+
+struct StoreFpRecord {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t fingerprint;
+    uint64_t reserved;
+};
+static_assert(sizeof(StoreFpRecord) == 24, "store.fp record must be 24 bytes");
+
+// Returns the persisted fingerprint, or 0 (UNKNOWN) if the sidecar is absent,
+// short, or has a bad magic/version — matching compute_meta_sha_head's
+// "0 disables the staleness check" convention (the safe direction: recompute).
+uint64_t read_store_fp(const fs::path& path)
+{
+    if (!fs::exists(path)) return 0;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+    struct FdClose { int fd; ~FdClose() { if (fd >= 0) ::close(fd); } } c{fd};
+    StoreFpRecord rec{};
+    ssize_t n = ::read(fd, &rec, sizeof(rec));
+    if (n != static_cast<ssize_t>(sizeof(rec))) return 0;
+    if (rec.magic != STORE_FP_MAGIC || rec.version != STORE_FP_VERSION) return 0;
+    return rec.fingerprint;
+}
+
+// Atomically write the sidecar (open|write_all|fsync|fsync_dir), mirroring the
+// store.meta write. Throws on failure so the build's cleanup catch removes it.
+void write_store_fp(const fs::path& path, uint64_t fingerprint)
+{
+    StoreFpRecord rec{};
+    rec.magic       = STORE_FP_MAGIC;
+    rec.version     = STORE_FP_VERSION;
+    rec.fingerprint = fingerprint;
+    rec.reserved    = 0;
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "FourLevelStore: cannot create " + path.string() + ": " +
+            safe_strerror(errno));
+    }
+    FdGuard guard(fd);
+    write_all(fd, &rec, sizeof(rec), path.string());
+    if (::fsync(fd) < 0) {
+        throw std::runtime_error(
+            "FourLevelStore: fsync failed on store.fp: " + safe_strerror(errno));
+    }
+    fsync_directory(path);
 }
 
 // Format an addr_table filename for a given batch_id.
@@ -317,6 +373,36 @@ fs::path FourLevelStore::gnn_meta_path_for(const fs::path&    db_folder,
                                            const std::string& projection_name)
 {
     return db_folder / "projections" / projection_name / "gnn_meta.bin";
+}
+
+bool FourLevelStore::store_matches_sample_fp(
+    const fs::path&    db_folder,
+    const std::string& feature_name,
+    uint64_t           sample_content_fp)
+{
+    auto gnn_dir       = db_folder / "gnn_features";
+    auto meta_path     = gnn_dir / (feature_name + "_store.meta");
+    auto store_fp_path = gnn_dir / (feature_name + "_store.fp");
+    if (!fs::exists(meta_path)) return false;
+
+    // Read store.meta for the feature dim + dtype that mix into the key.
+    StoreMetaHeader meta{};
+    {
+        int fd = ::open(meta_path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        FdGuard guard(fd);
+        try {
+            read_all(fd, &meta, sizeof(meta), meta_path.string());
+        } catch (...) {
+            return false;
+        }
+    }
+    if (!meta.is_valid()) return false;
+
+    uint64_t want = mix_feature_store_fingerprint(
+        sample_content_fp, feature_name, meta.feature_dim, meta.dtype);
+    uint64_t have = read_store_fp(store_fp_path);
+    return want != 0 && have == want;
 }
 
 // =============================================================================
@@ -476,7 +562,15 @@ FourLevelStore::BuildResult FourLevelStore::build(
                                db_folder.string(), catalog.sample_name);
     auto packed_slim_dir  = fs::path(sample_dir) / "packed_slim";
     auto addr_tables_dir  = fs::path(sample_dir) / "addr_tables";
+    auto store_fp_path    = gnn_dir / (feature_name + "_store.fp");
     result.packed_slim_dir = packed_slim_dir.string();
+
+    // STEP 8: the feature store's reuse key = the sample's persisted content
+    // fingerprint (catalog) mixed with this store's identity (name + dim +
+    // dtype). 0 = UNKNOWN (legacy/pre-STEP8 sample) → always recompute.
+    const uint64_t cur_fp = mix_feature_store_fingerprint(
+        catalog.sample_content_fp, feature_name,
+        features.num_cols(), static_cast<uint8_t>(features.dtype()));
 
     // --- Force cleanup ---
     // Fix #15: granular flags let callers preserve specific outputs.
@@ -489,15 +583,91 @@ FourLevelStore::BuildResult FourLevelStore::build(
         if (config.force_caches)      fs::remove(gpu_cache_path, ec);
         if (config.force_caches)      fs::remove(cpu_cache_path, ec);
         if (config.force_meta)        fs::remove(meta_path, ec);
+        if (config.force_meta)        fs::remove(store_fp_path, ec);  // STEP 8 sidecar
         if (config.force_reorder)     fs::remove(reordered_fmat, ec);
         if (config.force_reorder)     fs::remove(reordered_rmap, ec);
     }
 
-    // --- Pre-condition checks ---
+    // --- Pre-condition checks (STEP 8 reuse-or-recompute gate) ---
+    // Replaces the legacy unconditional "already exists" throw: when a store is
+    // present and we are NOT forcing, compare its content fingerprint to cur_fp.
+    // Match → reuse (skip the whole rebuild). Mismatch/UNKNOWN → delete the
+    // stale artifacts and fall through to a full recompute (never silent reuse).
     if (fs::exists(meta_path)) {
-        throw std::runtime_error(
-            "Feature store already exists at: " + meta_path.string() + "\n"
-            "Use force:1 to overwrite (or set force_meta:false to preserve).");
+        if (config.force) {
+            // force + force_meta=false intentionally preserved meta — keep the
+            // historical behaviour for this contradictory combination.
+            throw std::runtime_error(
+                "Feature store already exists at: " + meta_path.string() + "\n"
+                "Use force:1 to overwrite (or set force_meta:false to preserve).");
+        }
+
+        uint64_t prior_fp = read_store_fp(store_fp_path);
+        if (prior_fp != 0 && prior_fp == cur_fp) {
+            std::cerr << "[FourLevelStore] feature store fingerprint matches (fp="
+                      << prior_fp << ") — reusing existing artifacts\n" << std::flush;
+
+            StoreMetaHeader meta{};
+            bool meta_ok = false;
+            int fd = ::open(meta_path.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                FdGuard guard(fd);
+                read_all(fd, &meta, sizeof(meta), meta_path.string());
+                meta_ok = meta.is_valid();
+            }
+            if (meta_ok) {
+                auto fsz = [](const fs::path& p) -> uint64_t {
+                    std::error_code e; auto s = fs::file_size(p, e);
+                    return e ? 0 : static_cast<uint64_t>(s);
+                };
+                result.l1_nodes       = meta.l1_count;
+                result.l2_nodes       = meta.l2_count;
+                result.l3_nodes       = meta.l3_count;
+                result.l4_nodes       = meta.l4_count;
+                result.gpu_available  = meta.gpu_available != 0;
+                result.packed_slim_dir = meta.get_packed_slim_dir();
+                result.total_batches  = catalog.total_batches;
+                result.gpu_cache_bytes = fsz(gpu_cache_path);
+                result.cpu_cache_bytes = fsz(cpu_cache_path);
+                result.reordered_bytes = config.reorder ? fsz(reordered_fmat) : 0;
+                uint64_t slim = 0;
+                std::error_code de;
+                if (fs::exists(packed_slim_dir, de)) {
+                    for (const auto& ent :
+                         fs::directory_iterator(packed_slim_dir, de)) {
+                        std::error_code se;
+                        auto s = fs::file_size(ent.path(), se);
+                        if (!se) slim += static_cast<uint64_t>(s);
+                    }
+                }
+                result.slim_bytes = slim;
+                result.total_disk_bytes = result.slim_bytes + result.gpu_cache_bytes
+                                        + result.cpu_cache_bytes + result.reordered_bytes;
+                result.addr_tables_built_ok = fs::exists(addr_tables_dir, de);
+                auto now = std::chrono::high_resolution_clock::now();
+                result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           now - total_start).count();
+                return result;  // full reuse — no rebuild
+            }
+            std::cerr << "[FourLevelStore] existing store.meta unreadable/invalid"
+                         " — recomputing\n" << std::flush;
+        } else {
+            std::cerr << "[FourLevelStore] feature store fingerprint mismatch (prior="
+                      << prior_fp << " cur=" << cur_fp
+                      << ") — recomputing stale artifacts\n" << std::flush;
+        }
+
+        // Recompute: delete the same set force would, plus store.fp, then fall
+        // through to the normal full rebuild below.
+        std::error_code ec;
+        fs::remove_all(packed_slim_dir, ec);
+        fs::remove_all(addr_tables_dir, ec);
+        fs::remove(gpu_cache_path, ec);
+        fs::remove(cpu_cache_path, ec);
+        fs::remove(meta_path, ec);
+        fs::remove(reordered_fmat, ec);
+        fs::remove(reordered_rmap, ec);
+        fs::remove(store_fp_path, ec);
     }
 
     auto log_phase = [&total_start](const std::string& tag) {
@@ -617,7 +787,26 @@ FourLevelStore::BuildResult FourLevelStore::build(
     const RowMapping* active_rm = &row_mapping;
     std::optional<RowMapping> reordered_rm_holder;
 
-    if (config.reorder && !fs::exists(reordered_fmat)) {
+    // STEP 8: reordered.fmat is "fresh" only if it exists AND its embedded
+    // fingerprint matches cur_fp (with cur_fp known). A reordered.fmat left by a
+    // different sample (e.g. force + force_reorder=false) is detected here and
+    // rebuilt instead of being opened with the wrong shape.
+    bool reordered_fresh = false;
+    if (config.reorder && cur_fp != 0 &&
+        fs::exists(reordered_fmat) && fs::exists(reordered_rmap)) {
+        try {
+            reordered_fresh =
+                (FeatureMatrix::open(reordered_fmat).fingerprint() == cur_fp);
+        } catch (...) {
+            reordered_fresh = false;
+        }
+    }
+    if (config.reorder && !reordered_fresh) {
+        if (fs::exists(reordered_fmat)) {
+            std::error_code rec;
+            fs::remove(reordered_fmat, rec);
+            fs::remove(reordered_rmap, rec);
+        }
         log_phase("L3 MinHash build_access_graph start");
         MinHashReorderer reorderer(config.minhash);
         reorderer.build_access_graph(catalog.total_batches,
@@ -636,7 +825,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
         log_phase("L3 MinHash compute_permutation done");
 
         log_phase("L3 FeatureMatrix::create_reordered start (Fix #12)");
-        FeatureMatrix::create_reordered(features, perm, reordered_fmat);
+        FeatureMatrix::create_reordered(features, perm, reordered_fmat, cur_fp);
         log_phase("L3 FeatureMatrix::create_reordered done");
 
         // Create reordered RowMapping
@@ -648,7 +837,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
         RowMapping::create(reordered_rmap, reordered_ids);
         log_phase("L3 RowMapping::create done");
     } else if (config.reorder) {
-        log_phase("L3 reorder skipped — reordered.fmat already exists");
+        log_phase("L3 reorder fresh (fingerprint match) — reusing reordered.fmat");
     } else {
         log_phase("L3 reorder disabled");
     }
@@ -996,6 +1185,11 @@ FourLevelStore::BuildResult FourLevelStore::build(
         fsync_directory(meta_path);
     }
 
+    // STEP 8: write the content-fingerprint sidecar next to store.meta. Written
+    // after the meta fsync so the two together mark a fully built store bound to
+    // this specific sample+feature. The failure-cleanup catch removes it too.
+    write_store_fp(store_fp_path, cur_fp);
+
     } catch (...) {
         // Best-effort cleanup of partial outputs
         std::error_code ec;
@@ -1004,6 +1198,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
         fs::remove(gpu_cache_path, ec);
         fs::remove(cpu_cache_path, ec);
         fs::remove(meta_path, ec);
+        fs::remove(store_fp_path, ec);  // STEP 8 sidecar
         if (config.reorder) {
             fs::remove(reordered_fmat, ec);
             fs::remove(reordered_rmap, ec);

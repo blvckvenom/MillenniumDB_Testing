@@ -42,10 +42,15 @@ namespace mdb::gnn {
  * 88      K*8      Fanouts array
  * ...     var      Projection name (length-prefixed string)
  * ...     var      Sample name (length-prefixed string)
+ * ...     8        Sample content fingerprint (v3+ only; 0 = absent/UNKNOWN)
  * ```
  *
  * V1 compatibility: between total_edges and batch_size, v1 has an
  * extra uint64 legacy_num_epochs field (read and discarded).
+ *
+ * V2 compatibility: v1/v2 catalogs have no trailing sample_content_fp; it
+ * reads as 0 (UNKNOWN), which routes the feature store to recompute (the safe
+ * direction — never silently reuse a store whose sample provenance is unknown).
  *
  * @see SampleStorage for the actual sample data
  */
@@ -55,7 +60,7 @@ struct SampleCatalog {
     // =========================================================================
 
     static constexpr uint32_t MAGIC = 0x534E4E47;  // "GNNS" in little-endian
-    static constexpr uint32_t VERSION = 2;
+    static constexpr uint32_t VERSION = 3;
     static constexpr const char* CATALOG_FILENAME = "catalog.dat";
 
     // =========================================================================
@@ -85,6 +90,16 @@ struct SampleCatalog {
     uint64_t total_edges;         ///< Total edges across all samples
 
     // =========================================================================
+    // Content fingerprint (STEP 8)
+    // =========================================================================
+
+    /// Layout-independent XOR fold of per-batch content hashes (see
+    /// sample_fingerprint.h). 0 = absent/UNKNOWN (v1/v2 catalogs, or a sample
+    /// written before STEP 8). Consumed by FourLevelStore to decide reuse vs
+    /// recompute of the feature store. Persisted only in catalog v3+.
+    uint64_t sample_content_fp = 0;
+
+    // =========================================================================
     // Timestamps
     // =========================================================================
 
@@ -111,6 +126,7 @@ struct SampleCatalog {
         , test_batches(0)
         , unique_nodes(0)
         , total_edges(0)
+        , sample_content_fp(0)
         , created_at(std::chrono::system_clock::now())
     {
     }
@@ -269,6 +285,9 @@ private:
         // Strings
         write_string(out, projection_name);
         write_string(out, sample_name);
+
+        // Content fingerprint (v3+, append-only at the tail).
+        write_value(out, sample_content_fp);
     }
 
     void read_binary(std::istream& in) {
@@ -318,6 +337,14 @@ private:
         // Strings
         projection_name = read_string(in);
         sample_name = read_string(in);
+
+        // Content fingerprint (v3+ only). v1/v2 catalogs have no trailing
+        // field; leave it 0 = UNKNOWN so the feature store recomputes.
+        if (version >= 3) {
+            sample_content_fp = read_value<uint64_t>(in);
+        } else {
+            sample_content_fp = 0;
+        }
 
         if (!in) {
             throw std::runtime_error("Error reading catalog file");

@@ -249,6 +249,18 @@ public:
         const std::filesystem::path& db_folder,
         const std::string&           projection_name);
 
+    /// STEP 8: return true iff a built feature store for `feature_name` exists
+    /// AND its persisted content fingerprint (`<feature>_store.fp`) matches the
+    /// given sample's content fingerprint mixed with the store's own identity
+    /// (feature dim + dtype, read from store.meta). Used by the
+    /// gnn_build_feature_store phase5-only fast path to refuse reusing
+    /// addr_tables built from a different sample. Returns false if either
+    /// sidecar is absent/unreadable or `sample_content_fp` is 0 (UNKNOWN).
+    static bool store_matches_sample_fp(
+        const std::filesystem::path& db_folder,
+        const std::string&           feature_name,
+        uint64_t                     sample_content_fp);
+
     /// Primitive: features for a set of nodes (L1 -> L2 -> L3 fallback, no L4).
     torch::Tensor load_features(const std::vector<ObjectId>& oids);
 

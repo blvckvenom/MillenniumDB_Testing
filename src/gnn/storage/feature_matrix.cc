@@ -683,7 +683,8 @@ FeatureMatrix FeatureMatrix::create_parallel(
 FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     const FeatureMatrix& source,
     const std::vector<uint64_t>& permutation,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    uint64_t fingerprint)
 {
     namespace fs = std::filesystem;
     const uint64_t N  = source.num_rows();
@@ -691,6 +692,8 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     const GnnDtype dt = source.dtype();
 
     auto header = FeatureMatrixHeader::make(N, D, dt);
+    // STEP 8: embed the sample/feature content fingerprint in reserved[0..7].
+    std::memcpy(header.reserved, &fingerprint, sizeof(fingerprint));
     const size_t rb = header.row_bytes();
     size_t data_size = header.data_bytes();
     if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
@@ -1069,7 +1072,8 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
 FeatureMatrix FeatureMatrix::create_reordered(
     const FeatureMatrix& source,
     const std::vector<uint64_t>& permutation,
-    const fs::path& output_path)
+    const fs::path& output_path,
+    uint64_t fingerprint)
 {
     if (permutation.size() != source.num_rows()) {
         throw std::invalid_argument(
@@ -1103,7 +1107,7 @@ FeatureMatrix FeatureMatrix::create_reordered(
         }
     }
     if (use_external_sort && N > 0) {
-        return create_reordered_external_sort_(source, permutation, output_path);
+        return create_reordered_external_sort_(source, permutation, output_path, fingerprint);
     }
 
     if (N == 0) {
@@ -1114,6 +1118,8 @@ FeatureMatrix FeatureMatrix::create_reordered(
     }
 
     auto header = FeatureMatrixHeader::make(N, D, dt);
+    // STEP 8: embed the sample/feature content fingerprint in reserved[0..7].
+    std::memcpy(header.reserved, &fingerprint, sizeof(fingerprint));
     const size_t rb = header.row_bytes();
     if (rb > 0 && N > SIZE_MAX / rb) {
         throw std::overflow_error(

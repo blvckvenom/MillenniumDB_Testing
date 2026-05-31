@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "gnn/common/page_cache_hint.h"  // Fix #22
+#include "gnn/sampling/sample_fingerprint.h"  // STEP 8 content fingerprint
 #include "gnn/storage/row_mapping.h"
 #include "misc/logger.h"
 
@@ -128,6 +129,11 @@ struct SampleStorage::Impl {
     std::unordered_set<uint64_t> unique_nodes_seen;  // sparse fallback
     uint64_t total_edges_written = 0;
 
+    // STEP 8: order-independent XOR fold of per-batch content hashes. Commutative
+    // so it is invariant to worker write-completion order (numWorkers>=2); each
+    // batch_id contributes exactly once via write_sample_impl.
+    uint64_t content_fp_accumulator_ = 0;
+
     Impl() = default;
 
     // =========================================================================
@@ -233,6 +239,12 @@ struct SampleStorage::Impl {
 
         // Update split index
         split_index[static_cast<int>(sample.split)].push_back(sample.batch_id);
+
+        // STEP 8: fold this batch's layout-independent content hash into the
+        // sample fingerprint. XOR is commutative so the result is invariant to
+        // worker write-completion order; the per-batch hash is keyed by batch_id
+        // so distinct batches do not cancel.
+        content_fp_accumulator_ ^= compute_batch_content_hash(sample);
     }
 
     void finalize_impl() {
@@ -293,6 +305,11 @@ struct SampleStorage::Impl {
         catalog.test_batches = test_batches_written;
         catalog.unique_nodes = row_mapping_ ? dense_unique_count : unique_nodes_seen.size();
         catalog.total_edges = total_edges_written;
+
+        // STEP 8: persist the content fingerprint. 0 is reserved for
+        // "absent/UNKNOWN", so map a (vanishingly rare) all-XOR-cancelled 0 to 1.
+        catalog.sample_content_fp =
+            (content_fp_accumulator_ == 0) ? 1 : content_fp_accumulator_;
 
         catalog.save(storage_path);
 

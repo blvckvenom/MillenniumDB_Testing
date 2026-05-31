@@ -108,6 +108,7 @@ add_library(mdb_gnn_core STATIC
     sampling/sorted_batch_sampler.cc
     sampling/reservoir_sampler.cc
     sampling/sample_storage.cc
+    sampling/sample_fingerprint.cc
     sampling/offline_sampling_engine.cc
     sampling/node_counts_io.cc
     sampling/minhash_reorderer.cc
@@ -355,6 +356,19 @@ if(BUILD_TESTING)
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
         add_test(NAME GraphSampleTests COMMAND test_graph_sample)
+
+        # Sample content fingerprint tests (STEP 8 — staleness, isolable)
+        add_executable(test_sample_fingerprint
+            tests/test_sample_fingerprint.cc
+        )
+        target_link_libraries(test_sample_fingerprint mdb_gnn_core GTest::gtest_main)
+        target_compile_options(test_sample_fingerprint PRIVATE ${TORCH_CXX_FLAGS_LIST})
+        target_compile_definitions(test_sample_fingerprint PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+        set_target_properties(test_sample_fingerprint PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME SampleFingerprintTests COMMAND test_sample_fingerprint)
 
         # BatchMaterializer tests (L3+L4 pipeline)
         add_executable(test_batch_materializer
