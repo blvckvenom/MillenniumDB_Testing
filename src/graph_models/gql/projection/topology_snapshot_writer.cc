@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -147,6 +148,25 @@ TopologySnapshotWriter::TopologySnapshotWriter(
     }
     num_edges_ = running;
 
+    // Spec #6 narrow (uint32) eligibility. Opt-in via the `MDB_GNN_TOPOLOGY_UINT32`
+    // env var; default OFF keeps the legacy uint64 layout byte-identical. The
+    // narrow layout stores tag-stripped ordinals (node id & VALUE_MASK, edge id
+    // & VALUE_MASK) as uint32, so it is lossless only when every such ordinal
+    // fits uint32 — node ordinals < num_nodes, edge ordinals < num_edges, both
+    // < 2^32. ROW_PTR stays uint64 (offsets can exceed 2^32 for M > 4B).
+    {
+        bool want_narrow = false;
+        if (const char* e = std::getenv("MDB_GNN_TOPOLOGY_UINT32")) {
+            want_narrow = (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+        }
+        const uint64_t kU32 = uint64_t{1} << 32;
+        const bool node_fits = num_nodes_ < kU32;
+        const bool edge_fits = !include_edge_ids_ || num_edges_ < kU32;
+        id_width_ = (want_narrow && node_fits && edge_fits)
+                        ? kTopologySnapshotIdWidthNarrow
+                        : kTopologySnapshotIdWidth;
+    }
+
     write_cursor_.assign(static_cast<std::size_t>(num_nodes_), 0);
 
     // Reserve 1 MiB of staging space for each per-section coalescing
@@ -157,15 +177,22 @@ TopologySnapshotWriter::TopologySnapshotWriter(
     if (include_edge_ids_) {
         edge_ids_buf_.reserve(kCoalesceBytes / sizeof(uint64_t));
     }
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        col_idx_buf32_.reserve(kCoalesceBytes / sizeof(uint64_t));
+        if (include_edge_ids_) {
+            edge_ids_buf32_.reserve(kCoalesceBytes / sizeof(uint64_t));
+        }
+    }
 
-    // Section offsets. Fixed once N and M are known.
+    // Section offsets. Fixed once N, M, and id_width_ are known. ROW_PTR is
+    // uint64; COL_IDX / EDGE_IDS use element_size_() (4 or 8).
     col_idx_offset_  = static_cast<uint64_t>(kTopologySnapshotHeaderSize)
                      + sizeof(uint64_t) * (num_nodes_ + 1);
     edge_ids_offset_ = col_idx_offset_
-                     + sizeof(uint64_t) * num_edges_;
+                     + element_size_() * num_edges_;
     const uint64_t file_size =
         col_idx_offset_
-        + sizeof(uint64_t) * num_edges_ * (include_edge_ids_ ? 2 : 1);
+        + element_size_() * num_edges_ * (include_edge_ids_ ? 2 : 1);
 
     // Open .tmp with O_EXCL so a concurrent writer targeting the same file
     // is rejected with EEXIST rather than racing on the content.
@@ -241,7 +268,19 @@ void TopologySnapshotWriter::append_edge(ObjectId src, ObjectId dst, ObjectId ed
     }
 
     uint64_t src_idx = src.id;
+    // Stored COL_IDX value. Wide: the raw tagged ObjectId (legacy). Narrow:
+    // the tag-stripped ordinal, with the constant type tag captured into the
+    // header. capture_tag_ asserts a single tag per section.
     uint64_t dst_idx = dst.id;
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        capture_tag_(dst_tag_, static_cast<uint8_t>(dst.id >> 56), "dst");
+        dst_idx = dst.id & kTopologySnapshotValueMask;
+        if (dst_idx > 0xFFFFFFFFULL) {
+            throw std::runtime_error(
+                "TopologySnapshotWriter: dst ordinal " + std::to_string(dst_idx)
+                + " exceeds uint32 under narrow id_width");
+        }
+    }
 
     // Always-on invariant checks. Release-build silent corruption of the
     // CSR body would not be caught by the reader's SHA-256 (that hashes the
@@ -299,21 +338,32 @@ void TopologySnapshotWriter::append_edge(ObjectId src, ObjectId dst, ObjectId ed
             col_idx_flushed_words_ = edge_index;
         }
         col_idx_buf_.push_back(dst_idx);
-        if (col_idx_buf_.size() * sizeof(uint64_t) >= kCoalesceBytes) {
+        if (col_idx_buf_.size() * element_size_() >= kCoalesceBytes) {
             flush_col_idx_buffer_();
         }
     }
 
     // ---- EDGE_IDS --------------------------------------------------
     if (include_edge_ids_) {
+        uint64_t eid_store = edge_id.id;
+        if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+            capture_tag_(edge_tag_, static_cast<uint8_t>(edge_id.id >> 56), "edge");
+            eid_store = edge_id.id & kTopologySnapshotValueMask;
+            if (eid_store > 0xFFFFFFFFULL) {
+                throw std::runtime_error(
+                    "TopologySnapshotWriter: edge ordinal "
+                    + std::to_string(eid_store)
+                    + " exceeds uint32 under narrow id_width");
+            }
+        }
         const uint64_t buffered_next =
             edge_ids_flushed_words_ + edge_ids_buf_.size();
         if (edge_index != buffered_next) {
             flush_edge_ids_buffer_();
             edge_ids_flushed_words_ = edge_index;
         }
-        edge_ids_buf_.push_back(edge_id.id);
-        if (edge_ids_buf_.size() * sizeof(uint64_t) >= kCoalesceBytes) {
+        edge_ids_buf_.push_back(eid_store);
+        if (edge_ids_buf_.size() * element_size_() >= kCoalesceBytes) {
             flush_edge_ids_buffer_();
         }
     } else {
@@ -369,6 +419,44 @@ void TopologySnapshotWriter::append_subrange(
     // non-overlapping [lo_src, hi_src) intervals write to disjoint byte
     // ranges in COL_IDX and EDGE_IDS, so the kernel pwrite serialization
     // is per-write-region — no cross-thread data races on the file content.
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        // Narrow: validate + tag-strip + widen-down to uint32 into a local
+        // staging vector (local, not the member buffers, so concurrent
+        // workers don't share state). capture_tag_ is CAS-safe across workers.
+        std::vector<uint32_t> dst32(dst_buf.size());
+        for (std::size_t i = 0; i < dst_buf.size(); ++i) {
+            capture_tag_(dst_tag_, static_cast<uint8_t>(dst_buf[i] >> 56), "dst");
+            const uint64_t v = dst_buf[i] & kTopologySnapshotValueMask;
+            if (v > 0xFFFFFFFFULL) {
+                throw std::runtime_error(
+                    "TopologySnapshotWriter: dst ordinal " + std::to_string(v)
+                    + " exceeds uint32 under narrow id_width");
+            }
+            dst32[i] = static_cast<uint32_t>(v);
+        }
+        pwrite_all(dst32.data(), dst32.size() * sizeof(uint32_t),
+                   col_idx_offset_ + base_edge_index * element_size_());
+
+        if (include_edge_ids_) {
+            std::vector<uint32_t> eid32(edge_ids_buf.size());
+            for (std::size_t i = 0; i < edge_ids_buf.size(); ++i) {
+                capture_tag_(edge_tag_,
+                             static_cast<uint8_t>(edge_ids_buf[i] >> 56), "edge");
+                const uint64_t v = edge_ids_buf[i] & kTopologySnapshotValueMask;
+                if (v > 0xFFFFFFFFULL) {
+                    throw std::runtime_error(
+                        "TopologySnapshotWriter: edge ordinal "
+                        + std::to_string(v)
+                        + " exceeds uint32 under narrow id_width");
+                }
+                eid32[i] = static_cast<uint32_t>(v);
+            }
+            pwrite_all(eid32.data(), eid32.size() * sizeof(uint32_t),
+                       edge_ids_offset_ + base_edge_index * element_size_());
+        }
+        return;
+    }
+
     pwrite_all(
         dst_buf.data(),
         dst_buf.size() * sizeof(uint64_t),
@@ -387,10 +475,18 @@ void TopologySnapshotWriter::flush_col_idx_buffer_() {
         return;
     }
     const std::size_t n = col_idx_buf_.size();
-    pwrite_all(
-        col_idx_buf_.data(),
-        n * sizeof(uint64_t),
-        col_idx_offset_ + col_idx_flushed_words_ * sizeof(uint64_t));
+    const uint64_t off = col_idx_offset_ + col_idx_flushed_words_ * element_size_();
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        // Words in col_idx_buf_ were already tag-stripped + range-checked in
+        // append_edge; narrow them to uint32 for the on-disk layout.
+        col_idx_buf32_.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            col_idx_buf32_[i] = static_cast<uint32_t>(col_idx_buf_[i]);
+        }
+        pwrite_all(col_idx_buf32_.data(), n * sizeof(uint32_t), off);
+    } else {
+        pwrite_all(col_idx_buf_.data(), n * sizeof(uint64_t), off);
+    }
     col_idx_flushed_words_ += n;
     col_idx_buf_.clear();
 }
@@ -400,10 +496,16 @@ void TopologySnapshotWriter::flush_edge_ids_buffer_() {
         return;
     }
     const std::size_t n = edge_ids_buf_.size();
-    pwrite_all(
-        edge_ids_buf_.data(),
-        n * sizeof(uint64_t),
-        edge_ids_offset_ + edge_ids_flushed_words_ * sizeof(uint64_t));
+    const uint64_t off = edge_ids_offset_ + edge_ids_flushed_words_ * element_size_();
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        edge_ids_buf32_.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            edge_ids_buf32_[i] = static_cast<uint32_t>(edge_ids_buf_[i]);
+        }
+        pwrite_all(edge_ids_buf32_.data(), n * sizeof(uint32_t), off);
+    } else {
+        pwrite_all(edge_ids_buf_.data(), n * sizeof(uint64_t), off);
+    }
     edge_ids_flushed_words_ += n;
     edge_ids_buf_.clear();
 }
@@ -455,8 +557,20 @@ void TopologySnapshotWriter::finalize() {
 
     // Rewrite header at offset 0 with real values (§5.3 step 5).
     TopologySnapshotHeader header = make_default_topology_snapshot_header();
+    header.id_width = id_width_;
     if (include_edge_ids_) {
         header.flags |= TopologySnapshotFlags::kHasEdgeIds;
+    }
+    // Spec #6: persist the per-section type tag the reader re-applies to the
+    // tag-stripped uint32 ordinals. An empty section never captured a tag —
+    // 0 is harmless (no values to reconstruct). Stays 0 for the wide layout.
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        const uint16_t dt = dst_tag_.load(std::memory_order_relaxed);
+        header.dst_type_tag = (dt == kTagUnset) ? 0 : static_cast<uint8_t>(dt);
+        if (include_edge_ids_) {
+            const uint16_t et = edge_tag_.load(std::memory_order_relaxed);
+            header.edge_type_tag = (et == kTagUnset) ? 0 : static_cast<uint8_t>(et);
+        }
     }
     header.num_nodes = num_nodes_;
     header.num_edges = num_edges_;
@@ -496,14 +610,43 @@ void TopologySnapshotWriter::finalize() {
 
     fsync_directory(projection_dir_);
 
-    // Record final size for bytes_written().
+    // Record final size for bytes_written(). ROW_PTR uint64; COL_IDX / EDGE_IDS
+    // at element_size_() (4 or 8).
     const uint64_t expected =
         static_cast<uint64_t>(kTopologySnapshotHeaderSize)
         + sizeof(uint64_t) * (num_nodes_ + 1)
-        + sizeof(uint64_t) * num_edges_ * (include_edge_ids_ ? 2 : 1);
+        + element_size_() * num_edges_ * (include_edge_ids_ ? 2 : 1);
     bytes_written_ = expected;
 
     finalized_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// capture_tag_ — first-writer-wins capture + consistency assert (Spec #6)
+// ---------------------------------------------------------------------------
+
+void TopologySnapshotWriter::capture_tag_(std::atomic<uint16_t>& slot,
+                                          uint8_t tag, const char* what) {
+    uint16_t expected = kTagUnset;
+    // First narrow append for this section wins the CAS and stores the tag.
+    if (slot.compare_exchange_strong(expected,
+                                     static_cast<uint16_t>(tag),
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_acquire)) {
+        return;
+    }
+    // Already set (by us on a prior call or by another worker). The narrow
+    // layout carries ONE type tag per section in the header, so a mismatch
+    // means the section mixes node/edge types — not representable. Fail loud
+    // rather than silently corrupt the reconstructed ObjectIds.
+    if (static_cast<uint8_t>(expected) != tag) {
+        throw std::runtime_error(
+            std::string("TopologySnapshotWriter: inconsistent ") + what
+            + " ObjectId type tag under narrow id_width (saw "
+            + std::to_string(static_cast<unsigned>(tag)) + ", section already "
+            + std::to_string(static_cast<unsigned>(expected))
+            + "); a narrow section must share one type tag");
+    }
 }
 
 // ---------------------------------------------------------------------------

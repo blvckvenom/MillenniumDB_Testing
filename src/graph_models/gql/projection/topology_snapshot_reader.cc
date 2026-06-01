@@ -11,6 +11,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -42,44 +44,90 @@ const char* source_basename_for(TopologySnapshotReader::Direction d) {
     return "from_to_edge.leaf";  // unreachable
 }
 
-// Stream SHA-256 over `path` using EVP with a 64 KiB buffer. Duplicated
-// from topology_snapshot_writer.cc rather than exported from that
-// translation unit — the writer header deliberately does not expose its
-// OpenSSL helpers, and duplicating ~35 lines here is cheaper than
-// widening the writer's public surface just for the reader.
+// Process-level memoization of the source-.leaf SHA-256, keyed by
+// (path, mtime_ns, size). The four-level sample path hashes the SAME .leaf
+// TWICE per run — once in the TopologyAccessor ctor (opening fwd_csr_/rev_csr_)
+// and once in FourLevelTopologyStore::open_l3_sidecars_ — measured at 174s
+// (cold) + 83s (warm) = 257s on papers100M (72.4 GB .leaf), ~67% of the whole
+// sample stage. The second pass is pure redundancy: same file, same mtime/size
+// → identical digest. This cache makes it an O(1) lookup, and the (mtime,size)
+// key keeps the staleness gate correct (any .leaf edit changes the key →
+// recompute). Thread-safe for the parallel sampler workers (though both passes
+// happen single-threaded during setup today).
+struct ShaCacheEntry {
+    int64_t                 mtime_ns = 0;
+    int64_t                 size     = 0;
+    std::array<uint8_t, 32> digest{};
+};
+std::mutex                                   g_sha_cache_mutex;
+std::map<std::string, ShaCacheEntry>         g_sha_cache;
+
+// Stream SHA-256 over `path` using EVP. Memoized (see above) + reads via a
+// raw fd with POSIX_FADV_SEQUENTIAL so the cold first pass gets aggressive
+// kernel readahead instead of the ~415 MB/s the ifstream path was limited to.
 //
 // Returns true + fills `out` on success. Returns false on any I/O,
 // allocation, or digest-API failure — the caller treats that as a
 // mismatch (conservative: an unverifiable sidecar must not be trusted).
 bool compute_sha256_64k(const std::filesystem::path& path,
                         std::array<uint8_t, 32>&     out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+    // stat for the cache key (mtime + size). On failure fall through to the
+    // open() below, which will also fail and return false.
+    struct stat st{};
+    int64_t key_mtime = 0, key_size = -1;
+    if (::stat(path.c_str(), &st) == 0) {
+        key_mtime = static_cast<int64_t>(st.st_mtime) * 1000000000LL
+                  + static_cast<int64_t>(st.st_mtim.tv_nsec);
+        key_size  = static_cast<int64_t>(st.st_size);
+        std::lock_guard<std::mutex> lk(g_sha_cache_mutex);
+        auto it = g_sha_cache.find(path.string());
+        if (it != g_sha_cache.end()
+            && it->second.mtime_ns == key_mtime
+            && it->second.size == key_size) {
+            out = it->second.digest;  // cache hit — skip the re-hash
+            return true;
+        }
+    }
+
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
         return false;
     }
+    // Cold sequential scan of a multi-GB .leaf — ask the kernel for large
+    // readahead. Best-effort; ignore failure.
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) {
+        ::close(fd);
         return false;
     }
     if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
         EVP_MD_CTX_free(ctx);
+        ::close(fd);
         return false;
     }
 
-    // Same buffer size as topology_snapshot_writer.cc's sha256_of_file —
-    // producer and consumer hash over identical chunking so the digests
-    // are byte-identical for identical file contents.
-    constexpr std::size_t BUF = 64 * 1024;
+    // 256 KiB read buffer (vs the old 64 KiB ifstream chunk) — fewer syscalls
+    // on a 72 GB file; the SHA digest is byte-identical regardless of chunking.
+    constexpr std::size_t BUF = 256 * 1024;
     std::array<char, BUF> buf{};
-    while (f.read(buf.data(), BUF) || f.gcount() > 0) {
-        if (EVP_DigestUpdate(ctx, buf.data(),
-                             static_cast<std::size_t>(f.gcount())) != 1) {
-            EVP_MD_CTX_free(ctx);
-            return false;
+    bool ok = true;
+    while (true) {
+        ssize_t n = ::read(fd, buf.data(), BUF);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        if (n == 0) break;  // EOF
+        if (EVP_DigestUpdate(ctx, buf.data(), static_cast<std::size_t>(n)) != 1) {
+            ok = false;
+            break;
         }
     }
-    if (f.bad()) {
+    ::close(fd);
+    if (!ok) {
         EVP_MD_CTX_free(ctx);
         return false;
     }
@@ -90,6 +138,16 @@ bool compute_sha256_64k(const std::filesystem::path& path,
         return false;
     }
     EVP_MD_CTX_free(ctx);
+    if (len != 32) {
+        return false;
+    }
+
+    // Populate the cache so the redundant second pass over the same .leaf is
+    // an O(1) hit.
+    if (key_size >= 0) {
+        std::lock_guard<std::mutex> lk(g_sha_cache_mutex);
+        g_sha_cache[path.string()] = ShaCacheEntry{key_mtime, key_size, out};
+    }
     return len == 32;
 }
 
@@ -188,15 +246,18 @@ TopologySnapshotReader TopologySnapshotReader::open(
     }
 
     // Step 5 — file-size invariant (§5.2 step 4).
-    // expected = 64 + 8 * (N + 1) + 8 * M * (has_edge_ids ? 2 : 1)
+    // ROW_PTR is always uint64; COL_IDX / EDGE_IDS use the header's id_width
+    // (8 = full tagged ObjectId, 4 = Spec #6 tag-stripped uint32).
+    // expected = 64 + 8 * (N + 1) + W * M * (has_edge_ids ? 2 : 1)
     const bool has_edge_ids_flag =
         (header.flags & TopologySnapshotFlags::kHasEdgeIds) != 0;
     const uint64_t N = header.num_nodes;
     const uint64_t M = header.num_edges;
+    const uint64_t W = static_cast<uint64_t>(header.id_width);  // 4 or 8 (parse-validated)
     const uint64_t expected =
         static_cast<uint64_t>(kTopologySnapshotHeaderSize)
         + sizeof(uint64_t) * (N + 1)
-        + sizeof(uint64_t) * M * (has_edge_ids_flag ? 2 : 1);
+        + W * M * (has_edge_ids_flag ? 2 : 1);
     if (expected != static_cast<uint64_t>(file_size)) {
         warn(path, "file size mismatch: expected=" + std::to_string(expected)
                    + ", actual=" + std::to_string(file_size)
@@ -287,14 +348,25 @@ TopologySnapshotReader TopologySnapshotReader::open(
     reader.fd_        = fd;
 
     reader.row_ptr_ = row_ptr;
-    reader.col_idx_ = reinterpret_cast<const uint64_t*>(
-        map_bytes + kTopologySnapshotHeaderSize + sizeof(uint64_t) * (N + 1));
-    reader.edge_ids_ = has_edge_ids_flag
-        ? reinterpret_cast<const uint64_t*>(
-              map_bytes + kTopologySnapshotHeaderSize
-                        + sizeof(uint64_t) * (N + 1)
-                        + sizeof(uint64_t) * M)
-        : nullptr;
+    // COL_IDX starts right after ROW_PTR (uint64[N+1]); EDGE_IDS (if present)
+    // right after COL_IDX. Section element width is W (4 or 8). The base
+    // offsets are 8-aligned (header is 64, ROW_PTR is 8*(N+1)), so the uint32
+    // reinterpret is naturally aligned; EDGE_IDS at col_base + 4*M is at least
+    // 4-aligned, which is sufficient for uint32 reads.
+    const uint8_t* col_base = map_bytes + kTopologySnapshotHeaderSize
+                                        + sizeof(uint64_t) * (N + 1);
+    const uint8_t* eid_base = col_base + W * M;
+    if (header.id_width == kTopologySnapshotIdWidthNarrow) {
+        reader.col_idx32_  = reinterpret_cast<const uint32_t*>(col_base);
+        reader.edge_ids32_ = has_edge_ids_flag
+            ? reinterpret_cast<const uint32_t*>(eid_base)
+            : nullptr;
+    } else {
+        reader.col_idx_  = reinterpret_cast<const uint64_t*>(col_base);
+        reader.edge_ids_ = has_edge_ids_flag
+            ? reinterpret_cast<const uint64_t*>(eid_base)
+            : nullptr;
+    }
     reader.has_data_ = true;
 
     // Step 9 — staleness gate (§3.3 / T4.10). Re-hash the source `.leaf`
@@ -304,6 +376,24 @@ TopologySnapshotReader TopologySnapshotReader::open(
     // caller sees has_data() == false — identical to the "file absent"
     // contract. Missing source file or unreadable source both collapse
     // to "mismatch" via compute_sha256_64k() returning false.
+    //
+    // Opt-out: MDB_GNN_TRUST_SIDECAR=1 skips the re-hash entirely. The SHA-256
+    // streams the full source .leaf (72.4 GB on papers100M GNN_MINIMAL, ~81s /
+    // ~21% of a four-level sample build, recomputed EVERY open) purely as a
+    // staleness gate. When the caller KNOWS the projection's .leaf is unchanged
+    // since the sidecar was built (the common repeated-sampling workflow), this
+    // trades the safety net for the time. Default OFF (verify) — a stale
+    // sidecar silently producing wrong topology is a thesis-grade correctness
+    // bug, so trust must be explicit.
+    {
+        const char* trust = std::getenv("MDB_GNN_TRUST_SIDECAR");
+        if (trust && (trust[0] == '1' || trust[0] == 't' || trust[0] == 'T')) {
+            std::cerr << "TopologySnapshotReader: " << path.string()
+                      << ": MDB_GNN_TRUST_SIDECAR set — skipping source .leaf "
+                         "SHA-256 staleness check (caller asserts freshness)\n";
+            return reader;
+        }
+    }
     const std::filesystem::path source_leaf_path =
         projection_dir / source_basename_for(dir);
     if (!reader.verify_source_sha256(source_leaf_path)) {
@@ -324,11 +414,13 @@ void TopologySnapshotReader::release_resources_() noexcept {
     if (map_base_ != nullptr && file_size_ > 0) {
         ::munmap(map_base_, file_size_);
     }
-    map_base_  = nullptr;
-    file_size_ = 0;
-    row_ptr_   = nullptr;
-    col_idx_   = nullptr;
-    edge_ids_  = nullptr;
+    map_base_   = nullptr;
+    file_size_  = 0;
+    row_ptr_    = nullptr;
+    col_idx_    = nullptr;
+    edge_ids_   = nullptr;
+    col_idx32_  = nullptr;
+    edge_ids32_ = nullptr;
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -343,24 +435,28 @@ TopologySnapshotReader::~TopologySnapshotReader() {
 
 TopologySnapshotReader::TopologySnapshotReader(
     TopologySnapshotReader&& other) noexcept
-    : has_data_  (other.has_data_)
-    , header_    (other.header_)
-    , map_base_  (other.map_base_)
-    , file_size_ (other.file_size_)
-    , row_ptr_   (other.row_ptr_)
-    , col_idx_   (other.col_idx_)
-    , edge_ids_  (other.edge_ids_)
-    , fd_        (other.fd_)
+    : has_data_   (other.has_data_)
+    , header_     (other.header_)
+    , map_base_   (other.map_base_)
+    , file_size_  (other.file_size_)
+    , row_ptr_    (other.row_ptr_)
+    , col_idx_    (other.col_idx_)
+    , edge_ids_   (other.edge_ids_)
+    , col_idx32_  (other.col_idx32_)
+    , edge_ids32_ (other.edge_ids32_)
+    , fd_         (other.fd_)
 {
     // Detach `other` so its destructor is a no-op.
-    other.has_data_  = false;
-    other.header_    = {};
-    other.map_base_  = nullptr;
-    other.file_size_ = 0;
-    other.row_ptr_   = nullptr;
-    other.col_idx_   = nullptr;
-    other.edge_ids_  = nullptr;
-    other.fd_        = -1;
+    other.has_data_   = false;
+    other.header_     = {};
+    other.map_base_   = nullptr;
+    other.file_size_  = 0;
+    other.row_ptr_    = nullptr;
+    other.col_idx_    = nullptr;
+    other.edge_ids_   = nullptr;
+    other.col_idx32_  = nullptr;
+    other.edge_ids32_ = nullptr;
+    other.fd_         = -1;
 }
 
 TopologySnapshotReader& TopologySnapshotReader::operator=(
@@ -370,23 +466,27 @@ TopologySnapshotReader& TopologySnapshotReader::operator=(
     }
     release_resources_();
 
-    has_data_  = other.has_data_;
-    header_    = other.header_;
-    map_base_  = other.map_base_;
-    file_size_ = other.file_size_;
-    row_ptr_   = other.row_ptr_;
-    col_idx_   = other.col_idx_;
-    edge_ids_  = other.edge_ids_;
-    fd_        = other.fd_;
+    has_data_   = other.has_data_;
+    header_     = other.header_;
+    map_base_   = other.map_base_;
+    file_size_  = other.file_size_;
+    row_ptr_    = other.row_ptr_;
+    col_idx_    = other.col_idx_;
+    edge_ids_   = other.edge_ids_;
+    col_idx32_  = other.col_idx32_;
+    edge_ids32_ = other.edge_ids32_;
+    fd_         = other.fd_;
 
-    other.has_data_  = false;
-    other.header_    = {};
-    other.map_base_  = nullptr;
-    other.file_size_ = 0;
-    other.row_ptr_   = nullptr;
-    other.col_idx_   = nullptr;
-    other.edge_ids_  = nullptr;
-    other.fd_        = -1;
+    other.has_data_   = false;
+    other.header_     = {};
+    other.map_base_   = nullptr;
+    other.file_size_  = 0;
+    other.row_ptr_    = nullptr;
+    other.col_idx_    = nullptr;
+    other.edge_ids_   = nullptr;
+    other.col_idx32_  = nullptr;
+    other.edge_ids32_ = nullptr;
+    other.fd_         = -1;
     return *this;
 }
 
@@ -394,11 +494,35 @@ TopologySnapshotReader& TopologySnapshotReader::operator=(
 // Accessors
 // ---------------------------------------------------------------------------
 
+uint64_t TopologySnapshotReader::degree(uint64_t node_idx) const {
+    if (!has_data_) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::degree: reader has no data "
+            "(call has_data() first)");
+    }
+    if (node_idx >= header_.num_nodes) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::degree: node_idx "
+            + std::to_string(node_idx) + " >= num_nodes "
+            + std::to_string(header_.num_nodes));
+    }
+    // ROW_PTR is uint64 for both id widths, so degree is width-agnostic.
+    return row_ptr_[node_idx + 1] - row_ptr_[node_idx];
+}
+
 ConstU64Span TopologySnapshotReader::neighbors(uint64_t node_idx) const {
     if (!has_data_) {
         throw std::out_of_range(
             "TopologySnapshotReader::neighbors: reader has no data "
             "(call has_data() first)");
+    }
+    if (header_.id_width != kTopologySnapshotIdWidth) {
+        // Narrow (uint32) layout: a uint64 span would be a wrong
+        // reinterpret-cast of tag-stripped uint32 ordinals. Direct callers
+        // to the width-agnostic copy_neighbors() (or raw col_idx32_row()).
+        throw TopologySnapshotFormatError(
+            "TopologySnapshotReader::neighbors: uint64 span unavailable for "
+            "id_width=4 (use copy_neighbors() or col_idx32_row())");
     }
     if (node_idx >= header_.num_nodes) {
         throw std::out_of_range(
@@ -418,6 +542,11 @@ ConstU64Span TopologySnapshotReader::edge_ids(uint64_t node_idx) const {
             "TopologySnapshotReader::edge_ids: reader has no data "
             "(call has_data() first)");
     }
+    if (header_.id_width != kTopologySnapshotIdWidth) {
+        throw TopologySnapshotFormatError(
+            "TopologySnapshotReader::edge_ids: uint64 span unavailable for "
+            "id_width=4 (use copy_edge_ids() or edge_ids32_row())");
+    }
     if (node_idx >= header_.num_nodes) {
         throw std::out_of_range(
             "TopologySnapshotReader::edge_ids: node_idx "
@@ -431,6 +560,116 @@ ConstU64Span TopologySnapshotReader::edge_ids(uint64_t node_idx) const {
     const uint64_t end   = row_ptr_[node_idx + 1];
     return ConstU64Span(edge_ids_ + start,
                         static_cast<std::size_t>(end - start));
+}
+
+// ---------------------------------------------------------------------------
+// Width-agnostic copy accessors (work for id_width ∈ {4, 8})
+// ---------------------------------------------------------------------------
+//
+// For id_width==8 the stored values are full tagged ObjectIds → straight
+// memcpy. For id_width==4 each stored uint32 is the tag-stripped ordinal;
+// we widen it and OR the per-section type tag (carried in the header) back
+// into the top byte, reproducing the EXACT tagged ObjectId the uint64 layout
+// would have stored. This is the losslessness contract that lets the cora
+// byte-identical batches.dat gate pass for both widths.
+
+void TopologySnapshotReader::copy_neighbors(
+    uint64_t node_idx, std::vector<uint64_t>& out) const {
+    if (!has_data_) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::copy_neighbors: reader has no data "
+            "(call has_data() first)");
+    }
+    if (node_idx >= header_.num_nodes) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::copy_neighbors: node_idx "
+            + std::to_string(node_idx) + " >= num_nodes "
+            + std::to_string(header_.num_nodes));
+    }
+    const uint64_t start = row_ptr_[node_idx];
+    const uint64_t end   = row_ptr_[node_idx + 1];
+    const std::size_t deg = static_cast<std::size_t>(end - start);
+    out.reserve(out.size() + deg);
+    if (header_.id_width == kTopologySnapshotIdWidthNarrow) {
+        const uint64_t tag =
+            static_cast<uint64_t>(header_.dst_type_tag) << 56;
+        for (uint64_t i = start; i < end; ++i) {
+            out.push_back(tag | static_cast<uint64_t>(col_idx32_[i]));
+        }
+    } else {
+        out.insert(out.end(), col_idx_ + start, col_idx_ + end);
+    }
+}
+
+void TopologySnapshotReader::copy_edge_ids(
+    uint64_t node_idx, std::vector<uint64_t>& out) const {
+    if (!has_data_) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::copy_edge_ids: reader has no data "
+            "(call has_data() first)");
+    }
+    if (node_idx >= header_.num_nodes) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::copy_edge_ids: node_idx "
+            + std::to_string(node_idx) + " >= num_nodes "
+            + std::to_string(header_.num_nodes));
+    }
+    const bool has_eids =
+        (header_.flags & TopologySnapshotFlags::kHasEdgeIds) != 0;
+    if (!has_eids) {
+        return;  // No EDGE_IDS section — append nothing (matches edge_ids()).
+    }
+    const uint64_t start = row_ptr_[node_idx];
+    const uint64_t end   = row_ptr_[node_idx + 1];
+    const std::size_t deg = static_cast<std::size_t>(end - start);
+    out.reserve(out.size() + deg);
+    if (header_.id_width == kTopologySnapshotIdWidthNarrow) {
+        const uint64_t tag =
+            static_cast<uint64_t>(header_.edge_type_tag) << 56;
+        for (uint64_t i = start; i < end; ++i) {
+            out.push_back(tag | static_cast<uint64_t>(edge_ids32_[i]));
+        }
+    } else {
+        out.insert(out.end(), edge_ids_ + start, edge_ids_ + end);
+    }
+}
+
+const uint32_t* TopologySnapshotReader::col_idx32_row(uint64_t node_idx) const {
+    if (!has_data_ || header_.id_width != kTopologySnapshotIdWidthNarrow
+        || col_idx32_ == nullptr) {
+        return nullptr;
+    }
+    if (node_idx >= header_.num_nodes) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::col_idx32_row: node_idx "
+            + std::to_string(node_idx) + " >= num_nodes "
+            + std::to_string(header_.num_nodes));
+    }
+    return col_idx32_ + row_ptr_[node_idx];
+}
+
+const uint32_t* TopologySnapshotReader::edge_ids32_row(uint64_t node_idx) const {
+    if (!has_data_ || header_.id_width != kTopologySnapshotIdWidthNarrow
+        || edge_ids32_ == nullptr) {
+        return nullptr;
+    }
+    if (node_idx >= header_.num_nodes) {
+        throw std::out_of_range(
+            "TopologySnapshotReader::edge_ids32_row: node_idx "
+            + std::to_string(node_idx) + " >= num_nodes "
+            + std::to_string(header_.num_nodes));
+    }
+    return edge_ids32_ + row_ptr_[node_idx];
+}
+
+void TopologySnapshotReader::advise_access(bool sequential) const noexcept {
+    if (!has_data_ || map_base_ == nullptr || file_size_ == 0) {
+        return;
+    }
+    // Best-effort perf hint only — never affects correctness, so failures
+    // (EINVAL on some mount options) are silently ignored, matching the
+    // open()-time MADV_RANDOM policy.
+    ::madvise(map_base_, file_size_, sequential ? MADV_SEQUENTIAL : MADV_RANDOM);
 }
 
 // ---------------------------------------------------------------------------

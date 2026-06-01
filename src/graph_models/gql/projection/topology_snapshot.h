@@ -16,9 +16,12 @@
 //   ────────────────────────────────────────────────────────────────────
 //   0       8     magic              "TOPOCSR1" (8 ASCII bytes, no NUL)
 //   8       4     version            uint32 = 1
-//   12      1     id_width           uint8 = 8 (reserved for Spec #6)
+//   12      1     id_width           uint8 = 8 (full ObjectId) or 4 (Spec #6, tag-stripped)
 //   13      1     flags              bit 0 = has_edge_ids; rest reserved=0
-//   14      2     reserved0          zero-filled
+//   14      1     dst_type_tag       uint8 — ObjectId type tag re-applied to COL_IDX
+//                                    values when id_width==4; 0 when id_width==8.
+//   15      1     edge_type_tag      uint8 — ObjectId type tag re-applied to EDGE_IDS
+//                                    values when id_width==4; 0 when id_width==8.
 //   16      8     num_nodes          uint64 N
 //   24      8     num_edges          uint64 M
 //   32      32    source_sha256      SHA-256 of source .leaf file
@@ -48,9 +51,24 @@ inline constexpr std::array<uint8_t, 8> kTopologySnapshotMagic = {
 /// Currently supported on-disk version.
 inline constexpr uint32_t kTopologySnapshotVersion = 1;
 
-/// ObjectId width in bytes. Fixed at 8 for this Spec; reserved for a future
-/// bit-packed uint32 variant (Spec #6). Any other value is rejected on parse.
+/// Default ObjectId width in bytes (full tagged ObjectId.id). Writers emit
+/// this unless the narrow uint32 variant is eligible (Spec #6).
 inline constexpr uint8_t kTopologySnapshotIdWidth = 8;
+
+/// Narrow ObjectId width (Spec #6): COL_IDX / EDGE_IDS stored as uint32 of the
+/// tag-stripped value (id & 0x00FFFFFFFFFFFFFF), with the constant per-section
+/// type tag carried in the header (dst_type_tag / edge_type_tag) and re-OR'd
+/// onto each value on read. Lossless iff every value < 2^32 after masking and
+/// every entry in a section shares one type tag. Parse accepts {4, 8}.
+inline constexpr uint8_t kTopologySnapshotIdWidthNarrow = 4;
+
+/// Bit mask that strips the 8-bit ObjectId type tag, leaving the 56-bit value.
+inline constexpr uint64_t kTopologySnapshotValueMask = 0x00FFFFFFFFFFFFFFULL;
+
+/// True iff `w` is a supported on-disk id width.
+inline constexpr bool topology_snapshot_id_width_valid(uint8_t w) {
+    return w == kTopologySnapshotIdWidth || w == kTopologySnapshotIdWidthNarrow;
+}
 
 /// Flag bits in `TopologySnapshotHeader::flags`.
 ///
@@ -83,9 +101,10 @@ inline constexpr std::size_t kTopologySnapshotHeaderSize = 64;
 struct TopologySnapshotHeader {
     uint8_t  magic[8];            // "TOPOCSR1"
     uint32_t version;             // kTopologySnapshotVersion
-    uint8_t  id_width;            // kTopologySnapshotIdWidth
+    uint8_t  id_width;            // 8 (full) or 4 (Spec #6 tag-stripped uint32)
     uint8_t  flags;               // TopologySnapshotFlags::*
-    uint8_t  reserved0[2];        // zero-filled on write, preserved on read
+    uint8_t  dst_type_tag;        // Spec #6: tag re-applied to COL_IDX when id_width==4; else 0
+    uint8_t  edge_type_tag;       // Spec #6: tag re-applied to EDGE_IDS when id_width==4; else 0
     uint64_t num_nodes;           // N (number of source nodes)
     uint64_t num_edges;           // M (number of edges)
     uint8_t  source_sha256[32];   // SHA-256 of source .leaf file
@@ -145,11 +164,10 @@ inline TopologySnapshotHeader parse_topology_snapshot_header(
             std::to_string(header.version) + " (expected " +
             std::to_string(kTopologySnapshotVersion) + ")");
     }
-    if (header.id_width != kTopologySnapshotIdWidth) {
+    if (!topology_snapshot_id_width_valid(header.id_width)) {
         throw TopologySnapshotFormatError(
             "TopologySnapshot: unsupported id_width " +
-            std::to_string(header.id_width) + " (expected " +
-            std::to_string(kTopologySnapshotIdWidth) + ")");
+            std::to_string(header.id_width) + " (expected 4 or 8)");
     }
     return header;
 }
@@ -166,8 +184,9 @@ inline TopologySnapshotHeader make_default_topology_snapshot_header() noexcept {
     header.version  = kTopologySnapshotVersion;
     header.id_width = kTopologySnapshotIdWidth;
     header.flags    = 0;
-    // reserved0, num_nodes, num_edges, source_sha256 are zero-initialized
-    // via value-initialization above.
+    // dst_type_tag, edge_type_tag, num_nodes, num_edges, source_sha256 are
+    // zero-initialized via value-initialization above. The narrow (id_width==4)
+    // writer sets the tag bytes explicitly.
     return header;
 }
 

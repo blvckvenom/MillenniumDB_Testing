@@ -29,6 +29,7 @@
 // Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
 //                 §3.7, §4.3, §5.1, §5.3
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -156,6 +157,22 @@ private:
     std::filesystem::path final_path_;        // `topology_{fwd,rev}.csr`
     std::filesystem::path tmp_path_;          // `.csr.tmp`
 
+    // COL_IDX / EDGE_IDS element width in bytes (Spec #6). 8 (default, full
+    // tagged ObjectId, byte-identical to the legacy layout) or 4 (tag-stripped
+    // uint32). Selected once in the ctor from eligibility (num_nodes / num_edges
+    // both < 2^32) AND the `MDB_GNN_TOPOLOGY_UINT32` env opt-in. ROW_PTR is
+    // always uint64 regardless of this. See `element_size_()`.
+    uint8_t id_width_ = kTopologySnapshotIdWidth;
+
+    // Sentinel for "type tag not yet captured" (valid tags are 0..255).
+    static constexpr uint16_t kTagUnset = 0x100;
+    // Per-section ObjectId type tag, captured once on the first narrow append
+    // and asserted consistent thereafter (the narrow layout requires a single
+    // tag per section). Atomic so the parallel `append_subrange` path is
+    // race-free. Unused (stays kTagUnset) when id_width_ == 8.
+    std::atomic<uint16_t> dst_tag_{kTagUnset};
+    std::atomic<uint16_t> edge_tag_{kTagUnset};
+
     // ROW_PTR[0..N], prefix-sum of `degrees`. Kept in RAM for the cursor
     // tracking in `append_edge()`; sized (N+1) × 8 B.
     std::vector<uint64_t> row_ptr_;
@@ -190,13 +207,31 @@ private:
     // single uint64_t per section — no sparse writes are possible under
     // the monotonicity contract.
     static constexpr std::size_t kCoalesceBytes = 1 << 20;  // 1 MiB
-    std::vector<uint64_t> col_idx_buf_;   // pending COL_IDX words
+    std::vector<uint64_t> col_idx_buf_;   // pending COL_IDX words (already masked when narrow)
     std::vector<uint64_t> edge_ids_buf_;  // pending EDGE_IDS words (may be empty)
     uint64_t              col_idx_flushed_words_  = 0;
     uint64_t              edge_ids_flushed_words_ = 0;
 
+    // Reused uint32 staging for the narrow (id_width_==4) flush: the
+    // accumulation buffers stay uint64 (holding masked values < 2^32), and
+    // each flush narrows into these before the pwrite. Empty when id_width_==8.
+    std::vector<uint32_t> col_idx_buf32_;
+    std::vector<uint32_t> edge_ids_buf32_;
+
     void flush_col_idx_buffer_();
     void flush_edge_ids_buffer_();
+
+    // COL_IDX / EDGE_IDS on-disk element width in bytes (4 or 8). ROW_PTR is
+    // always uint64 and never uses this.
+    std::size_t element_size_() const noexcept {
+        return static_cast<std::size_t>(id_width_);
+    }
+
+    // Capture (first call) or validate (subsequent) the per-section ObjectId
+    // type tag for the narrow layout. Thread-safe via CAS on `slot`. Throws
+    // `std::runtime_error` if a section mixes more than one type tag. `what`
+    // names the section for the error message ("dst" / "edge").
+    void capture_tag_(std::atomic<uint16_t>& slot, uint8_t tag, const char* what);
 
     // Write `len` bytes at file offset `offset`, handling short writes and
     // EINTR. All writes go via pwrite so the file-position cursor never

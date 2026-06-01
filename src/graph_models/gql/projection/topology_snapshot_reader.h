@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <vector>
 
 #include "graph_models/gql/projection/topology_snapshot.h"
 
@@ -104,8 +105,31 @@ public:
             && (header_.flags & TopologySnapshotFlags::kHasEdgeIds) != 0;
     }
 
-    /// O(1) slice into the mmap'd COL_IDX section.
-    /// Precondition: `has_data() == true` and `node_idx < num_nodes()`.
+    /// On-disk COL_IDX / EDGE_IDS element width in bytes: 8 (full tagged
+    /// ObjectId, default) or 4 (Spec #6 tag-stripped uint32). Returns the
+    /// default width when `has_data() == false`. Callers that need a single
+    /// width-agnostic code path should use `copy_neighbors()` / `degree()`
+    /// rather than branching on this.
+    uint8_t  id_width() const noexcept {
+        return has_data_ ? header_.id_width : kTopologySnapshotIdWidth;
+    }
+
+    /// ObjectId type tag re-applied to narrow (id_width==4) COL_IDX values to
+    /// reconstruct the full tagged ObjectId. 0 when id_width==8 (values are
+    /// already full ObjectIds on disk).
+    uint8_t  dst_type_tag()  const noexcept { return header_.dst_type_tag; }
+    /// ObjectId type tag re-applied to narrow (id_width==4) EDGE_IDS values.
+    uint8_t  edge_type_tag() const noexcept { return header_.edge_type_tag; }
+
+    /// O(1) neighbor count of `node_idx` — `ROW_PTR[node_idx+1] - ROW_PTR[node_idx]`.
+    /// Width-agnostic (ROW_PTR is uint64 regardless of `id_width`), so this is
+    /// the correct way to get a degree without materialising neighbors. Same
+    /// out-of-range / no-data hardening as `neighbors()`.
+    uint64_t degree(uint64_t node_idx) const;
+
+    /// O(1) slice into the mmap'd COL_IDX section, as full tagged ObjectIds.
+    /// Precondition: `has_data() == true`, `id_width() == 8`, and
+    /// `node_idx < num_nodes()`.
     /// Bounds violation → throws `std::out_of_range` in every build config
     /// (same hardening discipline as `TopologySnapshotWriter::append_edge`'s
     /// always-on invariant checks — a silent out-of-range mmap read is a
@@ -113,12 +137,52 @@ public:
     /// Calling while `has_data() == false` is also rejected with
     /// `std::out_of_range` rather than returning an empty span, so misuse
     /// surfaces at the caller rather than being papered over.
+    /// When `id_width() == 4` the on-disk values are uint32, so a uint64 span
+    /// would be a wrong reinterpret-cast: this throws `TopologySnapshotFormatError`
+    /// directing the caller to `copy_neighbors()` (or the raw `col_idx32_row()`).
     ConstU64Span neighbors(uint64_t node_idx) const;
 
     /// O(1) slice into the mmap'd EDGE_IDS section. Returns an empty span
     /// when `has_edge_ids() == false` (but `has_data()` still constrains
-    /// access — see `neighbors()` contract). Same out-of-range rules.
+    /// access — see `neighbors()` contract). Same out-of-range rules, and
+    /// the same `id_width()==4` throw → use `copy_edge_ids()`.
     ConstU64Span edge_ids(uint64_t node_idx) const;
+
+    /// Width-agnostic copy accessor: appends the neighbors of `node_idx` to
+    /// `out` as full tagged ObjectIds, for BOTH id widths. For id_width==8
+    /// this is a memcpy of the stored uint64s; for id_width==4 each stored
+    /// uint32 is widened and OR'd with `dst_type_tag()` shifted into the top
+    /// byte, reproducing the exact tagged ObjectId the uint64 layout would
+    /// have stored (the losslessness contract — see spec §"Why lossless").
+    /// `out` is appended to (not cleared); the caller may `reserve` via
+    /// `degree()`. Same out-of-range / no-data hardening as `neighbors()`.
+    void copy_neighbors(uint64_t node_idx, std::vector<uint64_t>& out) const;
+
+    /// Width-agnostic copy accessor for EDGE_IDS — see `copy_neighbors()`.
+    /// Appends nothing when `has_edge_ids() == false`.
+    void copy_edge_ids(uint64_t node_idx, std::vector<uint64_t>& out) const;
+
+    /// Raw pointer into the narrow (id_width==4) COL_IDX section at
+    /// `node_idx`'s first neighbor. Returns nullptr unless `has_data()` and
+    /// `id_width() == 4`. Length is `degree(node_idx)`. Values are the
+    /// tag-stripped uint32 ordinals; the caller reconstructs full ObjectIds
+    /// via `dst_type_tag()`. This zero-copy path exists for the four-level
+    /// store's hot tier-3 dispatch, which must avoid a per-lookup allocation
+    /// over the papers100M cold tail. Out-of-range `node_idx` throws.
+    const uint32_t* col_idx32_row(uint64_t node_idx) const;
+    /// Raw pointer into the narrow EDGE_IDS section — see `col_idx32_row()`.
+    /// Returns nullptr unless `has_data()`, `id_width()==4`, and `has_edge_ids()`.
+    const uint32_t* edge_ids32_row(uint64_t node_idx) const;
+
+    /// Re-advise the kernel about the access pattern over the mmap'd file.
+    /// `open()` sets MADV_RANDOM (correct for the seed-driven runtime sampler).
+    /// A forward, offset-monotone scan (the four-level populate) should flip to
+    /// MADV_SEQUENTIAL for the scan and restore MADV_RANDOM after — that gives
+    /// the kernel aggressive readahead AND frees pages behind the read pointer
+    /// (lower peak cache than RANDOM). Best-effort: no-op when `has_data()` is
+    /// false; madvise failure is silently ignored (it only affects perf).
+    /// `sequential=true` → MADV_SEQUENTIAL; `false` → MADV_RANDOM.
+    void advise_access(bool sequential) const noexcept;
 
     /// Access the parsed header. Zero-initialized when `has_data() == false`.
     /// Downstream components (T4.10) use `header().source_sha256` as the
@@ -157,11 +221,17 @@ private:
 
     // Pointers into `map_base_`. Valid iff `has_data_`.
     //   row_ptr_[0..N]  — offsets in element counts (not bytes) into col_idx.
-    //   col_idx_[0..M-1] — neighbor ids.
-    //   edge_ids_[0..M-1] — edge ids, only when `has_edge_ids()`.
-    const uint64_t* row_ptr_  = nullptr;
-    const uint64_t* col_idx_  = nullptr;
-    const uint64_t* edge_ids_ = nullptr;
+    //                     ALWAYS uint64 regardless of id_width.
+    //   col_idx_[0..M-1] / edge_ids_[0..M-1]   — set when id_width==8 (full
+    //                     tagged ObjectIds); nullptr when id_width==4.
+    //   col_idx32_[0..M-1] / edge_ids32_[0..M-1] — set when id_width==4
+    //                     (tag-stripped uint32 ordinals); nullptr when ==8.
+    // Exactly one of {col_idx_, col_idx32_} is non-null when has_data_.
+    const uint64_t* row_ptr_    = nullptr;
+    const uint64_t* col_idx_    = nullptr;
+    const uint64_t* edge_ids_   = nullptr;
+    const uint32_t* col_idx32_  = nullptr;
+    const uint32_t* edge_ids32_ = nullptr;
 
     // Owned file descriptor for the mmap backing file. Kept open through
     // the reader's lifetime because some kernels require the fd for certain
