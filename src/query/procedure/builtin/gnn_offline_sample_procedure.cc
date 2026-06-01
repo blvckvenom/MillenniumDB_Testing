@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -348,6 +349,17 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // path (numWorkers=0); matches the parallel pool size otherwise.
     ctx.yield("numWorkersUsed", ctx.create_int(
         static_cast<int64_t>(result.num_workers_used)));
+
+    // STEP 8 content fingerprint, surfaced as a 16-char hex STRING (avoids the
+    // signed-int64 high-bit wrap a numeric yield would suffer). Order/worker-
+    // invariant (sort-then-XOR-fold) — the O(1) semantic-equality gate for
+    // parallelism work (numWorkers, single-vs-parallel populate).
+    {
+        char fp_hex[17];
+        std::snprintf(fp_hex, sizeof(fp_hex), "%016llx",
+                      static_cast<unsigned long long>(result.catalog.sample_content_fp));
+        ctx.yield("sampleContentFp", ctx.create_string(std::string(fp_hex)));
+    }
 
     ctx.yield_row();
 }

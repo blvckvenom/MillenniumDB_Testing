@@ -135,7 +135,13 @@ public:
             YieldField{"phase0LookupsDone", YieldType::INT,
                 "Plan E (2026-05-11): total neighbor lookups during Phase 0"},
             YieldField{"phase0Millis", YieldType::INT,
-                "Plan E (2026-05-11): Phase 0 elapsed time in milliseconds"}
+                "Plan E (2026-05-11): Phase 0 elapsed time in milliseconds"},
+            YieldField{"sampleContentFp", YieldType::STRING,
+                "Content fingerprint of the sample (STEP 8): hex of the "
+                "order-independent XOR fold over batch node-sets + layer shapes "
+                "+ edge endpoints. Worker/order-invariant — use as the O(1) "
+                "semantic-equality gate across numWorkers and single-vs-parallel "
+                "populate instead of re-running train and comparing testAccuracy."}
         };
     }
 
