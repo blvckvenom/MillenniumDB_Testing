@@ -139,6 +139,24 @@ if(PROFILE)
     add_definitions(-DBOOST_STACKTRACE_USE_ADDR2LINE)
 endif(PROFILE)
 
+# USE_TCMALLOC — link tcmalloc_minimal as the process-wide allocator (opt-in,
+# default OFF). The offline-sampling loop builds + tears down ~11K small result
+# vectors + 5 unordered_{map,set} per batch across up to 16 workers, hammering
+# glibc ptmalloc2; tcmalloc's thread-local free lists relieve that with ZERO
+# source change and bit-identical output. Default OFF keeps the legacy allocator
+# so a build can A/B it. Requires `apt install google-perftools
+# libgoogle-perftools-dev` (provides libtcmalloc_minimal).
+option(USE_TCMALLOC "Link tcmalloc_minimal as the global allocator" OFF)
+if(USE_TCMALLOC)
+    find_library(TCMALLOC_LIB NAMES tcmalloc_minimal tcmalloc)
+    if(NOT TCMALLOC_LIB)
+        message(FATAL_ERROR
+            "USE_TCMALLOC=ON but libtcmalloc_minimal not found — "
+            "install: apt install google-perftools libgoogle-perftools-dev")
+    endif()
+    message(STATUS "USE_TCMALLOC: linking ${TCMALLOC_LIB} as the global allocator")
+endif()
+
 
 # When compiling with Clang generate debug info specifically for lldb
 if(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
@@ -267,6 +285,12 @@ foreach(target ${BUILD_TARGETS})
         # whose only consumer under LTO is mdb_gnn/projection/topology_accessor)
         # is still resolved by the single-pass ld.bfd static-archive linker.
         target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES} millenniumdb)
+    endif()
+    # tcmalloc must come LAST + --no-as-needed so its malloc/free strong symbols
+    # win over libc and the lib is not dropped by the linker. Overrides the
+    # allocator process-wide for the executable.
+    if(USE_TCMALLOC)
+        target_link_libraries(${target} -Wl,--no-as-needed ${TCMALLOC_LIB})
     endif()
 endforeach(target)
 
