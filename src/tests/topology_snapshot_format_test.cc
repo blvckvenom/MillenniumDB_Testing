@@ -15,6 +15,7 @@
 
 using GQL::Projection::kTopologySnapshotHeaderSize;
 using GQL::Projection::kTopologySnapshotIdWidth;
+using GQL::Projection::kTopologySnapshotIdWidthNarrow;
 using GQL::Projection::kTopologySnapshotMagic;
 using GQL::Projection::kTopologySnapshotVersion;
 using GQL::Projection::make_default_topology_snapshot_header;
@@ -32,8 +33,8 @@ namespace {
 TopologySnapshotHeader make_sentinel_header() {
     TopologySnapshotHeader h = make_default_topology_snapshot_header();
     h.flags        = Flags::kHasEdgeIds;
-    h.reserved0[0] = 0x00;  // must stay zero for well-formed files
-    h.reserved0[1] = 0x00;
+    h.dst_type_tag = 0x00;   // id_width==8 -> tag bytes stay zero
+    h.edge_type_tag = 0x00;
     h.num_nodes    = 0x0123456789ABCDEFULL;
     h.num_edges    = 0xFEDCBA9876543210ULL;
     for (std::size_t i = 0; i < 32; ++i) {
@@ -76,8 +77,8 @@ TEST(TopologySnapshotFormat, HeaderRoundTripPreservesFields) {
     EXPECT_EQ(dst.version, kTopologySnapshotVersion);
     EXPECT_EQ(dst.id_width, kTopologySnapshotIdWidth);
     EXPECT_EQ(dst.flags, Flags::kHasEdgeIds);
-    EXPECT_EQ(dst.reserved0[0], 0);
-    EXPECT_EQ(dst.reserved0[1], 0);
+    EXPECT_EQ(dst.dst_type_tag, 0);
+    EXPECT_EQ(dst.edge_type_tag, 0);
     EXPECT_EQ(dst.num_nodes, src.num_nodes);
     EXPECT_EQ(dst.num_edges, src.num_edges);
     EXPECT_EQ(0, std::memcmp(dst.source_sha256, src.source_sha256, 32));
@@ -133,33 +134,30 @@ TEST(TopologySnapshotFormat, BadVersionRejected) {
 }
 
 // ---------------------------------------------------------------------------
-// id_width values other than 8 are rejected. This field is reserved for a
-// future bit-packed uint32 format (Spec #6). Exercising both smaller (4)
-// and larger (16) values catches off-by-one bugs in the validator.
+// id_width: 8 (full ObjectId) and 4 (Spec #6 tag-stripped uint32) are valid;
+// every other value is rejected. Catches off-by-one bugs in the validator.
 // ---------------------------------------------------------------------------
 TEST(TopologySnapshotFormat, BadIdWidthRejected) {
     TopologySnapshotHeader src = make_sentinel_header();
     uint8_t buf[kTopologySnapshotHeaderSize] = {};
 
-    src.id_width = 4;
-    serialize_topology_snapshot_header(src, buf);
-    EXPECT_THROW(parse_topology_snapshot_header(buf),
-                 TopologySnapshotFormatError);
-
-    src.id_width = 16;
-    serialize_topology_snapshot_header(src, buf);
-    EXPECT_THROW(parse_topology_snapshot_header(buf),
-                 TopologySnapshotFormatError);
-
-    src.id_width = 0;  // uninitialized zero block
-    serialize_topology_snapshot_header(src, buf);
-    EXPECT_THROW(parse_topology_snapshot_header(buf),
-                 TopologySnapshotFormatError);
-
-    // id_width = 8 round-trips cleanly.
-    src.id_width = kTopologySnapshotIdWidth;
+    // Spec #6: id_width 4 (tag-stripped uint32) is now a VALID width.
+    src.id_width = kTopologySnapshotIdWidthNarrow;  // 4
     serialize_topology_snapshot_header(src, buf);
     EXPECT_NO_THROW(parse_topology_snapshot_header(buf));
+
+    // id_width 8 (full ObjectId) round-trips cleanly.
+    src.id_width = kTopologySnapshotIdWidth;  // 8
+    serialize_topology_snapshot_header(src, buf);
+    EXPECT_NO_THROW(parse_topology_snapshot_header(buf));
+
+    // Any other width is rejected.
+    for (uint8_t bad : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{16}, uint8_t{255}}) {
+        src.id_width = bad;
+        serialize_topology_snapshot_header(src, buf);
+        EXPECT_THROW(parse_topology_snapshot_header(buf),
+                     TopologySnapshotFormatError) << "width=" << static_cast<int>(bad);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,8 +260,8 @@ TEST(TopologySnapshotFormat, DefaultHeaderIsParseable) {
     EXPECT_EQ(dst.flags, 0u);
     EXPECT_EQ(dst.num_nodes, 0u);
     EXPECT_EQ(dst.num_edges, 0u);
-    EXPECT_EQ(dst.reserved0[0], 0);
-    EXPECT_EQ(dst.reserved0[1], 0);
+    EXPECT_EQ(dst.dst_type_tag, 0);
+    EXPECT_EQ(dst.edge_type_tag, 0);
     for (std::size_t i = 0; i < 32; ++i) {
         EXPECT_EQ(dst.source_sha256[i], 0u);
     }

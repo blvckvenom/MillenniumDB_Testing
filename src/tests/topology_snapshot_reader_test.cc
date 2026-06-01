@@ -15,6 +15,7 @@
 // integration (T4.7).
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -34,7 +35,9 @@ using GQL::Projection::kTopologySnapshotHeaderSize;
 using GQL::Projection::kTopologySnapshotMagic;
 using GQL::Projection::kTopologySnapshotVersion;
 using GQL::Projection::kTopologySnapshotIdWidth;
+using GQL::Projection::kTopologySnapshotIdWidthNarrow;
 using GQL::Projection::TopologySnapshotFlags::kHasEdgeIds;
+using GQL::Projection::TopologySnapshotFormatError;
 using GQL::Projection::TopologySnapshotHeader;
 using GQL::Projection::TopologySnapshotReader;
 using GQL::Projection::TopologySnapshotWriter;
@@ -672,4 +675,233 @@ TEST_F(TopologySnapshotReaderTest, MoveSemanticsPreserveData) {
     auto n1 = b.neighbors(1);
     ASSERT_EQ(n1.size(), 1u);
     EXPECT_EQ(n1[0], 0u);
+}
+
+// ===========================================================================
+// Spec #6 — narrow (uint32) layout round-trip + losslessness vs the uint64
+// layout. The writer selects the narrow layout only under the
+// MDB_GNN_TOPOLOGY_UINT32 env opt-in; these tests force it via a RAII guard,
+// then prove the reader reconstructs byte-identical tagged ObjectIds.
+// ===========================================================================
+
+namespace {
+
+// Forces the narrow (uint32) writer opt-in for the test's duration; restores
+// the prior env on teardown so sibling tests stay on the default wide layout.
+class NarrowEnvGuard {
+public:
+    NarrowEnvGuard() {
+        if (const char* prev = std::getenv("MDB_GNN_TOPOLOGY_UINT32")) {
+            had_prev_ = true;
+            prev_     = prev;
+        }
+        ::setenv("MDB_GNN_TOPOLOGY_UINT32", "1", /*overwrite=*/1);
+    }
+    ~NarrowEnvGuard() {
+        if (had_prev_) {
+            ::setenv("MDB_GNN_TOPOLOGY_UINT32", prev_.c_str(), 1);
+        } else {
+            ::unsetenv("MDB_GNN_TOPOLOGY_UINT32");
+        }
+    }
+private:
+    bool        had_prev_ = false;
+    std::string prev_;
+};
+
+// Per-section ObjectId type tags used by the narrow tests. Picked to exercise
+// a real top-byte tag (the papers100M sidecar bug f71b3bf0 surfaced 0xD4).
+constexpr uint64_t kDstTag = 0xD4ull << 56;
+constexpr uint64_t kEidTag = 0xE2ull << 56;
+
+}  // namespace
+
+// Build the SAME tagged graph twice — once narrow (env on), once wide (env
+// off) — and assert the reader yields byte-identical tagged ObjectIds for
+// every node via the width-agnostic copy accessors, while the narrow file is
+// strictly smaller and the zero-copy uint64 span throws for the narrow layout.
+TEST_F(TopologySnapshotReaderTest, NarrowRoundTripLosslessVsWide) {
+    auto build = [&](const std::filesystem::path& d) {
+        std::filesystem::create_directories(d);
+        {
+            std::ofstream f(d / "from_to_edge.leaf",
+                            std::ios::binary | std::ios::trunc);
+            f << "narrow-vs-wide-payload";
+        }
+        // 0 → {1, 2}, 1 → {3}, 2 → {0}, 3 → {1}; dst + edge ids carry tags.
+        TopologySnapshotWriter w(d, TopologySnapshotWriter::Direction::FORWARD,
+                                 /*num_nodes=*/4, /*degrees=*/{2, 1, 1, 1},
+                                 /*include_edge_ids=*/true);
+        w.append_edge(oid(0), oid(kDstTag | 1), oid(kEidTag | 10));
+        w.append_edge(oid(0), oid(kDstTag | 2), oid(kEidTag | 11));
+        w.append_edge(oid(1), oid(kDstTag | 3), oid(kEidTag | 12));
+        w.append_edge(oid(2), oid(kDstTag | 0), oid(kEidTag | 13));
+        w.append_edge(oid(3), oid(kDstTag | 1), oid(kEidTag | 14));
+        w.finalize();
+    };
+
+    const auto narrow_dir = dir_ / "narrow";
+    const auto wide_dir   = dir_ / "wide";
+    { NarrowEnvGuard g; build(narrow_dir); }
+    build(wide_dir);  // env restored → wide layout
+
+    auto rn = TopologySnapshotReader::open(
+        narrow_dir, TopologySnapshotReader::Direction::FORWARD);
+    auto rw = TopologySnapshotReader::open(
+        wide_dir, TopologySnapshotReader::Direction::FORWARD);
+    ASSERT_TRUE(rn.has_data());
+    ASSERT_TRUE(rw.has_data());
+
+    EXPECT_EQ(rn.id_width(), kTopologySnapshotIdWidthNarrow);
+    EXPECT_EQ(rw.id_width(), kTopologySnapshotIdWidth);
+    EXPECT_EQ(rn.dst_type_tag(), 0xD4u);
+    EXPECT_EQ(rn.edge_type_tag(), 0xE2u);
+    // Wide header carries no tag bytes.
+    EXPECT_EQ(rw.dst_type_tag(), 0u);
+    EXPECT_EQ(rw.edge_type_tag(), 0u);
+
+    // Narrow file is strictly smaller: COL_IDX + EDGE_IDS halved (4B vs 8B),
+    // ROW_PTR identical.
+    EXPECT_LT(std::filesystem::file_size(narrow_dir / "topology_fwd.csr"),
+              std::filesystem::file_size(wide_dir / "topology_fwd.csr"));
+
+    // Per-node: degree + reconstructed tagged neighbors/edge_ids identical.
+    for (uint64_t v = 0; v < 4; ++v) {
+        EXPECT_EQ(rn.degree(v), rw.degree(v)) << "degree mismatch at v=" << v;
+
+        std::vector<uint64_t> nn, wn;
+        rn.copy_neighbors(v, nn);
+        rw.copy_neighbors(v, wn);
+        EXPECT_EQ(nn, wn) << "neighbor reconstruction mismatch at v=" << v;
+        for (uint64_t x : nn) {
+            EXPECT_EQ(x >> 56, 0xD4u)
+                << "narrow reader must restore the dst type tag at v=" << v;
+        }
+
+        std::vector<uint64_t> ne, we;
+        rn.copy_edge_ids(v, ne);
+        rw.copy_edge_ids(v, we);
+        EXPECT_EQ(ne, we) << "edge_id reconstruction mismatch at v=" << v;
+        for (uint64_t x : ne) {
+            EXPECT_EQ(x >> 56, 0xE2u)
+                << "narrow reader must restore the edge type tag at v=" << v;
+        }
+    }
+
+    // The zero-copy uint64 span is unavailable for the narrow layout.
+    EXPECT_THROW(rn.neighbors(0), TopologySnapshotFormatError);
+    EXPECT_THROW(rn.edge_ids(0), TopologySnapshotFormatError);
+    // ... but still works for the wide layout.
+    EXPECT_NO_THROW(rw.neighbors(0));
+    EXPECT_NO_THROW(rw.edge_ids(0));
+}
+
+// The narrow zero-copy raw-uint32 accessors (used by the four-level store's
+// hot tier-3 dispatch) return non-null pointers whose widened+tagged values
+// match copy_neighbors; the wide layout returns nullptr from them.
+TEST_F(TopologySnapshotReaderTest, NarrowZeroCopyU32PointersReconstruct) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "narrow-u32-ptr-payload");
+    {
+        NarrowEnvGuard g;
+        TopologySnapshotWriter w(dir_, TopologySnapshotWriter::Direction::FORWARD,
+                                 /*num_nodes=*/3, /*degrees=*/{2, 1, 0},
+                                 /*include_edge_ids=*/true);
+        w.append_edge(oid(0), oid(kDstTag | 1), oid(kEidTag | 7));
+        w.append_edge(oid(0), oid(kDstTag | 2), oid(kEidTag | 8));
+        w.append_edge(oid(1), oid(kDstTag | 0), oid(kEidTag | 9));
+        w.finalize();
+    }
+    auto r = TopologySnapshotReader::open(
+        dir_, TopologySnapshotReader::Direction::FORWARD);
+    ASSERT_TRUE(r.has_data());
+    ASSERT_EQ(r.id_width(), kTopologySnapshotIdWidthNarrow);
+
+    const uint32_t* col0 = r.col_idx32_row(0);
+    const uint32_t* eid0 = r.edge_ids32_row(0);
+    ASSERT_NE(col0, nullptr);
+    ASSERT_NE(eid0, nullptr);
+    const uint64_t dtag = static_cast<uint64_t>(r.dst_type_tag()) << 56;
+    const uint64_t etag = static_cast<uint64_t>(r.edge_type_tag()) << 56;
+    EXPECT_EQ(dtag | col0[0], kDstTag | 1);
+    EXPECT_EQ(dtag | col0[1], kDstTag | 2);
+    EXPECT_EQ(etag | eid0[0], kEidTag | 7);
+    EXPECT_EQ(etag | eid0[1], kEidTag | 8);
+
+    // degree-0 node: pointer is in-range but spans nothing.
+    EXPECT_NO_THROW((void)r.col_idx32_row(2));
+}
+
+// The parallel append_subrange path narrows + captures the tag via CAS and is
+// lossless on read.
+TEST_F(TopologySnapshotReaderTest, NarrowAppendSubrangeRoundTrip) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "narrow-subrange-payload");
+    {
+        NarrowEnvGuard g;
+        TopologySnapshotWriter w(dir_, TopologySnapshotWriter::Direction::FORWARD,
+                                 /*num_nodes=*/4, /*degrees=*/{2, 1, 1, 1},
+                                 /*include_edge_ids=*/true);
+        // One subrange covering all sources; dst/eid carry tags (raw, like the
+        // leaf record fields the parallel builder passes).
+        std::vector<uint64_t> dst = {kDstTag | 1, kDstTag | 2, kDstTag | 3,
+                                     kDstTag | 0, kDstTag | 1};
+        std::vector<uint64_t> eid = {kEidTag | 10, kEidTag | 11, kEidTag | 12,
+                                     kEidTag | 13, kEidTag | 14};
+        w.append_subrange(/*lo_src=*/0, /*hi_src=*/4, dst, eid);
+        w.finalize();
+    }
+    auto r = TopologySnapshotReader::open(
+        dir_, TopologySnapshotReader::Direction::FORWARD);
+    ASSERT_TRUE(r.has_data());
+    ASSERT_EQ(r.id_width(), kTopologySnapshotIdWidthNarrow);
+
+    std::vector<uint64_t> n0;
+    r.copy_neighbors(0, n0);
+    ASSERT_EQ(n0.size(), 2u);
+    EXPECT_EQ(n0[0], kDstTag | 1);
+    EXPECT_EQ(n0[1], kDstTag | 2);
+    std::vector<uint64_t> e0;
+    r.copy_edge_ids(0, e0);
+    ASSERT_EQ(e0.size(), 2u);
+    EXPECT_EQ(e0[0], kEidTag | 10);
+    EXPECT_EQ(e0[1], kEidTag | 11);
+}
+
+// A narrow section must carry a single ObjectId type tag; mixing tags is not
+// representable and must fail loud rather than silently corrupt the read.
+TEST_F(TopologySnapshotReaderTest, NarrowInconsistentDstTagThrows) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "narrow-bad-tag-payload");
+    NarrowEnvGuard g;
+    TopologySnapshotWriter w(dir_, TopologySnapshotWriter::Direction::FORWARD,
+                             /*num_nodes=*/2, /*degrees=*/{2, 0},
+                             /*include_edge_ids=*/false);
+    w.append_edge(oid(0), oid((0xD4ull << 56) | 1), ObjectId());
+    // Second dst carries a different top-byte tag → capture_tag_ rejects it.
+    EXPECT_THROW(
+        w.append_edge(oid(0), oid((0xC2ull << 56) | 0), ObjectId()),
+        std::runtime_error);
+}
+
+// The default (env unset) layout stays wide even for a small graph — proves
+// the narrow path is strictly opt-in and the legacy layout is unchanged.
+TEST_F(TopologySnapshotReaderTest, DefaultLayoutStaysWideWithoutOptIn) {
+    ::unsetenv("MDB_GNN_TOPOLOGY_UINT32");  // ensure clean default
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
+                           "default-wide-payload");
+    TopologySnapshotWriter w(dir_, TopologySnapshotWriter::Direction::FORWARD,
+                             /*num_nodes=*/2, /*degrees=*/{1, 0},
+                             /*include_edge_ids=*/false);
+    w.append_edge(oid(0), oid(kDstTag | 1), ObjectId());
+    w.finalize();
+
+    auto r = TopologySnapshotReader::open(
+        dir_, TopologySnapshotReader::Direction::FORWARD);
+    ASSERT_TRUE(r.has_data());
+    EXPECT_EQ(r.id_width(), kTopologySnapshotIdWidth);
+    // Wide layout keeps the full tagged ObjectId in the zero-copy span.
+    auto n0 = r.neighbors(0);
+    ASSERT_EQ(n0.size(), 1u);
+    EXPECT_EQ(n0[0], kDstTag | 1);
 }
