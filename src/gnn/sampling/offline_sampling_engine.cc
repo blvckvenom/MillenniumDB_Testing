@@ -241,9 +241,22 @@ struct OfflineSamplingEngine::Impl {
 
         auto start_time = std::chrono::steady_clock::now();
 
+        // Coarse do_run phase timers (sample-loop rank-1 follow-up): the
+        // direct sample-loop measurement showed the parallel batch loop is
+        // only ~27s, leaving ~188s of the ~382s total unaccounted between
+        // build() and the loop. These spans pin it: init (incl. the
+        // four-level build), seed/batch prep, and worker-pool setup.
+        auto phase_ms_ = [](std::chrono::steady_clock::time_point a,
+                             std::chrono::steady_clock::time_point b) -> long long {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+        };
+        long long init_ms_ = 0, seedprep_ms_ = 0, wsetup_ms_ = 0;
+
         try {
             // Initialize components
+            const auto t_init0_ = std::chrono::steady_clock::now();
             init_components();
+            init_ms_ = phase_ms_(t_init0_, std::chrono::steady_clock::now());
 
             // Check if storage already exists
             if (SampleStorage::exists(db_folder, config.sample_name)) {
@@ -259,6 +272,7 @@ struct OfflineSamplingEngine::Impl {
             SampleStorage sample_storage = SampleStorage::create(db_folder, config);
 
             // Get seed split
+            const auto t_seed0_ = std::chrono::steady_clock::now();
             SeedSplit split = seed_selector->get_seed_split();
 
             if (split.train_seeds.empty()) {
@@ -280,6 +294,7 @@ struct OfflineSamplingEngine::Impl {
             // Generate batches ONCE (following DiskGNN architecture)
             // Using epoch=0 for initial shuffle; training will shuffle batch ORDER
             EpochBatches batches = seed_selector->generate_epoch_batches(0);
+            seedprep_ms_ = phase_ms_(t_seed0_, std::chrono::steady_clock::now());
 
             // -----------------------------------------------------------------
             // Plan F (2026-05-11) — parallel-vs-legacy dispatch.
@@ -383,6 +398,7 @@ struct OfflineSamplingEngine::Impl {
             // (train batches first, then val, then test).
             // -----------------------------------------------------------------
             auto process_batches_parallel = [&]() -> bool {
+                const auto t_wsetup0_ = std::chrono::steady_clock::now();
                 struct WorkItem {
                     const std::vector<ObjectId>* seeds;
                     SplitType                    split;
@@ -449,6 +465,22 @@ struct OfflineSamplingEngine::Impl {
                 std::atomic<std::size_t> next_idx{0};
                 std::mutex               write_mutex;
 
+                // Sample-loop sub-stage instrumentation (analogous to the
+                // FourLevelTopologyStore::build() rank-1 split). Three atomic
+                // microsecond accumulators across all workers answer the
+                // decisive question for the 215s/56% sample loop: is it
+                // SERIAL-write-bound (in_lock ≈ wall) or CONCURRENT-assemble-
+                // bound (expand dominates, in_lock small)? wait_us is the
+                // lock-contention indicator. Logged once to stderr after join.
+                std::atomic<uint64_t> expand_us{0};   // sampler->sample() (concurrent)
+                std::atomic<uint64_t> wait_us{0};      // blocked acquiring write_mutex
+                std::atomic<uint64_t> inlock_us{0};    // write_sample + progress (serial)
+                auto dur_us_ = [](std::chrono::steady_clock::time_point a,
+                                  std::chrono::steady_clock::time_point b) -> uint64_t {
+                    return static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+                };
+
                 // QueryContext is a thread_local pointer initialized only
                 // for server-managed threads. Workers spawned via std::thread
                 // start with _query_ctx == nullptr, so the first BPT access
@@ -485,14 +517,25 @@ struct OfflineSamplingEngine::Impl {
 
                         const WorkItem& item = work[idx];
                         sampler->reseed_for_batch(item.batch_id);
+                        const auto t_exp0 = std::chrono::steady_clock::now();
                         GraphSample sample = sampler->sample(
                             *item.seeds, item.batch_id, item.split);
+                        const auto t_exp1 = std::chrono::steady_clock::now();
+                        expand_us.fetch_add(dur_us_(t_exp0, t_exp1),
+                                            std::memory_order_relaxed);
 
+                        const auto t_wait0 = std::chrono::steady_clock::now();
                         std::lock_guard<std::mutex> lk(write_mutex);
+                        const auto t_lock = std::chrono::steady_clock::now();
+                        wait_us.fetch_add(dur_us_(t_wait0, t_lock),
+                                          std::memory_order_relaxed);
                         sample_storage.write_sample(sample);
                         progress.samples_written++;
                         progress.current_batch  = item.batch_id + 1;
                         progress.current_split  = item.split;
+                        inlock_us.fetch_add(dur_us_(t_lock,
+                                            std::chrono::steady_clock::now()),
+                                            std::memory_order_relaxed);
 
                         if (progress.samples_written % progress_interval == 0) {
                             auto now = std::chrono::steady_clock::now();
@@ -520,6 +563,8 @@ struct OfflineSamplingEngine::Impl {
                 // Spawn workers. Primary runs in-thread to keep one fewer
                 // OS thread alive and to match the legacy path's behavior
                 // when num_workers == 1.
+                wsetup_ms_ = phase_ms_(t_wsetup0_, std::chrono::steady_clock::now());
+                const auto loop_start = std::chrono::steady_clock::now();
                 std::vector<std::thread> threads;
                 threads.reserve(effective_workers - 1);
                 for (auto& w : worker_samplers) {
@@ -527,6 +572,41 @@ struct OfflineSamplingEngine::Impl {
                 }
                 worker_fn(khop_sampler.get());
                 for (auto& t : threads) t.join();
+
+                // Sample-loop sub-stage split. loop_wall is the parallel
+                // region wall-clock; the three totals sum work across all
+                // workers (so each can exceed wall). Decisive reads:
+                //   inlock_total ≈ loop_wall   → serial-write-bound (attack the lock)
+                //   expand_total dominates     → concurrent-assemble-bound (attack assemble)
+                //   wait_total high            → lock contention
+                //   effParallelism = (expand+inlock)/wall ≈ workers → good scaling
+                {
+                    const double loop_wall_ms =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - loop_start).count();
+                    const double exp_ms = expand_us.load() / 1000.0;
+                    const double wait_ms = wait_us.load() / 1000.0;
+                    const double lock_ms = inlock_us.load() / 1000.0;
+                    const double eff_par =
+                        loop_wall_ms > 0 ? (exp_ms + lock_ms) / loop_wall_ms : 0.0;
+                    std::cerr << "[OfflineSamplingEngine] sample-loop split — "
+                              << "workers=" << effective_workers
+                              << " loopWallMs=" << static_cast<long long>(loop_wall_ms)
+                              << " expandMsTotal=" << static_cast<long long>(exp_ms)
+                              << " waitMsTotal=" << static_cast<long long>(wait_ms)
+                              << " inlockMsTotal=" << static_cast<long long>(lock_ms)
+                              << " effParallelism=" << eff_par
+                              << " (inlock/wall=" << (loop_wall_ms > 0 ? lock_ms / loop_wall_ms : 0.0)
+                              << ")\n";
+                    // Coarse do_run phases (locates the ~188s that is neither
+                    // build() nor the sample loop): init (incl. four-level
+                    // build), seed/batch prep, worker-pool setup.
+                    std::cerr << "[OfflineSamplingEngine] do_run phases — "
+                              << "initMs=" << init_ms_
+                              << " seedPrepMs=" << seedprep_ms_
+                              << " workerSetupMs=" << wsetup_ms_
+                              << " (initMs includes the four-level build split logged above)\n";
+                }
 
                 // R1.1 — snapshot the single shared atomic tally into the
                 // primary's plain vector (no per-worker merge: there was one

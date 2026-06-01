@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -45,6 +47,32 @@ void scan_index_into_(
         const uint64_t e = std::get<2>(*rec);
         out[a].push_back(AdjEntry{ b, e });
     }
+}
+
+// Read the cumulative "read_bytes" counter from /proc/self/io — the bytes
+// this process actually fetched from the block device (NOT page-cache hits).
+// Used to measure the physical/logical read amplification of the populate
+// phase under MADV_RANDOM (Spec #6 rank-1 instrumentation). Returns 0 on any
+// failure (non-Linux, permission, parse) so the diagnostic degrades silently.
+uint64_t read_proc_io_read_bytes_() {
+    std::ifstream f("/proc/self/io");
+    if (!f) return 0;
+    std::string key;
+    uint64_t val = 0;
+    while (f >> key) {
+        if (key == "read_bytes:") {
+            f >> val;
+            return val;
+        }
+        f >> val;  // skip this field's value
+    }
+    return 0;
+}
+
+// Milliseconds elapsed between two steady_clock samples.
+double elapsed_ms_(std::chrono::steady_clock::time_point a,
+                   std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
 }  // namespace
@@ -301,6 +329,30 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     l1_out = std::make_unique<L1HashCache>(tiers);
     l2_out = std::make_unique<L2CompactCsr>(/*hint=*/0);
 
+    // Rank-2 (Spec #6 follow-up): the populate scans the sidecar forward in
+    // file offset (ascending row_idx → ascending row_ptr). The open()-time
+    // MADV_RANDOM disables readahead → the scan faults pages one-at-a-time at
+    // QD1 (measured: ~98% of the 27.6 GB sidecar faulted @ 55 MB/s, dominating
+    // build() at 489s/62%). MADV_SEQUENTIAL for the scan gives the kernel
+    // aggressive readahead AND frees pages behind the cursor (lower peak cache
+    // than RANDOM — addresses the 5.5 GB-margin worry), then we restore
+    // MADV_RANDOM for the seed-driven runtime sampler. Pure perf hint (cannot
+    // change the bytes read), RAII-restored on any exit. Opt-out:
+    // MDB_GNN_NO_POPULATE_SEQUENTIAL=1 for A/B.
+    struct SeqAdviseGuard {
+        const GQL::Projection::TopologySnapshotReader* r;
+        bool active = false;
+        explicit SeqAdviseGuard(const GQL::Projection::TopologySnapshotReader& rr)
+            : r(&rr) {
+            const char* off = std::getenv("MDB_GNN_NO_POPULATE_SEQUENTIAL");
+            if (!(off && (off[0] == '1' || off[0] == 't' || off[0] == 'T'))) {
+                r->advise_access(/*sequential=*/true);
+                active = true;
+            }
+        }
+        ~SeqAdviseGuard() { if (active) r->advise_access(/*sequential=*/false); }
+    } seq_guard_(sidecar);
+
     const uint64_t num_nodes = sidecar.num_nodes();
     const bool     has_eids  = sidecar.has_edge_ids();
 
@@ -312,19 +364,24 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     // (or the L4 BPT direct path); promoting them to L1/L2 would defeat
     // the tier-budget contract.
     std::vector<AdjEntry> staging;
+    // Reused per-node scratch for the width-agnostic copy accessors. For
+    // id_width==8 these receive memcpy'd full ObjectIds; for id_width==4 the
+    // reader widens the uint32 ordinals + re-applies the type tag, so the
+    // values stored into AdjEntry are byte-identical across widths.
+    std::vector<uint64_t> dst_scratch;
+    std::vector<uint64_t> eid_scratch;
     for (uint64_t row_idx = 0; row_idx < num_nodes; ++row_idx) {
         if (row_idx >= tiers.size()) break;  // tier vector exhausted
         const uint8_t tier = tiers[row_idx];
         if (tier != 1 && tier != 2) continue;  // skip L3 / L4
 
-        auto dsts = sidecar.neighbors(row_idx);
-        const uint64_t* eids = nullptr;
+        dst_scratch.clear();
+        sidecar.copy_neighbors(row_idx, dst_scratch);
+        eid_scratch.clear();
         if (has_eids) {
-            auto eid_span = sidecar.edge_ids(row_idx);
-            if (eid_span.size() == dsts.size()) {
-                eids = eid_span.data();
-            }
+            sidecar.copy_edge_ids(row_idx, eid_scratch);
         }
+        const bool eids_ok = (eid_scratch.size() == dst_scratch.size());
 
         // Reuse the staging buffer across nodes so per-iteration alloc
         // overhead doesn't dominate the 1-5 us/node target. capacity is
@@ -333,11 +390,11 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
         if (row_idx < frequency.size() && frequency[row_idx] > 0) {
             staging.reserve(static_cast<std::size_t>(frequency[row_idx]));
         } else {
-            staging.reserve(dsts.size());
+            staging.reserve(dst_scratch.size());
         }
-        for (std::size_t i = 0; i < dsts.size(); ++i) {
-            const uint64_t eid = (eids != nullptr) ? eids[i] : 0ULL;
-            staging.push_back(AdjEntry{ dsts[i], eid });
+        for (std::size_t i = 0; i < dst_scratch.size(); ++i) {
+            const uint64_t eid = eids_ok ? eid_scratch[i] : 0ULL;
+            staging.push_back(AdjEntry{ dst_scratch[i], eid });
         }
 
         if (tier == 1) {
@@ -548,6 +605,17 @@ void FourLevelTopologyStore::build() {
             "store to rebuild");
     }
 
+    // Rank-1 build-phase instrumentation (Spec #6 follow-up): split the
+    // otherwise-opaque build() wall-clock into open/SHA, profile, MinHash,
+    // and populate spans, plus the physical bytes faulted during populate
+    // (/proc/self/io read_bytes). Emitted once to stderr next to the
+    // "built — ..." summary so the server log carries the breakdown without
+    // any cross-layer yield plumbing. Pure observation — never branches the
+    // build, cannot perturb sampling output.
+    using clk_ = std::chrono::steady_clock;
+    double sha_ms = 0.0, profile_ms = 0.0, minhash_ms = 0.0, populate_ms = 0.0;
+    uint64_t io_read_before = 0, io_read_after = 0;
+
     // Step 1: compute budgets.
     std::size_t l1_bytes = 0;
     std::size_t l2_bytes = 0;
@@ -558,8 +626,13 @@ void FourLevelTopologyStore::build() {
     // the BPT. The opens are no-ops when the sidecar files are absent
     // (e.g., projection built without buildTopologySnapshot:true) or
     // stale — in which case populate_direction_ falls through to the
-    // BPT path automatically.
-    open_l3_sidecars_();
+    // BPT path automatically. open() also runs the source-.leaf SHA-256
+    // staleness gate, so this span captures the SHA cost.
+    {
+        auto t0 = clk_::now();
+        open_l3_sidecars_();
+        sha_ms = elapsed_ms_(t0, clk_::now());
+    }
 
     // Step 2: build a TopologyAccessor over the storage so the profiler
     // can query degrees through a stable API. When `storage_` is null
@@ -625,7 +698,11 @@ void FourLevelTopologyStore::build() {
         // Production path: use TopologyAccessor + TopologyFrequencyProfiler.
         TopologyAccessor accessor(*storage_);
         TopologyFrequencyProfiler profiler(accessor, projection_dir_);
-        profiler.compute(config_.orientation);
+        {
+            auto t0 = clk_::now();
+            profiler.compute(config_.orientation);
+            profile_ms = elapsed_ms_(t0, clk_::now());
+        }
 
         const auto& freq = profiler.frequency();
         const std::size_t n = freq.size();
@@ -669,7 +746,17 @@ void FourLevelTopologyStore::build() {
         // warm-start data is available. Cold-start path emits a single
         // info log and leaves the permutation empty (no-op until Phase
         // 5 wires up node_counts.bin in gnn_offline_sample).
-        compute_l3_minhash_reorder_(profiler.warm_start_used());
+        {
+            auto t0 = clk_::now();
+            compute_l3_minhash_reorder_(profiler.warm_start_used());
+            minhash_ms = elapsed_ms_(t0, clk_::now());
+        }
+
+        // Populate span — the dominant, I/O-bound-at-QD1 cost on
+        // papers100M. Bracket both directions + sample /proc/self/io
+        // read_bytes around them to expose the physical read amplification.
+        io_read_before = read_proc_io_read_bytes_();
+        auto t_pop = clk_::now();
 
         // Build forward direction when needed.
         if (config_.orientation == EdgeOrientation::NATURAL ||
@@ -696,6 +783,9 @@ void FourLevelTopologyStore::build() {
             owned_l2_rev_ = std::make_unique<L2CompactCsr>(0);
             owned_l2_rev_->freeze();
         }
+
+        populate_ms = elapsed_ms_(t_pop, clk_::now());
+        io_read_after = read_proc_io_read_bytes_();
     }
 
     // Wire the active references to the owned tier sources.
@@ -771,6 +861,24 @@ void FourLevelTopologyStore::build() {
               << (l3_rev_ && l3_rev_->has_data() ? l3_rev_->num_nodes() : 0)
               << " ram_used=" << total_ram_used()
               << " bytes\n";
+
+    // Rank-1 build-phase split (Spec #6 follow-up). populateBytesFaulted is
+    // the physical block-device read during populate; compare to the logical
+    // tier-1/2 sidecar bytes to see the MADV_RANDOM read amplification.
+    const double pop_mb_per_s =
+        (populate_ms > 0.0)
+            ? (static_cast<double>(io_read_after - io_read_before) / 1e6)
+              / (populate_ms / 1000.0)
+            : 0.0;
+    std::cerr << "FourLevelTopologyStore: build phase split — "
+              << "openShaMs=" << static_cast<long long>(sha_ms)
+              << " profileMs=" << static_cast<long long>(profile_ms)
+              << " minhashMs=" << static_cast<long long>(minhash_ms)
+              << " populateMs=" << static_cast<long long>(populate_ms)
+              << " populateBytesFaulted="
+              << (io_read_after >= io_read_before ? io_read_after - io_read_before : 0)
+              << " populateReadMBps=" << static_cast<long long>(pop_mb_per_s)
+              << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -903,13 +1011,29 @@ FourLevelTopologyStore::dispatch_(
             if (l3 != nullptr && l3->has_data()
                 && row_idx < l3->num_nodes())
             {
-                auto dst_span = l3->neighbors(row_idx);
-                out.l3_col_idx = dst_span.data();
-                out.l3_size    = dst_span.size();
-                if (l3->has_edge_ids()) {
-                    auto eid_span = l3->edge_ids(row_idx);
-                    if (eid_span.size() == dst_span.size()) {
-                        out.l3_edge_ids = eid_span.data();
+                // Zero-copy into the mmap for BOTH id widths. degree() is
+                // width-agnostic; the section pointers differ by width.
+                out.l3_size = static_cast<std::size_t>(l3->degree(row_idx));
+                if (l3->id_width()
+                        == GQL::Projection::kTopologySnapshotIdWidthNarrow) {
+                    // Narrow (uint32): raw pointers + pre-shifted tags; the
+                    // for_each_* helpers widen + re-OR the tag inline.
+                    out.l3_col_idx32 = l3->col_idx32_row(row_idx);
+                    out.l3_dst_tag =
+                        static_cast<uint64_t>(l3->dst_type_tag()) << 56;
+                    if (l3->has_edge_ids()) {
+                        out.l3_edge_ids32 = l3->edge_ids32_row(row_idx);
+                        out.l3_eid_tag =
+                            static_cast<uint64_t>(l3->edge_type_tag()) << 56;
+                    }
+                } else {
+                    auto dst_span = l3->neighbors(row_idx);
+                    out.l3_col_idx = dst_span.data();
+                    if (l3->has_edge_ids()) {
+                        auto eid_span = l3->edge_ids(row_idx);
+                        if (eid_span.size() == dst_span.size()) {
+                            out.l3_edge_ids = eid_span.data();
+                        }
                     }
                 }
                 out.tier = 3;

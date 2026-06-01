@@ -68,9 +68,24 @@ public:
         // L2: uint32 dst row indexes, length l2_size.
         const uint32_t*           l2_col_idx = nullptr;
         std::size_t               l2_size    = 0;
-        // L3: uint64 dst node ids, length l3_size. Owned by mmap.
-        const uint64_t*           l3_col_idx = nullptr;
-        const uint64_t*           l3_edge_ids = nullptr;  // may be nullptr
+        // L3: dst node ids, length l3_size. Owned by mmap (zero-copy).
+        // Two on-disk widths (Spec #6):
+        //   id_width==8 → l3_col_idx / l3_edge_ids point at uint64 sections
+        //                 (full tagged ObjectIds; l3_*_32 stay nullptr).
+        //   id_width==4 → l3_col_idx32 / l3_edge_ids32 point at uint32
+        //                 sections (tag-stripped ordinals); l3_dst_tag /
+        //                 l3_eid_tag carry the per-section ObjectId type tag
+        //                 PRE-SHIFTED into the top byte (tag << 56), OR'd onto
+        //                 each widened value by the for_each_* helpers to
+        //                 reconstruct the exact tagged ObjectId. This keeps
+        //                 the hot tier-3 dispatch zero-copy + zero-alloc for
+        //                 BOTH widths over the papers100M cold tail.
+        const uint64_t*           l3_col_idx   = nullptr;
+        const uint64_t*           l3_edge_ids  = nullptr;  // may be nullptr
+        const uint32_t*           l3_col_idx32  = nullptr;
+        const uint32_t*           l3_edge_ids32 = nullptr;  // may be nullptr
+        uint64_t                  l3_dst_tag    = 0;        // (dst tag << 56)
+        uint64_t                  l3_eid_tag    = 0;        // (edge tag << 56)
         std::size_t               l3_size    = 0;
         // L4: BPT direct returns full Neighbors copies — the
         // dispatcher owns the allocation here.
@@ -106,8 +121,16 @@ public:
                     }
                     break;
                 case 3:
-                    for (std::size_t i = 0; i < l3_size; ++i) {
-                        callback(l3_col_idx[i]);
+                    if (l3_col_idx32 != nullptr) {
+                        // Narrow (uint32) layout: widen + re-apply the tag.
+                        for (std::size_t i = 0; i < l3_size; ++i) {
+                            callback(l3_dst_tag
+                                     | static_cast<uint64_t>(l3_col_idx32[i]));
+                        }
+                    } else {
+                        for (std::size_t i = 0; i < l3_size; ++i) {
+                            callback(l3_col_idx[i]);
+                        }
                     }
                     break;
                 case 4:
@@ -147,10 +170,24 @@ public:
                     }
                     break;
                 case 3:
-                    for (std::size_t i = 0; i < l3_size; ++i) {
-                        const uint64_t eid =
-                            (l3_edge_ids != nullptr) ? l3_edge_ids[i] : 0ULL;
-                        callback(l3_col_idx[i], eid);
+                    if (l3_col_idx32 != nullptr) {
+                        // Narrow (uint32) layout: widen + re-apply both tags.
+                        for (std::size_t i = 0; i < l3_size; ++i) {
+                            const uint64_t eid =
+                                (l3_edge_ids32 != nullptr)
+                                    ? (l3_eid_tag
+                                       | static_cast<uint64_t>(l3_edge_ids32[i]))
+                                    : 0ULL;
+                            callback(l3_dst_tag
+                                     | static_cast<uint64_t>(l3_col_idx32[i]),
+                                     eid);
+                        }
+                    } else {
+                        for (std::size_t i = 0; i < l3_size; ++i) {
+                            const uint64_t eid =
+                                (l3_edge_ids != nullptr) ? l3_edge_ids[i] : 0ULL;
+                            callback(l3_col_idx[i], eid);
+                        }
                     }
                     break;
                 case 4:

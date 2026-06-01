@@ -135,8 +135,9 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
     eligible_nodes.reserve(static_cast<std::size_t>(n));
     eligible_weights.reserve(static_cast<std::size_t>(n));
     for (uint64_t i = 0; i < n; ++i) {
-        const uint64_t deg =
-            static_cast<uint64_t>(reader.neighbors(i).size());
+        // degree() is width-agnostic and never throws on the narrow (uint32)
+        // layout, unlike neighbors() — see TopologySnapshotReader (Spec #6).
+        const uint64_t deg = reader.degree(i);
         if (deg > 0) {
             eligible_nodes.push_back(i);
             eligible_weights.push_back(deg);
@@ -156,6 +157,11 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
         return result;
     }
 
+    // Reused scratch for the width-agnostic copy accessor. copy_neighbors()
+    // works for both id widths (memcpy for uint64; widen + re-tag for the
+    // narrow uint32 layout) and returns the exact tagged ObjectIds that the
+    // uint64 layout would expose — so the tag-strip below is unchanged.
+    std::vector<uint64_t> walk_scratch;
     for (std::size_t w = 0; w < num_walks; ++w) {
         // alias.draw() returns an index INTO eligible_nodes — map back
         // to the global node id.
@@ -165,15 +171,16 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
         result.lookups_done++;
 
         for (std::size_t step = 1; step < walk_length; ++step) {
-            auto neighbors = reader.neighbors(curr);
-            if (neighbors.empty()) {
+            walk_scratch.clear();
+            reader.copy_neighbors(curr, walk_scratch);
+            if (walk_scratch.empty()) {
                 // Dead end. Restart from a fresh seed (does not count
                 // against `lookups_done` since we never moved).
                 result.restarts++;
                 break;
             }
             std::uniform_int_distribution<std::size_t> nb_dist(
-                0, neighbors.size() - 1);
+                0, walk_scratch.size() - 1);
             const std::size_t picked = nb_dist(rng);
             // The sidecar stores `dst` as ObjectId values (top 8 bits
             // are the type tag set by `Node`/`Edge` encoding). Strip
@@ -184,7 +191,7 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
             // 100% of walks to falsely restart on the out-of-range
             // defensive check.
             constexpr uint64_t kObjectIdValueMask = 0x00FFFFFFFFFFFFFFULL;
-            const uint64_t next = neighbors[picked] & kObjectIdValueMask;
+            const uint64_t next = walk_scratch[picked] & kObjectIdValueMask;
 
             // Guard against malformed sidecars whose row_idx exceeds
             // the declared num_nodes. Genuine corruption only — the

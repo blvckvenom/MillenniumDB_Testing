@@ -183,17 +183,24 @@ struct TopologyAccessor::Impl {
         if (!fwd_csr_.has_data() || row_idx >= fwd_csr_.num_nodes()) {
             return std::nullopt;
         }
-        auto dst_span = fwd_csr_.neighbors(row_idx);
-        auto eid_span = fwd_csr_.edge_ids(row_idx);
+        // Width-agnostic copy: handles both id_width==8 (full tagged
+        // ObjectIds, memcpy) and id_width==4 (Spec #6 tag-stripped uint32,
+        // widened + re-tagged by the reader). The values returned are the
+        // exact same tagged uint64s either way, so ObjectId() wrapping is
+        // identical across widths.
+        std::vector<uint64_t> dst_tmp;
+        fwd_csr_.copy_neighbors(row_idx, dst_tmp);
+        std::vector<uint64_t> eid_tmp;
+        fwd_csr_.copy_edge_ids(row_idx, eid_tmp);
         Neighbors result;
-        result.node_ids.reserve(dst_span.size());
-        for (std::size_t i = 0; i < dst_span.size(); ++i) {
-            result.node_ids.push_back(ObjectId(dst_span[i]));
+        result.node_ids.reserve(dst_tmp.size());
+        for (uint64_t v : dst_tmp) {
+            result.node_ids.push_back(ObjectId(v));
         }
-        if (eid_span.size() == dst_span.size()) {
-            result.edge_ids.reserve(eid_span.size());
-            for (std::size_t i = 0; i < eid_span.size(); ++i) {
-                result.edge_ids.push_back(ObjectId(eid_span[i]));
+        if (eid_tmp.size() == dst_tmp.size()) {
+            result.edge_ids.reserve(eid_tmp.size());
+            for (uint64_t v : eid_tmp) {
+                result.edge_ids.push_back(ObjectId(v));
             }
         }
         return result;
@@ -205,17 +212,20 @@ struct TopologyAccessor::Impl {
         if (!rev_csr_.has_data() || row_idx >= rev_csr_.num_nodes()) {
             return std::nullopt;
         }
-        auto dst_span = rev_csr_.neighbors(row_idx);
-        auto eid_span = rev_csr_.edge_ids(row_idx);
+        // Width-agnostic copy — see try_csr_out_neighbors.
+        std::vector<uint64_t> dst_tmp;
+        rev_csr_.copy_neighbors(row_idx, dst_tmp);
+        std::vector<uint64_t> eid_tmp;
+        rev_csr_.copy_edge_ids(row_idx, eid_tmp);
         Neighbors result;
-        result.node_ids.reserve(dst_span.size());
-        for (std::size_t i = 0; i < dst_span.size(); ++i) {
-            result.node_ids.push_back(ObjectId(dst_span[i]));
+        result.node_ids.reserve(dst_tmp.size());
+        for (uint64_t v : dst_tmp) {
+            result.node_ids.push_back(ObjectId(v));
         }
-        if (eid_span.size() == dst_span.size()) {
-            result.edge_ids.reserve(eid_span.size());
-            for (std::size_t i = 0; i < eid_span.size(); ++i) {
-                result.edge_ids.push_back(ObjectId(eid_span[i]));
+        if (eid_tmp.size() == dst_tmp.size()) {
+            result.edge_ids.reserve(eid_tmp.size());
+            for (uint64_t v : eid_tmp) {
+                result.edge_ids.push_back(ObjectId(v));
             }
         }
         return result;
@@ -812,7 +822,9 @@ int64_t TopologyAccessor::get_out_degree(ObjectId node_id) {
     // the per-row span O(1); we only need its size.
     const uint64_t row_idx = node_id.get_value();
     if (impl_->fwd_csr_.has_data() && row_idx < impl_->fwd_csr_.num_nodes()) {
-        return static_cast<int64_t>(impl_->fwd_csr_.neighbors(row_idx).size());
+        // degree() is width-agnostic (ROW_PTR is uint64 for both id widths)
+        // and never throws on the narrow layout, unlike neighbors().
+        return static_cast<int64_t>(impl_->fwd_csr_.degree(row_idx));
     }
     // B+Tree path: count tuples without materialising a Neighbors struct.
     return impl_->count_neighbors_from_index(
@@ -830,7 +842,8 @@ int64_t TopologyAccessor::get_in_degree(ObjectId node_id) {
     // Fast path: mmap'd topology_rev.csr (Spec #4-B).
     const uint64_t row_idx = node_id.get_value();
     if (impl_->rev_csr_.has_data() && row_idx < impl_->rev_csr_.num_nodes()) {
-        return static_cast<int64_t>(impl_->rev_csr_.neighbors(row_idx).size());
+        // Width-agnostic degree — see get_out_degree.
+        return static_cast<int64_t>(impl_->rev_csr_.degree(row_idx));
     }
     // B+Tree path: count without materialising.
     return impl_->count_neighbors_from_index(
