@@ -174,6 +174,18 @@ RowMapping RowMapping::create(const fs::path& path, const std::vector<ObjectId>&
         }
     }
 
+    // A freshly-written .rmap carries a NEW permutation, which invalidates any
+    // persisted sorted-index sidecar built from the OLD permutation. Remove the
+    // orphan so a later open() rebuilds the index from THIS .rmap rather than
+    // silently adopting a stale <path>.idx (the v1 count-only guard could not
+    // detect a same-N permutation change — root cause of the L4 feature-row
+    // corruption fixed 2026-06-01). The IDX_VERSION-2 fingerprint is the
+    // defense-in-depth; this removal is the direct fix at the write site.
+    {
+        std::error_code ec;
+        fs::remove(fs::path(path.string() + ".idx"), ec);
+    }
+
     // mmap read-only
     void* ptr = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (ptr == MAP_FAILED) {
@@ -331,6 +343,25 @@ void RowMapping::build_index() const {
 #endif
 }
 
+// --- Permutation fingerprint (2026-06-01) ---
+
+uint64_t RowMapping::compute_perm_fingerprint_() const {
+    // Order-sensitive FNV-1a-64 over the ObjectId array. A permutation change
+    // reorders the array and so changes this hash, letting try_load detect a
+    // .idx sidecar built from a different permutation (even at the same count).
+    // O(N) — ~0.2-0.5 s on papers100M, negligible vs the ~6-8 s index build it
+    // gates. Not cryptographic; staleness detection only.
+    const uint64_t FNV_OFFSET = 1469598103934665603ULL;
+    const uint64_t FNV_PRIME  = 1099511628211ULL;
+    uint64_t h = FNV_OFFSET;
+    const ObjectId* arr = data_ptr();
+    for (uint64_t i = 0; i < count_; ++i) {
+        h = (h ^ arr[i].id) * FNV_PRIME;
+        h ^= (h >> 29);  // extra avalanche so adjacent swaps diverge fast
+    }
+    return h;
+}
+
 // --- Fix #17: persistent sorted-index sidecar ---
 
 void RowMapping::persist_sorted_index_() const {
@@ -347,13 +378,16 @@ void RowMapping::persist_sorted_index_() const {
     }
     FdGuard guard(fd);
 
-    // Header: idx_magic(4) + idx_version(4) + count(8) = 16 bytes
+    // Header: idx_magic(4) + idx_version(4) + count(8) + perm_fp(8) = 24 bytes.
+    // perm_fp binds this sidecar to the .rmap permutation it indexes (v2).
     uint32_t idx_magic   = IDX_MAGIC;
     uint32_t idx_version = IDX_VERSION;
     uint64_t count       = sorted_index_.size();
+    uint64_t perm_fp     = compute_perm_fingerprint_();
     write_all(fd, &idx_magic,   sizeof(idx_magic));
     write_all(fd, &idx_version, sizeof(idx_version));
     write_all(fd, &count,       sizeof(count));
+    write_all(fd, &perm_fp,     sizeof(perm_fp));
 
     // Data: count × (uint64 oid, uint64 row) pairs, sorted by oid
     size_t data_bytes = count * sizeof(std::pair<uint64_t, uint64_t>);
@@ -381,7 +415,7 @@ bool RowMapping::try_load_persisted_index_() {
     if (!fs::exists(idx_path)) return false;
 
     auto file_size = fs::file_size(idx_path);
-    const size_t header_size = 16;  // idx_magic + idx_version + count
+    const size_t header_size = IDX_HEADER_SIZE;  // magic+version+count+perm_fp
     if (file_size < header_size) return false;
 
     int fd = ::open(idx_path.c_str(), O_RDONLY);
@@ -393,13 +427,18 @@ bool RowMapping::try_load_persisted_index_() {
 
     const char* base = static_cast<const char*>(ptr);
     uint32_t idx_magic, idx_version;
-    uint64_t idx_count;
-    std::memcpy(&idx_magic,   base,     sizeof(idx_magic));
-    std::memcpy(&idx_version, base + 4, sizeof(idx_version));
-    std::memcpy(&idx_count,   base + 8, sizeof(idx_count));
+    uint64_t idx_count, idx_perm_fp;
+    std::memcpy(&idx_magic,   base,      sizeof(idx_magic));
+    std::memcpy(&idx_version, base + 4,  sizeof(idx_version));
+    std::memcpy(&idx_count,   base + 8,  sizeof(idx_count));
+    std::memcpy(&idx_perm_fp, base + 16, sizeof(idx_perm_fp));
 
-    if (idx_magic != IDX_MAGIC || idx_version != IDX_VERSION || idx_count != count_) {
-        // Stale or wrong-format sidecar — fall back to lazy build.
+    // Reject a stale, wrong-format, or wrong-permutation sidecar. The perm_fp
+    // check is the fix for the same-N permutation change the old count-only
+    // guard missed: a .idx built from a different .rmap permutation no longer
+    // matches and we fall back to lazily rebuilding the index from THIS .rmap.
+    if (idx_magic != IDX_MAGIC || idx_version != IDX_VERSION ||
+        idx_count != count_ || idx_perm_fp != compute_perm_fingerprint_()) {
         ::munmap(ptr, file_size);
         return false;
     }

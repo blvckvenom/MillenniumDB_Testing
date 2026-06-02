@@ -64,13 +64,27 @@ private:
     // and find() works directly off the mmap'd region — skipping the
     // O(N log N) build_index() that takes ~30 s on papers100M-scale.
     static constexpr uint32_t IDX_MAGIC   = 0x52494458; // "RIDX"
-    static constexpr uint32_t IDX_VERSION = 1;
+    // IDX_VERSION 2 (2026-06-01): the .idx header now carries a 64-bit
+    // fingerprint of the .rmap permutation it indexes. The previous v1
+    // guard validated only magic+version+count, so a sidecar built from a
+    // DIFFERENT permutation at the same N was silently adopted and find()
+    // returned wrong rows. v2 binds the sidecar to its permutation; a v1
+    // (no-fingerprint) sidecar is rejected by the version check and lazily
+    // rebuilt. Header grows 16 -> 24 bytes.
+    static constexpr uint32_t IDX_VERSION     = 2;
+    static constexpr size_t   IDX_HEADER_SIZE = 24; // magic(4)+version(4)+count(8)+perm_fp(8)
 
     RowMapping() = default;
 
     void build_index() const;
     void persist_sorted_index_() const;
     bool try_load_persisted_index_();
+
+    /// 64-bit fingerprint of the .rmap permutation (order-sensitive FNV-1a
+    /// over the ObjectId array). Binds a persisted .idx sidecar to the exact
+    /// permutation it was built from, so a stale sidecar at the same count is
+    /// detected at load instead of returning wrong rows. Requires a valid mmap.
+    uint64_t compute_perm_fingerprint_() const;
 
     std::filesystem::path path_;
     void*    mmap_ptr_  = nullptr;

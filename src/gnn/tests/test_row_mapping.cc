@@ -406,3 +406,86 @@ TEST(RowMappingBinarySearch, LargeScaleLookup) {
 TEST_F(RowMappingTest, HeaderSizeIs16Bytes) {
     EXPECT_EQ(RowMapping::HEADER_SIZE, 16u);
 }
+
+// ===========================================================================
+// Permutation-fingerprint staleness (regression for the 2026-06-01 L4
+// feature-row corruption: a .idx built from one permutation was silently
+// adopted after the .rmap was rebuilt with a DIFFERENT permutation at the
+// same count, because the old guard validated only magic+version+count).
+// ===========================================================================
+
+TEST_F(RowMappingTest, StalePermutationIdxRejected) {
+    // Reproduce the on-disk state that caused the bug: persist a .idx for
+    // permutation A, then replace ONLY the .rmap data with permutation B
+    // (same count) leaving A's .idx orphaned. open()+find() must serve B's
+    // rows (the perm-fingerprint rejects the stale sidecar and rebuilds).
+    const uint64_t N = 256;
+    auto path = test_path("stale_perm.rmap");
+    auto idx_path = fs::path(path.string() + ".idx");
+
+    std::vector<ObjectId> a(N);
+    for (uint64_t i = 0; i < N; ++i) a[i] = ObjectId(i * 2 + 1);
+    {
+        auto rm = RowMapping::create(path, a);
+        auto r = rm.find(a[10]);          // first find() persists the .idx
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r.value(), 10u);
+    }
+    ASSERT_TRUE(fs::exists(idx_path)) << "first find() should have persisted the .idx";
+
+    // Permutation B: a full reverse — every entry moves (except a fixed point
+    // only if N is odd; here N=256 is even so all entries move).
+    std::vector<ObjectId> b(N);
+    for (uint64_t i = 0; i < N; ++i) b[i] = ObjectId((N - 1 - i) * 2 + 1);
+
+    // Overwrite the .rmap data region in place (header/count unchanged) so A's
+    // .idx survives as an orphan — exactly the reorder-rebuild on-disk state.
+    {
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(f.is_open());
+        f.seekp(static_cast<std::streamoff>(RowMapping::HEADER_SIZE));
+        for (uint64_t i = 0; i < N; ++i) {
+            uint64_t v = b[i].id;
+            f.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        }
+    }
+    ASSERT_TRUE(fs::exists(idx_path)) << "the stale .idx must still be on disk for the test to be meaningful";
+
+    auto rm = RowMapping::open(path);
+    for (uint64_t i = 0; i < N; ++i) {
+        auto r = rm.find(b[i]);
+        ASSERT_TRUE(r.has_value()) << "find missed B[" << i << "]";
+        EXPECT_EQ(r.value(), i)
+            << "stale .idx was adopted: B[" << i << "] (oid " << b[i].id
+            << ") resolved to the wrong row";
+    }
+}
+
+TEST_F(RowMappingTest, CreateRemovesStaleSiblingIdx) {
+    // create() must delete any pre-existing <path>.idx, because writing a new
+    // permutation invalidates a sidecar built from the previous one.
+    const uint64_t N = 64;
+    auto path = test_path("create_removes_idx.rmap");
+    auto idx_path = fs::path(path.string() + ".idx");
+
+    std::vector<ObjectId> a(N);
+    for (uint64_t i = 0; i < N; ++i) a[i] = ObjectId(i * 3 + 5);
+    {
+        auto rm = RowMapping::create(path, a);
+        (void)rm.find(a[0]);              // persist the .idx
+    }
+    ASSERT_TRUE(fs::exists(idx_path));
+
+    std::vector<ObjectId> b(N);
+    for (uint64_t i = 0; i < N; ++i) b[i] = ObjectId((N - 1 - i) * 3 + 5);
+    auto rm = RowMapping::create(path, b);
+
+    EXPECT_FALSE(fs::exists(idx_path))
+        << "create() must remove the stale sibling .idx before a new permutation is used";
+
+    for (uint64_t i = 0; i < N; ++i) {
+        auto r = rm.find(b[i]);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r.value(), i);
+    }
+}
