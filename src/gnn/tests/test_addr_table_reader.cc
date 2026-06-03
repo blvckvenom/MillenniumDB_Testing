@@ -107,6 +107,59 @@ TEST(AddrTableReaderOpen, RejectsTruncatedFile) {
     fs::remove(p);
 }
 
+TEST(AddrTableReaderOpen, V1FileSurfacesZeroSlimFields) {
+    // A v1 (40-byte header) addr_table written by make() must read back with
+    // slim_offset == slim_length == 0 (the reader zero-inits the v2 extension).
+    auto p = tmp_addrtab("v1_slim_zero");
+    fs::remove(p);
+    write_synthetic_addrtab(p, 0xCAFEBABE);
+
+    auto res = AddrTableReader::open(p, 0xCAFEBABE);
+    EXPECT_EQ(res.header.version, 1u);
+    EXPECT_EQ(res.header.header_bytes(), 40u);
+    EXPECT_EQ(res.header.slim_offset, 0ull);
+    EXPECT_EQ(res.header.slim_length, 0ull);
+    // arrays still parse correctly off the 40-byte header base
+    ASSERT_EQ(res.l4_indices.size(), 4u);
+    EXPECT_EQ(res.l4_indices[3], 303u);
+    fs::remove(p);
+}
+
+TEST(AddrTableReaderOpen, V2RoundTripSurfacesSlimFields) {
+    // A v2 (56-byte header) addr_table written by make_v2() must read back its
+    // slim_offset/slim_length AND parse the 9 arrays off the bumped 56-byte base.
+    auto p = tmp_addrtab("v2_roundtrip");
+    fs::remove(p);
+
+    AddrTableBuffers buf;
+    buf.header = AddrTableHeader::make_v2(2, 0, 1, 3, 0, 0xCAFEBABE,
+                                          /*slim_off=*/0x40000, /*slim_len=*/0x1800);
+    buf.l1_positions = {0, 1};
+    buf.l1_indices   = {100, 101};
+    buf.l3_positions = {2};
+    buf.l3_row_idxs  = {0xFEEDFACEull};
+    buf.l4_positions = {3, 4, 5};
+    buf.l4_indices   = {300, 301, 302};
+    AddrTableWriter::write_atomic(p, buf);
+
+    // File must be exactly 56-byte header + arrays (v2 on-disk size).
+    EXPECT_EQ(fs::file_size(p), buf.header.expected_file_size());
+
+    auto res = AddrTableReader::open(p, 0xCAFEBABE);
+    EXPECT_EQ(res.header.version, 2u);
+    EXPECT_EQ(res.header.header_bytes(), 56u);
+    EXPECT_EQ(res.header.slim_offset, 0x40000ull);
+    EXPECT_EQ(res.header.slim_length, 0x1800ull);
+    EXPECT_EQ(res.header.total, 6u);
+    ASSERT_EQ(res.l1_indices.size(), 2u);
+    EXPECT_EQ(res.l1_indices[1], 101u);
+    ASSERT_EQ(res.l3_row_idxs.size(), 1u);
+    EXPECT_EQ(res.l3_row_idxs[0], 0xFEEDFACEull);
+    ASSERT_EQ(res.l4_indices.size(), 3u);
+    EXPECT_EQ(res.l4_indices[2], 302u);
+    fs::remove(p);
+}
+
 TEST(AddrTableReaderOpen, ParsesOddL3AlignmentSafely) {
     // num_l3 = 1 (odd) puts l3_row_idxs at a 4-byte-aligned but not
     // 8-byte-aligned offset within the read buffer. The aligned-storage

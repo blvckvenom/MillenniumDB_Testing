@@ -53,6 +53,14 @@ public:
     /// Number of entries.
     uint64_t size() const { return count_; }
 
+    /// Order-sensitive 64-bit fingerprint of the .rmap permutation — the SAME
+    /// value bound into the persisted .idx sidecar (IDX_VERSION 2). Lets a
+    /// dependent artifact (e.g. the consolidated slim file of DiskGNN-adoption
+    /// Plan 1) detect at open that it was built from a DIFFERENT permutation at
+    /// the same count, instead of silently serving wrong rows. Returns 0 for an
+    /// empty mapping (no permutation to bind). O(N); requires a valid mmap.
+    uint64_t perm_fingerprint() const;
+
     const std::filesystem::path& path() const { return path_; }
 
 private:

@@ -12,8 +12,51 @@ TEST(AddrTableFormat, MakeSetsMagicAndVersion) {
     EXPECT_EQ(h.version, 1u);
 }
 
-TEST(AddrTableFormat, HeaderSizeIs40Bytes) {
-    EXPECT_EQ(sizeof(AddrTableHeader), 40u);
+TEST(AddrTableFormat, HeaderStructIs56Bytes) {
+    // v2 in-memory struct (adds slim_offset/slim_length).
+    EXPECT_EQ(sizeof(AddrTableHeader), 56u);
+}
+
+TEST(AddrTableFormat, OnDiskV1HeaderIs40Bytes) {
+    // Backwards-compat: a v1 header still occupies 40 bytes on disk so existing
+    // addr_tables round-trip byte-identically.
+    EXPECT_EQ(AddrTableHeader::SIZE_V1, 40u);
+    auto h = AddrTableHeader::make(1, 2, 3, 4, 5, 0);
+    EXPECT_EQ(h.version, 1u);
+    EXPECT_EQ(h.header_bytes(), 40u);
+}
+
+TEST(AddrTableFormat, MakeV2SetsVersionAndSlimFields) {
+    auto h = AddrTableHeader::make_v2(1, 2, 3, 4, 5, 0xABCD, 0x4000, 0x800);
+    EXPECT_EQ(h.version, AddrTableHeader::VERSION_V2);
+    EXPECT_EQ(h.version, 2u);
+    EXPECT_EQ(h.slim_offset, 0x4000ull);
+    EXPECT_EQ(h.slim_length, 0x800ull);
+    EXPECT_EQ(h.header_bytes(), 56u);
+    EXPECT_EQ(h.total, 15u);
+    EXPECT_TRUE(h.is_valid());
+}
+
+TEST(AddrTableFormat, V1SlimFieldsAreZero) {
+    auto h = AddrTableHeader::make(7, 0, 0, 0, 0, 0);
+    EXPECT_EQ(h.slim_offset, 0ull);
+    EXPECT_EQ(h.slim_length, 0ull);
+}
+
+TEST(AddrTableFormat, IsValidAcceptsV1AndV2RejectsV3) {
+    auto v1 = AddrTableHeader::make(1, 0, 0, 0, 0, 0);
+    auto v2 = AddrTableHeader::make_v2(1, 0, 0, 0, 0, 0, 0, 0);
+    EXPECT_TRUE(v1.is_valid());
+    EXPECT_TRUE(v2.is_valid());
+    v2.version = 3;
+    EXPECT_FALSE(v2.is_valid());
+}
+
+TEST(AddrTableFormat, V2ExpectedFileSizeUses56ByteHeader) {
+    auto h = AddrTableHeader::make_v2(2, 3, 5, 7, 0, 0, 0x1000, 0x40);
+    size_t expected =
+        56 + (2*4 + 2*4) + (3*4 + 3*4) + (5*4 + 5*8) + (7*4 + 7*4) + 0;
+    EXPECT_EQ(h.expected_file_size(), expected);
 }
 
 TEST(AddrTableFormat, MakeBuildsValidHeader) {

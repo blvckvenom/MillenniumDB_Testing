@@ -30,7 +30,7 @@ AddrTableReader::open(const fs::path& path, uint64_t expected_meta_sha_head)
                                  + ": " + std::strerror(saved));
     }
     const size_t file_size = static_cast<size_t>(st.st_size);
-    if (file_size < AddrTableHeader::SIZE) {
+    if (file_size < AddrTableHeader::SIZE_V1) {
         ::close(fd);
         throw std::runtime_error("AddrTableReader: file too small for header: "
                                  + path.string());
@@ -46,10 +46,24 @@ AddrTableReader::open(const fs::path& path, uint64_t expected_meta_sha_head)
     }
     ::close(fd);
 
-    std::memcpy(&res.header, res.data.data(), sizeof(res.header));
+    // Version-aware header read. The common 40-byte prefix (magic, version,
+    // tier counts, total, meta_sha) is identical across v1/v2 and always present
+    // (file_size >= SIZE_V1 checked above). Validate magic+version+total from it
+    // BEFORE deciding whether to pull the 16-byte v2 extension, so a corrupt or
+    // unknown-version file cannot drive an over-read. v1 leaves slim_* == 0
+    // (zero-init below); v2 fills slim_offset/slim_length from bytes [40,56).
+    std::memset(&res.header, 0, sizeof(res.header));
+    std::memcpy(&res.header, res.data.data(), AddrTableHeader::SIZE_V1);
 
     if (!res.header.is_valid()) {
         throw std::runtime_error("AddrTableReader: invalid header in " + path.string());
+    }
+    if (res.header.version >= AddrTableHeader::VERSION_V2) {
+        if (file_size < AddrTableHeader::SIZE) {
+            throw std::runtime_error("AddrTableReader: file too small for v2 header: "
+                                     + path.string());
+        }
+        std::memcpy(&res.header, res.data.data(), AddrTableHeader::SIZE);
     }
     if (res.header.expected_file_size() != file_size) {
         throw std::runtime_error("AddrTableReader: size mismatch in " + path.string()
@@ -70,7 +84,7 @@ AddrTableReader::open(const fs::path& path, uint64_t expected_meta_sha_head)
     //   l3_positions[num_l3] l3_row_idxs[num_l3] (uint64)
     //   l4_positions[num_l4] l4_indices[num_l4]
     //   zero_positions[num_zero]
-    const unsigned char* p = res.data.data() + sizeof(res.header);
+    const unsigned char* p = res.data.data() + res.header.header_bytes();
 
     auto take_u32 = [&](uint32_t n) -> const uint32_t* {
         const auto* r = reinterpret_cast<const uint32_t*>(p);

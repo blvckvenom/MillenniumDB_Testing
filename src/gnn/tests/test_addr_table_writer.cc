@@ -103,7 +103,8 @@ TEST(AddrTableWriterBuild, EmptyInputProducesEmptyBuffers) {
     AddrTableWriter::build(empty, &l1, &l2, slim, noop, 0, buf);
 
     EXPECT_EQ(buf.header.total, 0u);
-    EXPECT_EQ(buf.total_bytes(), AddrTableHeader::SIZE);
+    // build() emits a v1 header (40-byte on-disk), so an empty buffer is SIZE_V1.
+    EXPECT_EQ(buf.total_bytes(), AddrTableHeader::SIZE_V1);
 }
 
 TEST(AddrTableWriterWrite, RoundTripsViaTempFile) {
@@ -125,7 +126,10 @@ TEST(AddrTableWriterWrite, RoundTripsViaTempFile) {
 
     std::ifstream f(tmp, std::ios::binary);
     AddrTableHeader hdr_back{};
-    f.read(reinterpret_cast<char*>(&hdr_back), sizeof(hdr_back));
+    // build() writes a v1 header (40 bytes on disk); read exactly that so the
+    // body arrays below start at the correct v1 offset (40, not the 56-byte
+    // in-memory struct size).
+    f.read(reinterpret_cast<char*>(&hdr_back), AddrTableHeader::SIZE_V1);
     EXPECT_EQ(hdr_back.magic, AddrTableHeader::MAGIC);
     EXPECT_EQ(hdr_back.num_l1, 2u);
     EXPECT_EQ(hdr_back.meta_sha256_head, 0xABCDull);
@@ -160,11 +164,12 @@ TEST(AddrTableWriterWrite, EmptyTableRoundTrip) {
     AddrTableWriter::build(empty, &l1, &l2, slim, noop, 0xFEED, buf);
     AddrTableWriter::write_atomic(tmp, buf);
 
-    EXPECT_EQ(fs::file_size(tmp), AddrTableHeader::SIZE);
+    // Empty v1 table is exactly the 40-byte v1 header on disk.
+    EXPECT_EQ(fs::file_size(tmp), AddrTableHeader::SIZE_V1);
 
     std::ifstream f(tmp, std::ios::binary);
     AddrTableHeader hdr_back{};
-    f.read(reinterpret_cast<char*>(&hdr_back), sizeof(hdr_back));
+    f.read(reinterpret_cast<char*>(&hdr_back), AddrTableHeader::SIZE_V1);
     EXPECT_EQ(hdr_back.total, 0u);
     EXPECT_EQ(hdr_back.meta_sha256_head, 0xFEEDull);
     EXPECT_TRUE(hdr_back.is_valid());

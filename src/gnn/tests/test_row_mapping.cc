@@ -56,6 +56,38 @@ TEST_F(RowMappingTest, FindFirstOccurrence) {
 }
 
 // ===========================================================================
+// Permutation fingerprint (DiskGNN-adoption Plan 1 shared infra)
+// ===========================================================================
+
+TEST_F(RowMappingTest, PermFingerprintStableAcrossOpen) {
+    std::vector<ObjectId> ids;
+    for (uint64_t i = 0; i < 64; ++i) ids.push_back(ObjectId(i * 11 + 1));
+    auto path = test_path("fp_stable.rmap");
+    auto rm_write = RowMapping::create(path, ids);
+    uint64_t fp_write = rm_write.perm_fingerprint();
+    EXPECT_NE(fp_write, 0u);
+
+    auto rm_read = RowMapping::open(path);
+    EXPECT_EQ(rm_read.perm_fingerprint(), fp_write);  // same permutation -> same fp
+}
+
+TEST_F(RowMappingTest, PermFingerprintOrderSensitive) {
+    std::vector<ObjectId> a = {ObjectId(1), ObjectId(2), ObjectId(3), ObjectId(4)};
+    std::vector<ObjectId> b = {ObjectId(1), ObjectId(2), ObjectId(4), ObjectId(3)};  // swap last two
+    auto rm_a = RowMapping::create(test_path("fp_a.rmap"), a);
+    auto rm_b = RowMapping::create(test_path("fp_b.rmap"), b);
+    // Same multiset, different order -> different fingerprint (the staleness guard).
+    EXPECT_NE(rm_a.perm_fingerprint(), rm_b.perm_fingerprint());
+}
+
+TEST_F(RowMappingTest, PermFingerprintEmptyIsZero) {
+    std::vector<ObjectId> empty;
+    auto rm = RowMapping::create(test_path("fp_empty.rmap"), empty);
+    EXPECT_EQ(rm.size(), 0u);
+    EXPECT_EQ(rm.perm_fingerprint(), 0u);
+}
+
+// ===========================================================================
 // Empty
 // ===========================================================================
 

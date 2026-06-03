@@ -495,6 +495,12 @@ if(BUILD_TESTING)
         target_link_libraries(test_addr_table_writer PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME AddrTableWriterTests COMMAND test_addr_table_writer)
 
+        # ConsolidatedSlim format tests (DiskGNN-adoption Plan 1 Phase 0.1:
+        # on-disk header for the consolidated cold-feature file)
+        add_executable(test_consolidated_slim_format tests/test_consolidated_slim_format.cc)
+        target_link_libraries(test_consolidated_slim_format PRIVATE mdb_gnn_core gtest gtest_main)
+        add_test(NAME ConsolidatedSlimFormatTests COMMAND test_consolidated_slim_format)
+
         # AddrTable reader tests (Path 4 Task 3: open + validate + parse 9 arrays)
         add_executable(test_addr_table_reader tests/test_addr_table_reader.cc)
         target_link_libraries(test_addr_table_reader PRIVATE mdb_gnn_core gtest gtest_main)

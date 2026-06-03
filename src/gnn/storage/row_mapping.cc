@@ -362,6 +362,14 @@ uint64_t RowMapping::compute_perm_fingerprint_() const {
     return h;
 }
 
+uint64_t RowMapping::perm_fingerprint() const {
+    // Public accessor over the private order-sensitive fingerprint. An empty
+    // mapping has no permutation to bind, so report 0 (a dependent artifact
+    // treats 0 as "reorder disabled / no fingerprint to check").
+    if (count_ == 0) return 0;
+    return compute_perm_fingerprint_();
+}
+
 // --- Fix #17: persistent sorted-index sidecar ---
 
 void RowMapping::persist_sorted_index_() const {
