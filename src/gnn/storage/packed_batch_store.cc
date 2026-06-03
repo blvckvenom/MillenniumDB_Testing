@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "gnn/common/posix_io.h"
+#include "gnn/storage/consolidated_slim.h"
 
 namespace mdb::gnn {
 
@@ -312,7 +313,12 @@ void generate_packed_batches_partitioned(
     std::function<std::vector<uint64_t>(uint64_t batch_id)> row_provider,
     const fs::path& output_dir,
     size_t partition_bytes,
-    std::function<std::vector<ObjectId>(uint64_t batch_id)> oid_provider)
+    std::function<std::vector<ObjectId>(uint64_t batch_id)> oid_provider,
+    const fs::path& consolidated_path,
+    uint64_t consolidated_perm_fp,
+    uint64_t consolidated_meta_sha,
+    std::vector<uint64_t>* out_consolidated_offsets,
+    std::vector<uint64_t>* out_consolidated_lengths)
 {
     fs::create_directories(output_dir);
 
@@ -331,6 +337,26 @@ void generate_packed_batches_partitioned(
     const uint64_t feature_dim = features.num_cols();
     const auto     dtype       = features.dtype();
     const bool     has_oids    = static_cast<bool>(oid_provider);
+
+    // --- DiskGNN-adoption Plan 1: optional consolidated cold-feature file ---
+    // One file = ConsolidatedSlimHeader + every batch's data section, batch b
+    // at a 4096-aligned offset. Written in the SAME .fmat scan as the per-batch
+    // .bin files (which are left unchanged). cons_offset[b] is the byte offset
+    // of batch b's payload; the payload is cons_length[b] = batch_size[b]*row_bytes.
+    const bool write_consolidated = !consolidated_path.empty();
+    ConsolidatedSlimHeader cons_header{};
+    uint64_t cons_align = 4096;
+    if (write_consolidated) {
+        cons_header = ConsolidatedSlimHeader::make(
+            num_batches, feature_dim, static_cast<uint8_t>(dtype),
+            consolidated_perm_fp, consolidated_meta_sha);
+        cons_align = cons_header.alignment();
+    }
+    std::vector<uint64_t> cons_offset(write_consolidated ? num_batches : 0, 0);
+    uint64_t cons_cursor = write_consolidated ? cons_header.data_start : 0;
+    int      cons_fd     = -1;
+    if (out_consolidated_offsets) out_consolidated_offsets->assign(num_batches, 0);
+    if (out_consolidated_lengths) out_consolidated_lengths->assign(num_batches, 0);
 
     // Partition geometry: target partition_bytes, round down to whole rows.
     uint64_t partition_rows = std::max<uint64_t>(1, partition_bytes / row_bytes);
@@ -380,6 +406,10 @@ void generate_packed_batches_partitioned(
                 fd = -1;
             }
         }
+        if (cons_fd >= 0) {
+            ::close(cons_fd);
+            cons_fd = -1;
+        }
     };
 
     try {
@@ -387,6 +417,14 @@ void generate_packed_batches_partitioned(
             auto rows = row_provider(b);
             const uint64_t N = rows.size();
             batch_size[b] = N;
+
+            if (write_consolidated) {
+                const uint64_t payload = N * row_bytes;
+                cons_offset[b] = cons_cursor;
+                if (out_consolidated_offsets) (*out_consolidated_offsets)[b] = cons_cursor;
+                if (out_consolidated_lengths) (*out_consolidated_lengths)[b] = payload;
+                cons_cursor += ConsolidatedSlimHeader::align_up(payload, cons_align);
+            }
 
             if (has_oids) {
                 batch_oids[b] = oid_provider(b);
@@ -442,6 +480,27 @@ void generate_packed_batches_partitioned(
                     throw std::runtime_error(
                         "generate_packed_batches_partitioned: ftruncate failed for " +
                         path_str + ": " + safe_strerror(errno));
+                }
+            }
+        }
+
+        // Consolidated file: write the header and size the whole file once
+        // (header + sum of 4096-aligned per-batch payloads). Payloads are
+        // pwritten during Phase 2 alongside the per-batch data.
+        if (write_consolidated) {
+            std::string cpath = consolidated_path.string();
+            cons_fd = ::open(cpath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (cons_fd < 0) {
+                throw std::runtime_error(
+                    "generate_packed_batches_partitioned: cannot create consolidated " +
+                    cpath + ": " + safe_strerror(errno));
+            }
+            write_all(cons_fd, &cons_header, sizeof(cons_header), cpath);
+            if (cons_cursor > cons_header.data_start) {
+                if (::ftruncate(cons_fd, static_cast<off_t>(cons_cursor)) < 0) {
+                    throw std::runtime_error(
+                        "generate_packed_batches_partitioned: ftruncate consolidated "
+                        "failed for " + cpath + ": " + safe_strerror(errno));
                 }
             }
         }
@@ -590,6 +649,32 @@ void generate_packed_batches_partitioned(
                     }
                 }
 
+                // Consolidated file: same contrib_data at this batch's aligned
+                // base + the same row cursor, so the consolidated payload is
+                // byte-identical to the per-batch .bin data section.
+                if (write_consolidated) {
+                    size_t       remaining = group_size * row_bytes;
+                    const char*  src       = contrib_data.data();
+                    off_t        off_curr  = static_cast<off_t>(
+                        cons_offset[bid] + cursor[bid] * row_bytes);
+                    while (remaining > 0) {
+                        ssize_t n = ::pwrite(cons_fd, src, remaining, off_curr);
+                        if (n < 0) {
+                            if (errno == EINTR) continue;
+                            throw std::runtime_error(
+                                "generate_packed_batches_partitioned: pwrite consolidated failed: " +
+                                safe_strerror(errno));
+                        }
+                        if (n == 0) {
+                            throw std::runtime_error(
+                                "generate_packed_batches_partitioned: pwrite consolidated returned 0");
+                        }
+                        src       += n;
+                        off_curr  += n;
+                        remaining -= static_cast<size_t>(n);
+                    }
+                }
+
                 cursor[bid] += group_size;
                 i = j;
             }
@@ -647,6 +732,16 @@ void generate_packed_batches_partitioned(
         }
         if (num_batches > 0) {
             fsync_directory(output_dir / make_batch_filename(0));
+        }
+        if (write_consolidated && cons_fd >= 0) {
+            if (::fsync(cons_fd) < 0) {
+                throw std::runtime_error(
+                    "generate_packed_batches_partitioned: fsync consolidated failed: " +
+                    safe_strerror(errno));
+            }
+            ::close(cons_fd);
+            cons_fd = -1;
+            fsync_directory(consolidated_path);
         }
     } catch (...) {
         cleanup_fds();

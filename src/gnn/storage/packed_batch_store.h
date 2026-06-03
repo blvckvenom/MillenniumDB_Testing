@@ -199,13 +199,30 @@ void generate_packed_batches(
 /// papers100M-class datasets keeps peak RSS under 2 GB.
 ///
 /// partition_bytes: target bytes per partition (rounded down to whole rows).
+///
+/// DiskGNN-adoption Plan 1 (optional consolidated cold-feature file): when
+/// `consolidated_path` is non-empty, the SAME single .fmat scan ALSO writes one
+/// consolidated file — a ConsolidatedSlimHeader (consolidated_slim.h) followed
+/// by every batch's data section concatenated, batch b at a 4096-aligned offset.
+/// The per-batch data payload is byte-identical to the per-batch .bin data
+/// section (same partition-iteration order), so addr_table.l4_indices index it
+/// identically. Per-batch (offset, length) are returned in out_consolidated_*
+/// for the addr_table v2 header. The per-batch .bin files are written unchanged
+/// (the consolidated file is an additive artifact, not a replacement). Disabled
+/// (empty path) => behaviour byte-identical to before. `consolidated_perm_fp` /
+/// `consolidated_meta_sha` are stamped into the header for stale-rejection.
 void generate_packed_batches_partitioned(
     const FeatureMatrix& features,
     uint64_t num_batches,
     std::function<std::vector<uint64_t>(uint64_t batch_id)> row_provider,
     const std::filesystem::path& output_dir,
     size_t partition_bytes = 256ULL * 1024 * 1024,
-    std::function<std::vector<ObjectId>(uint64_t batch_id)> oid_provider = {}
+    std::function<std::vector<ObjectId>(uint64_t batch_id)> oid_provider = {},
+    const std::filesystem::path& consolidated_path = {},
+    uint64_t consolidated_perm_fp = 0,
+    uint64_t consolidated_meta_sha = 0,
+    std::vector<uint64_t>* out_consolidated_offsets = nullptr,
+    std::vector<uint64_t>* out_consolidated_lengths = nullptr
 );
 
 } // namespace mdb::gnn

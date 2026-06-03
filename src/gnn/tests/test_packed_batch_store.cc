@@ -9,7 +9,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <fstream>
+
 #include "gnn/storage/packed_batch_store.h"
+#include "gnn/storage/consolidated_slim.h"
+#include "graph_models/object_id.h"
 
 using PackedBatchTest = GnnStorageTest;
 
@@ -916,4 +920,121 @@ TEST_F(PackedBatchTest, Partitioned_PartitionSmallerThanSingleRow) {
     const uint64_t row_bytes = D * sizeof(float);
     expect_packed_dirs_functionally_equivalent(
         classic_dir, partitioned_dir, assignments.size(), row_bytes);
+}
+
+// ===========================================================================
+// DiskGNN-adoption Plan 1: consolidated cold-feature file (Phase 1.1)
+// ===========================================================================
+
+// The consolidated file's per-batch payload must be byte-identical to the
+// per-batch .bin data section, at a 4096-aligned offset, with v2 stale-rejection
+// fingerprints stamped in the header. Empty batches occupy zero payload bytes.
+TEST_F(PackedBatchTest, ConsolidatedRoundTrip) {
+    const uint64_t N = 64, D = 4;
+    std::vector<float> features(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) features[i] = static_cast<float>(i + 1);
+    auto fmat_path = test_path("cons_rt.fmat");
+    auto fm = FeatureMatrix::create(fmat_path, N, D, GnnDtype::FLOAT32, features.data());
+
+    std::vector<std::vector<uint64_t>> assignments = {
+        {0, 1, 2, 3},        // dense
+        {},                  // empty batch -> zero payload
+        {16, 0, 48, 32},     // cross-partition
+        {7, 7},              // duplicate rows
+        {63},                // single
+    };
+    const uint64_t row_bytes = D * sizeof(float);  // 16
+
+    auto dir       = test_path("cons_rt_pack");
+    auto cons_path = test_path("cons_rt_pack/consolidated.slim");
+
+    std::vector<uint64_t> offsets, lengths;
+    const uint64_t PERM_FP  = 0xABCDEF0123456789ull;
+    const uint64_t META_SHA = 0x1122334455667788ull;
+
+    generate_packed_batches_partitioned(
+        fm, assignments.size(),
+        [&](uint64_t bid) { return assignments.at(bid); },
+        dir, /*partition_bytes=*/row_bytes * 8,  // 8 rows/partition -> 8 partitions
+        /*oid_provider=*/[&](uint64_t bid) {
+            std::vector<ObjectId> v;
+            for (uint64_t r : assignments.at(bid)) v.push_back(ObjectId(r));
+            return v;
+        },
+        cons_path, PERM_FP, META_SHA, &offsets, &lengths);
+
+    // --- Header ---
+    ASSERT_TRUE(fs::exists(cons_path));
+    ConsolidatedSlimHeader hdr{};
+    {
+        std::ifstream f(cons_path, std::ios::binary);
+        f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        ASSERT_TRUE(f.good());
+    }
+    EXPECT_TRUE(hdr.is_valid());
+    EXPECT_EQ(hdr.num_batches, assignments.size());
+    EXPECT_EQ(hdr.feature_dim, D);
+    EXPECT_EQ(hdr.perm_fingerprint, PERM_FP);
+    EXPECT_EQ(hdr.meta_sha256_head, META_SHA);
+    EXPECT_EQ(hdr.data_start, 4096u);
+
+    ASSERT_EQ(offsets.size(), assignments.size());
+    ASSERT_EQ(lengths.size(), assignments.size());
+
+    // --- Per-batch: length, alignment, ordering, byte-identity vs .bin ---
+    uint64_t prev_end = hdr.data_start;
+    for (uint64_t b = 0; b < assignments.size(); ++b) {
+        const uint64_t N_b = assignments[b].size();
+        EXPECT_EQ(lengths[b], N_b * row_bytes) << "batch " << b;
+        EXPECT_GE(offsets[b], hdr.data_start) << "batch " << b;
+        EXPECT_EQ(offsets[b] % hdr.alignment(), 0u) << "offset not aligned, batch " << b;
+        EXPECT_GE(offsets[b], prev_end) << "offsets overlap/regress, batch " << b;
+        prev_end = offsets[b] + ConsolidatedSlimHeader::align_up(lengths[b], hdr.alignment());
+
+        if (N_b == 0) { EXPECT_EQ(lengths[b], 0u); continue; }
+
+        // Consolidated payload at offsets[b].
+        std::vector<char> cons_payload(lengths[b]);
+        {
+            std::ifstream f(cons_path, std::ios::binary);
+            f.seekg(static_cast<std::streamoff>(offsets[b]));
+            f.read(cons_payload.data(), static_cast<std::streamsize>(lengths[b]));
+            ASSERT_TRUE(f.good()) << "cons read batch " << b;
+        }
+
+        // Per-batch .bin data section (use the header's own data_offset()).
+        char fn[64];
+        std::snprintf(fn, sizeof(fn), "batch_%06" PRIu64 ".bin", b);
+        auto bin_path = dir / fn;
+        std::vector<char> bin_payload(lengths[b]);
+        {
+            std::ifstream f(bin_path, std::ios::binary);
+            PackedBatchHeader bh{};
+            f.read(reinterpret_cast<char*>(&bh), sizeof(bh));
+            ASSERT_TRUE(bh.is_valid()) << "bin header batch " << b;
+            f.seekg(static_cast<std::streamoff>(bh.data_offset()));
+            f.read(bin_payload.data(), static_cast<std::streamsize>(lengths[b]));
+            ASSERT_TRUE(f.good()) << "bin read batch " << b;
+        }
+
+        EXPECT_EQ(std::memcmp(cons_payload.data(), bin_payload.data(), lengths[b]), 0)
+            << "consolidated payload != per-batch .bin data section for batch " << b;
+    }
+}
+
+// Disabled (empty consolidated_path) => no consolidated file, behaviour
+// byte-identical to the plain partitioned packer.
+TEST_F(PackedBatchTest, ConsolidatedDisabledByDefault) {
+    const uint64_t N = 16, D = 2;
+    std::vector<float> features(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) features[i] = static_cast<float>(i + 1);
+    auto fm = FeatureMatrix::create(test_path("cons_off.fmat"), N, D,
+                                    GnnDtype::FLOAT32, features.data());
+    std::vector<std::vector<uint64_t>> assignments = {{0, 1}, {2, 3}, {0}};
+    auto dir = test_path("cons_off_pack");
+    generate_packed_batches_partitioned(
+        fm, assignments.size(),
+        [&](uint64_t bid) { return assignments.at(bid); },
+        dir, /*partition_bytes=*/64);  // no oid_provider, no consolidated_path
+    EXPECT_FALSE(fs::exists(dir / "consolidated.slim"));
 }
