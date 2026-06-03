@@ -83,6 +83,7 @@ add_library(mdb_gnn_core STATIC
     storage/addr_table_writer.cc
     storage/addr_table_reader.cc
     storage/direct_io_reader.cc
+    storage/consolidated_slim_reader.cc
 
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
@@ -500,6 +501,12 @@ if(BUILD_TESTING)
         add_executable(test_consolidated_slim_format tests/test_consolidated_slim_format.cc)
         target_link_libraries(test_consolidated_slim_format PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME ConsolidatedSlimFormatTests COMMAND test_consolidated_slim_format)
+
+        # ConsolidatedSlim reader tests (DiskGNN-adoption Plan 1 Phase 2:
+        # header validation + O_DIRECT-capable pread_exact)
+        add_executable(test_consolidated_slim_reader tests/test_consolidated_slim_reader.cc)
+        target_link_libraries(test_consolidated_slim_reader PRIVATE mdb_gnn_core gtest gtest_main)
+        add_test(NAME ConsolidatedSlimReaderTests COMMAND test_consolidated_slim_reader)
 
         # AddrTable reader tests (Path 4 Task 3: open + validate + parse 9 arrays)
         add_executable(test_addr_table_reader tests/test_addr_table_reader.cc)
