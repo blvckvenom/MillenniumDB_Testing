@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -26,6 +28,10 @@
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
+#include "gnn/storage/feature_matrix.h"
+#include "gnn/training/feature_label_integrity.h"
+#include <cstdio>
+#include <iostream>
 #include "gnn/training/batch_assembler.h"
 #include "gnn/training/label_store.h"
 #include "gnn/training/mini_batch.h"
@@ -284,7 +290,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // when the BatchAssembler runs in FeatureMatrix-fallback mode (see
     // TrainingLoop::Config::prefetch_num_workers for thread-safety notes
     // and the FourLevelStore clamp).
-    uint64_t    prefetch_num_workers = 1;
+    // 2026-06-01: default 0 = AUTO (host-adaptive, resolved below from
+    // hardware_concurrency); explicit prefetchNumWorkers (>=1) overrides.
+    uint64_t    prefetch_num_workers = 0;
+    // Round 3B-mw (2026-06-01): AsyncBatchPrefetcher shared-queue size. The
+    // prefetcher caps live workers at min(prefetch_num_workers, this), so N>2
+    // workers need a larger queue. Default 2 (DiskGNN §6); auto-raised to the
+    // worker count below if the caller bumped workers but left this default.
+    uint64_t    prefetch_queue_size = 2;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -346,6 +359,19 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                     std::to_string(*v));
             }
             prefetch_num_workers = static_cast<uint64_t>(*v);
+        }
+        // Round 3B-mw (2026-06-01): the AsyncBatchPrefetcher caps the live
+        // worker count at min(prefetchNumWorkers, prefetchQueueSize), so N>2
+        // workers require a larger queue. Expose the queue size; default
+        // stays 2 (DiskGNN §6). Auto-raise to prefetchNumWorkers below if the
+        // caller bumped workers but left the queue at the default.
+        if (auto v = opts.get_int("prefetchQueueSize")) {
+            if (*v < 1) {
+                throw std::runtime_error(
+                    "prefetchQueueSize must be >= 1, got: " +
+                    std::to_string(*v));
+            }
+            prefetch_queue_size = static_cast<uint64_t>(*v);
         }
         if (auto v = opts.get_bool("normalize")) {
             normalize = *v;
@@ -459,18 +485,64 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     auto rm = RowMapping::open(rmap_path);
     auto samples = SampleStorage::open(storage_path);
 
+    // Round 3B-mw (2026-06-01): resolve prefetchNumWorkers when unset (sentinel
+    // 0). The DEFAULT is 1 (single worker) to preserve REPRODUCIBILITY: the
+    // multi-worker prefetcher delivers batches in a timing-dependent order, so
+    // N>1 training is NOT bit-reproducible across runs at a fixed seed (measured:
+    // cora testAcc wobbles 0.8796<->0.8870 at N=4; features ARE bit-identical, it
+    // is the batch ORDER that varies the SGD trajectory). Multi-worker is a SPEED
+    // opt-in (4.32x at N=8) enabled via the prefetchNumWorkers param or the env
+    // MDB_GNN_PREFETCH_WORKERS (a number, or "auto" = clamp(cores-4, 2, 8),
+    // NVMe-bound). Making it the safe default requires in-order batch delivery in
+    // AsyncBatchPrefetcher (a reorder buffer) — deferred. The OOM-safe cache cap
+    // below still applies whenever N>1, so explicit multi-worker no longer needs
+    // a manual sampleCacheMb to avoid the documented N>1 OOM.
+    if (prefetch_num_workers == 0) {
+        unsigned auto_n = 1;
+        if (const char* env = std::getenv("MDB_GNN_PREFETCH_WORKERS")) {
+            std::string s(env);
+            if (s == "auto") {
+                unsigned hw = std::thread::hardware_concurrency();
+                unsigned a = (hw > 6u) ? (hw - 4u) : 2u;
+                auto_n = std::clamp<unsigned>(a, 2u, 8u);
+            } else {
+                try { long v = std::stol(s); if (v >= 1) auto_n = static_cast<unsigned>(v); }
+                catch (...) { /* keep 1 */ }
+            }
+        }
+        prefetch_num_workers = auto_n;
+        if (auto_n > 1) {
+            std::cerr << "[gnn_train] prefetchNumWorkers (env) -> " << prefetch_num_workers
+                      << " (multi-worker: faster but NOT bit-reproducible)\n";
+        }
+    }
+
+    // Auto RAM-cache budget (shared by the sample cache + struct cache below):
+    // -1 = auto, 0 = disabled, >0 = explicit MB. When auto AND multi-worker, cap
+    // the explicit cache at the validated-safe 2 GB. N workers hold in-flight
+    // pinned + combined buffers, and the kernel needs page-cache headroom for the
+    // (>> RAM) reordered.fmat + packed_slim, so the naive MemAvailable/4 applied
+    // at BOTH cache sites (= MemAvailable/2) OOMs at N>1 (the documented
+    // death-during-val). The kernel page cache still uses the rest of RAM for the
+    // feature working set automatically, so the small explicit cap costs little.
+    size_t auto_cache_budget_bytes = static_cast<size_t>(get_mem_available() / 4);
+    if (prefetch_num_workers > 1) {
+        auto_cache_budget_bytes =
+            std::min<size_t>(auto_cache_budget_bytes, 2048ULL * 1024 * 1024);
+    }
+
     // Deserialized-sample cache (train hot path): keep sample structure
     // RAM-resident across epochs so epochs 2..N skip the per-batch disk read +
     // deserialize that the cost model identified as the dominant train cost.
-    // -1 = auto (MemAvailable/4), 0 = disabled, >0 = explicit MB.
     {
         size_t budget = (sample_cache_mb < 0)
-            ? static_cast<size_t>(get_mem_available() / 4)
+            ? auto_cache_budget_bytes
             : static_cast<size_t>(sample_cache_mb) * 1024ULL * 1024ULL;
         samples.set_sample_cache_budget_bytes(budget);
         std::cerr << "[gnn_train] sample cache budget = "
                   << (budget / (1024 * 1024)) << " MB ("
-                  << (sample_cache_mb < 0 ? "auto" : "explicit") << ")\n";
+                  << (sample_cache_mb < 0 ? "auto" : "explicit")
+                  << ", workers=" << prefetch_num_workers << ")\n";
     }
 
     const auto& catalog = samples.get_catalog();
@@ -536,6 +608,71 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                 "(scripts/regenerate_labels_splits.py) or rebuild the projection "
                 "with graph_project."
             );
+        }
+    }
+
+    // Gate (A) — feature<->label integrity (2026-06-02). The labels<->splits
+    // guard above only verifies labels are PRESENT for TRAIN rows; it cannot
+    // detect a node_features.fmat whose feature ROWS are misaligned to node
+    // identity (the 2026-06-02 papers100M bug: fmat[r] held the wrong node's
+    // features, so the model trained on wrong-features + correct-label and
+    // capped accuracy ~3x, INVARIANT to all graph/model choices). This check
+    // fits per-class feature centroids on a strided sample of TRAIN nodes and
+    // aborts if nearest-centroid accuracy is no better than chance (features
+    // carry no label signal). Source-independent. Opt out via env
+    // MDB_GNN_SKIP_INTEGRITY=1.
+    {
+        const char* skip_env = std::getenv("MDB_GNN_SKIP_INTEGRITY");
+        const bool skip_integrity = skip_env && (std::string(skip_env) == "1" ||
+                                    std::string(skip_env) == "true" || std::string(skip_env) == "yes");
+        auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
+        if (!skip_integrity && labels && splits && meta.feature_dim > 0 &&
+            meta.num_classes >= 2 && fs::exists(fmat_path)) {
+            try {
+                auto fm = FeatureMatrix::open(fmat_path);
+                if (fm.dtype() == GnnDtype::FLOAT32 &&
+                    fm.num_cols() == static_cast<size_t>(meta.feature_dim)) {
+                    const size_t   D    = static_cast<size_t>(meta.feature_dim);
+                    const uint64_t N    = std::min(splits->num_nodes(), labels->num_nodes());
+                    const uint64_t WANT = 20000;
+                    const uint64_t stride = std::max<uint64_t>(1, N / (WANT * 3));
+                    std::vector<uint64_t> rows;
+                    rows.reserve(WANT);
+                    for (uint64_t r = 0; r < N && rows.size() < WANT; r += stride) {
+                        if (splits->get(r) == SplitStore::TRAIN && labels->get(r) >= 0)
+                            rows.push_back(r);
+                    }
+                    if (rows.size() >= 200) {
+                        std::vector<float>   feat(rows.size() * D);
+                        fm.extract_rows(rows, feat.data());
+                        std::vector<int64_t> lab(rows.size());
+                        for (size_t i = 0; i < rows.size(); ++i)
+                            lab[i] = labels->get(rows[i]);
+                        auto res = FeatureLabelIntegrity::check(
+                            feat.data(), rows.size(), D, lab.data(), meta.num_classes);
+                        if (res.ran && !res.passed) {
+                            char buf[512];
+                            std::snprintf(buf, sizeof(buf),
+                                "gnn_train: feature<->label INTEGRITY CHECK FAILED "
+                                "(nearest-centroid acc %.4f <= threshold %.4f, chance %.4f, "
+                                "on %zu TRAIN nodes). The feature store carries no label "
+                                "signal: node_features.fmat rows are misaligned to node "
+                                "identity (a node's features do not predict its label). "
+                                "Rebuild features so fmat[r] == the source features for node r "
+                                "(via graph_project / re-import). Bypass with "
+                                "MDB_GNN_SKIP_INTEGRITY=1.",
+                                res.accuracy, res.threshold, res.chance, res.num_scored);
+                            throw std::runtime_error(buf);
+                        }
+                    }
+                }
+            } catch (const std::runtime_error&) {
+                throw;  // integrity failure — propagate
+            } catch (const std::exception& e) {
+                // Non-fatal: could not run the check (e.g. fmat open issue). Warn, do not block.
+                std::cerr << "[gnn_train] feature-label integrity check skipped: "
+                          << e.what() << "\n";
+            }
         }
     }
 
@@ -615,7 +752,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // Same budget knob/policy as the sample cache.
     {
         size_t budget = (sample_cache_mb < 0)
-            ? static_cast<size_t>(get_mem_available() / 4)
+            ? auto_cache_budget_bytes
             : static_cast<size_t>(sample_cache_mb) * 1024ULL * 1024ULL;
         assembler.set_struct_cache_budget_bytes(budget);
     }
@@ -633,6 +770,13 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.use_async_prefetcher = use_async_prefetcher;
     loop_config.use_cuda_streams     = use_cuda_streams;
     loop_config.prefetch_num_workers = static_cast<unsigned>(prefetch_num_workers);
+    // Round 3B-mw: the prefetcher caps live workers at min(workers, queue).
+    // If the caller raised workers but left the queue at the default 2,
+    // auto-raise the queue so the requested workers are actually honored.
+    if (prefetch_queue_size < prefetch_num_workers) {
+        prefetch_queue_size = prefetch_num_workers;
+    }
+    loop_config.prefetch_queue_size = static_cast<size_t>(prefetch_queue_size);
     loop_config.output_dir    = output_dir.string();
     loop_config.profile_log_path = profile_log_path;  // Phase 0 instrumentation
 
