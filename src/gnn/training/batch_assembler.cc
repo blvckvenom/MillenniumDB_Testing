@@ -248,7 +248,7 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
 
     // Step 4: Build edge indices per layer (LOCAL to active sets).
     auto t_edge_start = std::chrono::steady_clock::now();
-    mini.edge_indices = build_edge_indices(sample, active.oid_to_local_per_layer);
+    mini.edge_indices = build_edge_indices(sample, active);
     auto t_edge_end = std::chrono::steady_clock::now();
     mini.timing.edge_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -305,26 +305,37 @@ BatchAssembler::build_active_indices(
     const std::unordered_map<uint64_t, int64_t>& oid_to_global)
 {
     // K+1 active sets for K-layer sample: A_0 .. A_K.
-    const size_t K = sample.edges_per_layer.size();
+    const size_t  K = sample.edges_per_layer.size();
+    const int64_t N = static_cast<int64_t>(sample.all_unique_nodes.size());
     ActiveIndicesResult out;
     out.indices_per_layer.reserve(K + 1);
     out.sizes_per_layer.reserve(K + 1);
-    out.oid_to_local_per_layer.reserve(K + 1);
 
-    // Accumulating active set. By the rebuild_unique_nodes ordering
-    // invariant, layer-k nodes always have higher positions than
-    // layer-(k-1) nodes (modulo cross-layer duplicates which are
-    // already deduped during rebuild). So adding layer k's positions
-    // in order produces a monotonically non-decreasing sequence —
-    // no explicit sort needed for the prefix invariant to hold.
-    std::vector<int64_t>         active_positions;
-    std::unordered_set<int64_t>  active_set;
-    active_positions.reserve(sample.all_unique_nodes.size());
-    active_set.reserve(sample.all_unique_nodes.size());
+    // --- Phase 1: accumulate the cumulative active set, layer by layer. ---
+    // By the rebuild_unique_nodes() ordering invariant (nodes inserted into
+    // all_unique_nodes in layer order, seeds first), adding layer k's global
+    // positions in iteration order yields a monotonically increasing sequence,
+    // and across all layers the full set is exactly [0,1,..,N-1]. We dedup with
+    // an O(1) `seen` bitmap indexed by global position (positions are in
+    // [0,N)), which is far cheaper than the prior unordered_set/unordered_map
+    // churn — that allocation traffic was the dominant per-batch CPU cost at
+    // N=8 (profile 2026-06-04: build_active_indices ~= 29% of epoch wall).
+    std::vector<char>    seen(static_cast<size_t>(N), 0);
+    std::vector<int64_t> active_positions;
+    active_positions.reserve(static_cast<size_t>(N));
+    std::vector<int64_t> prefix_sizes;  // |A_k| after processing layer k
+    prefix_sizes.reserve(K + 1);
+
+    // Per-layer-entry global positions, recorded for free from the same
+    // oid_to_global lookups below. layer_gpos[k][i] is the global position of
+    // nodes_per_layer[k][i] (every entry, incl. cross-layer dups). On the fast
+    // path this lets build_edge_indices remap edges with zero hash lookups.
+    const size_t num_node_layers = sample.nodes_per_layer.size();
+    std::vector<std::vector<int64_t>> layer_gpos(num_node_layers);
 
     for (size_t k = 0; k <= K; ++k) {
-        // Add nodes_per_layer[k] to the cumulative active set.
-        if (k < sample.nodes_per_layer.size()) {
+        if (k < num_node_layers) {
+            layer_gpos[k].reserve(sample.nodes_per_layer[k].size());
             for (const auto& oid : sample.nodes_per_layer[k]) {
                 auto it = oid_to_global.find(oid.id);
                 if (it == oid_to_global.end()) {
@@ -334,42 +345,62 @@ BatchAssembler::build_active_indices(
                         std::to_string(oid.id) + ")"
                     );
                 }
-                if (active_set.insert(it->second).second) {
-                    active_positions.push_back(it->second);
+                const int64_t pos = it->second;
+                layer_gpos[k].push_back(pos);
+                if (pos >= 0 && pos < N && !seen[static_cast<size_t>(pos)]) {
+                    seen[static_cast<size_t>(pos)] = 1;
+                    active_positions.push_back(pos);
                 }
             }
         }
+        prefix_sizes.push_back(static_cast<int64_t>(active_positions.size()));
+    }
 
-        // Sort for deterministic order (matches the model's gather pattern;
-        // also defensive in case future sampler changes break the
-        // monotone-insertion property).
-        std::sort(active_positions.begin(), active_positions.end());
+    // --- Phase 2: identity check. The universal case is active_positions ==
+    // [0,1,..,M-1]; then local index == global position for every layer, so the
+    // per-layer gather tensors are aranges and edges remap through oid_to_global
+    // with no per-layer maps at all. ---
+    bool identity = true;
+    for (size_t i = 0; i < active_positions.size(); ++i) {
+        if (active_positions[i] != static_cast<int64_t>(i)) { identity = false; break; }
+    }
+    out.identity_prefix = identity;
 
-        // Build tensor for A_k.
-        auto t = torch::empty(
-            {static_cast<int64_t>(active_positions.size())},
-            torch::kInt64
-        );
-        if (!active_positions.empty()) {
-            std::memcpy(t.data_ptr<int64_t>(),
-                        active_positions.data(),
-                        active_positions.size() * sizeof(int64_t));
+    if (identity) {
+        for (size_t k = 0; k <= K; ++k) {
+            const int64_t Mk = prefix_sizes[k];
+            out.sizes_per_layer.push_back(Mk);
+            out.indices_per_layer.push_back(torch::arange(Mk, torch::kInt64));
         }
-        out.sizes_per_layer.push_back(static_cast<int64_t>(active_positions.size()));
+        // oid_to_local_per_layer intentionally left empty (fast-path signal);
+        // carry the precomputed per-layer global positions for build_edge_indices.
+        out.layer_global_pos = std::move(layer_gpos);
+        return out;
+    }
+
+    // --- Defensive fallback (never observed: only if a future sampler change
+    // breaks the rebuild_unique_nodes ordering). Reproduce the legacy result
+    // BYTE-IDENTICALLY: each A_k is the sorted prefix active_positions[0,M_k),
+    // with a per-layer ObjectId.id -> local-index map. ---
+    out.oid_to_local_per_layer.reserve(K + 1);
+    for (size_t k = 0; k <= K; ++k) {
+        const size_t Mk = static_cast<size_t>(prefix_sizes[k]);
+        std::vector<int64_t> sorted_positions(active_positions.begin(),
+                                              active_positions.begin() + Mk);
+        std::sort(sorted_positions.begin(), sorted_positions.end());
+
+        auto t = torch::empty({static_cast<int64_t>(Mk)}, torch::kInt64);
+        if (Mk > 0) {
+            std::memcpy(t.data_ptr<int64_t>(), sorted_positions.data(),
+                        Mk * sizeof(int64_t));
+        }
+        out.sizes_per_layer.push_back(static_cast<int64_t>(Mk));
         out.indices_per_layer.push_back(std::move(t));
 
-        // Round 2C (2026-05-15): build the ObjectId.id -> local-A_k-index
-        // hash table for this layer. Walk active_positions (= sorted global
-        // positions in A_k) and pull the ObjectId from
-        // sample.all_unique_nodes[global_pos]. The resulting map lets
-        // build_edge_indices skip the oid->global->local two-hop dance.
         std::unordered_map<uint64_t, int64_t> oid_to_local;
-        oid_to_local.reserve(active_positions.size());
-        for (int64_t local_idx = 0;
-             local_idx < static_cast<int64_t>(active_positions.size());
-             ++local_idx)
-        {
-            const int64_t global_pos = active_positions[static_cast<size_t>(local_idx)];
+        oid_to_local.reserve(Mk);
+        for (int64_t local_idx = 0; local_idx < static_cast<int64_t>(Mk); ++local_idx) {
+            const int64_t global_pos = sorted_positions[static_cast<size_t>(local_idx)];
             oid_to_local[sample.all_unique_nodes[static_cast<size_t>(global_pos)].id] =
                 local_idx;
         }
@@ -385,17 +416,20 @@ BatchAssembler::build_active_indices(
 
 std::vector<torch::Tensor> BatchAssembler::build_edge_indices(
     const GraphSample& sample,
-    const std::vector<std::unordered_map<uint64_t, int64_t>>& oid_to_local_per_layer)
+    const ActiveIndicesResult& active)
 {
     std::vector<torch::Tensor> result;
     const size_t num_layers = sample.edges_per_layer.size();
     result.reserve(num_layers);
 
-    // Round 2C (2026-05-15): oid_to_local_per_layer[k] is already built by
-    // build_active_indices and maps each ObjectId.id present in A_k to its
-    // local index. One hash lookup per edge endpoint instead of two —
-    // half the hash work versus the prior oid->global->local two-hop path.
-    //
+    // Fast path (2026-06-04): empty per-layer maps => active sets are identity
+    // prefixes (local index == global position). Each endpoint is remapped by
+    // pure array indexing into active.layer_global_pos[layer][entry_idx]
+    // (precomputed in build_active_indices from the lookups it already did) —
+    // ZERO per-edge hash lookups. Fallback: legacy per-layer A_{k+1}/A_k maps.
+    const bool fast = active.oid_to_local_per_layer.empty();
+    const auto& lgp = active.layer_global_pos;
+
     // Nested aggregation (2026-06-02): conv k operates on dst set A_k =
     // ∪_{j<=k} nodes_per_layer[j] (all nodes within k hops). For STANDARD
     // GraphSAGE / DGL-block message passing every such node must aggregate its
@@ -411,8 +445,11 @@ std::vector<torch::Tensor> BatchAssembler::build_edge_indices(
     const bool nested = nested_aggregation_;
 
     for (size_t k = 0; k < num_layers; ++k) {
-        const auto& src_map = oid_to_local_per_layer[k + 1];  // A_{k+1}
-        const auto& dst_map = oid_to_local_per_layer[k];      // A_k
+        // Fallback per-layer maps (unused on the fast path).
+        const std::unordered_map<uint64_t, int64_t>* src_map =
+            fast ? nullptr : &active.oid_to_local_per_layer[k + 1];
+        const std::unordered_map<uint64_t, int64_t>* dst_map =
+            fast ? nullptr : &active.oid_to_local_per_layer[k];
 
         const size_t first_j = nested ? 0 : k;  // nested: E_0..E_k; legacy: E_k only
 
@@ -429,37 +466,42 @@ std::vector<torch::Tensor> BatchAssembler::build_edge_indices(
             const LayerEdges& edges = sample.edges_per_layer[j];
             const int64_t Ej = static_cast<int64_t>(edges.size());
             for (int64_t i = 0; i < Ej; ++i) {
-                // E_j edges are layer-local to (layer j+1 src, layer j dst).
-                const ObjectId src_oid = sample.nodes_per_layer[j + 1][
-                    static_cast<size_t>(edges.src_indices[i])
-                ];
-                const ObjectId dst_oid = sample.nodes_per_layer[j][
-                    static_cast<size_t>(edges.dst_indices[i])
-                ];
+                const size_t src_idx = static_cast<size_t>(edges.src_indices[i]);
+                const size_t dst_idx = static_cast<size_t>(edges.dst_indices[i]);
 
-                // Remap into THIS conv's cumulative active sets: src into
-                // A_{k+1}, dst into A_k. One hash lookup per endpoint.
-                auto src_it = src_map.find(src_oid.id);
-                auto dst_it = dst_map.find(dst_oid.id);
-                if (src_it == src_map.end()) {
-                    throw std::runtime_error(
-                        "BatchAssembler::build_edge_indices: src node not in A_" +
-                        std::to_string(k + 1) + " active set (conv " +
-                        std::to_string(k) + ", hop " + std::to_string(j) +
-                        ", edge " + std::to_string(i) + ")"
-                    );
-                }
-                if (dst_it == dst_map.end()) {
-                    throw std::runtime_error(
-                        "BatchAssembler::build_edge_indices: dst node not in A_" +
-                        std::to_string(k) + " active set (conv " +
-                        std::to_string(k) + ", hop " + std::to_string(j) +
-                        ", edge " + std::to_string(i) + ")"
-                    );
+                int64_t src_local, dst_local;
+                if (fast) {
+                    // Remap by precomputed global position (== local index).
+                    src_local = lgp[j + 1][src_idx];  // src in A_{k+1}
+                    dst_local = lgp[j][dst_idx];       // dst in A_k
+                } else {
+                    // E_j edges are layer-local to (layer j+1 src, layer j dst).
+                    const ObjectId src_oid = sample.nodes_per_layer[j + 1][src_idx];
+                    const ObjectId dst_oid = sample.nodes_per_layer[j][dst_idx];
+                    auto src_it = src_map->find(src_oid.id);
+                    auto dst_it = dst_map->find(dst_oid.id);
+                    if (src_it == src_map->end()) {
+                        throw std::runtime_error(
+                            "BatchAssembler::build_edge_indices: src node not in A_" +
+                            std::to_string(k + 1) + " active set (conv " +
+                            std::to_string(k) + ", hop " + std::to_string(j) +
+                            ", edge " + std::to_string(i) + ")"
+                        );
+                    }
+                    if (dst_it == dst_map->end()) {
+                        throw std::runtime_error(
+                            "BatchAssembler::build_edge_indices: dst node not in A_" +
+                            std::to_string(k) + " active set (conv " +
+                            std::to_string(k) + ", hop " + std::to_string(j) +
+                            ", edge " + std::to_string(i) + ")"
+                        );
+                    }
+                    src_local = src_it->second;
+                    dst_local = dst_it->second;
                 }
 
-                acc[0][out] = src_it->second;  // src local in A_{k+1}
-                acc[1][out] = dst_it->second;  // dst local in A_k
+                acc[0][out] = src_local;  // src local in A_{k+1}
+                acc[1][out] = dst_local;  // dst local in A_k
                 ++out;
             }
         }

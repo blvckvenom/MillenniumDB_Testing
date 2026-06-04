@@ -207,6 +207,24 @@ private:
         std::vector<int64_t>       sizes_per_layer;            // |A_k| for each k
         std::vector<std::unordered_map<uint64_t, int64_t>>
                                    oid_to_local_per_layer;     // K+1 maps: ObjectId.id -> local idx in A_k
+                                                               // (populated ONLY on the defensive fallback;
+                                                               //  empty on the fast identity-prefix path)
+        // Fast-path only: layer_global_pos[k][i] = global position (== local
+        // index under the identity prefix) of nodes_per_layer[k][i], for EVERY
+        // entry incl. cross-layer duplicates. Filled for free in Phase 1 (reuses
+        // the oid_to_global lookups build_active_indices already does), so
+        // build_edge_indices can remap each edge endpoint by pure array indexing
+        // with ZERO per-edge hash lookups. Empty on the defensive fallback.
+        std::vector<std::vector<int64_t>> layer_global_pos;
+        // Fast path flag. True (the universal case) when the cumulative active
+        // positions came out as the identity sequence [0,1,..,N-1] — guaranteed
+        // by rebuild_unique_nodes() inserting nodes in layer order, so local
+        // index == global position for every layer. When true, indices_per_layer
+        // is an arange and oid_to_local_per_layer is left empty (build_edge_indices
+        // remaps via oid_to_global directly). When false (never observed in
+        // practice, only if a future sampler change breaks the ordering), the
+        // legacy per-layer sort + maps are produced for exact equivalence.
+        bool identity_prefix = true;
     };
 
     /**
@@ -246,10 +264,17 @@ private:
      * Round 2C (2026-05-15): takes the per-layer oid_to_local maps produced
      * by build_active_indices so each edge endpoint costs ONE hash lookup
      * (ObjectId.id -> local idx) instead of two (oid -> global -> local).
+     *
+     * Fast path (2026-06-04): when active.oid_to_local_per_layer is EMPTY, the
+     * active sets are identity prefixes (local index == global position), so each
+     * endpoint is remapped by pure array indexing into active.layer_global_pos
+     * (precomputed in build_active_indices) — ZERO per-edge hash lookups. When
+     * non-empty, the legacy per-layer maps are used (defensive fallback for a
+     * hypothetically non-identity order).
      */
     std::vector<torch::Tensor> build_edge_indices(
         const GraphSample& sample,
-        const std::vector<std::unordered_map<uint64_t, int64_t>>& oid_to_local_per_layer);
+        const ActiveIndicesResult& active);
 
     /**
      * @brief Load features for the unique nodes of a sample.
