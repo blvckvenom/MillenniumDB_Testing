@@ -100,6 +100,10 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         // Default true — enables the fast runtime path in gnn_train via
         // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip Phase 5.
         if (auto v = opts.get_bool("buildAddrTables")) config.build_addr_tables = *v;
+        // DiskGNN-adoption Plan 1: also emit packed_slim/consolidated.slim during
+        // the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF. The
+        // runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
+        if (auto v = opts.get_bool("writeConsolidatedSlim")) config.write_consolidated_slim = *v;
         // cleanupIntermediate: delete the non-slim packed/ from materialize_batches
         // after build succeeds. Default true. Set false only for debugging.
         if (auto v = opts.get_bool("cleanupIntermediate")) {
