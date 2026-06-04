@@ -455,7 +455,14 @@ TrainingLoop::Result TrainingLoop::train()
         result.epoch_losses.push_back(avg_loss);
 
         // === Validation phase ===
+        // Phase-split instrumentation: wall up to here is the training phase;
+        // the delta across evaluate() is the validation phase.
+        auto t_train_end = std::chrono::steady_clock::now();
+        double train_phase_s = std::chrono::duration<double>(
+            t_train_end - epoch_start).count();
         double val_accuracy = evaluate(train_batches, val_batches);
+        double val_phase_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_train_end).count();
 
         // Phase 0: flush per-batch CSV at epoch boundary so partial logs
         // survive an early termination (Ctrl-C, OOM, etc.) and post-hoc
@@ -516,6 +523,8 @@ TrainingLoop::Result TrainingLoop::train()
                   << "  best_val=" << std::fixed << std::setprecision(4) << best_val_acc
                   << "  patience=" << patience_counter << "/" << config_.patience
                   << "  epoch_t=" << std::fixed << std::setprecision(1) << epoch_seconds << "s"
+                  << "  (train=" << std::fixed << std::setprecision(1) << train_phase_s
+                  << "s val=" << std::fixed << std::setprecision(1) << val_phase_s << "s)"
                   << "  total_t=" << std::fixed << std::setprecision(0) << wall_so_far << "s";
         // Spec B2: per-epoch L3+L4 disk-traffic delta inline. Suppressed
         // when provider is unset (delta stays zero) or the delta is
