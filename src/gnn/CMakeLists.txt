@@ -166,6 +166,9 @@ add_library(mdb_gnn_core STATIC
     training/batch_timing_log.cc
     training/npy_writer.cc
 
+    # Gate (A): feature<->label integrity check (2026-06-02)
+    training/feature_label_integrity.cc
+
     # Phase 4: GNN Models
     models/graphsage_model.cc
 
@@ -544,6 +547,21 @@ if(BUILD_TESTING)
             add_test(NAME BatchAssemblerTests COMMAND test_batch_assembler)
             if(EXISTS "${ASAN_SUPP_FILE}")
                 set_property(TEST BatchAssemblerTests PROPERTY
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+            endif()
+        endif()
+
+        # Gate (A): feature<->label integrity tests (2026-06-02)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_feature_label_integrity.cc")
+            add_executable(test_feature_label_integrity tests/test_feature_label_integrity.cc)
+            target_link_libraries(test_feature_label_integrity mdb_gnn_core GTest::gtest_main)
+            set_target_properties(test_feature_label_integrity PROPERTIES
+                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            )
+            add_test(NAME FeatureLabelIntegrityTests COMMAND test_feature_label_integrity)
+            if(EXISTS "${ASAN_SUPP_FILE}")
+                set_property(TEST FeatureLabelIntegrityTests PROPERTY
                     ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
             endif()
         endif()
