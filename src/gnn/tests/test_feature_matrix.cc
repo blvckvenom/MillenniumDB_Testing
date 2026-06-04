@@ -1,6 +1,7 @@
 #include "test_helpers.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 
 // Fixture alias — keeps test names as FeatureMatrixTest.* in output
@@ -431,6 +432,55 @@ TEST_F(FeatureMatrixTest, CreateReorderedDuplicateSourceRows) {
     for (uint64_t i = 0; i < N; ++i) {
         EXPECT_FLOAT_EQ(dst.row_as<float>(i)[0], 20.0f);
         EXPECT_FLOAT_EQ(dst.row_as<float>(i)[1], 21.0f);
+    }
+}
+
+// Differential gate for the 2026-06-01 ext_sort Pass-1 source-order rewrite:
+// the inverse-permutation sequential-source path must produce byte-identical
+// output to the output-order path. Exercises the external_sort strategy across
+// >1 bucket with a PARTIAL last bucket (the skeptics' boundary concern) on a
+// bijection, plus the non-bijective fallback (perm={1,1,1}) which must preserve
+// the documented CreateReorderedDuplicateSourceRows contract.
+TEST_F(FeatureMatrixTest, CreateReorderedExtSortSourceOrderMatches) {
+    struct EnvGuard {
+        std::string k, old; bool had;
+        EnvGuard(const char* key, const char* val) : k(key) {
+            const char* o = std::getenv(key); had = (o != nullptr); if (had) old = o;
+            ::setenv(key, val, 1);
+        }
+        ~EnvGuard() { if (had) ::setenv(k.c_str(), old.c_str(), 1); else ::unsetenv(k.c_str()); }
+    };
+    EnvGuard strat("MDB_GNN_REORDER_STRATEGY", "external_sort");
+    EnvGuard bsz("MDB_GNN_REORDER_BUCKET_MB", "1");  // tiny buckets -> 2 buckets + partial last
+
+    // Bijection across >1 bucket: D=2 float32 (rb=8) -> bucket_rows=131072;
+    // N=200000 -> 2 buckets, last partial (68928 rows). reverse perm = bijection.
+    const uint64_t N = 200000, D = 2;
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N; ++i) { data[i*D+0] = float(i); data[i*D+1] = float(i) + 0.5f; }
+    auto src = FeatureMatrix::create(test_path("extsort_src.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+
+    std::vector<uint64_t> perm(N);
+    for (uint64_t out = 0; out < N; ++out) perm[out] = (N - 1) - out;
+    auto dst = FeatureMatrix::create_reordered(src, perm, test_path("extsort_dst.fmat"));
+
+    ASSERT_EQ(dst.num_rows(), N);
+    for (uint64_t out = 0; out < N; ++out) {
+        const float* exp = src.row_as<float>(perm[out]);
+        const float* got = dst.row_as<float>(out);
+        ASSERT_FLOAT_EQ(got[0], exp[0]) << "row " << out;
+        ASSERT_FLOAT_EQ(got[1], exp[1]) << "row " << out;
+    }
+
+    // Non-bijective fallback under ext_sort: perm={1,1,1} -> all rows == src row 1.
+    const uint64_t M = 3;
+    std::vector<float> ddata = {10.0f, 11.0f, 20.0f, 21.0f, 30.0f, 31.0f};
+    auto dsrc = FeatureMatrix::create(test_path("extsort_dup_src.fmat"), M, D, GnnDtype::FLOAT32, ddata.data());
+    std::vector<uint64_t> dperm = {1, 1, 1};
+    auto ddst = FeatureMatrix::create_reordered(dsrc, dperm, test_path("extsort_dup_dst.fmat"));
+    for (uint64_t i = 0; i < M; ++i) {
+        EXPECT_FLOAT_EQ(ddst.row_as<float>(i)[0], 20.0f);
+        EXPECT_FLOAT_EQ(ddst.row_as<float>(i)[1], 21.0f);
     }
 }
 

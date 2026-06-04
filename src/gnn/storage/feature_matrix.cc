@@ -772,40 +772,103 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
             buckets[b].entries = 0;
         }
 
-        // Pass 1 reads source.row(permutation[out]) — i.e. RANDOM source rows
-        // in permutation order, NOT sequential. MADV_RANDOM tells the kernel
-        // to (a) skip the 128 KB readahead window (would waste I/O on pages
-        // we never touch) and (b) avoid aggressive eviction (lets pages stay
-        // cached for likely re-access). Bug fix 2026-05-17: previously this
-        // was MADV_SEQUENTIAL which actively hurt the random pattern below.
-        MadviseGuard madvise_guard(source.mmap_ptr_, source.mmap_size_, MADV_RANDOM);
+        // Fix (2026-06-01): make Pass 1's SOURCE reads sequential when possible.
+        // Historically Pass 1 read source.row(permutation[out]) in OUTPUT order,
+        // i.e. RANDOM mmap access keyed by the permutation. On a box where the
+        // source FM exceeds RAM (papers100M: 56 GB on 30 GB) that random gather
+        // thrashes the page cache at ~37 MB/s — the exact pathology ext_sort was
+        // meant to avoid but never actually fixed on the read side (it only made
+        // the WRITES sequential). Build the inverse permutation (src -> out) once
+        // in O(N); when `permutation` is a true bijection of [0,N) — the
+        // production case (all callers feed MinHashReorderer::compute_permutation,
+        // a partition of [0,N)) — iterate SOURCE rows instead, so source.row(src)
+        // walks the mmap in strictly increasing offset (sequential). The bucket /
+        // out_local assignment stays a pure function of out = inv[src], so each
+        // bucket receives the identical (out_local, row) SET and Pass 2 (a pure
+        // scatter-by-out_local) yields a BYTE-IDENTICAL reordered.fmat.
+        //
+        // create_reordered() validates permutation[i] < N but NOT uniqueness, so
+        // a non-injective permutation (duplicates/gaps — e.g. the documented
+        // CreateReorderedDuplicateSourceRows contract, perm={1,1,1}) can reach
+        // here. The inverse is ill-defined for those, so we DETECT them and fall
+        // back to the exact original output-order loop, preserving byte-identical
+        // behavior for the non-injective contract.
+        const uint64_t kInvUnset = N;       // valid out values are < N, so N is a safe sentinel
+        bool is_bijection = true;
+        std::vector<uint64_t> inv;
+        inv.assign(N, kInvUnset);           // N*8 bytes (papers100M: ~888 MB); freed before Pass 2
+        for (uint64_t out = 0; out < N; ++out) {
+            uint64_t src = permutation[out];           // validated < N in create_reordered()
+            if (inv[src] != kInvUnset) { is_bijection = false; break; }  // duplicate target
+            inv[src] = out;
+        }
+        if (!is_bijection) { inv.clear(); inv.shrink_to_fit(); }
+
+        // MADV per branch: the bijection path reads sequentially (src=0..N) so we
+        // re-enable readahead via MADV_SEQUENTIAL (the whole point of the
+        // inversion). The fallback keeps the random pattern, so it must keep
+        // MADV_RANDOM (the 2026-05-17 fix that disabled readahead for random reads).
+        MadviseGuard madvise_guard(source.mmap_ptr_, source.mmap_size_,
+                                   is_bijection ? MADV_SEQUENTIAL : MADV_RANDOM);
 
         auto report_every = std::max<uint64_t>(1, N / 20);
 
-        // Iterate by OUTPUT row (which is what perm is indexed on).
-        // For each output row, read source[perm[out]] — random mmap access.
-        for (uint64_t out = 0; out < N; ++out) {
-            uint64_t src = permutation[out];
-            uint64_t b   = out / bucket_rows;
-            uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
+        if (is_bijection) {
+            // Sequential source scan: out = inv[src]; bucket keyed by out exactly
+            // as before. Byte-identical output to the fallback for a bijection.
+            for (uint64_t src = 0; src < N; ++src) {
+                uint64_t out = inv[src];
+                uint64_t b   = out / bucket_rows;
+                uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
 
-            Bucket& bk = buckets[b];
-            if (bk.used + entry_size > bk.buf.size()) {
-                write_all(bk.fd, bk.buf.data(), bk.used);
-                bk.used = 0;
+                Bucket& bk = buckets[b];
+                if (bk.used + entry_size > bk.buf.size()) {
+                    write_all(bk.fd, bk.buf.data(), bk.used);
+                    bk.used = 0;
+                }
+                std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
+                std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
+                            source.row(src), rb);
+                bk.used += entry_size;
+                ++bk.entries;
+
+                if ((src + 1) % report_every == 0 || src + 1 == N) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double dt = std::chrono::duration<double>(now - t_start).count();
+                    std::cerr << "[create_reordered/ext] pass1 " << (src + 1)
+                              << "/" << N << " (" << std::fixed
+                              << std::setprecision(1) << dt << "s, seq)\n" << std::flush;
+                }
             }
-            std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
-            std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
-                        source.row(src), rb);
-            bk.used += entry_size;
-            ++bk.entries;
+            inv.clear();
+            inv.shrink_to_fit();   // release ~888 MB before Pass 2 allocates chunk_buf
+        } else {
+            // FALLBACK (exact original behavior): iterate OUTPUT rows, read
+            // source[perm[out]] (RANDOM). Preserves the documented non-injective
+            // contract (duplicate / missing perm values) byte-for-byte.
+            for (uint64_t out = 0; out < N; ++out) {
+                uint64_t src = permutation[out];
+                uint64_t b   = out / bucket_rows;
+                uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
 
-            if ((out + 1) % report_every == 0 || out + 1 == N) {
-                auto now = std::chrono::high_resolution_clock::now();
-                double dt = std::chrono::duration<double>(now - t_start).count();
-                std::cerr << "[create_reordered/ext] pass1 " << (out + 1)
-                          << "/" << N << " (" << std::fixed
-                          << std::setprecision(1) << dt << "s)\n" << std::flush;
+                Bucket& bk = buckets[b];
+                if (bk.used + entry_size > bk.buf.size()) {
+                    write_all(bk.fd, bk.buf.data(), bk.used);
+                    bk.used = 0;
+                }
+                std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
+                std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
+                            source.row(src), rb);
+                bk.used += entry_size;
+                ++bk.entries;
+
+                if ((out + 1) % report_every == 0 || out + 1 == N) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double dt = std::chrono::duration<double>(now - t_start).count();
+                    std::cerr << "[create_reordered/ext] pass1 " << (out + 1)
+                              << "/" << N << " (" << std::fixed
+                              << std::setprecision(1) << dt << "s, rand)\n" << std::flush;
+                }
             }
         }
         for (auto& bk : buckets) {
@@ -1096,13 +1159,22 @@ FeatureMatrix FeatureMatrix::create_reordered(
     const uint64_t D  = source.num_cols();
     const GnnDtype dt = source.dtype();
 
-    // Strategy selector — env-var driven. Default `chunked` (Fix #13),
-    // which is safer when temp disk space is tight (external_sort
-    // requires ~N * row_bytes extra disk for the bucket files).
-    bool use_external_sort = false;
+    // Strategy selector — env-var driven. DEFAULT external_sort (Fix #15)
+    // since 2026-06-01: two sequential passes (radix-partition into buckets,
+    // then merge) keep BOTH reads and writes sequential, avoiding the
+    // random-gather source page-cache thrash that collapses the legacy
+    // `chunked` path to ~27 MB/s whenever the source FM exceeds host RAM
+    // (papers100M on 30 GB celebi: chunked ~34 min vs external_sort ~7 min).
+    // Override with MDB_GNN_REORDER_STRATEGY=chunked when temp disk for the
+    // bucket files (~N * row_bytes) is tight. Pipeline overlap stays opt-in
+    // OFF: the documented A/B/C/D bench shows it is neutral-to-negative on the
+    // external_sort path (Pass 2 +8%) and a regression on chunked.
+    bool use_external_sort = true;
     if (const char* env = std::getenv("MDB_GNN_REORDER_STRATEGY")) {
         std::string s(env);
-        if (s == "external_sort" || s == "ext_sort" || s == "external") {
+        if (s == "chunked" || s == "legacy" || s == "0") {
+            use_external_sort = false;
+        } else if (s == "external_sort" || s == "ext_sort" || s == "external") {
             use_external_sort = true;
         }
     }
