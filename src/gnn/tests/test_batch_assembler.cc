@@ -287,6 +287,93 @@ TEST_F(BatchAssemblerTest, EdgeIndicesAreGloballyRemapped) {
 }
 
 // =============================================================================
+// Nested-aggregation edge wiring (2026-06-02)
+//
+// 3-layer sample (2 edge layers) over the 6-node fixture:
+//   Layer 0 (seeds): node0, node1     (global pos 0,1; A_0 = {0,1})
+//   Layer 1 (1-hop): node2, node3     (A_1 = {0,1,2,3})
+//   Layer 2 (2-hop): node4, node5     (A_2 = {0,1,2,3,4,5})
+//   E_0 (edges_per_layer[0]): node2->node0, node3->node1   (1-hop -> seed)
+//   E_1 (edges_per_layer[1]): node4->node2, node5->node3   (2-hop -> 1-hop)
+//
+// LEGACY: edge_index[1] = E_1 only (2 edges, dst in {node2,node3} = A_1-local
+//         {2,3}); the seeds do NOT aggregate at conv 1.
+// NESTED: edge_index[1] = E_0 ∪ E_1 (4 edges); the seeds (A_1-local {0,1}) now
+//         aggregate at conv 1 too — the standard nested-neighbourhood wiring.
+// edge_index[0] is identical in both (k=0 → only E_0).
+// =============================================================================
+
+static GraphSample make_three_layer_sample(const std::vector<ObjectId>& n) {
+    GraphSample s;
+    s.batch_id = 0;
+    s.split    = SplitType::TRAIN;
+    s.nodes_per_layer.resize(3);
+    s.nodes_per_layer[0] = { n[0], n[1] };   // seeds
+    s.nodes_per_layer[1] = { n[2], n[3] };   // 1-hop
+    s.nodes_per_layer[2] = { n[4], n[5] };   // 2-hop
+    s.edges_per_layer.resize(2);
+    s.edges_per_layer[0].src_indices = { 0, 1 };  // layer1[0,1] = n2,n3
+    s.edges_per_layer[0].dst_indices = { 0, 1 };  // layer0[0,1] = n0,n1
+    s.edges_per_layer[0].edge_ids    = { ObjectId(0), ObjectId(0) };
+    s.edges_per_layer[1].src_indices = { 0, 1 };  // layer2[0,1] = n4,n5
+    s.edges_per_layer[1].dst_indices = { 0, 1 };  // layer1[0,1] = n2,n3
+    s.edges_per_layer[1].edge_ids    = { ObjectId(0), ObjectId(0) };
+    s.all_unique_nodes = { n[0], n[1], n[2], n[3], n[4], n[5] };
+    return s;
+}
+
+TEST_F(BatchAssemblerTest, LegacyEdgeWiringIsPerHop) {
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto storage = create_sample_storage();
+
+    BatchAssembler assembler(fm, storage, nullptr, nullptr, rm);
+    assembler.set_nested_aggregation(false);
+    MiniBatch batch = assembler.assemble_from_sample(make_three_layer_sample(node_oids_));
+
+    ASSERT_EQ(batch.edge_indices.size(), 2u);
+    EXPECT_EQ(batch.edge_indices[0].size(1), 2);  // E_0
+    EXPECT_EQ(batch.edge_indices[1].size(1), 2);  // E_1 ONLY (no seed aggregation)
+
+    // conv-1 dst are A_1-local indices of the 1-hop nodes {node2,node3} = {2,3};
+    // the seeds (A_1-local {0,1}) are absent.
+    auto acc = batch.edge_indices[1].accessor<int64_t, 2>();
+    std::vector<int64_t> dsts = { acc[1][0], acc[1][1] };
+    std::sort(dsts.begin(), dsts.end());
+    EXPECT_EQ(dsts, (std::vector<int64_t>{2, 3}));
+}
+
+TEST_F(BatchAssemblerTest, NestedEdgeWiringIsCumulativeAndIncludesSeeds) {
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto storage = create_sample_storage();
+
+    BatchAssembler assembler(fm, storage, nullptr, nullptr, rm);
+    assembler.set_nested_aggregation(true);
+    MiniBatch batch = assembler.assemble_from_sample(make_three_layer_sample(node_oids_));
+
+    ASSERT_EQ(batch.edge_indices.size(), 2u);
+    EXPECT_EQ(batch.edge_indices[0].size(1), 2);  // k=0 unchanged: only E_0
+    EXPECT_EQ(batch.edge_indices[1].size(1), 4);  // E_0 ∪ E_1
+
+    // conv-1 dst must now include the seeds (A_1-local {0,1}) AND the 1-hop
+    // nodes ({2,3}) — every node within 1 hop re-aggregates at conv 1.
+    auto acc = batch.edge_indices[1].accessor<int64_t, 2>();
+    std::vector<int64_t> dsts, srcs;
+    for (int64_t i = 0; i < 4; ++i) { dsts.push_back(acc[1][i]); srcs.push_back(acc[0][i]); }
+    std::sort(dsts.begin(), dsts.end());
+    EXPECT_EQ(dsts, (std::vector<int64_t>{0, 1, 2, 3}));
+    // every src must be a valid A_2-local index [0,6)
+    for (int64_t v : srcs) { EXPECT_GE(v, 0); EXPECT_LT(v, 6); }
+
+    // edge_index[0] (conv 0, seeds) is identical to legacy: src=1-hop {2,3}, dst=seeds {0,1}.
+    auto acc0 = batch.edge_indices[0].accessor<int64_t, 2>();
+    std::vector<int64_t> d0 = { acc0[1][0], acc0[1][1] };
+    std::sort(d0.begin(), d0.end());
+    EXPECT_EQ(d0, (std::vector<int64_t>{0, 1}));
+}
+
+// =============================================================================
 // Test 3: LabelsMatchSeedNodes
 // =============================================================================
 

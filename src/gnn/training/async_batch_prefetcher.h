@@ -129,7 +129,11 @@ public:
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }
 
 private:
-    void worker_loop();
+    // Round 3B-mw (2026-06-01): each worker thread is assigned a stable index
+    // 0..num_workers-1 at spawn. It binds that index via
+    // FourLevelStore::bind_worker_id() at thread start so the FourLevelStore
+    // hot path selects this worker's private DirectIoReader + pinned buffer.
+    void worker_loop(unsigned worker_idx);
 
     BatchAssembler& assembler_;
     const size_t    queue_size_;

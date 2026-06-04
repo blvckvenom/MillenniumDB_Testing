@@ -264,6 +264,15 @@ private:
     // config_.profile_log_path is non-empty; nullptr otherwise. Owned by
     // TrainingLoop; flushed on epoch boundaries and on destruction.
     std::unique_ptr<BatchTimingLog> profile_log_;
+
+    // Round 3B-mw (2026-06-01): the FourLevelStore per-worker IO count that
+    // train() successfully provisioned (via prepare_feature_store_workers).
+    // 1 = single-worker / multi-worker not enabled. evaluate() reuses EXACTLY
+    // this count for its own prefetcher so a validation worker can never
+    // exceed the provisioned slots and fall back to the shared primary reader
+    // (which would race). Set in train(); 1 if evaluate() is ever called
+    // standalone.
+    unsigned fls_prefetch_workers_ = 1;
 };
 
 } // namespace mdb::gnn

@@ -2,12 +2,25 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 namespace mdb::gnn {
+
+namespace {
+// Nested (DGL-block) aggregation default, read once from the environment.
+// MDB_GNN_NESTED_AGG=1/true/yes => every node within k hops re-aggregates its
+// sampled neighbours at conv k (standard nested-neighbourhood message passing);
+// unset/0 => legacy per-hop wiring (seeds aggregate only at the final conv).
+bool nested_agg_env_default() {
+    const char* e = std::getenv("MDB_GNN_NESTED_AGG");
+    return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
+                 std::strcmp(e, "yes") == 0);
+}
+} // namespace
 
 // =============================================================================
 // Constructors
@@ -26,7 +39,9 @@ BatchAssembler::BatchAssembler(
     , labels_(labels)
     , splits_(splits)
     , row_mapping_(row_mapping)
-{}
+{
+    nested_aggregation_ = nested_agg_env_default();
+}
 
 BatchAssembler::BatchAssembler(
     const FeatureMatrix& feature_matrix,
@@ -41,7 +56,9 @@ BatchAssembler::BatchAssembler(
     , labels_(labels)
     , splits_(splits)
     , row_mapping_(row_mapping)
-{}
+{
+    nested_aggregation_ = nested_agg_env_default();
+}
 
 // =============================================================================
 // Public: assemble(batch_id)
@@ -378,45 +395,73 @@ std::vector<torch::Tensor> BatchAssembler::build_edge_indices(
     // build_active_indices and maps each ObjectId.id present in A_k to its
     // local index. One hash lookup per edge endpoint instead of two —
     // half the hash work versus the prior oid->global->local two-hop path.
-    for (size_t k = 0; k < num_layers; ++k) {
-        const LayerEdges& edges = sample.edges_per_layer[k];
-        const int64_t E = static_cast<int64_t>(edges.size());
+    //
+    // Nested aggregation (2026-06-02): conv k operates on dst set A_k =
+    // ∪_{j<=k} nodes_per_layer[j] (all nodes within k hops). For STANDARD
+    // GraphSAGE / DGL-block message passing every such node must aggregate its
+    // sampled neighbours at conv k, so edge_index[k] is the union of the
+    // per-hop edge sets E_0..E_k. Each per-hop set E_j (= edges_per_layer[j])
+    // carries dst in layer j ⊆ A_k and src in layer j+1 ⊆ A_{k+1}, so both
+    // endpoints resolve in the cumulative A_k / A_{k+1} maps.
+    //
+    // LEGACY (nested_aggregation_ == false): edge_index[k] = E_k only. A seed
+    // (layer 0) then has edges solely in edge_index[0] and aggregates its
+    // neighbourhood at just the final conv — a strictly weaker variant whose
+    // deviation compounds with depth (see set_nested_aggregation docs).
+    const bool nested = nested_aggregation_;
 
+    for (size_t k = 0; k < num_layers; ++k) {
         const auto& src_map = oid_to_local_per_layer[k + 1];  // A_{k+1}
         const auto& dst_map = oid_to_local_per_layer[k];      // A_k
 
-        auto edge_index = torch::empty({2, E}, torch::kInt64);
+        const size_t first_j = nested ? 0 : k;  // nested: E_0..E_k; legacy: E_k only
+
+        int64_t E_total = 0;
+        for (size_t j = first_j; j <= k; ++j) {
+            E_total += static_cast<int64_t>(sample.edges_per_layer[j].size());
+        }
+
+        auto edge_index = torch::empty({2, E_total}, torch::kInt64);
         auto acc = edge_index.accessor<int64_t, 2>();
 
-        for (int64_t i = 0; i < E; ++i) {
-            // Resolve OIDs via nodes_per_layer.
-            const ObjectId src_oid = sample.nodes_per_layer[k + 1][
-                static_cast<size_t>(edges.src_indices[i])
-            ];
-            const ObjectId dst_oid = sample.nodes_per_layer[k][
-                static_cast<size_t>(edges.dst_indices[i])
-            ];
+        int64_t out = 0;
+        for (size_t j = first_j; j <= k; ++j) {
+            const LayerEdges& edges = sample.edges_per_layer[j];
+            const int64_t Ej = static_cast<int64_t>(edges.size());
+            for (int64_t i = 0; i < Ej; ++i) {
+                // E_j edges are layer-local to (layer j+1 src, layer j dst).
+                const ObjectId src_oid = sample.nodes_per_layer[j + 1][
+                    static_cast<size_t>(edges.src_indices[i])
+                ];
+                const ObjectId dst_oid = sample.nodes_per_layer[j][
+                    static_cast<size_t>(edges.dst_indices[i])
+                ];
 
-            // Single hash lookup per endpoint: ObjectId.id -> local index in A_k.
-            auto src_it = src_map.find(src_oid.id);
-            auto dst_it = dst_map.find(dst_oid.id);
-            if (src_it == src_map.end()) {
-                throw std::runtime_error(
-                    "BatchAssembler::build_edge_indices: src node not in A_" +
-                    std::to_string(k + 1) + " active set at layer " +
-                    std::to_string(k) + ", edge " + std::to_string(i)
-                );
-            }
-            if (dst_it == dst_map.end()) {
-                throw std::runtime_error(
-                    "BatchAssembler::build_edge_indices: dst node not in A_" +
-                    std::to_string(k) + " active set at layer " +
-                    std::to_string(k) + ", edge " + std::to_string(i)
-                );
-            }
+                // Remap into THIS conv's cumulative active sets: src into
+                // A_{k+1}, dst into A_k. One hash lookup per endpoint.
+                auto src_it = src_map.find(src_oid.id);
+                auto dst_it = dst_map.find(dst_oid.id);
+                if (src_it == src_map.end()) {
+                    throw std::runtime_error(
+                        "BatchAssembler::build_edge_indices: src node not in A_" +
+                        std::to_string(k + 1) + " active set (conv " +
+                        std::to_string(k) + ", hop " + std::to_string(j) +
+                        ", edge " + std::to_string(i) + ")"
+                    );
+                }
+                if (dst_it == dst_map.end()) {
+                    throw std::runtime_error(
+                        "BatchAssembler::build_edge_indices: dst node not in A_" +
+                        std::to_string(k) + " active set (conv " +
+                        std::to_string(k) + ", hop " + std::to_string(j) +
+                        ", edge " + std::to_string(i) + ")"
+                    );
+                }
 
-            acc[0][i] = src_it->second;  // src local in A_{k+1}
-            acc[1][i] = dst_it->second;  // dst local in A_k
+                acc[0][out] = src_it->second;  // src local in A_{k+1}
+                acc[1][out] = dst_it->second;  // dst local in A_k
+                ++out;
+            }
         }
         result.push_back(std::move(edge_index));
     }

@@ -160,6 +160,16 @@ public:
         // Set to false only to skip Phase 5 (e.g., when rebuilding caches only).
         bool   build_addr_tables = true;
 
+        // DiskGNN-adoption Plan 1: also emit a single consolidated cold-feature
+        // file (packed_slim/consolidated.slim) during the partitioned L4 pack, so
+        // the runtime can serve each batch's cold features with ONE O_DIRECT
+        // sequential pread instead of opening ~1512 small per-batch files. When
+        // true, the addr_table sidecars are written as v2 (carrying per-batch
+        // slim_offset/slim_length). Opt-in, default OFF; the per-batch .bin files
+        // are still written so the legacy read path remains valid. Requires the
+        // partitioned packer (Lever B); ignored on the legacy worker-loop path.
+        bool   write_consolidated_slim = false;
+
         // After build() succeeds, delete the non-slim packed/ directory left
         // over by materialize_batches. This scratch is never read at runtime
         // (training reads packed_slim/) and on large graphs wastes tens of
@@ -329,19 +339,43 @@ public:
     // Phase 0 (2026-05-17): public API still in microseconds (matches the
     // `_us` fields of BatchTiming). Internal storage uses nanoseconds for
     // precision; conversion happens here, once per batch (not per node).
-    uint64_t last_l1_us() const   { return last_l1_ns_ / 1000; }
-    uint64_t last_l2_us() const   { return last_l2_ns_ / 1000; }
-    uint64_t last_l3_us() const   { return last_l3_ns_ / 1000; }
-    uint64_t last_l4_us() const   { return last_l4_ns_ / 1000; }
-    uint64_t last_rmap_us() const { return last_rmap_ns_ / 1000; }
+    uint64_t last_l1_us() const   { return last_l1_ns_.load() / 1000; }
+    uint64_t last_l2_us() const   { return last_l2_ns_.load() / 1000; }
+    uint64_t last_l3_us() const   { return last_l3_ns_.load() / 1000; }
+    uint64_t last_l4_us() const   { return last_l4_ns_.load() / 1000; }
+    uint64_t last_rmap_us() const { return last_rmap_ns_.load() / 1000; }
 
     // Path 4 (2026-05-19): v2 runtime path telemetry.
     // last_addr_load_us() — microseconds to open + parse the addr_table sidecar
     //   for the most recent batch. 0 if the v2 path was not taken.
     // last_used_addr_tables() — whether the most recent load_batch_features
     //   was served by the v2 (addr_table) path.
-    uint64_t last_addr_load_us() const { return last_addr_load_ns_ / 1000; }
-    bool last_used_addr_tables() const { return last_used_v2_; }
+    uint64_t last_addr_load_us() const { return last_addr_load_ns_.load() / 1000; }
+    bool last_used_addr_tables() const { return last_used_v2_.load(); }
+
+    // Round 3B-mw (2026-06-01): multi-worker prefetch support.
+    //
+    // The AsyncBatchPrefetcher can now drive load_batch_features() from N
+    // concurrent worker threads (prefetchNumWorkers>1). Every shared mutable
+    // resource on the hot path that is NOT thread-safe is replicated per
+    // worker so there is no cross-worker data race on feature content:
+    //   - the DirectIoReader (its own 4 io_uring rings, "one ring per thread"
+    //     per direct_io_reader.h) — worker 0 uses the primary l3_reader_;
+    //     workers 1..N-1 use extra_workers_[w-1].l3_reader.
+    //   - the pinned host staging buffer the assemble CUDA kernel reads — same
+    //     primary/extra split. assemble() is host-blocking
+    //     (cudaStreamSynchronize), so each worker's buffer is safe to reuse on
+    //     its next batch.
+    // Read-only state (gpu_cache_, cpu_cache_, l3_mmap_fb_) and the atomic
+    // Stats counters are already concurrency-safe and remain shared.
+    //
+    // Call prepare_worker_io(n) ONCE before constructing an N-worker
+    // prefetcher (it is idempotent + grow-only + single-threaded). Each worker
+    // thread binds its id via bind_worker_id() at thread start; the hot path
+    // reads current_worker_id() to select its private resources.
+    void prepare_worker_io(unsigned num_workers);
+    static void     bind_worker_id(unsigned id) noexcept;
+    static unsigned current_worker_id() noexcept;
 
 private:
     std::unique_ptr<GpuCache> gpu_cache_;
@@ -377,16 +411,46 @@ private:
     void*              pinned_ptr_      = nullptr;
     size_t             pinned_capacity_ = 0;
 
+    // Round 3B-mw (2026-06-01): per-worker IO resources for safe N>1 prefetch.
+    // Worker id 0 uses the primary l3_reader_ + pinned_ptr_ above (so the
+    // single-worker path is byte-identical to pre-change). Workers 1..N-1 use
+    // extra_workers_[id-1]. prepare_worker_io(N) populates this vector ONCE,
+    // single-threaded, before any concurrent load_batch_features call.
+    struct WorkerIo {
+        std::unique_ptr<DirectIoReader> l3_reader;        // own io_uring rings
+        void*  pinned_ptr      = nullptr;                 // own pinned staging
+        size_t pinned_capacity = 0;
+    };
+    std::vector<WorkerIo> extra_workers_;
+    std::filesystem::path reord_fmat_path_;   // source for per-worker readers
+
+    // Select the DirectIoReader for the calling thread (primary for id 0,
+    // per-worker otherwise). May return nullptr if O_DIRECT was unavailable at
+    // construction — callers then use the shared (read-only) l3_mmap_fb_.
+    DirectIoReader* l3_reader_for_current_worker_();
+
+    // Ensure the calling worker's pinned buffer is >= bytes; on success sets
+    // `out` to that worker's pinned pointer. Worker 0 grows pinned_ptr_; other
+    // workers grow their own extra_workers_[id-1].pinned_ptr. No lock: each
+    // worker touches only its own slot, and extra_workers_ is never resized
+    // once workers are running.
+    bool ensure_pinned_capacity_for_worker_(size_t bytes, void*& out);
+
     // Phase 0 (2026-05-17) profile instrumentation. Per-call sub-timers in
     // nanoseconds (high precision to avoid integer-microsecond truncation of
     // sub-μs hash lookups). Accessors below convert to μs at the API boundary.
     // rmap_lookup_ns is a SUB-counter: already included in the L3 total;
     // tracked separately to quantify Phase 1 address-table candidate.
-    mutable uint64_t last_l1_ns_   = 0;
-    mutable uint64_t last_l2_ns_   = 0;
-    mutable uint64_t last_l3_ns_   = 0;
-    mutable uint64_t last_l4_ns_   = 0;
-    mutable uint64_t last_rmap_ns_ = 0;
+    // Round 3B-mw: atomic so concurrent prefetch workers do not data-race on
+    // these telemetry counters. Values are only meaningful single-worker
+    // (under N>1 every worker accumulates into the same counter, so the sum is
+    // not a per-batch figure) and are NOT read on the prefetcher path; the
+    // atomics exist purely to keep the writes well-defined under N>1.
+    mutable std::atomic<uint64_t> last_l1_ns_{0};
+    mutable std::atomic<uint64_t> last_l2_ns_{0};
+    mutable std::atomic<uint64_t> last_l3_ns_{0};
+    mutable std::atomic<uint64_t> last_l4_ns_{0};
+    mutable std::atomic<uint64_t> last_rmap_ns_{0};
 
     // Path 4 (2026-05-19): v2 path dispatch state.
     //
@@ -407,8 +471,23 @@ private:
     bool                  use_addr_tables_    = false;
     uint64_t              expected_meta_sha_head_ = 0;
     std::filesystem::path sample_dir_;
-    mutable uint64_t      last_addr_load_ns_  = 0;
-    mutable bool          last_used_v2_       = false;
+    mutable std::atomic<uint64_t> last_addr_load_ns_{0};
+    mutable std::atomic<bool>     last_used_v2_{false};
+
+    // DiskGNN-adoption Plan 1 Phase 2: consolidated cold-feature read path.
+    // When `use_consolidated_slim_`, load_batch_features_v2_ serves each batch's
+    // cold features with ONE pread of [slim_offset, slim_length) (from the v2
+    // addr_table header) from the single consolidated.slim file, instead of
+    // opening the per-batch .bin. The O_DIRECT fd is shared across prefetch
+    // workers (pread is offset-based, so concurrent reads at distinct offsets are
+    // safe); each read uses a private posix_memalign'd buffer. consolidated_buf_fd_
+    // is the buffered fallback when O_DIRECT is unavailable/fails. Opt-in (env
+    // MDB_GNN_CONSOLIDATED_SLIM), validated against the perm/meta fingerprints at
+    // ctor; any mismatch leaves use_consolidated_slim_ false → per-batch read.
+    bool   use_consolidated_slim_ = false;
+    int    consolidated_od_fd_    = -1;     // O_DIRECT fd (shared)
+    int    consolidated_buf_fd_   = -1;     // buffered fallback fd (shared)
+    size_t cons_block_align_      = 4096;
 
     /// Ensure the persistent pinned buffer is at least `bytes` long.
     /// Returns true on success, false if cudaHostAlloc failed (caller falls

@@ -110,6 +110,18 @@ public:
     bool uses_feature_store() const { return feature_store_ != nullptr; }
 
     /**
+     * @brief Round 3B-mw (2026-06-01): prepare the FourLevelStore for N
+     *        concurrent prefetch workers (per-worker DirectIoReader + pinned
+     *        buffer). No-op in FeatureMatrix-fallback mode. MUST be called
+     *        once before an N>1 AsyncBatchPrefetcher is constructed. May throw
+     *        std::runtime_error if per-worker O_DIRECT readers cannot be
+     *        opened — TrainingLoop catches and falls back to a single worker.
+     */
+    void prepare_feature_store_workers(unsigned num_workers) {
+        if (feature_store_) feature_store_->prepare_worker_io(num_workers);
+    }
+
+    /**
      * @brief Read-only access to the underlying FourLevelStore, if any.
      *
      * Returns nullptr in FeatureMatrix-fallback mode. Used by TrainingLoop's
@@ -149,6 +161,35 @@ public:
         size_t   entries = 0;
     };
     StructCacheStats struct_cache_stats() const;
+
+    // =========================================================================
+    // Nested (DGL-style) aggregation toggle
+    // =========================================================================
+
+    /**
+     * @brief Select between the legacy per-hop edge wiring and the nested
+     *        (DGL-block / Hamilton Alg.2) wiring in build_edge_indices.
+     *
+     * LEGACY (false, the historical default): edge_index[k] connects ONLY the
+     * k-th hop frontier (nodes_per_layer[k]) to its sampled neighbours. A seed
+     * therefore aggregates its 1-hop neighbourhood at only the final conv, and
+     * the function the model computes is a strictly weaker variant of GraphSAGE
+     * whose deviation COMPOUNDS WITH DEPTH (fine at 2 layers, degrades at >=3).
+     *
+     * NESTED (true): edge_index[k] = union of the per-hop edge sets E_0..E_k,
+     * so EVERY node within k hops (incl. the seeds) re-aggregates its sampled
+     * neighbours at conv k — the standard nested-neighbourhood message passing.
+     * The active sets A_k (cumulative unions) already satisfy the prefix
+     * invariant the model needs; only the edges change. Reuses the existing
+     * sample on disk (the per-hop edges E_j are all serialised) and the feature
+     * store unchanged.
+     *
+     * Default is read once from env MDB_GNN_NESTED_AGG (1/true/yes => nested)
+     * in the constructor; this setter overrides it (used by unit tests).
+     * NOTE: a model trained with nested=ON must be inferred with nested=ON.
+     */
+    void set_nested_aggregation(bool on) { nested_aggregation_ = on; }
+    bool nested_aggregation() const { return nested_aggregation_; }
 
 private:
     /**
@@ -232,6 +273,10 @@ private:
     LabelStore*       labels_;    // nullable
     SplitStore*       splits_;    // nullable
     const RowMapping& row_mapping_;
+
+    // Nested (DGL-block) edge wiring in build_edge_indices. Default read from
+    // env MDB_GNN_NESTED_AGG in the constructor; see set_nested_aggregation().
+    bool nested_aggregation_ = false;
 
     // --- Structural per-batch cache (see set_struct_cache_budget_bytes) ---
     // Holds everything assemble_from_sample produces EXCEPT features (which are

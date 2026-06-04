@@ -137,14 +137,32 @@ TrainingLoop::Result TrainingLoop::train()
     if (effective_workers == 0) {
         effective_workers = 1;
     }
-    if (assembler_.uses_feature_store() && effective_workers > 1) {
-        std::cerr
-            << "[TrainingLoop] prefetchNumWorkers=" << effective_workers
-            << " requested, but FourLevelStore feature path is not yet"
-               " multi-worker-safe (DirectIoReader io_uring rings + shared"
-               " pinned host buffer would race silently). Clamping to 1."
-               " Use the FeatureMatrix-fallback BatchAssembler ctor to"
-               " unlock N>1." << std::endl;
+    if (config_.use_async_prefetcher && assembler_.uses_feature_store()
+        && effective_workers > 1) {
+        // Round 3B-mw (2026-06-01): the FourLevelStore path is now
+        // multi-worker-safe — each worker owns a private DirectIoReader (its
+        // own io_uring rings) and a private pinned staging buffer, so there is
+        // no shared mutable state on the feature hot path. Provision those
+        // resources up front. If per-worker O_DIRECT readers cannot be opened
+        // (e.g. fd exhaustion) we clamp to 1 rather than let a worker read
+        // zeros — fail safe, never silently corrupt features.
+        try {
+            assembler_.prepare_feature_store_workers(effective_workers);
+            fls_prefetch_workers_ = effective_workers;  // evaluate() reuses this
+            std::cerr
+                << "[TrainingLoop] prefetchNumWorkers=" << effective_workers
+                << " on the FourLevelStore path (per-worker DirectIoReader + "
+                   "pinned buffer enabled)." << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr
+                << "[TrainingLoop] could not enable multi-worker FourLevelStore"
+                   " prefetch (" << e.what() << "); clamping to 1."
+                << std::endl;
+            effective_workers = 1;
+        }
+    } else if (assembler_.uses_feature_store() && effective_workers > 1) {
+        // No async prefetcher: features load on the calling (main) thread, so
+        // N>1 is moot. Report the honest effective worker count.
         effective_workers = 1;
     }
     result.effective_prefetch_workers = effective_workers;
@@ -629,8 +647,14 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
     if (effective_eval_workers == 0) {
         effective_eval_workers = 1;
     }
-    if (assembler_.uses_feature_store() && effective_eval_workers > 1) {
-        effective_eval_workers = 1;
+    if (assembler_.uses_feature_store()) {
+        // Round 3B-mw: reuse EXACTLY the per-worker IO count train() already
+        // provisioned (fls_prefetch_workers_; 1 if multi-worker was not
+        // enabled). Never exceed it — a worker id beyond the provisioned slots
+        // would fall back to the shared primary DirectIoReader and race.
+        // prepare_feature_store_workers() ran in train() before the epoch loop
+        // (single-threaded), so the slots already exist here.
+        effective_eval_workers = fls_prefetch_workers_;
     }
 
     std::unique_ptr<AsyncBatchPrefetcher> prefetcher;

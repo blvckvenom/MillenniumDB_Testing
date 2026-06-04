@@ -17,6 +17,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>  // getrlimit/setrlimit — raise NOFILE for Lever B
 
 #ifdef GNN_CUDA_ENABLED
 #include <cuda_runtime.h>
@@ -35,6 +36,7 @@
 #include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
 #include "gnn/storage/packed_batch_store.h"
+#include "gnn/storage/consolidated_slim_reader.h"
 #include "gnn/storage/row_mapping.h"
 #include "gnn/sampling/graph_sample.h"
 #include "gnn/sampling/minhash_reorderer.h"
@@ -261,7 +263,9 @@ void build_addr_tables_(
     const std::optional<RowMapping>&            reordered_rm_holder,
     uint64_t                                    meta_sha_head,
     uint64_t                                    total_batches,
-    uint64_t&                                   out_addr_tables_bytes)
+    uint64_t&                                   out_addr_tables_bytes,
+    const std::vector<uint64_t>*                cons_offsets = nullptr,
+    const std::vector<uint64_t>*                cons_lengths = nullptr)
 {
     fs::create_directories(addr_tables_dir);
 
@@ -335,6 +339,16 @@ void build_addr_tables_(
                     rmap_find,
                     meta_sha_head,
                     buf);
+
+                // DiskGNN-adoption Plan 1: when a consolidated cold-feature file
+                // was written, upgrade this batch's header to v2 carrying its
+                // (slim_offset, slim_length) so the runtime can pread it directly.
+                if (cons_offsets && cons_lengths) {
+                    buf.header = AddrTableHeader::make_v2(
+                        buf.header.num_l1, buf.header.num_l2, buf.header.num_l3,
+                        buf.header.num_l4, buf.header.num_zero, meta_sha_head,
+                        (*cons_offsets)[b], (*cons_lengths)[b]);
+                }
 
                 // 4. Atomically write the addr_table sidecar.
                 auto addr_path = addr_table_filename(addr_tables_dir, b);
@@ -438,6 +452,85 @@ torch::ScalarType FourLevelStore::to_torch_dtype(GnnDtype dt) {
 // + main thread can both touch this path.
 // =============================================================================
 
+// Round 3B-mw (2026-06-01): per-thread worker id. Default 0 = primary
+// (main thread / single-worker / non-prefetch callers). AsyncBatchPrefetcher
+// binds 0..N-1 at each worker thread's start via bind_worker_id().
+namespace { thread_local unsigned t_gnn_worker_id = 0; }
+
+void FourLevelStore::bind_worker_id(unsigned id) noexcept { t_gnn_worker_id = id; }
+unsigned FourLevelStore::current_worker_id() noexcept { return t_gnn_worker_id; }
+
+DirectIoReader* FourLevelStore::l3_reader_for_current_worker_() {
+    const unsigned w = t_gnn_worker_id;
+    if (w == 0 || w > extra_workers_.size()) {
+        return l3_reader_.get();              // primary (also the clamp fallback)
+    }
+    return extra_workers_[w - 1].l3_reader.get();  // may be null -> mmap fallback
+}
+
+void FourLevelStore::prepare_worker_io(unsigned num_workers) {
+    // Idempotent + grow-only + single-threaded: MUST be called before any
+    // concurrent load_batch_features (i.e. before an N>1 prefetcher exists).
+    if (num_workers <= 1) return;
+    const unsigned want_extra = num_workers - 1;
+    while (extra_workers_.size() < want_extra) {
+        WorkerIo io;
+        // Only the O_DIRECT reader is per-worker-unsafe and thus replicated.
+        // If the primary fell back to the shared mmap (l3_reader_ == null),
+        // workers share l3_mmap_fb_ (read-only, concurrency-safe) and need no
+        // private reader.
+        if (l3_reader_ && !reord_fmat_path_.empty()) {
+            // The primary uses O_DIRECT, so l3_mmap_fb_ is NOT populated; a
+            // worker whose reader failed to open would silently read zeros for
+            // L3 rows (corrupt features). Fail loud instead — the caller
+            // (TrainingLoop) catches and falls back to a single worker.
+            try {
+                io.l3_reader = std::make_unique<DirectIoReader>(reord_fmat_path_);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(
+                    std::string("FourLevelStore::prepare_worker_io: cannot open "
+                                "per-worker O_DIRECT reader for ")
+                    + reord_fmat_path_.string() + " (refusing to enable "
+                      "multi-worker with a worker that would read zeros): "
+                    + e.what());
+            }
+        }
+        extra_workers_.push_back(std::move(io));
+    }
+}
+
+bool FourLevelStore::ensure_pinned_capacity_for_worker_(size_t bytes, void*& out) {
+#ifdef GNN_CUDA_ENABLED
+    if (bytes == 0) { out = nullptr; return true; }
+    const unsigned w = t_gnn_worker_id;
+    void**  pp;
+    size_t* pc;
+    if (w == 0 || w > extra_workers_.size()) {
+        pp = &pinned_ptr_;
+        pc = &pinned_capacity_;
+    } else {
+        pp = &extra_workers_[w - 1].pinned_ptr;
+        pc = &extra_workers_[w - 1].pinned_capacity;
+    }
+    if (bytes <= *pc) { out = *pp; return true; }
+    size_t new_cap = bytes;
+    const size_t grown = *pc + (*pc >> 1);
+    if (grown > new_cap) new_cap = grown;
+    void* new_ptr = nullptr;
+    if (cudaHostAlloc(&new_ptr, new_cap, cudaHostAllocDefault) != cudaSuccess
+        || new_ptr == nullptr) {
+        return false;  // caller falls back to unpinned memory
+    }
+    if (*pp != nullptr) cudaFreeHost(*pp);
+    *pp = new_ptr;
+    *pc = new_cap;
+    out = new_ptr;
+    return true;
+#else
+    (void)bytes; out = nullptr; return false;
+#endif
+}
+
 bool FourLevelStore::ensure_pinned_capacity(size_t bytes) {
 #ifdef GNN_CUDA_ENABLED
     if (bytes == 0) return true;
@@ -476,7 +569,18 @@ FourLevelStore::~FourLevelStore() {
         pinned_ptr_      = nullptr;
         pinned_capacity_ = 0;
     }
+    // Round 3B-mw: free per-worker pinned staging buffers.
+    for (auto& io : extra_workers_) {
+        if (io.pinned_ptr != nullptr) {
+            cudaFreeHost(io.pinned_ptr);
+            io.pinned_ptr      = nullptr;
+            io.pinned_capacity = 0;
+        }
+    }
 #endif
+    // DiskGNN-adoption Plan 1 Phase 2: close the consolidated.slim fds.
+    if (consolidated_od_fd_  >= 0) { ::close(consolidated_od_fd_);  consolidated_od_fd_  = -1; }
+    if (consolidated_buf_fd_ >= 0) { ::close(consolidated_buf_fd_); consolidated_buf_fd_ = -1; }
 }
 
 // =============================================================================
@@ -806,6 +910,13 @@ FourLevelStore::BuildResult FourLevelStore::build(
             std::error_code rec;
             fs::remove(reordered_fmat, rec);
             fs::remove(reordered_rmap, rec);
+            // Drop the orphaned sorted-index sidecar too: a fresh permutation
+            // is about to be written, and a stale <rmap>.idx from the OLD
+            // permutation would otherwise be silently adopted at open() and
+            // serve wrong feature rows (root cause of the 2026-06-01 L4
+            // corruption). RowMapping::create now also removes it, but make
+            // the intent explicit at the rebuild site.
+            fs::remove(fs::path(reordered_rmap.string() + ".idx"), rec);
         }
         log_phase("L3 MinHash build_access_graph start");
         MinHashReorderer reorderer(config.minhash);
@@ -1064,13 +1175,146 @@ FourLevelStore::BuildResult FourLevelStore::build(
         }
     };
 
-    std::vector<std::thread> workers;
-    workers.reserve(num_l4_workers);
-    for (unsigned i = 0; i < num_l4_workers; ++i) {
-        workers.emplace_back(worker_fn);
+    // Lever B (2026-06-01): opt-in partitioned packed_slim. The default
+    // worker loop above gathers each batch's cold (non-L1/L2) rows RANDOMLY
+    // from the reordered FM; on papers100M (54 GB FM > 30 GB RAM) those rows
+    // are by definition the on-disk cold tier, so every gather faults a page
+    // -> ~0.3 batches/s page-cache thrash (IOPS-bound; more workers do not
+    // help). MDB_GNN_SLIM_PARTITIONED=1 instead reuses the proven Spec-B1
+    // partitioned packer: ONE sequential .fmat scan in row-range partitions +
+    // scatter-pwrite each row into the batch files that need it. Output is the
+    // identical v2 [header][OID table][features] format read_slim_oid_table
+    // consumes; the OID table travels with each row so AddrTable resolution is
+    // positionally agnostic (correctness independent of within-batch order).
+    // DEFAULT ON since 2026-06-01: the partitioned packer is ~5.7x faster on
+    // papers100M-scale (one sequential .fmat scan vs per-batch random gather of
+    // cold on-disk rows) and produces BIT-IDENTICAL output (validated cora
+    // testAccuracy 0.86240786 classic vs partitioned). Disable with
+    // MDB_GNN_SLIM_PARTITIONED=0.
+    bool use_slim_partitioned = true;
+    if (const char* env = std::getenv("MDB_GNN_SLIM_PARTITIONED")) {
+        std::string s(env);
+        if (s == "0" || s == "false" || s == "no")       use_slim_partitioned = false;
+        else if (s == "1" || s == "true" || s == "yes")  use_slim_partitioned = true;
     }
-    for (auto& t : workers) t.join();
-    if (first_exception) std::rethrow_exception(first_exception);
+
+    // The partitioned packer keeps ONE fd open per batch through its final
+    // phase, so it needs NOFILE >= total_batches + headroom. Raise the soft
+    // limit toward the hard limit; if even the hard limit can't cover it, fall
+    // back to the (slower but unbounded-fd) worker loop instead of failing the
+    // build with EMFILE. This makes the fast path a safe default regardless of
+    // the inherited ulimit.
+    if (use_slim_partitioned) {
+        const rlim_t need = static_cast<rlim_t>(catalog.total_batches) + 64;
+        struct rlimit rl;
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur < need) {
+                rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY)
+                                  ? need
+                                  : std::min<rlim_t>(need, rl.rlim_max);
+                ::setrlimit(RLIMIT_NOFILE, &rl);   // best-effort
+                ::getrlimit(RLIMIT_NOFILE, &rl);   // re-read what we actually got
+            }
+            if (rl.rlim_cur < need) {
+                log_phase("L4 packed_slim: NOFILE soft limit " +
+                          std::to_string(static_cast<uint64_t>(rl.rlim_cur)) +
+                          " < needed " + std::to_string(static_cast<uint64_t>(need)) +
+                          " (total_batches+64) — falling back to non-partitioned packer");
+                use_slim_partitioned = false;
+            }
+        }
+    }
+
+    // DiskGNN-adoption Plan 1: consolidated cold-feature file (opt-in). Computed
+    // before the partitioned pack so the writer can stamp the perm/meta
+    // fingerprints; per-batch (offset, length) are captured for the v2 addr_tables.
+    // Only the partitioned (Lever B) path writes it; the legacy worker loop ignores it.
+    const bool write_consolidated =
+        config.write_consolidated_slim && use_slim_partitioned;
+    fs::path              consolidated_path =
+        write_consolidated ? (packed_slim_dir / "consolidated.slim") : fs::path{};
+    uint64_t              cons_perm_fp  = 0;
+    uint64_t              cons_meta_sha = 0;
+    std::vector<uint64_t> cons_offsets, cons_lengths;
+    if (write_consolidated) {
+        cons_perm_fp = reordered_rm_holder.has_value()
+                         ? reordered_rm_holder->perm_fingerprint() : 0;
+        cons_meta_sha = compute_meta_sha_head(
+            gnn_meta_path_for(db_folder, catalog.projection_name));
+        log_phase("L4 consolidated.slim: enabled (Plan 1)");
+    }
+
+    if (use_slim_partitioned) {
+        log_phase("L4 packed_slim: partitioned sequential-scan path (Lever B)");
+        size_t slim_partition_bytes = 256ULL * 1024 * 1024;
+        if (const char* mb = std::getenv("MDB_GNN_SLIM_PARTITION_MB")) {
+            try {
+                long v = std::stol(mb);
+                if (v > 0) slim_partition_bytes = static_cast<size_t>(v) * 1024 * 1024;
+            } catch (...) { /* keep default */ }
+        }
+        // Cold-node entries for batch b, sorted by row ascending — mirrors the
+        // worker-loop collection exactly so output is row-order-equivalent.
+        // The partitioned packer pairs oid_provider[k] with row_provider[k],
+        // so BOTH lambdas must return the same row-sorted order.
+        auto cold_entries = [&](uint64_t b) {
+            auto sample = samples.read_sample(b);
+            std::vector<SlimEntry> e;
+            e.reserve(sample.all_unique_nodes.size());
+            for (const auto& oid : sample.all_unique_nodes) {
+                if (cached_oid_set.count(oid.id) != 0) continue;
+                auto row = active_rm->find(oid);
+                if (row.has_value()) e.push_back({*row, oid});
+            }
+            std::sort(e.begin(), e.end(),
+                      [](const SlimEntry& a, const SlimEntry& c) { return a.row < c.row; });
+            return e;
+        };
+        generate_packed_batches_partitioned(
+            *active_fm,
+            catalog.total_batches,
+            [&](uint64_t b) {
+                auto e = cold_entries(b);
+                std::vector<uint64_t> rows;
+                rows.reserve(e.size());
+                for (const auto& x : e) rows.push_back(x.row);
+                return rows;
+            },
+            packed_slim_dir,
+            slim_partition_bytes,
+            [&](uint64_t b) {
+                auto e = cold_entries(b);
+                std::vector<ObjectId> oids;
+                oids.reserve(e.size());
+                for (const auto& x : e) oids.push_back(x.oid);
+                return oids;
+            },
+            consolidated_path,
+            cons_perm_fp,
+            cons_meta_sha,
+            write_consolidated ? &cons_offsets : nullptr,
+            write_consolidated ? &cons_lengths : nullptr);
+        // Account slim bytes from the written files (the partitioned packer
+        // does not thread through shared_slim_bytes).
+        std::error_code de_ec;
+        uint64_t acc = 0;
+        for (auto& de : fs::directory_iterator(packed_slim_dir, de_ec)) {
+            if (de.path().extension() == ".bin") {
+                std::error_code sz_ec;
+                auto sz = fs::file_size(de.path(), sz_ec);
+                if (!sz_ec) acc += sz;
+            }
+        }
+        shared_slim_bytes.store(acc, std::memory_order_relaxed);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(num_l4_workers);
+        for (unsigned i = 0; i < num_l4_workers; ++i) {
+            workers.emplace_back(worker_fn);
+        }
+        for (auto& t : workers) t.join();
+        if (first_exception) std::rethrow_exception(first_exception);
+    }
 
     uint64_t slim_bytes_acc = shared_slim_bytes.load(std::memory_order_relaxed);
 
@@ -1109,7 +1353,9 @@ FourLevelStore::BuildResult FourLevelStore::build(
                 reordered_rm_holder,
                 meta_sha_head,
                 catalog.total_batches,
-                result.addr_tables_bytes);
+                result.addr_tables_bytes,
+                write_consolidated ? &cons_offsets : nullptr,
+                write_consolidated ? &cons_lengths : nullptr);
 
             result.addr_tables_built_ok = true;
             log_phase("Phase 5 addr_tables done");
@@ -1252,6 +1498,7 @@ FourLevelStore::FourLevelStore(
     auto meta_path   = gnn_dir / (feature_name + "_store.meta");
     auto reord_fmat  = gnn_dir / (feature_name + "_reordered.fmat");
     auto reord_rmap  = gnn_dir / (feature_name + "_reordered.rmap");
+    reord_fmat_path_ = reord_fmat;   // Round 3B-mw: source for per-worker readers
 
     // Read and validate metadata
     if (!fs::exists(meta_path)) {
@@ -1342,6 +1589,56 @@ FourLevelStore::FourLevelStore(
         reordered_rm_.emplace(RowMapping::open(reord_rmap));
     }
 
+    // DiskGNN-adoption Plan 1 Phase 2: probe packed_slim/consolidated.slim.
+    // Opt-in (env MDB_GNN_CONSOLIDATED_SLIM). Validate magic/version/dim/dtype +
+    // the perm + meta stale-rejection fingerprints; only then open the O_DIRECT
+    // + buffered fds and flip use_consolidated_slim_. Any mismatch/absence leaves
+    // it false → the per-batch read path. NEVER throws out of the ctor for this.
+    {
+        const char* ce = std::getenv("MDB_GNN_CONSOLIDATED_SLIM");
+        const bool cons_enabled = ce && (std::strcmp(ce, "1") == 0 ||
+                                          std::strcmp(ce, "true") == 0 ||
+                                          std::strcmp(ce, "yes") == 0);
+        auto cons_path = fs::path(packed_slim_dir_) / "consolidated.slim";
+        if (cons_enabled && fs::exists(cons_path)) {
+            try {
+                ConsolidatedSlimHeader ch{};
+                bool hdr_ok = false;
+                {
+                    int fd = ::open(cons_path.c_str(), O_RDONLY);
+                    if (fd >= 0) {
+                        FdGuard g(fd);
+                        struct stat st{};
+                        if (::fstat(fd, &st) == 0 &&
+                            static_cast<size_t>(st.st_size) >= sizeof(ch)) {
+                            read_all(fd, &ch, sizeof(ch), cons_path.string());
+                            hdr_ok = true;
+                            if (st.st_blksize > 0 &&
+                                (st.st_blksize & (st.st_blksize - 1)) == 0) {
+                                cons_block_align_ = static_cast<size_t>(st.st_blksize);
+                            }
+                        }
+                    }
+                }
+                const uint64_t expect_perm =
+                    reordered_rm_.has_value() ? reordered_rm_->perm_fingerprint() : 0;
+                if (hdr_ok && validate_consolidated_header(
+                                  ch, feature_dim_, static_cast<uint8_t>(dtype_),
+                                  expect_perm, expected_meta_sha_head_)) {
+                    int bf = ::open(cons_path.c_str(), O_RDONLY);
+                    if (bf >= 0) {
+                        consolidated_buf_fd_   = bf;
+                        consolidated_od_fd_    = ::open(cons_path.c_str(),
+                                                        O_RDONLY | O_DIRECT);  // -1 if unsupported
+                        use_consolidated_slim_ = true;
+                    }
+                }
+            } catch (...) {
+                use_consolidated_slim_ = false;  // any failure → per-batch read
+            }
+        }
+    }
+
     // Feature assembler (always created; dispatches to CUDA kernel or LibTorch
     // index_copy_ internally depending on ENABLE_CUDA_ASSEMBLER + GPU availability)
     assembler_ = std::make_unique<FeatureAssembler>(static_cast<int64_t>(feature_dim_));
@@ -1404,10 +1701,10 @@ torch::Tensor FourLevelStore::load_features(const std::vector<ObjectId>& oids) {
         if (reordered_rm_.has_value()) {
             auto row = reordered_rm_->find(oid);
             if (row.has_value()) {
-                if (l3_reader_) {
+                if (DirectIoReader* l3_rdr = l3_reader_for_current_worker_()) {
                     // DirectIoReader path: read single row via O_DIRECT
                     std::vector<uint64_t> single_row = {*row};
-                    auto result = l3_reader_->read_rows(single_row, row_bytes, l3_header_size_);
+                    auto result = l3_rdr->read_rows(single_row, row_bytes, l3_header_size_);
                     std::memcpy(out_ptr + i * row_bytes, result.data.get(), row_bytes);
                     stats_.l3_bytes_disk += result.bytes_disk;
                 } else if (l3_mmap_fb_.has_value()) {
@@ -1487,6 +1784,55 @@ torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample) {
     return load_batch_features_legacy_(sample);
 }
 
+// ---------------------------------------------------------------------------
+// Round 3B-mw follow-up (2026-06-01): opt-in O_DIRECT whole-file read of an L4
+// packed_slim .bin (env MDB_GNN_L4_O_DIRECT, default OFF). The buffered read
+// path caps ~1.2 GB/s per file via page cache + readahead and makes N
+// concurrent prefetch workers contend on a shared page-cache budget under RAM
+// pressure. O_DIRECT bypasses the page cache, so workers reading DIFFERENT
+// .bin files parallelize toward the NVMe ceiling. It reads the SAME bytes as
+// the buffered path → features are bit-identical (validated on cora). Returns
+// true with file_buf filled to exactly file_size; false to fall back to the
+// buffered read (O_DIRECT unsupported on the fs, alignment/short-read failure).
+static bool l4_o_direct_enabled() {
+    static const bool on = []() {
+        const char* e = std::getenv("MDB_GNN_L4_O_DIRECT");
+        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
+                     std::strcmp(e, "yes") == 0);
+    }();
+    return on;
+}
+
+static bool read_slim_file_o_direct(const std::string& path, size_t file_size,
+                                    std::vector<char>& file_buf) {
+    int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) return false;
+    FdGuard guard(fd);
+    constexpr size_t ALIGN = 4096;
+    const size_t cap = ((file_size + ALIGN - 1) / ALIGN) * ALIGN;  // aligned-up
+    void* abuf = nullptr;
+    if (::posix_memalign(&abuf, ALIGN, cap) != 0 || abuf == nullptr) return false;
+    char*  dst = static_cast<char*>(abuf);
+    size_t got = 0;
+    bool   ok  = true;
+    while (got < file_size) {
+        // O_DIRECT requires aligned offset+buffer; intermediate reads return
+        // block multiples (offset stays aligned) and the final read at EOF
+        // returns the partial tail.
+        ssize_t r = ::pread(fd, dst + got, cap - got, static_cast<off_t>(got));
+        if (r < 0) { if (errno == EINTR) continue; ok = false; break; }
+        if (r == 0) break;  // EOF
+        got += static_cast<size_t>(r);
+    }
+    if (ok && got >= file_size) {
+        file_buf.assign(dst, dst + file_size);
+    } else {
+        ok = false;
+    }
+    std::free(abuf);
+    return ok;
+}
+
 torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sample) {
     const auto& oids = sample.all_unique_nodes;
     const uint64_t batch_id = sample.batch_id;
@@ -1556,12 +1902,15 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
             const size_t file_size = static_cast<size_t>(st.st_size);
 
             if (file_size >= sizeof(PackedBatchHeader)) {
-                // Hint sequential access pattern for the single bulk read.
-                ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
-                                POSIX_FADV_SEQUENTIAL);
-
-                std::vector<char> file_buf(file_size);
-                read_all(fd, file_buf.data(), file_size, slim_path.string());
+                std::vector<char> file_buf;
+                if (!(l4_o_direct_enabled() &&
+                      read_slim_file_o_direct(slim_path.string(), file_size, file_buf))) {
+                    // Buffered fallback: sequential hint + single bulk read.
+                    ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
+                                    POSIX_FADV_SEQUENTIAL);
+                    file_buf.resize(file_size);
+                    read_all(fd, file_buf.data(), file_size, slim_path.string());
+                }
 
                 PackedBatchHeader hdr{};
                 std::memcpy(&hdr, file_buf.data(), sizeof(hdr));
@@ -1747,8 +2096,9 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
     {
         auto t_l3_read_start = std::chrono::steady_clock::now();
         if (!l3_row_indices.empty()) {
-            if (l3_reader_) {
-                auto result = l3_reader_->read_rows(l3_row_indices, row_bytes, l3_header_size_);
+            DirectIoReader* l3_rdr = l3_reader_for_current_worker_();
+            if (l3_rdr) {
+                auto result = l3_rdr->read_rows(l3_row_indices, row_bytes, l3_header_size_);
                 l3_buf.assign(result.data.get(), result.data.get() + result.size);
                 // Spec A1: capture O_DIRECT physical bytes (>= wanted due to
                 // 4 KB block alignment overhead — Spec A2 will reduce this).
@@ -1884,12 +2234,16 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
         const float* assembler_data = cpu_combined.data();
 #ifdef GNN_CUDA_ENABLED
         size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
-        if (cpu_combined_bytes > 0 && ensure_pinned_capacity(cpu_combined_bytes)) {
-            // pinned_ptr_ is grow-only and never reallocated under us inside
-            // a single call site (we just ensured capacity above); the lock
-            // is only contended across concurrent grow attempts.
-            std::memcpy(pinned_ptr_, cpu_combined.data(), cpu_combined_bytes);
-            assembler_data = reinterpret_cast<const float*>(pinned_ptr_);
+        void* worker_pinned = nullptr;
+        if (cpu_combined_bytes > 0
+            && ensure_pinned_capacity_for_worker_(cpu_combined_bytes, worker_pinned)
+            && worker_pinned != nullptr) {
+            // Per-worker pinned buffer (Round 3B-mw): the calling worker owns
+            // this slot, so the memcpy + the assemble kernel that reads it
+            // cannot race another worker. assemble() is host-blocking, so the
+            // buffer is safe to reuse on this worker's next batch.
+            std::memcpy(worker_pinned, cpu_combined.data(), cpu_combined_bytes);
+            assembler_data = reinterpret_cast<const float*>(worker_pinned);
         }
 #endif
 
@@ -2061,6 +2415,43 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     auto t_l4_read_start = std::chrono::steady_clock::now();
     std::vector<char> slim_data;
     if (addr.header.num_l4 > 0) {
+      if (use_consolidated_slim_ &&
+          addr.header.version >= AddrTableHeader::VERSION_V2 &&
+          addr.header.slim_length > 0) {
+        // DiskGNN-adoption Plan 1: ONE pread of this batch's payload from the
+        // single consolidated.slim at [slim_offset, slim_length). The payload is
+        // byte-identical to the per-batch .bin data section (same partition
+        // order), so the l4_indices below index it identically. O_DIRECT first
+        // (page-cache bypass → N workers parallelize); buffered fallback; on
+        // total failure throw so the dispatcher falls back to legacy.
+        const uint64_t off = addr.header.slim_offset;
+        const uint64_t len = addr.header.slim_length;
+        if (len % row_bytes != 0) {
+            throw std::runtime_error(
+                "v2: consolidated slim_length " + std::to_string(len)
+                + " not a multiple of row_bytes " + std::to_string(row_bytes));
+        }
+        const size_t aligned_len =
+            ((len + cons_block_align_ - 1) / cons_block_align_) * cons_block_align_;
+        void* abuf = nullptr;
+        if (::posix_memalign(&abuf, cons_block_align_, aligned_len) != 0 || !abuf) {
+            throw std::runtime_error("v2: consolidated posix_memalign failed");
+        }
+        bool ok = (consolidated_od_fd_ >= 0) &&
+                  pread_exact(consolidated_od_fd_, abuf, aligned_len, off);
+        if (!ok) {
+            // O_DIRECT unavailable/failed → buffered read of the EXACT range.
+            ok = pread_exact(consolidated_buf_fd_, abuf, len, off);
+        }
+        if (!ok) {
+            std::free(abuf);
+            throw std::runtime_error(
+                "v2: consolidated read failed at offset " + std::to_string(off));
+        }
+        slim_data.assign(static_cast<char*>(abuf), static_cast<char*>(abuf) + len);
+        std::free(abuf);
+        stats_.l4_bytes_disk += len;
+      } else {
         // C1: any failure here is a hard error — slim_data must be populated
         // when num_l4 > 0, otherwise the L4 copy loop reads an empty buffer
         // (UB).  Throw std::runtime_error so the dispatcher catches, logs
@@ -2090,13 +2481,18 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
                                      + slim_path.string());
         }
 
-        // Fix #22: SEQUENTIAL hint before read, DONTNEED after (page-cache
-        // relief so late-phase L4 throughput does not collapse on 30 GB hosts).
-        ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
-                        POSIX_FADV_SEQUENTIAL);
-
-        std::vector<char> file_buf(file_size);
-        read_all(fd, file_buf.data(), file_size, slim_path.string());
+        // Round 3B-mw: opt-in O_DIRECT whole-file read (bypasses page cache so
+        // N workers' per-file reads parallelize). Falls back to buffered.
+        std::vector<char> file_buf;
+        if (!(l4_o_direct_enabled() &&
+              read_slim_file_o_direct(slim_path.string(), file_size, file_buf))) {
+            // Fix #22: SEQUENTIAL hint before read, DONTNEED after (page-cache
+            // relief so late-phase L4 throughput does not collapse on 30 GB hosts).
+            ::posix_fadvise(fd, 0, static_cast<off_t>(file_size),
+                            POSIX_FADV_SEQUENTIAL);
+            file_buf.resize(file_size);
+            read_all(fd, file_buf.data(), file_size, slim_path.string());
+        }
 
         PackedBatchHeader hdr{};
         std::memcpy(&hdr, file_buf.data(), sizeof(hdr));
@@ -2118,6 +2514,7 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         stats_.l4_bytes_disk += sizeof(hdr) + oid_bytes + data_bytes;
 
         fadvise_dontneed(fd, 0, static_cast<off_t>(file_size));
+      }  // end else (per-batch .bin read)
     }
     {
         auto t_l4_read_end = std::chrono::steady_clock::now();
@@ -2137,8 +2534,9 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
             std::vector<uint64_t> l3_row_indices(
                 addr.l3_row_idxs.data,
                 addr.l3_row_idxs.data + addr.header.num_l3);
-            if (l3_reader_) {
-                auto result = l3_reader_->read_rows(
+            DirectIoReader* l3_rdr = l3_reader_for_current_worker_();
+            if (l3_rdr) {
+                auto result = l3_rdr->read_rows(
                     l3_row_indices, row_bytes, l3_header_size_);
                 l3_buf.assign(result.data.get(),
                               result.data.get() + result.size);
@@ -2266,9 +2664,13 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     const float* assembler_data = cpu_combined.data();
 #ifdef GNN_CUDA_ENABLED
     size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
-    if (cpu_combined_bytes > 0 && ensure_pinned_capacity(cpu_combined_bytes)) {
-        std::memcpy(pinned_ptr_, cpu_combined.data(), cpu_combined_bytes);
-        assembler_data = reinterpret_cast<const float*>(pinned_ptr_);
+    void* worker_pinned = nullptr;
+    if (cpu_combined_bytes > 0
+        && ensure_pinned_capacity_for_worker_(cpu_combined_bytes, worker_pinned)
+        && worker_pinned != nullptr) {
+        // Per-worker pinned buffer (Round 3B-mw) — see legacy_ note.
+        std::memcpy(worker_pinned, cpu_combined.data(), cpu_combined_bytes);
+        assembler_data = reinterpret_cast<const float*>(worker_pinned);
     }
 #endif
 

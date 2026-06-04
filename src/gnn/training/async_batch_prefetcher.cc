@@ -1,5 +1,7 @@
 #include "gnn/training/async_batch_prefetcher.h"
 
+#include "gnn/storage/four_level_store.h"  // FourLevelStore::bind_worker_id
+
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -35,7 +37,7 @@ AsyncBatchPrefetcher::AsyncBatchPrefetcher(BatchAssembler& assembler,
 
     workers_.reserve(effective);
     for (unsigned i = 0; i < effective; ++i) {
-        workers_.emplace_back(&AsyncBatchPrefetcher::worker_loop, this);
+        workers_.emplace_back(&AsyncBatchPrefetcher::worker_loop, this, i);
     }
 }
 
@@ -128,7 +130,13 @@ bool AsyncBatchPrefetcher::is_shutdown() const {
     return shutdown_requested_;
 }
 
-void AsyncBatchPrefetcher::worker_loop() {
+void AsyncBatchPrefetcher::worker_loop(unsigned worker_idx) {
+    // Round 3B-mw (2026-06-01): bind this thread's worker id so the
+    // FourLevelStore hot path routes to this worker's PRIVATE DirectIoReader
+    // + pinned staging buffer (no cross-worker race on feature content).
+    // Harmless in FeatureMatrix-fallback mode (the id is simply unread there).
+    FourLevelStore::bind_worker_id(worker_idx);
+
     // Spec C3 stage 3: when use_cuda_streams_ is true, each worker keeps a
     // single pool stream for its lifetime. All assemblies run under
     // CUDAStreamGuard(worker_stream); we record a CUDAEvent into the
