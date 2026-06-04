@@ -390,6 +390,50 @@ TEST(GraphSampleTest, BulkRoundtripEmptyVectors) {
     EXPECT_EQ(restored.all_unique_nodes.size(), 1u);
 }
 
+// skip_edge_ids deserialize: src/dst indices, nodes, and all_unique_nodes come
+// back identical to a full deserialize, but every layer's edge_ids is empty
+// (the block is seeked past, not read). edge_ids are unused by the training /
+// embedding read path, so this is a pure I/O saving.
+TEST(GraphSampleTest, DeserializeSkipEdgeIds) {
+    auto s = make_2hop_sample(7, SplitType::TRAIN);
+    ASSERT_FALSE(s.edges_per_layer.empty());
+    bool any_eids = false;
+    for (const auto& e : s.edges_per_layer) {
+        if (!e.edge_ids.empty()) any_eids = true;
+    }
+    ASSERT_TRUE(any_eids) << "fixture must have edge_ids to exercise the skip";
+
+    std::stringstream ss;
+    s.serialize(ss);
+
+    ss.seekg(0);
+    auto full = GraphSample::deserialize(ss, /*skip_edge_ids=*/false);
+    ss.seekg(0);
+    auto skipped = GraphSample::deserialize(ss, /*skip_edge_ids=*/true);
+
+    EXPECT_EQ(skipped.batch_id, full.batch_id);
+    EXPECT_EQ(skipped.split, full.split);
+    ASSERT_EQ(skipped.nodes_per_layer.size(), full.nodes_per_layer.size());
+    for (size_t k = 0; k < full.nodes_per_layer.size(); ++k) {
+        ASSERT_EQ(skipped.nodes_per_layer[k].size(), full.nodes_per_layer[k].size());
+        for (size_t i = 0; i < full.nodes_per_layer[k].size(); ++i) {
+            EXPECT_EQ(skipped.nodes_per_layer[k][i].id, full.nodes_per_layer[k][i].id);
+        }
+    }
+    ASSERT_EQ(skipped.edges_per_layer.size(), full.edges_per_layer.size());
+    for (size_t k = 0; k < full.edges_per_layer.size(); ++k) {
+        EXPECT_EQ(skipped.edges_per_layer[k].src_indices,
+                  full.edges_per_layer[k].src_indices);
+        EXPECT_EQ(skipped.edges_per_layer[k].dst_indices,
+                  full.edges_per_layer[k].dst_indices);
+        EXPECT_TRUE(skipped.edges_per_layer[k].edge_ids.empty());
+    }
+    ASSERT_EQ(skipped.all_unique_nodes.size(), full.all_unique_nodes.size());
+    for (size_t i = 0; i < full.all_unique_nodes.size(); ++i) {
+        EXPECT_EQ(skipped.all_unique_nodes[i].id, full.all_unique_nodes[i].id);
+    }
+}
+
 TEST(GraphSampleTest, ReadSplitWithoutFullDeserialize) {
     auto s = make_2hop_sample(0, SplitType::TEST);
     std::stringstream ss;

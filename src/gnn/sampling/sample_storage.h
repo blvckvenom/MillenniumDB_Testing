@@ -215,6 +215,18 @@ public:
      */
     void set_sample_cache_budget_bytes(size_t budget_bytes);
 
+    /**
+     * @brief Skip the per-layer edge_ids blocks when deserializing samples.
+     *
+     * edge_ids are ~half the serialized bytes of a deep-fanout sample and are
+     * NOT consumed by the training / embedding read path (only the src/dst
+     * indices are). With this enabled, read_sample seeks past the edge_ids
+     * blocks — roughly halving the per-batch sample read I/O — and returns
+     * samples whose edges_per_layer[k].edge_ids are empty. Off by default;
+     * the training setup turns it on. Affects only reads from THIS storage.
+     */
+    void set_skip_edge_ids_on_read(bool enable);
+
     struct SampleCacheStats {
         uint64_t hits = 0;        ///< read_sample served from the RAM cache
         uint64_t misses = 0;      ///< read_sample fell through to disk

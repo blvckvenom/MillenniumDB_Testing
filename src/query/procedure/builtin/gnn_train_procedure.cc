@@ -545,6 +545,11 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                   << ", workers=" << prefetch_num_workers << ")\n";
     }
 
+    // Training never consumes sample edge_ids (only src/dst indices feed
+    // build_edge_indices). Skip them on read — ~half the per-batch sample read
+    // I/O on deep-fanout samples where edge_ids are ~50% of the bytes.
+    samples.set_skip_edge_ids_on_read(true);
+
     const auto& catalog = samples.get_catalog();
     std::string projection_name = catalog.projection_name;
 

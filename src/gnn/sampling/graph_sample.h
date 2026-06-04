@@ -323,10 +323,17 @@ struct GraphSample {
      * @brief Deserialize from binary stream.
      *
      * @param in Input stream (must be open in binary mode)
+     * @param skip_edge_ids When true, the per-layer edge_ids blocks are seeked
+     *        past instead of read — edges_per_layer[k].edge_ids comes back empty.
+     *        edge_ids are ~half the serialized bytes of a deep-fanout sample and
+     *        are NOT consumed by the training / embedding read path (only
+     *        src_indices/dst_indices are), so skipping them roughly halves the
+     *        per-batch sample read I/O. Default false preserves a full,
+     *        round-trippable deserialize for every other caller.
      * @return Deserialized GraphSample
      * @throws std::runtime_error on read failure or invalid format
      */
-    static GraphSample deserialize(std::istream& in);
+    static GraphSample deserialize(std::istream& in, bool skip_edge_ids = false);
 
     /**
      * @brief Read only the split field from a serialized GraphSample.

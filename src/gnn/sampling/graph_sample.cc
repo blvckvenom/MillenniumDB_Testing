@@ -122,6 +122,28 @@ std::vector<T> read_bulk_vector(std::istream& in) {
     return vec;
 }
 
+// Skip a [uint64 count][count * sizeof(T)] block without materializing it.
+// Reads the count then seeks the stream forward over the payload. On ifstream
+// the skipped bytes are never read from disk; on a memory-mapped stream the
+// payload pages are never faulted in — both halve the I/O for unused blocks.
+// The on-disk layout is identical across v1/v2 (element-by-element) and v3
+// (bulk) for fixed-width trivially-copyable types, so one skip covers all.
+template <typename T>
+void skip_bulk_vector(std::istream& in) {
+    uint64_t size = 0;
+    in.read(reinterpret_cast<char*>(&size), sizeof(size));
+    if (!in) {
+        throw std::runtime_error("skip_bulk_vector: size read failed");
+    }
+    if (size > 0) {
+        in.seekg(static_cast<std::streamoff>(size * sizeof(T)),
+                 std::ios_base::cur);
+        if (!in) {
+            throw std::runtime_error("skip_bulk_vector: seek failed");
+        }
+    }
+}
+
 // ObjectId is a class wrapping a single uint64_t; assert trivial copyability
 // (also asserted at the bottom of object_id.h) so the bulk read/write is safe.
 static_assert(sizeof(ObjectId) == sizeof(uint64_t),
@@ -170,7 +192,7 @@ void GraphSample::serialize(std::ostream& out) const {
     write_object_id_vector_bulk(out, all_unique_nodes);
 }
 
-GraphSample GraphSample::deserialize(std::istream& in) {
+GraphSample GraphSample::deserialize(std::istream& in, bool skip_edge_ids) {
     // Header validation
     uint32_t magic = read_value<uint32_t>(in);
     if (magic != MAGIC) {
@@ -221,8 +243,14 @@ GraphSample GraphSample::deserialize(std::istream& in) {
                                      : read_int32_vector(in);
         edges.dst_indices = use_bulk ? read_bulk_vector<int32_t>(in)
                                      : read_int32_vector(in);
-        edges.edge_ids = use_bulk ? read_object_id_vector_bulk(in)
-                                  : read_object_id_vector(in);
+        if (skip_edge_ids) {
+            // edge_ids are unused by the training/embedding read path; seek past
+            // the block (leaving edges.edge_ids empty) to ~halve the sample read.
+            skip_bulk_vector<uint64_t>(in);
+        } else {
+            edges.edge_ids = use_bulk ? read_object_id_vector_bulk(in)
+                                      : read_object_id_vector(in);
+        }
         sample.edges_per_layer.push_back(std::move(edges));
     }
 
