@@ -156,6 +156,58 @@ TEST(FourLevelTopologyStore, Dispatch_L2_Hits) {
 }
 
 // ---------------------------------------------------------------------------
+// Test 2b — Dispatch_L2_ReappliesTypeTag (regression, 2026-06-01).
+//
+// L2 stores tag-stripped uint32 ordinals (l2_compact_csr.cc truncates the
+// 8-bit ObjectId type tag for density). The fix captures the per-direction
+// dst tag at populate time and re-ORs it in for_each_*; without it, L2
+// neighbours leak as tag-0 ids that miss the tagged feature RowMapping
+// (BatchMaterializer "no corresponding feature row"). cora cannot catch this
+// (node tag 0); this fixture uses MASK_NODE (0xD4) — the tag papers100M
+// "Paper" nodes carry. Dispatch_L2_Hits above keeps using UNTAGGED ids so
+// its captured tag stays 0 and its raw-col_idx reads are unchanged.
+// ---------------------------------------------------------------------------
+TEST(FourLevelTopologyStore, Dispatch_L2_ReappliesTypeTag) {
+    const std::vector<uint8_t> tiers = { 2, 2 };
+    L1HashCache l1_fwd(tiers), l1_rev(tiers);
+    L2CompactCsr l2_fwd, l2_rev;
+
+    const uint64_t T = ObjectId::MASK_NODE;  // 0xD4 << 56, pre-shifted
+    l2_fwd.add_node(0, std::vector<AdjEntry>{ {T | 10u, 0}, {T | 11u, 0} });
+    l2_fwd.add_node(1, std::vector<AdjEntry>{ {T | 20u, 0} });
+    l2_fwd.freeze();
+    l2_rev.freeze();
+
+    // Populate-side capture: uniform dst type tag, pre-shifted into top byte.
+    EXPECT_EQ(T, l2_fwd.dst_type_tag());
+
+    FourLevelTopologyStore::Config cfg;
+    FourLevelTopologyStore store(
+        l1_fwd, l1_rev, l2_fwd, l2_rev,
+        nullptr, nullptr, {}, {},
+        tiers, identity_row_lookup(), cfg);
+
+    auto n0 = store.get_out_neighbors(ObjectId(0));
+    ASSERT_EQ(2u, n0.tier);
+    ASSERT_EQ(2u, n0.size());
+    EXPECT_EQ(10u, n0.l2_col_idx[0]);   // raw field stays the bare ordinal
+    EXPECT_EQ(T, n0.l2_dst_tag);        // tag carried on the Neighbors
+
+    // for_each_dst reconstructs the EXACT tagged ObjectId (the fix).
+    std::vector<uint64_t> got;
+    n0.for_each_dst([&](uint64_t id) { got.push_back(id); });
+    EXPECT_EQ((std::vector<uint64_t>{ T | 10u, T | 11u }), got);
+
+    // for_each_with_edge_id: dst tagged, edge id 0 (L2 omits edge ids).
+    std::vector<uint64_t> got_e;
+    n0.for_each_with_edge_id([&](uint64_t id, uint64_t eid) {
+        got_e.push_back(id);
+        EXPECT_EQ(0u, eid);
+    });
+    EXPECT_EQ((std::vector<uint64_t>{ T | 10u, T | 11u }), got_e);
+}
+
+// ---------------------------------------------------------------------------
 // Test 3 — Dispatch_L3_Sidecar_AbsentFallsThroughToL4.
 //
 // Real L3 mmap-sidecar hits are exercised by the existing
