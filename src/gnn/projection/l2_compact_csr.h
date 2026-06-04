@@ -136,6 +136,19 @@ public:
     std::size_t edge_count()  const noexcept { return col_idx_.size(); }
 
     /**
+     * @brief Per-direction dst ObjectId type tag, PRE-SHIFTED into the top
+     *        byte (tag << 56); 0 if no nodes were added.
+     *
+     * `col_idx_` stores tag-stripped uint32 ordinals (the 8-bit ObjectId
+     * type tag is dropped at add_node time for density). Consumers MUST
+     * OR this back to recover the exact tagged ObjectId:
+     * `dst_type_tag() | static_cast<uint64_t>(col_idx_[i])` — the same
+     * convention the L3-narrow tier uses with `l3_dst_tag`. Captured in
+     * add_node from the stored dst's top byte (uniform per direction).
+     */
+    uint64_t    dst_type_tag() const noexcept { return dst_type_tag_; }
+
+    /**
      * @brief Approximate resident-byte cost using the Phase 1 contract.
      *
      * `kL2NodeFixedOverhead + kL2PerEdgeBytes * degree` per node.
@@ -150,6 +163,9 @@ private:
     bool                                        frozen_ = false;
     std::vector<uint64_t>                       row_ptr_;
     std::vector<uint32_t>                       col_idx_;
+    // Pre-shifted (tag << 56) ObjectId type tag shared by all stored dst.
+    // col_idx_ holds tag-stripped uint32 ordinals; this re-supplies the tag.
+    uint64_t                                    dst_type_tag_ = 0;
     std::unordered_map<uint64_t, uint32_t>      node_to_l2_idx_;
 
     // Per-row degrees, captured at add_node time. Used in two places:

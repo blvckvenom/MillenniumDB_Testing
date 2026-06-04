@@ -68,6 +68,12 @@ public:
         // L2: uint32 dst row indexes, length l2_size.
         const uint32_t*           l2_col_idx = nullptr;
         std::size_t               l2_size    = 0;
+        // L2: per-direction dst ObjectId type tag, PRE-SHIFTED (tag << 56).
+        //   l2_col_idx stores tag-stripped uint32 ordinals (see
+        //   l2_compact_csr.cc); for_each_* OR this back to reconstruct the
+        //   exact tagged ObjectId — identical to the l3_dst_tag convention.
+        //   0 for an empty L2 (harmless: empty spans emit nothing).
+        uint64_t                  l2_dst_tag = 0;
         // L3: dst node ids, length l3_size. Owned by mmap (zero-copy).
         // Two on-disk widths (Spec #6):
         //   id_width==8 → l3_col_idx / l3_edge_ids point at uint64 sections
@@ -116,8 +122,11 @@ public:
                     }
                     break;
                 case 2:
+                    // L2 col_idx holds tag-stripped uint32 ordinals; OR the
+                    // per-direction dst tag back to recover the tagged ObjectId.
                     for (std::size_t i = 0; i < l2_size; ++i) {
-                        callback(static_cast<uint64_t>(l2_col_idx[i]));
+                        callback(l2_dst_tag
+                                 | static_cast<uint64_t>(l2_col_idx[i]));
                     }
                     break;
                 case 3:
@@ -164,8 +173,11 @@ public:
                     }
                     break;
                 case 2:
+                    // L2 omits edge ids by design (callback gets 0); re-apply
+                    // the dst tag to the tag-stripped uint32 ordinal.
                     for (std::size_t i = 0; i < l2_size; ++i) {
-                        callback(static_cast<uint64_t>(l2_col_idx[i]),
+                        callback(l2_dst_tag
+                                 | static_cast<uint64_t>(l2_col_idx[i]),
                                  uint64_t{0});
                     }
                     break;

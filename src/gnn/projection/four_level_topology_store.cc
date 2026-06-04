@@ -1004,6 +1004,12 @@ FourLevelTopologyStore::dispatch_(
             auto span = l2.get(row_idx);
             out.l2_col_idx = span.first;
             out.l2_size    = span.second;
+            // col_idx_ stores tag-stripped uint32 ordinals; carry the
+            // per-direction dst type tag so for_each_* reconstructs the exact
+            // tagged ObjectId. Without it, L2 neighbours leak as tag-0 ids
+            // that miss the tagged feature RowMapping (BatchMaterializer
+            // "no corresponding feature row") — silent sample corruption.
+            out.l2_dst_tag = l2.dst_type_tag();
             out.tier       = 2;
             return out;
         }

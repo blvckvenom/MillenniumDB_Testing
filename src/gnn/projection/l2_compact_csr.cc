@@ -7,6 +7,7 @@
 #include <string>
 
 #include "gnn/projection/topology_frequency_profiler.h"
+#include "graph_models/object_id.h"
 
 namespace mdb::gnn {
 
@@ -53,6 +54,22 @@ void L2CompactCsr::add_node(uint64_t                     src_node_id,
     // populate_via_sidecar. Plain push_back amortizes to O(1) via
     // vector's exponential capacity growth, restoring linear total.
     for (const auto& nb : neighbors) {
+        // Capture the dst ObjectId type tag (top byte, pre-shifted into
+        // bits 56..63) BEFORE truncating to uint32. col_idx_ keeps only the
+        // tag-stripped ordinal for density; for_each_*/dispatch_ OR this tag
+        // back to reconstruct the exact tagged ObjectId — without it, L2
+        // neighbours leak as tag-0 ids that miss the tagged feature
+        // RowMapping (silent corruption). Uniform per direction in a
+        // homogeneous node graph; fail loud on a mismatch (mirrors the
+        // narrow-sidecar writer's capture_tag_).
+        const uint64_t tag = nb.node_id & ObjectId::TYPE_MASK;
+        if (dst_type_tag_ == 0) {
+            dst_type_tag_ = tag;
+        } else if (tag != 0 && tag != dst_type_tag_) {
+            throw std::invalid_argument(
+                "L2CompactCsr::add_node heterogeneous dst type tag — "
+                "an L2 section must share one ObjectId type tag");
+        }
         col_idx_.push_back(static_cast<uint32_t>(nb.node_id));
     }
 }
