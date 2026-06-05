@@ -2413,7 +2413,14 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     // (addr table already has indices), but we still read the file for the
     // feature payload and for l4_bytes_disk accounting parity with legacy_.
     auto t_l4_read_start = std::chrono::steady_clock::now();
-    std::vector<char> slim_data;
+    // The L4 data section lives inside slim_owner at
+    // [slim_data_offset, slim_data_offset + slim_data_bytes). For the per-batch
+    // .bin path we MOVE the whole file buffer in and index it (no separate copy
+    // of the data section); the consolidated path owns its exact-range buffer at
+    // offset 0.
+    std::vector<char> slim_owner;
+    size_t slim_data_offset = 0;
+    size_t slim_data_bytes  = 0;
     if (addr.header.num_l4 > 0) {
       if (use_consolidated_slim_ &&
           addr.header.version >= AddrTableHeader::VERSION_V2 &&
@@ -2448,7 +2455,11 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
             throw std::runtime_error(
                 "v2: consolidated read failed at offset " + std::to_string(off));
         }
-        slim_data.assign(static_cast<char*>(abuf), static_cast<char*>(abuf) + len);
+        // Consolidated read uses an O_DIRECT-aligned buffer that must be freed,
+        // so one copy out of it is unavoidable; own the exact range at offset 0.
+        slim_owner.assign(static_cast<char*>(abuf), static_cast<char*>(abuf) + len);
+        slim_data_offset = 0;
+        slim_data_bytes  = len;
         std::free(abuf);
         stats_.l4_bytes_disk += len;
       } else {
@@ -2509,8 +2520,12 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
                 "v2: slim file size invariant violated: " + slim_path.string());
         }
 
-        slim_data.assign(file_buf.begin() + static_cast<ptrdiff_t>(data_offset),
-                         file_buf.begin() + static_cast<ptrdiff_t>(data_offset + data_bytes));
+        // Move the file buffer in and index its data section directly — avoids
+        // copying ~data_bytes (the per-batch feature payload, tens of MB on
+        // papers100M) into a separate slim_data vector.
+        slim_owner       = std::move(file_buf);
+        slim_data_offset = data_offset;
+        slim_data_bytes  = data_bytes;
         stats_.l4_bytes_disk += sizeof(hdr) + oid_bytes + data_bytes;
 
         fadvise_dontneed(fd, 0, static_cast<off_t>(file_size));
@@ -2676,8 +2691,9 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         // C2: bounds-check every L4 index.  A stale-but-format-valid addr_table
         // can carry l4_indices that exceed the slim file's row count; an unchecked
         // read would silently walk past the end of slim_data (UB).
-        const float*  slim_float           = reinterpret_cast<const float*>(slim_data.data());
-        const size_t  slim_capacity_floats = slim_data.size() / sizeof(float);
+        const float*  slim_float           = reinterpret_cast<const float*>(
+                                                 slim_owner.data() + slim_data_offset);
+        const size_t  slim_capacity_floats = slim_data_bytes / sizeof(float);
         for (uint32_t j = 0; j < addr.header.num_l4; ++j) {
             cpu_combined_positions.push_back(addr.l4_positions[j]);
             uint32_t     idx           = addr.l4_indices[j];
