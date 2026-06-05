@@ -258,10 +258,20 @@ int64_t LabelStore::get(uint64_t row_index) const {
 // ============================================================================
 
 torch::Tensor LabelStore::gather(const std::vector<uint64_t>& row_indices) const {
+    if (mmap_ptr_ == nullptr) {
+        throw std::runtime_error("LabelStore::gather: store is not open");
+    }
     auto tensor = torch::empty({static_cast<int64_t>(row_indices.size())}, torch::kInt64);
     auto acc    = tensor.accessor<int64_t, 1>();
+    const int64_t* d = data_ptr();
     for (size_t i = 0; i < row_indices.size(); i++) {
-        acc[i] = get(row_indices[i]);
+        const uint64_t r = row_indices[i];
+        // BatchAssembler injects UINT64_MAX as an "unknown seed" sentinel and
+        // documents that LabelStore treats it as -1 (the unlabeled label that
+        // mini.label_mask filters out). Honour that contract: map the sentinel
+        // and any out-of-range index to -1 instead of throwing (get() throws),
+        // so a sample with an unmapped seed degrades gracefully not crash-train.
+        acc[i] = (r < num_nodes_) ? d[r] : static_cast<int64_t>(-1);
     }
     return tensor;
 }
