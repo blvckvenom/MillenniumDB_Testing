@@ -2573,18 +2573,44 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         stats_.l1_bytes_served += addr.header.num_l1 * row_bytes;
     }
 
-    // --- Step 4 (v2): Combine L2 + L3 + L4 into cpu_combined ---
+    // --- Step 4+5 (v2): assemble L2 + L3 + L4 directly into the pinned buffer ---
     //
-    // Mirror legacy_ lines 1482-1555 exactly: build one contiguous float
-    // buffer + positions vector, then pin and hand to assembler_.assemble().
-    std::vector<float>    cpu_combined;
+    // Previously this built a std::vector<float> cpu_combined (row-by-row
+    // insert, reallocating as it grew) and then memcpy'd the whole thing into
+    // the worker pinned buffer — two ~(cpu_total×D) passes over hundreds of MB
+    // per batch on papers100M. We now size the pinned destination up front and
+    // write each tier's rows STRAIGHT into it (one pass), mirroring DiskGNN's
+    // read→scatter-by-precomputed-index pattern. Byte-identical output: same
+    // rows, same order (L2→L3→L4), same positions; only the intermediate vector
+    // + the final memcpy are gone. Falls back to a heap buffer when a pinned
+    // destination is unavailable (CPU-only build / pinned alloc failure) — that
+    // fallback path is byte-identical to the pre-refactor heap path.
     std::vector<uint32_t> cpu_combined_positions;
 
     size_t cpu_total = addr.header.num_l2
                      + addr.header.num_l3
                      + addr.header.num_l4;
-    cpu_combined.reserve(cpu_total * feature_dim_);
     cpu_combined_positions.reserve(cpu_total);
+
+    const size_t cpu_total_floats = cpu_total * feature_dim_;
+    float* dst = nullptr;                 // contiguous [rows,D] destination
+    std::vector<float> cpu_fallback;      // used only when pinned is unavailable
+#ifdef GNN_CUDA_ENABLED
+    void* worker_pinned = nullptr;
+    const size_t cpu_total_bytes = cpu_total_floats * sizeof(float);
+    if (cpu_total_bytes > 0
+        && ensure_pinned_capacity_for_worker_(cpu_total_bytes, worker_pinned)
+        && worker_pinned != nullptr) {
+        // Per-worker pinned buffer (Round 3B-mw). Sized once; the pointer is
+        // stable for the whole assembly (no realloc between here and assemble).
+        dst = reinterpret_cast<float*>(worker_pinned);
+    }
+#endif
+    if (dst == nullptr && cpu_total_floats > 0) {
+        cpu_fallback.resize(cpu_total_floats);
+        dst = cpu_fallback.data();
+    }
+    size_t cursor = 0;  // running float offset into dst (advances in row order)
 
     // L2: copy rows from cpu_cache_ by pre-resolved cache indices.
     if (addr.header.num_l2 > 0) {
@@ -2606,9 +2632,8 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
             }
             const float* row_ptr_f = static_cast<const float*>(
                 cpu_cache_->row_ptr(l2_idx));
-            cpu_combined.insert(cpu_combined.end(),
-                                row_ptr_f,
-                                row_ptr_f + feature_dim_);
+            std::memcpy(dst + cursor, row_ptr_f, feature_dim_ * sizeof(float));
+            cursor += feature_dim_;
         }
         auto t_l2_end = std::chrono::steady_clock::now();
         last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2624,9 +2649,9 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         const float* l3_data = reinterpret_cast<const float*>(l3_buf.data());
         for (uint32_t j = 0; j < addr.header.num_l3; ++j) {
             cpu_combined_positions.push_back(addr.l3_positions[j]);
-            cpu_combined.insert(cpu_combined.end(),
-                                l3_data + j * feature_dim_,
-                                l3_data + (j + 1) * feature_dim_);
+            std::memcpy(dst + cursor, l3_data + j * feature_dim_,
+                        feature_dim_ * sizeof(float));
+            cursor += feature_dim_;
         }
         auto t_l3_copy_end = std::chrono::steady_clock::now();
         last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2636,6 +2661,8 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     } else if (addr.header.num_l3 > 0 && l3_buf.empty()) {
         // L3 rows requested but nothing was readable (no reader + no mmap).
         // Count as reads with no data — same semantics as legacy_ line 1414.
+        // (No row written and no position pushed — identical to the old
+        // insert-of-nothing; dst was over-sized by num_l3 rows, harmless.)
         stats_.l3_reads += addr.header.num_l3;
     }
 
@@ -2662,9 +2689,9 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
                     + std::to_string(slim_capacity_floats / feature_dim_)
                     + " rows)");
             }
-            cpu_combined.insert(cpu_combined.end(),
-                                slim_float + idx * feature_dim_,
-                                slim_float + idx * feature_dim_ + feature_dim_);
+            std::memcpy(dst + cursor, slim_float + idx * feature_dim_,
+                        feature_dim_ * sizeof(float));
+            cursor += feature_dim_;
         }
         auto t_l4_copy_end = std::chrono::steady_clock::now();
         last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2673,19 +2700,10 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         stats_.l4_bytes_wanted += addr.header.num_l4 * row_bytes;
     }
 
-    // --- Step 5 (v2): Pin + assemble --- mirror legacy_ lines 1557-1585.
-    const float* assembler_data = cpu_combined.data();
-#ifdef GNN_CUDA_ENABLED
-    size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
-    void* worker_pinned = nullptr;
-    if (cpu_combined_bytes > 0
-        && ensure_pinned_capacity_for_worker_(cpu_combined_bytes, worker_pinned)
-        && worker_pinned != nullptr) {
-        // Per-worker pinned buffer (Round 3B-mw) — see legacy_ note.
-        std::memcpy(worker_pinned, cpu_combined.data(), cpu_combined_bytes);
-        assembler_data = reinterpret_cast<const float*>(worker_pinned);
-    }
-#endif
+    // Step 5 (v2): the destination is already the pinned (or fallback) buffer —
+    // no separate pin/memcpy pass. `dst` is nullptr only when cpu_total==0, in
+    // which case assemble() reads zero CPU rows and never dereferences it.
+    const float* assembler_data = dst;
 
     // I1: set the flag AFTER assemble() returns successfully.  If assemble()
     // throws, the flag stays false so the dispatcher's catch block and any
