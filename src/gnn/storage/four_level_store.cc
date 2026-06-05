@@ -2589,10 +2589,23 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     // L2: copy rows from cpu_cache_ by pre-resolved cache indices.
     if (addr.header.num_l2 > 0) {
         auto t_l2_start = std::chrono::steady_clock::now();
+        // Bounds-check every L2 index, symmetric with the L4 tier below. A
+        // stale-but-format-valid addr_table can carry l2_indices that exceed
+        // the CPU cache's row count; CpuCache::row_ptr does NOT validate (the
+        // caller owns idx < num_nodes), so an unchecked deref would walk past
+        // the cache buffer (UB / silent wrong-node features).
+        const uint64_t l2_rows = cpu_cache_->num_nodes();
         for (uint32_t h = 0; h < addr.header.num_l2; ++h) {
             cpu_combined_positions.push_back(addr.l2_positions[h]);
+            const uint32_t l2_idx = addr.l2_indices[h];
+            if (static_cast<uint64_t>(l2_idx) >= l2_rows) {
+                throw std::runtime_error(
+                    "v2: L2 index " + std::to_string(l2_idx)
+                    + " out of bounds for CPU cache ("
+                    + std::to_string(l2_rows) + " rows)");
+            }
             const float* row_ptr_f = static_cast<const float*>(
-                cpu_cache_->row_ptr(addr.l2_indices[h]));
+                cpu_cache_->row_ptr(l2_idx));
             cpu_combined.insert(cpu_combined.end(),
                                 row_ptr_f,
                                 row_ptr_f + feature_dim_);
