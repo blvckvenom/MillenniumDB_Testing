@@ -358,6 +358,28 @@ TrainingLoop::Result TrainingLoop::train()
             bt.h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_assem_end - t_h2d_start).count();
 
+            // Read-only isolation bench (2026-06-05): the producer path
+            // (read_sample + load_batch_features + GPU assemble) has already
+            // run to produce `mini`. Skip the model forward/backward/optimizer
+            // so the prefetch workers run UNTHROTTLED by GPU compute; the
+            // per-epoch io_disk/epoch_t then measures the read+assemble path's
+            // throughput when compute does not pace it (handoff 2026-06-05 §3).
+            if (config_.read_only_bench) {
+                ++num_train_batches;
+                if (profile_log_) {
+                    profile_log_->append(bt);
+                }
+#ifdef GNN_CUDA_ENABLED
+                if (config_.empty_cache_every_n_batches > 0 &&
+                    num_train_batches % config_.empty_cache_every_n_batches == 0 &&
+                    !device.is_cpu())
+                {
+                    c10::cuda::CUDACachingAllocator::emptyCache();
+                }
+#endif
+                continue;
+            }
+
             optimizer.zero_grad();
 
             auto t_fwd_start = std::chrono::steady_clock::now();
@@ -460,7 +482,11 @@ TrainingLoop::Result TrainingLoop::train()
         auto t_train_end = std::chrono::steady_clock::now();
         double train_phase_s = std::chrono::duration<double>(
             t_train_end - epoch_start).count();
-        double val_accuracy = evaluate(train_batches, val_batches);
+        // Read-only bench skips validation — the train phase is the whole
+        // measurement (workers read+assemble all batches with no compute).
+        double val_accuracy = config_.read_only_bench
+            ? 0.0
+            : evaluate(train_batches, val_batches);
         double val_phase_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_train_end).count();
 

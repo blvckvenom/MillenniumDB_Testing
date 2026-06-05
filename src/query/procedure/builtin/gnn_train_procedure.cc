@@ -278,6 +278,11 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     bool        save_on_best_val = true;
     bool        save_final       = true;
     std::string profile_log_path = "";  // Phase 0 per-batch timing CSV (empty = disabled)
+    // Read-only isolation bench (2026-06-05): skip model forward/backward +
+    // validation; run only the producer (read_sample + load_batch_features +
+    // assemble). io_disk/epoch_t then measures the read path's throughput
+    // unthrottled by compute (settles pacing vs read-path-limit).
+    bool        read_only_bench  = false;
     // Spec C3 stage 1 (default true since 2026-05-07): async prefetcher.
     // 1.609× speedup measured on papers100M, bit-identical accuracy.
     bool        use_async_prefetcher = true;
@@ -415,6 +420,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         // Phase 0 (2026-05-17): per-batch profile CSV path. Empty disables.
         if (auto v = opts.get_string("profileLog")) {
             profile_log_path = *v;
+        }
+        // Read-only isolation bench (2026-06-05): skip compute + validation.
+        if (auto v = opts.get_bool("readOnlyBench")) {
+            read_only_bench = *v;
         }
     }
 
@@ -784,6 +793,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.prefetch_queue_size = static_cast<size_t>(prefetch_queue_size);
     loop_config.output_dir    = output_dir.string();
     loop_config.profile_log_path = profile_log_path;  // Phase 0 instrumentation
+    loop_config.read_only_bench  = read_only_bench;   // read-only isolation bench
 
     // =========================================================================
     // Step 8a: Build base TrainingState (identifying fields) for checkpoints

@@ -150,6 +150,17 @@ public:
         // last_*_us() is racy/unattributable without MiniBatch-level
         // propagation (deferred refactor).
         std::string profile_log_path = "";
+
+        // Read-only isolation bench (2026-06-05). When true, each train batch
+        // runs the full producer path (read_sample + load_batch_features +
+        // GPU assemble, via the prefetcher when enabled) but SKIPS the model
+        // forward/backward/optimizer and the validation phase. The prefetch
+        // workers therefore run unthrottled by GPU compute, so the per-epoch
+        // io_disk / epoch_t measures the read+assemble path's throughput when
+        // compute does not pace it. This settles whether MDB's in-train read
+        // is limited by compute-pacing or by the read path itself (handoff
+        // 2026-06-05 §3 — vs DiskGNN's isolated cold-load stage ~2.18 GB/s).
+        bool        read_only_bench = false;
     };
 
     // =========================================================================
