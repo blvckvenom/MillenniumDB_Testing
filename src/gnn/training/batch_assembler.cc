@@ -1,6 +1,7 @@
 #include "gnn/training/batch_assembler.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -472,6 +473,14 @@ std::vector<torch::Tensor> BatchAssembler::build_edge_indices(
                 int64_t src_local, dst_local;
                 if (fast) {
                     // Remap by precomputed global position (== local index).
+                    // Debug-only bounds check on the disk-sourced edge endpoints
+                    // (zero-cost in Release where NDEBUG disables assert). A
+                    // stale/corrupt sample whose edge indices exceed the layer
+                    // node counts would otherwise index lgp out of bounds (UB);
+                    // the legacy fallback below throws on the same condition.
+                    assert(j + 1 < lgp.size() && src_idx < lgp[j + 1].size() &&
+                           j < lgp.size() && dst_idx < lgp[j].size() &&
+                           "edge endpoint index out of active-set bounds");
                     src_local = lgp[j + 1][src_idx];  // src in A_{k+1}
                     dst_local = lgp[j][dst_idx];       // dst in A_k
                 } else {
