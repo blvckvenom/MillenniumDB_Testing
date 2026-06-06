@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <iostream>
 #include <string>
 
 #include "query/procedure/procedure_context.h"
@@ -20,6 +21,16 @@ namespace GQL::Procedures {
 
 void GnnMaterializeBatchesProcedure::execute(ProcedureContext& ctx) {
     using namespace mdb::gnn;
+
+    // Deprecation notice (audit 2026-06-04): gnn_materialize_batches is redundant.
+    // gnn_build_feature_store is self-sufficient — it reorders + packs directly
+    // from the sample. This procedure's packed/ output is not consumed by the
+    // downstream stages (it is deleted by the next stage). Prefer calling
+    // gnn_build_feature_store directly; this procedure may be removed in a future
+    // release. (Kept for now to avoid breaking existing user scripts.)
+    std::cerr << "[gnn_materialize_batches] DEPRECATED/REDUNDANT: prefer "
+                 "gnn_build_feature_store (self-sufficient); this procedure's "
+                 "packed/ output is unused downstream and may be removed.\n";
 
     // =========================================================================
     // Step 1: Parse arguments
