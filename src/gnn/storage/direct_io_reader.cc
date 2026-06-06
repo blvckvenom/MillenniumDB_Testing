@@ -1,10 +1,12 @@
 #include "gnn/storage/direct_io_reader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <exception>
 #include <future>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -401,7 +403,23 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
     for (const auto& op : ops) {
         uint64_t aligned_off = align_down(op.file_offset, block_align_);
         uint64_t end         = op.file_offset + row_bytes;
-        if (end > file_size_) end = file_size_;
+        if (end > file_size_) {
+            // This row extends past EOF — its out-of-range bytes stay zero (the
+            // `out` buffer was zero-filled above). The L4 caller bounds-checks
+            // indices, so this normally never fires; a stale/corrupt row index
+            // would land here and yield a silently zero-filled feature row.
+            // Warn ONCE rather than throw (changing to a hard error is
+            // behaviour-risky and the caller already validates indices).
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                std::cerr << "[DirectIoReader] WARNING: row at offset "
+                          << op.file_offset << " (+" << row_bytes
+                          << " B) exceeds file size " << file_size_
+                          << " — out-of-range bytes zero-filled "
+                             "(further such warnings suppressed)\n";
+            }
+            end = file_size_;
+        }
         uint64_t aligned_end = align_up(end, block_align_);
         if (aligned_end > aligned_fs) aligned_end = aligned_fs;
 
