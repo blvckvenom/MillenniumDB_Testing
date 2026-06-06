@@ -79,7 +79,6 @@ add_library(mdb_gnn_core STATIC
     storage/cpu_cache.cc
     storage/gpu_cache.cc
     storage/four_level_store.cc
-    storage/addr_table.cc
     storage/addr_table_writer.cc
     storage/addr_table_reader.cc
     storage/direct_io_reader.cc
