@@ -16,6 +16,7 @@
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
+#include "gnn/training/graph_block_builder.h"
 #include "gnn/training/label_store.h"
 #include "gnn/training/mini_batch.h"
 #include "gnn/training/split_store.h"
@@ -195,37 +196,12 @@ private:
     /**
      * @brief Output bundle from build_active_indices.
      *
-     * Round 2C (2026-05-15): in addition to the per-layer global-position
-     * tensors used by the model gather, also produce a per-layer
-     * `ObjectId.id -> local-position-in-A_k` hash table. These are the
-     * direct map build_edge_indices needs to remap edges from layer-local
-     * indices straight into the active set, halving the number of hash
-     * lookups per edge (was: oid->global, then global->local; now: oid->local).
+     * Relocated to mdb::gnn::graph_block (graph_block_builder.h) so the offline
+     * bake (gnn_build_feature_store) and the train path share one definition.
+     * Kept as a private type alias here so the rest of BatchAssembler still
+     * names ActiveIndicesResult unchanged.
      */
-    struct ActiveIndicesResult {
-        std::vector<torch::Tensor> indices_per_layer;          // K+1 Long tensors of global positions
-        std::vector<int64_t>       sizes_per_layer;            // |A_k| for each k
-        std::vector<std::unordered_map<uint64_t, int64_t>>
-                                   oid_to_local_per_layer;     // K+1 maps: ObjectId.id -> local idx in A_k
-                                                               // (populated ONLY on the defensive fallback;
-                                                               //  empty on the fast identity-prefix path)
-        // Fast-path only: layer_global_pos[k][i] = global position (== local
-        // index under the identity prefix) of nodes_per_layer[k][i], for EVERY
-        // entry incl. cross-layer duplicates. Filled for free in Phase 1 (reuses
-        // the oid_to_global lookups build_active_indices already does), so
-        // build_edge_indices can remap each edge endpoint by pure array indexing
-        // with ZERO per-edge hash lookups. Empty on the defensive fallback.
-        std::vector<std::vector<int64_t>> layer_global_pos;
-        // Fast path flag. True (the universal case) when the cumulative active
-        // positions came out as the identity sequence [0,1,..,N-1] — guaranteed
-        // by rebuild_unique_nodes() inserting nodes in layer order, so local
-        // index == global position for every layer. When true, indices_per_layer
-        // is an arange and oid_to_local_per_layer is left empty (build_edge_indices
-        // remaps via oid_to_global directly). When false (never observed in
-        // practice, only if a future sampler change breaks the ordering), the
-        // legacy per-layer sort + maps are produced for exact equivalence.
-        bool identity_prefix = true;
-    };
+    using ActiveIndicesResult = graph_block::ActiveIndicesResult;
 
     /**
      * @brief Build per-layer cumulative active-set gather indices.

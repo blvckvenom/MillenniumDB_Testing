@@ -163,6 +163,7 @@ add_library(mdb_gnn_core STATIC
     training/label_store.cc
     training/split_store.cc
     training/batch_assembler.cc
+    training/graph_block_builder.cc
     training/batch_timing_log.cc
     training/npy_writer.cc
 
