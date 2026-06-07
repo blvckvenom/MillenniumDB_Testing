@@ -83,6 +83,7 @@ add_library(mdb_gnn_core STATIC
     storage/addr_table_reader.cc
     storage/direct_io_reader.cc
     storage/consolidated_slim_reader.cc
+    storage/block_store.cc
 
     # Phase 1: Projection Integration
     projection/feature_accessor.cc
