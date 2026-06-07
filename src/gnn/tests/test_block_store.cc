@@ -55,6 +55,29 @@ TEST(BlockStore, MissingFileReturnsNullopt) {
     EXPECT_FALSE(BlockReader::open(tmp / "does_not_exist.blk", 0).has_value());
 }
 
+// is_fresh: header-only freshness peek used for the idempotent bake-skip.
+TEST(BlockStore, IsFreshTrueForMatchingFp) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_fresh_ok";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {2, 1};                       // K=1 conv layer
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0xABCDull, /*batch_id=*/0, sizes, edges);
+    EXPECT_TRUE(BlockReader::is_fresh(tmp / "b.blk", /*expected=*/0xABCDull));
+}
+TEST(BlockStore, IsFreshFalseForWrongFp) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_fresh_wrong";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {2, 1};
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0x1111ull, /*batch_id=*/0, sizes, edges);
+    EXPECT_FALSE(BlockReader::is_fresh(tmp / "b.blk", /*expected=*/0x2222ull));  // stale fp
+}
+TEST(BlockStore, IsFreshFalseForMissingFile) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_fresh_missing";
+    std::filesystem::create_directories(tmp);
+    EXPECT_FALSE(BlockReader::is_fresh(tmp / "does_not_exist.blk", 0));
+}
+
 // The bit-identical guarantee: a block written from the ONLINE
 // graph_block::build_active_indices/build_edge_indices output and read back
 // must yield active_sizes + per-layer edge_index tensors identical

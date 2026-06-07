@@ -160,6 +160,11 @@ public:
         // Set to false only to skip Phase 5 (e.g., when rebuilding caches only).
         bool   build_addr_tables = true;
 
+        // Bake per-batch computation-graph blocks (blocks/block_NNNNNN.blk)
+        // keyed by sample content hash. Default OFF; consumed by BatchAssembler
+        // when present+fresh.
+        bool   bake_blocks = false;
+
         // DiskGNN-adoption Plan 1: also emit a single consolidated cold-feature
         // file (packed_slim/consolidated.slim) during the partitioned L4 pack, so
         // the runtime can serve each batch's cold features with ONE O_DIRECT
@@ -216,6 +221,12 @@ public:
         // addr_tables_built_ok — true iff Phase 5 completed without error.
         uint64_t addr_tables_bytes    = 0;
         bool     addr_tables_built_ok = false;
+
+        // Task 6 (2026-06-07): baked computation-graph block telemetry.
+        // blocks_bytes — total bytes written to blocks/*.blk files.
+        // blocks_built_ok — true iff block baking completed without error.
+        uint64_t blocks_bytes    = 0;
+        bool     blocks_built_ok = false;
     };
 
     /// Preprocessing: classify nodes by frequency, build caches, re-pack L4 slim.
@@ -247,7 +258,9 @@ public:
     /// Side-effect: enables use_addr_tables_ and sets expected_meta_sha_head_
     /// so this instance's load_batch_features() can immediately serve via
     /// the v2 fast path (no need to re-construct the FourLevelStore).
-    uint64_t rebuild_addr_tables(const std::filesystem::path& db_folder);
+    uint64_t rebuild_addr_tables(const std::filesystem::path& db_folder,
+                                 bool bake_blocks = false,
+                                 uint64_t* out_blocks_bytes = nullptr);
 
     /// Resolve the per-projection gnn_meta.bin path used as the addr-table
     /// staleness marker. gnn_meta.bin lives in the PROJECTION directory

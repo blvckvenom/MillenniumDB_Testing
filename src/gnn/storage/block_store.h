@@ -19,5 +19,12 @@ struct BlockWriter {
 struct BlockReader {
     // Returns nullopt if missing / bad magic-version / sample_fp mismatch (stale).
     static std::optional<LoadedBlock> open(const std::filesystem::path& path, uint64_t expected_sample_fp);
+
+    // Cheap freshness check: reads ONLY the 64-byte header and returns true iff
+    // magic+version valid AND sample_fp == expected. Does NOT read the body.
+    // For the bake-skip decision; a torn block (header ok, body truncated) is
+    // impossible post-crash (atomic fsync+rename) and would still fall back to
+    // online at train time via open() returning nullopt.
+    static bool is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp);
 };
 } // namespace mdb::gnn

@@ -30,6 +30,8 @@
 #include "gnn/storage/addr_table.h"
 #include "gnn/storage/addr_table_reader.h"
 #include "gnn/storage/addr_table_writer.h"
+#include "gnn/storage/block_store.h"
+#include "gnn/training/graph_block_builder.h"
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/direct_io_reader.h"
 #include "gnn/storage/feature_matrix.h"
@@ -241,6 +243,16 @@ fs::path addr_table_filename(const fs::path& addr_tables_dir, uint64_t batch_id)
     return addr_tables_dir / fname;
 }
 
+// Format a baked-block filename for a given batch_id.
+// Mirrors the addr_table naming: "block_%06lu.blk".
+fs::path block_filename(const fs::path& blocks_dir, uint64_t batch_id)
+{
+    char fname[32];
+    std::snprintf(fname, sizeof(fname), "block_%06lu.blk",
+                  static_cast<unsigned long>(batch_id));
+    return blocks_dir / fname;
+}
+
 // ---------------------------------------------------------------------------
 // build_addr_tables_ — Phase 5 of FourLevelStore::build()
 //
@@ -264,10 +276,15 @@ void build_addr_tables_(
     uint64_t                                    meta_sha_head,
     uint64_t                                    total_batches,
     uint64_t&                                   out_addr_tables_bytes,
+    bool                                        write_addr_tables,
+    bool                                        bake_blocks,
+    const fs::path&                             blocks_dir,
+    uint64_t&                                   out_blocks_bytes,
     const std::vector<uint64_t>*                cons_offsets = nullptr,
     const std::vector<uint64_t>*                cons_lengths = nullptr)
 {
-    fs::create_directories(addr_tables_dir);
+    if (write_addr_tables) fs::create_directories(addr_tables_dir);
+    if (bake_blocks)       fs::create_directories(blocks_dir);
 
     unsigned num_workers = std::thread::hardware_concurrency();
     if (num_workers == 0) num_workers = 4;
@@ -305,6 +322,7 @@ void build_addr_tables_(
 
     std::atomic<uint64_t> next_bid{0};
     std::atomic<uint64_t> total_bytes_acc{0};
+    std::atomic<uint64_t> blocks_bytes_acc{0};
     std::exception_ptr    first_exc;
     std::mutex            exc_mutex;
 
@@ -322,39 +340,78 @@ void build_addr_tables_(
                 // 1. Read sample for the classify-input list.
                 auto sample = samples.read_sample(b);
 
-                // 2. Build L4 lookup map from packed_slim OID table.
-                char fname[32];
-                std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
-                              static_cast<unsigned long>(b));
-                auto slim_path = packed_slim_dir / fname;
-                auto slim_oid_to_idx = read_slim_oid_table(slim_path);
+                if (write_addr_tables) {
+                    // 2. Build L4 lookup map from packed_slim OID table.
+                    char fname[32];
+                    std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
+                                  static_cast<unsigned long>(b));
+                    auto slim_path = packed_slim_dir / fname;
+                    auto slim_oid_to_idx = read_slim_oid_table(slim_path);
 
-                // 3. Classify each unique node into a tier.
-                AddrTableBuffers buf;
-                AddrTableWriter::build(
-                    sample.all_unique_nodes,
-                    &l1_adapter,
-                    &l2_adapter,
-                    slim_oid_to_idx,
-                    rmap_find,
-                    meta_sha_head,
-                    buf);
+                    // 3. Classify each unique node into a tier.
+                    AddrTableBuffers buf;
+                    AddrTableWriter::build(
+                        sample.all_unique_nodes,
+                        &l1_adapter,
+                        &l2_adapter,
+                        slim_oid_to_idx,
+                        rmap_find,
+                        meta_sha_head,
+                        buf);
 
-                // DiskGNN-adoption Plan 1: when a consolidated cold-feature file
-                // was written, upgrade this batch's header to v2 carrying its
-                // (slim_offset, slim_length) so the runtime can pread it directly.
-                if (cons_offsets && cons_lengths) {
-                    buf.header = AddrTableHeader::make_v2(
-                        buf.header.num_l1, buf.header.num_l2, buf.header.num_l3,
-                        buf.header.num_l4, buf.header.num_zero, meta_sha_head,
-                        (*cons_offsets)[b], (*cons_lengths)[b]);
+                    // DiskGNN-adoption Plan 1: when a consolidated cold-feature
+                    // file was written, upgrade this batch's header to v2 carrying
+                    // its (slim_offset, slim_length) so the runtime can pread it
+                    // directly.
+                    if (cons_offsets && cons_lengths) {
+                        buf.header = AddrTableHeader::make_v2(
+                            buf.header.num_l1, buf.header.num_l2, buf.header.num_l3,
+                            buf.header.num_l4, buf.header.num_zero, meta_sha_head,
+                            (*cons_offsets)[b], (*cons_lengths)[b]);
+                    }
+
+                    // 4. Atomically write the addr_table sidecar.
+                    auto addr_path = addr_table_filename(addr_tables_dir, b);
+                    AddrTableWriter::write_atomic(addr_path, buf);
+
+                    total_bytes_acc.fetch_add(buf.total_bytes(),
+                                              std::memory_order_relaxed);
                 }
 
-                // 4. Atomically write the addr_table sidecar.
-                auto addr_path = addr_table_filename(addr_tables_dir, b);
-                AddrTableWriter::write_atomic(addr_path, buf);
-
-                total_bytes_acc.fetch_add(buf.total_bytes(), std::memory_order_relaxed);
+                // Task 6: bake the per-batch computation-graph block. Additive
+                // and independent of addr_tables. Idempotent via content hash:
+                // skip when a fresh block with a matching sample_fp exists.
+                // Thread-safe: each batch writes its own file via the atomic
+                // tmp+rename BlockWriter, the byte counter is atomic, and
+                // graph_block::build_* are pure functions on the local sample.
+                if (bake_blocks) {
+                    uint64_t fp = mdb::gnn::compute_batch_content_hash(sample);
+                    auto blk_path = block_filename(blocks_dir, b);
+                    // Cheap header-only freshness peek (no body read) for the
+                    // idempotent re-bake skip; train-time open() still validates
+                    // the full block.
+                    if (!BlockReader::is_fresh(blk_path, fp)) {
+                        // Build oid_to_global identically to BatchAssembler.
+                        std::unordered_map<uint64_t, int64_t> oid_to_global;
+                        oid_to_global.reserve(sample.all_unique_nodes.size());
+                        for (int64_t i = 0;
+                             i < static_cast<int64_t>(sample.all_unique_nodes.size());
+                             ++i) {
+                            oid_to_global[sample.all_unique_nodes[i].id] = i;
+                        }
+                        auto active = mdb::gnn::graph_block::build_active_indices(
+                            sample, oid_to_global);
+                        auto edges = mdb::gnn::graph_block::build_edge_indices(
+                            sample, active);
+                        BlockWriter::write(blk_path, fp, b,
+                                           active.sizes_per_layer, edges);
+                        std::error_code sz_ec;
+                        auto bsz = fs::file_size(blk_path, sz_ec);
+                        if (!sz_ec)
+                            blocks_bytes_acc.fetch_add(bsz,
+                                                       std::memory_order_relaxed);
+                    }
+                }
             }
         } catch (...) {
             std::lock_guard<std::mutex> lk(exc_mutex);
@@ -370,8 +427,10 @@ void build_addr_tables_(
     for (auto& t : workers) t.join();
     if (first_exc) std::rethrow_exception(first_exc);
 
-    fsync_directory(addr_tables_dir);
+    if (write_addr_tables) fsync_directory(addr_tables_dir);
+    if (bake_blocks)       fsync_directory(blocks_dir);
     out_addr_tables_bytes = total_bytes_acc.load(std::memory_order_relaxed);
+    out_blocks_bytes      = blocks_bytes_acc.load(std::memory_order_relaxed);
 }
 
 } // anonymous namespace
@@ -591,7 +650,9 @@ FourLevelStore::~FourLevelStore() {
 // intact. Re-runs Phase 5 against the already-loaded caches and updates this
 // instance's v2-dispatch state so subsequent load_batch_features() calls can
 // immediately use the v2 fast path.
-uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder) {
+uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder,
+                                             bool bake_blocks,
+                                             uint64_t* out_blocks_bytes) {
     if (!samples_) {
         throw std::runtime_error(
             "FourLevelStore::rebuild_addr_tables: no SampleStorage bound");
@@ -616,8 +677,10 @@ uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder) {
     // Match the path convention used by FourLevelStore::build() at the Phase 5
     // wiring (line 460): addr_tables_dir = sample_dir / "addr_tables".
     auto addr_tables_dir = sample_dir_ / "addr_tables";
+    auto blocks_dir      = sample_dir_ / "blocks";
 
-    uint64_t out_bytes = 0;
+    uint64_t out_bytes    = 0;
+    uint64_t blocks_bytes = 0;
     build_addr_tables_(
         *samples_,
         addr_tables_dir,
@@ -627,7 +690,13 @@ uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder) {
         reordered_rm_,
         meta_sha_head,
         total_batches,
-        out_bytes);
+        out_bytes,
+        /*write_addr_tables=*/true,
+        bake_blocks,
+        blocks_dir,
+        blocks_bytes);
+
+    if (out_blocks_bytes) *out_blocks_bytes = blocks_bytes;
 
     // After Phase 5 completes, this instance's v2 dispatch can serve
     // load_batch_features() immediately. (The runtime ctor would have
@@ -684,6 +753,9 @@ FourLevelStore::BuildResult FourLevelStore::build(
         std::error_code ec;
         if (config.force_packed_slim) fs::remove_all(packed_slim_dir, ec);
         if (config.force_packed_slim) fs::remove_all(addr_tables_dir, ec);
+        // Task 6: a force rebuild also clears stale baked blocks so they are
+        // rebaked fresh against the new sample content.
+        if (config.force_packed_slim) fs::remove_all(fs::path(sample_dir) / "blocks", ec);
         if (config.force_caches)      fs::remove(gpu_cache_path, ec);
         if (config.force_caches)      fs::remove(cpu_cache_path, ec);
         if (config.force_meta)        fs::remove(meta_path, ec);
@@ -766,6 +838,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
         std::error_code ec;
         fs::remove_all(packed_slim_dir, ec);
         fs::remove_all(addr_tables_dir, ec);
+        fs::remove_all(fs::path(sample_dir) / "blocks", ec);  // Task 6: stale blocks
         fs::remove(gpu_cache_path, ec);
         fs::remove(cpu_cache_path, ec);
         fs::remove(meta_path, ec);
@@ -1335,7 +1408,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // files' OID tables rather than loading them into GPU/CPU memory.
     // GpuCache/CpuCache::build() sorts entries by FeatureMatrix row before
     // writing, so the on-disk OID table is the ground truth for find_index().
-    if (config.build_addr_tables) {
+    if (config.build_addr_tables || config.bake_blocks) {
         log_phase("Phase 5 addr_tables start");
         try {
             auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
@@ -1343,6 +1416,8 @@ FourLevelStore::BuildResult FourLevelStore::build(
 
             auto meta_sha_head = compute_meta_sha_head(
                 gnn_meta_path_for(db_folder, catalog.projection_name));
+
+            auto blocks_dir = fs::path(sample_dir) / "blocks";
 
             build_addr_tables_(
                 samples,
@@ -1354,10 +1429,15 @@ FourLevelStore::BuildResult FourLevelStore::build(
                 meta_sha_head,
                 catalog.total_batches,
                 result.addr_tables_bytes,
+                /*write_addr_tables=*/config.build_addr_tables,
+                /*bake_blocks=*/config.bake_blocks,
+                blocks_dir,
+                result.blocks_bytes,
                 write_consolidated ? &cons_offsets : nullptr,
                 write_consolidated ? &cons_lengths : nullptr);
 
             result.addr_tables_built_ok = true;
+            if (config.bake_blocks) result.blocks_built_ok = true;
             log_phase("Phase 5 addr_tables done");
         } catch (const std::exception& ex) {
             // Phase 5 is best-effort: a failure logs a warning but does not
@@ -1366,6 +1446,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
             std::cerr << "FourLevelStore::build: WARNING Phase 5 addr_tables failed: "
                       << ex.what() << " — runtime will use per-batch lookup fallback.\n";
             result.addr_tables_built_ok = false;
+            result.blocks_built_ok = false;
         }
     }
 

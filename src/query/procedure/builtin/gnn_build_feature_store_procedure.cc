@@ -100,6 +100,12 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         // Default true — enables the fast runtime path in gnn_train via
         // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip Phase 5.
         if (auto v = opts.get_bool("buildAddrTables")) config.build_addr_tables = *v;
+        // Task 6: bake per-batch computation-graph blocks (blocks/block_NNNNNN.blk)
+        // keyed by sample content hash, idempotent across re-runs. Default OFF —
+        // when off the build is byte-identical to before. NOTE: bakeBlocks on a
+        // reused store requires buildAddrTables (the default) to be on; with
+        // buildAddrTables:false + reuse, pass force to bake.
+        if (auto v = opts.get_bool("bakeBlocks")) config.bake_blocks = *v;
         // DiskGNN-adoption Plan 1: also emit packed_slim/consolidated.slim during
         // the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF. The
         // runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
@@ -224,9 +230,13 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         // BuildResult stay at their default zero values — only the
         // addrTablesMb / addrTablesBuiltOk yields are meaningful here.
         FourLevelStore store(db_folder, feature_name, samples);
-        uint64_t addr_bytes = store.rebuild_addr_tables(db_folder);
+        uint64_t blocks_bytes = 0;
+        uint64_t addr_bytes = store.rebuild_addr_tables(
+            db_folder, config.bake_blocks, &blocks_bytes);
         result.addr_tables_bytes    = addr_bytes;
         result.addr_tables_built_ok = true;
+        result.blocks_bytes         = blocks_bytes;
+        result.blocks_built_ok      = config.bake_blocks;
     } else {
         auto fm = FeatureMatrix::open(fmat_path);
         auto rm = RowMapping::open(rmap_path);
@@ -261,6 +271,11 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
               ctx.create_int(bytes_to_mb(result.addr_tables_bytes)));
     ctx.yield("addrTablesBuiltOk",
               ctx.create_bool(result.addr_tables_built_ok));
+    // Task 6: baked computation-graph block telemetry.
+    ctx.yield("blocksMb",
+              ctx.create_int(bytes_to_mb(result.blocks_bytes)));
+    ctx.yield("blocksBuiltOk",
+              ctx.create_bool(result.blocks_built_ok));
     ctx.yield_row();
 }
 

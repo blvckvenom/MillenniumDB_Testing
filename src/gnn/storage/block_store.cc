@@ -91,4 +91,13 @@ std::optional<LoadedBlock> BlockReader::open(const std::filesystem::path& path, 
     }
     return out;
 }
+
+bool BlockReader::is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return false;
+    BlockBatchHeader h{};
+    is.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!is) return false;  // short read / open failure
+    return h.is_valid() && h.sample_fp == expected_sample_fp;
+}
 } // namespace mdb::gnn
