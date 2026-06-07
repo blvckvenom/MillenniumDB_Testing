@@ -1,9 +1,13 @@
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <unordered_map>
 #include <vector>
 #include <torch/torch.h>
 #include "gnn/storage/block_format.h"
 #include "gnn/storage/block_store.h"
+#include "gnn/training/graph_block_builder.h"  // graph_block::build_active_indices / build_edge_indices
+                                                // (pulls in gnn/sampling/graph_sample.h => GraphSample,
+                                                //  SplitType, ObjectId)
 using namespace mdb::gnn;
 
 TEST(BlockFormat, MakeAndValidate) {
@@ -49,4 +53,47 @@ TEST(BlockStore, MissingFileReturnsNullopt) {
     auto tmp = std::filesystem::temp_directory_path() / "blk_missing";
     std::filesystem::create_directories(tmp);
     EXPECT_FALSE(BlockReader::open(tmp / "does_not_exist.blk", 0).has_value());
+}
+
+// The bit-identical guarantee: a block written from the ONLINE
+// graph_block::build_active_indices/build_edge_indices output and read back
+// must yield active_sizes + per-layer edge_index tensors identical
+// (torch::equal) to the online derivation. Proves write->read == online.
+TEST(BlockStore, BakeMatchesOnlineDerivation) {
+    std::vector<ObjectId> n;
+    for (uint64_t i = 1; i <= 6; ++i) n.emplace_back(i);   // 6 distinct nonzero ids
+
+    GraphSample s;
+    s.batch_id = 7;
+    s.split = SplitType::TRAIN;
+    s.nodes_per_layer = { {n[0], n[1]}, {n[2], n[3]}, {n[4], n[5]} };  // K=2 conv layers
+    s.edges_per_layer.resize(2);
+    s.edges_per_layer[0].src_indices = {0, 1};  // layer1[0,1] = n2,n3
+    s.edges_per_layer[0].dst_indices = {0, 1};  // layer0[0,1] = n0,n1
+    s.edges_per_layer[0].edge_ids    = { ObjectId(0), ObjectId(0) };
+    s.edges_per_layer[1].src_indices = {0, 1};  // layer2[0,1] = n4,n5
+    s.edges_per_layer[1].dst_indices = {0, 1};  // layer1[0,1] = n2,n3
+    s.edges_per_layer[1].edge_ids    = { ObjectId(0), ObjectId(0) };
+    s.rebuild_unique_nodes();  // identity-prefix all_unique_nodes (layer order)
+    ASSERT_EQ(s.all_unique_nodes.size(), 6u);  // non-degenerate active sets
+
+    std::unordered_map<uint64_t, int64_t> oid_to_global;
+    for (int64_t i = 0; i < static_cast<int64_t>(s.all_unique_nodes.size()); ++i)
+        oid_to_global[s.all_unique_nodes[i].id] = i;
+
+    auto active       = mdb::gnn::graph_block::build_active_indices(s, oid_to_global);
+    auto online_edges = mdb::gnn::graph_block::build_edge_indices(s, active);
+    ASSERT_EQ(online_edges.size(), 2u);  // K conv layers => K edge_index tensors
+
+    auto tmp = std::filesystem::temp_directory_path() / "blk_equal";
+    std::filesystem::create_directories(tmp);
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0x55ull, s.batch_id,
+                       active.sizes_per_layer, online_edges);
+    auto blk = BlockReader::open(tmp / "b.blk", /*expected_sample_fp=*/0x55ull);
+    ASSERT_TRUE(blk.has_value());
+
+    EXPECT_EQ(blk->active_sizes, active.sizes_per_layer);
+    ASSERT_EQ(blk->edge_indices.size(), online_edges.size());
+    for (size_t k = 0; k < online_edges.size(); ++k)
+        EXPECT_TRUE(torch::equal(blk->edge_indices[k], online_edges[k]));
 }
