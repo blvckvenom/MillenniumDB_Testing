@@ -360,6 +360,19 @@ if(BUILD_TESTING)
         )
         add_test(NAME GraphSampleTests COMMAND test_graph_sample)
 
+        # Block store tests (offline computation-graph bake)
+        add_executable(test_block_store
+            tests/test_block_store.cc
+        )
+        target_link_libraries(test_block_store mdb_gnn_core GTest::gtest_main ${TORCH_LIBRARIES})
+        target_compile_options(test_block_store PRIVATE ${TORCH_CXX_FLAGS_LIST})
+        target_compile_definitions(test_block_store PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+        set_target_properties(test_block_store PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+        add_test(NAME BlockStoreTests COMMAND test_block_store)
+
         # Sample content fingerprint tests (STEP 8 — staleness, isolable)
         add_executable(test_sample_fingerprint
             tests/test_sample_fingerprint.cc
