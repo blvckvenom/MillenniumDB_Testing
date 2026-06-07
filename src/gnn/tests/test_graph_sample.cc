@@ -434,6 +434,88 @@ TEST(GraphSampleTest, DeserializeSkipEdgeIds) {
     }
 }
 
+// skip_edges deserialize: nodes_per_layer and all_unique_nodes come back
+// identical to a full deserialize, but every layer's src_indices + dst_indices
+// is empty (those blocks are seeked past, not read). Unlike skip_edge_ids, the
+// skipped src/dst ARE needed for training — a baked computation-graph block must
+// supply them at train time; here we just verify the deserialize contract.
+// A second deserialize with default args (skip_edges=false) must still fully
+// round-trip the edges, proving the new param defaults to off.
+TEST(GraphSampleTest, DeserializeSkipEdges) {
+    auto s = make_2hop_sample(9, SplitType::VALIDATION);
+    ASSERT_GE(s.nodes_per_layer.size(), 2u);
+    ASSERT_FALSE(s.edges_per_layer.empty());
+    for (const auto& e : s.edges_per_layer) {
+        ASSERT_FALSE(e.src_indices.empty())
+            << "fixture must have src_indices to exercise the skip";
+        ASSERT_FALSE(e.dst_indices.empty())
+            << "fixture must have dst_indices to exercise the skip";
+        ASSERT_FALSE(e.edge_ids.empty())
+            << "fixture must have edge_ids to exercise the skip";
+    }
+
+    std::stringstream ss;
+    s.serialize(ss);
+    const std::string bytes = ss.str();
+
+    // skip_edges=true: src/dst seeked past (empty), everything else intact.
+    {
+        std::stringstream in(bytes);
+        auto skipped = GraphSample::deserialize(in, /*skip_edge_ids=*/false,
+                                                /*skip_edges=*/true);
+
+        EXPECT_EQ(skipped.batch_id, s.batch_id);
+        EXPECT_EQ(skipped.split, s.split);
+
+        // edges_per_layer still has one LayerEdges per layer.
+        ASSERT_EQ(skipped.edges_per_layer.size(), s.edges_per_layer.size());
+        for (size_t k = 0; k < s.edges_per_layer.size(); ++k) {
+            EXPECT_TRUE(skipped.edges_per_layer[k].src_indices.empty())
+                << "edge layer " << k << " src_indices should be empty";
+            EXPECT_TRUE(skipped.edges_per_layer[k].dst_indices.empty())
+                << "edge layer " << k << " dst_indices should be empty";
+            // edge_ids were NOT skipped (skip_edge_ids=false) — they round-trip.
+            ASSERT_EQ(skipped.edges_per_layer[k].edge_ids.size(),
+                      s.edges_per_layer[k].edge_ids.size());
+            for (size_t i = 0; i < s.edges_per_layer[k].edge_ids.size(); ++i) {
+                EXPECT_EQ(skipped.edges_per_layer[k].edge_ids[i].id,
+                          s.edges_per_layer[k].edge_ids[i].id);
+            }
+        }
+
+        // nodes_per_layer intact (count + contents per layer).
+        ASSERT_EQ(skipped.nodes_per_layer.size(), s.nodes_per_layer.size());
+        for (size_t k = 0; k < s.nodes_per_layer.size(); ++k) {
+            ASSERT_EQ(skipped.nodes_per_layer[k].size(),
+                      s.nodes_per_layer[k].size());
+            for (size_t i = 0; i < s.nodes_per_layer[k].size(); ++i) {
+                EXPECT_EQ(skipped.nodes_per_layer[k][i].id,
+                          s.nodes_per_layer[k][i].id);
+            }
+        }
+
+        // all_unique_nodes intact.
+        ASSERT_EQ(skipped.all_unique_nodes.size(), s.all_unique_nodes.size());
+        for (size_t i = 0; i < s.all_unique_nodes.size(); ++i) {
+            EXPECT_EQ(skipped.all_unique_nodes[i].id, s.all_unique_nodes[i].id);
+        }
+    }
+
+    // Default args (skip_edges defaults to false): edges fully round-trip,
+    // proving the new param does not regress the normal read path.
+    {
+        std::stringstream in(bytes);
+        auto full = GraphSample::deserialize(in);
+        ASSERT_EQ(full.edges_per_layer.size(), s.edges_per_layer.size());
+        for (size_t k = 0; k < s.edges_per_layer.size(); ++k) {
+            EXPECT_EQ(full.edges_per_layer[k].src_indices,
+                      s.edges_per_layer[k].src_indices);
+            EXPECT_EQ(full.edges_per_layer[k].dst_indices,
+                      s.edges_per_layer[k].dst_indices);
+        }
+    }
+}
+
 TEST(GraphSampleTest, ReadSplitWithoutFullDeserialize) {
     auto s = make_2hop_sample(0, SplitType::TEST);
     std::stringstream ss;

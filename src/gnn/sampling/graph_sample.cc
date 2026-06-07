@@ -192,7 +192,8 @@ void GraphSample::serialize(std::ostream& out) const {
     write_object_id_vector_bulk(out, all_unique_nodes);
 }
 
-GraphSample GraphSample::deserialize(std::istream& in, bool skip_edge_ids) {
+GraphSample GraphSample::deserialize(std::istream& in, bool skip_edge_ids,
+                                     bool skip_edges) {
     // Header validation
     uint32_t magic = read_value<uint32_t>(in);
     if (magic != MAGIC) {
@@ -239,10 +240,20 @@ GraphSample GraphSample::deserialize(std::istream& in, bool skip_edge_ids) {
     sample.edges_per_layer.reserve(num_edge_layers);
     for (uint64_t i = 0; i < num_edge_layers; ++i) {
         LayerEdges edges;
-        edges.src_indices = use_bulk ? read_bulk_vector<int32_t>(in)
-                                     : read_int32_vector(in);
-        edges.dst_indices = use_bulk ? read_bulk_vector<int32_t>(in)
-                                     : read_int32_vector(in);
+        if (skip_edges) {
+            // src/dst supplied by a baked computation-graph block at train time;
+            // seek past both index blocks (leaving src_indices/dst_indices empty).
+            // The on-disk [uint64 count][count*sizeof(int32_t)] layout is identical
+            // across v1/v2/v3, so a single skip_bulk_vector<int32_t> covers all —
+            // do NOT special-case use_bulk (mirrors how skip_edge_ids works).
+            skip_bulk_vector<int32_t>(in);   // src_indices
+            skip_bulk_vector<int32_t>(in);   // dst_indices
+        } else {
+            edges.src_indices = use_bulk ? read_bulk_vector<int32_t>(in)
+                                         : read_int32_vector(in);
+            edges.dst_indices = use_bulk ? read_bulk_vector<int32_t>(in)
+                                         : read_int32_vector(in);
+        }
         if (skip_edge_ids) {
             // edge_ids are unused by the training/embedding read path; seek past
             // the block (leaving edges.edge_ids empty) to ~halve the sample read.

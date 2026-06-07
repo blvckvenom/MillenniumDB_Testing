@@ -227,6 +227,18 @@ public:
      */
     void set_skip_edge_ids_on_read(bool enable);
 
+    /**
+     * @brief Skip the per-layer src/dst edge index blocks when deserializing.
+     *
+     * When set, read_sample deserializes WITHOUT the per-layer src/dst edge
+     * indices — used when baked blocks supply the edge structure. Off by
+     * default. Affects only reads from THIS storage. Caller MUST supply the
+     * edge structure from another source (a baked computation-graph block) when
+     * enabled; otherwise the assembled graph is edgeless (src/dst left empty)
+     * and training silently produces wrong results.
+     */
+    void set_skip_edges_on_read(bool enable);
+
     struct SampleCacheStats {
         uint64_t hits = 0;        ///< read_sample served from the RAM cache
         uint64_t misses = 0;      ///< read_sample fell through to disk

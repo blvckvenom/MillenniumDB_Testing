@@ -169,6 +169,10 @@ struct SampleStorage::Impl {
     // blocks (seeks past them) — ~halves the per-batch sample read I/O. Enabled
     // by the training path, which never consumes sample edge_ids.
     bool   skip_edge_ids_ = false;
+    // When set, read_sample_impl deserializes WITHOUT the per-layer src/dst edge
+    // index blocks (seeks past them) — used when baked blocks supply the edge
+    // structure at train time. Enabled by the training path in that case.
+    bool   skip_edges_ = false;
     std::unordered_map<uint64_t, CacheEntry> sample_cache_;
     std::list<uint64_t> cache_lru_;  // front = most recently used
     uint64_t cache_hits_ = 0;
@@ -483,7 +487,7 @@ struct SampleStorage::Impl {
         {
             const char* base = static_cast<const char*>(data_mmap_ptr_);
             MmapIStream stream(base + offset, size);
-            sample = GraphSample::deserialize(stream, skip_edge_ids_);
+            sample = GraphSample::deserialize(stream, skip_edge_ids_, skip_edges_);
             // Fix #22: release this region of batches.dat from the page cache.
             // The MmapStreamBuf wraps a const-pointer view; the underlying memory
             // is read-only, so the cast away const is safe (madvise doesn't write).
@@ -496,7 +500,7 @@ struct SampleStorage::Impl {
                 throw std::runtime_error("Failed to open batch data file");
             }
             data_in.seekg(offset);
-            sample = GraphSample::deserialize(data_in, skip_edge_ids_);
+            sample = GraphSample::deserialize(data_in, skip_edge_ids_, skip_edges_);
 
             // Fix #22: tell the kernel we're done with [offset, offset+size).
             // ifstream doesn't expose its underlying fd, so we open a brief
@@ -742,6 +746,10 @@ GraphSample SampleStorage::read_sample(uint64_t batch_id) {
 
 void SampleStorage::set_skip_edge_ids_on_read(bool enable) {
     impl_->skip_edge_ids_ = enable;
+}
+
+void SampleStorage::set_skip_edges_on_read(bool enable) {
+    impl_->skip_edges_ = enable;
 }
 
 void SampleStorage::set_sample_cache_budget_bytes(size_t budget_bytes) {

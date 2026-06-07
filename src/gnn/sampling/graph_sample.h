@@ -330,10 +330,16 @@ struct GraphSample {
      *        src_indices/dst_indices are), so skipping them roughly halves the
      *        per-batch sample read I/O. Default false preserves a full,
      *        round-trippable deserialize for every other caller.
+     * @param skip_edges When true, the per-layer src_indices + dst_indices blocks
+     *        are seeked past (leaving those vectors empty); used when a baked
+     *        computation-graph block supplies the edge structure at train time.
+     *        Caller MUST supply that edge structure from another source when
+     *        enabled, or the assembled graph is edgeless and training is wrong.
      * @return Deserialized GraphSample
      * @throws std::runtime_error on read failure or invalid format
      */
-    static GraphSample deserialize(std::istream& in, bool skip_edge_ids = false);
+    static GraphSample deserialize(std::istream& in, bool skip_edge_ids = false,
+                                   bool skip_edges = false);
 
     /**
      * @brief Read only the split field from a serialized GraphSample.
