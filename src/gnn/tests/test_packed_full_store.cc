@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "gnn/storage/packed_full_format.h"
 #include "gnn/storage/packed_full_store.h"
+#include "gnn/storage/feature_matrix.h"
 #include <filesystem>
 #include <vector>
 using namespace mdb::gnn;
@@ -95,4 +96,48 @@ TEST(PackedFullStore, ZeroNodeBatch) {
     EXPECT_EQ(e1.offset % PackedFullHeader::ALIGNMENT, 0u);
     std::vector<float> got(D);
     r->read_payload_for_test(1, got.data()); EXPECT_EQ(got, b1);
+}
+
+TEST(PackedFullStore, PayloadEqualsRowGather) {
+    auto tmp = std::filesystem::temp_directory_path() / "pf_gather";
+    std::filesystem::remove_all(tmp); std::filesystem::create_directories(tmp);
+
+    // Source FeatureMatrix: N=6 nodes, D=4 float32, row r = {r*10+0, r*10+1, r*10+2, r*10+3}.
+    const uint64_t N = 6, D = 4;
+    std::vector<float> src(N * D);
+    for (uint64_t r = 0; r < N; ++r)
+        for (uint64_t c = 0; c < D; ++c)
+            src[r * D + c] = static_cast<float>(r * 10 + c);
+    auto fmat_path = tmp / "src.fmat";
+    FeatureMatrix::create(fmat_path, N, D, GnnDtype::FLOAT32, src.data());
+    auto fm = FeatureMatrix::open(fmat_path);
+
+    // A fake "all_unique_nodes order": rows 5,0,3,1 (4 nodes), arbitrary order.
+    std::vector<uint64_t> rows = {5, 0, 3, 1};
+    const uint64_t row_bytes = fm.row_bytes();           // D * sizeof(float)
+    std::vector<char> expected(rows.size() * row_bytes);
+    fm.extract_rows(rows, expected.data());              // the row-gather output
+
+    // Write the SAME gather through the packed-full writer.
+    PackedFullWriter w(tmp / "packed_full", /*store_fp=*/0xC0FFEEull,
+                       static_cast<uint32_t>(fm.num_cols()),
+                       static_cast<uint32_t>(fm.dtype()), row_bytes);
+    w.write_batch(0, expected.data(), rows.size());
+    w.finalize();
+
+    // Read it back and assert byte-for-byte equality with the row-gather.
+    auto r = PackedFullReader::open(tmp / "packed_full", /*expected_store_fp=*/0xC0FFEEull);
+    ASSERT_TRUE(r.has_value());
+    auto e0 = r->entry(0);
+    EXPECT_EQ(e0.num_nodes, rows.size());
+    EXPECT_EQ(e0.length, rows.size() * row_bytes);
+    std::vector<char> got(rows.size() * row_bytes);
+    r->read_payload_for_test(0, got.data());
+    EXPECT_EQ(got, expected);   // packed_full payload == row-gather, bit-identical
+
+    // And spot-check the actual float values match the source rows in order.
+    const float* gf = reinterpret_cast<const float*>(got.data());
+    for (size_t i = 0; i < rows.size(); ++i)
+        for (uint64_t c = 0; c < D; ++c)
+            EXPECT_FLOAT_EQ(gf[i * D + c], src[rows[i] * D + c]);
 }
