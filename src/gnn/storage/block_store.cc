@@ -74,12 +74,13 @@ void BlockWriter::write(const std::filesystem::path& path, uint64_t sample_fp, u
     fsync_directory(path);
 }
 
-std::optional<LoadedBlock> BlockReader::open(const std::filesystem::path& path, uint64_t expected_sample_fp) {
-    std::ifstream is(path, std::ios::binary);
-    if (!is) return std::nullopt;
-    BlockBatchHeader h{};
-    is.read(reinterpret_cast<char*>(&h), sizeof(h));
-    if (!is || !h.is_valid() || h.sample_fp != expected_sample_fp) return std::nullopt;
+namespace {
+// Shared body read for open() / open_self_contained(): given an ifstream
+// positioned right after a validated 64-byte header, decode active_sizes, the
+// per-conv-layer edge tensors (int32 on disk, widened to int64), and the v2
+// seed_ids tail. Populates the v2 header-derived fields from `h`. Returns
+// nullopt on any short read so a torn/truncated block falls back to online.
+std::optional<LoadedBlock> read_block_body(std::ifstream& is, const BlockBatchHeader& h) {
     const uint32_t K = h.num_layers;
     LoadedBlock out;
     // v2 self-contained header fields (0 for legacy v1 / non-self-contained v2 blocks).
@@ -109,6 +110,34 @@ std::optional<LoadedBlock> BlockReader::open(const std::filesystem::path& path, 
         if (!is) return std::nullopt;  // short read on the seed tail
     }
     return out;
+}
+} // namespace
+
+std::optional<LoadedBlock> BlockReader::open(const std::filesystem::path& path, uint64_t expected_sample_fp) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return std::nullopt;
+    BlockBatchHeader h{};
+    is.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!is || !h.is_valid() || h.sample_fp != expected_sample_fp) return std::nullopt;
+    return read_block_body(is, h);
+}
+
+std::optional<LoadedBlock> BlockReader::open_self_contained(
+    const std::filesystem::path& path, uint64_t expected_store_fp) {
+    // Validate via the STORE fingerprint, not the per-batch sample_fp. The block
+    // must be self-contained (version>=2 && store_fp!=0) and its store_fp must
+    // match the caller's catalog fingerprint; a 0 expected_store_fp is rejected
+    // (UNKNOWN provenance must never adopt a block silently).
+    if (expected_store_fp == 0) return std::nullopt;
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return std::nullopt;
+    BlockBatchHeader h{};
+    is.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!is || !h.is_valid() || !h.is_self_contained()
+        || h.store_fp != expected_store_fp) {
+        return std::nullopt;
+    }
+    return read_block_body(is, h);
 }
 
 bool BlockReader::is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp) {

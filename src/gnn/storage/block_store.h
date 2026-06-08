@@ -44,6 +44,17 @@ struct BlockReader {
     // present; for a legacy v1 block they stay 0 / empty.
     static std::optional<LoadedBlock> open(const std::filesystem::path& path, uint64_t expected_sample_fp);
 
+    // SC-3 self-contained open: validates via the STORE fingerprint
+    // (catalog.sample_content_fp), NOT the per-batch sample_fp. Returns nullopt
+    // unless the header is valid AND self-contained (version>=2 && store_fp!=0)
+    // AND h.store_fp == expected_store_fp AND expected_store_fp != 0. On match
+    // reads the full body exactly like open() (active_sizes, edge tensors widened
+    // int32->int64) plus the seed_ids tail, and populates num_unique_nodes /
+    // split / store_fp / seed_ids. Used by the train-time self-contained fast
+    // path to build a minimal sample WITHOUT reading batches.dat.
+    static std::optional<LoadedBlock> open_self_contained(
+        const std::filesystem::path& path, uint64_t expected_store_fp);
+
     // Cheap freshness check: reads ONLY the 64-byte header and returns true iff
     // magic+version valid AND sample_fp == expected. Does NOT read the body.
     // For the bake-skip decision; a torn block (header ok, body truncated) is

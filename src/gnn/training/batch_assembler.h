@@ -228,6 +228,29 @@ private:
     void init_blocks_();
 
     /**
+     * @brief SC-3: try to assemble batch @p batch_id WITHOUT reading batches.dat.
+     *
+     * Reads ONLY the baked self-contained block (active_sizes + edge_index +
+     * num_unique_nodes + seeds + split) and builds a MINIMAL GraphSample whose
+     * all_unique_nodes is a placeholder of the right SIZE — sufficient for the
+     * v2 (addr_table) feature gather, which keys off the count + batch_id and
+     * never reads node CONTENTS.
+     *
+     * Returns true iff the MiniBatch is fully + correctly populated (in which
+     * case @p mini.timing.sample_read_ns == 0 — batches.dat was never touched).
+     * Returns false to request the caller fall back to the legacy real-sample
+     * path, which is always correct. THE LOAD-BEARING SAFETY NET: after
+     * load_features on the placeholder, we check feature_store_->
+     * last_used_addr_tables(); if v2 did NOT serve (addr_table stale/absent ->
+     * silent legacy v1 gather which DOES read node contents), the placeholder
+     * features would be WRONG, so we discard and return false. A placeholder
+     * MiniBatch is therefore NEVER returned with v1-gathered features.
+     *
+     * Only ever invoked when self_contained_mode_ is true.
+     */
+    bool try_assemble_self_contained_(uint64_t batch_id, MiniBatch& mini);
+
+    /**
      * @brief Output bundle from build_active_indices.
      *
      * Relocated to mdb::gnn::graph_block (graph_block_builder.h) so the offline
@@ -325,6 +348,23 @@ private:
     // assembler (the first stale/missing batch), not once per batch per epoch.
     std::atomic<bool> block_fallback_warned_{false};
 
+    // --- SC-3: self-contained-block train mode ---
+    // When true, assemble(batch_id) reads ONLY the baked self-contained block
+    // (active_sizes + edge_index + num_unique_nodes + seeds + split) and SKIPS
+    // deserializing batches.dat (the dominant per-epoch cost). Eligibility
+    // (set once in init_blocks_): use_blocks_ && !nested_aggregation_ &&
+    // feature_store_ != nullptr && catalog.sample_content_fp != 0 &&
+    // addr_tables/ present && batch-0 block store_fp == catalog fingerprint, and
+    // not forced off by MDB_GNN_NO_BLOCKS / MDB_GNN_NO_SELF_CONTAINED. When
+    // false, assemble() takes the existing real-sample path verbatim (OFF path
+    // byte-identical). store_fp_ is the validated store fingerprint reused for
+    // every per-batch open_self_contained.
+    bool     self_contained_mode_ = false;
+    uint64_t store_fp_            = 0;
+    // Warn-once latch for the self-contained per-batch fallback (missing/stale
+    // block, or v2 not served) so the cerr line is emitted at most once.
+    std::atomic<bool> self_contained_fallback_warned_{false};
+
     // --- Structural per-batch cache (see set_struct_cache_budget_bytes) ---
     // Holds everything assemble_from_sample produces EXCEPT features (which are
     // re-loaded each epoch). Tensors are CPU + refcounted, so a cache hit shares
@@ -339,6 +379,12 @@ private:
         uint64_t                   num_seeds = 0;
         uint64_t                   num_nodes = 0;
         uint64_t                   num_labeled = 0;
+        // SC-3: the batch's SplitType (as the SplitType ordinal). Cached so the
+        // self-contained hit path can restore mini.split without reopening the
+        // block header. (The real-sample hit path still restores split from
+        // sample.split — it has the live sample; c.split exists for the
+        // self-contained path, which has no live sample to read it from.)
+        uint32_t                   split = 0;
     };
     struct StructCacheEntry {
         CachedStruct s;

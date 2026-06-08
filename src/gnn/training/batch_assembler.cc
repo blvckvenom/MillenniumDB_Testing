@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -75,6 +76,63 @@ void BatchAssembler::init_blocks_() {
     blocks_dir_ = samples_.get_path() / "blocks";
     // Detected here; consumed only when also !nested_aggregation_ at use time.
     use_blocks_ = std::filesystem::exists(blocks_dir_, ec);
+
+    // ------------------------------------------------------------------
+    // SC-3: decide self-contained-block train mode (skip batches.dat).
+    //
+    // Eligible only when baked blocks exist, aggregation is the legacy per-hop
+    // wiring the blocks were baked with, and features route through the
+    // FourLevelStore (the v2 addr_table path — the ONLY gather safe with a
+    // placeholder all_unique_nodes). We additionally verify, header-only:
+    //   - the sample catalog carries a non-UNKNOWN content fingerprint,
+    //   - an addr_tables/ directory is present (the v2 path needs it), and
+    //   - batch 0's block is self-contained with store_fp == catalog fingerprint.
+    // Any mismatch leaves self_contained_mode_ false -> assemble() takes the
+    // existing real-sample path, byte-identical to today.
+    //
+    // Two env toggles drive the SC-5 same-session A/B:
+    //   MDB_GNN_NO_BLOCKS=1        -> force fully-online (no blocks at all).
+    //   MDB_GNN_NO_SELF_CONTAINED=1-> force Option-A per-batch blocks (still
+    //                                 reads batches.dat in assemble_from_sample).
+    // CAVEAT: both toggles are read INSIDE the `feature_store_ != nullptr`
+    // eligibility block below, so they affect ONLY the FourLevelStore ctor path
+    // (the measured config). On the FeatureMatrix-fallback ctor (feature_store_
+    // == nullptr) the block is skipped entirely, so MDB_GNN_NO_BLOCKS does NOT
+    // disable Option-A block consumption there — that path is not a measured
+    // configuration and self-contained mode never applies to it anyway.
+    // ------------------------------------------------------------------
+    self_contained_mode_ = false;
+    store_fp_            = 0;
+    const char* sc_mode_label = "online";
+    if (use_blocks_) sc_mode_label = "Option-A blocks";
+
+    if (use_blocks_ && !nested_aggregation_ && feature_store_ != nullptr) {
+        const char* nb  = std::getenv("MDB_GNN_NO_BLOCKS");
+        const char* nsc = std::getenv("MDB_GNN_NO_SELF_CONTAINED");
+        if (nb && std::string(nb) == "1") {
+            use_blocks_   = false;          // fully-online
+            sc_mode_label = "online";
+        } else if (!(nsc && std::string(nsc) == "1")) {
+            uint64_t catalog_fp = samples_.get_catalog().sample_content_fp;
+            bool addr_present =
+                std::filesystem::exists(samples_.get_path() / "addr_tables", ec);
+            if (catalog_fp != 0 && addr_present) {
+                // Header-only peek of batch 0's block store fingerprint.
+                uint64_t b0 = BlockReader::read_store_fp(
+                    block_filename(blocks_dir_, 0));
+                if (b0 != 0 && b0 == catalog_fp) {
+                    self_contained_mode_ = true;
+                    store_fp_            = catalog_fp;
+                    sc_mode_label        = "self-contained";
+                }
+            }
+        }
+        // else MDB_GNN_NO_SELF_CONTAINED=1: stays Option-A (use_blocks_ true,
+        // self_contained_mode_ false) -> assemble_from_sample consumes per-batch
+        // blocks but still reads batches.dat.
+    }
+
+    std::cerr << "[BatchAssembler] feature-load mode: " << sc_mode_label << "\n";
 }
 
 // =============================================================================
@@ -97,6 +155,15 @@ size_t estimate_struct_bytes(const std::vector<torch::Tensor>& edges,
 } // namespace
 
 MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
+    // SC-3: self-contained fast path — read ONLY the baked block, never
+    // batches.dat. Returns true on success; false requests the legacy
+    // real-sample path below (always correct). See try_assemble_self_contained_.
+    if (self_contained_mode_) {
+        MiniBatch m;
+        if (try_assemble_self_contained_(batch_id, m)) return m;
+        // else: fall through to the unchanged real-sample path.
+    }
+
     auto t0 = std::chrono::steady_clock::now();
     GraphSample sample = samples_.read_sample(batch_id);
     auto t1 = std::chrono::steady_clock::now();
@@ -177,6 +244,7 @@ MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
                 c.num_seeds                = mini.num_seeds;
                 c.num_nodes                = mini.num_nodes;
                 c.num_labeled              = mini.num_labeled;
+                c.split                    = static_cast<uint32_t>(mini.split);
                 struct_lru_.push_front(batch_id);
                 struct_cache_.emplace(
                     batch_id, StructCacheEntry{std::move(c), struct_lru_.begin(), sz});
@@ -185,6 +253,231 @@ MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
         }
     }
     return mini;
+}
+
+// =============================================================================
+// Private: try_assemble_self_contained_ (SC-3 fast path — never reads batches.dat)
+// =============================================================================
+
+bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& mini) {
+    // ---- Fast path A: structural-cache hit (cross-epoch) ----------------
+    // The structural bundle (edges/active/labels) is identical every epoch, so
+    // on a hit we reuse it and only re-run the (cheap) v2 feature gather. We
+    // still build a minimal placeholder sample for that gather.
+    {
+        bool hit = false;
+        CachedStruct c;
+        if (struct_budget_ > 0) {
+            std::lock_guard<std::mutex> lk(struct_mu_);
+            auto it = struct_cache_.find(batch_id);
+            if (it != struct_cache_.end()) {
+                ++struct_hits_;
+                struct_lru_.splice(struct_lru_.begin(), struct_lru_, it->second.lru_it);
+                c   = it->second.s;   // refcounted tensors — shares storage
+                hit = true;
+            }
+            // NOTE: we DON'T ++struct_misses_ here; the miss is accounted once
+            // below where the block is actually opened (parity with assemble()'s
+            // single miss-count per batch).
+        }
+
+        if (hit) {
+            mini.batch_id                 = batch_id;
+            mini.split                    = static_cast<SplitType>(c.split);
+            mini.edge_indices             = c.edge_indices;
+            mini.active_indices_per_layer = c.active_indices_per_layer;
+            mini.active_sizes_per_layer   = c.active_sizes_per_layer;
+            mini.labels                   = c.labels;
+            mini.label_mask               = c.label_mask;
+            mini.num_seeds                = c.num_seeds;
+            mini.num_nodes                = c.num_nodes;
+            mini.num_labeled              = c.num_labeled;
+
+            // Minimal placeholder sample for the v2 gather: only the SIZE of
+            // all_unique_nodes and batch_id are consulted by the addr_table
+            // path (verified: load_batch_features_v2_ never reads node contents).
+            GraphSample ms;
+            ms.batch_id = batch_id;
+            ms.split    = mini.split;
+            ms.all_unique_nodes.assign(static_cast<size_t>(c.num_nodes), ObjectId());
+
+            auto tl0 = std::chrono::steady_clock::now();
+            mini.features = load_features(ms);
+            auto tl1 = std::chrono::steady_clock::now();
+
+            // LOAD-BEARING SAFETY NET: if v2 did NOT serve, the dispatcher fell
+            // back to the legacy v1 gather, which reads node CONTENTS — with our
+            // placeholder that yields WRONG features. Discard and fall back to
+            // the real-sample path (always correct).
+            if (!feature_store_->last_used_addr_tables()) {
+                if (!self_contained_fallback_warned_.exchange(true)) {
+                    std::cerr << "[BatchAssembler] self-contained: v2 addr_table "
+                                 "did not serve batch " << batch_id
+                              << " on cache-hit — falling back to real sample "
+                                 "read for this and any other such batches.\n";
+                }
+                return false;
+            }
+            mini.timing.sample_read_ns      = 0;   // batches.dat never read
+            mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
+            mini.timing.used_addr_tables = true;
+            mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
+            return true;
+        }
+    }
+
+    // ---- Fast path B: structural-cache miss — build from the block ------
+    if (struct_budget_ > 0) {
+        std::lock_guard<std::mutex> lk(struct_mu_);
+        ++struct_misses_;
+    }
+
+    auto blk = BlockReader::open_self_contained(
+        block_filename(blocks_dir_, batch_id), store_fp_);
+    if (!blk) {
+        if (!self_contained_fallback_warned_.exchange(true)) {
+            std::cerr << "[BatchAssembler] self-contained: block missing/stale "
+                         "(store_fp mismatch) for batch " << batch_id
+                      << " (blocks_dir=" << blocks_dir_
+                      << ") — falling back to real sample read for this and any "
+                         "other such batches.\n";
+        }
+        return false;
+    }
+
+    mini.batch_id = batch_id;
+    mini.split    = static_cast<SplitType>(blk->split);
+
+    // Minimal sample: only the count + batch_id + split feed the v2 gather; the
+    // seeds (nodes_per_layer[0]) feed the label gather below. Edges come from
+    // the block, NOT from the sample (edges_per_layer left empty).
+    GraphSample ms;
+    ms.batch_id = batch_id;
+    ms.split    = mini.split;
+    ms.all_unique_nodes.assign(static_cast<size_t>(blk->num_unique_nodes), ObjectId());
+    ms.nodes_per_layer.resize(1);
+    ms.nodes_per_layer[0].reserve(blk->seed_ids.size());
+    for (uint64_t id : blk->seed_ids) ms.nodes_per_layer[0].emplace_back(id);
+
+    // Graph from the block — identity-prefix active gather indices (A_k is the
+    // prefix [0, M_k) of all_unique_nodes), baked edges (already int64).
+    mini.active_sizes_per_layer = blk->active_sizes;
+    mini.active_indices_per_layer.clear();
+    mini.active_indices_per_layer.reserve(blk->active_sizes.size());
+    for (int64_t m : blk->active_sizes) {
+        mini.active_indices_per_layer.push_back(torch::arange(m, torch::kInt64));
+    }
+    mini.edge_indices     = blk->edge_indices;
+    mini.timing.active_ns = 0;   // baked offline
+    mini.timing.edge_ns   = 0;   // baked offline
+#ifndef NDEBUG
+    // Identity-prefix bounds (same invariant as assemble_from_sample's block path).
+    for (size_t k = 0;
+         k < mini.edge_indices.size()
+             && (k + 1) < mini.active_sizes_per_layer.size();
+         ++k) {
+        const auto& e = mini.edge_indices[k];
+        if (e.numel() > 0) {
+            assert(e.select(0, 0).max().item<int64_t>()
+                   < mini.active_sizes_per_layer[k + 1]);
+            assert(e.select(0, 1).max().item<int64_t>()
+                   < mini.active_sizes_per_layer[k]);
+        }
+    }
+#endif
+
+    // Labels for seed nodes (layer 0) — identical logic to assemble_from_sample.
+    int64_t num_seeds = static_cast<int64_t>(ms.nodes_per_layer[0].size());
+    mini.num_seeds = static_cast<uint64_t>(num_seeds);
+    mini.num_nodes = blk->num_unique_nodes;
+
+    if (labels_ && num_seeds > 0) {
+        std::vector<uint64_t> seed_row_indices;
+        seed_row_indices.reserve(static_cast<size_t>(num_seeds));
+        for (const auto& oid : ms.nodes_per_layer[0]) {
+            auto row = row_mapping_.find(oid);
+            if (row) {
+                seed_row_indices.push_back(*row);
+            } else {
+                seed_row_indices.push_back(std::numeric_limits<uint64_t>::max());
+            }
+        }
+        mini.labels     = labels_->gather(seed_row_indices);
+        mini.label_mask = (mini.labels != -1);
+    } else {
+        mini.labels     = torch::zeros({num_seeds}, torch::kInt64);
+        mini.label_mask = torch::zeros({num_seeds}, torch::kBool);
+    }
+
+    mini.num_labeled = 0;
+    if (mini.label_mask.numel() > 0) {
+        auto mask_acc = mini.label_mask.accessor<bool, 1>();
+        for (int64_t i = 0; i < mini.label_mask.size(0); ++i) {
+            if (mask_acc[i]) mini.num_labeled++;
+        }
+    }
+
+    // Features via the v2 (addr_table) path on the placeholder sample.
+    auto tl0 = std::chrono::steady_clock::now();
+    mini.features = load_features(ms);
+    auto tl1 = std::chrono::steady_clock::now();
+
+    // LOAD-BEARING SAFETY NET (miss path): same as the hit path — if v2 did NOT
+    // serve, the legacy v1 gather read node contents from our placeholder and
+    // produced WRONG features. Discard and fall back to the real-sample path.
+    if (!feature_store_->last_used_addr_tables()) {
+        if (!self_contained_fallback_warned_.exchange(true)) {
+            std::cerr << "[BatchAssembler] self-contained: v2 addr_table did not "
+                         "serve batch " << batch_id
+                      << " — falling back to real sample read for this and any "
+                         "other such batches.\n";
+        }
+        return false;
+    }
+    mini.timing.sample_read_ns      = 0;   // batches.dat never read
+    mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
+    mini.timing.used_addr_tables = true;
+    mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
+
+    // Cache the structural bundle (same budget/LRU dance as assemble()'s miss).
+    if (struct_budget_ > 0) {
+        std::lock_guard<std::mutex> lk(struct_mu_);
+        if (struct_cache_.find(batch_id) == struct_cache_.end()) {
+            size_t sz = estimate_struct_bytes(mini.edge_indices,
+                                              mini.active_indices_per_layer,
+                                              mini.labels, mini.label_mask);
+            while (struct_bytes_ + sz > struct_budget_ && !struct_lru_.empty()) {
+                uint64_t victim = struct_lru_.back();
+                struct_lru_.pop_back();
+                auto vit = struct_cache_.find(victim);
+                if (vit != struct_cache_.end()) {
+                    struct_bytes_ -= vit->second.bytes;
+                    struct_cache_.erase(vit);
+                    ++struct_evictions_;
+                }
+            }
+            if (sz <= struct_budget_) {
+                CachedStruct c;
+                c.edge_indices             = mini.edge_indices;
+                c.active_indices_per_layer = mini.active_indices_per_layer;
+                c.active_sizes_per_layer   = mini.active_sizes_per_layer;
+                c.labels                   = mini.labels;
+                c.label_mask               = mini.label_mask;
+                c.num_seeds                = mini.num_seeds;
+                c.num_nodes                = mini.num_nodes;
+                c.num_labeled              = mini.num_labeled;
+                c.split                    = static_cast<uint32_t>(mini.split);
+                struct_lru_.push_front(batch_id);
+                struct_cache_.emplace(
+                    batch_id, StructCacheEntry{std::move(c), struct_lru_.begin(), sz});
+                struct_bytes_ += sz;
+            }
+        }
+    }
+
+    return true;
 }
 
 void BatchAssembler::set_struct_cache_budget_bytes(size_t budget_bytes) {

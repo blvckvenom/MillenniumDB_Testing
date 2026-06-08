@@ -198,6 +198,64 @@ TEST(BlockStore, LegacyWriteHasNoSelfContainedFields) {
     EXPECT_TRUE(torch::equal(blk->edge_indices[1], edges[1]));
 }
 
+// ---------------------------------------------------------------------------
+// SC-3: open_self_contained validates via the STORE fingerprint (not per-batch
+// sample_fp) and is the train-time entry point for skipping batches.dat.
+// ---------------------------------------------------------------------------
+
+TEST(BlockStore, OpenSelfContainedMatchesStoreFp) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_sc_open_ok";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {5, 3, 2};                    // K=2 conv layers
+    std::vector<torch::Tensor> edges = {
+        torch::tensor({{0,1,2},{2,2,1}}, torch::kInt64),       // [2,3]
+        torch::tensor({{0},{1}}, torch::kInt64),               // [2,1]
+    };
+    std::vector<uint64_t> seeds = {10, 11, 12};
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges,
+                       /*store_fp=*/0xBEEFull, /*num_unique_nodes=*/50, /*seed_ids=*/seeds,
+                       /*split=*/2);
+    // Correct store_fp -> has_value with all self-contained fields populated.
+    auto blk = BlockReader::open_self_contained(tmp / "b.blk", /*expected_store_fp=*/0xBEEFull);
+    ASSERT_TRUE(blk.has_value());
+    EXPECT_EQ(blk->active_sizes, sizes);
+    ASSERT_EQ(blk->edge_indices.size(), 2u);
+    EXPECT_TRUE(torch::equal(blk->edge_indices[0], edges[0]));
+    EXPECT_TRUE(torch::equal(blk->edge_indices[1], edges[1]));
+    EXPECT_EQ(blk->store_fp, 0xBEEFull);
+    EXPECT_EQ(blk->num_unique_nodes, 50u);
+    EXPECT_EQ(blk->split, 2u);
+    EXPECT_EQ(blk->seed_ids, seeds);
+}
+
+TEST(BlockStore, OpenSelfContainedRejectsWrongOrAbsentFp) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_sc_open_reject";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {2, 1};                       // K=1 conv layer
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    std::vector<uint64_t> seeds = {7, 8};
+
+    // Self-contained block (store_fp != 0).
+    BlockWriter::write(tmp / "sc.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges,
+                       /*store_fp=*/0x1234ull, /*num_unique_nodes=*/9, /*seed_ids=*/seeds,
+                       /*split=*/1);
+    // Wrong store_fp -> nullopt.
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "sc.blk", /*expected=*/0x9999ull).has_value());
+    // expected_store_fp == 0 (UNKNOWN provenance) -> nullopt even though it matches nothing.
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "sc.blk", /*expected=*/0ull).has_value());
+    // Correct store_fp -> accepted.
+    EXPECT_TRUE (BlockReader::open_self_contained(tmp / "sc.blk", /*expected=*/0x1234ull).has_value());
+
+    // A non-self-contained block (legacy 5-arg write, store_fp==0) is rejected
+    // regardless of the expected fp.
+    BlockWriter::write(tmp / "legacy.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges);
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "legacy.blk", /*expected=*/0x1234ull).has_value());
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "legacy.blk", /*expected=*/0ull).has_value());
+
+    // Missing file -> nullopt.
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "missing.blk", /*expected=*/0x1234ull).has_value());
+}
+
 TEST(BlockStore, ReadStoreFpHeaderOnly) {
     auto tmp = std::filesystem::temp_directory_path() / "blk_read_storefp";
     std::filesystem::create_directories(tmp);
