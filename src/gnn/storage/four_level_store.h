@@ -356,6 +356,18 @@ public:
 
     uint64_t feature_dim() const { return feature_dim_; }
 
+    GnnDtype dtype() const { return dtype_; }
+    /// Device the model should train on for this store. Mirrors the v2 gather's
+    /// device decision: CUDA only for a float32 store on a GPU host (the v2
+    /// assembler path), else CPU. Keeps the packed-full TrainingLoop device-probe
+    /// consistent with the 4-tier path across dtypes (packed-full is PS-class
+    /// float32 in practice; this just avoids a CPU/GPU mismatch on other dtypes).
+    torch::Device feature_device() const {
+        return (torch::cuda::is_available() && dtype_ == GnnDtype::FLOAT32)
+                   ? torch::Device(torch::kCUDA)
+                   : torch::Device(torch::kCPU);
+    }
+
     // Phase 0 (2026-05-17) profile instrumentation getters. Each returns the
     // per-tier microseconds captured during the most recent
     // load_batch_features() call. last_rmap_us() is a SUB-counter and its time

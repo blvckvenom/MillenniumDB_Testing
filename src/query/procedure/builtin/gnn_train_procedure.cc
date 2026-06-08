@@ -770,9 +770,11 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         DictOptions block_opts(ctx.get_argument(2));
         auto nb  = block_opts.get_bool("noBlocks");
         auto nsc = block_opts.get_bool("noSelfContained");
-        if (nb.has_value() || nsc.has_value()) {
+        auto npf = block_opts.get_bool("noPackedFull");
+        if (nb.has_value() || nsc.has_value() || npf.has_value()) {
             assembler.set_block_mode_override(nb.value_or(false),
-                                              nsc.value_or(false));
+                                              nsc.value_or(false),
+                                              npf.value_or(false));
         }
     }
 

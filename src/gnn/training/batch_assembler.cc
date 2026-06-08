@@ -6,12 +6,14 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 
 #include "gnn/sampling/sample_fingerprint.h"
 #include "gnn/storage/block_store.h"
+#include "gnn/storage/direct_io_reader.h"
 
 namespace mdb::gnn {
 
@@ -84,14 +86,16 @@ void BatchAssembler::init_blocks_() {
     const char* nsc = std::getenv("MDB_GNN_NO_SELF_CONTAINED");
     const bool env_no_blocks        = (nb  && std::string(nb)  == "1");
     const bool env_no_self_contained = (nsc && std::string(nsc) == "1");
-    apply_block_mode_(env_no_blocks, env_no_self_contained);
+    const char* npf = std::getenv("MDB_GNN_NO_PACKED_FULL");
+    const bool env_no_packed_full = (npf && std::string(npf) == "1");
+    apply_block_mode_(env_no_blocks, env_no_self_contained, env_no_packed_full);
 }
 
 // =============================================================================
 // Private: apply_block_mode_ — shared mode selection (env path + override path)
 // =============================================================================
 
-void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained) {
+void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained, bool no_packed_full) {
     std::error_code ec;
     blocks_dir_ = samples_.get_path() / "blocks";
     // Detected here; consumed only when also !nested_aggregation_ at use time.
@@ -124,6 +128,8 @@ void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained) {
     // ------------------------------------------------------------------
     self_contained_mode_ = false;
     store_fp_            = 0;
+    packed_full_mode_    = false;
+    packed_full_.reset();
     const char* sc_mode_label = "online";
     if (use_blocks_) sc_mode_label = "Option-A blocks";
 
@@ -135,14 +141,31 @@ void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained) {
             uint64_t catalog_fp = samples_.get_catalog().sample_content_fp;
             bool addr_present =
                 std::filesystem::exists(samples_.get_path() / "addr_tables", ec);
-            if (catalog_fp != 0 && addr_present) {
+            // Packed-full probe: features come from the consolidated pack (NO
+            // addr_tables needed). Keyed by the MIXED feature-store fingerprint
+            // (must match build_packed_full_'s cur_fp).
+            std::optional<PackedFullReader> pf;
+            if (!no_packed_full && catalog_fp != 0) {
+                uint64_t pf_fp = mix_feature_store_fingerprint(
+                    catalog_fp, "node_features",
+                    feature_store_->feature_dim(),
+                    static_cast<uint8_t>(feature_store_->dtype()));
+                pf = PackedFullReader::open(samples_.get_path() / "packed_full", pf_fp);
+            }
+            if (catalog_fp != 0 && (addr_present || pf.has_value())) {
                 // Header-only peek of batch 0's block store fingerprint.
                 uint64_t b0 = BlockReader::read_store_fp(
                     block_filename(blocks_dir_, 0));
                 if (b0 != 0 && b0 == catalog_fp) {
                     self_contained_mode_ = true;
                     store_fp_            = catalog_fp;
-                    sc_mode_label        = "self-contained";
+                    if (pf.has_value()) {
+                        packed_full_      = std::move(pf);
+                        packed_full_mode_ = true;
+                        sc_mode_label     = "self-contained+packed-full";
+                    } else {
+                        sc_mode_label     = "self-contained";
+                    }
                 }
             }
         }
@@ -278,6 +301,74 @@ MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
 // Private: try_assemble_self_contained_ (SC-3 fast path — never reads batches.dat)
 // =============================================================================
 
+bool BatchAssembler::load_self_contained_features_(uint64_t batch_id,
+                                                   const GraphSample& ms,
+                                                   MiniBatch& mini) {
+    auto tl0 = std::chrono::steady_clock::now();
+    if (packed_full_mode_) {
+        const auto e = packed_full_->entry(batch_id);
+        // Per-thread O_DIRECT reader: prefetch workers call assemble()
+        // concurrently and DirectIoReader is not thread-safe across its io_uring
+        // rings, so each worker thread owns one reader (amortizes io_uring setup
+        // across batches; keyed by (path, store_fp) so a same-process rebuild of
+        // the pack — which keeps the path but changes the size/fingerprint —
+        // rebuilds the reader instead of serving a stale cached file_size_).
+        static thread_local std::unique_ptr<DirectIoReader> tl_pf_reader;
+        static thread_local std::string tl_pf_path;
+        static thread_local uint64_t tl_pf_fp = 0;
+        const std::string dat = packed_full_->dat_path().string();
+        const uint64_t   fp  = packed_full_->header().store_fp;
+        if (!tl_pf_reader || tl_pf_path != dat || tl_pf_fp != fp) {
+            tl_pf_reader = std::make_unique<DirectIoReader>(packed_full_->dat_path());
+            tl_pf_path   = dat;
+            tl_pf_fp     = fp;
+        }
+        auto res = tl_pf_reader->read_range(e.offset, e.length);
+        torch::ScalarType st = torch::kFloat32;
+        switch (static_cast<GnnDtype>(packed_full_->dtype())) {
+            case GnnDtype::FLOAT32: st = torch::kFloat32; break;
+            case GnnDtype::FLOAT64: st = torch::kFloat64; break;
+            case GnnDtype::INT32:   st = torch::kInt32;   break;
+            case GnnDtype::INT64:   st = torch::kInt64;   break;
+            case GnnDtype::UINT8:   st = torch::kUInt8;   break;
+            case GnnDtype::BOOL:    st = torch::kBool;    break;
+            default:
+                throw std::runtime_error(
+                    "BatchAssembler packed-full: unsupported GnnDtype");
+        }
+        mini.features = torch::from_blob(
+            res.data.get(),
+            {static_cast<int64_t>(e.num_nodes),
+             static_cast<int64_t>(packed_full_->feature_dim())},
+            torch::TensorOptions().dtype(st)
+        ).clone().to(feature_store_->feature_device());
+        auto tl1 = std::chrono::steady_clock::now();
+        mini.timing.sample_read_ns      = 0;
+        mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
+        mini.timing.used_addr_tables    = false;
+        mini.timing.addr_load_ns        = 0;
+        return true;
+    }
+    mini.features = load_features(ms);
+    auto tl1 = std::chrono::steady_clock::now();
+    if (!feature_store_->last_used_addr_tables()) {
+        if (!self_contained_fallback_warned_.exchange(true)) {
+            std::cerr << "[BatchAssembler] self-contained: v2 addr_table did not "
+                         "serve batch " << batch_id
+                      << " — falling back to real sample read for this and any "
+                         "other such batches.\n";
+        }
+        return false;
+    }
+    mini.timing.sample_read_ns      = 0;
+    mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
+    mini.timing.used_addr_tables = true;
+    mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
+    return true;
+}
+
 bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& mini) {
     // ---- Fast path A: structural-cache hit (cross-epoch) ----------------
     // The structural bundle (edges/active/labels) is identical every epoch, so
@@ -320,28 +411,7 @@ bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& 
             ms.split    = mini.split;
             ms.all_unique_nodes.assign(static_cast<size_t>(c.num_nodes), ObjectId());
 
-            auto tl0 = std::chrono::steady_clock::now();
-            mini.features = load_features(ms);
-            auto tl1 = std::chrono::steady_clock::now();
-
-            // LOAD-BEARING SAFETY NET: if v2 did NOT serve, the dispatcher fell
-            // back to the legacy v1 gather, which reads node CONTENTS — with our
-            // placeholder that yields WRONG features. Discard and fall back to
-            // the real-sample path (always correct).
-            if (!feature_store_->last_used_addr_tables()) {
-                if (!self_contained_fallback_warned_.exchange(true)) {
-                    std::cerr << "[BatchAssembler] self-contained: v2 addr_table "
-                                 "did not serve batch " << batch_id
-                              << " on cache-hit — falling back to real sample "
-                                 "read for this and any other such batches.\n";
-                }
-                return false;
-            }
-            mini.timing.sample_read_ns      = 0;   // batches.dat never read
-            mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
-            mini.timing.used_addr_tables = true;
-            mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
+            if (!load_self_contained_features_(batch_id, ms, mini)) return false;
             return true;
         }
     }
@@ -437,28 +507,9 @@ bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& 
         }
     }
 
-    // Features via the v2 (addr_table) path on the placeholder sample.
-    auto tl0 = std::chrono::steady_clock::now();
-    mini.features = load_features(ms);
-    auto tl1 = std::chrono::steady_clock::now();
-
-    // LOAD-BEARING SAFETY NET (miss path): same as the hit path — if v2 did NOT
-    // serve, the legacy v1 gather read node contents from our placeholder and
-    // produced WRONG features. Discard and fall back to the real-sample path.
-    if (!feature_store_->last_used_addr_tables()) {
-        if (!self_contained_fallback_warned_.exchange(true)) {
-            std::cerr << "[BatchAssembler] self-contained: v2 addr_table did not "
-                         "serve batch " << batch_id
-                      << " — falling back to real sample read for this and any "
-                         "other such batches.\n";
-        }
-        return false;
-    }
-    mini.timing.sample_read_ns      = 0;   // batches.dat never read
-    mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
-    mini.timing.used_addr_tables = true;
-    mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
+    // Features via packed-full (one O_DIRECT read) or the v2 (addr_table) path
+    // on the placeholder sample.
+    if (!load_self_contained_features_(batch_id, ms, mini)) return false;
 
     // Cache the structural bundle (same budget/LRU dance as assemble()'s miss).
     if (struct_budget_ > 0) {

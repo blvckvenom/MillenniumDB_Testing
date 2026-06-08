@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
+#include "gnn/storage/packed_full_store.h"
 #include "gnn/storage/row_mapping.h"
 #include "gnn/training/graph_block_builder.h"
 #include "gnn/training/label_store.h"
@@ -229,8 +231,8 @@ public:
      *   no_self_contained==true -> Option-A (when blocks are otherwise eligible).
      *   both false              -> self-contained if eligible, else Option-A.
      */
-    void set_block_mode_override(bool no_blocks, bool no_self_contained) {
-        apply_block_mode_(no_blocks, no_self_contained);
+    void set_block_mode_override(bool no_blocks, bool no_self_contained, bool no_packed_full = false) {
+        apply_block_mode_(no_blocks, no_self_contained, no_packed_full);
     }
 
 private:
@@ -262,7 +264,14 @@ private:
      * addr_tables/ present, batch-0 store_fp == catalog fp), and emits the
      * once-style feature-load mode log line.
      */
-    void apply_block_mode_(bool no_blocks, bool no_self_contained);
+    void apply_block_mode_(bool no_blocks, bool no_self_contained, bool no_packed_full);
+
+    /// Load features for a self-contained batch: packed-full (one O_DIRECT read,
+    /// when packed_full_mode_) else the v2 addr_table gather on @p ms. Sets
+    /// mini.features + feature timing. Returns false ONLY when the v2 gather fell
+    /// back to the legacy contents-reading path (caller must fall back to the
+    /// real sample); packed-full always returns true (bit-identical by construction).
+    bool load_self_contained_features_(uint64_t batch_id, const GraphSample& ms, MiniBatch& mini);
 
     /**
      * @brief SC-3: try to assemble batch @p batch_id WITHOUT reading batches.dat.
@@ -398,6 +407,14 @@ private:
     // every per-batch open_self_contained.
     bool     self_contained_mode_ = false;
     uint64_t store_fp_            = 0;
+
+    // --- Packed-full feature store (consume per-batch contiguous [N_b,D] pack) ---
+    // When true, a self-contained batch's features come from a single O_DIRECT
+    // read of <sample_dir>/packed_full/{dat,idx} (keyed by the MIXED feature
+    // fingerprint) instead of the v2 4-tier addr_table gather. Composes with the
+    // self-contained block path (the block still drives graph + seeds + labels).
+    bool packed_full_mode_ = false;
+    std::optional<PackedFullReader> packed_full_;
     // Warn-once latch for the self-contained per-batch fallback (missing/stale
     // block, or v2 not served) so the cerr line is emitted at most once.
     std::atomic<bool> self_contained_fallback_warned_{false};
