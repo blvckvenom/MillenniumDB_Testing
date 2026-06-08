@@ -120,3 +120,91 @@ TEST(BlockStore, BakeMatchesOnlineDerivation) {
     for (size_t k = 0; k < online_edges.size(); ++k)
         EXPECT_TRUE(torch::equal(blk->edge_indices[k], online_edges[k]));
 }
+
+// ---------------------------------------------------------------------------
+// SC-1: v2 self-contained format (store_fp + node count + seeds + split).
+// ---------------------------------------------------------------------------
+
+static_assert(sizeof(BlockBatchHeader) == 64, "v2 block header still 64 B");
+
+TEST(BlockFormat, V2HeaderSelfContained) {
+    auto h = BlockBatchHeader::make_self_contained(/*num_layers=*/3, /*sample_fp=*/0xABull,
+                                                   /*batch_id=*/7, /*store_fp=*/0xCAFEull,
+                                                   /*num_unique_nodes=*/100, /*num_seeds=*/4,
+                                                   /*split=*/1);
+    EXPECT_TRUE(h.is_valid());
+    EXPECT_TRUE(h.is_self_contained());
+    EXPECT_EQ(h.version, 2u);
+    EXPECT_EQ(h.store_fp, 0xCAFEull);
+    EXPECT_EQ(h.num_unique_nodes, 100u);
+    EXPECT_EQ(h.num_seeds, 4u);
+    EXPECT_EQ(h.split, 1u);
+    EXPECT_EQ(h.num_layers, 3u);
+    EXPECT_EQ(h.sample_fp, 0xABull);
+    EXPECT_EQ(h.batch_id, 7u);
+
+    // The plain make() is v2-format but NOT self-contained (store_fp==0).
+    auto h0 = BlockBatchHeader::make(/*num_layers=*/3, /*sample_fp=*/0xABull, /*batch_id=*/7);
+    EXPECT_TRUE(h0.is_valid());
+    EXPECT_FALSE(h0.is_self_contained());
+    EXPECT_EQ(h0.version, 2u);
+    EXPECT_EQ(h0.store_fp, 0u);
+}
+
+TEST(BlockStore, SelfContainedRoundTrip) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_self_rt";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {5, 3, 2};                    // K=2 conv layers
+    std::vector<torch::Tensor> edges = {
+        torch::tensor({{0,1,2},{2,2,1}}, torch::kInt64),       // [2,3]
+        torch::tensor({{0},{1}}, torch::kInt64),               // [2,1]
+    };
+    std::vector<uint64_t> seeds = {10, 11, 12};
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges,
+                       /*store_fp=*/0xBEEFull, /*num_unique_nodes=*/50, /*seed_ids=*/seeds,
+                       /*split=*/2);
+    auto blk = BlockReader::open(tmp / "b.blk", /*expected_sample_fp=*/0xFEEDull);
+    ASSERT_TRUE(blk.has_value());
+    EXPECT_EQ(blk->active_sizes, sizes);
+    ASSERT_EQ(blk->edge_indices.size(), 2u);
+    EXPECT_TRUE(torch::equal(blk->edge_indices[0], edges[0]));
+    EXPECT_TRUE(torch::equal(blk->edge_indices[1], edges[1]));
+    EXPECT_EQ(blk->store_fp, 0xBEEFull);
+    EXPECT_EQ(blk->num_unique_nodes, 50u);
+    EXPECT_EQ(blk->split, 2u);
+    EXPECT_EQ(blk->seed_ids, seeds);
+}
+
+TEST(BlockStore, LegacyWriteHasNoSelfContainedFields) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_legacy_write";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {5, 3, 2};
+    std::vector<torch::Tensor> edges = {
+        torch::tensor({{0,1,2},{2,2,1}}, torch::kInt64),
+        torch::tensor({{0},{1}}, torch::kInt64),
+    };
+    // OLD 5-arg form: no v2 args -> defaults (store_fp=0, no seeds).
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges);
+    auto blk = BlockReader::open(tmp / "b.blk", /*expected_sample_fp=*/0xFEEDull);
+    ASSERT_TRUE(blk.has_value());
+    // Self-contained fields absent...
+    EXPECT_EQ(blk->store_fp, 0u);
+    EXPECT_EQ(blk->num_unique_nodes, 0u);
+    EXPECT_TRUE(blk->seed_ids.empty());
+    // ...but the computation graph still round-trips intact.
+    EXPECT_EQ(blk->active_sizes, sizes);
+    ASSERT_EQ(blk->edge_indices.size(), 2u);
+    EXPECT_TRUE(torch::equal(blk->edge_indices[0], edges[0]));
+    EXPECT_TRUE(torch::equal(blk->edge_indices[1], edges[1]));
+}
+
+TEST(BlockStore, ReadStoreFpHeaderOnly) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_read_storefp";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {2, 1};                       // K=1 conv layer
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0xABCDull, /*batch_id=*/0, sizes, edges,
+                       /*store_fp=*/0x1234ull);
+    EXPECT_EQ(BlockReader::read_store_fp(tmp / "b.blk"), 0x1234ull);
+    EXPECT_EQ(BlockReader::read_store_fp(tmp / "does_not_exist.blk"), 0u);  // missing -> 0
+}

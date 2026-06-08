@@ -14,12 +14,15 @@ namespace mdb::gnn {
 
 void BlockWriter::write(const std::filesystem::path& path, uint64_t sample_fp, uint64_t batch_id,
                         const std::vector<int64_t>& active_sizes,
-                        const std::vector<torch::Tensor>& edge_indices) {
+                        const std::vector<torch::Tensor>& edge_indices,
+                        uint64_t store_fp, uint64_t num_unique_nodes,
+                        const std::vector<uint64_t>& seed_ids, uint32_t split) {
     const uint32_t K = static_cast<uint32_t>(edge_indices.size());      // conv layers
     // node layers = K+1; active_sizes must have K+1 entries.
     if (active_sizes.size() != static_cast<size_t>(K) + 1)
         throw std::runtime_error("BlockWriter: active_sizes.size() must == edge_indices.size()+1");
-    auto h = BlockBatchHeader::make(K, sample_fp, batch_id);
+    auto h = BlockBatchHeader::make_self_contained(K, sample_fp, batch_id, store_fp,
+                                                   num_unique_nodes, seed_ids.size(), split);
 
     // Atomic write: tmp -> fsync fd -> close -> rename -> fsync parent dir.
     // Mirrors addr_table_writer.cc / four_level_store.cc / model_checkpoint.cc
@@ -43,6 +46,11 @@ void BlockWriter::write(const std::filesystem::path& path, uint64_t sample_fp, u
             auto t = edge_indices[k].to(torch::kInt32).contiguous();        // [2,E_k] int32
             write_all(fd, t.data_ptr<int32_t>(),
                       static_cast<size_t>(t.numel()) * sizeof(int32_t), tmp);
+        }
+        // v2 self-contained tail: seed ObjectId.ids (num_seeds × uint64). Empty for the
+        // default / legacy callers (num_seeds==0) — no seed bytes written in that case.
+        if (!seed_ids.empty()) {
+            write_all(fd, seed_ids.data(), seed_ids.size() * sizeof(uint64_t), tmp);
         }
         if (::fsync(fd) < 0) {
             throw std::runtime_error("BlockWriter: fsync failed on " + tmp
@@ -74,6 +82,10 @@ std::optional<LoadedBlock> BlockReader::open(const std::filesystem::path& path, 
     if (!is || !h.is_valid() || h.sample_fp != expected_sample_fp) return std::nullopt;
     const uint32_t K = h.num_layers;
     LoadedBlock out;
+    // v2 self-contained header fields (0 for legacy v1 / non-self-contained v2 blocks).
+    out.store_fp         = h.store_fp;
+    out.num_unique_nodes = h.num_unique_nodes;
+    out.split            = h.split;
     out.active_sizes.resize(static_cast<size_t>(K) + 1);
     is.read(reinterpret_cast<char*>(out.active_sizes.data()),
             static_cast<std::streamsize>(out.active_sizes.size() * sizeof(int64_t)));
@@ -89,6 +101,13 @@ std::optional<LoadedBlock> BlockReader::open(const std::filesystem::path& path, 
         if (!is) return std::nullopt;
         out.edge_indices.push_back(t32.to(torch::kInt64));   // widen
     }
+    // v2 self-contained tail: num_seeds uint64 seed ids (header.num_seeds==0 for v1).
+    if (h.num_seeds > 0) {
+        out.seed_ids.resize(static_cast<size_t>(h.num_seeds));
+        is.read(reinterpret_cast<char*>(out.seed_ids.data()),
+                static_cast<std::streamsize>(out.seed_ids.size() * sizeof(uint64_t)));
+        if (!is) return std::nullopt;  // short read on the seed tail
+    }
     return out;
 }
 
@@ -99,5 +118,14 @@ bool BlockReader::is_fresh(const std::filesystem::path& path, uint64_t expected_
     is.read(reinterpret_cast<char*>(&h), sizeof(h));
     if (!is) return false;  // short read / open failure
     return h.is_valid() && h.sample_fp == expected_sample_fp;
+}
+
+uint64_t BlockReader::read_store_fp(const std::filesystem::path& path) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return 0;  // open failure
+    BlockBatchHeader h{};
+    is.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!is) return 0;  // short read
+    return h.is_valid() ? h.store_fp : 0;
 }
 } // namespace mdb::gnn
