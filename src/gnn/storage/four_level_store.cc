@@ -274,6 +274,7 @@ void build_addr_tables_(
     bool                                        bake_blocks,
     const fs::path&                             blocks_dir,
     uint64_t&                                   out_blocks_bytes,
+    uint64_t                                    store_fp,
     const std::vector<uint64_t>*                cons_offsets = nullptr,
     const std::vector<uint64_t>*                cons_lengths = nullptr)
 {
@@ -397,8 +398,25 @@ void build_addr_tables_(
                             sample, oid_to_global);
                         auto edges = mdb::gnn::graph_block::build_edge_indices(
                             sample, active);
+                        // SC-2: stamp the v2 self-contained fields so a later
+                        // train run (SC-3) can skip batches.dat. store_fp is the
+                        // store-level staleness key; the rest come from the full
+                        // sample (seeds = nodes_per_layer[0] for label gather).
+                        const uint64_t num_unique_nodes =
+                            sample.all_unique_nodes.size();
+                        std::vector<uint64_t> seed_ids;
+                        if (!sample.nodes_per_layer.empty()) {
+                            const auto& seeds = sample.nodes_per_layer[0];
+                            seed_ids.reserve(seeds.size());
+                            for (const auto& oid : seeds)
+                                seed_ids.push_back(oid.id);
+                        }
+                        const uint32_t split =
+                            static_cast<uint32_t>(sample.split);
                         BlockWriter::write(blk_path, fp, b,
-                                           active.sizes_per_layer, edges);
+                                           active.sizes_per_layer, edges,
+                                           store_fp, num_unique_nodes,
+                                           seed_ids, split);
                         std::error_code sz_ec;
                         auto bsz = fs::file_size(blk_path, sz_ec);
                         if (!sz_ec)
@@ -688,7 +706,8 @@ uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder,
         /*write_addr_tables=*/true,
         bake_blocks,
         blocks_dir,
-        blocks_bytes);
+        blocks_bytes,
+        /*store_fp=*/catalog.sample_content_fp);
 
     if (out_blocks_bytes) *out_blocks_bytes = blocks_bytes;
 
@@ -1427,6 +1446,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
                 /*bake_blocks=*/config.bake_blocks,
                 blocks_dir,
                 result.blocks_bytes,
+                /*store_fp=*/catalog.sample_content_fp,
                 write_consolidated ? &cons_offsets : nullptr,
                 write_consolidated ? &cons_lengths : nullptr);
 
