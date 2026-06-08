@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <list>
 #include <mutex>
 #include <stdexcept>
@@ -192,7 +194,39 @@ public:
     void set_nested_aggregation(bool on) { nested_aggregation_ = on; }
     bool nested_aggregation() const { return nested_aggregation_; }
 
+    // =========================================================================
+    // Baked computation-graph blocks (Task 7) — test seam
+    // =========================================================================
+
+    /**
+     * @brief Test-only override of the baked-blocks directory.
+     *
+     * In production both constructors auto-detect `<sample_dir>/blocks` via
+     * init_blocks_(). This setter lets a unit test point the assembler at a
+     * temporary blocks/ dir it baked itself (the production path is never
+     * exercised by tests because the on-disk SampleStorage they construct has
+     * no blocks/ subdir). Sets use_blocks_ to whether @p dir exists.
+     */
+    void set_blocks_dir_for_test(const std::filesystem::path& dir) {
+        std::error_code ec;
+        blocks_dir_ = dir;
+        use_blocks_ = std::filesystem::exists(dir, ec);
+    }
+
 private:
+    /**
+     * @brief Auto-detect a baked blocks/ directory next to the samples and
+     *        record whether it exists. Called once from each constructor.
+     *
+     * When `<sample_dir>/blocks` exists, assemble_from_sample consumes baked
+     * per-batch blocks (active_sizes + edge_index) instead of rebuilding them
+     * online — guarded additionally by !nested_aggregation_ at use time, and
+     * with per-batch full-hash staleness verification + graceful fallback.
+     * When absent (the default today, since blocks/ won't exist), use_blocks_
+     * stays false and behavior is byte-identical to the online build.
+     */
+    void init_blocks_();
+
     /**
      * @brief Output bundle from build_active_indices.
      *
@@ -278,6 +312,18 @@ private:
     // Nested (DGL-block) edge wiring in build_edge_indices. Default read from
     // env MDB_GNN_NESTED_AGG in the constructor; see set_nested_aggregation().
     bool nested_aggregation_ = false;
+
+    // --- Baked computation-graph blocks (Task 7) ---
+    // use_blocks_ is set by init_blocks_() at construction: true iff a
+    // `<sample_dir>/blocks` directory exists. When true (and not nested at use
+    // time), assemble_from_sample consumes the baked block for the batch — full
+    // active+edge build is skipped, with per-batch full-hash staleness check and
+    // graceful fallback to the online build on any miss/stale block.
+    bool use_blocks_ = false;
+    std::filesystem::path blocks_dir_;   // <sample_dir>/blocks
+    // Warn-once latch so the fallback log line is emitted at most once per
+    // assembler (the first stale/missing batch), not once per batch per epoch.
+    std::atomic<bool> block_fallback_warned_{false};
 
     // --- Structural per-batch cache (see set_struct_cache_budget_bytes) ---
     // Holds everything assemble_from_sample produces EXCEPT features (which are

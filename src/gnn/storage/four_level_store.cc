@@ -243,15 +243,9 @@ fs::path addr_table_filename(const fs::path& addr_tables_dir, uint64_t batch_id)
     return addr_tables_dir / fname;
 }
 
-// Format a baked-block filename for a given batch_id.
-// Mirrors the addr_table naming: "block_%06lu.blk".
-fs::path block_filename(const fs::path& blocks_dir, uint64_t batch_id)
-{
-    char fname[32];
-    std::snprintf(fname, sizeof(fname), "block_%06lu.blk",
-                  static_cast<unsigned long>(batch_id));
-    return blocks_dir / fname;
-}
+// Baked-block filename: use the shared mdb::gnn::block_filename free function
+// (block_store.h) so the train-time consume in batch_assembler.cc derives the
+// exact same name. Previously a local copy lived here.
 
 // ---------------------------------------------------------------------------
 // build_addr_tables_ — Phase 5 of FourLevelStore::build()

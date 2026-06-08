@@ -1,10 +1,16 @@
 #include "gnn/training/batch_assembler.h"
 
+#include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+
+#include "gnn/sampling/sample_fingerprint.h"
+#include "gnn/storage/block_store.h"
 
 namespace mdb::gnn {
 
@@ -39,6 +45,7 @@ BatchAssembler::BatchAssembler(
     , row_mapping_(row_mapping)
 {
     nested_aggregation_ = nested_agg_env_default();
+    init_blocks_();
 }
 
 BatchAssembler::BatchAssembler(
@@ -56,6 +63,18 @@ BatchAssembler::BatchAssembler(
     , row_mapping_(row_mapping)
 {
     nested_aggregation_ = nested_agg_env_default();
+    init_blocks_();
+}
+
+// =============================================================================
+// Private: init_blocks_ — auto-detect baked blocks/ at construction
+// =============================================================================
+
+void BatchAssembler::init_blocks_() {
+    std::error_code ec;
+    blocks_dir_ = samples_.get_path() / "blocks";
+    // Detected here; consumed only when also !nested_aggregation_ at use time.
+    use_blocks_ = std::filesystem::exists(blocks_dir_, ec);
 }
 
 // =============================================================================
@@ -199,32 +218,102 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
     mini.batch_id = sample.batch_id;
     mini.split    = sample.split;
 
-    // Step 1: Build global index map (ObjectId -> position in all_unique_nodes)
-    std::unordered_map<uint64_t, int64_t> oid_to_global;
-    oid_to_global.reserve(sample.all_unique_nodes.size());
-    for (int64_t i = 0; i < static_cast<int64_t>(sample.all_unique_nodes.size()); ++i) {
-        oid_to_global[sample.all_unique_nodes[i].id] = i;
+    // ------------------------------------------------------------------
+    // Task 7: baked computation-graph block fast path.
+    //
+    // When a fresh per-batch block (baked offline in gnn_build_feature_store)
+    // exists and matches this sample's FULL content hash, consume its
+    // active_sizes + edge_indices and SKIP the online build_active_indices +
+    // build_edge_indices work entirely. The block is keyed by the full
+    // compute_batch_content_hash (which includes edges); we keep reading the
+    // full edge-bearing sample, so the train side recomputes that exact hash
+    // to verify the block per-batch, and any stale/missing block falls back
+    // to the online build directly from the same sample (no re-read).
+    //
+    // Gated on !nested_aggregation_ (re-read at use time): blocks are baked
+    // with the legacy per-hop wiring, so a late set_nested_aggregation(true)
+    // must disable block consumption. NO skip_edges is requested (deferred):
+    // the full sample is read so the hash + fallback both work directly.
+    // ------------------------------------------------------------------
+    bool used_block = false;
+    if (use_blocks_ && !nested_aggregation_) {
+        auto blk_path = block_filename(blocks_dir_, sample.batch_id);
+        // Full content hash (sample has edges) — matches the bake's full hash.
+        uint64_t fp = mdb::gnn::compute_batch_content_hash(sample);
+        auto blk = BlockReader::open(blk_path, fp);
+        if (blk) {
+            mini.active_sizes_per_layer = blk->active_sizes;
+            // Reconstruct the identity-prefix active gather indices: A_k is the
+            // prefix [0, M_k) of all_unique_nodes (rebuild_unique_nodes inserts
+            // nodes in layer order), so active_indices_per_layer[k] == arange(M_k).
+            mini.active_indices_per_layer.clear();
+            mini.active_indices_per_layer.reserve(blk->active_sizes.size());
+            for (int64_t m : blk->active_sizes) {
+                mini.active_indices_per_layer.push_back(torch::arange(m, torch::kInt64));
+            }
+            mini.edge_indices     = blk->edge_indices;
+            mini.timing.active_ns = 0;   // baked offline
+            mini.timing.edge_ns   = 0;   // baked offline
+#ifndef NDEBUG
+            // Identity-prefix bounds: for conv layer k, edge_index[k] row 0
+            // (src, in A_{k+1}) must be < M_{k+1}; row 1 (dst, in A_k) < M_k.
+            for (size_t k = 0;
+                 k < mini.edge_indices.size()
+                     && (k + 1) < mini.active_sizes_per_layer.size();
+                 ++k) {
+                const auto& e = mini.edge_indices[k];
+                if (e.numel() > 0) {
+                    assert(e.select(0, 0).max().item<int64_t>()
+                           < mini.active_sizes_per_layer[k + 1]);
+                    assert(e.select(0, 1).max().item<int64_t>()
+                           < mini.active_sizes_per_layer[k]);
+                }
+            }
+#endif
+            used_block = true;
+        } else if (!block_fallback_warned_.exchange(true)) {
+            std::cerr << "[BatchAssembler] block missing/stale for batch "
+                      << sample.batch_id << " (blocks_dir=" << blocks_dir_
+                      << ") — falling back to online build for this and any "
+                         "other stale batches.\n";
+        }
     }
 
-    // Step 2: Build per-layer active-set indices for the active-set-shrinking
-    // model refactor — see plan ~/Desktop/2026-05-14-graphsage-active-set-shrinking-plan.md.
-    // Must precede build_edge_indices so the edge tensors can be remapped from
-    // global positions into local positions within each active set.
-    //
-    // Round 2C (2026-05-15): build_active_indices now also emits a per-layer
-    // ObjectId.id -> local-A_k-index hash table, which build_edge_indices
-    // uses directly to halve the per-edge hash count (one lookup per
-    // endpoint instead of two).
-    auto t_active_start = std::chrono::steady_clock::now();
-    auto active = build_active_indices(sample, oid_to_global);
-    auto t_active_end = std::chrono::steady_clock::now();
-    mini.active_indices_per_layer = std::move(active.indices_per_layer);
-    mini.active_sizes_per_layer   = std::move(active.sizes_per_layer);
-    mini.timing.active_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            t_active_end - t_active_start).count());
+    // `active` carries the oid_to_local / layer_global_pos / identity_prefix
+    // fields build_edge_indices needs; only populated on the online path.
+    ActiveIndicesResult active;
 
-    // Step 3: Load features
+    if (!used_block) {
+        // Step 1: Build global index map (ObjectId -> position in all_unique_nodes)
+        std::unordered_map<uint64_t, int64_t> oid_to_global;
+        oid_to_global.reserve(sample.all_unique_nodes.size());
+        for (int64_t i = 0; i < static_cast<int64_t>(sample.all_unique_nodes.size()); ++i) {
+            oid_to_global[sample.all_unique_nodes[i].id] = i;
+        }
+
+        // Step 2: Build per-layer active-set indices for the active-set-shrinking
+        // model refactor — see plan ~/Desktop/2026-05-14-graphsage-active-set-shrinking-plan.md.
+        // Must precede build_edge_indices so the edge tensors can be remapped from
+        // global positions into local positions within each active set.
+        //
+        // Round 2C (2026-05-15): build_active_indices now also emits a per-layer
+        // ObjectId.id -> local-A_k-index hash table, which build_edge_indices
+        // uses directly to halve the per-edge hash count (one lookup per
+        // endpoint instead of two).
+        auto t_active_start = std::chrono::steady_clock::now();
+        active = build_active_indices(sample, oid_to_global);
+        auto t_active_end = std::chrono::steady_clock::now();
+        // NOTE: only indices_per_layer + sizes_per_layer are moved into mini;
+        // build_edge_indices uses active's OTHER fields (oid_to_local_per_layer,
+        // layer_global_pos, identity_prefix), which are NOT moved — preserved.
+        mini.active_indices_per_layer = std::move(active.indices_per_layer);
+        mini.active_sizes_per_layer   = std::move(active.sizes_per_layer);
+        mini.timing.active_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t_active_end - t_active_start).count());
+    }
+
+    // Step 3: Load features — ALWAYS (both block and online paths need them).
     // Round 2B (2026-05-15): pass the already-deserialized sample so the
     // FourLevelStore path skips re-reading the same ~55 MB sample file.
     auto t_load_start = std::chrono::steady_clock::now();
@@ -244,15 +333,17 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
         mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
     }
 
-    // Step 4: Build edge indices per layer (LOCAL to active sets).
-    auto t_edge_start = std::chrono::steady_clock::now();
-    mini.edge_indices = build_edge_indices(sample, active);
-    auto t_edge_end = std::chrono::steady_clock::now();
-    mini.timing.edge_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            t_edge_end - t_edge_start).count());
+    if (!used_block) {
+        // Step 4: Build edge indices per layer (LOCAL to active sets).
+        auto t_edge_start = std::chrono::steady_clock::now();
+        mini.edge_indices = build_edge_indices(sample, active);
+        auto t_edge_end = std::chrono::steady_clock::now();
+        mini.timing.edge_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t_edge_end - t_edge_start).count());
+    }
 
-    // Step 4: Gather labels for seed nodes (layer 0)
+    // Step 5: Gather labels for seed nodes (layer 0)
     int64_t num_seeds = static_cast<int64_t>(
         sample.nodes_per_layer.empty() ? 0 : sample.nodes_per_layer[0].size()
     );

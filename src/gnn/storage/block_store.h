@@ -1,11 +1,23 @@
 // src/gnn/storage/block_store.h
 #pragma once
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <vector>
 #include <torch/torch.h>
 namespace mdb::gnn {
+
+// Shared baked-block filename helper (DRY across the offline bake in
+// four_level_store.cc and the train-time consume in batch_assembler.cc).
+// Mirrors the addr_table naming convention: "block_%06...blk".
+inline std::filesystem::path block_filename(const std::filesystem::path& dir, uint64_t batch_id) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "block_%06llu.blk",
+                  static_cast<unsigned long long>(batch_id));
+    return dir / buf;
+}
+
 struct LoadedBlock {
     std::vector<int64_t>       active_sizes;   // M_k, K+1 values
     std::vector<torch::Tensor> edge_indices;   // K tensors, each [2,E_k] int64 (widened from int32)

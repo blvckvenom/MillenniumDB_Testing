@@ -10,9 +10,11 @@
 #include "gnn/training/batch_assembler.h"
 #include "gnn/training/label_store.h"
 #include "gnn/training/split_store.h"
+#include "gnn/storage/block_store.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/row_mapping.h"
 #include "gnn/sampling/graph_sample.h"
+#include "gnn/sampling/sample_fingerprint.h"
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/sampling_config.h"
 #include "graph_models/object_id.h"
@@ -742,4 +744,88 @@ TEST_F(BatchAssemblerTest, StructCacheMatchesFreshBuild) {
     // Disable clears.
     assembler.set_struct_cache_budget_bytes(0);
     EXPECT_EQ(assembler.struct_cache_stats().entries, 0u);
+}
+
+// =============================================================================
+// Task 7: baked computation-graph block consumption
+//
+// A baked block (active_sizes + edge_indices), keyed by the sample's FULL
+// content hash, must produce byte-identical edge_indices + active_sizes to the
+// online build, with timing.active_ns/edge_ns zeroed (baked offline). A stale
+// fingerprint must be rejected (graceful fallback to the online build).
+// =============================================================================
+
+TEST_F(BatchAssemblerTest, BlockConsumptionMatchesOnlineBuild) {
+    auto fm  = FeatureMatrix::open(fmat_path_);
+    auto rm  = RowMapping::open(rmap_path_);
+    auto ls  = LabelStore::open(labels_path_);
+    auto ss  = SplitStore::open(splits_path_);
+    auto storage = create_sample_storage();
+
+    GraphSample sample = make_two_layer_sample(0);
+
+    // Reference: pure online build (no blocks/ dir → use_blocks_ stays false).
+    BatchAssembler online(fm, storage, &ls, &ss, rm);
+    MiniBatch ref = online.assemble_from_sample(sample);
+    EXPECT_GT(ref.edge_indices.size(), 0u);
+
+    // Bake a block to a temp dir from the online-built structure.
+    fs::path blocks_dir = gnn_dir_ / "blocks_task7";
+    fs::create_directories(blocks_dir);
+    uint64_t fp = compute_batch_content_hash(sample);
+    BlockWriter::write(block_filename(blocks_dir, sample.batch_id), fp,
+                       sample.batch_id, ref.active_sizes_per_layer,
+                       ref.edge_indices);
+
+    // Point a fresh assembler at the baked block and consume it.
+    BatchAssembler blocked(fm, storage, &ls, &ss, rm);
+    blocked.set_blocks_dir_for_test(blocks_dir);
+    MiniBatch out = blocked.assemble_from_sample(sample);
+
+    // active_sizes identical.
+    EXPECT_EQ(out.active_sizes_per_layer, ref.active_sizes_per_layer);
+
+    // active_indices reconstructed as identity-prefix aranges; identical values.
+    ASSERT_EQ(out.active_indices_per_layer.size(), ref.active_indices_per_layer.size());
+    for (size_t k = 0; k < ref.active_indices_per_layer.size(); ++k) {
+        EXPECT_TRUE(torch::equal(out.active_indices_per_layer[k],
+                                 ref.active_indices_per_layer[k]))
+            << "active_indices mismatch at layer " << k;
+    }
+
+    // edge_indices byte-identical.
+    ASSERT_EQ(out.edge_indices.size(), ref.edge_indices.size());
+    for (size_t k = 0; k < ref.edge_indices.size(); ++k) {
+        EXPECT_TRUE(torch::equal(out.edge_indices[k], ref.edge_indices[k]))
+            << "edge_indices mismatch at layer " << k;
+    }
+
+    // Timings for the baked stages are zeroed.
+    EXPECT_EQ(out.timing.active_ns, 0u);
+    EXPECT_EQ(out.timing.edge_ns, 0u);
+
+    // Labels still produced (always-run step).
+    EXPECT_TRUE(torch::equal(out.labels, ref.labels));
+    EXPECT_TRUE(torch::equal(out.label_mask, ref.label_mask));
+    EXPECT_EQ(out.num_seeds, ref.num_seeds);
+    EXPECT_EQ(out.num_nodes, ref.num_nodes);
+    EXPECT_EQ(out.num_labeled, ref.num_labeled);
+
+    // Stale fingerprint → block rejected → falls back to online build.
+    fs::path stale_dir = gnn_dir_ / "blocks_task7_stale";
+    fs::create_directories(stale_dir);
+    BlockWriter::write(block_filename(stale_dir, sample.batch_id), fp ^ 0xDEADBEEFULL,
+                       sample.batch_id, ref.active_sizes_per_layer,
+                       ref.edge_indices);
+    BatchAssembler stale(fm, storage, &ls, &ss, rm);
+    stale.set_blocks_dir_for_test(stale_dir);
+    MiniBatch fb = stale.assemble_from_sample(sample);
+    // Online fallback produced the same structure (and timed the build → > 0
+    // is plausible but not guaranteed on a fast machine; assert content only).
+    ASSERT_EQ(fb.edge_indices.size(), ref.edge_indices.size());
+    for (size_t k = 0; k < ref.edge_indices.size(); ++k) {
+        EXPECT_TRUE(torch::equal(fb.edge_indices[k], ref.edge_indices[k]))
+            << "fallback edge_indices mismatch at layer " << k;
+    }
+    EXPECT_EQ(fb.active_sizes_per_layer, ref.active_sizes_per_layer);
 }
