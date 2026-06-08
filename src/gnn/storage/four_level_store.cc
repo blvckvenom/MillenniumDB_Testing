@@ -38,6 +38,7 @@
 #include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
 #include "gnn/storage/packed_batch_store.h"
+#include "gnn/storage/packed_full_store.h"
 #include "gnn/storage/consolidated_slim_reader.h"
 #include "gnn/storage/row_mapping.h"
 #include "gnn/sampling/graph_sample.h"
@@ -246,6 +247,63 @@ fs::path addr_table_filename(const fs::path& addr_tables_dir, uint64_t batch_id)
 // Baked-block filename: use the shared mdb::gnn::block_filename free function
 // (block_store.h) so the train-time consume in batch_assembler.cc derives the
 // exact same name. Previously a local copy lived here.
+
+// Packed-full build (additive): gather each batch's all_unique_nodes features
+// from the source fmat into a contiguous [N_b, D] payload (in all_unique_nodes
+// order) and append to <sample_dir>/packed_full/. One sequential gather pass;
+// NO reorder/caches/tiering. Keyed by store_fp (the mixed feature-store fp).
+// Single-threaded v1 (the gather is the cost; measure before parallelizing).
+uint64_t build_packed_full_(SampleStorage& samples, const FeatureMatrix& fm,
+                            const RowMapping& rmap, const fs::path& sample_dir,
+                            uint64_t store_fp, uint64_t total_batches) {
+    const uint64_t D         = fm.num_cols();
+    const uint64_t row_bytes = fm.row_bytes();
+
+    // Disk guard: estimate total packed_full size from batch 0 and refuse early
+    // if it won't fit (suggest deleting the 4-tier to free space).
+    // batch-0 size extrapolation assumes uniform fanout across batches.
+    if (total_batches > 0) {
+        auto s0 = samples.read_sample(0);
+        uint64_t est_per_batch = static_cast<uint64_t>(s0.all_unique_nodes.size()) * row_bytes;
+        uint64_t est_total     = est_per_batch * total_batches;
+        std::error_code sec;
+        auto space = fs::space(sample_dir, sec);
+        if (!sec && space.available < est_total + est_total / 20) {  // +5% margin
+            throw std::runtime_error(
+                "build_packed_full_: insufficient disk for packed_full (need ~" +
+                std::to_string(est_total / (1024ULL * 1024)) + " MiB, have " +
+                std::to_string(space.available / (1024ULL * 1024)) + " MiB free in " +
+                sample_dir.string() + "). Delete the 4-tier (reordered.fmat, "
+                "packed_slim/, addr_tables/) to free space — keep store.meta + blocks/.");
+        }
+    }
+
+    PackedFullWriter w(sample_dir / "packed_full", store_fp,
+                       static_cast<uint32_t>(D), static_cast<uint32_t>(fm.dtype()), row_bytes);
+    std::vector<char> buf;
+    std::vector<uint64_t> rows;
+    for (uint64_t b = 0; b < total_batches; ++b) {
+        auto sample = samples.read_sample(b);
+        const auto& uniq = sample.all_unique_nodes;
+        rows.clear();
+        rows.reserve(uniq.size());
+        for (const auto& oid : uniq) {
+            auto r = rmap.find(oid);
+            if (!r) {
+                throw std::runtime_error(
+                    "build_packed_full_: node not in RowMapping: " + std::to_string(oid.id));
+            }
+            rows.push_back(*r);
+        }
+        buf.resize(rows.size() * row_bytes);
+        fm.extract_rows(rows, buf.data());          // gather in all_unique_nodes order
+        w.write_batch(b, buf.data(), rows.size());
+    }
+    w.finalize();
+    std::error_code ec;
+    auto sz = fs::file_size(sample_dir / "packed_full" / "packed_full.dat", ec);
+    return ec ? 0 : static_cast<uint64_t>(sz);
+}
 
 // ---------------------------------------------------------------------------
 // build_addr_tables_ — Phase 5 of FourLevelStore::build()
@@ -757,6 +815,30 @@ FourLevelStore::BuildResult FourLevelStore::build(
     const uint64_t cur_fp = mix_feature_store_fingerprint(
         catalog.sample_content_fp, feature_name,
         features.num_cols(), static_cast<uint8_t>(features.dtype()));
+
+    // Packed-full build mode (additive, PS-class): a single gather pass over the
+    // source fmat into <sample_dir>/packed_full/, keyed by cur_fp. Writes ONLY
+    // packed_full/; never builds/deletes the 4-tier or blocks/. Requires
+    // store.meta + blocks/ to already exist (a prior bakeBlocks build). The
+    // train-time consumer (BatchAssembler packed-full mode) prefers this pack.
+    if (config.pack_full) {
+        if (cur_fp == 0) {
+            throw std::runtime_error(
+                "packFullFeatures: sample has no content fingerprint (legacy/pre-STEP8 sample); "
+                "the packed-full pack would never be adopted at train. Re-run gnn_offline_sample "
+                "so the sample carries a content fingerprint, then bakeBlocks, then packFullFeatures.");
+        }
+        std::cerr << "[FourLevelStore] packed-full build start (additive)\n";
+        result.packed_full_bytes = build_packed_full_(
+            samples, features, row_mapping, fs::path(sample_dir),
+            cur_fp, catalog.total_batches);
+        std::cerr << "[FourLevelStore] packed-full build done ("
+                  << (result.packed_full_bytes / (1024ULL * 1024)) << " MiB)\n";
+        auto pf_end = std::chrono::high_resolution_clock::now();
+        result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            pf_end - total_start).count();
+        return result;
+    }
 
     // --- Force cleanup ---
     // Fix #15: granular flags let callers preserve specific outputs.

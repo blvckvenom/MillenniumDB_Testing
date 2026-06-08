@@ -106,6 +106,10 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         // reused store requires buildAddrTables (the default) to be on; with
         // buildAddrTables:false + reuse, pass force to bake.
         if (auto v = opts.get_bool("bakeBlocks")) config.bake_blocks = *v;
+        // Task 4: packed-full feature pack (additive). Writes ONLY packed_full/;
+        // never builds/deletes the 4-tier or blocks/. Requires store.meta +
+        // blocks/ from a prior bakeBlocks build. Default OFF.
+        if (auto v = opts.get_bool("packFullFeatures")) config.pack_full = *v;
         // DiskGNN-adoption Plan 1: also emit packed_slim/consolidated.slim during
         // the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF. The
         // runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
@@ -172,7 +176,7 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     // those caches directly; this avoids the FeatureMatrix::open's strict
     // header-size check on the source fmat.
     bool phase5_only_mode =
-        config.build_addr_tables &&
+        config.build_addr_tables && !config.pack_full &&
         !config.force && !config.force_caches && !config.force_reorder &&
         !config.force_packed_slim && !config.force_meta;
     auto store_meta_path = fs::path(db_folder) / "gnn_features" /
@@ -276,6 +280,9 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
               ctx.create_int(bytes_to_mb(result.blocks_bytes)));
     ctx.yield("blocksBuiltOk",
               ctx.create_bool(result.blocks_built_ok));
+    // Task 4: packed-full feature pack telemetry.
+    ctx.yield("packedFullMb",
+              ctx.create_int(bytes_to_mb(result.packed_full_bytes)));
     ctx.yield_row();
 }
 

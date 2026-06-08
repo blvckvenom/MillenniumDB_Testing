@@ -165,6 +165,15 @@ public:
         // when present+fresh.
         bool   bake_blocks = false;
 
+        // Packed-full build mode (additive, PS-class): a single gather pass over
+        // the source fmat into <sample_dir>/packed_full/ (one contiguous
+        // [N_b, D] pack per batch, in all_unique_nodes order). Writes ONLY
+        // packed_full/; never builds or deletes the 4-tier (reordered/caches/
+        // packed_slim/addr_tables) or blocks/. Requires store.meta + blocks/ to
+        // already exist (a prior bakeBlocks build). The train-time consumer
+        // prefers this pack. Default OFF.
+        bool   pack_full = false;
+
         // DiskGNN-adoption Plan 1: also emit a single consolidated cold-feature
         // file (packed_slim/consolidated.slim) during the partitioned L4 pack, so
         // the runtime can serve each batch's cold features with ONE O_DIRECT
@@ -227,6 +236,10 @@ public:
         // blocks_built_ok — true iff block baking completed without error.
         uint64_t blocks_bytes    = 0;
         bool     blocks_built_ok = false;
+
+        // Task 4 (2026-06-08): packed-full feature pack telemetry.
+        // packed_full_bytes — size of packed_full/packed_full.dat (0 if not built).
+        uint64_t packed_full_bytes = 0;
     };
 
     /// Preprocessing: classify nodes by frequency, build caches, re-pack L4 slim.
