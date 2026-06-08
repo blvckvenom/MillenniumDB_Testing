@@ -213,6 +213,26 @@ public:
         use_blocks_ = std::filesystem::exists(dir, ec);
     }
 
+    /**
+     * @brief SC-5a: per-gnn_train-call override of the block-consumption mode.
+     *
+     * Re-runs the SAME eligibility logic as the constructor's env/auto
+     * detection (apply_block_mode_), but with the two booleans supplied by the
+     * caller instead of the MDB_GNN_NO_BLOCKS / MDB_GNN_NO_SELF_CONTAINED env
+     * vars. This lets a same-session A/B/C measurement pick online / Option-A /
+     * self-contained without restarting the server (the env vars are read once
+     * at server start, so they can't vary per call). Because it re-runs the
+     * identical eligibility checks, it can never force self-contained when
+     * ineligible (no blocks / stale store_fp / no addr_tables) — it falls to
+     * Option-A or online, which is correct.
+     *   no_blocks==true         -> online.
+     *   no_self_contained==true -> Option-A (when blocks are otherwise eligible).
+     *   both false              -> self-contained if eligible, else Option-A.
+     */
+    void set_block_mode_override(bool no_blocks, bool no_self_contained) {
+        apply_block_mode_(no_blocks, no_self_contained);
+    }
+
 private:
     /**
      * @brief Auto-detect a baked blocks/ directory next to the samples and
@@ -224,8 +244,25 @@ private:
      * with per-batch full-hash staleness verification + graceful fallback.
      * When absent (the default today, since blocks/ won't exist), use_blocks_
      * stays false and behavior is byte-identical to the online build.
+     *
+     * SC-5a: this now reads the two env toggles into booleans and delegates to
+     * apply_block_mode_ (the shared mode-selection body). With neither env var
+     * set, the result is byte-identical to the pre-SC-5a auto-detection.
      */
     void init_blocks_();
+
+    /**
+     * @brief SC-5a: shared block-mode selection used by both init_blocks_()
+     *        (with env-derived booleans) and set_block_mode_override() (with
+     *        per-call booleans).
+     *
+     * Sets use_blocks_ / self_contained_mode_ / store_fp_ from the two booleans
+     * plus the existing eligibility checks (blocks/ dir presence,
+     * !nested_aggregation_, feature_store_ != nullptr, catalog content fp != 0,
+     * addr_tables/ present, batch-0 store_fp == catalog fp), and emits the
+     * once-style feature-load mode log line.
+     */
+    void apply_block_mode_(bool no_blocks, bool no_self_contained);
 
     /**
      * @brief SC-3: try to assemble batch @p batch_id WITHOUT reading batches.dat.

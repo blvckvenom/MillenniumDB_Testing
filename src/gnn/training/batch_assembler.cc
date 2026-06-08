@@ -72,6 +72,26 @@ BatchAssembler::BatchAssembler(
 // =============================================================================
 
 void BatchAssembler::init_blocks_() {
+    // Read the two SC-5 env toggles once (same as before SC-5a) and delegate the
+    // actual mode selection to apply_block_mode_, which is shared with the
+    // per-call override setter set_block_mode_override(). With neither env var
+    // set (the default), the booleans are both false and the selected flags are
+    // byte-identical to the pre-SC-5a auto-detection.
+    //   MDB_GNN_NO_BLOCKS=1        -> force fully-online (no blocks at all).
+    //   MDB_GNN_NO_SELF_CONTAINED=1-> force Option-A per-batch blocks (still
+    //                                 reads batches.dat in assemble_from_sample).
+    const char* nb  = std::getenv("MDB_GNN_NO_BLOCKS");
+    const char* nsc = std::getenv("MDB_GNN_NO_SELF_CONTAINED");
+    const bool env_no_blocks        = (nb  && std::string(nb)  == "1");
+    const bool env_no_self_contained = (nsc && std::string(nsc) == "1");
+    apply_block_mode_(env_no_blocks, env_no_self_contained);
+}
+
+// =============================================================================
+// Private: apply_block_mode_ — shared mode selection (env path + override path)
+// =============================================================================
+
+void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained) {
     std::error_code ec;
     blocks_dir_ = samples_.get_path() / "blocks";
     // Detected here; consumed only when also !nested_aggregation_ at use time.
@@ -90,15 +110,16 @@ void BatchAssembler::init_blocks_() {
     // Any mismatch leaves self_contained_mode_ false -> assemble() takes the
     // existing real-sample path, byte-identical to today.
     //
-    // Two env toggles drive the SC-5 same-session A/B:
-    //   MDB_GNN_NO_BLOCKS=1        -> force fully-online (no blocks at all).
-    //   MDB_GNN_NO_SELF_CONTAINED=1-> force Option-A per-batch blocks (still
-    //                                 reads batches.dat in assemble_from_sample).
-    // CAVEAT: both toggles are read INSIDE the `feature_store_ != nullptr`
+    // The two booleans drive the SC-5 same-session A/B (from env vars in
+    // init_blocks_, or from the per-call set_block_mode_override() in SC-5a):
+    //   no_blocks==true        -> force fully-online (no blocks at all).
+    //   no_self_contained==true-> force Option-A per-batch blocks (still
+    //                             reads batches.dat in assemble_from_sample).
+    // CAVEAT: both toggles only take effect INSIDE the `feature_store_ != nullptr`
     // eligibility block below, so they affect ONLY the FourLevelStore ctor path
     // (the measured config). On the FeatureMatrix-fallback ctor (feature_store_
-    // == nullptr) the block is skipped entirely, so MDB_GNN_NO_BLOCKS does NOT
-    // disable Option-A block consumption there — that path is not a measured
+    // == nullptr) the block is skipped entirely, so no_blocks does NOT disable
+    // Option-A block consumption there — that path is not a measured
     // configuration and self-contained mode never applies to it anyway.
     // ------------------------------------------------------------------
     self_contained_mode_ = false;
@@ -107,12 +128,10 @@ void BatchAssembler::init_blocks_() {
     if (use_blocks_) sc_mode_label = "Option-A blocks";
 
     if (use_blocks_ && !nested_aggregation_ && feature_store_ != nullptr) {
-        const char* nb  = std::getenv("MDB_GNN_NO_BLOCKS");
-        const char* nsc = std::getenv("MDB_GNN_NO_SELF_CONTAINED");
-        if (nb && std::string(nb) == "1") {
+        if (no_blocks) {
             use_blocks_   = false;          // fully-online
             sc_mode_label = "online";
-        } else if (!(nsc && std::string(nsc) == "1")) {
+        } else if (!no_self_contained) {
             uint64_t catalog_fp = samples_.get_catalog().sample_content_fp;
             bool addr_present =
                 std::filesystem::exists(samples_.get_path() / "addr_tables", ec);
@@ -127,7 +146,7 @@ void BatchAssembler::init_blocks_() {
                 }
             }
         }
-        // else MDB_GNN_NO_SELF_CONTAINED=1: stays Option-A (use_blocks_ true,
+        // else no_self_contained: stays Option-A (use_blocks_ true,
         // self_contained_mode_ false) -> assemble_from_sample consumes per-batch
         // blocks but still reads batches.dat.
     }

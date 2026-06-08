@@ -760,6 +760,22 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     }
     BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
 
+    // SC-5a: per-call override of the block-consumption mode for same-session
+    // A/B/C measurement (online / Option-A / self-contained). The ctor already
+    // ran its env/auto detection; we only override it when the caller explicitly
+    // passed at least one of noBlocks / noSelfContained, so the default path
+    // (neither param) is byte-identical to today. The override re-runs the SAME
+    // eligibility logic, so it can never force an unsafe (unservable) mode.
+    if (ctx.arguments.size() == 3) {
+        DictOptions block_opts(ctx.get_argument(2));
+        auto nb  = block_opts.get_bool("noBlocks");
+        auto nsc = block_opts.get_bool("noSelfContained");
+        if (nb.has_value() || nsc.has_value()) {
+            assembler.set_block_mode_override(nb.value_or(false),
+                                              nsc.value_or(false));
+        }
+    }
+
     // Structural per-batch cache: reuse the index/label build across epochs
     // (the cost model showed build_active_indices + build_edge_indices dominate
     // the assemble worker cost; the feature gather is cheap when L1-resident).
