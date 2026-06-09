@@ -1,6 +1,7 @@
 // src/graph_models/gql/projection/partition_file.cc
 #include "graph_models/gql/projection/partition_file.h"
 
+#include <cerrno>
 #include <cstring>
 #include <stdexcept>
 
@@ -51,7 +52,9 @@ void PartitionFile<N>::flush() {
 }
 
 template<std::size_t N>
-PartitionFile<N>::Reader::Reader(const std::string& path) {
+PartitionFile<N>::Reader::Reader(const std::string& path)
+    : path_(path)
+{
     fp_ = std::fopen(path.c_str(), "rb");
     if (!fp_) {
         eof_ = true;  // absent file == empty partition
@@ -68,6 +71,13 @@ bool PartitionFile<N>::Reader::next(Record<N>& out) {
     if (eof_ || !fp_) return false;
     std::size_t n = std::fread(&out, sizeof(Record<N>), 1, fp_);
     if (n != 1) {
+        // Distinguish a real read failure from a clean EOF — treating an
+        // I/O error as EOF would silently drop the tail of the partition.
+        if (std::ferror(fp_)) {
+            throw std::runtime_error(
+                "PartitionFile: read error on " + path_ + ": "
+                + std::strerror(errno));
+        }
         eof_ = true;
         return false;
     }
@@ -81,7 +91,14 @@ std::size_t PartitionFile<N>::Reader::read_batch(
     if (eof_ || !fp_ || max_records == 0) return 0;
     std::size_t n = std::fread(out, sizeof(Record<N>), max_records, fp_);
     if (n < max_records) {
-        eof_ = true;  // hit EOF or short read
+        // Distinguish a real read failure from a clean EOF — treating an
+        // I/O error as EOF would silently drop the tail of the partition.
+        if (std::ferror(fp_)) {
+            throw std::runtime_error(
+                "PartitionFile: read error on " + path_ + ": "
+                + std::strerror(errno));
+        }
+        eof_ = true;  // hit EOF
     }
     return n;
 }

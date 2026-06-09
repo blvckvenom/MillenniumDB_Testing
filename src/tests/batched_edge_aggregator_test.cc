@@ -16,19 +16,26 @@
 //     hand-rolled std::sort produce the same group structure (sanity
 //     check that the sort step external_edge_sort.h relies on is
 //     equivalent to the simple comparator).
+//   - Aggregated-value packing: SUM/MIN/MAX persist as doubles (fractional
+//     values survive bit-exact); COUNT persists as an integer.
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "graph_models/common/conversions.h"
 #include "graph_models/gql/projection/batched_edge_aggregator.h"
 #include "graph_models/gql/projection/edge_aggregation_record.h"
 #include "graph_models/gql/projection/external_edge_sort.h"
+#include "graph_models/gql/projection/native_projection_builder.h"
+#include "graph_models/object_id.h"
 #include "query/exceptions.h"
+#include "system/system.h"
 
 namespace {
 
@@ -352,6 +359,50 @@ TEST(BatchedEdgeAggregator, RadixVsStdSortGiveIdenticalOutput) {
 
     EXPECT_EQ(out_radix.size(), 25u);
     EXPECT_EQ(out_radix, out_std);
+}
+
+// ----------------------------------------------------------------------
+// Aggregated-value packing: SUM/MIN/MAX results are doubles and must be
+// persisted as doubles. Truncating them to int64 silently corrupts
+// fractional aggregates (SUM of 0.5 + 0.5 stored as 1, MIN of 2.7 stored
+// as 2) and changes the property's type even for whole-number results.
+// COUNT is integral by construction and stays an inlined integer.
+// ----------------------------------------------------------------------
+
+TEST(AggregatedValuePacking, SumMinMaxPersistAsDoublesCountAsInt) {
+    // pack_aggregated_property_value persists doubles through the
+    // string_manager, so bring up a minimal System against a scratch db
+    // folder (same init pattern as the projection_* test mains).
+    const std::string db_dir = "test_db_agg_value_packing";
+    std::filesystem::remove_all(db_dir);
+    System system(db_dir,
+                  1024 * 1024,        // str_static_size
+                  1024 * 1024,        // str_dynamic_size
+                  64 * 1024 * 1024,   // shared_buffer_size
+                  32 * 1024 * 1024,   // private_buffer_size
+                  1024 * 1024,        // tensor_static_size
+                  1024 * 1024,        // tensor_dynamic_size
+                  1);                 // workers
+
+    // SUM of 0.5 + 0.5 must come back as the double 1.0, not the int 1.
+    ObjectId sum_oid = GQL::pack_aggregated_property_value(Aggregation::SUM, 0.5 + 0.5);
+    EXPECT_EQ(sum_oid.get_sub_type(), ObjectId::MASK_DOUBLE);
+    EXPECT_EQ(Common::Conversions::unpack_double(sum_oid), 1.0);
+
+    // MIN of 2.7 must keep its fractional part (int64 truncation gives 2).
+    ObjectId min_oid = GQL::pack_aggregated_property_value(Aggregation::MIN, 2.7);
+    EXPECT_EQ(min_oid.get_sub_type(), ObjectId::MASK_DOUBLE);
+    EXPECT_EQ(Common::Conversions::unpack_double(min_oid), 2.7);
+
+    // MAX with a negative fractional value round-trips bit-exact too.
+    ObjectId max_oid = GQL::pack_aggregated_property_value(Aggregation::MAX, -0.25);
+    EXPECT_EQ(max_oid.get_sub_type(), ObjectId::MASK_DOUBLE);
+    EXPECT_EQ(Common::Conversions::unpack_double(max_oid), -0.25);
+
+    // COUNT stays an integer.
+    ObjectId cnt_oid = GQL::pack_aggregated_property_value(Aggregation::COUNT, 3.0);
+    EXPECT_EQ(cnt_oid.get_type(), ObjectId::MASK_POSITIVE_INT);
+    EXPECT_EQ(Common::Conversions::unpack_int(cnt_oid), 3);
 }
 
 } // namespace

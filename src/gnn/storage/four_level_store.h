@@ -308,7 +308,14 @@ public:
     /// Round 2B (2026-05-15): Load batch features given an already-deserialized
     /// GraphSample. Avoids re-reading + re-parsing the sample when the caller
     /// (e.g., BatchAssembler::assemble_from_sample) already has it in hand.
-    torch::Tensor load_batch_features(const GraphSample& sample);
+    ///
+    /// out_used_v2 (optional): receives whether THIS call was served by the v2
+    /// (addr_table) path. Unlike last_used_addr_tables(), this per-call outcome
+    /// cannot be overwritten by a concurrent prefetch worker, so any
+    /// correctness decision (e.g., BatchAssembler's self-contained placeholder
+    /// safety net) must consume it instead of the shared flag.
+    torch::Tensor load_batch_features(const GraphSample& sample,
+                                      bool* out_used_v2 = nullptr);
 
     struct Stats {
         // Per-tier node-count counters (existing).
@@ -387,7 +394,10 @@ public:
     // last_addr_load_us() — microseconds to open + parse the addr_table sidecar
     //   for the most recent batch. 0 if the v2 path was not taken.
     // last_used_addr_tables() — whether the most recent load_batch_features
-    //   was served by the v2 (addr_table) path.
+    //   was served by the v2 (addr_table) path. TELEMETRY-ONLY / APPROXIMATE:
+    //   the flag is shared across prefetch workers, so under N>1 it reflects
+    //   whichever call finished last, not necessarily the caller's own. For a
+    //   per-call answer, pass `out_used_v2` to load_batch_features instead.
     uint64_t last_addr_load_us() const { return last_addr_load_ns_.load() / 1000; }
     bool last_used_addr_tables() const { return last_used_v2_.load(); }
 
@@ -506,6 +516,9 @@ private:
     // Per-call v2 telemetry:
     //   last_addr_load_ns_ — nanoseconds to open + parse the addr sidecar.
     //   last_used_v2_      — true if the most recent batch went through v2.
+    //                        Shared across workers (telemetry-only); the
+    //                        authoritative per-call outcome is reported via
+    //                        load_batch_features' out_used_v2 out-param.
     bool                  use_addr_tables_    = false;
     uint64_t              expected_meta_sha_head_ = 0;
     std::filesystem::path sample_dir_;

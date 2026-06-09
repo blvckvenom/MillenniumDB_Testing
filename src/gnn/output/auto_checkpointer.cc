@@ -32,7 +32,13 @@ void AutoCheckpointer::on_epoch_end(const TrainingLoop::EpochEvent& e)
 {
     if (!policy_.save_on_best_val) return;
 
-    if (e.val_accuracy > best_val_seen_) {
+    // Trust the loop's improvement flag: TrainingLoop computes is_best
+    // against a best-so-far tracker seeded with Config::start_best_val
+    // (the resumed checkpoint's best_val_accuracy), so it stays correct
+    // across resumeFrom continuations. A local comparison starting at 0.0
+    // would treat the first post-resume epoch as a new best and overwrite
+    // best_model with a worse model.
+    if (e.is_best) {
         best_val_seen_ = e.val_accuracy;
 
         TrainingState s          = base_state_;

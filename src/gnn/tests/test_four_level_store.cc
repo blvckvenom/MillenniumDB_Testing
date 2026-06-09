@@ -1243,6 +1243,72 @@ TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4WithReorder) {
 }
 
 // =============================================================================
+// Per-call v2 dispatch outcome: load_batch_features reports which path served
+// THIS call through the out-param. The shared last_used_addr_tables() flag is
+// telemetry-only (any other call may overwrite it); the out-param is what the
+// BatchAssembler self-contained safety net consumes, so a call that falls back
+// to legacy MUST report false even when a neighbouring call was served by v2.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_PerCallDispatchOutcome) {
+    auto samples = create_frequency_samples("fls_percall");
+    auto config = make_config(1, false);
+
+    auto build_result = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_percall"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    // Delete batch 3's addr sidecar so that call can NEVER take the v2 path.
+    auto addr3 = fs::path(build_result.packed_slim_dir).parent_path()
+               / "addr_tables" / "batch_000003.addr";
+    fs::remove(addr3);
+
+    // Batches 0..2: sequentially, the per-call outcome must agree with the
+    // shared flag observed immediately after each call. (Whether v2 actually
+    // engages depends on the GPU assembler gate; agreement must hold either
+    // way. The out-param is what stays correct when calls interleave across
+    // prefetch workers.)
+    for (uint64_t b = 0; b < 3; ++b) {
+        auto sample = samples2.read_sample(b);
+        bool used_v2 = true;  // poison: the call must always overwrite it
+        auto tensor = store.load_batch_features(sample, &used_v2);
+        EXPECT_EQ(tensor.size(0),
+                  static_cast<int64_t>(sample.all_unique_nodes.size()));
+        EXPECT_EQ(used_v2, store.last_used_addr_tables()) << "batch " << b;
+    }
+
+    // Batch 3 (sidecar removed): per-call outcome must be false regardless of
+    // what any prior call did, and the legacy fallback must still serve the
+    // correct feature contents.
+    auto rm = RowMapping::open(rmap_path_);
+    auto sample3 = samples2.read_sample(3);
+    bool used_v2 = true;  // poison: must be overwritten to false
+    auto tensor3 = store.load_batch_features(sample3, &used_v2);
+    EXPECT_FALSE(used_v2);
+    ASSERT_EQ(tensor3.size(0),
+              static_cast<int64_t>(sample3.all_unique_nodes.size()));
+    auto tensor3_cpu = tensor3.cpu();
+    auto acc = tensor3_cpu.accessor<float, 2>();
+    for (size_t i = 0; i < sample3.all_unique_nodes.size(); ++i) {
+        auto row = rm.find(sample3.all_unique_nodes[i]);
+        ASSERT_TRUE(row.has_value());
+        for (uint64_t d = 0; d < D; ++d) {
+            EXPECT_FLOAT_EQ(acc[i][d], expected_feature(*row, d))
+                << "batch 3 node " << i << " dim " << d;
+        }
+    }
+
+    // Legacy callers passing no out-param remain valid.
+    auto sample0 = samples2.read_sample(0);
+    EXPECT_NO_THROW(store.load_batch_features(sample0));
+}
+
+// =============================================================================
 // Stats: Counts are correct after load_batch_features
 // =============================================================================
 

@@ -132,6 +132,19 @@ static ObjectId pack_double_persistent(double value)
     return ObjectId(ObjectId::MASK_DOUBLE_EXTERN | bytes_id);
 }
 
+ObjectId GQL::pack_aggregated_property_value(Aggregation aggregation, double agg_value)
+{
+    // COUNT is integral by construction. SUM/MIN/MAX aggregate double-typed
+    // property values, so the result must persist as a double: truncating to
+    // int64 corrupts fractional aggregates (SUM of 0.5 + 0.5 must be 1.0,
+    // MIN of 2.7 must stay 2.7) and changes the property's type from double
+    // to int even when the value happens to be whole.
+    if (aggregation == Aggregation::COUNT) {
+        return Common::Conversions::pack_int(static_cast<int64_t>(agg_value));
+    }
+    return pack_double_persistent(agg_value);
+}
+
 NativeProjectionBuilder::NativeProjectionBuilder(
     const std::string& projection_name_,
     const std::string& db_folder_,
@@ -346,8 +359,14 @@ bool EdgeAggregator::process_edge(ObjectId edge_id, std::optional<double> proper
             // SINGLE is strict by design: multiple edges between the same
             // (from, to, type) triple are ambiguous. Instead of picking one
             // silently (which loses data), we fail and ask the caller how
-            // they want to collapse parallels. Pick the strategy that matches
-            // your intent:
+            // they want to collapse parallels.
+            //
+            // Caveat: detection is windowed, not exact. The detector is
+            // cleared every BATCH_SIZE edges to bound memory, so parallels
+            // more than BATCH_SIZE apart in scan order escape detection and
+            // are both stored (see the ParallelEdgeDetector class doc).
+            //
+            // Pick the strategy that matches your intent:
             //
             //   COUNT  — keep one edge with synthetic `_count` property
             //   SUM    — keep one edge with `aggregationProperty` summed
@@ -763,6 +782,13 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
             // MIN/MAX/SUM/COUNT must NOT flush+clear here because their aggregated
             // values are read after the full type scan at get_aggregated_property_values().
             // Clearing the detector mid-scan would lose accumulated min/max/sum/count state.
+            //
+            // KNOWN LIMITATION: the clear() also drops SINGLE's seen-edge set, so
+            // duplicate detection is best-effort within a BATCH_SIZE-edge window of
+            // the scan order — two parallel edges more than BATCH_SIZE apart are
+            // BOTH stored without the QueryException. Deliberate memory trade-off
+            // (an uncleared detector holds every kept edge; 25 GB RSS on
+            // papers100M). See the ParallelEdgeDetector class doc.
             if (type_aggregation == Aggregation::SINGLE && edge_batch.size() >= BATCH_SIZE) {
                 flush_edges();
                 detector->clear();
@@ -797,10 +823,12 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
                 }
             }
 
-            // Store aggregated value as property on each representative edge
+            // Store aggregated value as property on each representative edge.
+            // COUNT packs as int; SUM/MIN/MAX pack as persistent doubles so
+            // fractional aggregates survive (see pack_aggregated_property_value).
             for (const auto& [edge_id_raw, agg_value] : aggregated_values) {
                 ObjectId edge_id(edge_id_raw);
-                ObjectId value_oid = Common::Conversions::pack_int(static_cast<int64_t>(agg_value));
+                ObjectId value_oid = pack_aggregated_property_value(type_aggregation, agg_value);
 
                 if (property_key_id.id != 0) {
                     storage->add_edge_property(edge_id, property_key_id, value_oid);
@@ -2085,10 +2113,12 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
     // Run the ParallelEdgeDetector only on the first Phase C pass (FROM_TO_EDGE).
     // Gating on FROM_TO_EDGE avoids running detection 9× (once per edge index)
     // while still throwing the same QueryException before any B+Tree build begins.
-    // The per-batch clear() mirrors classic's pattern (scan_edges_impl_classic_,
-    // line 723): after each BATCH_SIZE flush the map is cleared, keeping peak RSS
-    // bounded at ~132 KB regardless of graph size.  This replaces the unbounded
-    // Phase B detector that caused 25 GB RSS on papers100M (Run 7 PSI-abort).
+    // The per-batch clear() mirrors classic's pattern in scan_edges_impl_classic_:
+    // after each BATCH_SIZE flush the map is cleared, keeping peak RSS bounded
+    // regardless of graph size.  This replaces the unbounded Phase B detector
+    // that caused 25 GB RSS on papers100M (Run 7 PSI-abort).  The bound makes
+    // detection windowed, not exact — parallels more than BATCH_SIZE apart in
+    // scan order escape detection (see the ParallelEdgeDetector class doc).
     const bool run_detection = has_flag(target_mask, ProjectionIndex::FROM_TO_EDGE);
 
     std::unordered_map<std::string, ObjectId> type_id_map;
@@ -2180,11 +2210,14 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
             }
 
             // Auto-flush and clear detector when batch is full.
-            // For SINGLE mode, clearing mid-scan is safe because there is no
-            // aggregation state to preserve (unlike MIN/MAX/SUM/COUNT).
-            // This bounds the detector map to ~132 KB (BATCH_SIZE=250 entries)
-            // regardless of graph size — matching classic's per-batch clear
-            // (scan_edges_impl_classic_, line 723).
+            // The clear() DOES drop SINGLE state — the seen-edge set is the
+            // detector's only state — so duplicate detection is best-effort
+            // within a BATCH_SIZE-edge window: two parallel edges more than
+            // BATCH_SIZE apart in scan order are BOTH stored without the
+            // QueryException. Accepted memory trade-off (an uncleared detector
+            // holds every kept edge; 25 GB RSS on papers100M) matching
+            // classic's per-batch clear in scan_edges_impl_classic_. See the
+            // ParallelEdgeDetector class doc.
             if (emit_any_edge_buffer && edge_batch.size() >= BATCH_SIZE) {
                 flush_edges();
                 if (detector) {

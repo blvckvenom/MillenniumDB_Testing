@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -154,6 +155,7 @@ public:
         current_spill_file_ = 0;
         iter_memory_pos_ = 0;
         iter_file_pos_ = 0;
+        iter_records_returned_ = 0;
 
         // Open first spill file if exists
         if (spill_file_count_ > 0) {
@@ -169,9 +171,14 @@ public:
             // All data in memory
             return iter_memory_pos_ < memory_buffer_.size();
         } else {
-            // Data in spill files
-            return current_spill_file_ < spill_file_count_ ||
-                   iter_file_pos_ < file_read_buffer_.size();
+            // Data in spill files. Exhaustion is tracked with an explicit
+            // record count: the positional state (current spill file index +
+            // read buffer) only advances inside read_next_chunk(), so it
+            // would still report one more record after the last chunk of the
+            // last file has been fully consumed. finalize() flushed any
+            // in-memory tail to disk, so total_records_ equals the sum of
+            // all spill file counts here.
+            return iter_records_returned_ < total_records_;
         }
     }
 
@@ -180,6 +187,9 @@ public:
      *
      * @return Reference to the next record
      * @note Caller must check has_next() before calling
+     * @throws std::runtime_error if called past the end or if a spill file
+     *         is truncated (a chunk read yields no records while records
+     *         are still owed)
      */
     Record<N>& next() {
         if (spill_file_count_ == 0) {
@@ -189,7 +199,16 @@ public:
             // Data in spill files - need to read from disk
             if (iter_file_pos_ >= file_read_buffer_.size()) {
                 read_next_chunk();
+                if (file_read_buffer_.empty()) {
+                    throw std::runtime_error(
+                        "StreamingRecordBuffer: spill data exhausted after "
+                        + std::to_string(iter_records_returned_) + " of "
+                        + std::to_string(total_records_) + " records ("
+                        + temp_file_prefix_ + "_spill_*): truncated spill "
+                        "file or next() called past the end");
+                }
             }
+            iter_records_returned_++;
             return file_read_buffer_[iter_file_pos_++];
         }
     }
@@ -423,6 +442,9 @@ private:
     size_t current_spill_file_;
     size_t iter_memory_pos_;
     size_t iter_file_pos_;
+    // Records handed out by next() since begin_iteration(); the sole source
+    // of truth for spilled-mode exhaustion in has_next().
+    uint64_t iter_records_returned_ = 0;
     // Replaces ifstream — SpillReader handles both compressed (LZ4) and
     // legacy raw spills, auto-detected from the file header. Per-spill
     // lifetime via unique_ptr so each open_spill_file_for_reading() gets a

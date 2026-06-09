@@ -1924,11 +1924,16 @@ torch::Tensor FourLevelStore::load_batch_features(uint64_t batch_id) {
 // Public dispatcher: attempts v2 path (addr_table sidecar) when eligible;
 // falls through to legacy on miss/stale/error or when the GPU assembler
 // gate is not met (CPU-only, non-float32).
-torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample) {
+torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample,
+                                                  bool* out_used_v2) {
     // Reset per-call v2 telemetry. The legacy path resets its own per-tier
     // timers internally (at the top of load_batch_features_legacy_).
     last_addr_load_ns_ = 0;
     last_used_v2_ = false;
+    // Per-call dispatch outcome: starts false, flipped only on a successful v2
+    // return below. Concurrent workers each receive their own answer here —
+    // the shared last_used_v2_ flag remains telemetry-only.
+    if (out_used_v2) *out_used_v2 = false;
 
     // Gate: v2 only when the GPU assembler path is active. The CPU-only path
     // (no gpu_cache, or non-float32 dtype) is served by legacy_ to avoid
@@ -1945,7 +1950,9 @@ torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample) {
         auto addr_path = sample_dir_ / "addr_tables" / fname;
         if (fs::exists(addr_path)) {
             try {
-                return load_batch_features_v2_(sample, addr_path);
+                auto result = load_batch_features_v2_(sample, addr_path);
+                if (out_used_v2) *out_used_v2 = true;
+                return result;
             } catch (const AddrTableStaleException& e) {
                 std::cerr << "[FourLevelStore] addr_table stale for batch "
                           << sample.batch_id << " (" << e.what()

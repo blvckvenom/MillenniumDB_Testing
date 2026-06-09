@@ -28,6 +28,8 @@ using AlignedBuffer = std::unique_ptr<char[], AlignedDeleter>;
  * When ENABLE_IO_URING is defined and liburing is available at runtime,
  * uses io_uring for async batch submission (single syscall for N reads).
  * Falls back to synchronous pread() + POSIX_FADV_DONTNEED otherwise.
+ * Set env MDB_GNN_NO_IO_URING=1 to force the synchronous pread path
+ * (ablation; also useful when ring init would fail, e.g. RLIMIT_MEMLOCK).
  *
  * O_DIRECT requires buffer addresses, read offsets, and read sizes to be
  * aligned to the filesystem block size (typically 512 or 4096 bytes).
@@ -115,6 +117,15 @@ private:
 
     /// Read using pread, retrying on EINTR and partial reads.
     void pread_all(void* buf, size_t count, off_t offset);
+
+    /// Read a block-aligned region using pread, retrying on EINTR and partial
+    /// reads. O_DIRECT rounds read sizes up to block multiples, so an aligned
+    /// region at the file tail extends past EOF whenever the file size is not
+    /// block-aligned; the kernel then returns a short read. A short read is
+    /// valid iff it covers every byte of [offset, offset + count) that exists
+    /// in the file — only a read shorter than that is an error. Bytes past
+    /// EOF are zero-filled in buf.
+    void pread_all_tail_aware(void* buf, size_t count, off_t offset);
 
     /// Issue POSIX_FADV_DONTNEED for a range (best-effort, non-O_DIRECT mode).
     void advise_dontneed(off_t offset, size_t len);

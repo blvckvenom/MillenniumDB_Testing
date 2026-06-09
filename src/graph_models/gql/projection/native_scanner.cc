@@ -1,8 +1,10 @@
 #include "native_scanner.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -237,12 +239,11 @@ uint64_t NativeScanner::scan_label_node(
         tbb::blocked_range<std::size_t>(0, num_partitions, 1),
         [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
             // Inherit the parent thread's QueryContext into this worker.
-            // BPT leaf decode requires it (bplus_tree_leaf.cc:301,345);
-            // without this, worker threads dereference a null
-            // thread_local pointer.
-            if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
-                QueryContext::set_query_ctx(parent_ctx);
-            }
+            // BPT leaf decode requires it (bplus_tree_leaf.cc:301,345).
+            // Set unconditionally: TBB pool threads persist across queries,
+            // so a non-null slot may hold the context of a PREVIOUS query
+            // (stale, possibly destroyed) and must be overwritten.
+            QueryContext::set_query_ctx(parent_ctx);
             for (std::size_t p = r.begin(); p < r.end(); ++p) {
                 auto& sink = per_partition[p];
                 scan_label_node_subrange(
@@ -437,10 +438,13 @@ struct EdgeEndpointTriple {
 };
 
 // Callback variant of the sub-range scan: invokes `cb(edge_id, from, to)`
-// for each successfully-resolved edge in [lo_edge, hi_edge]. Used by each
-// parallel worker (callback pushes to a bounded queue) and could equally
-// be used from the sequential path (in this file the sequential path
-// inlines the same loop directly because its callback is the user's).
+// for each successfully-resolved edge in [lo_edge, hi_edge]. `cb` returns
+// true to continue and false to stop the scan early — the parallel workers
+// use this to wind down promptly when the consumer or a peer worker has
+// failed. Used by each parallel worker (callback pushes to a bounded
+// queue) and could equally be used from the sequential path (in this file
+// the sequential path inlines the same loop directly because its callback
+// is the user's).
 template <typename Callback>
 static uint64_t scan_label_edge_with_endpoints_subrange_cb(
     BPlusTree<2>* label_edge_index,
@@ -478,7 +482,9 @@ static uint64_t scan_label_edge_with_endpoints_subrange_cb(
             // Edge not found in endpoint index — skip, matching legacy semantics.
             continue;
         }
-        cb(edge_id, from_node, to_node);
+        if (!cb(edge_id, from_node, to_node)) {
+            break;
+        }
         ++count;
     }
     return count;
@@ -587,63 +593,161 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
         queues[i]->buffer.reserve(kQueueMax);
     }
 
+    // ---- Failure propagation.
+    //
+    // Any exception — from the user callback on the consumer side (e.g. the
+    // documented duplicate-edge QueryException thrown by
+    // ParallelEdgeDetector::process_edge in native_projection_builder.cc) or
+    // from a worker's B+Tree reads — must unwind out of THIS frame, never
+    // out of a worker/producer thread: an exception escaping a std::thread
+    // body, or unwinding past a joinable std::thread, calls std::terminate()
+    // and aborts the whole server. First exception wins under
+    // exception_mutex; abort_requested makes every backpressure / drain wait
+    // re-check and wind down; the consumer rethrows after the producer is
+    // joined.
+    std::atomic<bool> abort_requested{false};
+    std::exception_ptr first_exception;
+    std::mutex exception_mutex;
+
+    // Wake every thread blocked on a queue condition variable. The empty
+    // critical section on each queue mutex pairs with the predicate
+    // re-checks below: a waiter either observed abort_requested before
+    // blocking or is fully blocked when the notify fires — no missed wakeup.
+    auto request_abort = [&]() {
+        abort_requested.store(true, std::memory_order_relaxed);
+        for (auto& qp : queues) {
+            { std::lock_guard<std::mutex> lk(qp->mu); }
+            qp->cv_not_empty.notify_all();
+            qp->cv_not_full.notify_all();
+        }
+    };
+
+    auto record_first_exception = [&]() {
+        {
+            std::lock_guard<std::mutex> lk(exception_mutex);
+            if (!first_exception) {
+                first_exception = std::current_exception();
+            }
+        }
+        request_abort();
+    };
+
     // Producer thread: launches all workers via TBB parallel_for. Runs in
     // its own std::thread so the main thread is free to consume in parallel.
     std::thread producer([&, parent_ctx]() {
-        tbb::parallel_for(
-            tbb::blocked_range<std::size_t>(0, num_partitions, 1),
-            [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
-                if (QueryContext::_query_ctx == nullptr && parent_ctx != nullptr) {
+        try {
+            tbb::parallel_for(
+                tbb::blocked_range<std::size_t>(0, num_partitions, 1),
+                [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
+                    // Inherit the parent thread's QueryContext into this
+                    // worker. BPT leaf decode requires it
+                    // (bplus_tree_leaf.cc:301,345). Set unconditionally: TBB
+                    // pool threads persist across queries, so a non-null
+                    // slot may hold the context of a PREVIOUS query (stale,
+                    // possibly destroyed) and must be overwritten.
                     QueryContext::set_query_ctx(parent_ctx);
-                }
-                for (std::size_t p = r.begin(); p < r.end(); ++p) {
-                    EdgeQueue& q = *queues[p];
+                    for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                        EdgeQueue& q = *queues[p];
 
-                    // Worker-local batch — accumulated then flushed under one
-                    // lock acquire. Cuts mutex traffic by kFlushBatch×.
-                    std::vector<EdgeEndpointTriple> local_batch;
-                    local_batch.reserve(kFlushBatch);
+                        if (!abort_requested.load(std::memory_order_relaxed)) {
+                            try {
+                                // Worker-local batch — accumulated then
+                                // flushed under one lock acquire. Cuts mutex
+                                // traffic by kFlushBatch×.
+                                std::vector<EdgeEndpointTriple> local_batch;
+                                local_batch.reserve(kFlushBatch);
 
-                    auto flush_batch = [&]() {
-                        if (local_batch.empty()) return;
-                        {
-                            std::unique_lock<std::mutex> lk(q.mu);
-                            q.cv_not_full.wait(lk, [&] {
-                                return q.buffer.size() < kQueueMax;
-                            });
-                            for (auto& t : local_batch) {
-                                q.buffer.push_back(t);
+                                auto flush_batch = [&]() {
+                                    if (local_batch.empty()) return;
+                                    {
+                                        std::unique_lock<std::mutex> lk(q.mu);
+                                        q.cv_not_full.wait(lk, [&] {
+                                            return q.buffer.size() < kQueueMax ||
+                                                   abort_requested.load(
+                                                       std::memory_order_relaxed);
+                                        });
+                                        if (abort_requested.load(
+                                                std::memory_order_relaxed)) {
+                                            // Consumer is gone — drop the
+                                            // batch and let the scan stop.
+                                            local_batch.clear();
+                                            return;
+                                        }
+                                        for (auto& t : local_batch) {
+                                            q.buffer.push_back(t);
+                                        }
+                                    }
+                                    q.cv_not_empty.notify_one();
+                                    local_batch.clear();
+                                };
+
+                                scan_label_edge_with_endpoints_subrange_cb(
+                                    label_edge_index,
+                                    edge_from_to_index, from_to_edge_index,
+                                    edge_n1_n2_index,   n1_n2_edge_index,
+                                    search_type_id,
+                                    ranges[p].first, ranges[p].second,
+                                    [&](ObjectId eid, ObjectId fn, ObjectId tn) {
+                                        if (abort_requested.load(
+                                                std::memory_order_relaxed)) {
+                                            return false;  // stop the scan
+                                        }
+                                        local_batch.push_back(
+                                            EdgeEndpointTriple{eid, fn, tn});
+                                        if (local_batch.size() >= kFlushBatch) {
+                                            flush_batch();
+                                        }
+                                        return true;
+                                    });
+
+                                // Drain remainder.
+                                flush_batch();
+                            } catch (...) {
+                                record_first_exception();
                             }
                         }
-                        q.cv_not_empty.notify_one();
-                        local_batch.clear();
-                    };
 
-                    scan_label_edge_with_endpoints_subrange_cb(
-                        label_edge_index,
-                        edge_from_to_index, from_to_edge_index,
-                        edge_n1_n2_index,   n1_n2_edge_index,
-                        search_type_id,
-                        ranges[p].first, ranges[p].second,
-                        [&](ObjectId eid, ObjectId fn, ObjectId tn) {
-                            local_batch.push_back(
-                                EdgeEndpointTriple{eid, fn, tn});
-                            if (local_batch.size() >= kFlushBatch) {
-                                flush_batch();
-                            }
-                        });
-
-                    // Drain remainder, then signal finished so the consumer
-                    // can advance past this partition.
-                    flush_batch();
-                    {
-                        std::lock_guard<std::mutex> lk(q.mu);
-                        q.finished = true;
+                        // Signal finished — even on abort — so the consumer
+                        // can always advance past this partition.
+                        {
+                            std::lock_guard<std::mutex> lk(q.mu);
+                            q.finished = true;
+                        }
+                        q.cv_not_empty.notify_all();
                     }
-                    q.cv_not_empty.notify_all();
-                }
-            });
+                });
+        } catch (...) {
+            // parallel_for itself failed (scheduler error) — workers swallow
+            // their own exceptions above, so nothing user-level lands here.
+            record_first_exception();
+        }
+        // Safety net: if parallel_for did not run every iteration, mark all
+        // queues finished so the consumer can never block forever.
+        for (auto& qp : queues) {
+            {
+                std::lock_guard<std::mutex> lk(qp->mu);
+                qp->finished = true;
+            }
+            qp->cv_not_empty.notify_all();
+        }
     });
+
+    // Backstop: the producer must be joined on EVERY exit path — destroying
+    // a joinable std::thread calls std::terminate(). request_abort() first
+    // so workers blocked on backpressure (cv_not_full) wake up and wind
+    // down instead of deadlocking the join. On the normal path the explicit
+    // join below runs first and this dtor is a no-op.
+    struct ProducerJoinGuard {
+        std::thread& thread;
+        decltype(request_abort)& abort;
+        ~ProducerJoinGuard() {
+            if (thread.joinable()) {
+                abort();
+                thread.join();
+            }
+        }
+    };
+    ProducerJoinGuard producer_guard{producer, request_abort};
 
     // Consumer (main thread): drain each partition queue in order. Each
     // drain swaps the queue buffer out (so workers can keep producing) and
@@ -653,30 +757,48 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
     uint64_t count = 0;
     std::vector<EdgeEndpointTriple> drained;
     drained.reserve(kQueueMax);
-    for (std::size_t p = 0; p < num_partitions; ++p) {
-        EdgeQueue& q = *queues[p];
-        while (true) {
-            {
-                std::unique_lock<std::mutex> lk(q.mu);
-                q.cv_not_empty.wait(lk, [&] {
-                    return !q.buffer.empty() || q.finished;
-                });
-                if (q.buffer.empty() && q.finished) {
-                    break;
+    try {
+        for (std::size_t p = 0; p < num_partitions; ++p) {
+            EdgeQueue& q = *queues[p];
+            while (!abort_requested.load(std::memory_order_relaxed)) {
+                {
+                    std::unique_lock<std::mutex> lk(q.mu);
+                    q.cv_not_empty.wait(lk, [&] {
+                        return !q.buffer.empty() || q.finished ||
+                               abort_requested.load(std::memory_order_relaxed);
+                    });
+                    if (abort_requested.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    if (q.buffer.empty() && q.finished) {
+                        break;
+                    }
+                    drained.swap(q.buffer);
+                    q.buffer.reserve(kQueueMax);
                 }
-                drained.swap(q.buffer);
-                q.buffer.reserve(kQueueMax);
+                q.cv_not_full.notify_all();
+                for (const auto& t : drained) {
+                    callback(t.edge_id, t.from_node, t.to_node);
+                    ++count;
+                }
+                drained.clear();
             }
-            q.cv_not_full.notify_all();
-            for (const auto& t : drained) {
-                callback(t.edge_id, t.from_node, t.to_node);
-                ++count;
+            if (abort_requested.load(std::memory_order_relaxed)) {
+                break;
             }
-            drained.clear();
         }
+    } catch (...) {
+        // User callback threw (e.g. the duplicate-edge QueryException).
+        // Record + abort, then fall through to the join + rethrow below so
+        // the exception reaches the caller AFTER all threads are stopped.
+        record_first_exception();
     }
 
     producer.join();
+
+    if (first_exception) {
+        std::rethrow_exception(first_exception);
+    }
     return count;
 #else
     // Unreachable (parallel_enabled forced false above when !HAS_TBB).

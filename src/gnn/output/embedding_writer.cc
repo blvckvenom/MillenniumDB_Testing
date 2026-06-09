@@ -9,9 +9,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -20,6 +22,7 @@
 #include <torch/torch.h>
 
 #include "gnn/storage/feature_matrix.h"
+#include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
@@ -509,11 +512,87 @@ GraphSample EmbeddingWriter::build_graph_sample(
 // subsequent queries can find the embedding property.
 // =============================================================================
 
-/// Synthetic key ID for GNN embedding properties.  Chosen to be well above
-/// any realistic number of schema-defined node property keys (mirroring the
-/// COUNT_KEY_SYNTHETIC_ID=1000 pattern from NativeProjectionBuilder) while
-/// avoiding collision with it.
-static constexpr uint64_t EMBEDDING_KEY_SYNTHETIC_ID = 2000;
+uint64_t EmbeddingWriter::next_available_key_id(
+    const std::unordered_map<std::string, uint64_t>& node_keys,
+    const std::unordered_map<std::string, uint64_t>& edge_keys)
+{
+    // Start at the synthetic base (mirroring NativeProjectionBuilder's
+    // RENAME_KEY_SYNTHETIC_START) and go one past every id already in use.
+    // Both namespaces are scanned because the builder allocates node and
+    // edge synthetic ids from a single shared counter.
+    uint64_t next_id = EMBEDDING_KEY_SYNTHETIC_BASE;
+    for (const auto& [name, id] : node_keys) {
+        if (id >= next_id) {
+            next_id = id + 1;
+        }
+    }
+    for (const auto& [name, id] : edge_keys) {
+        if (id >= next_id) {
+            next_id = id + 1;
+        }
+    }
+    return next_id;
+}
+
+uint64_t EmbeddingWriter::resolve_property_key_id(
+    GQL::ProjectionStorage& storage,
+    const std::string&      property_name)
+{
+    // ProjectionStorage::open() restores statistics from the on-disk catalog
+    // but not the property key maps, so a storage opened from disk starts
+    // with empty key maps even when earlier sessions registered keys.
+    // Re-sync them before allocating: otherwise an existing property would
+    // be re-allocated under a colliding id, and the save_catalog() at flush
+    // time would drop every previously persisted key from the catalog.
+    // register_node_key / register_edge_key keep the first binding for a
+    // name, so in-memory registrations from this session always win.
+    const std::filesystem::path catalog_file =
+        std::filesystem::path(storage.get_projection_dir()) / "catalog.dat";
+    if (std::filesystem::exists(catalog_file)) {
+        GQL::ProjectionCatalog catalog(storage.get_projection_dir());
+        catalog.load();
+        for (const auto& [name, id] : catalog.node_keys2id) {
+            storage.register_node_key(name, id);
+        }
+        for (const auto& [name, id] : catalog.edge_keys2id) {
+            storage.register_edge_key(name, id);
+        }
+    }
+
+    // Reuse the existing binding when the property was already registered.
+    auto existing = storage.get_node_key_id(property_name);
+    if (existing) {
+        return *existing;
+    }
+
+    // Allocate a fresh id strictly above every id in use, refusing to bind
+    // an id that already belongs to a different property (two names on one
+    // key id would make their values indistinguishable at query time).
+    const uint64_t key_id_raw = next_available_key_id(
+        storage.get_node_keys(), storage.get_edge_keys());
+
+    for (const auto& [name, id] : storage.get_node_keys()) {
+        if (id == key_id_raw) {
+            throw std::runtime_error(
+                "EmbeddingWriter: key id " + std::to_string(key_id_raw)
+                + " for property '" + property_name
+                + "' is already bound to property '" + name + "'");
+        }
+    }
+
+    storage.register_node_key(property_name, key_id_raw);
+
+    // register_node_key silently ignores a name that is already present, so
+    // verify the binding actually took the id we allocated.
+    auto bound = storage.get_node_key_id(property_name);
+    if (!bound || *bound != key_id_raw) {
+        throw std::runtime_error(
+            "EmbeddingWriter: failed to register property key '"
+            + property_name + "' under id " + std::to_string(key_id_raw));
+    }
+
+    return key_id_raw;
+}
 
 uint64_t EmbeddingWriter::write_to_projection(
     const std::unordered_map<uint64_t, torch::Tensor>& emb_map)
@@ -523,18 +602,11 @@ uint64_t EmbeddingWriter::write_to_projection(
     }
 
     // -------------------------------------------------------------------------
-    // Step 1: Register the property key in the projection catalog
+    // Step 1: Resolve (or allocate + register) the property key
     // -------------------------------------------------------------------------
 
-    // Check if the key already exists in the projection's node key map.
-    uint64_t key_id_raw = EMBEDDING_KEY_SYNTHETIC_ID;
-    auto existing = projection_storage_.get_node_key_id(config_.property_name);
-    if (existing) {
-        key_id_raw = *existing;
-    } else {
-        // Register a new synthetic key for this embedding property.
-        projection_storage_.register_node_key(config_.property_name, key_id_raw);
-    }
+    uint64_t key_id_raw = resolve_property_key_id(projection_storage_,
+                                                  config_.property_name);
 
     ObjectId key_oid(key_id_raw | ObjectId::MASK_NODE_KEY);
 
@@ -578,7 +650,38 @@ uint64_t EmbeddingWriter::write_to_projection(
         // 3d. Build tensor ObjectId (float extern)
         ObjectId tensor_oid(ObjectId::MASK_TENSOR_FLOAT_EXTERN | tensor_id);
 
-        // 3e. Insert into both B+Tree property indexes
+        // 3e. Delete any existing records for this (node, key) BEFORE
+        //     inserting.  get_node_property() returns the first record in
+        //     the (node, key) range, so a leftover record from a previous
+        //     write (smaller tensor id sorts first) would shadow the new
+        //     value.  Property indexes are v1-mutable, so delete_record is
+        //     supported.  Stale values are collected first so the range
+        //     iterator is destroyed before the tree is mutated.
+        std::vector<uint64_t> stale_value_ids;
+        {
+            Record<3> min_record = { node_oid.id, key_oid.id, 0 };
+            Record<3> max_record = { node_oid.id, key_oid.id, UINT64_MAX };
+
+            bool interruption_requested = false;
+            auto iter = nkv_index->get_range(&interruption_requested,
+                                             min_record, max_record);
+            const Record<3>* rec;
+            while ((rec = iter.next()) != nullptr) {
+                stale_value_ids.push_back((*rec)[2]);
+            }
+        }
+        for (uint64_t stale_value_id : stale_value_ids) {
+            if (stale_value_id == tensor_oid.id) {
+                continue;  // identical record; the insert below is a no-op
+            }
+            Record<3> stale_nkv = { node_oid.id, key_oid.id, stale_value_id };
+            nkv_index->delete_record(stale_nkv);
+
+            Record<3> stale_kvn = { key_oid.id, stale_value_id, node_oid.id };
+            kvn_index->delete_record(stale_kvn);
+        }
+
+        // 3f. Insert into both B+Tree property indexes
         //     Primary: (node_id, key_id, value_id) -- for node property lookups
         Record<3> nkv_record;
         nkv_record[0] = node_oid.id;

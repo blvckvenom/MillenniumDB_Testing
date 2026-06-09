@@ -141,6 +141,56 @@ TEST_F(AutoCheckpointerTest, CustomBasenamesHonored) {
     EXPECT_FALSE(std::filesystem::exists(dir / "best_model.pt"));
 }
 
+TEST_F(AutoCheckpointerTest, ResumeWorseEpochDoesNotOverwriteBest) {
+    auto m = make_model();
+    torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));
+    auto dir = test_dir_ / "ckpts";
+    mdb::gnn::AutoCheckpointer ac(*m, opt, dir, base_state());
+
+    // Simulate a resumed run: the loop's best tracker was seeded with the
+    // checkpoint's best (0.66), so a 0.45 epoch arrives with is_best=false
+    // even though it exceeds a freshly-constructed checkpointer's 0.0.
+    ac.seed_best_val(0.66);
+    mdb::gnn::TrainingLoop::EpochEvent worse{10, 0.5, 0.45, 1, false};
+    ac.on_epoch_end(worse);
+
+    EXPECT_EQ(ac.saves_written(), 0u);
+    EXPECT_FALSE(std::filesystem::exists(dir / "best_model.pt"));
+    EXPECT_DOUBLE_EQ(ac.best_val_seen(), 0.66);
+
+    // A genuine cross-resume improvement (loop-flagged) must save.
+    mdb::gnn::TrainingLoop::EpochEvent better{11, 0.4, 0.70, 0, true};
+    ac.on_epoch_end(better);
+
+    EXPECT_EQ(ac.saves_written(), 1u);
+    EXPECT_TRUE(std::filesystem::exists(dir / "best_model.pt"));
+    EXPECT_DOUBLE_EQ(ac.best_val_seen(), 0.70);
+
+    auto loaded = mdb::gnn::ModelCheckpoint::read_ckptmeta(
+        dir / "best_model.ckptmeta");
+    EXPECT_FLOAT_EQ(loaded.best_val_accuracy, 0.7f);
+}
+
+TEST_F(AutoCheckpointerTest, IsBestFlagDrivesSavesNotLocalTracker) {
+    auto m = make_model();
+    torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));
+    auto dir = test_dir_ / "ckpts";
+    mdb::gnn::AutoCheckpointer ac(*m, opt, dir, base_state());
+
+    // Without seeding, an event the loop flags as not-best must still be
+    // skipped (the checkpointer must not re-derive "improved?" from its
+    // own 0.0-initialized tracker).
+    mdb::gnn::TrainingLoop::EpochEvent not_best{0, 0.8, 0.45, 1, false};
+    ac.on_epoch_end(not_best);
+    EXPECT_EQ(ac.saves_written(), 0u);
+    EXPECT_FALSE(std::filesystem::exists(dir / "best_model.pt"));
+
+    mdb::gnn::TrainingLoop::EpochEvent best{1, 0.7, 0.50, 0, true};
+    ac.on_epoch_end(best);
+    EXPECT_EQ(ac.saves_written(), 1u);
+    EXPECT_TRUE(std::filesystem::exists(dir / "best_model.pt"));
+}
+
 TEST_F(AutoCheckpointerTest, BaseStateFieldsPersistedInSaves) {
     auto m = make_model();
     torch::optim::Adam opt(m->parameters(), torch::optim::AdamOptions(0.01));

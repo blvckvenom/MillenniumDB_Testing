@@ -5,12 +5,14 @@
 #include <fstream>
 #include <vector>
 
+#include "graph_models/gql/gql_model.h"
 #include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
+#include "query/procedure/builtin/project_procedure.h"
 #include "query/query_context.h"
 #include "system/system.h"
 
@@ -861,6 +863,78 @@ int main() {
                           << std::endl;
                 return 1;
             }
+        }
+        std::cout << " OK" << std::endl;
+
+        // ================================================================
+        // graph_project duplicate-name safety
+        // ================================================================
+        // Calling graph_project with the name of an existing projection
+        // must fail with "already exists" WITHOUT touching the existing
+        // projection's directory. The build-failure rollback must only
+        // remove state created by the failing invocation itself.
+
+        // Test 29: duplicate graph_project preserves the existing projection
+        std::cout << "Test 29: duplicate graph_project preserves existing projection...";
+        {
+            // ProjectProcedure::execute consults gql_model.catalog for the
+            // non-blocking missing-label warnings, so the global model must
+            // be initialized. init() also re-inits the ProjectionManager
+            // (rescan of test_db_storage/projections).
+            auto model_destroyer = GQLModel::init("test_db_storage");
+
+            // Pre-existing projection with a sentinel file that must
+            // survive the failed re-projection. Name kept <= 7 chars so
+            // the procedure arguments inline without the string manager.
+            std::string dup_dir = manager.create_projection("dup_old");
+            {
+                GQL::ProjectionCatalog cat(dup_dir);
+                cat.projection_name = "dup_old";
+                cat.save();
+            }
+            auto sentinel_path = std::filesystem::path(dup_dir) / "sentinel.bin";
+            {
+                std::ofstream sentinel(sentinel_path, std::ios::binary);
+                sentinel << "keep";
+            }
+
+            Binding binding(1);
+            GQL::ProcedureContext ctx(binding);
+            ctx.arguments = {
+                ctx.create_string("dup_old"),
+                ctx.create_string("User"),
+                ctx.create_string("KNOWS"),
+            };
+
+            GQL::Procedures::ProjectProcedure proc;
+            bool threw = false;
+            std::string error_msg;
+            try {
+                proc.execute(ctx);
+            } catch (const std::exception& e) {
+                threw = true;
+                error_msg = e.what();
+            }
+
+            if (!threw || error_msg.find("already exists") == std::string::npos) {
+                std::cerr << "\nFAIL Test 29: expected 'already exists' error, "
+                          << (threw ? "got: " + error_msg : "but no exception was thrown")
+                          << std::endl;
+                return 1;
+            }
+            if (!std::filesystem::exists(sentinel_path)) {
+                std::cerr << "\nFAIL Test 29: pre-existing projection was deleted "
+                          << "by the failed duplicate graph_project" << std::endl;
+                return 1;
+            }
+            if (!manager.projection_exists("dup_old")) {
+                std::cerr << "\nFAIL Test 29: pre-existing projection was "
+                          << "unregistered by the failed duplicate graph_project"
+                          << std::endl;
+                return 1;
+            }
+
+            manager.drop_projection("dup_old");
         }
         std::cout << " OK" << std::endl;
 

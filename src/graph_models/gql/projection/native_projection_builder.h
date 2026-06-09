@@ -239,7 +239,18 @@ private:
  * @brief Detects and aggregates parallel edges during projection creation.
  *
  * Hash-based streaming aggregation with RAII memory management.
- * Cleared after each batch (1000 edges) to maintain constant memory.
+ * Under SINGLE mode the map is cleared after each batch (BATCH_SIZE = 1000
+ * edges) to maintain constant memory; MIN/MAX/SUM/COUNT keep their state
+ * for the full per-type scan and clear once per type.
+ *
+ * SINGLE-mode caveat: the per-batch clear() drops the seen-edge set (which
+ * IS the detector's SINGLE state), so duplicate detection is best-effort
+ * within a BATCH_SIZE-edge window of the scan order. Two parallel edges
+ * more than BATCH_SIZE apart are BOTH stored without the QueryException.
+ * Deliberate memory trade-off: an uncleared detector holds every kept edge
+ * (~138 bytes each — 25 GB RSS on papers100M). An exact check would have
+ * to run where records arrive sorted by (from, to), i.e. during the
+ * from_to_edge index build in ProjectionStorage.
  *
  * Memory overhead: 132 KB constant (independent of graph size)
  * Performance: O(1) average per edge (hash table lookup)
@@ -301,7 +312,7 @@ public:
         for (const auto& [key, aggregator] : edge_map_) {
             // COUNT always has a value; MIN/MAX/SUM only if a non-NULL property was seen
             if (strategy_ != Aggregation::COUNT && !aggregator.has_value()) {
-                continue;  // Skip: all property values were NULL, sentinel would overflow int64_t
+                continue;  // Skip: all property values were NULL — the min/max/sum sentinels are not real aggregates
             }
             ObjectId first_edge = aggregator.get_first_edge();
             double agg_value = aggregator.get_aggregated_value();
@@ -315,6 +326,18 @@ private:
     Aggregation strategy_;
     std::unordered_map<ParallelEdgeKey, EdgeAggregator, ParallelEdgeKeyHash> edge_map_;
 };
+
+/**
+ * @brief Packs an aggregated parallel-edge value into a persistable ObjectId.
+ *
+ * COUNT aggregates are integral by construction and pack as integers.
+ * SUM/MIN/MAX aggregate double-typed property values and must pack as
+ * doubles (via the persistent string_manager encoding, since projections
+ * live on disk across sessions): truncating them to int64 would silently
+ * corrupt fractional aggregates and change the property's type. Not
+ * meaningful for SINGLE, which produces no aggregated values.
+ */
+ObjectId pack_aggregated_property_value(Aggregation aggregation, double agg_value);
 
 /**
  * @brief Orchestrates native graph projection creation.

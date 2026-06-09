@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -30,6 +31,7 @@
 #include <torch/torch.h>
 
 #include "gnn/models/graphsage_model.h"
+#include "gnn/output/embedding_writer.h"
 #include "gnn/sampling/graph_sample.h"
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/sampling_config.h"
@@ -40,6 +42,7 @@
 #include "gnn/training/mini_batch.h"
 #include "gnn/training/split_store.h"
 #include "gnn/tests/test_helpers.h"
+#include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 
 namespace fs = std::filesystem;
@@ -897,4 +900,114 @@ TEST_F(EmbeddingWriterTest, TensorSerializationMultiDim) {
     auto reconstructed = flat.reshape({4, 16});
     auto diff = (reconstructed - emb_cpu).abs().max().item<float>();
     EXPECT_FLOAT_EQ(diff, 0.0f);
+}
+
+// =============================================================================
+// Test 13: NextAvailableKeyIdStartsAtSyntheticBase
+//
+// With no keys registered, allocation starts at the synthetic base shared
+// with NativeProjectionBuilder's rename-key range.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, NextAvailableKeyIdStartsAtSyntheticBase) {
+    std::unordered_map<std::string, uint64_t> node_keys;
+    std::unordered_map<std::string, uint64_t> edge_keys;
+
+    EXPECT_EQ(EmbeddingWriter::next_available_key_id(node_keys, edge_keys),
+              EmbeddingWriter::EMBEDDING_KEY_SYNTHETIC_BASE);
+}
+
+// =============================================================================
+// Test 14: NextAvailableKeyIdGoesPastUsedIds
+//
+// Allocation must clear every id already in use in EITHER namespace —
+// including builder-synthetic ids at/above the base (e.g. a renamed property
+// at 2000) and edge keys (the builder allocates node and edge synthetic ids
+// from one shared counter).
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, NextAvailableKeyIdGoesPastUsedIds) {
+    std::unordered_map<std::string, uint64_t> node_keys{
+        { "feat", 5 }, { "renamed", 2000 }
+    };
+    std::unordered_map<std::string, uint64_t> edge_keys{
+        { "_count", 1000 }, { "weight", 2047 }
+    };
+
+    EXPECT_EQ(EmbeddingWriter::next_available_key_id(node_keys, edge_keys), 2048u);
+
+    // Ids below the base never pull allocation under it.
+    std::unordered_map<std::string, uint64_t> low_only{ { "feat", 3 } };
+    std::unordered_map<std::string, uint64_t> empty;
+    EXPECT_EQ(EmbeddingWriter::next_available_key_id(low_only, empty),
+              EmbeddingWriter::EMBEDDING_KEY_SYNTHETIC_BASE);
+}
+
+// =============================================================================
+// Test 15: ResolveDistinctIdsForDistinctProperties
+//
+// Writing two different property names must bind two DISTINCT key ids;
+// a hardcoded id would alias them, making n.emb_b silently resolve to
+// emb_a's records.  Resolving an already-registered name is idempotent.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, ResolveDistinctIdsForDistinctProperties) {
+    fs::path proj_dir = test_dir_ / "proj_alloc";
+    fs::create_directories(proj_dir);
+    GQL::ProjectionStorage storage(
+        proj_dir.string(), test_dir_.string(), "proj_alloc");
+
+    uint64_t id_a = EmbeddingWriter::resolve_property_key_id(storage, "emb_a");
+    uint64_t id_b = EmbeddingWriter::resolve_property_key_id(storage, "emb_b");
+
+    EXPECT_NE(id_a, id_b)
+        << "two writeProperty names must not alias one key id";
+
+    // Both bindings are registered and stable on re-resolution.
+    EXPECT_EQ(EmbeddingWriter::resolve_property_key_id(storage, "emb_a"), id_a);
+    EXPECT_EQ(EmbeddingWriter::resolve_property_key_id(storage, "emb_b"), id_b);
+    EXPECT_EQ(storage.get_node_key_id("emb_a"), std::optional<uint64_t>(id_a));
+    EXPECT_EQ(storage.get_node_key_id("emb_b"), std::optional<uint64_t>(id_b));
+}
+
+// =============================================================================
+// Test 16: ResolveReusesPersistedCatalogKeys
+//
+// ProjectionStorage::open() does not restore the key maps from the on-disk
+// catalog.  resolve_property_key_id must re-sync them so that (a) a property
+// persisted by an earlier session keeps its id, (b) a NEW property does not
+// get allocated an id that aliases it, and (c) the merged map carries every
+// key forward so the next save_catalog() drops none.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, ResolveReusesPersistedCatalogKeys) {
+    fs::path proj_dir = test_dir_ / "proj_catalog";
+    fs::create_directories(proj_dir);
+
+    uint64_t id_a = 0;
+    {
+        GQL::ProjectionStorage storage(
+            proj_dir.string(), test_dir_.string(), "proj_catalog");
+        id_a = EmbeddingWriter::resolve_property_key_id(storage, "emb_a");
+        storage.flush();  // persists catalog.dat with the key mapping
+    }
+    ASSERT_TRUE(fs::exists(proj_dir / "catalog.dat"));
+
+    // Fresh storage on the same dir starts with empty in-memory key maps
+    // (mirroring the open() path).
+    GQL::ProjectionStorage storage2(
+        proj_dir.string(), test_dir_.string(), "proj_catalog");
+    ASSERT_TRUE(storage2.get_node_keys().empty());
+
+    // A NEW property must be allocated past the persisted 'emb_a' id...
+    uint64_t id_b = EmbeddingWriter::resolve_property_key_id(storage2, "emb_b");
+    EXPECT_NE(id_b, id_a)
+        << "second-session property must not alias the persisted key";
+
+    // ...and the persisted property keeps its original id.
+    EXPECT_EQ(EmbeddingWriter::resolve_property_key_id(storage2, "emb_a"), id_a);
+
+    // Both keys are now live in the in-memory map, so a subsequent
+    // save_catalog() persists the union instead of dropping 'emb_a'.
+    EXPECT_EQ(storage2.get_node_keys().size(), 2u);
 }

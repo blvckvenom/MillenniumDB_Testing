@@ -111,6 +111,7 @@ struct SampleStorage::Impl {
     SampleCatalog catalog;
     bool write_mode = false;
     bool finalized = false;
+    bool aborted = false;
 
     // Write mode streams
     std::unique_ptr<std::ofstream> batch_data_stream;
@@ -360,6 +361,29 @@ struct SampleStorage::Impl {
 
         finalized = true;
         write_mode = false;
+    }
+
+    void abort_impl() {
+        if (!write_mode || finalized) {
+            return;
+        }
+
+        // Close streams WITHOUT writing the index, frequency, or catalog
+        // files — the on-disk state must not look like a valid sample.
+        batch_data_stream.reset();
+        batch_index_stream.reset();
+        write_mode = false;
+        aborted = true;
+
+        // Remove the partial storage directory (created by init_write_mode)
+        // so create() on a re-run does not fail with "already exists" and
+        // readers cannot open a truncated sample.
+        std::error_code ec;
+        std::filesystem::remove_all(storage_path, ec);
+        if (ec) {
+            logger.error() << "SampleStorage abort: failed to remove partial storage '"
+                           << storage_path.string() << "': " << ec.message();
+        }
     }
 
     // =========================================================================
@@ -654,14 +678,18 @@ struct SampleStorage::Impl {
 SampleStorage::SampleStorage() : impl_(std::make_unique<Impl>()) {}
 
 SampleStorage::~SampleStorage() {
-    // Ensure finalization on destruction
+    // A write-mode storage destroyed without an explicit finalize() means the
+    // run did NOT complete (exception, cancellation, early return). Finalizing
+    // here would persist a self-consistent catalog for a truncated sample —
+    // re-runs would fail with "already exists" and downstream consumers would
+    // silently train on partial data. Discard the partial write instead.
     if (impl_ && impl_->write_mode && !impl_->finalized) {
         try {
-            impl_->finalize_impl();
+            impl_->abort_impl();
         } catch (const std::exception& e) {
-            logger.error() << "SampleStorage finalization failed in destructor: " << e.what();
+            logger.error() << "SampleStorage abort failed in destructor: " << e.what();
         } catch (...) {
-            logger.error() << "SampleStorage finalization failed with unknown exception";
+            logger.error() << "SampleStorage abort failed with unknown exception";
         }
     }
 }
@@ -738,6 +766,10 @@ void SampleStorage::write_sample(const GraphSample& sample) {
 
 void SampleStorage::finalize() {
     impl_->finalize_impl();
+}
+
+void SampleStorage::abort() {
+    impl_->abort_impl();
 }
 
 GraphSample SampleStorage::read_sample(uint64_t batch_id) {

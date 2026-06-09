@@ -150,6 +150,13 @@ public:
      * Partition count K is `min(hardware_concurrency, 16)` by default; can
      * be overridden via MDB_PROJECTION_EDGE_SCAN_PARTITIONS (clamped [2, 64]).
      *
+     * Exceptions thrown by `callback` (e.g. the duplicate-edge
+     * QueryException raised in SINGLE aggregation mode) propagate to the
+     * caller on both the sequential and the parallel path; on the parallel
+     * path the producer/worker threads are signalled to abort and joined
+     * before the exception is rethrown. Symmetrically, the first exception
+     * raised inside a worker is rethrown on the calling thread.
+     *
      * @param type_id ObjectId of the edge type
      * @param callback Function called for each (edge_id, from, to) tuple found
      * @return Number of edges scanned

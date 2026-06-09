@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -91,11 +92,15 @@ DirectIoReader::DirectIoReader(const fs::path& file_path) {
     // Spec A3: initialize NUM_RINGS rings (DiskGNN config: 4 rings × 1024 SQEs).
     // Each ring is independent — one may fail (e.g., RLIMIT_MEMLOCK on old
     // kernels) while others succeed. We use whichever rings init'd; if zero,
-    // fall back to pread silently.
-    for (auto& slot : rings_) {
-        if (::io_uring_queue_init(QUEUE_DEPTH, &slot.ring, 0) == 0) {
-            slot.initialized  = true;
-            io_uring_active_  = true;
+    // fall back to pread silently. MDB_GNN_NO_IO_URING=1 skips ring init
+    // entirely, forcing the synchronous pread path.
+    const char* no_uring = std::getenv("MDB_GNN_NO_IO_URING");
+    if (!(no_uring && std::strcmp(no_uring, "0") != 0)) {
+        for (auto& slot : rings_) {
+            if (::io_uring_queue_init(QUEUE_DEPTH, &slot.ring, 0) == 0) {
+                slot.initialized  = true;
+                io_uring_active_  = true;
+            }
         }
     }
 #endif
@@ -146,6 +151,49 @@ void DirectIoReader::pread_all(void* buf, size_t count, off_t offset) {
 }
 
 // =============================================================================
+// pread_all_tail_aware — synchronous read of a block-aligned region
+// =============================================================================
+
+void DirectIoReader::pread_all_tail_aware(void* buf, size_t count, off_t offset) {
+    // O_DIRECT requires block-aligned read sizes, so an aligned region at the
+    // file tail extends past EOF whenever the file size is not block-aligned
+    // (feature rows rarely are). The kernel returns the partial tail on the
+    // final read and 0 thereafter; only bytes that exist in the file within
+    // [offset, offset + count) are required.
+    const uint64_t off_u   = static_cast<uint64_t>(offset);
+    const size_t   logical = off_u >= file_size_
+        ? 0
+        : static_cast<size_t>(std::min<uint64_t>(count, file_size_ - off_u));
+
+    char* p = static_cast<char*>(buf);
+    size_t got = 0;
+    while (got < count) {
+        ssize_t n = ::pread(fd_, p + got, count - got,
+                            offset + static_cast<off_t>(got));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error(
+                "DirectIoReader: pread failed at offset " +
+                std::to_string(offset + static_cast<off_t>(got)) +
+                ": " + std::strerror(errno));
+        }
+        if (n == 0) break;  // EOF — valid at the aligned tail
+        got += static_cast<size_t>(n);
+    }
+    if (got < logical) {
+        throw std::runtime_error(
+            "DirectIoReader: unexpected EOF at offset " +
+            std::to_string(offset + static_cast<off_t>(got)) + " (wanted " +
+            std::to_string(logical - got) + " more bytes)");
+    }
+    if (got < count) {
+        // Keep the unread tail deterministic — scatter copies of a row that
+        // was clamped at EOF read from this region.
+        std::memset(p + got, 0, count - got);
+    }
+}
+
+// =============================================================================
 // advise_dontneed — page cache eviction hint (non-O_DIRECT mode)
 // =============================================================================
 
@@ -191,7 +239,7 @@ size_t DirectIoReader::read_aligned_region(
     if (aligned_size == 0) return 0;
 
     auto tmp = alloc_aligned(aligned_size, block_align_);
-    pread_all(tmp.get(), aligned_size, static_cast<off_t>(aligned_off));
+    pread_all_tail_aware(tmp.get(), aligned_size, static_cast<off_t>(aligned_off));
     std::memcpy(dest, tmp.get() + skip, wanted_bytes);
     return static_cast<size_t>(aligned_size);
 }
@@ -465,11 +513,12 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
     } else
 #endif
     {
-        // Synchronous direct: pread per merged span.
+        // Synchronous direct: pread per merged span. Spans are block-aligned,
+        // so the span at the file tail may extend past EOF — tail-aware.
         for (const auto& s : spans) {
-            pread_all(scratch.get() + s.buf_offset,
-                      static_cast<size_t>(s.aligned_size),
-                      static_cast<off_t>(s.aligned_off));
+            pread_all_tail_aware(scratch.get() + s.buf_offset,
+                                 static_cast<size_t>(s.aligned_size),
+                                 static_cast<off_t>(s.aligned_off));
         }
     }
 
@@ -568,9 +617,9 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
     }
 #endif
 
-    // Synchronous O_DIRECT fallback
+    // Synchronous O_DIRECT fallback — aligned region may extend past EOF.
     auto scratch = alloc_aligned(aligned_size, block_align_);
-    pread_all(scratch.get(), aligned_size, static_cast<off_t>(aligned_off));
+    pread_all_tail_aware(scratch.get(), aligned_size, static_cast<off_t>(aligned_off));
     std::memcpy(out.get(), scratch.get() + skip, size);
 
     return {std::move(out), size, 0, static_cast<size_t>(aligned_size)};

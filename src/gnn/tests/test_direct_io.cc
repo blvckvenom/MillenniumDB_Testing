@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #include <unistd.h> // getpid
@@ -724,6 +726,108 @@ TEST_F(DirectIoReaderTest, MultiRing_StressManySpans) {
         EXPECT_FLOAT_EQ(row[0], static_cast<float>((r + 1) * 100 + 1))
             << "Row " << r << " first float mismatch — multi-ring scatter bug?";
     }
+}
+
+// =============================================================================
+// Synchronous-path tail reads — feature files are rarely block-aligned, so
+// the aligned region containing the last row extends past EOF and the kernel
+// returns a short read. The sync pread path must accept it (io_uring does so
+// implicitly). MDB_GNN_NO_IO_URING=1 forces the sync path.
+// =============================================================================
+
+namespace {
+
+/// Sets an env var for the lifetime of the object, restoring on destruction.
+struct ScopedEnvVar {
+    std::string name;
+    bool        had_old = false;
+    std::string old_value;
+
+    ScopedEnvVar(const char* n, const char* v) : name(n) {
+        if (const char* old = std::getenv(n)) {
+            had_old   = true;
+            old_value = old;
+        }
+        ::setenv(n, v, 1);
+    }
+    ~ScopedEnvVar() {
+        if (had_old) {
+            ::setenv(name.c_str(), old_value.c_str(), 1);
+        } else {
+            ::unsetenv(name.c_str());
+        }
+    }
+};
+
+} // namespace
+
+TEST_F(DirectIoReaderTest, SyncPathReadsLastRowOfUnalignedFile) {
+    ScopedEnvVar no_uring("MDB_GNN_NO_IO_URING", "1");
+
+    // 64 B header + 10 × 5732 B rows = 57384 B — NOT a 4096 multiple, so the
+    // aligned span of the last row ([49152, 61440)) extends past EOF.
+    constexpr uint64_t HEADER    = 64;
+    constexpr uint64_t ROWS      = 10;
+    constexpr uint64_t DIMS      = 1433;
+    constexpr uint64_t ROW_BYTES = DIMS * sizeof(float);  // 5732
+    auto path = create_test_file("sync_tail.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    EXPECT_FALSE(reader.is_io_uring());
+    ASSERT_NE(reader.file_size() % 4096u, 0u)
+        << "Test requires a non-block-aligned file size";
+
+    // Last row ends exactly at EOF, inside a partial block.
+    auto result = reader.read_rows({9}, ROW_BYTES, HEADER);
+
+    ASSERT_EQ(result.num_rows, 1u);
+    ASSERT_EQ(result.size, ROW_BYTES);
+    auto* r = reinterpret_cast<const float*>(result.data.get());
+    EXPECT_FLOAT_EQ(r[0], 1001.0f);                            // row 9, dim 0
+    EXPECT_FLOAT_EQ(r[DIMS - 1], static_cast<float>(1000 + DIMS));  // last dim
+}
+
+TEST_F(DirectIoReaderTest, SyncPathReadRangeEndingAtUnalignedEof) {
+    ScopedEnvVar no_uring("MDB_GNN_NO_IO_URING", "1");
+
+    // 64 B header + 3 × 100 B rows = 364 B file — the only block is partial.
+    constexpr uint64_t HEADER = 64, ROWS = 3, ROW_BYTES = 100;
+    auto path = create_test_file("sync_range_tail.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    EXPECT_FALSE(reader.is_io_uring());
+
+    // Read the last row's byte range, ending exactly at EOF.
+    auto result = reader.read_range(HEADER + 2 * ROW_BYTES, ROW_BYTES);
+
+    ASSERT_EQ(result.size, ROW_BYTES);
+    auto* r = reinterpret_cast<const float*>(result.data.get());
+    EXPECT_FLOAT_EQ(r[0], 301.0f);  // row 2: (2+1)*100 + 1
+}
+
+TEST_F(DirectIoReaderTest, SyncPathMixedTailAndInteriorRows) {
+    ScopedEnvVar no_uring("MDB_GNN_NO_IO_URING", "1");
+
+    constexpr uint64_t HEADER    = 64;
+    constexpr uint64_t ROWS      = 10;
+    constexpr uint64_t DIMS      = 1433;
+    constexpr uint64_t ROW_BYTES = DIMS * sizeof(float);  // 5732
+    auto path = create_test_file("sync_mixed.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    EXPECT_FALSE(reader.is_io_uring());
+
+    // Interior rows still demand full reads; only the tail span is short.
+    auto result = reader.read_rows({0, 5, 9}, ROW_BYTES, HEADER);
+
+    ASSERT_EQ(result.num_rows, 3u);
+    auto* r0 = reinterpret_cast<const float*>(result.data.get());
+    auto* r5 = reinterpret_cast<const float*>(result.data.get() + ROW_BYTES);
+    auto* r9 = reinterpret_cast<const float*>(result.data.get() + 2 * ROW_BYTES);
+    EXPECT_FLOAT_EQ(r0[0], 101.0f);
+    EXPECT_FLOAT_EQ(r5[0], 601.0f);
+    EXPECT_FLOAT_EQ(r9[0], 1001.0f);
+    EXPECT_FLOAT_EQ(r9[DIMS - 1], static_cast<float>(1000 + DIMS));
 }
 
 TEST_F(DirectIoReaderTest, Dedup_StraddlePageBoundary) {

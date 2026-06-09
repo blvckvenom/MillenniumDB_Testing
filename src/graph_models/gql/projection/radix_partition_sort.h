@@ -60,6 +60,13 @@ public:
         // TO_FROM_EDGE) per design §3.6 D6. Default BTREE preserves
         // pre-Spec-#8 byte-identical RADIX output.
         BPT::GraphStorage graph_storage    = BPT::GraphStorage::BTREE;
+
+        // Keep the intermediate `.sorted_part_*.bin` files after Phase 3
+        // instead of removing them. The B+Tree (`.leaf` + `.dir`) remains
+        // the authoritative output either way; this exists so tests can
+        // inspect per-partition sort order post-hoc. Production callers
+        // leave it false.
+        bool keep_sorted_parts             = false;
     };
 
     explicit RadixPartitionSort(Config config);

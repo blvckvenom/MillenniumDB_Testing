@@ -244,13 +244,14 @@ MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
 
     if (hit) {
         auto tl0 = std::chrono::steady_clock::now();
-        mini.features = load_features(sample);
+        bool used_v2 = false;
+        mini.features = load_features(sample, &used_v2);
         auto tl1 = std::chrono::steady_clock::now();
         mini.timing.sample_read_ns      = sample_read_ns;
         mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(tl1 - tl0).count());
         if (feature_store_) {
-            mini.timing.used_addr_tables = feature_store_->last_used_addr_tables();
+            mini.timing.used_addr_tables = used_v2;
             mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
         }
         return mini;
@@ -350,9 +351,15 @@ bool BatchAssembler::load_self_contained_features_(uint64_t batch_id,
         mini.timing.addr_load_ns        = 0;
         return true;
     }
-    mini.features = load_features(ms);
+    // PER-CALL v2 dispatch outcome — the safety-net check below must NOT read
+    // the store's shared last_used_addr_tables() flag: under N>1 prefetch
+    // workers another worker's v2 success could overwrite it between our load
+    // and the check, masking a legacy fallback over the PLACEHOLDER sample
+    // (zero node contents -> silent wrong features).
+    bool used_v2 = false;
+    mini.features = load_features(ms, &used_v2);
     auto tl1 = std::chrono::steady_clock::now();
-    if (!feature_store_->last_used_addr_tables()) {
+    if (!used_v2) {
         if (!self_contained_fallback_warned_.exchange(true)) {
             std::cerr << "[BatchAssembler] self-contained: v2 addr_table did not "
                          "serve batch " << batch_id
@@ -680,19 +687,21 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
     // Round 2B (2026-05-15): pass the already-deserialized sample so the
     // FourLevelStore path skips re-reading the same ~55 MB sample file.
     auto t_load_start = std::chrono::steady_clock::now();
-    mini.features = load_features(sample);
+    bool used_v2 = false;
+    mini.features = load_features(sample, &used_v2);
     auto t_load_end = std::chrono::steady_clock::now();
     mini.timing.assembler_kernel_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             t_load_end - t_load_start).count());
 
     // STEP 6 (2026-05-31): capture the v2 addr-table dispatch result for THIS
-    // batch right after the load, while feature_store_->last_used_addr_tables()
-    // still refers to it. Carried on the MiniBatch so TrainingLoop reports
-    // correct v2 telemetry on the async-prefetcher path (the worker stamps
-    // here; the consumer reads after next()).
+    // batch, as reported per-call by load_features (the store's shared
+    // last_used_addr_tables() flag can be overwritten by a concurrent prefetch
+    // worker before we read it). Carried on the MiniBatch so TrainingLoop
+    // reports correct v2 telemetry on the async-prefetcher path (the worker
+    // stamps here; the consumer reads after next()).
     if (feature_store_) {
-        mini.timing.used_addr_tables = feature_store_->last_used_addr_tables();
+        mini.timing.used_addr_tables = used_v2;
         mini.timing.addr_load_ns     = feature_store_->last_addr_load_us() * 1000ULL;
     }
 
@@ -774,12 +783,15 @@ std::vector<torch::Tensor> BatchAssembler::build_edge_indices(
 // Private: load_features
 // =============================================================================
 
-torch::Tensor BatchAssembler::load_features(const GraphSample& sample) {
+torch::Tensor BatchAssembler::load_features(const GraphSample& sample,
+                                            bool* used_addr_tables) {
+    if (used_addr_tables) *used_addr_tables = false;
     if (feature_store_) {
         // Full mode: FourLevelStore handles all four tiers.
         // Round 2B (2026-05-15): pass the GraphSample directly so the store
-        // does not re-read it from disk inside load_batch_features.
-        return feature_store_->load_batch_features(sample);
+        // does not re-read it from disk inside load_batch_features. The store
+        // reports the per-call v2 dispatch outcome through the out-param.
+        return feature_store_->load_batch_features(sample, used_addr_tables);
     }
 
     // Fallback mode: FeatureMatrix + RowMapping

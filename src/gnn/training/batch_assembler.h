@@ -286,9 +286,11 @@ private:
      * case @p mini.timing.sample_read_ns == 0 — batches.dat was never touched).
      * Returns false to request the caller fall back to the legacy real-sample
      * path, which is always correct. THE LOAD-BEARING SAFETY NET: after
-     * load_features on the placeholder, we check feature_store_->
-     * last_used_addr_tables(); if v2 did NOT serve (addr_table stale/absent ->
-     * silent legacy v1 gather which DOES read node contents), the placeholder
+     * load_features on the placeholder, we check the PER-CALL v2 dispatch
+     * outcome it reports (NOT the store's shared last_used_addr_tables() flag,
+     * which a concurrent prefetch worker can overwrite between our load and
+     * the check); if v2 did NOT serve (addr_table stale/absent -> silent
+     * legacy v1 gather which DOES read node contents), the placeholder
      * features would be WRONG, so we discard and return false. A placeholder
      * MiniBatch is therefore NEVER returned with v1-gathered features.
      *
@@ -365,9 +367,16 @@ private:
      * from disk inside load_batch_features (eliminates the double-deserialize).
      *
      * @param sample  Source sample whose `all_unique_nodes` define the feature rows
+     * @param used_addr_tables  Optional out-param: whether THIS call was served
+     *                          by the FourLevelStore v2 (addr_table) path.
+     *                          Always false in FeatureMatrix-fallback mode.
+     *                          Per-call (safe under concurrent prefetch
+     *                          workers), unlike the store's shared
+     *                          last_used_addr_tables() telemetry flag.
      * @return [N, D] tensor matching the feature dtype
      */
-    torch::Tensor load_features(const GraphSample& sample);
+    torch::Tensor load_features(const GraphSample& sample,
+                                bool* used_addr_tables = nullptr);
 
     // Feature source — exactly one of the two is set.
     FourLevelStore*      feature_store_   = nullptr;  // full mode

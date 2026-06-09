@@ -129,6 +129,48 @@ public:
      */
     Result write_all();
 
+    // =========================================================================
+    // Property key allocation (Phase C)
+    // =========================================================================
+
+    /// First synthetic key id usable for embedding properties.  Matches the
+    /// base NativeProjectionBuilder uses for synthetic keys
+    /// (RENAME_KEY_SYNTHETIC_START = 2000), so dynamically allocated ids
+    /// never dip below the build-time synthetic range.
+    static constexpr uint64_t EMBEDDING_KEY_SYNTHETIC_BASE = 2000;
+
+    /**
+     * @brief Compute the next free synthetic key id for a new node property.
+     *
+     * Returns max(EMBEDDING_KEY_SYNTHETIC_BASE, highest id in use + 1).
+     * Both key namespaces are scanned because NativeProjectionBuilder
+     * allocates node and edge synthetic ids from a single shared counter.
+     *
+     * @param node_keys Projection's node key name -> id map
+     * @param edge_keys Projection's edge key name -> id map
+     */
+    static uint64_t next_available_key_id(
+        const std::unordered_map<std::string, uint64_t>& node_keys,
+        const std::unordered_map<std::string, uint64_t>& edge_keys);
+
+    /**
+     * @brief Resolve (or allocate and register) the key id for a node property.
+     *
+     * Re-syncs key mappings from the on-disk projection catalog first —
+     * ProjectionStorage::open() restores statistics but not the key maps, so
+     * without the re-sync a property persisted by an earlier session would be
+     * re-allocated under a colliding id and the next save_catalog() would
+     * drop every previously registered key.  An already-registered name
+     * returns its existing id; otherwise a fresh id strictly above every id
+     * in use is registered and returned.
+     *
+     * @throws std::runtime_error if the chosen id is already bound to a
+     *         different property name, or the registration does not stick.
+     */
+    static uint64_t resolve_property_key_id(
+        GQL::ProjectionStorage& storage,
+        const std::string&      property_name);
+
 private:
     // =========================================================================
     // Phase A: Seed embedding collection

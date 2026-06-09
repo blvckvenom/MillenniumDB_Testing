@@ -16,6 +16,12 @@
 //      with controlled frequency + budgets: highest-frequency nodes pack
 //      into tier 1, next into tier 2, rest into tier 3. Includes the
 //      "budget covers the graph → all tier 1" edge case.
+//   5. ColdStart_TaggedNodeIds_ProfilesRealDegrees — same as (1)/(3) but
+//      over a projection whose node ObjectIds carry the production type
+//      tag (`ObjectId::MASK_NODE`, 0xD4...), so the edge B+Tree keys are
+//      tagged uint64s. Guards against the cold path ranging the B+Tree
+//      with bare ordinals (which matches nothing and silently profiles
+//      every node as degree 0).
 //
 // Mirrors the fixture style of topology_accessor_adjacency_cache_test.cc
 // so both suites can share the process-lifetime System singleton when run
@@ -131,7 +137,13 @@ struct BuiltFixture {
     fs::path projection_dir;
 };
 
-BuiltFixture build_asym_storage(const std::string& projection_name) {
+// `node_id_tag` / `edge_id_tag` let a test mirror the production id shape
+// (projected nodes carry `ObjectId::MASK_NODE` in the top 8 bits, edges
+// `ObjectId::MASK_DIRECTED_EDGE`); the defaults preserve the original
+// untagged synthetic shape.
+BuiltFixture build_asym_storage(const std::string& projection_name,
+                                uint64_t node_id_tag = 0,
+                                uint64_t edge_id_tag = 0) {
     auto& manager = GQL::ProjectionManager::get_instance();
     std::string proj_dir = manager.create_projection(projection_name);
 
@@ -143,14 +155,14 @@ BuiltFixture build_asym_storage(const std::string& projection_name) {
 
     for (uint64_t i = 0; i < AsymGraph::kNumNodes; ++i) {
         GQL::ProjectedNode node;
-        node.node_id = ObjectId(i);
+        node.node_id = ObjectId(node_id_tag | i);
         storage->add_node(node);
     }
     for (const auto& [from, to, eid] : AsymGraph::edges()) {
         GQL::ProjectedEdge edge;
-        edge.from_node   = ObjectId(from);
-        edge.to_node     = ObjectId(to);
-        edge.edge_id     = ObjectId(eid);
+        edge.from_node   = ObjectId(node_id_tag | from);
+        edge.to_node     = ObjectId(node_id_tag | to);
+        edge.edge_id     = ObjectId(edge_id_tag | eid);
         edge.is_directed = true;
         storage->add_edge(edge);
     }
@@ -333,4 +345,65 @@ TEST(TopologyFrequencyProfiler, TierAssignment_RespectsBudgets) {
     // (d) Empty frequency vector → empty result.
     auto tiers_empty = mdb::gnn::compute_tier_assignment({}, 1024, 1024, 4.0);
     EXPECT_TRUE(tiers_empty.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — ColdStart_TaggedNodeIds_ProfilesRealDegrees.
+//
+// Production projections store node ObjectIds WITH the 8-bit type tag
+// (`ObjectId::MASK_NODE` = 0xD4ULL << 56 | ordinal), so the projection's
+// edge B+Tree keys are tagged uint64s. The cold-start degree pass must
+// range those B+Trees with ids that carry the tag; querying bare ordinals
+// matches no key and silently yields an all-zero frequency vector (and
+// thus a blind tier assignment that accounts only fixed per-node overhead).
+// The frequency vector must stay indexed by dense row ordinal — i.e. the
+// tag-stripped value — matching the untagged expectations of Test 1/3.
+// ---------------------------------------------------------------------------
+TEST(TopologyFrequencyProfiler, ColdStart_TaggedNodeIds_ProfilesRealDegrees) {
+    (void)MdbFixture::instance();
+    auto fx = build_asym_storage("freq_profiler_tagged_cold_start",
+                                 ObjectId::MASK_NODE,
+                                 ObjectId::MASK_DIRECTED_EDGE);
+
+    mdb::gnn::TopologyAccessor acc(*fx.storage);
+    mdb::gnn::TopologyFrequencyProfiler profiler(acc, fx.projection_dir);
+
+    const auto out_d = AsymGraph::out_degrees();
+    const auto in_d  = AsymGraph::in_degrees();
+
+    // NATURAL -> out_degree
+    profiler.compute(mdb::gnn::EdgeOrientation::NATURAL);
+    EXPECT_FALSE(profiler.warm_start_used());
+    {
+        const auto& f = profiler.frequency();
+        ASSERT_EQ(f.size(), out_d.size());
+        uint64_t total = 0;
+        for (std::size_t i = 0; i < f.size(); ++i) {
+            EXPECT_EQ(f[i], out_d[i]) << "NATURAL tagged node " << i;
+            total += f[i];
+        }
+        // The core regression check: a tagged projection with edges must
+        // never profile as all-zero.
+        EXPECT_GT(total, 0u);
+    }
+
+    // REVERSE -> in_degree
+    profiler.compute(mdb::gnn::EdgeOrientation::REVERSE);
+    {
+        const auto& f = profiler.frequency();
+        ASSERT_EQ(f.size(), in_d.size());
+        for (std::size_t i = 0; i < f.size(); ++i) {
+            EXPECT_EQ(f[i], in_d[i]) << "REVERSE tagged node " << i;
+        }
+    }
+
+    // UNDIRECTED -> out + in
+    profiler.compute(mdb::gnn::EdgeOrientation::UNDIRECTED);
+    {
+        const auto& f = profiler.frequency();
+        ASSERT_EQ(f.size(), out_d.size());
+        for (std::size_t i = 0; i < f.size(); ++i) {
+            EXPECT_EQ(f[i], out_d[i] + in_d[i]) << "UNDIRECTED tagged node " << i;
+        }
+    }
 }

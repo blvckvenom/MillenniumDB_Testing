@@ -383,6 +383,41 @@ else()
 endif()
 
 # ============================================================================
+# Parallel edge-scan abort/exception-propagation unit tests
+# ============================================================================
+if(GTest_FOUND)
+    add_executable(native_scanner_parallel_abort_test
+        ${CMAKE_SOURCE_DIR}/src/tests/native_scanner_parallel_abort_test.cc
+    )
+    set_target_properties(native_scanner_parallel_abort_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # Same link-order constraint as radix_partition_sort_test: gtest_main
+    # must precede millenniumdb so its main() wins over serdi.cc's.
+    target_link_libraries(native_scanner_parallel_abort_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(native_scanner_parallel_abort_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME NativeScannerParallelAbortTests
+        COMMAND $<TARGET_FILE:native_scanner_parallel_abort_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # Serial scan pipeline unit tests (Spec #2, TDD-gated)
 # ============================================================================
 if(GTest_FOUND AND

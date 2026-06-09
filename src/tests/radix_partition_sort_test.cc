@@ -27,6 +27,7 @@
 #include "graph_models/gql/projection/partition_file.h"
 #include "graph_models/gql/projection/radix_partition_sort.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
+#include "graph_models/gql/projection/spill_codec.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/record.h"
@@ -84,12 +85,16 @@ TEST(RadixPartitionSort, Phase1RecordsRoutedByRadix) {
 }
 
 // --- Test 3: Phase 2 each partition is sorted ---
+// keep_sorted_parts retains the `.sorted_part_*.bin` files that Phase 3
+// normally removes as cleanup, so the per-partition sortedness assertions
+// below run against real data instead of vacuously skipping missing files.
 TEST(RadixPartitionSort, Phase2EachPartitionIsSorted) {
     wipe_scratch();
     GQL::RadixPartitionSort<3>::Config cfg;
     cfg.scratch_dir = kScratchBase;
     cfg.min_partitions = 8;
     cfg.max_partitions = 8;
+    cfg.keep_sorted_parts = true;
     GQL::RadixPartitionSort<3> rps(cfg);
 
     GQL::StreamingRecordBuffer<3> input("/tmp/test_input3");
@@ -102,21 +107,35 @@ TEST(RadixPartitionSort, Phase2EachPartitionIsSorted) {
     std::size_t written = rps.sort_and_write("/tmp/test_output3");
 
     ASSERT_GT(written, 0u);
+    std::size_t parts_inspected = 0;
+    std::size_t records_seen = 0;
     for (std::size_t p = 0; p < 8; ++p) {
         std::string path = "/tmp/test_output3.sorted_part_" + std::to_string(p) + ".bin";
         if (!fs::exists(path)) continue;
+        ++parts_inspected;
         std::ifstream in(path, std::ios::binary);
         Record<3> prev{};
         Record<3> curr{};
         bool first = true;
         while (in.read(reinterpret_cast<char*>(&curr), sizeof(curr))) {
+            ++records_seen;
             if (!first) {
                 ASSERT_FALSE(curr < prev) << "non-monotonic in partition " << p;
             }
             prev = curr;
             first = false;
         }
+        fs::remove(path);
     }
+    ASSERT_GT(parts_inspected, 0u)
+        << "no .sorted_part_*.bin file survived sort_and_write despite "
+           "keep_sorted_parts — the sortedness loop above never ran";
+    // 10000 distinct fixed-seed records: the pre-dedup partition contents
+    // must carry exactly the records Phase 3 counted as written.
+    ASSERT_EQ(records_seen, written)
+        << "sorted partition files are missing records";
+    fs::remove("/tmp/test_output3.leaf");
+    fs::remove("/tmp/test_output3.dir");
 }
 
 // --- Test 4: Concatenation is globally sorted (SUPERSEDED by Task 13) ---
@@ -234,6 +253,32 @@ TEST(RadixPartitionSort, FallbackExternalWhenPartitionOversized) {
     rps.scan_and_partition(input, 500);
     std::size_t written = rps.sort_and_write("/tmp/test_output9");
     ASSERT_EQ(written, 500u);
+}
+
+// --- Test 9b: Phase 2 write failure must throw, not silently truncate ---
+// An unopenable output path stands in for any Phase 2 write failure
+// (ENOSPC, EIO, ...). With unchecked streams every ofstream write silently
+// no-ops, Phase 3 then sees zero sorted partitions and emits a
+// structurally-valid EMPTY B+Tree while sort_and_write returns 0 — total
+// silent data loss. The checked Phase 2 streams must surface the failure
+// as an exception instead.
+TEST(RadixPartitionSort, Phase2WriteFailureThrows) {
+    wipe_scratch();
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir = kScratchBase;
+    cfg.min_partitions = 8;
+    cfg.max_partitions = 8;
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input("/tmp/test_input_wfail");
+    for (std::uint64_t i = 1; i <= 100; ++i) {
+        input.push_back(Record<3>{{i, i + 1, i + 2}});
+    }
+    rps.scan_and_partition(input, 100);
+    // The parent directory does not exist, so every Phase 2 output open
+    // fails — the same observable state a short write leaves behind.
+    EXPECT_THROW(rps.sort_and_write("/tmp/radix_sort_test_no_such_dir/out"),
+                 std::runtime_error);
 }
 
 // --- Test 10: Cleanup on exception ---
@@ -612,4 +657,97 @@ TEST(RadixPartitionSortPhase1, ParallelDeterministicRepeatedRuns) {
         << "RADIX parallel Phase 1 path is non-deterministic across repeated runs";
 
     unsetenv("MDB_PROJECTION_RADIX_GPU");
+}
+
+// Spilled iteration must yield exactly the records that were pushed. The
+// spilled-mode has_next() used to infer exhaustion from positional state
+// (current spill file index + read buffer), which only advances inside the
+// next read attempt: after the last chunk of the last file was consumed it
+// still reported one more record, and next() then indexed an empty read
+// buffer (out-of-bounds read).
+TEST(StreamingRecordBuffer, SpilledIterationYieldsExactlyNRecords) {
+    // 437 records with a 300-record memory threshold produce two spill files
+    // (300 + 137 records); the 300-record file is read in two chunks
+    // (RECORDS_PER_PAGE = 170 for N = 3), so iteration crosses both chunk
+    // and file boundaries.
+    constexpr std::size_t kNumRecords       = 437;
+    constexpr std::size_t kThresholdRecords = 300;
+    GQL::StreamingRecordBuffer<3> buffer(
+        "/tmp/test_srb_exact",
+        kThresholdRecords * 3 * sizeof(std::uint64_t));
+
+    for (std::uint64_t i = 0; i < kNumRecords; i++) {
+        buffer.push_back(Record<3>{{ i, i + 1000, i + 2000 }});
+    }
+    buffer.finalize();
+    ASSERT_TRUE(buffer.has_spilled());
+    ASSERT_EQ(buffer.get_spill_paths().size(), 2u);
+    ASSERT_EQ(buffer.size(), kNumRecords);
+
+    buffer.begin_iteration();
+    std::uint64_t count = 0;
+    while (buffer.has_next()) {
+        ASSERT_LT(count, kNumRecords) << "iteration emitted a record past the end";
+        const Record<3>& rec = buffer.next();
+        EXPECT_EQ(rec[0], count);
+        EXPECT_EQ(rec[1], count + 1000);
+        EXPECT_EQ(rec[2], count + 2000);
+        count++;
+    }
+    EXPECT_EQ(count, kNumRecords);
+}
+
+// A spill file shorter than its recorded record count must surface as an
+// exception from next() instead of indexing an empty read buffer or spinning
+// forever on a reader that keeps returning 0 bytes.
+//
+// Compression-mode note: resolve_default_spill_compression() is cached
+// process-wide on its first call (spill_codec.h), so when this binary runs
+// the full suite, earlier StreamingRecordBuffer constructions have already
+// pinned the compiled default (LZ4 when HAS_LZ4) and setting
+// MDB_SPILL_COMPRESSION here would be silently ignored. The truncation
+// point below therefore lands differently per mode:
+//   - NONE: the cut is at an exact record boundary — file 1 keeps 1 of its
+//     3 records, so 5 records are readable before the throw.
+//   - LZ4:  the cut lands mid-frame — file 1 decodes to nothing, so only
+//     the 4 records of the intact file 0 are readable before the throw.
+// Either way the regression contract of the honest-has_next fix holds: a
+// full drain loop must throw std::runtime_error from next() after serving
+// at least every record of the intact first file and strictly fewer than
+// the recorded total — never index an empty read buffer or spin forever.
+TEST(StreamingRecordBuffer, TruncatedSpillFileThrowsMidIteration) {
+    constexpr std::size_t  kThresholdRecords = 4;
+    constexpr std::uint64_t kNumRecords      = 7;
+    GQL::StreamingRecordBuffer<3> buffer(
+        "/tmp/test_srb_trunc",
+        kThresholdRecords * 3 * sizeof(std::uint64_t));
+    for (std::uint64_t i = 0; i < kNumRecords; i++) {
+        buffer.push_back(Record<3>{{ i, i, i }});
+    }
+    buffer.finalize();
+    ASSERT_EQ(buffer.get_spill_paths().size(), 2u);  // 4 + 3 records
+
+    // Truncate the second spill file (3 records) down to one record's worth
+    // of payload bytes.
+    fs::resize_file(buffer.get_spill_paths()[1],
+                    GQL::SpillFormat::HEADER_SIZE + 1 * 3 * sizeof(std::uint64_t));
+
+    buffer.begin_iteration();
+    std::uint64_t drained = 0;
+    EXPECT_THROW(
+        {
+            while (buffer.has_next()) {
+                buffer.next();
+                drained++;
+            }
+        },
+        std::runtime_error);
+
+    // The intact first spill file (4 records) must have been served in
+    // full before the truncation was detected...
+    EXPECT_GE(drained, 4u);
+    // ...and the unreadable truncated tail must NOT have been fabricated:
+    // pre-fix, the positional has_next() over-reported and next() indexed
+    // an empty read buffer instead of throwing.
+    EXPECT_LT(drained, kNumRecords);
 }

@@ -157,32 +157,54 @@ bool TopologyFrequencyProfiler::compute_from_node_counts_(EdgeOrientation direct
 
 void TopologyFrequencyProfiler::compute_from_degrees_(EdgeOrientation direction) {
     const uint64_t n = topo_.get_node_count();
-    frequency_.clear();
-    frequency_.reserve(static_cast<std::size_t>(n));
 
-    // Phase 1 cold-start path: query degree for each row index in [0..n).
-    // The unit-test fixtures (and the projection import pipeline at
-    // present) assign sequential ObjectIds 0..N-1 to projected nodes, so
-    // the resulting frequency vector aligns with the projection's node
-    // B+Tree iteration order. Phase 2 (`compute_from_node_counts_`) will
-    // align by RowMapping when warm-start counts persist.
-    for (uint64_t i = 0; i < n; ++i) {
-        const ObjectId node_id(i);
-        uint64_t freq = 0;
-        switch (direction) {
-            case EdgeOrientation::NATURAL:
-                freq = static_cast<uint64_t>(topo_.get_out_degree(node_id));
-                break;
-            case EdgeOrientation::REVERSE:
-                freq = static_cast<uint64_t>(topo_.get_in_degree(node_id));
-                break;
-            case EdgeOrientation::UNDIRECTED:
-                freq = static_cast<uint64_t>(topo_.get_out_degree(node_id))
-                     + static_cast<uint64_t>(topo_.get_in_degree(node_id));
-                break;
+    // Cold-start path: query degree for each dense row ordinal in [0..n).
+    //
+    // The projection's edge B+Trees key records by the FULL ObjectId — the
+    // 8-bit type tag plus the 56-bit value. Production projected nodes carry
+    // `ObjectId::MASK_NODE` (0xD4'00...) and enumerate row ordinals 0..N-1
+    // in the value bits (`row_idx == ObjectId.id & VALUE_MASK`, the same
+    // invariant `FourLevelTopologyStore::row_lookup_` and the Spec #4-B
+    // sidecar ROW_PTR layout rely on). Ranging with the bare ordinal
+    // `ObjectId(i)` matches no tagged key, so every node would profile as
+    // degree 0 — collapsing `avg_degree` to 0 and letting the L1/L2 budget
+    // account only the fixed per-node overhead against a 56 + 16*deg
+    // reality. Query with the tagged id first; if the whole pass comes back
+    // empty while the projection does contain edges, retry with the raw
+    // ordinal so synthetic builds whose nodes were stored untagged keep
+    // profiling correctly. The resulting vector stays indexed by row
+    // ordinal in both cases.
+    constexpr uint64_t id_tags[] = { ObjectId::MASK_NODE, 0 };
+    for (const uint64_t tag : id_tags) {
+        frequency_.assign(static_cast<std::size_t>(n), 0);
+        bool any_degree = false;
+        for (uint64_t i = 0; i < n; ++i) {
+            const ObjectId node_id(tag | i);
+            uint64_t freq = 0;
+            switch (direction) {
+                case EdgeOrientation::NATURAL:
+                    freq = static_cast<uint64_t>(topo_.get_out_degree(node_id));
+                    break;
+                case EdgeOrientation::REVERSE:
+                    freq = static_cast<uint64_t>(topo_.get_in_degree(node_id));
+                    break;
+                case EdgeOrientation::UNDIRECTED:
+                    freq = static_cast<uint64_t>(topo_.get_out_degree(node_id))
+                         + static_cast<uint64_t>(topo_.get_in_degree(node_id));
+                    break;
+            }
+            frequency_[static_cast<std::size_t>(i)] = freq;
+            any_degree = any_degree || (freq != 0);
         }
-        frequency_.push_back(freq);
+        if (any_degree || topo_.get_edge_count() == 0) {
+            return;
+        }
     }
+
+    std::cerr << "[TopologyFrequencyProfiler] WARNING: degree profile is "
+              << "all-zero despite edge_count=" << topo_.get_edge_count()
+              << "; tier assignment will run blind (per-node cost may be "
+              << "underestimated).\n";
 }
 
 std::vector<uint8_t> compute_tier_assignment(

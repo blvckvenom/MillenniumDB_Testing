@@ -107,6 +107,15 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     }
     validate_projection_name(graph_name);
 
+    // Refuse duplicate names up-front, before any build state exists.
+    // NativeProjectionBuilder's constructor performs the same check, but by
+    // then the rollback in Step 10 is armed and would tear down the
+    // PRE-EXISTING projection directory instead of just failing. Message
+    // kept identical to ProjectionManager::create_projection.
+    if (ProjectionManager::get_instance().projection_exists(graph_name)) {
+        throw std::runtime_error("Projection '" + graph_name + "' already exists");
+    }
+
     // Step 3: Parse optional config map ONCE (needed for global defaults)
     std::vector<std::string> global_node_properties;
     std::vector<std::string> global_edge_properties;
@@ -471,8 +480,15 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // Rollback guard: if any step of the build fails, remove the
     // half-written projection directory so the user can retry with the
     // same name. Without this we leave zombie dirs that block re-creation.
+    // `build_started` scopes the cleanup to state created by THIS call: it
+    // is set before the builder constructor because the constructor can
+    // fail after registering the projection directory (e.g. storage init),
+    // and the duplicate-name check in Step 2 guarantees nothing was
+    // registered under graph_name before this point.
     NativeProjectionBuilder::Statistics stats;
+    bool build_started = false;
     try {
+        build_started = true;
         NativeProjectionBuilder builder(
             graph_name,
             db_folder,
@@ -501,11 +517,15 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     } catch (...) {
         // Best-effort cleanup of partial state before re-throwing so the
         // caller sees the original error (converted to HTTP 500 upstream).
-        try {
-            ProjectionManager::get_instance().drop_projection(graph_name);
-        } catch (...) {
-            // If cleanup itself fails, swallow — the user will need to
-            // inspect the projections directory manually.
+        // Only drop when this invocation started the build — never a
+        // projection that existed before this call.
+        if (build_started) {
+            try {
+                ProjectionManager::get_instance().drop_projection(graph_name);
+            } catch (...) {
+                // If cleanup itself fails, swallow — the user will need to
+                // inspect the projections directory manually.
+            }
         }
         throw;
     }

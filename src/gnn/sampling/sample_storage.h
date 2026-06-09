@@ -174,11 +174,27 @@ public:
      * @brief Finalize storage after writing all samples.
      *
      * Must be called after all samples are written and before reading.
-     * Updates catalog with final statistics.
+     * Updates catalog with final statistics. This is the explicit COMMIT of
+     * the write phase: only a finalized sample has a catalog on disk.
      *
      * @throws std::runtime_error if finalization fails
      */
     void finalize();
+
+    /**
+     * @brief Abort an in-progress write, discarding the partial sample.
+     *
+     * Closes the write streams WITHOUT writing the index, frequency, or
+     * catalog files, then removes the partial storage directory. The sample
+     * therefore never looks valid on disk: readers cannot open a truncated
+     * sample and a re-run of `create()` does not fail with "already exists".
+     *
+     * No-op in read mode or after a successful finalize(). Called
+     * automatically by the destructor when a write-mode storage is destroyed
+     * without an explicit finalize() — e.g. when a sampling run threw or was
+     * cancelled.
+     */
+    void abort();
 
     // =========================================================================
     // Read Interface

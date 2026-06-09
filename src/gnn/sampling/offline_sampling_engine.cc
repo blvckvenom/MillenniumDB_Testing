@@ -649,8 +649,18 @@ struct OfflineSamplingEngine::Impl {
                 }
             }
 
-            // Finalize storage
-            sample_storage.finalize();
+            // Commit the sample only when the run completed. A cancelled run
+            // must not leave a self-consistent catalog on disk: abort()
+            // discards the partial sample so a re-run does not fail with
+            // "already exists" and downstream consumers cannot open a
+            // truncated sample. The worker-exception path (rethrow above)
+            // unwinds past this point; the SampleStorage destructor then
+            // aborts the partial write for the same reason.
+            if (result.cancelled) {
+                sample_storage.abort();
+            } else {
+                sample_storage.finalize();
+            }
 
             // Spec #13 Phase 5 (T13.2 writer half) — persist
             // `<projection_dir>/node_counts.bin` so the next

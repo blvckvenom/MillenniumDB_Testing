@@ -132,3 +132,105 @@ TEST_F(SampleStorageCacheTest, DisableClearsCache) {
     EXPECT_EQ(s.bytes, 0u);
     EXPECT_EQ(s.budget, 0u);
 }
+
+// Commit/abort protocol of the write phase: only an explicit finalize()
+// persists a valid catalog; destruction (or abort()) without finalize must
+// discard the partial sample so re-runs don't hit "already exists" and
+// readers cannot consume a truncated sample.
+class SampleStorageCommitTest : public GnnStorageTest {
+protected:
+    fs::path db_folder_;
+
+    void SetUp() override {
+        GnnStorageTest::SetUp();
+        db_folder_ = test_dir_ / "db_commit";
+        fs::create_directories(db_folder_);
+    }
+
+    SamplingConfig make_config(const std::string& sample_name) {
+        SamplingConfig config;
+        config.projection_name = "p";
+        config.sample_name = sample_name;
+        config.fanouts = {2};
+        config.batch_size = 4;
+        config.train_ratio = 1.0;
+        config.val_ratio = 0.0;
+        config.test_ratio = 0.0;
+        return config;
+    }
+
+    GraphSample make_sample(uint64_t bid) {
+        GraphSample s;
+        s.batch_id = bid;
+        s.split = SplitType::TRAIN;
+        s.nodes_per_layer.resize(2);
+        ObjectId seed(0xD400000000000000ULL | (bid * 100));
+        ObjectId nb(0xD400000000000000ULL | (bid * 100 + 50));
+        s.nodes_per_layer[0].push_back(seed);
+        s.nodes_per_layer[1].push_back(nb);
+        s.all_unique_nodes.push_back(seed);
+        s.all_unique_nodes.push_back(nb);
+        return s;
+    }
+};
+
+TEST_F(SampleStorageCommitTest, FinalizeCommitsValidSample) {
+    auto config = make_config("s_commit");
+    {
+        auto storage = SampleStorage::create(db_folder_, config);
+        storage.write_sample(make_sample(0));
+        storage.finalize();
+    }
+    EXPECT_TRUE(SampleStorage::exists(db_folder_, "s_commit"));
+    auto st = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "s_commit"));
+    EXPECT_EQ(st.get_catalog().total_batches, 1u);
+    EXPECT_EQ(st.read_sample(0).batch_id, 0u);
+}
+
+TEST_F(SampleStorageCommitTest, DestroyWithoutFinalizeDiscardsPartialSample) {
+    auto config = make_config("s_partial");
+    auto path = SampleStorage::get_storage_path(db_folder_, "s_partial");
+    {
+        auto storage = SampleStorage::create(db_folder_, config);
+        storage.write_sample(make_sample(0));
+        // No finalize(): simulates a failed/cancelled run unwinding.
+    }
+    EXPECT_FALSE(SampleStorage::exists(db_folder_, "s_partial"));
+    EXPECT_FALSE(fs::exists(path));
+    EXPECT_THROW(SampleStorage::open(path), std::runtime_error);
+
+    // A re-run with the same sample_name must not fail with "already exists".
+    auto retry = SampleStorage::create(db_folder_, config);
+    retry.write_sample(make_sample(0));
+    retry.finalize();
+    EXPECT_TRUE(SampleStorage::exists(db_folder_, "s_partial"));
+}
+
+TEST_F(SampleStorageCommitTest, ExplicitAbortDiscardsPartialSample) {
+    auto config = make_config("s_abort");
+    auto path = SampleStorage::get_storage_path(db_folder_, "s_abort");
+    auto storage = SampleStorage::create(db_folder_, config);
+    storage.write_sample(make_sample(0));
+    storage.abort();
+    EXPECT_FALSE(SampleStorage::exists(db_folder_, "s_abort"));
+    EXPECT_FALSE(fs::exists(path));
+    EXPECT_FALSE(storage.is_write_mode());
+    // Writes after abort are rejected.
+    EXPECT_THROW(storage.write_sample(make_sample(1)), std::runtime_error);
+    // Idempotent: a second abort (and the destructor) must not resurrect it.
+    storage.abort();
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST_F(SampleStorageCommitTest, AbortAfterFinalizeIsNoOp) {
+    auto config = make_config("s_committed");
+    auto storage = SampleStorage::create(db_folder_, config);
+    storage.write_sample(make_sample(0));
+    storage.finalize();
+    storage.abort();  // must not discard a committed sample
+    EXPECT_TRUE(SampleStorage::exists(db_folder_, "s_committed"));
+    auto st = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "s_committed"));
+    EXPECT_EQ(st.get_catalog().total_batches, 1u);
+}

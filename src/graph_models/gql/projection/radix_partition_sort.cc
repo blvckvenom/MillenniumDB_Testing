@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bitset>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -19,6 +20,7 @@
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
@@ -34,6 +36,44 @@
 namespace fs = std::filesystem;
 
 namespace GQL {
+
+namespace {
+
+// Phase 2 emits its `.sorted_part_*.bin` files through std::ofstream, which
+// swallows I/O failures by default: a short write (e.g. ENOSPC) would leave
+// a truncated file that the Phase 3 reader consumes as a clean EOF,
+// producing a structurally-valid B+Tree silently missing records. Every
+// Phase 2 output stream therefore goes through these helpers, which arm the
+// stream's exception mask and convert failures into std::runtime_error with
+// errno context.
+std::ofstream open_checked_output(const std::string& path) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) {
+        throw std::runtime_error(
+            "RadixPartitionSort: cannot open " + path + " for writing: "
+            + std::strerror(errno));
+    }
+    out.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+    return out;
+}
+
+[[noreturn]] void throw_write_error(const std::string& path) {
+    throw std::runtime_error(
+        "RadixPartitionSort: write to " + path + " failed: "
+        + std::strerror(errno));
+}
+
+// close() flushes the stdio buffer; with the exception mask armed a flush
+// failure surfaces here instead of being dropped by the ofstream destructor.
+void close_checked_output(std::ofstream& out, const std::string& path) {
+    try {
+        out.close();
+    } catch (const std::ios_base::failure&) {
+        throw_write_error(path);
+    }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Phase 3: concatenate sorted per-partition files into B+Tree leaves.
@@ -492,28 +532,51 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
         adaptive_memory_budget,
         config_.worker_memory_budget,
         config_.num_workers);
-    (void)num_workers;  // passed to TBB via default arena; grain 1 already set
+    // Bound Phase 2 concurrency to the memory-capped worker count. Each
+    // in-flight partition sort buffers up to worker_memory_budget bytes, so
+    // dispatching on the default arena (up to hardware_concurrency workers)
+    // would multiply transient RSS far beyond the
+    // O(num_workers × worker_memory_budget) bound that compute_num_workers
+    // derives (ADR 004 §peak-RSS).
+    tbb::task_arena arena(static_cast<int>(num_workers));
 
     // Dispatch partitions across workers via tbb::parallel_for.
-    tbb::parallel_for(
-        tbb::blocked_range<std::size_t>(0, num_partitions_, 1),
-        [&](const tbb::blocked_range<std::size_t>& r) {
-            for (std::size_t p = r.begin(); p < r.end(); ++p) {
-                std::string sorted_path = output_base_path +
-                    ".sorted_part_" + std::to_string(p) + ".bin";
-                // Decide in-memory vs external.
-                std::uintmax_t sz = fs::file_size(partition_paths_[p]);
-                if (sz <= config_.worker_memory_budget) {
-                    sort_partition_in_memory(p, sorted_path);
-                } else {
-                    sort_partition_external(p, sorted_path);
-                }
-                // Release free heap pages to the kernel between sorts.
+    arena.execute([&] {
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, num_partitions_, 1),
+            [&](const tbb::blocked_range<std::size_t>& r) {
+                for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                    std::string sorted_path = output_base_path +
+                        ".sorted_part_" + std::to_string(p) + ".bin";
+                    // Decide in-memory vs external.
+                    std::uintmax_t sz = fs::file_size(partition_paths_[p]);
+                    if (sz <= config_.worker_memory_budget) {
+                        sort_partition_in_memory(p, sorted_path);
+                    } else {
+                        sort_partition_external(p, sorted_path);
+                    }
+                    // Consistency cross-check: Phase 2 sorts without
+                    // deduplicating, so the sorted output must carry exactly
+                    // the bytes of its input partition. A mismatch means a
+                    // short read or short write slipped past the per-call
+                    // checks; failing here beats handing Phase 3 a truncated
+                    // partition it would consume as a clean EOF.
+                    std::uintmax_t sorted_sz = fs::file_size(sorted_path);
+                    if (sorted_sz != sz) {
+                        throw std::runtime_error(
+                            "RadixPartitionSort: sorted partition "
+                            + sorted_path + " holds "
+                            + std::to_string(sorted_sz)
+                            + " bytes but its input partition holds "
+                            + std::to_string(sz) + " bytes");
+                    }
+                    // Release free heap pages to the kernel between sorts.
 #if defined(__GLIBC__)
-                malloc_trim(0);
+                    malloc_trim(0);
 #endif
-            }
-        });
+                }
+            });
+    });
 
     // Phase 3: concatenate sorted partitions into B+Tree leaves.
     // The radix-prefix property guarantees global sorted order without a
@@ -534,9 +597,12 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
         config_.leaf_format, config_.graph_storage);
 
     // Cleanup intermediate per-partition sorted files — the B+Tree
-    // (`.leaf` + `.dir`) is now the authoritative output.
-    for (const auto& p : sorted_paths) {
-        try { fs::remove(p); } catch (...) { /* best-effort cleanup */ }
+    // (`.leaf` + `.dir`) is now the authoritative output. Tests may set
+    // keep_sorted_parts to inspect per-partition sort order post-hoc.
+    if (!config_.keep_sorted_parts) {
+        for (const auto& p : sorted_paths) {
+            try { fs::remove(p); } catch (...) { /* best-effort cleanup */ }
+        }
     }
 
     return total_written;
@@ -601,11 +667,15 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
             cpu_only != nullptr;
 
         if (!radix_gpu_disabled && !buffer.empty()) {
-            std::ofstream out(sorted_output_path, std::ios::binary);
+            std::ofstream out = open_checked_output(sorted_output_path);
             std::function<void(const Record<N>&)> emit =
-                [&out](const Record<N>& rec) {
-                    out.write(reinterpret_cast<const char*>(&rec),
-                              sizeof(Record<N>));
+                [&out, &sorted_output_path](const Record<N>& rec) {
+                    try {
+                        out.write(reinterpret_cast<const char*>(&rec),
+                                  sizeof(Record<N>));
+                    } catch (const std::ios_base::failure&) {
+                        throw_write_error(sorted_output_path);
+                    }
                 };
 
             mdb::gpu::PlannerConfig pcfg;
@@ -630,6 +700,7 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
                 // sort_and_stream moved out of `buffer` and either sorted on
                 // GPU or on CPU; either way the records are now in
                 // `sorted_output_path`.
+                close_checked_output(out, sorted_output_path);
                 return;
             }
             // EXTERNAL_SORT decision (planner returned false): fall through
@@ -640,9 +711,14 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
 #endif  // MDB_GPU_ENABLED
 
     std::sort(buffer.begin(), buffer.end());
-    std::ofstream out(sorted_output_path, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(buffer.data()),
-              buffer.size() * sizeof(Record<N>));
+    std::ofstream out = open_checked_output(sorted_output_path);
+    try {
+        out.write(reinterpret_cast<const char*>(buffer.data()),
+                  buffer.size() * sizeof(Record<N>));
+    } catch (const std::ios_base::failure&) {
+        throw_write_error(sorted_output_path);
+    }
+    close_checked_output(out, sorted_output_path);
 }
 
 template<std::size_t N>
@@ -676,9 +752,14 @@ void RadixPartitionSort<N>::sort_partition_external(
                 if (chunk.size() >= chunk_cap) {
                     std::sort(chunk.begin(), chunk.end());
                     std::string run_path = sorted_output_path + ".run_" + std::to_string(run_idx++);
-                    std::ofstream run_out(run_path, std::ios::binary);
-                    run_out.write(reinterpret_cast<const char*>(chunk.data()),
-                                  chunk.size() * sizeof(Record<N>));
+                    std::ofstream run_out = open_checked_output(run_path);
+                    try {
+                        run_out.write(reinterpret_cast<const char*>(chunk.data()),
+                                      chunk.size() * sizeof(Record<N>));
+                    } catch (const std::ios_base::failure&) {
+                        throw_write_error(run_path);
+                    }
+                    close_checked_output(run_out, run_path);
                     run_paths.push_back(run_path);
                     chunk.clear();
                 }
@@ -687,9 +768,14 @@ void RadixPartitionSort<N>::sort_partition_external(
         if (!chunk.empty()) {
             std::sort(chunk.begin(), chunk.end());
             std::string run_path = sorted_output_path + ".run_" + std::to_string(run_idx++);
-            std::ofstream run_out(run_path, std::ios::binary);
-            run_out.write(reinterpret_cast<const char*>(chunk.data()),
-                          chunk.size() * sizeof(Record<N>));
+            std::ofstream run_out = open_checked_output(run_path);
+            try {
+                run_out.write(reinterpret_cast<const char*>(chunk.data()),
+                              chunk.size() * sizeof(Record<N>));
+            } catch (const std::ios_base::failure&) {
+                throw_write_error(run_path);
+            }
+            close_checked_output(run_out, run_path);
             run_paths.push_back(run_path);
         }
     }
@@ -708,21 +794,26 @@ void RadixPartitionSort<N>::sort_partition_external(
         if (readers[i]->next(rr)) fronts[i] = rr;
     }
 
-    std::ofstream out(sorted_output_path, std::ios::binary);
-    while (true) {
-        std::size_t min_idx = SIZE_MAX;
-        for (std::size_t i = 0; i < fronts.size(); ++i) {
-            if (!fronts[i].has_value()) continue;
-            if (min_idx == SIZE_MAX || *fronts[i] < *fronts[min_idx]) {
-                min_idx = i;
+    std::ofstream out = open_checked_output(sorted_output_path);
+    try {
+        while (true) {
+            std::size_t min_idx = SIZE_MAX;
+            for (std::size_t i = 0; i < fronts.size(); ++i) {
+                if (!fronts[i].has_value()) continue;
+                if (min_idx == SIZE_MAX || *fronts[i] < *fronts[min_idx]) {
+                    min_idx = i;
+                }
             }
+            if (min_idx == SIZE_MAX) break;
+            out.write(reinterpret_cast<const char*>(&(*fronts[min_idx])),
+                      sizeof(Record<N>));
+            Record<N> rr{};
+            if (readers[min_idx]->next(rr)) fronts[min_idx] = rr;
+            else fronts[min_idx].reset();
         }
-        if (min_idx == SIZE_MAX) break;
-        out.write(reinterpret_cast<const char*>(&(*fronts[min_idx])),
-                  sizeof(Record<N>));
-        Record<N> rr{};
-        if (readers[min_idx]->next(rr)) fronts[min_idx] = rr;
-        else fronts[min_idx].reset();
+        out.close();
+    } catch (const std::ios_base::failure&) {
+        throw_write_error(sorted_output_path);
     }
 
     readers.clear();  // close files before removing
