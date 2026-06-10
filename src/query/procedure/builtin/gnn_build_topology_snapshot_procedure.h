@@ -14,6 +14,8 @@
 //     YIELD projectionName  STRING,
 //           fwdBytes        INT,
 //           revBytes        INT,
+//           fwdStatus       STRING,
+//           revStatus       STRING,
 //           durationMillis  INT
 //
 // Semantics:
@@ -22,6 +24,10 @@
 //     neither `FROM_TO_EDGE` nor `TO_FROM_EDGE` — the caller is told to
 //     rebuild with `indexSet='ALL'`, `'GNN_MINIMAL'`, or
 //     `'READONLY_TRAVERSAL'`.
+//   * Raises `QueryException` when every eligible direction fails to
+//     build; a single-direction failure is reported via the per-direction
+//     status yields ('built', 'skipped', or 'failed: <error>') so a remote
+//     client can distinguish IndexSet-skip from a build failure.
 //   * Idempotent: when a sidecar file already exists it is overwritten with
 //     a one-line stderr warning. This matches the T4.4 writer's atomic
 //     `.tmp → rename` contract — the old file is replaced only if the new
@@ -72,6 +78,12 @@ public:
                        "Bytes written to topology_fwd.csr (0 when not emitted)"},
             YieldField{"revBytes",       YieldType::INT,
                        "Bytes written to topology_rev.csr (0 when not emitted)"},
+            YieldField{"fwdStatus",      YieldType::STRING,
+                       "Forward direction outcome: 'built', 'skipped' "
+                       "(IndexSet-ineligible), or 'failed: <error>'"},
+            YieldField{"revStatus",      YieldType::STRING,
+                       "Reverse direction outcome: 'built', 'skipped' "
+                       "(IndexSet-ineligible), or 'failed: <error>'"},
             YieldField{"durationMillis", YieldType::INT,
                        "Total wall-clock time in milliseconds"},
         };

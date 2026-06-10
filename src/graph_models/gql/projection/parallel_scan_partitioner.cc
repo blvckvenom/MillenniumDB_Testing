@@ -6,10 +6,13 @@
 #include <tbb/partitioner.h>
 #include <tbb/task_arena.h>
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
@@ -27,6 +30,51 @@ ParallelScanPartitioner<N>::ParallelScanPartitioner(
       bucket_hash_(std::move(bucket_hash))
 {
     fs::create_directories(scratch_dir_);
+
+    // Every (thread, partition) pair below eagerly opens one FILE*, so the
+    // fan-out can exceed a stock 1024 soft RLIMIT_NOFILE before any record
+    // flows (e.g. 10 scan threads × 128 partitions = 1280 descriptors).
+    // Raise the soft limit best-effort; if the achievable limit still can't
+    // accommodate the fan-out (plus headroom for the process's other fds),
+    // shrink the slot count so the constructor doesn't die with EMFILE
+    // inside the PartitionFile ctor. Fewer slots only reduces Phase 1
+    // parallelism; output stays correct (Phase 2 sorts each partition).
+    constexpr std::size_t kFdHeadroom = 256;
+    if (num_partitions_ > 0 && num_scan_threads_ > 0) {
+        const rlim_t need =
+            static_cast<rlim_t>(num_scan_threads_ * num_partitions_ + kFdHeadroom);
+        struct rlimit rl;
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur < need) {
+                rl.rlim_cur = (rl.rlim_max == RLIM_INFINITY)
+                                  ? need
+                                  : std::min<rlim_t>(need, rl.rlim_max);
+                ::setrlimit(RLIMIT_NOFILE, &rl);   // best-effort
+                ::getrlimit(RLIMIT_NOFILE, &rl);   // re-read what we actually got
+            }
+            if (rl.rlim_cur < need) {
+                const std::size_t usable =
+                    (static_cast<std::size_t>(rl.rlim_cur) > kFdHeadroom)
+                        ? static_cast<std::size_t>(rl.rlim_cur) - kFdHeadroom
+                        : 1;
+                num_scan_threads_ = std::max<std::size_t>(
+                    1, std::min(num_scan_threads_, usable / num_partitions_));
+            }
+        }
+    }
+
+    // Budget the aggregate per-file record buffers: threads × partitions ×
+    // 4 MB reaches ~5 GB at the 10 × 128 worst case, all reserved up front.
+    // Cap the total at 1 GB and shrink the per-file capacity instead (64 KB
+    // floor so small buffers don't degenerate into per-record fwrites).
+    constexpr std::size_t kTotalBufferBudget = 1ULL << 30;
+    constexpr std::size_t kMinBufferBytes    = 64ULL * 1024;
+    std::size_t per_file_buffer = PartitionFile<N>::DEFAULT_BUFFER_BYTES;
+    const std::size_t total_files = num_scan_threads_ * num_partitions_;
+    if (total_files > 0 && per_file_buffer > kTotalBufferBudget / total_files) {
+        per_file_buffer = std::max(kMinBufferBytes, kTotalBufferBudget / total_files);
+    }
+
     files_.resize(num_scan_threads_);
     for (std::size_t t = 0; t < num_scan_threads_; ++t) {
         fs::create_directories(fs::path(scratch_dir_) / ("thread_" + std::to_string(t)));
@@ -35,7 +83,7 @@ ParallelScanPartitioner<N>::ParallelScanPartitioner(
             std::string path = fs::path(scratch_dir_) /
                                ("thread_" + std::to_string(t)) /
                                ("part_" + std::to_string(p) + ".bin");
-            files_[t].push_back(std::make_unique<PartitionFile<N>>(path));
+            files_[t].push_back(std::make_unique<PartitionFile<N>>(path, per_file_buffer));
         }
     }
 }
@@ -227,14 +275,38 @@ ParallelScanPartitioner<N>::collect_merged_partition_paths() {
                 std::string merged = fs::path(scratch_dir_) /
                                      ("partition_" + std::to_string(p) + ".bin");
                 std::ofstream sink(merged, std::ios::binary);
+                if (!sink) {
+                    throw std::runtime_error(
+                        "ParallelScanPartitioner: cannot open merged partition file "
+                        + merged);
+                }
                 for (std::size_t t = 0; t < num_scan_threads_; ++t) {
                     std::string src = fs::path(scratch_dir_) /
                                       ("thread_" + std::to_string(t)) /
                                       ("part_" + std::to_string(p) + ".bin");
-                    std::ifstream in(src, std::ios::binary);
-                    sink << in.rdbuf();
+                    // operator<<(streambuf*) sets failbit when it inserts ZERO
+                    // characters, so an empty per-thread file (pre-created in
+                    // the ctor for every slot) would poison the sink and make
+                    // every later thread's insert a silent no-op — dropping
+                    // records from the merged partition. Skip empty sources.
+                    std::error_code size_ec;
+                    const auto src_size = fs::file_size(src, size_ec);
+                    if (!size_ec && src_size > 0) {
+                        std::ifstream in(src, std::ios::binary);
+                        sink << in.rdbuf();
+                        if (!sink) {
+                            throw std::runtime_error(
+                                "ParallelScanPartitioner: merge failed for "
+                                + merged + " (source " + src + ")");
+                        }
+                    }
                     std::error_code ec;
                     fs::remove(src, ec);  // reclaim disk; ignore missing-file races
+                }
+                sink.flush();
+                if (!sink) {
+                    throw std::runtime_error(
+                        "ParallelScanPartitioner: flush failed for " + merged);
                 }
                 out[p] = merged;
             }

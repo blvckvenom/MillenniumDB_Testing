@@ -229,6 +229,7 @@ SplitStore SplitStore::open(const fs::path& path) {
 SplitStore::Split SplitStore::parse_split_string(const std::string& s) {
     if (s == "train")      return TRAIN;
     if (s == "val")        return VAL;
+    if (s == "valid")      return VAL;  // OGB convention
     if (s == "validation") return VAL;
     if (s == "test")       return TEST;
     return UNLABELED;

@@ -484,6 +484,49 @@ TEST_F(FeatureMatrixTest, CreateReorderedExtSortSourceOrderMatches) {
     }
 }
 
+// ext_sort Pass 1 stages (out_local, row) entries in a per-bucket buffer
+// that must hold at least one full entry: a row wider than the 1 MiB base
+// size has to grow the buffer — the flush check can only EMPTY it, not make
+// a too-large entry fit, so a fixed-size buffer overflows on the memcpy.
+// D = 262200 float32 -> row_bytes = 1048800 > 1 MiB.
+TEST_F(FeatureMatrixTest, CreateReorderedExtSortRowsWiderThanBucketBuffer) {
+    struct EnvGuard {
+        std::string k, old; bool had;
+        EnvGuard(const char* key, const char* val) : k(key) {
+            const char* o = std::getenv(key); had = (o != nullptr); if (had) old = o;
+            ::setenv(key, val, 1);
+        }
+        ~EnvGuard() { if (had) ::setenv(k.c_str(), old.c_str(), 1); else ::unsetenv(k.c_str()); }
+    };
+    EnvGuard strat("MDB_GNN_REORDER_STRATEGY", "external_sort");
+    // 3 MiB buckets -> bucket_rows=2, so one bucket takes 2 entries and the
+    // flush-then-stage path is exercised alongside the grown buffer.
+    EnvGuard bsz("MDB_GNN_REORDER_BUCKET_MB", "3");
+
+    const uint64_t N = 3;
+    const uint64_t D = 262200;
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N; ++i) {
+        for (uint64_t j = 0; j < D; ++j) {
+            data[i * D + j] = static_cast<float>(i * 1000 + (j % 997));
+        }
+    }
+    auto src = FeatureMatrix::create(test_path("widerow_src.fmat"), N, D,
+                                     GnnDtype::FLOAT32, data.data());
+
+    std::vector<uint64_t> perm = {2, 0, 1};
+    auto dst = FeatureMatrix::create_reordered(src, perm, test_path("widerow_dst.fmat"));
+
+    ASSERT_EQ(dst.num_rows(), N);
+    for (uint64_t out = 0; out < N; ++out) {
+        const float* exp = src.row_as<float>(perm[out]);
+        const float* got = dst.row_as<float>(out);
+        for (uint64_t j : { uint64_t(0), uint64_t(1), D / 2, D - 2, D - 1 }) {
+            ASSERT_FLOAT_EQ(got[j], exp[j]) << "row " << out << " col " << j;
+        }
+    }
+}
+
 // ===========================================================================
 // File Persistence & Overwrite
 // ===========================================================================
@@ -775,13 +818,25 @@ TEST(FeatureMatrixHeaderTest, ZeroColsIsInvalid) {
 }
 
 TEST_F(FeatureMatrixTest, CreateOverflowRowsColsThrows) {
-    // num_rows * num_cols * dtype_size would overflow size_t
+    // The data pointer must be non-null so the null-data check doesn't
+    // preempt the overflow guards; each guard throws before any byte of
+    // data is read.
+    std::vector<float> dummy = {1.0f};
+
+    // num_rows * row_bytes would overflow size_t:
     // UINT64_MAX rows × 1 col × 4 bytes = overflow
     EXPECT_THROW(
         FeatureMatrix::create(test_path("overflow.fmat"),
-                               UINT64_MAX, 1, GnnDtype::FLOAT32, nullptr),
-        std::exception  // could be overflow_error or invalid_argument
-    ) << "Creating FeatureMatrix with overflowing dimensions should throw";
+                               UINT64_MAX, 1, GnnDtype::FLOAT32, dummy.data()),
+        std::overflow_error
+    ) << "Creating FeatureMatrix with overflowing num_rows should throw";
+
+    // num_cols * dtype_size would overflow size_t (the first guard).
+    EXPECT_THROW(
+        FeatureMatrix::create(test_path("overflow_cols.fmat"),
+                               1, UINT64_MAX, GnnDtype::FLOAT32, dummy.data()),
+        std::overflow_error
+    ) << "Creating FeatureMatrix with overflowing num_cols should throw";
 }
 
 TEST_F(FeatureMatrixTest, OpenCraftedOverflowHeaderThrows) {

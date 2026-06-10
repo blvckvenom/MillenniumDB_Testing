@@ -2,7 +2,11 @@
 
 #include <openssl/evp.h>
 
+#include <fcntl.h>       // open, O_RDONLY
+#include <unistd.h>      // fsync, close
+
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -27,6 +31,26 @@ inline void read_le(std::ifstream& f, T& v, const std::string& context) {
         throw std::runtime_error(
             "ModelCheckpoint::read_ckptmeta: truncated .ckptmeta reading " + context);
     }
+}
+
+// Force a file's data to stable storage. Must run before rename() commits a
+// checkpoint name: rename durability without data durability can leave a
+// committed-named but truncated/empty file after a power loss.
+void fsync_file_impl(const std::filesystem::path& path) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "ModelCheckpoint: cannot open file for fsync: " + path.string()
+            + " (errno=" + std::to_string(errno) + ")");
+    }
+    if (::fsync(fd) != 0) {
+        int e = errno;
+        ::close(fd);
+        throw std::runtime_error(
+            "ModelCheckpoint: fsync failed on " + path.string()
+            + " (errno=" + std::to_string(e) + ")");
+    }
+    ::close(fd);
 }
 
 // Peek only the magic + version + save_kind (first 16 bytes) without reading
@@ -178,10 +202,15 @@ void ModelCheckpoint::write_ckptmeta_impl(
                 static_cast<std::streamsize>(k * sizeof(double)));
     }
 
-    if (!f) {
+    // close() performs the final flush; checking the stream before it would
+    // miss a failure (e.g. ENOSPC) on that last flush and silently leave a
+    // truncated file behind.
+    f.close();
+    if (f.fail()) {
         throw std::runtime_error(
             "ModelCheckpoint::write_ckptmeta: I/O error writing " + path.string());
     }
+    fsync_file_impl(path);
 }
 
 TrainingState ModelCheckpoint::read_ckptmeta(
@@ -192,6 +221,20 @@ TrainingState ModelCheckpoint::read_ckptmeta(
         throw std::runtime_error(
             "ModelCheckpoint::read_ckptmeta: cannot open " + path.string());
     }
+
+    // Total size for plausibility-bounding the var-length section below: a
+    // length prefix can never exceed the bytes that remain in the file, so a
+    // corrupt or crafted header is rejected before driving any allocation.
+    f.seekg(0, std::ios::end);
+    const uint64_t file_bytes = static_cast<uint64_t>(f.tellg());
+    f.seekg(0, std::ios::beg);
+
+    auto remaining_bytes = [&]() -> uint64_t {
+        const auto pos = f.tellg();
+        if (pos < 0) return 0;
+        const uint64_t upos = static_cast<uint64_t>(pos);
+        return upos <= file_bytes ? file_bytes - upos : 0;
+    };
 
     uint8_t magic[8];
     if (!f.read(reinterpret_cast<char*>(magic), 8)) {
@@ -250,6 +293,13 @@ TrainingState ModelCheckpoint::read_ckptmeta(
     auto read_str = [&](std::string& out, const std::string& ctx) {
         uint32_t len = 0;
         read_le(f, len, ctx + "_len");
+        const uint64_t remaining = remaining_bytes();
+        if (len > remaining) {
+            throw std::runtime_error(
+                "ModelCheckpoint::read_ckptmeta: corrupt " + ctx + " length "
+                + std::to_string(len) + " exceeds remaining "
+                + std::to_string(remaining) + " bytes in " + path.string());
+        }
         out.resize(len);
         if (len > 0 && !f.read(out.data(), len)) {
             throw std::runtime_error(
@@ -262,6 +312,12 @@ TrainingState ModelCheckpoint::read_ckptmeta(
 
     uint32_t k = 0;
     read_le(f, k, "num_epoch_losses");
+    if (static_cast<uint64_t>(k) * sizeof(double) > remaining_bytes()) {
+        throw std::runtime_error(
+            "ModelCheckpoint::read_ckptmeta: corrupt epoch_losses count "
+            + std::to_string(k) + " exceeds remaining "
+            + std::to_string(remaining_bytes()) + " bytes in " + path.string());
+    }
     s.epoch_losses.resize(k);
     if (k > 0 && !f.read(reinterpret_cast<char*>(s.epoch_losses.data()),
                          static_cast<std::streamsize>(k * sizeof(double)))) {
@@ -344,17 +400,29 @@ void ModelCheckpoint::save_full(
             const_cast<torch::optim::Adam&>(optimizer).save(archive);
             archive.save_to(pt_tmp);
         }
+        // save_to uses buffered I/O; force the payload to disk so the rename
+        // below cannot commit a name whose data is still volatile.
+        fsync_file_impl(pt_tmp);
 
         // --- Write .ckptmeta (always SaveKind::Full via public wrapper) ---
+        // write_ckptmeta fsyncs the file data internally.
         write_ckptmeta(meta_tmp, state);
 
         // .pt first, then .ckptmeta: presence of .ckptmeta signals a
         // fully-committed checkpoint to list_checkpoints() (Task 2.4).
-        // NOTE: if rename() fails between the two calls, the prior .ckptmeta
-        // becomes stale/missing — list_checkpoints treats this as invalid.
-        // Callers needing true rollback should save to a fresh basename.
-        std::filesystem::rename(pt_tmp,   pt_path);
-        std::filesystem::rename(meta_tmp, meta_path);
+        std::filesystem::rename(pt_tmp, pt_path);
+        try {
+            std::filesystem::rename(meta_tmp, meta_path);
+        } catch (...) {
+            // The new .pt is already committed; the surviving old .ckptmeta
+            // would silently pair stale training state with the new weights.
+            // Remove it so the checkpoint reads as absent (orphan .pt)
+            // instead of torn. Callers needing true rollback should save to
+            // a fresh basename.
+            std::error_code rec;
+            std::filesystem::remove(meta_path, rec);
+            throw;
+        }
         fsync_directory(basename.parent_path());
     }
     catch (...) {
@@ -431,15 +499,28 @@ void ModelCheckpoint::save_weights(
             model.save(archive);           // ONLY weights — no optimizer
             archive.save_to(pt_tmp);
         }
+        // save_to uses buffered I/O; force the payload to disk so the rename
+        // below cannot commit a name whose data is still volatile.
+        fsync_file_impl(pt_tmp);
+
+        // write_ckptmeta_impl fsyncs the file data internally.
         write_ckptmeta_impl(meta_tmp, state, SaveKind::WeightsOnly);
 
         // .pt first, then .ckptmeta: presence of .ckptmeta signals a
         // fully-committed checkpoint to list_checkpoints() (Task 2.4).
-        // NOTE: if rename() fails between the two calls, the prior .ckptmeta
-        // becomes stale/missing — list_checkpoints treats this as invalid.
-        // Callers needing true rollback should save to a fresh basename.
-        std::filesystem::rename(pt_tmp,   pt_path);
-        std::filesystem::rename(meta_tmp, meta_path);
+        std::filesystem::rename(pt_tmp, pt_path);
+        try {
+            std::filesystem::rename(meta_tmp, meta_path);
+        } catch (...) {
+            // The new .pt is already committed; the surviving old .ckptmeta
+            // would silently pair stale training state with the new weights.
+            // Remove it so the checkpoint reads as absent (orphan .pt)
+            // instead of torn. Callers needing true rollback should save to
+            // a fresh basename.
+            std::error_code rec;
+            std::filesystem::remove(meta_path, rec);
+            throw;
+        }
         fsync_directory(basename.parent_path());
     }
     catch (...) {

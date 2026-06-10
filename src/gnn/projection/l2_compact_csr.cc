@@ -41,8 +41,8 @@ void L2CompactCsr::add_node(uint64_t                     src_node_id,
 
     // Append destination row indexes to the flat col_idx_ array. The
     // ObjectId payload occupies the lower 56 bits; we drop only the
-    // 8-bit type tag here. uint32 truncation safety is enforced at
-    // freeze() time.
+    // 8-bit type tag here. uint32 truncation safety is enforced below,
+    // per value, where the narrowing actually happens.
     //
     // NOTE (2026-05-21 fix): the previous version called
     //   col_idx_.reserve(col_idx_.size() + neighbors.size());
@@ -54,18 +54,30 @@ void L2CompactCsr::add_node(uint64_t                     src_node_id,
     // populate_via_sidecar. Plain push_back amortizes to O(1) via
     // vector's exponential capacity growth, restoring linear total.
     for (const auto& nb : neighbors) {
+        // Guard the uint32 narrowing per value: the 56-bit ordinal must fit
+        // in 32 bits or col_idx_ silently aliases (wrong neighbours served
+        // from L2 with no error). Mirrors the narrow-sidecar writer's
+        // per-dst "exceeds uint32" guard.
+        const uint64_t ordinal = nb.node_id & ObjectId::VALUE_MASK;
+        if (ordinal > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error(
+                "L2CompactCsr::add_node dst ordinal "
+                + std::to_string(ordinal)
+                + " exceeds uint32 — graph too large for L2 layout");
+        }
         // Capture the dst ObjectId type tag (top byte, pre-shifted into
         // bits 56..63) BEFORE truncating to uint32. col_idx_ keeps only the
         // tag-stripped ordinal for density; for_each_*/dispatch_ OR this tag
         // back to reconstruct the exact tagged ObjectId — without it, L2
         // neighbours leak as tag-0 ids that miss the tagged feature
         // RowMapping (silent corruption). Uniform per direction in a
-        // homogeneous node graph; fail loud on a mismatch (mirrors the
-        // narrow-sidecar writer's capture_tag_).
+        // homogeneous node graph; fail loud on ANY mismatch — a tag-0 dst
+        // mixed with tagged ones would be silently retagged by the read-time
+        // OR (mirrors the narrow-sidecar writer's capture_tag_).
         const uint64_t tag = nb.node_id & ObjectId::TYPE_MASK;
-        if (dst_type_tag_ == 0) {
+        if (col_idx_.empty()) {
             dst_type_tag_ = tag;
-        } else if (tag != 0 && tag != dst_type_tag_) {
+        } else if (tag != dst_type_tag_) {
             throw std::invalid_argument(
                 "L2CompactCsr::add_node heterogeneous dst type tag — "
                 "an L2 section must share one ObjectId type tag");
@@ -77,9 +89,9 @@ void L2CompactCsr::add_node(uint64_t                     src_node_id,
 void L2CompactCsr::freeze() {
     if (frozen_) return;
 
-    // Validate the uint32 col_idx invariant. Each col_idx_ entry is a
-    // truncated ObjectId payload — for projections with > 4 billion
-    // nodes this would silently alias. Fail loudly instead.
+    // Validate the L2 edge-COUNT budget: the layout caps col_idx_ at
+    // uint32 entries. (Per-dst uint32 value narrowing is guarded in
+    // add_node, where the truncation actually happens.)
     if (col_idx_.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error(
             "L2CompactCsr::freeze edge count exceeds uint32 — "

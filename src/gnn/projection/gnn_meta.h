@@ -6,6 +6,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace mdb::gnn {
 
@@ -34,6 +35,11 @@ struct GnnMeta {
     // -------------------------------------------------------------------------
     static constexpr uint8_t  MAGIC[8]  = {'G','N','N','M','\0','\0','\0','\0'};
     static constexpr uint32_t VERSION   = 1;
+
+    /// Upper bound accepted for feature_name_len by read(). Property names
+    /// are short; anything larger indicates a corrupt/truncated file and is
+    /// rejected before the length can drive an allocation.
+    static constexpr uint32_t MAX_FEATURE_NAME_LEN = 4096;
 
     // -------------------------------------------------------------------------
     // Fields
@@ -117,6 +123,13 @@ struct GnnMeta {
         if (!f.read(reinterpret_cast<char*>(&name_len), 4)) {
             throw std::runtime_error("GnnMeta::read: failed to read feature_name_len in: " + path.string());
         }
+        if (name_len > MAX_FEATURE_NAME_LEN) {
+            throw std::runtime_error(
+                "GnnMeta::read: feature_name_len " + std::to_string(name_len)
+                + " exceeds limit " + std::to_string(MAX_FEATURE_NAME_LEN)
+                + " (corrupt gnn_meta.bin?) in: " + path.string()
+            );
+        }
 
         // --- feature_name (N bytes) ---
         if (name_len > 0) {
@@ -139,50 +152,71 @@ struct GnnMeta {
             std::filesystem::create_directories(parent);
         }
 
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (!f.is_open()) {
-            throw std::runtime_error("GnnMeta::write: cannot open file for writing: " + path.string());
+        // Write to a sibling temp file, then rename over the target so a
+        // crash mid-write never leaves a torn gnn_meta.bin (checkpoint
+        // validation gates on the SHA-256 of this file).
+        std::filesystem::path tmp = path;
+        tmp += ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f.is_open()) {
+                throw std::runtime_error("GnnMeta::write: cannot open file for writing: " + tmp.string());
+            }
+
+            // --- magic (8 bytes) ---
+            f.write(reinterpret_cast<const char*>(MAGIC), 8);
+
+            // --- version (4 bytes) ---
+            uint32_t ver = VERSION;
+            f.write(reinterpret_cast<const char*>(&ver), 4);
+
+            // --- feature_dim (4 bytes) ---
+            f.write(reinterpret_cast<const char*>(&feature_dim), 4);
+
+            // --- num_nodes (8 bytes) ---
+            f.write(reinterpret_cast<const char*>(&num_nodes), 8);
+
+            // --- num_classes (8 bytes) ---
+            f.write(reinterpret_cast<const char*>(&num_classes), 8);
+
+            // --- has_labels (1 byte) ---
+            uint8_t hl = has_labels ? 1 : 0;
+            f.write(reinterpret_cast<const char*>(&hl), 1);
+
+            // --- has_splits (1 byte) ---
+            uint8_t hs = has_splits ? 1 : 0;
+            f.write(reinterpret_cast<const char*>(&hs), 1);
+
+            // --- reserved (2 bytes, zeros) ---
+            uint8_t reserved[2] = {0, 0};
+            f.write(reinterpret_cast<const char*>(reserved), 2);
+
+            // --- feature_name_len (4 bytes) ---
+            auto name_len = static_cast<uint32_t>(feature_name.size());
+            f.write(reinterpret_cast<const char*>(&name_len), 4);
+
+            // --- feature_name (N bytes) ---
+            if (name_len > 0) {
+                f.write(feature_name.data(), name_len);
+            }
+
+            f.flush();
+            if (!f) {
+                std::error_code rm_ec;
+                std::filesystem::remove(tmp, rm_ec);
+                throw std::runtime_error("GnnMeta::write: I/O error while writing: " + tmp.string());
+            }
         }
 
-        // --- magic (8 bytes) ---
-        f.write(reinterpret_cast<const char*>(MAGIC), 8);
-
-        // --- version (4 bytes) ---
-        uint32_t ver = VERSION;
-        f.write(reinterpret_cast<const char*>(&ver), 4);
-
-        // --- feature_dim (4 bytes) ---
-        f.write(reinterpret_cast<const char*>(&feature_dim), 4);
-
-        // --- num_nodes (8 bytes) ---
-        f.write(reinterpret_cast<const char*>(&num_nodes), 8);
-
-        // --- num_classes (8 bytes) ---
-        f.write(reinterpret_cast<const char*>(&num_classes), 8);
-
-        // --- has_labels (1 byte) ---
-        uint8_t hl = has_labels ? 1 : 0;
-        f.write(reinterpret_cast<const char*>(&hl), 1);
-
-        // --- has_splits (1 byte) ---
-        uint8_t hs = has_splits ? 1 : 0;
-        f.write(reinterpret_cast<const char*>(&hs), 1);
-
-        // --- reserved (2 bytes, zeros) ---
-        uint8_t reserved[2] = {0, 0};
-        f.write(reinterpret_cast<const char*>(reserved), 2);
-
-        // --- feature_name_len (4 bytes) ---
-        auto name_len = static_cast<uint32_t>(feature_name.size());
-        f.write(reinterpret_cast<const char*>(&name_len), 4);
-
-        // --- feature_name (N bytes) ---
-        if (name_len > 0) {
-            f.write(feature_name.data(), name_len);
-        }
-
-        if (!f) {
-            throw std::runtime_error("GnnMeta::write: I/O error while writing: " + path.string());
+        std::error_code rename_ec;
+        std::filesystem::rename(tmp, path, rename_ec);
+        if (rename_ec) {
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            throw std::runtime_error(
+                "GnnMeta::write: rename " + tmp.string() + " -> " + path.string()
+                + " failed: " + rename_ec.message()
+            );
         }
     }
 

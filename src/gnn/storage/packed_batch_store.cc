@@ -563,11 +563,17 @@ void generate_packed_batches_partitioned(
                         features.row(row_start),
                         this_bytes);
 
-            // (2) Sort refs by batch_id so each batch's contribution is one
-            // contiguous group — one open/pwrite per batch contribution.
+            // (2) Sort refs by (batch_id, pos_in_batch) so each batch's
+            // contribution is one contiguous group — one open/pwrite per batch
+            // contribution. pos_in_batch is part of the key because std::sort
+            // is unstable: keyed on batch_id alone it may permute equal-key
+            // refs, breaking the v1 positional contract (rows within a group
+            // must keep row_provider order).
             std::sort(refs.begin(), refs.end(),
                       [](const RowRef& a, const RowRef& b) {
-                          return a.batch_id < b.batch_id;
+                          return a.batch_id != b.batch_id
+                                   ? a.batch_id < b.batch_id
+                                   : a.pos_in_batch < b.pos_in_batch;
                       });
 
             size_t i = 0;

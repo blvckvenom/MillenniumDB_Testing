@@ -938,6 +938,84 @@ int main() {
         }
         std::cout << " OK" << std::endl;
 
+        // Test 30: open() must not recreate index files elided by the
+        // IndexSet preset. GNN_MINIMAL omits edge_direction / edge_from_to /
+        // edge_n1_n2; an unconditional BPlusTree construction in open()
+        // would O_CREAT 0-byte .leaf/.dir files for them, breaking the
+        // preset's file-count / disk-footprint contract.
+        std::cout << "Test 30: open() respects IndexSet preset...";
+        {
+            std::string min_dir = manager.create_projection("gnnmin");
+            {
+                GQL::ProjectionStorage min_storage(min_dir, "test_db_storage");
+                min_storage.requested_index_set = GQL::IndexSet::GNN_MINIMAL;
+                min_storage.init();
+                for (uint64_t i = 1; i <= 3; i++) {
+                    GQL::ProjectedNode node;
+                    node.node_id = ObjectId(i);
+                    min_storage.add_node(node);
+                }
+                GQL::ProjectedEdge edge;
+                edge.from_node = ObjectId(1);
+                edge.to_node = ObjectId(2);
+                edge.edge_id = ObjectId(101);
+                edge.is_directed = true;
+                min_storage.add_edge(edge);
+                min_storage.flush();
+
+                GQL::ProjectionCatalog cat(min_dir);
+                cat.projection_name = "gnnmin";
+                cat.node_count = 3;
+                cat.edge_count = 1;
+                cat.index_set = GQL::IndexSet::GNN_MINIMAL;
+                cat.save();
+            }
+
+            const char* elided[] = { "edge_direction", "edge_from_to", "edge_n1_n2" };
+            for (const char* name : elided) {
+                auto leaf = std::filesystem::path(min_dir) / (std::string(name) + ".leaf");
+                if (std::filesystem::exists(leaf)) {
+                    std::cerr << "\nFAIL Test 30: build materialized elided index "
+                              << name << std::endl;
+                    return 1;
+                }
+            }
+
+            {
+                GQL::ProjectionStorage reopened(min_dir, "test_db_storage");
+                reopened.open();
+                if (reopened.get_index_set() != GQL::IndexSet::GNN_MINIMAL) {
+                    std::cerr << "\nFAIL Test 30: open() did not restore the "
+                              << "GNN_MINIMAL preset from the catalog" << std::endl;
+                    return 1;
+                }
+                for (const char* name : elided) {
+                    for (const char* ext : { ".leaf", ".dir" }) {
+                        auto f = std::filesystem::path(min_dir)
+                               / (std::string(name) + ext);
+                        if (std::filesystem::exists(f)) {
+                            std::cerr << "\nFAIL Test 30: open() created 0-byte "
+                                      << name << ext
+                                      << " for an index elided by GNN_MINIMAL"
+                                      << std::endl;
+                            return 1;
+                        }
+                    }
+                }
+                if (reopened.get_nodes_index() == nullptr
+                    || reopened.get_from_to_edge_index() == nullptr
+                    || reopened.get_to_from_edge_index() == nullptr)
+                {
+                    std::cerr << "\nFAIL Test 30: open() missing a GNN_MINIMAL "
+                              << "index reader" << std::endl;
+                    return 1;
+                }
+            }
+
+            manager.drop_projection("gnnmin");
+        }
+        std::cout << " OK" << std::endl;
+
         // Test 8: List projections
         std::cout << "Test 8: Listing projections...";
         auto projections = manager.list_projections();

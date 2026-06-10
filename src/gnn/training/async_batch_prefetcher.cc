@@ -53,8 +53,12 @@ AsyncBatchPrefetcher::~AsyncBatchPrefetcher() {
 void AsyncBatchPrefetcher::prefetch(uint64_t batch_id) {
     std::unique_lock<std::mutex> lk(mu_);
     space_cv_.wait(lk, [&] {
-        return shutdown_requested_ || in_flight_count_ < queue_size_;
+        return shutdown_requested_ || worker_failure_ != nullptr
+            || in_flight_count_ < queue_size_;
     });
+    if (worker_failure_ != nullptr) {
+        std::rethrow_exception(worker_failure_);
+    }
     if (shutdown_requested_) {
         throw std::runtime_error(
             "AsyncBatchPrefetcher::prefetch: shutdown was already requested");
@@ -73,6 +77,7 @@ MiniBatch AsyncBatchPrefetcher::next() {
     //   - shutdown was requested AND nothing is in flight (caller drained).
     item_cv_.wait(lk, [&] {
         if (shutdown_requested_ && in_flight_count_ == 0) return true;
+        if (worker_failure_ != nullptr) return true;
         if (resp_map_.find(next_consume_pos_) != resp_map_.end()) return true;
         if (err_map_.find(next_consume_pos_) != err_map_.end()) return true;
         return false;
@@ -100,6 +105,13 @@ MiniBatch AsyncBatchPrefetcher::next() {
         --in_flight_count_;
         space_cv_.notify_one();
         return out;
+    }
+
+    // No completed batch is deliverable: surface a recorded worker-thread
+    // failure (a request stuck in req_queue_ might otherwise never be
+    // assembled, blocking the consumer forever).
+    if (worker_failure_ != nullptr) {
+        std::rethrow_exception(worker_failure_);
     }
 
     // Nothing left to deliver.
@@ -131,6 +143,22 @@ bool AsyncBatchPrefetcher::is_shutdown() const {
 }
 
 void AsyncBatchPrefetcher::worker_loop(unsigned worker_idx) {
+    try {
+        worker_loop_impl(worker_idx);
+    } catch (...) {
+        // An exception escaping a std::thread body calls std::terminate,
+        // killing the whole process. Record the failure so next()/prefetch()
+        // rethrow it on the consumer thread instead.
+        std::lock_guard<std::mutex> lk(mu_);
+        if (worker_failure_ == nullptr) {
+            worker_failure_ = std::current_exception();
+        }
+        space_cv_.notify_all();
+        item_cv_.notify_all();
+    }
+}
+
+void AsyncBatchPrefetcher::worker_loop_impl(unsigned worker_idx) {
     // Round 3B-mw (2026-06-01): bind this thread's worker id so the
     // FourLevelStore hot path routes to this worker's PRIVATE DirectIoReader
     // + pinned staging buffer (no cross-worker race on feature content).
@@ -142,13 +170,13 @@ void AsyncBatchPrefetcher::worker_loop(unsigned worker_idx) {
     // CUDAStreamGuard(worker_stream); we record a CUDAEvent into the
     // produced MiniBatch so the consumer can sync via event.block().
     //
-    // Acquired lazily here (not in constructor) to keep CUDA dependencies
-    // off the constructor path when use_cuda_streams_ is false.
+    // Acquired lazily on the first request, INSIDE the per-request try:
+    // getStreamFromPool can throw c10::Error on a degraded CUDA runtime,
+    // and there the per-request catch turns it into an err_map_ entry the
+    // consumer rethrows cleanly. It also keeps CUDA dependencies off the
+    // constructor path when use_cuda_streams_ is false.
 #ifdef ENABLE_CUDA_ASSEMBLER
     std::optional<c10::cuda::CUDAStream> worker_stream;
-    if (use_cuda_streams_) {
-        worker_stream.emplace(c10::cuda::getStreamFromPool());
-    }
 #endif
 
     while (true) {
@@ -173,7 +201,10 @@ void AsyncBatchPrefetcher::worker_loop(unsigned worker_idx) {
         try {
             MiniBatch batch;
 #ifdef ENABLE_CUDA_ASSEMBLER
-            if (use_cuda_streams_ && worker_stream.has_value()) {
+            if (use_cuda_streams_) {
+                if (!worker_stream.has_value()) {
+                    worker_stream.emplace(c10::cuda::getStreamFromPool());
+                }
                 c10::cuda::CUDAStreamGuard guard(*worker_stream);
                 batch = assembler_.assemble(req.batch_id);
                 // Record the event AFTER assemble so the consumer's

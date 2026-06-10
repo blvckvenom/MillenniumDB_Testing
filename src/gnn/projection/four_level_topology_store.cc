@@ -75,6 +75,11 @@ double elapsed_ms_(std::chrono::steady_clock::time_point a,
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
+// Magic of `<projection_dir>/node_counts.bin`. Must stay in sync with the
+// writers (offline_sampling_engine.cc / node_counts_io.cc) and the canonical
+// reader (TopologyFrequencyProfiler::compute_from_node_counts_).
+constexpr uint8_t kNodeCountsMagic[8] = {'N','O','D','E','C','N','T','0'};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -496,6 +501,7 @@ void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
                 uint64_t num_nodes = 0;
                 uint64_t direction_bitmask = 0;
                 if (f.read(reinterpret_cast<char*>(magic), 8) &&
+                    std::memcmp(magic, kNodeCountsMagic, 8) == 0 &&
                     f.read(reinterpret_cast<char*>(&num_nodes),         sizeof(num_nodes)) &&
                     f.read(reinterpret_cast<char*>(&direction_bitmask), sizeof(direction_bitmask)) &&
                     num_nodes == tier_lookup_ref_->size())

@@ -8,15 +8,22 @@
 //   2. OutOfOrderInsert_PreservesIdentity — random insert order; lookup
 //      still resolves through node_to_l2_idx_.
 //   3. FreezeRejectsAddNode — calling add_node after freeze() throws.
-//   4. Uint32EdgeOverflow_ThrowsOnFreeze — synthetic forced overflow via a
-//      stub helper (see test). We don't allocate 4 B entries; instead we
-//      verify the error path symbolically by construction. Marked as a
-//      "NoCheap" test if the harness ever needs to skip it.
+//   4. Uint32EdgeCountGuard — the freeze() edge-COUNT cap has no executable
+//      negative coverage (4 B entries are unallocatable in a unit test); the
+//      per-dst VALUE narrowing guard in add_node IS exercised for real in
+//      tests 8/9 below.
 //   5. EmptyNode_ZeroDegreeRoundTrips — node with empty neighbor list.
 //   6. TotalBytes_MatchesL2Contract — assertion against the Phase 1 contract
 //      (kL2NodeFixedOverhead + kL2PerEdgeBytes * degree).
 //   7. GetPreFreezeThrows — calling get() before freeze() throws
 //      std::logic_error, symmetric to add_node()'s post-freeze throw.
+//   8. Uint32DstOrdinalOverflow_ThrowsOnAddNode — a dst ordinal > UINT32_MAX
+//      throws std::overflow_error at add_node (the actual narrowing site);
+//      UINT32_MAX itself round-trips.
+//   9. HeterogeneousDstTag_Throws — mixed dst type tags (including tag-0
+//      mixed with tagged) throw std::invalid_argument: the read path ORs
+//      dst_type_tag_ back onto every entry, so a mixed section would be
+//      silently retagged.
 //
 // Pure data-structure tests — no DB / System / projection dependency.
 
@@ -136,28 +143,96 @@ TEST(L2CompactCsr, FreezeRejectsAddNode) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4 — Uint32EdgeOverflow_ThrowsOnFreeze.
+// Test 4 — Uint32EdgeCountGuard_Documented_NoExecutableCoverage.
 //
-// We can't actually allocate 4.3 B entries in a unit test, so this test
-// instead verifies the freeze() invariant path is reachable + correctly
-// guarded. We do this by constructing a small CSR, then calling a private
-// helper-style scenario via a friend test — but L2CompactCsr does not have
-// a friend hook. We therefore document the path with a sanity test that
-// the freeze() of a small CSR does NOT throw, and trust the
-// `numeric_limits<uint32_t>::max()` check from the source via code review.
-//
-// (A full overflow simulation would require an artificial `col_idx_.resize()`
-// to UINT32_MAX+1 — possible only with `friend class` access. Phase 3 may
-// add such a hook; for Phase 2 we keep the test honest by documenting the
-// limitation.)
+// freeze() caps the total EDGE COUNT (col_idx_.size()) at UINT32_MAX. We
+// can't actually allocate 4.3 B entries in a unit test and L2CompactCsr has
+// no friend hook to fake col_idx_, so the count guard itself has no
+// executable negative coverage — this test only documents that a small CSR
+// freezes cleanly under the cap. The per-dst VALUE narrowing (the truncation
+// that would actually alias neighbour ids) IS exercised for real in
+// Uint32DstOrdinalOverflow_ThrowsOnAddNode below.
 // ---------------------------------------------------------------------------
-TEST(L2CompactCsr, Uint32EdgeOverflow_ThrowsOnFreeze_Documented) {
+TEST(L2CompactCsr, Uint32EdgeCountGuard_Documented_NoExecutableCoverage) {
     L2CompactCsr csr;
     csr.add_node(0, make_neighbors(0, 5));
     EXPECT_NO_THROW(csr.freeze());
     EXPECT_TRUE(csr.is_frozen());
     EXPECT_LE(csr.edge_count(),
               static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()));
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — Uint32DstOrdinalOverflow_ThrowsOnAddNode.
+//
+// col_idx_ stores each dst as a uint32 ordinal; a 56-bit payload above
+// UINT32_MAX would silently alias (wrong neighbours served from L2). The
+// narrowing site is add_node, so the guard must fire there — with or
+// without a type tag in bits 56..63.
+// ---------------------------------------------------------------------------
+TEST(L2CompactCsr, Uint32DstOrdinalOverflow_ThrowsOnAddNode) {
+    const uint64_t kOverflowOrdinal = 0x1'0000'0000ULL;  // UINT32_MAX + 1
+
+    L2CompactCsr csr;
+    EXPECT_THROW(
+        csr.add_node(0, std::vector<AdjEntry>{ { kOverflowOrdinal, 0 } }),
+        std::overflow_error);
+
+    // The tag bits don't excuse a payload overflow.
+    const uint64_t kTag = 0xD4ULL << 56;
+    L2CompactCsr csr_tagged;
+    EXPECT_THROW(
+        csr_tagged.add_node(0, std::vector<AdjEntry>{ { kTag | kOverflowOrdinal, 0 } }),
+        std::overflow_error);
+
+    // Boundary: UINT32_MAX itself is representable and must round-trip.
+    L2CompactCsr csr_max;
+    csr_max.add_node(0, std::vector<AdjEntry>{ { 0xFFFF'FFFFULL, 0 } });
+    csr_max.freeze();
+    auto span = csr_max.get(0);
+    ASSERT_EQ(1u, span.second);
+    EXPECT_EQ(std::numeric_limits<uint32_t>::max(), span.first[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9 — HeterogeneousDstTag_Throws.
+//
+// The read path reconstructs every dst as dst_type_tag() | col_idx_[i], so
+// all dsts in one L2 section must carry the SAME tag — including tag 0:
+// a raw ordinal mixed into a tagged section would be silently retagged
+// (and vice versa, earlier tag-0 entries would absorb a later tag).
+// ---------------------------------------------------------------------------
+TEST(L2CompactCsr, HeterogeneousDstTag_Throws) {
+    const uint64_t kTagA = 0xD4ULL << 56;
+    const uint64_t kTagB = 0xD5ULL << 56;
+
+    // Two different non-zero tags.
+    L2CompactCsr csr;
+    csr.add_node(0, std::vector<AdjEntry>{ { kTagA | 1u, 0 } });
+    EXPECT_THROW(
+        csr.add_node(1, std::vector<AdjEntry>{ { kTagB | 2u, 0 } }),
+        std::invalid_argument);
+
+    // tag-0 dst after a tagged section.
+    L2CompactCsr csr_tag_then_raw;
+    csr_tag_then_raw.add_node(0, std::vector<AdjEntry>{ { kTagA | 1u, 0 } });
+    EXPECT_THROW(
+        csr_tag_then_raw.add_node(1, std::vector<AdjEntry>{ { 2u, 0 } }),
+        std::invalid_argument);
+
+    // Tagged dst after raw tag-0 entries.
+    L2CompactCsr csr_raw_then_tag;
+    csr_raw_then_tag.add_node(0, std::vector<AdjEntry>{ { 1u, 0 } });
+    EXPECT_THROW(
+        csr_raw_then_tag.add_node(1, std::vector<AdjEntry>{ { kTagA | 2u, 0 } }),
+        std::invalid_argument);
+
+    // Uniform tags (any value, including 0) are fine.
+    L2CompactCsr csr_uniform;
+    csr_uniform.add_node(0, std::vector<AdjEntry>{ { kTagA | 1u, 0 }, { kTagA | 2u, 0 } });
+    csr_uniform.add_node(1, std::vector<AdjEntry>{ { kTagA | 3u, 0 } });
+    EXPECT_NO_THROW(csr_uniform.freeze());
+    EXPECT_EQ(kTagA, csr_uniform.dst_type_tag());
 }
 
 // ---------------------------------------------------------------------------

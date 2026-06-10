@@ -373,9 +373,9 @@ GraphSample EmbeddingWriter::build_graph_sample(
         return sample;
     }
 
-    // Build the undirected adjacency cache on first use. Subsequent chunks
-    // re-use the cached hash map so the O(|E|) scan is amortised across
-    // Phase B.
+    // Build the adjacency cache (directions selected by config_.orientation)
+    // on first use. Subsequent chunks re-use the cached hash map so the
+    // O(|E|) scan is amortised across Phase B.
     if (!adj_cache_built_) {
         build_adjacency_cache_();
     }
@@ -398,7 +398,7 @@ GraphSample EmbeddingWriter::build_graph_sample(
         const auto& current_layer = sample.nodes_per_layer[k];
 
         for (const ObjectId& node_id : current_layer) {
-            // Pull neighbors from the in-memory undirected cache (Phase B
+            // Pull neighbors from the in-memory adjacency cache (Phase B
             // performance path — see EmbeddingWriter::build_adjacency_cache_
             // for rationale). This replaces the per-call B+Tree range query,
             // which is O(page_tuples) under CSR_HYBRID v3 storage and
@@ -625,78 +625,105 @@ uint64_t EmbeddingWriter::write_to_projection(
     auto* nkv_index = projection_storage_.get_node_key_value_index();
     auto* kvn_index = projection_storage_.get_key_value_node_index();
 
+    // Persist the catalog (carrying the key registered above) BEFORE any
+    // property record is inserted: pages dirtied by a partially-completed
+    // loop can still reach disk via the buffer pool, and records under a
+    // key id that never made it into catalog.dat would be unresolvable.
+    // flush() is idempotent — it only rebuilds indexes when streaming
+    // buffers have pending records (they don't; we use direct inserts).
+    projection_storage_.flush();
+
     // -------------------------------------------------------------------------
     // Step 3: For each embedding, serialize -> TensorManager -> B+Tree insert
     // -------------------------------------------------------------------------
 
     uint64_t written = 0;
 
-    for (const auto& [row_index, emb_tensor] : emb_map) {
-        // 3a. Get node ObjectId from RowMapping
-        ObjectId node_oid = row_mapping_.get(row_index);
-        if (node_oid.is_null()) {
-            // Defensive: skip invalid row indices
-            continue;
-        }
-
-        // 3b. Serialize embedding to contiguous float bytes
-        torch::Tensor emb_cpu = emb_tensor.cpu().contiguous().to(torch::kFloat32);
-        const auto* bytes = reinterpret_cast<const char*>(emb_cpu.data_ptr<float>());
-        size_t num_bytes = static_cast<size_t>(emb_cpu.numel()) * sizeof(float);
-
-        // 3c. Store in TensorManager (deduplicates identical tensors)
-        uint64_t tensor_id = tensor_manager.get_or_create_id(bytes, num_bytes);
-
-        // 3d. Build tensor ObjectId (float extern)
-        ObjectId tensor_oid(ObjectId::MASK_TENSOR_FLOAT_EXTERN | tensor_id);
-
-        // 3e. Delete any existing records for this (node, key) BEFORE
-        //     inserting.  get_node_property() returns the first record in
-        //     the (node, key) range, so a leftover record from a previous
-        //     write (smaller tensor id sorts first) would shadow the new
-        //     value.  Property indexes are v1-mutable, so delete_record is
-        //     supported.  Stale values are collected first so the range
-        //     iterator is destroyed before the tree is mutated.
-        std::vector<uint64_t> stale_value_ids;
-        {
-            Record<3> min_record = { node_oid.id, key_oid.id, 0 };
-            Record<3> max_record = { node_oid.id, key_oid.id, UINT64_MAX };
-
-            bool interruption_requested = false;
-            auto iter = nkv_index->get_range(&interruption_requested,
-                                             min_record, max_record);
-            const Record<3>* rec;
-            while ((rec = iter.next()) != nullptr) {
-                stale_value_ids.push_back((*rec)[2]);
+    try {
+        for (const auto& [row_index, emb_tensor] : emb_map) {
+            // 3a. Get node ObjectId from RowMapping
+            ObjectId node_oid = row_mapping_.get(row_index);
+            if (node_oid.is_null()) {
+                // Defensive: skip invalid row indices
+                continue;
             }
-        }
-        for (uint64_t stale_value_id : stale_value_ids) {
-            if (stale_value_id == tensor_oid.id) {
-                continue;  // identical record; the insert below is a no-op
+
+            // 3b. Serialize embedding to contiguous float bytes
+            torch::Tensor emb_cpu = emb_tensor.cpu().contiguous().to(torch::kFloat32);
+            const auto* bytes = reinterpret_cast<const char*>(emb_cpu.data_ptr<float>());
+            size_t num_bytes = static_cast<size_t>(emb_cpu.numel()) * sizeof(float);
+
+            // 3c. Store in TensorManager (deduplicates identical tensors)
+            uint64_t tensor_id = tensor_manager.get_or_create_id(bytes, num_bytes);
+
+            // 3d. Build tensor ObjectId (float extern)
+            ObjectId tensor_oid(ObjectId::MASK_TENSOR_FLOAT_EXTERN | tensor_id);
+
+            // 3e. Delete any existing records for this (node, key) BEFORE
+            //     inserting.  get_node_property() returns the first record in
+            //     the (node, key) range, so a leftover record from a previous
+            //     write (smaller tensor id sorts first) would shadow the new
+            //     value.  Property indexes are v1-mutable, so delete_record is
+            //     supported.  Stale values are collected first so the range
+            //     iterator is destroyed before the tree is mutated.
+            std::vector<uint64_t> stale_value_ids;
+            {
+                Record<3> min_record = { node_oid.id, key_oid.id, 0 };
+                Record<3> max_record = { node_oid.id, key_oid.id, UINT64_MAX };
+
+                bool interruption_requested = false;
+                auto iter = nkv_index->get_range(&interruption_requested,
+                                                 min_record, max_record);
+                const Record<3>* rec;
+                while ((rec = iter.next()) != nullptr) {
+                    stale_value_ids.push_back((*rec)[2]);
+                }
             }
-            Record<3> stale_nkv = { node_oid.id, key_oid.id, stale_value_id };
-            nkv_index->delete_record(stale_nkv);
+            for (uint64_t stale_value_id : stale_value_ids) {
+                if (stale_value_id == tensor_oid.id) {
+                    continue;  // identical record; the insert below is a no-op
+                }
+                Record<3> stale_nkv = { node_oid.id, key_oid.id, stale_value_id };
+                nkv_index->delete_record(stale_nkv);
 
-            Record<3> stale_kvn = { key_oid.id, stale_value_id, node_oid.id };
-            kvn_index->delete_record(stale_kvn);
+                Record<3> stale_kvn = { key_oid.id, stale_value_id, node_oid.id };
+                kvn_index->delete_record(stale_kvn);
+            }
+
+            // 3f. Insert into both B+Tree property indexes, back-to-back so a
+            //     failure leaves at most the FINAL (node, key) pair ragged
+            //     (nkv inserted, kvn not).  The delete-before-insert pass in
+            //     3e repairs such a pair on re-run.
+            //     Primary: (node_id, key_id, value_id) -- for node property lookups
+            Record<3> nkv_record;
+            nkv_record[0] = node_oid.id;
+            nkv_record[1] = key_oid.id;
+            nkv_record[2] = tensor_oid.id;
+            nkv_index->insert(nkv_record);
+
+            //     Auxiliary: (key_id, value_id, node_id) -- for property -> node lookups
+            Record<3> kvn_record;
+            kvn_record[0] = key_oid.id;
+            kvn_record[1] = tensor_oid.id;
+            kvn_record[2] = node_oid.id;
+            kvn_index->insert(kvn_record);
+
+            ++written;
         }
-
-        // 3f. Insert into both B+Tree property indexes
-        //     Primary: (node_id, key_id, value_id) -- for node property lookups
-        Record<3> nkv_record;
-        nkv_record[0] = node_oid.id;
-        nkv_record[1] = key_oid.id;
-        nkv_record[2] = tensor_oid.id;
-        nkv_index->insert(nkv_record);
-
-        //     Auxiliary: (key_id, value_id, node_id) -- for property -> node lookups
-        Record<3> kvn_record;
-        kvn_record[0] = key_oid.id;
-        kvn_record[1] = tensor_oid.id;
-        kvn_record[2] = node_oid.id;
-        kvn_index->insert(kvn_record);
-
-        ++written;
+    } catch (const std::exception& e) {
+        // Persist the records inserted before the failure so the on-disk
+        // B+Trees match the already-saved catalog, then surface the partial
+        // progress so the user knows a re-run is needed (re-runs are
+        // self-healing via the 3e upsert).
+        try {
+            projection_storage_.flush();
+        } catch (...) {
+            // keep the original error — it names the actionable failure
+        }
+        throw std::runtime_error(
+            "EmbeddingWriter::write_to_projection: failed after writing "
+            + std::to_string(written) + " of "
+            + std::to_string(emb_map.size()) + " embeddings: " + e.what());
     }
 
     // -------------------------------------------------------------------------
@@ -737,7 +764,7 @@ void EmbeddingWriter::build_adjacency_cache_() {
     // rehashes that would serialize against the streaming inserts below.
     adj_cache_.reserve(row_mapping_.size());
 
-    auto scan_and_merge = [&](BPlusTree<3>* index, bool forward) {
+    auto scan_and_merge = [&](BPlusTree<3>* index) {
         if (!index) return;
         Record<3> min_record = {0, 0, 0};
         Record<3> max_record = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
@@ -749,17 +776,26 @@ void EmbeddingWriter::build_adjacency_cache_() {
             const uint64_t a = std::get<0>(*rec);
             const uint64_t b = std::get<1>(*rec);
             const uint64_t e = std::get<2>(*rec);
-            // from_to_edge stores (from, to, edge_id); to_from_edge
-            // stores (to, from, edge_id). Under UNDIRECTED semantics the
-            // adjacency map is keyed on "this endpoint" so both edges
-            // contribute to both endpoints' neighbor lists.
-            (void)forward; // same merge for both indexes — symmetry baked in
             adj_cache_[a].push_back({b, e});
         }
     };
 
-    scan_and_merge(fwd_index, /*forward=*/true);
-    scan_and_merge(rev_index, /*forward=*/false);
+    // from_to_edge stores (from, to, edge_id) and to_from_edge stores
+    // (to, from, edge_id), both keyed on "this endpoint": the forward scan
+    // contributes out-neighbors, the reverse scan in-neighbors.
+    // config_.orientation selects which directions Phase B sampling may
+    // traverse, so inference neighborhoods match the neighbor semantics the
+    // model was trained on.
+    if (config_.orientation == EdgeOrientation::NATURAL
+        || config_.orientation == EdgeOrientation::UNDIRECTED)
+    {
+        scan_and_merge(fwd_index);
+    }
+    if (config_.orientation == EdgeOrientation::REVERSE
+        || config_.orientation == EdgeOrientation::UNDIRECTED)
+    {
+        scan_and_merge(rev_index);
+    }
 
     adj_cache_built_ = true;
 
@@ -773,9 +809,14 @@ void EmbeddingWriter::build_adjacency_cache_() {
     for (const auto& [k, v] : adj_cache_) {
         total_edges += v.size();
     }
-    std::cerr << "[EmbeddingWriter] adjacency cache built: "
+    const char* orient_name =
+        config_.orientation == EdgeOrientation::NATURAL    ? "NATURAL"
+        : config_.orientation == EdgeOrientation::REVERSE  ? "REVERSE"
+                                                           : "UNDIRECTED";
+    std::cerr << "[EmbeddingWriter] adjacency cache built ("
+              << orient_name << "): "
               << adj_cache_.size() << " nodes, "
-              << total_edges << " directed entries (incl. both directions), "
+              << total_edges << " directed entries, "
               << static_cast<int>(ms) << " ms"
               << std::endl;
 }

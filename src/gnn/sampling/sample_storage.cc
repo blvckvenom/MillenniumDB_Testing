@@ -1,6 +1,8 @@
 #include "gnn/sampling/sample_storage.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <fstream>
 #include <list>
 #include <mutex>
@@ -35,6 +37,31 @@ constexpr const char* FREQUENCY_FILE = "frequency.dat";
 constexpr uint32_t BATCH_MAGIC = 0x48435442;  // "BTCH"
 constexpr uint32_t INDEX_MAGIC = 0x58444E49;  // "INDX"
 constexpr uint32_t FREQ_MAGIC = 0x51455246;   // "FREQ"
+
+// Claim the on-disk sample directory for a new write. SampleStorage::exists()
+// keys off catalog.dat (written only at finalize), so a directory WITHOUT a
+// catalog is a stale leftover from a run that died before finalizing — remove
+// it instead of wedging every re-run on "already exists" (which force:true,
+// keyed off exists(), cannot clear). The trailing mkdir() is atomic: under
+// concurrent same-name creates exactly one caller wins; the loser gets EEXIST.
+void claim_storage_dir(const std::filesystem::path& path) {
+    if (std::filesystem::exists(path)) {
+        if (SampleCatalog::exists(path)) {
+            throw std::runtime_error("Sample storage already exists: " + path.string());
+        }
+        logger.info() << "SampleStorage: removing stale sample directory "
+                      << "(no catalog.dat): " << path.string();
+        std::filesystem::remove_all(path);
+    }
+    std::filesystem::create_directories(path.parent_path());
+    if (::mkdir(path.c_str(), 0755) != 0) {
+        if (errno == EEXIST) {
+            throw std::runtime_error("Sample storage already exists: " + path.string());
+        }
+        throw std::runtime_error("Failed to create sample storage directory '"
+                                 + path.string() + "': " + std::strerror(errno));
+    }
+}
 
 } // anonymous namespace
 
@@ -416,6 +443,19 @@ struct SampleStorage::Impl {
         }
 
         uint64_t num_entries = read_value<uint64_t>(index_in);
+
+        // Validate the entry count against the file size BEFORE the resize so
+        // a corrupted header cannot drive an arbitrary-size allocation.
+        constexpr uint64_t index_header_bytes = 2 * sizeof(uint32_t) + sizeof(uint64_t);
+        uint64_t index_file_bytes = std::filesystem::file_size(index_path);
+        if (index_file_bytes < index_header_bytes
+            || num_entries > (index_file_bytes - index_header_bytes) / (2 * sizeof(uint64_t)))
+        {
+            throw std::runtime_error(
+                "Index file claims " + std::to_string(num_entries)
+                + " entries but holds " + std::to_string(index_file_bytes)
+                + " bytes (file likely corrupted): " + index_path.string());
+        }
         batch_index.resize(num_entries);
 
         for (uint64_t i = 0; i < num_entries; ++i) {
@@ -595,28 +635,59 @@ struct SampleStorage::Impl {
             return;
         }
 
-        uint32_t magic = read_value<uint32_t>(freq_in);
-        if (magic != FREQ_MAGIC) {
-            return;
-        }
-
-        uint32_t version = read_value<uint32_t>(freq_in);
-        uint64_t num_entries = read_value<uint64_t>(freq_in);
-
-        if (version == 2) {
-            // Dense format: N consecutive uint64 counts
-            dense_freq_cache_.resize(num_entries);
-            freq_in.read(reinterpret_cast<char*>(dense_freq_cache_.data()),
-                         num_entries * sizeof(uint64_t));
-            freq_version_ = 2;
-        } else {
-            // v1 sparse format: [oid, count] pairs
-            for (uint64_t i = 0; i < num_entries; ++i) {
-                uint64_t node_id = read_value<uint64_t>(freq_in);
-                uint64_t count = read_value<uint64_t>(freq_in);
-                node_frequencies[node_id] = count;
+        try {
+            uint32_t magic = read_value<uint32_t>(freq_in);
+            if (magic != FREQ_MAGIC) {
+                return;
             }
-            freq_version_ = 1;
+
+            uint32_t version = read_value<uint32_t>(freq_in);
+            uint64_t num_entries = read_value<uint64_t>(freq_in);
+
+            // Validate the entry count against the file size BEFORE any
+            // allocation: a corrupted header must not drive an arbitrary-size
+            // resize, and a truncated payload must not silently load as
+            // zero-filled counts (consumed by MinHash reorder and L1/L2 tier
+            // assignment with no further checks).
+            constexpr uint64_t freq_header_bytes = 2 * sizeof(uint32_t) + sizeof(uint64_t);
+            const uint64_t entry_bytes = (version == 2) ? sizeof(uint64_t)
+                                                        : 2 * sizeof(uint64_t);
+            uint64_t freq_file_bytes = std::filesystem::file_size(freq_path);
+            if (freq_file_bytes < freq_header_bytes
+                || num_entries > (freq_file_bytes - freq_header_bytes) / entry_bytes)
+            {
+                throw std::runtime_error(
+                    "frequency file claims " + std::to_string(num_entries)
+                    + " entries but holds " + std::to_string(freq_file_bytes) + " bytes");
+            }
+
+            if (version == 2) {
+                // Dense format: N consecutive uint64 counts
+                dense_freq_cache_.resize(num_entries);
+                freq_in.read(reinterpret_cast<char*>(dense_freq_cache_.data()),
+                             num_entries * sizeof(uint64_t));
+                if (!freq_in) {
+                    throw std::runtime_error("truncated dense frequency payload");
+                }
+                freq_version_ = 2;
+            } else {
+                // v1 sparse format: [oid, count] pairs
+                for (uint64_t i = 0; i < num_entries; ++i) {
+                    uint64_t node_id = read_value<uint64_t>(freq_in);
+                    uint64_t count = read_value<uint64_t>(freq_in);
+                    node_frequencies[node_id] = count;
+                }
+                freq_version_ = 1;
+            }
+        } catch (const std::exception& e) {
+            // Corrupt/truncated frequency.dat degrades to "no frequency data"
+            // (callers fall back) instead of serving partial or zero-filled
+            // counts downstream.
+            dense_freq_cache_.clear();
+            node_frequencies.clear();
+            freq_version_ = 0;
+            logger.error() << "SampleStorage: failed to load frequency file '"
+                           << freq_path.string() << "': " << e.what();
         }
     }
 
@@ -667,6 +738,9 @@ struct SampleStorage::Impl {
     static T read_value(std::istream& in) {
         T value;
         in.read(reinterpret_cast<char*>(&value), sizeof(T));
+        if (!in) {
+            throw std::runtime_error("SampleStorage: read failed (truncated or corrupt file)");
+        }
         return value;
     }
 };
@@ -703,9 +777,7 @@ SampleStorage SampleStorage::create(
 ) {
     auto path = get_storage_path(db_folder, config.sample_name);
 
-    if (std::filesystem::exists(path)) {
-        throw std::runtime_error("Sample storage already exists: " + path.string());
-    }
+    claim_storage_dir(path);
 
     SampleStorage storage;
     storage.impl_->init_write_mode(path, config);
@@ -719,9 +791,7 @@ SampleStorage SampleStorage::create(
 ) {
     auto path = get_storage_path(db_folder, config.sample_name);
 
-    if (std::filesystem::exists(path)) {
-        throw std::runtime_error("Sample storage already exists: " + path.string());
-    }
+    claim_storage_dir(path);
 
     SampleStorage storage;
     storage.impl_->row_mapping_ = &row_mapping;

@@ -187,8 +187,12 @@ void generate_packed_batches(
 /// ulimit -n; 1024+ recommended).
 ///
 /// Two output formats, selected by whether `oid_provider` is supplied:
-///   - v1 (oid_provider empty): header + features section; rows in the
-///     order returned by row_provider. Bit-identical to generate_packed_batches.
+///   - v1 (oid_provider empty): header + features section; rows grouped by
+///     feature partition (ascending fmat row), keeping row_provider order
+///     within each group. PRECONDITION for positional consumers: this equals
+///     row_provider order — and the output is bit-identical to
+///     generate_packed_batches — only when row_provider returns rows sorted
+///     ascending by fmat row (true for the four_level_store caller).
 ///   - v2 (oid_provider non-empty): header + OID table + features section;
 ///     rows in **partition iteration order** (NOT row_provider order).
 ///     `oid_table[i] ↔ data[i]` consistency is preserved. Functionally

@@ -79,6 +79,49 @@ torch::Tensor GraphSAGEModel::sage_conv(
 }
 
 // ============================================================================
+// Shared input validation — forward() and get_embeddings() enforce the same
+// invariants; `who` names the entry point in error messages.
+// ============================================================================
+
+namespace {
+
+void validate_message_passing_inputs(
+    const char* who,
+    const GraphSAGEConfig& config,
+    const torch::Tensor& x,
+    const std::vector<torch::Tensor>& edge_indices,
+    const std::vector<int64_t>& active_sizes_per_layer)
+{
+    if ((int64_t)edge_indices.size() != config.num_layers) {
+        throw std::invalid_argument(
+            std::string(who) + ": edge_indices.size() must equal num_layers ("
+            + std::to_string(config.num_layers) + "), got "
+            + std::to_string(edge_indices.size()));
+    }
+    if ((int64_t)active_sizes_per_layer.size() != config.num_layers + 1) {
+        throw std::invalid_argument(
+            std::string(who) + ": active_sizes_per_layer.size() must be "
+            "num_layers+1 (" + std::to_string(config.num_layers + 1) + "), got "
+            + std::to_string(active_sizes_per_layer.size()));
+    }
+    if (active_sizes_per_layer.back() != x.size(0)) {
+        throw std::invalid_argument(
+            std::string(who) + ": active_sizes_per_layer.back() ("
+            + std::to_string(active_sizes_per_layer.back())
+            + ") must equal x.size(0) ("
+            + std::to_string(x.size(0)) + ")");
+    }
+    const int64_t num_seeds = active_sizes_per_layer[0];
+    if (num_seeds <= 0) {
+        throw std::invalid_argument(
+            std::string(who) + ": num_seeds (= active_sizes_per_layer[0]) "
+            "must be > 0, got " + std::to_string(num_seeds));
+    }
+}
+
+} // namespace
+
+// ============================================================================
 // forward — outside-in layer traversal
 // ============================================================================
 
@@ -87,54 +130,15 @@ torch::Tensor GraphSAGEModel::forward(
     const std::vector<torch::Tensor>& edge_indices,
     const std::vector<int64_t>& active_sizes_per_layer)
 {
-    if ((int64_t)edge_indices.size() != config_.num_layers) {
-        throw std::invalid_argument(
-            "GraphSAGEModel::forward: edge_indices.size() must equal num_layers ("
-            + std::to_string(config_.num_layers) + "), got "
-            + std::to_string(edge_indices.size()));
-    }
-    if ((int64_t)active_sizes_per_layer.size() != config_.num_layers + 1) {
-        throw std::invalid_argument(
-            "GraphSAGEModel::forward: active_sizes_per_layer.size() must be "
-            "num_layers+1 (" + std::to_string(config_.num_layers + 1) + "), got "
-            + std::to_string(active_sizes_per_layer.size()));
-    }
-    if (active_sizes_per_layer.back() != x.size(0)) {
-        throw std::invalid_argument(
-            "GraphSAGEModel::forward: active_sizes_per_layer.back() ("
-            + std::to_string(active_sizes_per_layer.back())
-            + ") must equal x.size(0) ("
-            + std::to_string(x.size(0)) + ")");
-    }
-    const int64_t num_seeds = active_sizes_per_layer[0];
-    if (num_seeds <= 0) {
-        throw std::invalid_argument(
-            "GraphSAGEModel::forward: num_seeds (= active_sizes_per_layer[0]) "
-            "must be > 0, got " + std::to_string(num_seeds));
-    }
+    validate_message_passing_inputs(
+        "GraphSAGEModel::forward", config_, x, edge_indices, active_sizes_per_layer);
 
-    // Process layers from outermost (convs_[num_layers-1], deepest applied)
-    // down to innermost (convs_[0], seeds dst).
-    // convs_[k] consumes A_{k+1} features and produces A_k features.
-    for (int k = (int)convs_.size() - 1; k >= 0; k--) {
-        const int64_t num_dst = active_sizes_per_layer[k];
-        x = sage_conv(x, edge_indices[k], num_dst, convs_[k]);
+    // Message passing is shared with get_embeddings; after the final conv at
+    // k=0, the result has shape [num_seeds, hidden_dim].
+    auto hidden = get_embeddings(std::move(x), edge_indices, active_sizes_per_layer);
 
-        if (k > 0) {
-            // Activation + regularization between hidden layers (not after last conv).
-            x = torch::relu(x);
-            if (is_training()) {
-                x = torch::dropout(x, config_.dropout, /*train=*/true);
-            }
-            if (config_.normalize) {
-                x = x / x.norm(2, /*dim=*/1, /*keepdim=*/true).clamp_min(1e-6);
-            }
-        }
-    }
-
-    // After the final sage_conv at k=0, x has shape [num_seeds, hidden_dim].
     // The classifier maps to num_classes.
-    auto logits = classifier_->forward(x);   // [num_seeds, num_classes]
+    auto logits = classifier_->forward(hidden);   // [num_seeds, num_classes]
     return logits;
 }
 
@@ -147,23 +151,18 @@ torch::Tensor GraphSAGEModel::get_embeddings(
     const std::vector<torch::Tensor>& edge_indices,
     const std::vector<int64_t>& active_sizes_per_layer)
 {
-    if ((int64_t)edge_indices.size() != config_.num_layers) {
-        throw std::invalid_argument(
-            "GraphSAGEModel::get_embeddings: edge_indices.size() must equal num_layers ("
-            + std::to_string(config_.num_layers) + "), got "
-            + std::to_string(edge_indices.size()));
-    }
-    if ((int64_t)active_sizes_per_layer.size() != config_.num_layers + 1) {
-        throw std::invalid_argument(
-            "GraphSAGEModel::get_embeddings: active_sizes_per_layer.size() must be num_layers+1");
-    }
+    validate_message_passing_inputs(
+        "GraphSAGEModel::get_embeddings", config_, x, edge_indices, active_sizes_per_layer);
 
-    // Same message-passing as forward, just no classifier.
+    // Process layers from outermost (convs_[num_layers-1], deepest applied)
+    // down to innermost (convs_[0], seeds dst).
+    // convs_[k] consumes A_{k+1} features and produces A_k features.
     for (int k = (int)convs_.size() - 1; k >= 0; k--) {
         const int64_t num_dst = active_sizes_per_layer[k];
         x = sage_conv(x, edge_indices[k], num_dst, convs_[k]);
 
         if (k > 0) {
+            // Activation + regularization between hidden layers (not after last conv).
             x = torch::relu(x);
             if (is_training()) {
                 x = torch::dropout(x, config_.dropout, /*train=*/true);

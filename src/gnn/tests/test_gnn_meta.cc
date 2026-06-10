@@ -146,6 +146,70 @@ TEST_F(GnnMetaTest, BothFlagsTrue) {
 }
 
 // ===========================================================================
+// OversizedFeatureNameLenThrows
+// ===========================================================================
+
+TEST_F(GnnMetaTest, OversizedFeatureNameLenThrows) {
+    auto bad_path = test_dir_ / "bad_name_len.bin";
+
+    // Valid header up to feature_name_len, then a file-controlled length
+    // of 0xFFFFFFFF. read() must reject the length BEFORE allocating,
+    // not after attempting a 4 GiB resize.
+    {
+        std::ofstream f(bad_path, std::ios::binary);
+        const uint8_t magic[8] = {'G','N','N','M','\0','\0','\0','\0'};
+        f.write(reinterpret_cast<const char*>(magic), 8);
+        uint32_t ver = 1;
+        f.write(reinterpret_cast<const char*>(&ver), 4);
+        uint32_t feature_dim = 8;
+        f.write(reinterpret_cast<const char*>(&feature_dim), 4);
+        uint64_t num_nodes = 10;
+        f.write(reinterpret_cast<const char*>(&num_nodes), 8);
+        uint64_t num_classes = 2;
+        f.write(reinterpret_cast<const char*>(&num_classes), 8);
+        const uint8_t flags_and_reserved[4] = {0, 0, 0, 0};
+        f.write(reinterpret_cast<const char*>(flags_and_reserved), 4);
+        uint32_t name_len = 0xFFFFFFFFu;
+        f.write(reinterpret_cast<const char*>(&name_len), 4);
+    }
+
+    try {
+        mdb::gnn::GnnMeta::read(bad_path);
+        FAIL() << "read() must reject an oversized feature_name_len";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("feature_name_len"), std::string::npos)
+            << "expected the oversized-length rejection, got: " << e.what();
+    }
+}
+
+// ===========================================================================
+// WriteLeavesNoTmpFile
+// ===========================================================================
+
+TEST_F(GnnMetaTest, WriteLeavesNoTmpFile) {
+    auto meta_path = test_dir_ / "gnn_meta_atomic.bin";
+
+    mdb::gnn::GnnMeta m;
+    m.feature_name = "feat";
+    m.feature_dim  = 4;
+    m.num_nodes    = 5;
+    m.num_classes  = 2;
+
+    m.write(meta_path);
+    EXPECT_TRUE(std::filesystem::exists(meta_path));
+    EXPECT_FALSE(std::filesystem::exists(meta_path.string() + ".tmp"));
+
+    // Overwriting an existing file must go through the same tmp -> rename
+    // sequence and leave the new content in place.
+    m.feature_name = "feat2";
+    m.write(meta_path);
+    EXPECT_FALSE(std::filesystem::exists(meta_path.string() + ".tmp"));
+
+    auto m2 = mdb::gnn::GnnMeta::read(meta_path);
+    EXPECT_EQ(m2.feature_name, "feat2");
+}
+
+// ===========================================================================
 // UnsupportedVersionThrows
 // ===========================================================================
 

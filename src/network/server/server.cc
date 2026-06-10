@@ -18,6 +18,14 @@ using namespace boost;
 using tcp = asio::ip::tcp;
 namespace http = boost::beast::http;
 
+namespace {
+// Written from the SIGTERM/SIGINT handler and polled by execute_timeouts().
+// Mutating a plain bool from a signal handler is undefined behavior;
+// volatile std::sig_atomic_t is the only integer type std::signal
+// guarantees safe to write from a handler.
+volatile std::sig_atomic_t shutdown_signal_received = 0;
+} // namespace
+
 // Append an HTTP rel-path to a local filesystem path.
 // The returned path is normalized for the platform.
 inline std::string path_cat(std::string_view base, std::string_view path)
@@ -356,12 +364,12 @@ void Server::run(
 
 void Server::signal_shutdown_server(int)
 {
-    shutdown_server = true;
+    shutdown_signal_received = 1;
 }
 
 void Server::execute_timeouts()
 {
-    while (!shutdown_server) {
+    while (!shutdown_signal_received) {
         auto start = std::chrono::system_clock::now();
 
         while (std::chrono::system_clock::now() - start < std::chrono::milliseconds(1'000)) {

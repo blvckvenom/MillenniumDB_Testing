@@ -1240,6 +1240,34 @@ NodeProjectionConfig ProjectProcedure::parse_single_node_config(
     return config;
 }
 
+// =============================================================================
+// Helper: auto-select the aggregation property for MIN/MAX/SUM when none was
+// given (deterministic: first simple property, else lexicographically first
+// property-config key). Shared by every relationship-projection parse path so
+// the selection rule cannot diverge between map syntaxes.
+// =============================================================================
+
+static void auto_select_aggregation_property(RelationshipProjectionConfig& config) {
+    if ((config.aggregation == Aggregation::MIN ||
+         config.aggregation == Aggregation::MAX ||
+         config.aggregation == Aggregation::SUM) &&
+        config.aggregation_property.empty())
+    {
+        if (!config.simple_properties.empty()) {
+            config.aggregation_property = config.simple_properties[0];
+        } else if (!config.property_configs.empty()) {
+            // Use lexicographically first key for deterministic behavior
+            std::string first_key;
+            for (const auto& [k, v] : config.property_configs) {
+                if (first_key.empty() || k < first_key) {
+                    first_key = k;
+                }
+            }
+            config.aggregation_property = first_key;
+        }
+    }
+}
+
 RelationshipProjectionConfig ProjectProcedure::parse_single_relationship_config(
     ObjectId config_oid, const std::string& projected_type,
     Orientation global_orientation, Aggregation global_aggregation)
@@ -1287,24 +1315,7 @@ RelationshipProjectionConfig ProjectProcedure::parse_single_relationship_config(
     }
 
     // Auto-select aggregation property for MIN/MAX/SUM (deterministic: first simple, then sorted configs)
-    if ((config.aggregation == Aggregation::MIN ||
-         config.aggregation == Aggregation::MAX ||
-         config.aggregation == Aggregation::SUM) &&
-        config.aggregation_property.empty())
-    {
-        if (!config.simple_properties.empty()) {
-            config.aggregation_property = config.simple_properties[0];
-        } else if (!config.property_configs.empty()) {
-            // Use lexicographically first key for deterministic behavior
-            std::string first_key;
-            for (const auto& [k, v] : config.property_configs) {
-                if (first_key.empty() || k < first_key) {
-                    first_key = k;
-                }
-            }
-            config.aggregation_property = first_key;
-        }
-    }
+    auto_select_aggregation_property(config);
 
     return config;
 }
@@ -1374,23 +1385,7 @@ RelationshipProjectionMap ProjectProcedure::parse_relationship_projection_map(
                 extract_nested_properties(nested_dict, config.simple_properties, config.property_configs);
 
                 // Auto-select aggregation property (deterministic)
-                if ((config.aggregation == Aggregation::MIN ||
-                     config.aggregation == Aggregation::MAX ||
-                     config.aggregation == Aggregation::SUM) &&
-                    config.aggregation_property.empty())
-                {
-                    if (!config.simple_properties.empty()) {
-                        config.aggregation_property = config.simple_properties[0];
-                    } else if (!config.property_configs.empty()) {
-                        std::string first_key;
-                        for (const auto& [k, v] : config.property_configs) {
-                            if (first_key.empty() || k < first_key) {
-                                first_key = k;
-                            }
-                        }
-                        config.aggregation_property = first_key;
-                    }
-                }
+                auto_select_aggregation_property(config);
 
                 result[projected_type] = config;
             } else {

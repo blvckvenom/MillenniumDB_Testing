@@ -8,6 +8,7 @@
 
 #include "gnn/sampling/minhash_reorderer.h"
 #include "gnn/sampling/sample_storage.h"
+#include "gnn/storage/block_store.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
@@ -17,6 +18,63 @@
 namespace fs = std::filesystem;
 
 namespace GQL::Procedures {
+
+namespace {
+
+// The first options (gpu_budget_mb, cpu_budget_mb, force_*) predate the
+// camelCase convention used by every later key in this map; both spellings
+// are accepted for those. Everything else is camelCase-only.
+constexpr const char* KNOWN_OPTION_KEYS[] = {
+    "gpu_budget_mb",     "gpuBudgetMb",
+    "cpu_budget_mb",     "cpuBudgetMb",
+    "reorder",
+    "force",
+    "force_caches",      "forceCaches",
+    "force_reorder",     "forceReorder",
+    "force_packed_slim", "forcePackedSlim",
+    "force_meta",        "forceMeta",
+    "buildAddrTables",
+    "bakeBlocks",
+    "packFullFeatures",
+    "writeConsolidatedSlim",
+    "cleanupIntermediate",
+    "strategy",
+    "numHashes",
+    "segmentSize",
+    "diskBudgetMb",
+};
+
+// A mistyped option key must fail loudly instead of silently taking the
+// default (e.g. 'gpuBudget_mb' would otherwise leave the auto budget on with
+// zero feedback).
+void assert_known_option_keys(ObjectId arg) {
+    auto dict = Common::Conversions::unpack_dictionary(arg);
+    auto* dict_obj = dynamic_cast<DictionaryObject*>(dict->dictionary.get());
+    if (!dict_obj) return;  // DictOptions already rejects non-dictionaries
+    for (const auto& [key_oid, val_item] : dict_obj->keys) {
+        std::string key = Conversions::unpack_string(key_oid);
+        bool known = false;
+        for (const char* k : KNOWN_OPTION_KEYS) {
+            if (key == k) { known = true; break; }
+        }
+        if (!known) {
+            std::string msg = "Unknown option '" + key +
+                "' for gnn_build_feature_store. Accepted options: [";
+            bool first = true;
+            for (const char* k : KNOWN_OPTION_KEYS) {
+                if (!first) msg += ", ";
+                first = false;
+                msg += "'";
+                msg += k;
+                msg += "'";
+            }
+            msg += "]";
+            throw std::runtime_error(msg);
+        }
+    }
+}
+
+} // namespace
 
 void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     using namespace mdb::gnn;
@@ -68,12 +126,22 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
+        assert_known_option_keys(ctx.get_argument(2));
 
-        if (auto v = opts.get_int("gpu_budget_mb")) {
+        auto get_int_opt = [&](const char* key, const char* alias) {
+            auto v = opts.get_int(key);
+            return v ? v : opts.get_int(alias);
+        };
+        auto get_bool_opt = [&](const char* key, const char* alias) {
+            auto v = opts.get_bool(key);
+            return v ? v : opts.get_bool(alias);
+        };
+
+        if (auto v = get_int_opt("gpu_budget_mb", "gpuBudgetMb")) {
             if (*v < 0) throw std::runtime_error("gpu_budget_mb must be non-negative, got: " + std::to_string(*v));
             config.gpu.budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
         }
-        if (auto v = opts.get_int("cpu_budget_mb")) {
+        if (auto v = get_int_opt("cpu_budget_mb", "cpuBudgetMb")) {
             if (*v <= 0) throw std::runtime_error("cpu_budget_mb must be positive, got: " + std::to_string(*v));
             config.cpu.budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
         }
@@ -92,10 +160,10 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         //       leader on papers100M-scale graphs).
         //   {force: true, force_caches: false, force_reorder: false}
         //       Rebuild only packed_slim + meta. Useful to re-bench Fix #1-4.
-        if (auto v = opts.get_bool("force_caches"))      config.force_caches = *v;
-        if (auto v = opts.get_bool("force_reorder"))     config.force_reorder = *v;
-        if (auto v = opts.get_bool("force_packed_slim")) config.force_packed_slim = *v;
-        if (auto v = opts.get_bool("force_meta"))        config.force_meta = *v;
+        if (auto v = get_bool_opt("force_caches", "forceCaches"))           config.force_caches = *v;
+        if (auto v = get_bool_opt("force_reorder", "forceReorder"))         config.force_reorder = *v;
+        if (auto v = get_bool_opt("force_packed_slim", "forcePackedSlim"))  config.force_packed_slim = *v;
+        if (auto v = get_bool_opt("force_meta", "forceMeta"))               config.force_meta = *v;
         // Path 4 (2026-05-19): pre-resolve per-batch classification offline.
         // Default true — enables the fast runtime path in gnn_train via
         // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip Phase 5.
@@ -240,7 +308,23 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         result.addr_tables_bytes    = addr_bytes;
         result.addr_tables_built_ok = true;
         result.blocks_bytes         = blocks_bytes;
-        result.blocks_built_ok      = config.bake_blocks;
+        if (config.bake_blocks) {
+            // Report the bake outcome from the on-disk artifacts, not from the
+            // request flag: a bake that skipped over stale-format blocks must
+            // not claim success. Mirrors the train-time eligibility gate —
+            // every batch needs a block stamped with the catalog's store
+            // fingerprint (header-only probes, no body reads).
+            const auto& catalog = samples.get_catalog();
+            auto blocks_dir = storage_path / "blocks";
+            bool blocks_ok = catalog.total_batches > 0;
+            for (uint64_t b = 0; blocks_ok && b < catalog.total_batches; ++b) {
+                auto blk = block_filename(blocks_dir, b);
+                blocks_ok = catalog.sample_content_fp != 0
+                    ? BlockReader::read_store_fp(blk) == catalog.sample_content_fp
+                    : fs::exists(blk);
+            }
+            result.blocks_built_ok = blocks_ok;
+        }
     } else {
         auto fm = FeatureMatrix::open(fmat_path);
         auto rm = RowMapping::open(rmap_path);

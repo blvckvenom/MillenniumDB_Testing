@@ -413,21 +413,26 @@ TEST(FeatureAssemblerTest, CudaKernelMatchesFallback) {
     auto gpu_features = torch::randn({3, D}).to(torch::kCUDA);
     std::vector<uint32_t> gpu_pos = {0, 4, 7};
 
-    // CPU features (7 rows for positions 1,2,3,5,6,8,9)
-    std::vector<float> cpu_data(7 * D);
+    // CPU features (7 rows for positions 1,2,3,5,6,8,9). Pinned: the CUDA
+    // kernel reads this buffer from device threads via UVA, which is only
+    // legal for page-locked memory — a pageable buffer would be routed to
+    // the fallback and the kernel would never run.
+    auto cpu_pinned = torch::empty({7, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu_data = cpu_pinned.data_ptr<float>();
     std::srand(42);
-    for (auto& v : cpu_data) {
-        v = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    for (int64_t i = 0; i < 7 * D; ++i) {
+        cpu_data[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
     }
     std::vector<uint32_t> cpu_pos = {1, 2, 3, 5, 6, 8, 9};
 
     // Run CUDA path
     auto cuda_result = assembler.assemble(N, gpu_features, gpu_pos,
-                                          cpu_data.data(), 7, cpu_pos);
+                                          cpu_data, 7, cpu_pos);
 
     // Run fallback on CPU
     auto fb_result = assembler.assemble_fallback(N, gpu_features.cpu(), gpu_pos,
-                                                 cpu_data.data(), 7, cpu_pos);
+                                                 cpu_data, 7, cpu_pos);
 
     // Compare: the results should match within float precision
     auto diff = (cuda_result.cpu() - fb_result).abs().max().item<float>();
@@ -456,14 +461,17 @@ TEST(FeatureAssemblerTest, AssembleCuda_BitIdenticalAcrossStreams) {
     std::vector<uint32_t> gpu_pos;
     for (int i = 0; i < 16; ++i) gpu_pos.push_back(i);
 
-    std::vector<float> cpu_buf(16 * D);
-    for (size_t i = 0; i < cpu_buf.size(); ++i) cpu_buf[i] = static_cast<float>(i + 1000);
+    // Pinned host buffer — required for the CUDA kernel's UVA reads.
+    auto cpu_pinned = torch::empty({16, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu_buf = cpu_pinned.data_ptr<float>();
+    for (int64_t i = 0; i < 16 * D; ++i) cpu_buf[i] = static_cast<float>(i + 1000);
     std::vector<uint32_t> cpu_pos;
     for (int i = 16; i < 32; ++i) cpu_pos.push_back(i);
 
     // Run on default stream (no guard).
     auto out_default = assembler.assemble(N, gpu_features, gpu_pos,
-                                           cpu_buf.data(), 16, cpu_pos);
+                                           cpu_buf, 16, cpu_pos);
 
     // Run on a non-default stream from the pool.
     auto custom_stream = c10::cuda::getStreamFromPool();
@@ -471,13 +479,75 @@ TEST(FeatureAssemblerTest, AssembleCuda_BitIdenticalAcrossStreams) {
     {
         c10::cuda::CUDAStreamGuard guard(custom_stream);
         out_custom = assembler.assemble(N, gpu_features, gpu_pos,
-                                         cpu_buf.data(), 16, cpu_pos);
+                                         cpu_buf, 16, cpu_pos);
     }
 
     auto diff = (out_default - out_custom).abs().max().item<float>();
     EXPECT_LT(diff, 1e-6f)
         << "assemble_cuda must produce bit-identical output regardless of"
            " which stream is active when called";
+}
+
+// ===========================================================================
+// Pageable cpu_data must not reach the CUDA kernel: the UVA reads are only
+// legal for page-locked memory, so assemble() routes pageable pointers to
+// the index_copy_ fallback and still produces the correct output.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, PageableCpuPointerTakesFallbackSafely) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 6, D = 4;
+    FeatureAssembler assembler(D);
+
+    auto gpu_features = torch::randn({2, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 3};
+
+    // Plain pageable heap buffer.
+    std::vector<float> pageable(4 * D);
+    for (size_t i = 0; i < pageable.size(); ++i) {
+        pageable[i] = static_cast<float>(i);
+    }
+    std::vector<uint32_t> cpu_pos = {1, 2, 4, 5};
+
+    auto out = assembler.assemble(N, gpu_features, gpu_pos,
+                                  pageable.data(), 4, cpu_pos);
+    auto ref = assembler.assemble_fallback(N, gpu_features, gpu_pos,
+                                           pageable.data(), 4, cpu_pos);
+
+    auto diff = (out.cpu() - ref.cpu()).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-6f);
+}
+
+// ===========================================================================
+// assemble_simple must hand assemble() a device-accessible (pinned) holder
+// when dispatch will take the CUDA kernel, and the result must match the
+// fallback.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, AssembleSimpleCudaMatchesFallback) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 5, D = 3;
+    FeatureAssembler assembler(D);
+
+    auto l1 = torch::randn({2, D}).to(torch::kCUDA);
+    std::vector<uint32_t> l1_pos = {0, 2};
+
+    auto cpu = torch::tensor({{7.f, 8.f, 9.f},
+                              {10.f, 11.f, 12.f},
+                              {13.f, 14.f, 15.f}});
+    std::vector<uint32_t> cpu_pos = {1, 3, 4};
+
+    auto out = assembler.assemble_simple(N, l1, l1_pos, cpu, cpu_pos);
+    auto cpu_contig = cpu.contiguous();
+    auto ref = assembler.assemble_fallback(N, l1, l1_pos,
+                                           cpu_contig.data_ptr<float>(), 3, cpu_pos);
+
+    auto diff = (out.cpu() - ref.cpu()).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-5f);
 }
 #endif
 

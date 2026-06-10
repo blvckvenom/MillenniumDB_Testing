@@ -13,17 +13,22 @@
 // Spec reference:
 //   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
 #include "graph_models/gql/projection/radix_partition_sort.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
@@ -230,10 +235,14 @@ TEST(RadixPartitionSort, WorkerCountAdaptivToCoresMemory) {
 }
 
 // --- Test 8: Env var switches backend ---
+// get_sorter_backend() caches its decision process-wide on first call
+// (std::call_once), so this test must remain the binary's only caller —
+// a second observation could not see a different env value.
 TEST(SorterDispatch, EnvVarSwitchesBackend) {
-    unsetenv("MDB_PROJECTION_SORTER");
     setenv("MDB_PROJECTION_SORTER", "radix", 1);
-    SUCCEED() << "Manual verification: set env var then run projection.";
+    EXPECT_EQ(GQL::get_sorter_backend(), GQL::SorterBackend::RADIX)
+        << "MDB_PROJECTION_SORTER=radix must select the RADIX backend";
+    unsetenv("MDB_PROJECTION_SORTER");
 }
 
 // --- Test 9: Defensive fallback when partition exceeds worker memory ---
@@ -282,6 +291,9 @@ TEST(RadixPartitionSort, Phase2WriteFailureThrows) {
 }
 
 // --- Test 10: Cleanup on exception ---
+// Phase 2 dies mid-flight (unopenable output directory — the same
+// observable state as ENOSPC); the destructor must still remove the
+// whole scratch directory on unwind.
 TEST(RadixPartitionSort, ScratchFilesCleanedOnException) {
     wipe_scratch();
     {
@@ -294,15 +306,14 @@ TEST(RadixPartitionSort, ScratchFilesCleanedOnException) {
         GQL::StreamingRecordBuffer<3> input("/tmp/test_input10");
         input.push_back(Record<3>{{1, 2, 3}});
         rps.scan_and_partition(input, 1);
+        EXPECT_THROW(
+            rps.sort_and_write("/tmp/radix_sort_test_no_such_dir10/out"),
+            std::runtime_error);
+        ASSERT_TRUE(fs::exists(kScratchBase))
+            << "partition scratch vanished before the destructor ran";
     }
-    if (fs::exists(kScratchBase)) {
-        std::size_t remaining = 0;
-        for (auto& entry : fs::directory_iterator(kScratchBase)) {
-            (void)entry;
-            remaining++;
-        }
-        ASSERT_EQ(remaining, 0u) << "scratch files not cleaned after destructor";
-    }
+    ASSERT_FALSE(fs::exists(kScratchBase))
+        << "scratch dir not cleaned by destructor after exception";
 }
 
 // Read the first 16 bytes of a file and return them.
@@ -452,6 +463,75 @@ TEST(RadixPartitionSortGpu, GpuVsCpuBitEqualPartitionOutputs) {
         << "RADIX .leaf size differs between CPU and GPU paths";
     EXPECT_EQ(cpu_bytes, gpu_bytes)
         << "RADIX .leaf bytes differ between CPU and GPU paths";
+
+    unsetenv("MDB_PROJECTION_RADIX_GPU");
+    unsetenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS");
+}
+
+// Keys whose counters exceed 32 bits violate the GPU sort's truncated-key
+// precondition: execute_gpu_radix_sort keeps only the low 32 bits of each
+// field, so 48-bit counters would collide and come out mis-ordered. The
+// runtime guard must route such partitions to the CPU std::sort, keeping
+// GPU-on and GPU-off runs byte-identical. On a CUDA build without the
+// guard the GPU run silently sorts by truncated keys and this test fails;
+// on non-CUDA builds both runs take the CPU path by construction.
+TEST(RadixPartitionSortGpu, WideCountersFallBackToCpuBitEqual) {
+    constexpr uint64_t kTypePrefix = 0x4200000000000000ULL;
+    auto make_wide_oid = [&](uint64_t v) {
+        // 48-bit counters: well past the GPU path's 32-bit key range.
+        return kTypePrefix | (v & 0x0000FFFFFFFFFFFFULL);
+    };
+
+    auto run = [&](const char* seed_label, bool gpu_on) {
+        const std::string scratch =
+            std::string(kScratchBase) + "_gpu_wide_" + seed_label;
+        const std::string output_base =
+            std::string("/tmp/radix_gpu_wide_test_output_") + seed_label;
+        fs::remove_all(scratch);
+        fs::create_directories(scratch);
+        fs::remove(output_base + ".leaf");
+        fs::remove(output_base + ".dir");
+
+        if (gpu_on) {
+            unsetenv("MDB_PROJECTION_RADIX_GPU");
+        } else {
+            setenv("MDB_PROJECTION_RADIX_GPU", "0", 1);
+        }
+        // Reach the GPU planner even at this small dataset size.
+        setenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS", "1000", 1);
+
+        GQL::RadixPartitionSort<3>::Config cfg;
+        cfg.scratch_dir    = scratch;
+        cfg.min_partitions = 8;
+        cfg.max_partitions = 8;
+        GQL::RadixPartitionSort<3> rps(cfg);
+
+        GQL::StreamingRecordBuffer<3> input(scratch + "/input");
+        std::mt19937_64 rng(0xBADC0DE5);  // fixed seed → deterministic input
+        for (int i = 0; i < 50000; i++) {
+            Record<3> r{{ make_wide_oid(rng()), make_wide_oid(rng()),
+                          make_wide_oid(rng()) }};
+            input.push_back(r);
+        }
+        rps.scan_and_partition(input, 50000);
+        std::size_t written = rps.sort_and_write(output_base);
+        EXPECT_GT(written, 0u);
+
+        std::ifstream in(output_base + ".leaf", std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+
+    const std::string cpu_bytes = run("cpu", /*gpu_on=*/false);
+    const std::string gpu_bytes = run("gpu", /*gpu_on=*/true);
+
+    ASSERT_EQ(cpu_bytes.size(), gpu_bytes.size())
+        << "RADIX .leaf size differs between CPU and GPU-eligible runs "
+           "on >32-bit counters";
+    EXPECT_EQ(cpu_bytes, gpu_bytes)
+        << "RADIX .leaf bytes differ on >32-bit counters — the GPU path "
+           "must fall back to CPU instead of sorting truncated keys";
 
     unsetenv("MDB_PROJECTION_RADIX_GPU");
     unsetenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS");
@@ -750,4 +830,85 @@ TEST(StreamingRecordBuffer, TruncatedSpillFileThrowsMidIteration) {
     // pre-fix, the positional has_next() over-reported and next() indexed
     // an empty read buffer instead of throwing.
     EXPECT_LT(drained, kNumRecords);
+}
+
+// --- ParallelScanPartitioner: merge survives empty per-thread files ---
+// Every (thread, partition) part_p.bin is pre-created in the ctor, so a
+// sparse partition commonly has an EMPTY file for some slot. Per
+// [ostream.inserters], operator<<(basic_streambuf*) sets failbit when it
+// inserts zero characters: if an empty source precedes a non-empty one in
+// the merge loop, a poisoned sink turns every later insert into a silent
+// no-op — losing that partition's records entirely.
+TEST(ParallelScanPartitioner, MergeSurvivesEmptyThreadFileBeforeNonEmpty) {
+    const std::string scratch = std::string(kScratchBase) + "_psp_merge";
+    fs::remove_all(scratch);
+
+    GQL::ParallelScanPartitioner<1> partitioner(
+        /*num_partitions=*/2, /*num_scan_threads=*/2, scratch,
+        [](const Record<1>& r) { return static_cast<std::uint32_t>(r[0]); });
+
+    constexpr std::size_t kRecordsForPartition1 = 5;
+    partitioner.run([&](std::function<void(const Record<1>&)> emit) {
+        // Slot assignment is first-touch. Thread A (joined before B starts)
+        // takes slot 0 and writes ONLY partition 0, so thread_0/part_1.bin
+        // stays empty; thread B takes slot 1 and writes ONLY partition 1.
+        // Partition 1's merge order is therefore: empty file, then 5 records.
+        std::thread a([&] { emit(Record<1>{ { 0 } }); });
+        a.join();
+        std::thread b([&] {
+            for (std::size_t i = 0; i < kRecordsForPartition1; ++i) {
+                emit(Record<1>{ { 1 } });
+            }
+        });
+        b.join();
+    });
+
+    auto merged = partitioner.collect_merged_partition_paths();
+    ASSERT_EQ(merged.size(), 2u);
+
+    std::error_code ec;
+    const auto p0_size = fs::file_size(merged[0], ec);
+    ASSERT_FALSE(ec);
+    EXPECT_EQ(p0_size, 1 * sizeof(Record<1>));
+
+    const auto p1_size = fs::file_size(merged[1], ec);
+    ASSERT_FALSE(ec);
+    EXPECT_EQ(p1_size, kRecordsForPartition1 * sizeof(Record<1>));
+
+    fs::remove_all(scratch);
+}
+
+// --- ParallelScanPartitioner: ctor survives a low NOFILE soft limit ---
+// The ctor eagerly opens one FILE* per (thread, partition) pair; with a
+// stock 1024 soft RLIMIT_NOFILE a large fan-out used to die inside the
+// PartitionFile ctor before any record flowed. The ctor must raise the
+// soft limit (or shrink the slot count) instead.
+TEST(ParallelScanPartitioner, CtorSurvivesLowNofileSoftLimit) {
+    struct rlimit saved;
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &saved), 0);
+    if (saved.rlim_max != RLIM_INFINITY && saved.rlim_max < 1024) {
+        GTEST_SKIP() << "hard RLIMIT_NOFILE too low to exercise the raise path";
+    }
+
+    // Drop the soft limit below the 4 × 64 = 256 eager-FILE* fan-out.
+    struct rlimit low = saved;
+    low.rlim_cur = 96;
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &low), 0);
+
+    const std::string scratch = std::string(kScratchBase) + "_psp_rlimit";
+    fs::remove_all(scratch);
+
+    try {
+        GQL::ParallelScanPartitioner<1> partitioner(
+            /*num_partitions=*/64, /*num_scan_threads=*/4, scratch,
+            [](const Record<1>& r) { return static_cast<std::uint32_t>(r[0]); });
+        (void)partitioner;
+    } catch (const std::exception& e) {
+        ::setrlimit(RLIMIT_NOFILE, &saved);
+        fs::remove_all(scratch);
+        FAIL() << "ctor threw under a low NOFILE soft limit: " << e.what();
+    }
+
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &saved), 0);
+    fs::remove_all(scratch);
 }

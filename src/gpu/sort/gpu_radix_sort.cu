@@ -224,10 +224,25 @@ bool execute_gpu_radix_sort(
         h_fields[f].resize(num_items);
     }
 
+    // The uint32 keys drop the 8-bit ObjectId type prefix and the upper
+    // 24 counter bits, so this sort matches the 64-bit CPU ordering only
+    // when, per field, every record carries the same type prefix and every
+    // counter fits in 32 bits. Reject violating inputs instead of silently
+    // mis-sorting; a false return makes the caller fall back to CPU sort.
+    constexpr uint64_t COUNTER_MASK = 0x00FFFFFFFFFFFFFFULL;
     for (uint64_t i = 0; i < num_items; i++) {
         for (uint32_t f = 0; f < num_passes; f++) {
-            h_fields[f][i] = static_cast<uint32_t>(
-                all_records[i][f] & 0x00FFFFFFFFFFFFFFULL);
+            const uint64_t raw     = all_records[i][f];
+            const uint64_t counter = raw & COUNTER_MASK;
+            if (counter > 0xFFFFFFFFULL
+                || (raw >> 56) != (all_records[0][f] >> 56)) {
+                fprintf(stderr,
+                        "GPU sort: field %u value 0x%016llx breaks the "
+                        "32-bit key precondition; falling back to CPU sort\n",
+                        f, (unsigned long long)raw);
+                return false;
+            }
+            h_fields[f][i] = static_cast<uint32_t>(counter);
         }
     }
 

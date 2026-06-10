@@ -1,11 +1,20 @@
 /**
  * @file test_embedding_writer.cc
- * @brief Unit tests for EmbeddingWriter (Phases A + B in isolation).
+ * @brief Unit tests for EmbeddingWriter.
  *
  * Phase C (write_to_projection) requires TensorManager + ProjectionStorage +
- * B+Tree infrastructure, which is covered by the E2E test (gnn_e2e_test.sh).
- * These tests focus on the embedding collection, deduplication, and inference
- * logic that can be exercised without the full database stack.
+ * B+Tree infrastructure backed by an initialized System, which is covered by
+ * the E2E test (gnn_e2e_test.sh).
+ *
+ * Coverage levels in this file — NOTE the distinction:
+ *   - Tests 1-12 validate the Phase A/B ALGORITHM SPEC by re-implementing
+ *     the collection / dedup / missing-node logic inline (the production
+ *     methods are private). A regression inside EmbeddingWriter's own
+ *     implementation of that logic is caught by the E2E gate, NOT by these.
+ *   - Tests 13-16 drive the REAL production key-allocation statics
+ *     (next_available_key_id / resolve_property_key_id).
+ *   - Test 17 constructs a REAL EmbeddingWriter and drives write_all() on
+ *     the orchestration path executable without the full database stack.
  *
  * Strategy:
  *   - Use the same GnnStorageTest fixture pattern as test_batch_assembler.cc
@@ -1010,4 +1019,53 @@ TEST_F(EmbeddingWriterTest, ResolveReusesPersistedCatalogKeys) {
     // Both keys are now live in the in-memory map, so a subsequent
     // save_catalog() persists the union instead of dropping 'emb_a'.
     EXPECT_EQ(storage2.get_node_keys().size(), 2u);
+}
+
+// =============================================================================
+// Test 17: WriteAllRunsRealOrchestration
+//
+// Construct a REAL EmbeddingWriter (real model, assembler, storage, mapping,
+// catalog, ProjectionStorage) and drive write_all() end-to-end on the only
+// path executable without an initialized System (TensorManager + B+Tree
+// buffer pool): a single empty batch with Phase B disabled (no fanouts).
+//
+// This exercises the instance entry points the per-phase tests above cannot
+// reach: construction (including the TopologyAccessor over the projection),
+// the real Phase A batch loop (assemble + read_sample on the empty batch),
+// missing-node detection, the Phase B skip condition, and the Phase C
+// empty-map early return.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, WriteAllRunsRealOrchestration) {
+    const std::string sname = "real_writer_test";
+    auto [storage, catalog] = create_storage_empty_batch(sname);
+
+    auto fm = FeatureMatrix::open(fmat_path_);
+    auto rm = RowMapping::open(rmap_path_);
+    auto ls = LabelStore::open(labels_path_);
+
+    BatchAssembler assembler(fm, storage, &ls, nullptr, rm);
+    GraphSAGEModel model = make_model();
+
+    fs::path proj_dir = test_dir_ / "proj_writer";
+    fs::create_directories(proj_dir);
+    GQL::ProjectionStorage proj_storage(
+        proj_dir.string(), test_dir_.string(), "proj_writer");
+
+    EmbeddingWriter::Config wconfig;
+    wconfig.property_name       = "embedding";
+    wconfig.batch_size          = 4;
+    wconfig.fanouts             = {};  // Phase B disabled
+    wconfig.feature_matrix_path = fmat_path_;
+
+    EmbeddingWriter writer(model, assembler, storage, rm, catalog,
+                           proj_storage, std::move(wconfig));
+
+    EmbeddingWriter::Result res = writer.write_all();
+
+    // The single batch has zero seeds and Phase B is disabled, so nothing
+    // is collected, inferred, or written — but the full orchestration ran.
+    EXPECT_EQ(res.nodes_written, 0u);
+    EXPECT_EQ(res.nodes_inferred, 0u);
+    EXPECT_GE(res.write_ms, 0.0);
 }

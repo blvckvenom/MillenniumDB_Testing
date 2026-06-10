@@ -360,4 +360,130 @@ TEST(CatalogV5, InvalidFormatByte_Rejected) {
     fs::remove_all(dir);
 }
 
+// ============================================================================
+// Helper: write a minimal v1.0 catalog whose FINAL field
+// (edge_property_names) ends in a string with a declared length larger
+// than the bytes actually present. At MINOR=0 nothing is read after this
+// field, so a reader that doesn't validate gcount() returns garbage
+// SILENTLY (uninitialized heap bytes) instead of throwing.
+// ============================================================================
+void write_v10_catalog_with_truncated_tail_string(const std::string& path) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out.good());
+
+    auto put_u8 = [&](uint8_t v) { out.put(static_cast<char>(v)); };
+    auto put_u32_le = [&](uint32_t v) {
+        uint8_t b[4];
+        for (size_t i = 0, s = 0; i < 4; ++i, s += 8) b[i] = (v >> s) & 0xFF;
+        out.write(reinterpret_cast<const char*>(b), 4);
+    };
+    auto put_u64_le = [&](uint64_t v) {
+        uint8_t b[8];
+        for (size_t i = 0, s = 0; i < 8; ++i, s += 8) b[i] = (v >> s) & 0xFF;
+        out.write(reinterpret_cast<const char*>(b), 8);
+    };
+    auto put_str = [&](const std::string& s) {
+        put_u32_le(static_cast<uint32_t>(s.size()));
+        out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    };
+
+    // Magic number (6 bytes)
+    const uint8_t magic[6] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};
+    out.write(reinterpret_cast<const char*>(magic), 6);
+    // MDB version (3 bytes)
+    put_u8(1); put_u8(0); put_u8(0);
+    // Model ID
+    put_u8(255);
+    // Catalog version: MAJOR=1, MINOR=0
+    put_u8(1); put_u8(0);
+
+    // v1.0 body
+    put_str("trunc_proj");
+    put_u64_le(1700000000);    // creation_timestamp
+    put_u64_le(1);             // node_count
+    put_u64_le(1);             // edge_count
+    put_u64_le(1);             // directed_edge_count
+    put_u64_le(0);             // undirected_edge_count
+    put_u8(0);                 // has_node_properties
+    put_u8(0);                 // has_edge_properties
+    put_u8(0);                 // undirected_relationships
+    put_str("");               // original_query
+    put_u64_le(0);             // projection_millis
+    put_u32_le(0);             // node_property_names: empty strvec
+
+    // edge_property_names: declared count 1, declared string length 64,
+    // but only 4 payload bytes follow before EOF.
+    put_u32_le(1);
+    put_u32_le(64);
+    out.write("abcd", 4);
+    out.flush();
+    out.close();
+}
+
+// ============================================================================
+// Truncated tail string must be rejected, not returned as silent garbage.
+// ============================================================================
+TEST(CatalogIO, TruncatedTailString_Rejected) {
+    const auto dir = make_tempdir("TruncatedTailString_Rejected");
+    write_v10_catalog_with_truncated_tail_string(dir + "/catalog.dat");
+
+    EXPECT_THROW({
+        GQL::ProjectionCatalog reader(dir);
+        (void)reader;
+    }, std::runtime_error);
+
+    fs::remove_all(dir);
+}
+
+// ============================================================================
+// A corrupt string-length prefix claiming ~4 GB must be rejected before
+// any allocation is attempted.
+// ============================================================================
+TEST(CatalogIO, OversizedStringLength_Rejected) {
+    const auto dir = make_tempdir("OversizedStringLength_Rejected");
+    const auto catalog_path = dir + "/catalog.dat";
+    {
+        std::ofstream out(catalog_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.good());
+        const uint8_t magic[6] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};
+        out.write(reinterpret_cast<const char*>(magic), 6);
+        // MDB version (3), model id, catalog MAJOR=1 / MINOR=6
+        const uint8_t header[6] = {1, 0, 0, 255, 1, 6};
+        out.write(reinterpret_cast<const char*>(header), 6);
+        // projection_name length prefix claims ~4 GB with no payload.
+        const uint8_t len[4] = {0xF0, 0xFF, 0xFF, 0xFF};
+        out.write(reinterpret_cast<const char*>(len), 4);
+    }
+
+    EXPECT_THROW({
+        GQL::ProjectionCatalog reader(dir);
+        (void)reader;
+    }, std::runtime_error);
+
+    fs::remove_all(dir);
+}
+
+// ============================================================================
+// save() writes via tmp + rename: no .tmp residue, and an overwrite of an
+// existing catalog roundtrips the new content.
+// ============================================================================
+TEST(CatalogIO, SaveLeavesNoTmpResidueAndRoundtrips) {
+    const auto dir = make_tempdir("SaveLeavesNoTmpResidue");
+    {
+        GQL::ProjectionCatalog writer(dir);
+        populate_baseline(writer);
+        writer.save();
+        // Overwrite in place — exercises the rename-over-existing path.
+        writer.projection_name = "test_proj_v2";
+        writer.save();
+    }
+    EXPECT_FALSE(fs::exists(dir + "/catalog.dat.tmp"));
+    ASSERT_TRUE(fs::exists(dir + "/catalog.dat"));
+
+    GQL::ProjectionCatalog reader(dir);
+    EXPECT_EQ(reader.projection_name, "test_proj_v2");
+
+    fs::remove_all(dir);
+}
+
 }  // namespace

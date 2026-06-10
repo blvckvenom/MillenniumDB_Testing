@@ -1,7 +1,6 @@
 #include "gnn/training/graph_block_builder.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -144,6 +143,48 @@ std::vector<torch::Tensor> build_edge_indices(
     const bool fast = active.oid_to_local_per_layer.empty();
     const auto& lgp = active.layer_global_pos;
 
+    // Always-on validation of the disk-sourced edge endpoints on the fast
+    // path: every edges_per_layer[j] entry must index within the layer node
+    // lists (src in layer j+1, dst in layer j). Hoisted out of the remap loop
+    // below (one sequential pass per hop layer, zero per-edge cost in the hot
+    // loop) so a stale/corrupt sample throws a descriptive error — matching
+    // the legacy fallback's failure behavior — instead of indexing lgp out of
+    // bounds.
+    if (fast) {
+        for (size_t j = 0; j < num_layers; ++j) {
+            if (j + 1 >= lgp.size()) {
+                throw std::runtime_error(
+                    "graph_block::build_edge_indices: missing node layer " +
+                    std::to_string(j + 1) + " for edge layer " + std::to_string(j)
+                );
+            }
+            const LayerEdges& edges = sample.edges_per_layer[j];
+            const size_t src_bound  = lgp[j + 1].size();
+            const size_t dst_bound  = lgp[j].size();
+            const size_t Ej         = edges.size();
+            for (size_t i = 0; i < Ej; ++i) {
+                if (static_cast<size_t>(edges.src_indices[i]) >= src_bound) {
+                    throw std::runtime_error(
+                        "graph_block::build_edge_indices: src index " +
+                        std::to_string(edges.src_indices[i]) +
+                        " out of layer " + std::to_string(j + 1) + " bounds (" +
+                        std::to_string(src_bound) + ") at hop " +
+                        std::to_string(j) + ", edge " + std::to_string(i)
+                    );
+                }
+                if (static_cast<size_t>(edges.dst_indices[i]) >= dst_bound) {
+                    throw std::runtime_error(
+                        "graph_block::build_edge_indices: dst index " +
+                        std::to_string(edges.dst_indices[i]) +
+                        " out of layer " + std::to_string(j) + " bounds (" +
+                        std::to_string(dst_bound) + ") at hop " +
+                        std::to_string(j) + ", edge " + std::to_string(i)
+                    );
+                }
+            }
+        }
+    }
+
     // Nested aggregation (2026-06-02): conv k operates on dst set A_k =
     // ∪_{j<=k} nodes_per_layer[j] (all nodes within k hops). For STANDARD
     // GraphSAGE / DGL-block message passing every such node must aggregate its
@@ -186,14 +227,8 @@ std::vector<torch::Tensor> build_edge_indices(
                 int64_t src_local, dst_local;
                 if (fast) {
                     // Remap by precomputed global position (== local index).
-                    // Debug-only bounds check on the disk-sourced edge endpoints
-                    // (zero-cost in Release where NDEBUG disables assert). A
-                    // stale/corrupt sample whose edge indices exceed the layer
-                    // node counts would otherwise index lgp out of bounds (UB);
-                    // the legacy fallback below throws on the same condition.
-                    assert(j + 1 < lgp.size() && src_idx < lgp[j + 1].size() &&
-                           j < lgp.size() && dst_idx < lgp[j].size() &&
-                           "edge endpoint index out of active-set bounds");
+                    // Endpoints were validated against the layer bounds in the
+                    // hoisted pass above, so this indexing cannot go OOB.
                     src_local = lgp[j + 1][src_idx];  // src in A_{k+1}
                     dst_local = lgp[j][dst_idx];       // dst in A_k
                 } else {

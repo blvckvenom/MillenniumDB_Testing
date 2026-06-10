@@ -34,17 +34,20 @@
 //     unordered_maps and tensors; no shared mutable state.
 //   - In FeatureMatrix fallback mode (BatchAssembler with FeatureMatrix
 //     ctor) features are read concurrent-safe via extract_rows.
-//   - In FourLevelStore full mode the load_batch_features path has
-//     SHARED state that is NOT YET multi-worker-safe:
-//        a) DirectIoReader holds 4 io_uring rings without inter-call
-//           locking (header marks "NOT thread-safe").
-//        b) pinned_ptr_ is a single shared host-pinned buffer; concurrent
-//           memcpy → assembler->assemble() races on the buffer contents
-//           because the CUDA kernel reads it asynchronously.
-//   The training loop guards against this by enforcing num_workers==1
-//   when the BatchAssembler is in FourLevelStore mode (see TrainingLoop
-//   construction). num_workers>1 with FourLevelStore would silently
-//   corrupt feature tensors (no test would catch it at the API surface).
+//   - In FourLevelStore full mode (Round 3B-mw, 2026-06-01) num_workers>1
+//     is safe ONLY IF the per-worker IO slots were provisioned BEFORE this
+//     prefetcher is constructed, via
+//     BatchAssembler::prepare_feature_store_workers(num_workers) →
+//     FourLevelStore::prepare_worker_io(num_workers). Each worker thread
+//     then binds its id (bind_worker_id, see worker_loop) and the hot path
+//     routes it to a PRIVATE DirectIoReader (io_uring rings are not
+//     thread-safe) + a PRIVATE pinned staging buffer.
+//     Worker ids BEYOND the provisioned slots silently fall back to the
+//     SHARED primary reader/buffer (FourLevelStore::
+//     l3_reader_for_current_worker_) and would race on feature content —
+//     silent corruption, invisible at the API surface. TrainingLoop
+//     provisions the slots up front and clamps to num_workers=1 when
+//     provisioning fails; any new call site MUST do the same.
 
 #include <atomic>
 #include <condition_variable>
@@ -85,7 +88,8 @@ public:
     /// re-orders results so next() returns batches in submission order.
     /// Values > queue_size are useless (in_flight is capped by queue_size).
     /// 0 is rejected. See the file-level comment for multi-worker
-    /// thread-safety constraints (FourLevelStore is not safe).
+    /// thread-safety constraints (FourLevelStore mode requires
+    /// prepare_feature_store_workers(num_workers) BEFORE construction).
     explicit AsyncBatchPrefetcher(BatchAssembler& assembler,
                                   size_t queue_size = 2,
                                   bool use_cuda_streams = false,
@@ -103,6 +107,8 @@ public:
     /// Submit `batch_id` for async assembly. Blocks if in-flight count ==
     /// queue_size (backpressure). Throws std::runtime_error if shutdown
     /// was already requested (the workers are no longer accepting work).
+    /// Rethrows a recorded worker-thread failure (see worker_failure_)
+    /// instead of accepting work a dead pool may never assemble.
     void prefetch(uint64_t batch_id);
 
     /// Block until the next assembled MiniBatch is ready, then return it.
@@ -111,7 +117,9 @@ public:
     /// Throws std::runtime_error if there are no more batches to deliver
     /// (shutdown was called AND every prefetched batch has been consumed).
     /// If a worker thread caught an exception while assembling the
-    /// next-in-line batch, that exception is rethrown here.
+    /// next-in-line batch, that exception is rethrown here. A worker-thread
+    /// failure outside per-batch assembly (worker_failure_) is rethrown
+    /// once no completed batch is deliverable.
     MiniBatch next();
 
     /// Stop accepting new prefetch requests. Workers drain their req
@@ -133,7 +141,13 @@ private:
     // 0..num_workers-1 at spawn. It binds that index via
     // FourLevelStore::bind_worker_id() at thread start so the FourLevelStore
     // hot path selects this worker's private DirectIoReader + pinned buffer.
+    //
+    // worker_loop is a catch-all shell around worker_loop_impl: an exception
+    // escaping a std::thread body calls std::terminate (whole-process death),
+    // so anything thrown outside the per-request try is recorded into
+    // worker_failure_ and rethrown by next()/prefetch() instead.
     void worker_loop(unsigned worker_idx);
+    void worker_loop_impl(unsigned worker_idx);
 
     BatchAssembler& assembler_;
     const size_t    queue_size_;
@@ -166,6 +180,12 @@ private:
     size_t in_flight_count_ = 0;
 
     bool shutdown_requested_ = false;
+
+    // First exception that escaped a worker thread OUTSIDE the per-request
+    // try (e.g. thread-startup failure). Rethrown by next() when no result
+    // is deliverable and by prefetch() before accepting new work, so the
+    // consumer sees a clean error instead of a hang or std::terminate.
+    std::exception_ptr worker_failure_;
 
     std::vector<std::thread> workers_;
 };

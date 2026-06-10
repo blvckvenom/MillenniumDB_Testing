@@ -1,8 +1,13 @@
 #include "projection_catalog.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <system_error>
 
 #include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
@@ -232,9 +237,15 @@ void ProjectionCatalog::load() {
 }
 
 void ProjectionCatalog::save() {
-    std::fstream file(catalog_path, std::ios::out | std::ios::binary | std::ios::trunc);
+    // Write to a sibling tmp file, fsync, then atomically rename over
+    // catalog.dat (the TopologySnapshotWriter pattern). The previous
+    // in-place ios::trunc rewrite left a torn catalog on a crash/ENOSPC
+    // mid-save, making the projection unloadable even with all index
+    // files intact.
+    const std::string tmp_path = catalog_path + ".tmp";
+    std::fstream file(tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
-        throw std::runtime_error("Could not create catalog file: " + catalog_path);
+        throw std::runtime_error("Could not create catalog file: " + tmp_path);
     }
 
     // Write magic number
@@ -341,7 +352,50 @@ void ProjectionCatalog::save() {
 
     // Ensure data is flushed to OS buffer before close
     file.flush();
+    if (!file.good()) {
+        file.close();
+        std::error_code rm_ec;
+        fs::remove(tmp_path, rm_ec);
+        throw std::runtime_error("Error writing catalog file: " + tmp_path);
+    }
     file.close();
+
+    // fsync the tmp file so its contents are durable BEFORE the rename
+    // makes it visible as catalog.dat.
+    int fd = ::open(tmp_path.c_str(), O_RDONLY);
+    if (fd < 0 || ::fsync(fd) != 0) {
+        int e = errno;
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        std::error_code rm_ec;
+        fs::remove(tmp_path, rm_ec);
+        throw std::runtime_error(
+            "Could not fsync catalog file: " + tmp_path
+            + " (errno=" + std::to_string(e) + ")");
+    }
+    ::close(fd);
+
+    std::error_code rename_ec;
+    fs::rename(tmp_path, catalog_path, rename_ec);
+    if (rename_ec) {
+        std::error_code rm_ec;
+        fs::remove(tmp_path, rm_ec);
+        throw std::runtime_error(
+            "Could not rename catalog file " + tmp_path + " -> " + catalog_path
+            + ": " + rename_ec.message());
+    }
+
+    // fsync the parent directory so the rename itself is durable.
+    // Best-effort: a failure here leaves a fully-written catalog.dat whose
+    // directory entry may not yet be persisted, which is strictly better
+    // than the pre-rename states; don't undo the successful rename for it.
+    const fs::path parent_dir = fs::path(catalog_path).parent_path();
+    int dir_fd = ::open(parent_dir.c_str(), O_RDONLY);
+    if (dir_fd >= 0) {
+        ::fsync(dir_fd);
+        ::close(dir_fd);
+    }
 }
 
 void ProjectionCatalog::print(std::ostream& os) const {
@@ -438,12 +492,27 @@ std::string ProjectionCatalog::read_string(std::fstream& file) {
     for (int i = 0, shift = 0; i < 4; ++i, shift += 8) {
         len |= static_cast<uint32_t>(buf[i]) << shift;
     }
+    if (!file.good()) {
+        throw std::runtime_error("Error reading string length from catalog");
+    }
+
+    // Bound the length so a corrupt/truncated catalog can't demand a multi-GB
+    // allocation. Catalog strings are names/queries — far below this cap.
+    constexpr uint32_t MAX_STRING_LEN = 16u * 1024 * 1024;
+    if (len > MAX_STRING_LEN) {
+        throw std::runtime_error(
+            "Corrupt catalog: string length " + std::to_string(len)
+            + " exceeds limit of " + std::to_string(MAX_STRING_LEN) + " bytes");
+    }
 
     // Read string data
-    char* str_buf = new char[len];
-    file.read(str_buf, len);
-    std::string res(str_buf, len);
-    delete[] str_buf;
+    std::string res(len, '\0');
+    if (len > 0) {
+        file.read(&res[0], len);
+        if (!file.good() || static_cast<uint32_t>(file.gcount()) != len) {
+            throw std::runtime_error("Error reading string from catalog (truncated file)");
+        }
+    }
     return res;
 }
 
@@ -454,6 +523,9 @@ std::vector<std::string> ProjectionCatalog::read_strvec(std::fstream& file) {
     file.read(reinterpret_cast<char*>(buf), sizeof(buf));
     for (int i = 0, shift = 0; i < 4; ++i, shift += 8) {
         count |= static_cast<uint32_t>(buf[i]) << shift;
+    }
+    if (!file.good()) {
+        throw std::runtime_error("Error reading string vector count from catalog");
     }
 
     std::vector<std::string> res;

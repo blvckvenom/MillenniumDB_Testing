@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -55,13 +56,21 @@ public:
      * @param labels        Optional label store (nullptr = unsupervised)
      * @param splits        Optional split store (nullptr = no split)
      * @param row_mapping   ObjectId <-> row_index mapping (used for label lookup)
+     * @param feature_name  Name the feature store was built/opened with. Keys
+     *                      the packed-full probe via
+     *                      mix_feature_store_fingerprint — FourLevelStore::build
+     *                      mixes the ACTUAL feature name into the pack
+     *                      fingerprint, so a mismatched name here makes a valid
+     *                      pack look stale and silently skips it. Callers
+     *                      serving a non-default feature name MUST pass it.
      */
     BatchAssembler(
         FourLevelStore& feature_store,
         SampleStorage&  samples,
         LabelStore*     labels,
         SplitStore*     splits,
-        const RowMapping& row_mapping
+        const RowMapping& row_mapping,
+        const std::string& feature_name = "node_features"
     );
 
     /**
@@ -247,8 +256,9 @@ private:
      * When absent (the default today, since blocks/ won't exist), use_blocks_
      * stays false and behavior is byte-identical to the online build.
      *
-     * SC-5a: this now reads the two env toggles into booleans and delegates to
-     * apply_block_mode_ (the shared mode-selection body). With neither env var
+     * SC-5a: this now reads the env toggles into booleans (truthy values
+     * 1/true/yes, like every other MDB_GNN_* boolean flag) and delegates to
+     * apply_block_mode_ (the shared mode-selection body). With no env var
      * set, the result is byte-identical to the pre-SC-5a auto-detection.
      */
     void init_blocks_();
@@ -258,11 +268,13 @@ private:
      *        (with env-derived booleans) and set_block_mode_override() (with
      *        per-call booleans).
      *
-     * Sets use_blocks_ / self_contained_mode_ / store_fp_ from the two booleans
+     * Sets use_blocks_ / self_contained_mode_ / store_fp_ from the booleans
      * plus the existing eligibility checks (blocks/ dir presence,
      * !nested_aggregation_, feature_store_ != nullptr, catalog content fp != 0,
      * addr_tables/ present, batch-0 store_fp == catalog fp), and emits the
-     * once-style feature-load mode log line.
+     * once-style feature-load mode log line. no_blocks gates use_blocks_ on
+     * BOTH constructor paths (the FeatureMatrix-fallback assembler consumes
+     * Option-A blocks too); the other two booleans only matter in full mode.
      */
     void apply_block_mode_(bool no_blocks, bool no_self_contained, bool no_packed_full);
 
@@ -272,6 +284,20 @@ private:
     /// back to the legacy contents-reading path (caller must fall back to the
     /// real sample); packed-full always returns true (bit-identical by construction).
     bool load_self_contained_features_(uint64_t batch_id, const GraphSample& ms, MiniBatch& mini);
+
+    /// Structural-cache lookup. On a hit, bumps the LRU and copies the cached
+    /// bundle into @p mini (refcounted tensors — shares storage), restoring
+    /// batch_id + split from the cached entry. On a miss, increments the miss
+    /// counter only when @p count_miss is true (the self-contained path
+    /// accounts its miss once, where the block is actually opened). Returns
+    /// false without touching counters when the cache is disabled.
+    bool try_struct_hit_(uint64_t batch_id, MiniBatch& mini, bool count_miss);
+
+    /// Insert @p mini's structural bundle (everything except features) into
+    /// the cache under @p batch_id, evicting LRU entries until the byte budget
+    /// fits. No-op when the cache is disabled, the batch is already cached, or
+    /// the bundle alone exceeds the budget.
+    void cache_struct_(uint64_t batch_id, const MiniBatch& mini);
 
     /**
      * @brief SC-3: try to assemble batch @p batch_id WITHOUT reading batches.dat.
@@ -386,6 +412,10 @@ private:
     LabelStore*       labels_;    // nullable
     SplitStore*       splits_;    // nullable
     const RowMapping& row_mapping_;
+
+    // Feature-store name (full mode only): keys the packed-full pack probe in
+    // apply_block_mode_. Unused in FeatureMatrix-fallback mode.
+    std::string feature_name_ = "node_features";
 
     // Nested (DGL-block) edge wiring in build_edge_indices. Default read from
     // env MDB_GNN_NESTED_AGG in the constructor; see set_nested_aggregation().

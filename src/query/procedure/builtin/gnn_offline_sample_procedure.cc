@@ -110,6 +110,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     uint64_t random_seed = SamplingConfig::DEFAULT_RANDOM_SEED;
     std::string orientation_str = "UNDIRECTED";
     bool use_predefined_splits = false;
+    bool use_predefined_splits_explicit = false;
     bool use_adjacency_cache = true;
     bool use_four_level_topology_store = true;
     uint64_t l1_cache_mb = 0;
@@ -119,18 +120,21 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     uint64_t profile_num_walks = 0;
     uint64_t profile_walk_length = 0;
     uint64_t num_workers = std::numeric_limits<uint64_t>::max();  // F#1 sentinel: unset
+    bool force = false;
 
     if (ctx.arguments.size() >= 4) {
         try {
             parse_options(ctx, 3, batch_size, train_ratio, val_ratio,
                           test_ratio, random_seed, orientation_str,
-                          use_predefined_splits, use_adjacency_cache,
+                          use_predefined_splits,
+                          use_predefined_splits_explicit,
+                          use_adjacency_cache,
                           use_four_level_topology_store,
                           l1_cache_mb, l2_cache_mb,
                           use_l3_mmap_sidecar,
                           auto_profile_on_cold_start,
                           profile_num_walks, profile_walk_length,
-                          num_workers);
+                          num_workers, force);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -146,7 +150,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - useFourLevelTopologyStore (BOOL): Spec #13 (default: true)\n"
                 "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
                 "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
-                "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3 (default: true)\n\n"
+                "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3 (default: true)\n"
+                "  - force (BOOL): Drop + re-create an existing sample set (default: false)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
                 "      batchSize: 512,\n"
@@ -182,35 +187,21 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // and re-sample (matches gnn_materialize_batches / gnn_build_feature_store
     // force semantics) instead of hard-failing. The sample dir is self-contained,
     // so remove_all is an atomic-enough drop. Default false preserves the
-    // fail-loud behavior.
-    bool force = false;
-    if (ctx.arguments.size() >= 4) {
-        DictOptions o(ctx.get_argument(3));
-        if (auto v = o.get_bool("force")) force = *v;
-    }
-
-    if (SampleStorage::exists(db_folder, sample_name)) {
-        if (force) {
-            std::error_code ec;
-            std::filesystem::remove_all(
-                SampleStorage::get_storage_path(db_folder, sample_name), ec);
-            if (ec) {
-                throw std::runtime_error(
-                    "gnn_offline_sample: force=true could not remove existing "
-                    "sample '" + sample_name + "': " + ec.message());
-            }
-        } else {
-            throw std::runtime_error(
-                "Sample set '" + sample_name + "' already exists.\n\n"
-                "Solutions:\n"
-                "  1. Pass force:true to overwrite it in place\n"
-                "  2. Use a different name for the new sample set\n"
-                "  3. Delete the existing one first:\n"
-                "     CALL gnn.sample_drop('" + sample_name + "')\n"
-                "  4. List existing samples:\n"
-                "     CALL gnn.sample_list() YIELD sampleName"
-            );
-        }
+    // fail-loud behavior. The drop itself is deferred until just before the
+    // engine runs (Step 10b) so that orientation parsing / config validation
+    // failures leave the existing sample untouched.
+    const bool sample_exists = SampleStorage::exists(db_folder, sample_name);
+    if (sample_exists && !force) {
+        throw std::runtime_error(
+            "Sample set '" + sample_name + "' already exists.\n\n"
+            "Solutions:\n"
+            "  1. Pass force:true to overwrite it in place\n"
+            "  2. Use a different name for the new sample set\n"
+            "  3. Delete the existing one first:\n"
+            "     CALL gnn.sample_drop('" + sample_name + "')\n"
+            "  4. List existing samples:\n"
+            "     CALL gnn.sample_list() YIELD sampleName"
+        );
     }
 
     // Step 8: Parse orientation
@@ -252,22 +243,15 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // caller did not set usePredefinedSplits. Otherwise a random ratio split
     // silently ignores splits.bin -> validation collapses on labeled-subset
     // datasets (e.g. OGB). Explicit usePredefinedSplits always wins.
-    {
-        bool splits_explicit = false;
-        if (ctx.arguments.size() >= 4) {
-            DictOptions o(ctx.get_argument(3));
-            splits_explicit = o.get_bool("usePredefinedSplits").has_value();
-        }
-        if (!splits_explicit && !use_predefined_splits) {
-            auto splits_path = std::filesystem::path(db_folder) /
-                               "projections" / projection_name / "splits.bin";
-            if (std::filesystem::exists(splits_path)) {
-                use_predefined_splits = true;
-                std::cerr << "[gnn_offline_sample] notice: projection has splits.bin "
-                             "and usePredefinedSplits was not set — defaulting to "
-                             "true (using the predefined train/val/test split). Pass "
-                             "usePredefinedSplits:false to force a ratio split.\n";
-            }
+    if (!use_predefined_splits_explicit && !use_predefined_splits) {
+        auto splits_path = std::filesystem::path(db_folder) /
+                           "projections" / projection_name / "splits.bin";
+        if (std::filesystem::exists(splits_path)) {
+            use_predefined_splits = true;
+            std::cerr << "[gnn_offline_sample] notice: projection has splits.bin "
+                         "and usePredefinedSplits was not set — defaulting to "
+                         "true (using the predefined train/val/test split). Pass "
+                         "usePredefinedSplits:false to force a ratio split.\n";
         }
     }
 
@@ -306,6 +290,21 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     std::string proj_dir = manager.get_projection_dir(projection_name);
     ProjectionStorage storage(proj_dir, db_folder);
     storage.open();
+
+    // Step 10b: force-drop the existing sample. Done only now — after every
+    // option is parsed, the config validated, and the projection opened — so
+    // none of those failure modes can destroy a sample that may have taken
+    // hours to build.
+    if (sample_exists && force) {
+        std::error_code ec;
+        std::filesystem::remove_all(
+            SampleStorage::get_storage_path(db_folder, sample_name), ec);
+        if (ec) {
+            throw std::runtime_error(
+                "gnn_offline_sample: force=true could not remove existing "
+                "sample '" + sample_name + "': " + ec.message());
+        }
+    }
 
     // Step 11: Create and run engine
     // Pass db_folder so the engine can locate the global RowMapping when
@@ -428,6 +427,7 @@ void GnnOfflineSampleProcedure::parse_options(
     uint64_t& random_seed,
     std::string& orientation,
     bool& use_predefined_splits,
+    bool& use_predefined_splits_explicit,
     bool& use_adjacency_cache,
     bool& use_four_level_topology_store,
     uint64_t& l1_cache_mb,
@@ -436,7 +436,8 @@ void GnnOfflineSampleProcedure::parse_options(
     bool& auto_profile_on_cold_start,
     uint64_t& profile_num_walks,
     uint64_t& profile_walk_length,
-    uint64_t& num_workers
+    uint64_t& num_workers,
+    bool& force
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -472,9 +473,11 @@ void GnnOfflineSampleProcedure::parse_options(
         }
     }
 
-    // Parse usePredefinedSplits (before ratio validation)
+    // Parse usePredefinedSplits (before ratio validation). The explicitness
+    // flag lets the F#2 splits.bin auto-default defer to the caller's choice.
     if (auto v = opts.get_bool("usePredefinedSplits")) {
         use_predefined_splits = *v;
+        use_predefined_splits_explicit = true;
     }
 
     // Validate ratios sum to 1.0 (only when not using predefined splits)
@@ -551,5 +554,10 @@ void GnnOfflineSampleProcedure::parse_options(
                 "numWorkers must be non-negative, got: " + std::to_string(*v));
         }
         num_workers = static_cast<uint64_t>(*v);
+    }
+
+    // Parse force — drop + re-create the sample set when it already exists.
+    if (auto v = opts.get_bool("force")) {
+        force = *v;
     }
 }

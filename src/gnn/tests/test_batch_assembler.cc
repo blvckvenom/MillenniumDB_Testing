@@ -1,13 +1,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <numeric>
+#include <unordered_map>
 #include <vector>
 
 #include "gnn/training/batch_assembler.h"
+#include "gnn/training/graph_block_builder.h"
 #include "gnn/training/label_store.h"
 #include "gnn/training/split_store.h"
 #include "gnn/storage/block_store.h"
@@ -828,4 +831,104 @@ TEST_F(BatchAssemblerTest, BlockConsumptionMatchesOnlineBuild) {
             << "fallback edge_indices mismatch at layer " << k;
     }
     EXPECT_EQ(fb.active_sizes_per_layer, ref.active_sizes_per_layer);
+}
+
+// =============================================================================
+// Corrupt (disk-sourced) edge endpoint indices must throw on the identity
+// fast path — same failure behavior as the legacy fallback — instead of
+// indexing layer_global_pos out of bounds.
+// =============================================================================
+
+TEST_F(BatchAssemblerTest, CorruptEdgeEndpointIndexThrowsOnFastPath) {
+    GraphSample s = make_two_layer_sample(0);
+    std::unordered_map<uint64_t, int64_t> oid_to_global;
+    for (int64_t i = 0; i < static_cast<int64_t>(s.all_unique_nodes.size()); ++i) {
+        oid_to_global[s.all_unique_nodes[i].id] = i;
+    }
+
+    // src index beyond the layer-1 node count (3): must throw, never read OOB.
+    {
+        GraphSample bad = s;
+        bad.edges_per_layer[0].src_indices[1] = 99;
+        auto active = graph_block::build_active_indices(bad, oid_to_global);
+        ASSERT_TRUE(active.oid_to_local_per_layer.empty());  // fast path engaged
+        EXPECT_THROW(graph_block::build_edge_indices(bad, active, false),
+                     std::runtime_error);
+    }
+
+    // dst index beyond the layer-0 node count (3): must throw too.
+    {
+        GraphSample bad = s;
+        bad.edges_per_layer[0].dst_indices[2] = 42;
+        auto active = graph_block::build_active_indices(bad, oid_to_global);
+        EXPECT_THROW(graph_block::build_edge_indices(bad, active, false),
+                     std::runtime_error);
+    }
+
+    // Negative (corrupt int32) endpoint: the size_t cast makes it huge → throw.
+    {
+        GraphSample bad = s;
+        bad.edges_per_layer[0].src_indices[0] = -1;
+        auto active = graph_block::build_active_indices(bad, oid_to_global);
+        EXPECT_THROW(graph_block::build_edge_indices(bad, active, false),
+                     std::runtime_error);
+    }
+
+    // Sanity: the uncorrupted sample still builds on the same path.
+    auto active = graph_block::build_active_indices(s, oid_to_global);
+    ASSERT_TRUE(active.oid_to_local_per_layer.empty());
+    auto edges = graph_block::build_edge_indices(s, active, false);
+    ASSERT_EQ(edges.size(), 1u);
+    EXPECT_EQ(edges[0].size(1), 3);
+}
+
+// =============================================================================
+// MDB_GNN_NO_BLOCKS env parsing: "true"/"yes" must disable block consumption
+// exactly like "1", and the flag must take effect on the FeatureMatrix-fallback
+// constructor path too (it consumes Option-A blocks as well).
+// =============================================================================
+
+TEST_F(BatchAssemblerTest, EnvNoBlocksParsesTruthyValuesOnFallbackCtor) {
+    auto fm      = FeatureMatrix::open(fmat_path_);
+    auto rm      = RowMapping::open(rmap_path_);
+    auto storage = create_sample_storage("env_no_blocks");
+
+    GraphSample sample = make_two_layer_sample(0);
+
+    // Online reference (no blocks/ dir exists yet at construction).
+    BatchAssembler online(fm, storage, nullptr, nullptr, rm);
+    MiniBatch ref = online.assemble_from_sample(sample);
+    ASSERT_EQ(ref.edge_indices.size(), 1u);
+
+    // Bake a DECOY block (valid content hash, recognizably different edges)
+    // into the natural <sample_dir>/blocks location so construction-time
+    // auto-detection finds it.
+    fs::path blocks_dir = storage.get_path() / "blocks";
+    fs::create_directories(blocks_dir);
+    uint64_t fp = compute_batch_content_hash(sample);
+    std::vector<torch::Tensor> decoy_edges;
+    decoy_edges.reserve(ref.edge_indices.size());
+    for (const auto& t : ref.edge_indices) {
+        decoy_edges.push_back(torch::zeros_like(t));
+    }
+    ASSERT_FALSE(torch::equal(decoy_edges[0], ref.edge_indices[0]));
+    BlockWriter::write(block_filename(blocks_dir, sample.batch_id), fp,
+                       sample.batch_id, ref.active_sizes_per_layer, decoy_edges);
+
+    // Default (env unset): the decoy block IS consumed.
+    unsetenv("MDB_GNN_NO_BLOCKS");
+    BatchAssembler consuming(fm, storage, nullptr, nullptr, rm);
+    MiniBatch blk = consuming.assemble_from_sample(sample);
+    EXPECT_TRUE(torch::equal(blk.edge_indices[0], decoy_edges[0]))
+        << "decoy block was not consumed with the env var unset";
+
+    // Every truthy spelling must force the fully-online build.
+    for (const char* v : {"1", "true", "yes"}) {
+        setenv("MDB_GNN_NO_BLOCKS", v, 1);
+        BatchAssembler disabled(fm, storage, nullptr, nullptr, rm);
+        unsetenv("MDB_GNN_NO_BLOCKS");
+        MiniBatch out = disabled.assemble_from_sample(sample);
+        EXPECT_TRUE(torch::equal(out.edge_indices[0], ref.edge_indices[0]))
+            << "MDB_GNN_NO_BLOCKS=" << v << " did not disable block consumption";
+    }
 }

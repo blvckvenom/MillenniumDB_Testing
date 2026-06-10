@@ -1910,6 +1910,76 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# GNN procedure metadata consistency tests (yield_fields vs runtime yields)
+# ============================================================================
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gnn_train_procedure_metadata_test.cc")
+    add_executable(gnn_train_procedure_metadata_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_train_procedure_metadata_test.cc
+    )
+    set_target_properties(gnn_train_procedure_metadata_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(gnn_train_procedure_metadata_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnTrainProcedureMetadataTests
+        COMMAND $<TARGET_FILE:gnn_train_procedure_metadata_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# SampleStorage commit/abort protocol tests
+# ============================================================================
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/sample_storage_test.cc")
+    add_executable(sample_storage_test
+        ${CMAKE_SOURCE_DIR}/src/tests/sample_storage_test.cc
+    )
+    set_target_properties(sample_storage_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(sample_storage_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SampleStorageTests
+        COMMAND $<TARGET_FILE:sample_storage_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # Isolated TopologyAccessor micro-benchmark (Spec #4-B T4.17)
 # ============================================================================
 # Standalone binary that measures `TopologyAccessor::sample_khop_neighbors`

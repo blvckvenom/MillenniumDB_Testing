@@ -19,9 +19,12 @@ public:
             Parameter("sampleName",  ParamType::STRING, true,  "Existing sample set name"),
             Parameter("featureName", ParamType::STRING, true,  "Registered feature name (e.g. 'node_features')"),
             Parameter("options",     ParamType::ANY,    false,
-                "Options: {model, hiddenDim, dropout, epochs, lr, patience, tolerance, "
-                "normalize, randomSeed, outputDir, exportEmbeddings, writeProperty, "
-                "resumeFrom, saveOnBestVal, saveFinal}"),
+                "Options: {model, hiddenDim, dropout, epochs, lr, weightDecay, "
+                "patience, tolerance, normalize, randomSeed, outputDir, "
+                "exportEmbeddings, writeProperty, inferenceBatchSize, resumeFrom, "
+                "saveOnBestVal, saveFinal, sampleCacheMb, useAsyncPrefetcher, "
+                "useCudaStreams, prefetchNumWorkers, prefetchQueueSize, profileLog, "
+                "readOnlyBench, noBlocks, noSelfContained, noPackedFull}"),
         };
     }
 
@@ -33,10 +36,17 @@ public:
             YieldField{"bestValAccuracy", YieldType::FLOAT,  "Best validation accuracy achieved"},
             YieldField{"testAccuracy",    YieldType::FLOAT,  "Test accuracy (-1.0 if no test split)"},
             YieldField{"trainSeconds",    YieldType::FLOAT,  "Total wall-clock training time in seconds"},
+            YieldField{"assembleSeconds", YieldType::FLOAT,  "Cumulative batch assemble time across all train batches in seconds"},
+            YieldField{"forwardSeconds",  YieldType::FLOAT,  "Cumulative model forward time across all train batches in seconds"},
+            YieldField{"backwardSeconds", YieldType::FLOAT,  "Cumulative model backward time across all train batches in seconds"},
             YieldField{"l1HitRatio",      YieldType::FLOAT,  "FourLevelStore L1 (GPU) cache hit ratio"},
             YieldField{"l2HitRatio",      YieldType::FLOAT,  "FourLevelStore L2 (CPU pinned) cache hit ratio"},
             YieldField{"l3Reads",         YieldType::INT,    "FourLevelStore L3 (disk reordered) read count"},
             YieldField{"l4Reads",         YieldType::INT,    "FourLevelStore L4 (packed batch) read count"},
+            YieldField{"l3BytesDisk",     YieldType::INT,    "Bytes read from disk by L3 (page-granular)"},
+            YieldField{"l4BytesDisk",     YieldType::INT,    "Bytes read from disk by L4 packed batches"},
+            YieldField{"totalBytesDisk",  YieldType::INT,    "Total feature-store disk traffic in bytes (l3BytesDisk + l4BytesDisk)"},
+            YieldField{"l3ReadAmplification", YieldType::FLOAT, "L3 bytes read from disk / bytes actually wanted"},
             YieldField{"nodesWritten",    YieldType::INT,    "Nodes whose embeddings were written to projection (0 if writeProperty not set)"},
             YieldField{"nodesInferred",   YieldType::INT,    "Non-seed nodes inferred during write-back (0 if writeProperty not set)"},
             YieldField{"inferenceMillis", YieldType::FLOAT,  "Wall-clock time for non-seed inference in ms (0.0 if writeProperty not set)"},
@@ -44,7 +54,9 @@ public:
             YieldField{"bestCheckpointPath",  YieldType::STRING, "Absolute path (no extension) to best_model checkpoint; empty if disabled or no improvement"},
             YieldField{"finalCheckpointPath", YieldType::STRING, "Absolute path (no extension) to final_model checkpoint; empty if disabled"},
             YieldField{"resumedFromEpoch",    YieldType::INT,    "Epoch index from which training resumed (0 if fresh training)"},
-            YieldField{"effectivePrefetchWorkers", YieldType::INT, "Actual number of AsyncBatchPrefetcher workers used (clamped to 1 in FourLevelStore mode regardless of prefetchNumWorkers)"},
+            YieldField{"effectivePrefetchWorkers", YieldType::INT, "Actual number of AsyncBatchPrefetcher workers used (resolved from prefetchNumWorkers or env MDB_GNN_PREFETCH_WORKERS; N>1 is faster but not bit-reproducible)"},
+            YieldField{"useAddrTablesEffective", YieldType::BOOL, "True if the v2 addr-table fast path served at least one batch"},
+            YieldField{"addrTableLoadUs", YieldType::DOUBLE, "Mean per-batch addr-table load time in microseconds"},
         };
     }
 

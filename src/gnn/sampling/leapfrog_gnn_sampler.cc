@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <random>
+#include <unordered_set>
 
+#include "gnn/sampling/parallel_cursor_merger.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/record.h"
@@ -161,16 +163,30 @@ struct LeapfrogGnnSampler::Impl {
             effective_fanout
         );
 
-        // Merge results (deduplicate if needed)
+        // Merge results, deduplicating by (neighbor, edge): UNDIRECTED
+        // projections store every edge in both indexes, so the two sweeps
+        // return the same edge twice. Dedup matches ParallelCursorMerger
+        // (SEEK) and TopologyAccessor (PER_NODE) semantics so the strategy
+        // choice does not change sample content.
         BatchNeighbors merged;
         for (uint64_t node_id : sorted_nodes) {
             auto& out_neighbors = result_out.neighbors[node_id];
             auto& in_neighbors = result_in.neighbors[node_id];
 
+            std::unordered_set<MergedEdge, MergedEdgeHash> seen;
+            seen.reserve(out_neighbors.size() + in_neighbors.size());
+
             std::vector<std::pair<ObjectId, ObjectId>> combined;
             combined.reserve(out_neighbors.size() + in_neighbors.size());
-            combined.insert(combined.end(), out_neighbors.begin(), out_neighbors.end());
-            combined.insert(combined.end(), in_neighbors.begin(), in_neighbors.end());
+            for (const auto* direction : { &out_neighbors, &in_neighbors }) {
+                for (const auto& [neighbor, edge] : *direction) {
+                    if (seen.insert(MergedEdge { neighbor.id, edge.id, direction == &out_neighbors })
+                            .second)
+                    {
+                        combined.emplace_back(neighbor, edge);
+                    }
+                }
+            }
 
             // If fanout is limited, we need to sub-sample the combined result
             if (effective_fanout > 0 && combined.size() > effective_fanout) {

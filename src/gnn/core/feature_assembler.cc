@@ -3,7 +3,36 @@
 #include <algorithm>
 #include <stdexcept>
 
+#ifdef ENABLE_CUDA_ASSEMBLER
+#include <cuda_runtime.h>
+#endif
+
 namespace mdb::gnn {
+
+#ifdef ENABLE_CUDA_ASSEMBLER
+namespace {
+
+// The assemble_cuda kernel dereferences cpu_data from device threads via
+// UVA, which is only guaranteed-legal for page-locked (pinned), managed,
+// or device memory. A pageable heap pointer (e.g. a caller whose pinned
+// allocation failed) must take the index_copy_ fallback instead.
+bool is_device_accessible_(const float* ptr) {
+    cudaPointerAttributes attrs {};
+    cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
+    if (err != cudaSuccess) {
+        // Pre-CUDA-11 runtimes report unregistered host pointers as
+        // cudaErrorInvalidValue; clear the sticky error and treat the
+        // pointer as pageable.
+        cudaGetLastError();
+        return false;
+    }
+    return attrs.type == cudaMemoryTypeHost
+        || attrs.type == cudaMemoryTypeDevice
+        || attrs.type == cudaMemoryTypeManaged;
+}
+
+} // namespace
+#endif
 
 // ============================================================================
 // Constructor
@@ -105,6 +134,16 @@ torch::Tensor FeatureAssembler::assemble_simple(
     if (cpu_features.defined() && cpu_features.numel() > 0) {
         // Ensure contiguous CPU tensor for raw pointer access
         contig_holder = cpu_features.contiguous().to(torch::kCPU);
+#ifdef ENABLE_CUDA_ASSEMBLER
+        // assemble() dispatches to the CUDA kernel when l1_features lives
+        // on CUDA; the kernel reads cpu_ptr from device threads via UVA,
+        // which requires page-locked memory.
+        if (torch::cuda::is_available() &&
+            l1_features.defined() && l1_features.is_cuda() &&
+            !contig_holder.is_pinned()) {
+            contig_holder = contig_holder.pin_memory();
+        }
+#endif
         cpu_ptr = contig_holder.data_ptr<float>();
         cpu_count = contig_holder.size(0);
     }
@@ -145,8 +184,13 @@ torch::Tensor FeatureAssembler::assemble(
     // Only use the CUDA kernel when gpu_features is actually on CUDA.
     // Passing a CPU tensor would give the kernel a host pointer that
     // GPU threads cannot dereference (illegal memory access / SIGSEGV).
+    // cpu_data has the same constraint: the kernel reads it from device
+    // threads via UVA, which is only legal for pinned/managed memory, so
+    // pageable pointers are routed to the fallback as well.
     if (torch::cuda::is_available() &&
-        gpu_features.defined() && gpu_features.is_cuda()) {
+        gpu_features.defined() && gpu_features.is_cuda() &&
+        (cpu_positions.empty() || cpu_data == nullptr ||
+         is_device_accessible_(cpu_data))) {
         return assemble_cuda(total_nodes, gpu_features, gpu_positions,
                              cpu_data, cpu_count, cpu_positions);
     }

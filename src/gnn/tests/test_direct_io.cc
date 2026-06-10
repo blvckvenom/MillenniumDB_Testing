@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -338,6 +340,27 @@ TEST_F(DirectIoReaderTest, ReadRangeZeroSize) {
     auto result = reader.read_range(0, 0);
     EXPECT_EQ(result.size, 0u);
     EXPECT_EQ(result.data.get(), nullptr);
+}
+
+TEST_F(DirectIoReaderTest, ReadRangePastEofThrows) {
+    constexpr uint64_t HEADER = 64, ROWS = 10, ROW_BYTES = 16;
+    auto path = create_test_file("range_eof.bin", HEADER, ROWS, ROW_BYTES);
+
+    DirectIoReader reader(path);
+    const uint64_t fsize = reader.file_size();
+
+    // Range crossing EOF by one byte
+    EXPECT_THROW(reader.read_range(fsize - 4, 5), std::out_of_range);
+    // Offset entirely past EOF
+    EXPECT_THROW(reader.read_range(fsize + 1, 1), std::out_of_range);
+    // offset + size wrapping uint64_t must not bypass the check
+    EXPECT_THROW(reader.read_range(UINT64_MAX - 2, 8), std::out_of_range);
+
+    // Range ending exactly at EOF remains valid
+    auto ok = reader.read_range(fsize - 4, 4);
+    ASSERT_EQ(ok.size, 4u);
+    auto* val = reinterpret_cast<const float*>(ok.data.get());
+    EXPECT_FLOAT_EQ(*val, 1004.0f);
 }
 
 // =============================================================================

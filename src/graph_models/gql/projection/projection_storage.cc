@@ -225,18 +225,41 @@ void ProjectionStorage::open() {
             ? BPT::LeafFormat::CSR_HYBRID
             : lf;
 
-    // Open required indexes (always present)
-    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
-    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
-    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
-    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
+    // Spec #3 T3.8 (mirrored from open_all_bplustree_readers_): open readers
+    // only for indexes whose bit is in the active IndexSet preset.
+    // FileManager::get_file_id() opens with O_CREAT, so unconditional
+    // construction of a BPlusTree for an index elided by GNN_MINIMAL /
+    // READONLY_TRAVERSAL would produce 0-byte .leaf/.dir files on disk —
+    // defeating the file-count / disk-footprint contract of the preset.
+    // Pre-v1.4 catalogs default to IndexSet::ALL (see above), so every
+    // legacy projection keeps the previous unconditional behavior.
+    const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
-    // Open edge-first indexes if they exist (added in Phase 13)
+    if (has_flag(active_mask, ProjectionIndex::NODES)) {
+        nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
+        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
+        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
+        edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
+    }
+
+    // Open edge-first indexes if they exist (added in Phase 13). Dual gate:
+    // the IndexSet bit AND on-disk presence, so pre-Phase-13 projections
+    // (built before these files existed) still open cleanly under ALL.
     std::filesystem::path proj_path_check(projection_dir);
-    if (std::filesystem::exists(proj_path_check / "edge_from_to.leaf")) {
+    if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)
+        && std::filesystem::exists(proj_path_check / "edge_from_to.leaf"))
+    {
         edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
     }
-    if (std::filesystem::exists(proj_path_check / "edge_n1_n2.leaf")) {
+    if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)
+        && std::filesystem::exists(proj_path_check / "edge_n1_n2.leaf"))
+    {
         edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
     }
 

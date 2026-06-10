@@ -4,13 +4,11 @@
  * @file radix_partition_sort.h
  * @brief Memory-bounded parallel external sort via radix partitioning.
  *
- * Skeleton header committed as part of the TDD RED cycle for the
- * Radix-Partition Sort campaign (M2 milestone).
- *
- * The implementation is added incrementally across Tasks 5-11. At the
- * current commit the declarations below are intentionally unbacked by
- * any `.cc` translation unit, so linking `radix_partition_sort_test`
- * yields unresolved-symbol errors. This is the expected RED state.
+ * RADIX backend for the projection B+Tree index build phase, selected at
+ * runtime via MDB_PROJECTION_SORTER=radix (see sorter_dispatch.h).
+ * Implemented in radix_partition_sort.cc; unit tests live in
+ * src/tests/radix_partition_sort_test.cc, and golden-compare integration
+ * against the CLASSIC backend in scripts/test_projection_radix.sh.
  *
  * Spec reference:
  *   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2

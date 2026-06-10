@@ -666,6 +666,30 @@ TEST_F(PackedBatchTest, LargeBatchIdFilename) {
     // Verify filenames: 0-4 should be zero-padded to 6 digits
     EXPECT_TRUE(fs::exists(dir / "batch_000000.bin"));
     EXPECT_TRUE(fs::exists(dir / "batch_000004.bin"));
+
+    // 7-digit rollover: "%06" is a *minimum* width, so id 1000000 must map to
+    // batch_1000000.bin (widened, not truncated/wrapped). The writer enforces
+    // sequential ids, so place a valid batch file at that name by hand and
+    // verify the reader's name construction resolves it round-trip.
+    auto header = PackedBatchHeader::make(1, 2, GnnDtype::FLOAT32);
+    std::vector<float> row = { 7.0f, 8.0f };
+    {
+        std::ofstream ofs(dir / "batch_1000000.bin", std::ios::binary);
+        ASSERT_TRUE(ofs.good());
+        ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        ofs.write(reinterpret_cast<const char*>(row.data()),
+                  static_cast<std::streamsize>(row.size() * sizeof(float)));
+    }
+
+    PackedBatchReader reader(dir, 1000001, 2, GnnDtype::FLOAT32);
+    auto h = reader.read_header(1000000);
+    EXPECT_EQ(h.num_nodes, 1u);
+
+    std::vector<float> out(2, 0.0f);
+    uint64_t nodes = reader.read_batch(1000000, out.data(), out.size() * sizeof(float));
+    EXPECT_EQ(nodes, 1u);
+    EXPECT_EQ(out[0], 7.0f);
+    EXPECT_EQ(out[1], 8.0f);
 }
 
 // Fix #5 (test): Reader rejects feature_dim=0

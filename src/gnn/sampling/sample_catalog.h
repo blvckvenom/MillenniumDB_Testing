@@ -28,7 +28,7 @@ namespace mdb::gnn {
  * ```
  * Offset  Size     Field
  * 0       4        Magic ("GNNS" = 0x534E4E47)
- * 4       4        Version (currently 2)
+ * 4       4        Version (currently 3)
  * 8       8        Created timestamp (Unix epoch)
  * 16      8        Total batches
  * 24      8        Train batches
@@ -298,7 +298,7 @@ private:
         }
 
         uint32_t version = read_value<uint32_t>(in);
-        if (version != VERSION && version != 1) {
+        if (version < 1 || version > VERSION) {
             throw std::runtime_error("Unsupported catalog version: " + std::to_string(version));
         }
 

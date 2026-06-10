@@ -82,6 +82,24 @@ namespace {
 // nullopt on any short read so a torn/truncated block falls back to online.
 std::optional<LoadedBlock> read_block_body(std::ifstream& is, const BlockBatchHeader& h) {
     const uint32_t K = h.num_layers;
+    // The header counts come straight off disk and drive allocations below.
+    // The magic + fingerprint checks do not cover them, so a corrupt count
+    // (bit rot, tampering) must degrade to nullopt — the graceful online
+    // fallback — instead of throwing bad_alloc / c10::Error out of assemble.
+    constexpr uint32_t MAX_LAYERS = 64;          // fanout depth bound
+    constexpr int64_t  MAX_EDGES  = (1ll << 31); // edge indices are int32 on disk
+    if (K > MAX_LAYERS) return std::nullopt;
+    // Remaining bytes after the 64 B header; every count below must add up
+    // to exactly this (the writer emits header + body with no padding).
+    const std::streamoff body_start = is.tellg();
+    is.seekg(0, std::ios::end);
+    const std::streamoff file_end = is.tellg();
+    is.seekg(body_start, std::ios::beg);
+    if (!is || body_start < 0 || file_end < body_start) return std::nullopt;
+    const uint64_t remaining = static_cast<uint64_t>(file_end - body_start);
+    const uint64_t fixed_bytes = (2ull * K + 1) * sizeof(int64_t);  // M_k + E_k arrays
+    if (remaining < fixed_bytes) return std::nullopt;
+    if (h.num_seeds > remaining / sizeof(uint64_t)) return std::nullopt;
     LoadedBlock out;
     // v2 self-contained header fields (0 for legacy v1 / non-self-contained v2 blocks).
     out.store_fp         = h.store_fp;
@@ -93,6 +111,14 @@ std::optional<LoadedBlock> read_block_body(std::ifstream& is, const BlockBatchHe
     std::vector<int64_t> E(K);
     is.read(reinterpret_cast<char*>(E.data()), static_cast<std::streamsize>(K * sizeof(int64_t)));
     if (!is) return std::nullopt;
+    uint64_t edge_bytes = 0;
+    for (uint32_t k = 0; k < K; ++k) {
+        if (E[k] < 0 || E[k] >= MAX_EDGES) return std::nullopt;
+        edge_bytes += 2ull * static_cast<uint64_t>(E[k]) * sizeof(int32_t);
+    }
+    if (fixed_bytes + edge_bytes + h.num_seeds * sizeof(uint64_t) != remaining) {
+        return std::nullopt;
+    }
     out.edge_indices.reserve(K);
     for (uint32_t k = 0; k < K; ++k) {
         const int64_t Ek = E[k];
@@ -140,13 +166,27 @@ std::optional<LoadedBlock> BlockReader::open_self_contained(
     return read_block_body(is, h);
 }
 
-bool BlockReader::is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp) {
+bool BlockReader::is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp,
+                           uint64_t expected_store_fp) {
     std::ifstream is(path, std::ios::binary);
     if (!is) return false;
     BlockBatchHeader h{};
     is.read(reinterpret_cast<char*>(&h), sizeof(h));
     if (!is) return false;  // short read / open failure
-    return h.is_valid() && h.sample_fp == expected_sample_fp;
+    // The bake always writes the current format: a valid-but-older block must
+    // NOT count as fresh, or the re-bake would silently keep it and the
+    // self-contained train path would never become eligible.
+    if (!h.is_valid() || h.version < BlockBatchHeader::VERSION) return false;
+    if (h.sample_fp != expected_sample_fp) return false;
+    // A self-contained bake (expected_store_fp != 0) further requires the
+    // existing block to carry the SAME store fingerprint; otherwise
+    // open_self_contained would reject it at train time and the speedup
+    // would silently degrade to the batches.dat fallback.
+    if (expected_store_fp != 0
+        && (!h.is_self_contained() || h.store_fp != expected_store_fp)) {
+        return false;
+    }
+    return true;
 }
 
 uint64_t BlockReader::read_store_fp(const std::filesystem::path& path) {

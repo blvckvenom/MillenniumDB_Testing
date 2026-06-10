@@ -6,6 +6,8 @@
 #include <set>
 #include <vector>
 
+#include <sys/resource.h>
+
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/cpu_cache.h"
 #include "gnn/storage/four_level_store.h"
@@ -1937,4 +1939,282 @@ TEST(FourLevelStoreMetaSha, ResolvesProjectionDirNotDbRoot) {
     EXPECT_FALSE(fs::exists(base / "gnn_meta.bin"));
 
     fs::remove_all(base);
+}
+
+// =============================================================================
+// Build: the fingerprint-match reuse path honors an explicit bake_blocks
+// request instead of silently dropping it.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_ReusePathHonorsBakeBlocks) {
+    auto samples = create_frequency_samples("fls_bake");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto blocks_dir =
+        SampleStorage::get_storage_path(db_folder_, "fls_bake") / "blocks";
+    ASSERT_FALSE(fs::exists(blocks_dir))
+        << "first build did not request bake_blocks";
+
+    // Second build of the SAME sample hits the reuse fast path — the
+    // explicitly requested bake must still happen.
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_bake"));
+    auto config_bake = make_config(1, false);
+    config_bake.bake_blocks = true;
+    auto r2 = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples2, config_bake, db_folder_, "test_feat");
+
+    EXPECT_TRUE(r2.blocks_built_ok)
+        << "bake_blocks on the reuse path must report success";
+    ASSERT_TRUE(fs::exists(blocks_dir));
+    size_t blk_count = 0;
+    for (const auto& e : fs::directory_iterator(blocks_dir)) {
+        if (e.path().extension() == ".blk") blk_count++;
+    }
+    EXPECT_EQ(blk_count, 5u) << "one baked block per batch";
+}
+
+// =============================================================================
+// Build: the reuse fast path verifies the tier artifacts still exist; a
+// fingerprint match with a deleted packed_slim/ must recompute, not silently
+// return a store that would zero-fill at train.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_ReuseVerifiesArtifactsExist) {
+    auto samples = create_frequency_samples("fls_verify");
+    auto config = make_config(1, false);
+
+    auto r1 = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto slim_dir = fs::path(r1.packed_slim_dir);
+    ASSERT_TRUE(fs::exists(slim_dir));
+    fs::remove_all(slim_dir);
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_verify"));
+    auto r2 = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples2, config, db_folder_, "test_feat");
+
+    EXPECT_TRUE(fs::exists(slim_dir))
+        << "reuse with missing packed_slim/ must recompute the store";
+    EXPECT_EQ(r2.l2_nodes, r1.l2_nodes);
+}
+
+// =============================================================================
+// Constructor: a partially-deleted reordered pair (.fmat without .rmap or
+// vice versa) must throw instead of constructing a store that silently
+// zero-fills L3 rows.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Constructor_ThrowsOnPartialReorderedArtifacts) {
+    auto samples = create_frequency_samples("fls_partial");
+    auto config = make_config(1, /*reorder=*/true);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto reord_rmap = gnn_dir_ / "test_feat_reordered.rmap";
+    ASSERT_TRUE(fs::exists(reord_rmap));
+    fs::remove(reord_rmap);
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_partial"));
+    EXPECT_THROW(
+        { FourLevelStore store(db_folder_, "test_feat", samples2); },
+        std::runtime_error);
+}
+
+// =============================================================================
+// Constructor: store.meta records cold (L3/L4) nodes but BOTH cold sources
+// (packed_slim/ and the reordered pair) are gone — every cold node would be
+// silently zero-filled, so construction must fail loudly.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Constructor_ThrowsWhenColdTiersMissing) {
+    auto samples = create_frequency_samples("fls_cold");
+    auto config = make_config(1, /*reorder=*/false);
+
+    auto r1 = FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    ASSERT_GT(r1.l3_nodes + r1.l4_nodes, 0u);
+    fs::remove_all(fs::path(r1.packed_slim_dir));
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_cold"));
+    EXPECT_THROW(
+        { FourLevelStore store(db_folder_, "test_feat", samples2); },
+        std::runtime_error);
+}
+
+// =============================================================================
+// Constructor: when addr_tables/ is present but the gnn_meta.bin staleness
+// marker is missing/unreadable (marker == 0 disables validation), the
+// fail-open state must be VISIBLE via a stderr warning.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Constructor_WarnsWhenStalenessMarkerUnavailable) {
+    auto samples = create_frequency_samples("fls_warnsha");
+    auto config = make_config(1, false);  // build_addr_tables defaults true
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto addr_dir =
+        SampleStorage::get_storage_path(db_folder_, "fls_warnsha") / "addr_tables";
+    ASSERT_TRUE(fs::exists(addr_dir));
+    // The fixture never creates projections/<name>/gnn_meta.bin, so the
+    // marker resolves to 0 (validation disabled).
+    ASSERT_FALSE(fs::exists(
+        FourLevelStore::gnn_meta_path_for(db_folder_, "test_proj")));
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_warnsha"));
+    testing::internal::CaptureStderr();
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+    std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_NE(err.find("staleness validation DISABLED"), std::string::npos)
+        << "disabled staleness validation must be announced, got: " << err;
+}
+
+// =============================================================================
+// Build: force:1 + force_meta:false preserves store.meta and throws — the
+// message must name the actual conflict, not recommend the very flag
+// combination that triggered it.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_ForceWithPreservedMetaNamesTheConflict) {
+    auto samples = create_frequency_samples("fls_forcemsg");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_forcemsg"));
+    auto config_force = make_config(1, false, /*force=*/true);
+    config_force.force_meta = false;
+
+    try {
+        FourLevelStore::build(
+            FeatureMatrix::open(fmat_path_),
+            RowMapping::open(rmap_path_),
+            samples2, config_force, db_folder_, "test_feat");
+        FAIL() << "force:1 + force_meta:false on an existing store must throw";
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("force_meta:true"), std::string::npos)
+            << "message must point at the resolving flag, got: " << msg;
+        EXPECT_EQ(msg.find("Use force:1 to overwrite"), std::string::npos)
+            << "message must not recommend the combination that triggered the "
+               "error, got: " << msg;
+    }
+}
+
+// =============================================================================
+// Build: the partitioned packed_slim NOFILE raise is build-phase-only — the
+// inherited soft limit must be restored once the build finishes.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, Build_RestoresNofileSoftLimit) {
+    // Enough batches that need (= total_batches + 64) exceeds the lowered
+    // soft limit below, forcing the partitioned packer to raise it.
+    std::vector<std::vector<uint64_t>> batches(64, {0, 1, 2});
+    auto samples = create_samples("fls_rlimit", batches);
+    auto config = make_config(1, false);
+
+    const rlim_t need = 64 + 64;
+    struct rlimit orig {};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &orig), 0);
+    if (orig.rlim_max != RLIM_INFINITY && orig.rlim_max < need) {
+        GTEST_SKIP() << "hard NOFILE limit too low to exercise the raise";
+    }
+    size_t open_fds = 0;
+    for (const auto& e : fs::directory_iterator("/proc/self/fd")) {
+        (void) e;
+        open_fds++;
+    }
+    if (open_fds > 48) {
+        GTEST_SKIP() << "too many fds already open (" << open_fds
+                     << ") to safely lower the soft limit";
+    }
+
+    struct rlimit lowered = orig;
+    lowered.rlim_cur = need - 28;  // < need -> triggers the raise
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &lowered), 0);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    struct rlimit after {};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &after), 0);
+    EXPECT_EQ(after.rlim_cur, lowered.rlim_cur)
+        << "the NOFILE soft limit raised for the partitioned pack must be "
+           "restored after the build";
+
+    ::setrlimit(RLIMIT_NOFILE, &orig);
+}
+
+// =============================================================================
+// load_batch_features: nodes resolvable in no tier are served as zeros — that
+// state must be loud (stderr warning), not silent.
+// =============================================================================
+
+TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_WarnsOnZeroFilledNodes) {
+    auto samples = create_frequency_samples("fls_zerofill");
+    auto config = make_config(1, false);
+
+    FourLevelStore::build(
+        FeatureMatrix::open(fmat_path_),
+        RowMapping::open(rmap_path_),
+        samples, config, db_folder_, "test_feat");
+
+    auto samples2 = SampleStorage::open(
+        SampleStorage::get_storage_path(db_folder_, "fls_zerofill"));
+    FourLevelStore store(db_folder_, "test_feat", samples2);
+
+    // A sample referencing a node the store has never seen: it resolves in no
+    // tier and is served as a zero row.
+    const ObjectId unknown(0xD4000000000000FFULL);
+    GraphSample s;
+    s.batch_id = 0;
+    s.split = SplitType::TRAIN;
+    s.nodes_per_layer.resize(1);
+    s.nodes_per_layer[0].push_back(unknown);
+    s.all_unique_nodes.push_back(unknown);
+
+    testing::internal::CaptureStderr();
+    auto tensor = store.load_batch_features(s);
+    std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_NE(err.find("ZERO-FILLED"), std::string::npos)
+        << "zero-filled features must be announced, got: " << err;
+
+    auto cpu = tensor.cpu().contiguous();
+    ASSERT_EQ(cpu.size(0), 1);
+    auto acc = cpu.accessor<float, 2>();
+    for (uint64_t d = 0; d < D; ++d) {
+        EXPECT_FLOAT_EQ(acc[0][d], 0.0f);
+    }
 }

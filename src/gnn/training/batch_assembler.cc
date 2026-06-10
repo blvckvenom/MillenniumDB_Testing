@@ -18,14 +18,21 @@
 namespace mdb::gnn {
 
 namespace {
+// Truthy boolean env values for the MDB_GNN_* flag family: "1"/"true"/"yes"
+// (matches MDB_GNN_NO_FADVISE in page_cache_hint.h so every boolean toggle
+// consumed by this file parses identically).
+bool env_flag_enabled(const char* name) {
+    const char* e = std::getenv(name);
+    return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
+                 std::strcmp(e, "yes") == 0);
+}
+
 // Nested (DGL-block) aggregation default, read once from the environment.
 // MDB_GNN_NESTED_AGG=1/true/yes => every node within k hops re-aggregates its
 // sampled neighbours at conv k (standard nested-neighbourhood message passing);
 // unset/0 => legacy per-hop wiring (seeds aggregate only at the final conv).
 bool nested_agg_env_default() {
-    const char* e = std::getenv("MDB_GNN_NESTED_AGG");
-    return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
-                 std::strcmp(e, "yes") == 0);
+    return env_flag_enabled("MDB_GNN_NESTED_AGG");
 }
 } // namespace
 
@@ -38,7 +45,8 @@ BatchAssembler::BatchAssembler(
     SampleStorage&  samples,
     LabelStore*     labels,
     SplitStore*     splits,
-    const RowMapping& row_mapping
+    const RowMapping& row_mapping,
+    const std::string& feature_name
 )
     : feature_store_(&feature_store)
     , feature_matrix_(nullptr)
@@ -46,6 +54,7 @@ BatchAssembler::BatchAssembler(
     , labels_(labels)
     , splits_(splits)
     , row_mapping_(row_mapping)
+    , feature_name_(feature_name)
 {
     nested_aggregation_ = nested_agg_env_default();
     init_blocks_();
@@ -74,20 +83,18 @@ BatchAssembler::BatchAssembler(
 // =============================================================================
 
 void BatchAssembler::init_blocks_() {
-    // Read the two SC-5 env toggles once (same as before SC-5a) and delegate the
+    // Read the SC-5 env toggles once (same as before SC-5a) and delegate the
     // actual mode selection to apply_block_mode_, which is shared with the
-    // per-call override setter set_block_mode_override(). With neither env var
-    // set (the default), the booleans are both false and the selected flags are
+    // per-call override setter set_block_mode_override(). With no env var
+    // set (the default), the booleans are all false and the selected flags are
     // byte-identical to the pre-SC-5a auto-detection.
-    //   MDB_GNN_NO_BLOCKS=1        -> force fully-online (no blocks at all).
-    //   MDB_GNN_NO_SELF_CONTAINED=1-> force Option-A per-batch blocks (still
-    //                                 reads batches.dat in assemble_from_sample).
-    const char* nb  = std::getenv("MDB_GNN_NO_BLOCKS");
-    const char* nsc = std::getenv("MDB_GNN_NO_SELF_CONTAINED");
-    const bool env_no_blocks        = (nb  && std::string(nb)  == "1");
-    const bool env_no_self_contained = (nsc && std::string(nsc) == "1");
-    const char* npf = std::getenv("MDB_GNN_NO_PACKED_FULL");
-    const bool env_no_packed_full = (npf && std::string(npf) == "1");
+    //   MDB_GNN_NO_BLOCKS=1/true/yes         -> force fully-online (no blocks).
+    //   MDB_GNN_NO_SELF_CONTAINED=1/true/yes -> force Option-A per-batch blocks
+    //                                           (still reads batches.dat in
+    //                                           assemble_from_sample).
+    const bool env_no_blocks         = env_flag_enabled("MDB_GNN_NO_BLOCKS");
+    const bool env_no_self_contained = env_flag_enabled("MDB_GNN_NO_SELF_CONTAINED");
+    const bool env_no_packed_full    = env_flag_enabled("MDB_GNN_NO_PACKED_FULL");
     apply_block_mode_(env_no_blocks, env_no_self_contained, env_no_packed_full);
 }
 
@@ -99,7 +106,10 @@ void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained, b
     std::error_code ec;
     blocks_dir_ = samples_.get_path() / "blocks";
     // Detected here; consumed only when also !nested_aggregation_ at use time.
-    use_blocks_ = std::filesystem::exists(blocks_dir_, ec);
+    // no_blocks forces fully-online regardless of ctor path: BOTH the
+    // FourLevelStore and the FeatureMatrix-fallback assembler consume Option-A
+    // blocks in assemble_from_sample, so the kill switch must gate both.
+    use_blocks_ = !no_blocks && std::filesystem::exists(blocks_dir_, ec);
 
     // ------------------------------------------------------------------
     // SC-3: decide self-contained-block train mode (skip batches.dat).
@@ -114,17 +124,17 @@ void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained, b
     // Any mismatch leaves self_contained_mode_ false -> assemble() takes the
     // existing real-sample path, byte-identical to today.
     //
-    // The two booleans drive the SC-5 same-session A/B (from env vars in
+    // The booleans drive the SC-5 same-session A/B (from env vars in
     // init_blocks_, or from the per-call set_block_mode_override() in SC-5a):
-    //   no_blocks==true        -> force fully-online (no blocks at all).
+    //   no_blocks==true        -> force fully-online (no blocks at all);
+    //                             applied to use_blocks_ above, so it gates
+    //                             BOTH ctor paths.
     //   no_self_contained==true-> force Option-A per-batch blocks (still
     //                             reads batches.dat in assemble_from_sample).
-    // CAVEAT: both toggles only take effect INSIDE the `feature_store_ != nullptr`
-    // eligibility block below, so they affect ONLY the FourLevelStore ctor path
-    // (the measured config). On the FeatureMatrix-fallback ctor (feature_store_
-    // == nullptr) the block is skipped entirely, so no_blocks does NOT disable
-    // Option-A block consumption there — that path is not a measured
-    // configuration and self-contained mode never applies to it anyway.
+    //                             Only meaningful inside the
+    //                             `feature_store_ != nullptr` block below —
+    //                             self-contained mode never applies to the
+    //                             FeatureMatrix-fallback ctor anyway.
     // ------------------------------------------------------------------
     self_contained_mode_ = false;
     store_fp_            = 0;
@@ -134,20 +144,18 @@ void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained, b
     if (use_blocks_) sc_mode_label = "Option-A blocks";
 
     if (use_blocks_ && !nested_aggregation_ && feature_store_ != nullptr) {
-        if (no_blocks) {
-            use_blocks_   = false;          // fully-online
-            sc_mode_label = "online";
-        } else if (!no_self_contained) {
+        if (!no_self_contained) {
             uint64_t catalog_fp = samples_.get_catalog().sample_content_fp;
             bool addr_present =
                 std::filesystem::exists(samples_.get_path() / "addr_tables", ec);
             // Packed-full probe: features come from the consolidated pack (NO
             // addr_tables needed). Keyed by the MIXED feature-store fingerprint
-            // (must match build_packed_full_'s cur_fp).
+            // (must match build_packed_full_'s cur_fp, which mixes the ACTUAL
+            // feature name the store was built with).
             std::optional<PackedFullReader> pf;
             if (!no_packed_full && catalog_fp != 0) {
                 uint64_t pf_fp = mix_feature_store_fingerprint(
-                    catalog_fp, "node_features",
+                    catalog_fp, feature_name_,
                     feature_store_->feature_dim(),
                     static_cast<uint8_t>(feature_store_->dtype()));
                 pf = PackedFullReader::open(samples_.get_path() / "packed_full", pf_fp);
@@ -196,6 +204,70 @@ size_t estimate_struct_bytes(const std::vector<torch::Tensor>& edges,
 }
 } // namespace
 
+// =============================================================================
+// Private: structural-cache helpers (single home for the LRU policy and the
+// CachedStruct <-> MiniBatch field list, shared by assemble() and the
+// self-contained path)
+// =============================================================================
+
+bool BatchAssembler::try_struct_hit_(uint64_t batch_id, MiniBatch& mini, bool count_miss) {
+    if (struct_budget_ == 0) return false;
+    std::lock_guard<std::mutex> lk(struct_mu_);
+    auto it = struct_cache_.find(batch_id);
+    if (it == struct_cache_.end()) {
+        if (count_miss) ++struct_misses_;
+        return false;
+    }
+    ++struct_hits_;
+    struct_lru_.splice(struct_lru_.begin(), struct_lru_, it->second.lru_it);
+    const CachedStruct& c = it->second.s;  // refcounted tensors — shares storage
+    mini.batch_id                 = batch_id;
+    mini.split                    = static_cast<SplitType>(c.split);
+    mini.edge_indices             = c.edge_indices;
+    mini.active_indices_per_layer = c.active_indices_per_layer;
+    mini.active_sizes_per_layer   = c.active_sizes_per_layer;
+    mini.labels                   = c.labels;
+    mini.label_mask               = c.label_mask;
+    mini.num_seeds                = c.num_seeds;
+    mini.num_nodes                = c.num_nodes;
+    mini.num_labeled              = c.num_labeled;
+    return true;
+}
+
+void BatchAssembler::cache_struct_(uint64_t batch_id, const MiniBatch& mini) {
+    if (struct_budget_ == 0) return;
+    std::lock_guard<std::mutex> lk(struct_mu_);
+    if (struct_cache_.find(batch_id) != struct_cache_.end()) return;
+    size_t sz = estimate_struct_bytes(mini.edge_indices,
+                                      mini.active_indices_per_layer,
+                                      mini.labels, mini.label_mask);
+    while (struct_bytes_ + sz > struct_budget_ && !struct_lru_.empty()) {
+        uint64_t victim = struct_lru_.back();
+        struct_lru_.pop_back();
+        auto vit = struct_cache_.find(victim);
+        if (vit != struct_cache_.end()) {
+            struct_bytes_ -= vit->second.bytes;
+            struct_cache_.erase(vit);
+            ++struct_evictions_;
+        }
+    }
+    if (sz > struct_budget_) return;
+    CachedStruct c;
+    c.edge_indices             = mini.edge_indices;
+    c.active_indices_per_layer = mini.active_indices_per_layer;
+    c.active_sizes_per_layer   = mini.active_sizes_per_layer;
+    c.labels                   = mini.labels;
+    c.label_mask               = mini.label_mask;
+    c.num_seeds                = mini.num_seeds;
+    c.num_nodes                = mini.num_nodes;
+    c.num_labeled              = mini.num_labeled;
+    c.split                    = static_cast<uint32_t>(mini.split);
+    struct_lru_.push_front(batch_id);
+    struct_cache_.emplace(
+        batch_id, StructCacheEntry{std::move(c), struct_lru_.begin(), sz});
+    struct_bytes_ += sz;
+}
+
 MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
     // SC-3: self-contained fast path — read ONLY the baked block, never
     // batches.dat. Returns true on success; false requests the legacy
@@ -214,35 +286,11 @@ MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
 
     // Structural cache fast path: reuse the per-batch index/label build across
     // epochs (it is a pure function of the sample) and only re-run the feature
-    // load. We copy the cached fields under the lock (torch tensors are
-    // refcounted, so this shares storage — no data copy) and release the lock
+    // load. The cached fields are copied under the lock (torch tensors are
+    // refcounted, so this shares storage — no data copy); the lock is released
     // before the feature load.
-    bool hit = false;
     MiniBatch mini;
-    if (struct_budget_ > 0) {
-        std::lock_guard<std::mutex> lk(struct_mu_);
-        auto it = struct_cache_.find(batch_id);
-        if (it != struct_cache_.end()) {
-            ++struct_hits_;
-            struct_lru_.splice(struct_lru_.begin(), struct_lru_, it->second.lru_it);
-            const CachedStruct& c = it->second.s;
-            mini.batch_id                 = sample.batch_id;
-            mini.split                    = sample.split;
-            mini.edge_indices             = c.edge_indices;
-            mini.active_indices_per_layer = c.active_indices_per_layer;
-            mini.active_sizes_per_layer   = c.active_sizes_per_layer;
-            mini.labels                   = c.labels;
-            mini.label_mask               = c.label_mask;
-            mini.num_seeds                = c.num_seeds;
-            mini.num_nodes                = c.num_nodes;
-            mini.num_labeled              = c.num_labeled;
-            hit = true;
-        } else {
-            ++struct_misses_;
-        }
-    }
-
-    if (hit) {
+    if (try_struct_hit_(batch_id, mini, /*count_miss=*/true)) {
         auto tl0 = std::chrono::steady_clock::now();
         bool used_v2 = false;
         mini.features = load_features(sample, &used_v2);
@@ -260,41 +308,7 @@ MiniBatch BatchAssembler::assemble(uint64_t batch_id) {
     // Miss: full structural build + feature load, then cache the structural part.
     mini = assemble_from_sample(sample);
     mini.timing.sample_read_ns = sample_read_ns;
-
-    if (struct_budget_ > 0) {
-        std::lock_guard<std::mutex> lk(struct_mu_);
-        if (struct_cache_.find(batch_id) == struct_cache_.end()) {
-            size_t sz = estimate_struct_bytes(mini.edge_indices,
-                                              mini.active_indices_per_layer,
-                                              mini.labels, mini.label_mask);
-            while (struct_bytes_ + sz > struct_budget_ && !struct_lru_.empty()) {
-                uint64_t victim = struct_lru_.back();
-                struct_lru_.pop_back();
-                auto vit = struct_cache_.find(victim);
-                if (vit != struct_cache_.end()) {
-                    struct_bytes_ -= vit->second.bytes;
-                    struct_cache_.erase(vit);
-                    ++struct_evictions_;
-                }
-            }
-            if (sz <= struct_budget_) {
-                CachedStruct c;
-                c.edge_indices             = mini.edge_indices;
-                c.active_indices_per_layer = mini.active_indices_per_layer;
-                c.active_sizes_per_layer   = mini.active_sizes_per_layer;
-                c.labels                   = mini.labels;
-                c.label_mask               = mini.label_mask;
-                c.num_seeds                = mini.num_seeds;
-                c.num_nodes                = mini.num_nodes;
-                c.num_labeled              = mini.num_labeled;
-                c.split                    = static_cast<uint32_t>(mini.split);
-                struct_lru_.push_front(batch_id);
-                struct_cache_.emplace(
-                    batch_id, StructCacheEntry{std::move(c), struct_lru_.begin(), sz});
-                struct_bytes_ += sz;
-            }
-        }
-    }
+    cache_struct_(batch_id, mini);
     return mini;
 }
 
@@ -380,47 +394,21 @@ bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& 
     // ---- Fast path A: structural-cache hit (cross-epoch) ----------------
     // The structural bundle (edges/active/labels) is identical every epoch, so
     // on a hit we reuse it and only re-run the (cheap) v2 feature gather. We
-    // still build a minimal placeholder sample for that gather.
-    {
-        bool hit = false;
-        CachedStruct c;
-        if (struct_budget_ > 0) {
-            std::lock_guard<std::mutex> lk(struct_mu_);
-            auto it = struct_cache_.find(batch_id);
-            if (it != struct_cache_.end()) {
-                ++struct_hits_;
-                struct_lru_.splice(struct_lru_.begin(), struct_lru_, it->second.lru_it);
-                c   = it->second.s;   // refcounted tensors — shares storage
-                hit = true;
-            }
-            // NOTE: we DON'T ++struct_misses_ here; the miss is accounted once
-            // below where the block is actually opened (parity with assemble()'s
-            // single miss-count per batch).
-        }
+    // still build a minimal placeholder sample for that gather. The miss is
+    // NOT counted here (count_miss=false); it is accounted once below where
+    // the block is actually opened (parity with assemble()'s single miss-count
+    // per batch).
+    if (try_struct_hit_(batch_id, mini, /*count_miss=*/false)) {
+        // Minimal placeholder sample for the v2 gather: only the SIZE of
+        // all_unique_nodes and batch_id are consulted by the addr_table
+        // path (verified: load_batch_features_v2_ never reads node contents).
+        GraphSample ms;
+        ms.batch_id = batch_id;
+        ms.split    = mini.split;
+        ms.all_unique_nodes.assign(static_cast<size_t>(mini.num_nodes), ObjectId());
 
-        if (hit) {
-            mini.batch_id                 = batch_id;
-            mini.split                    = static_cast<SplitType>(c.split);
-            mini.edge_indices             = c.edge_indices;
-            mini.active_indices_per_layer = c.active_indices_per_layer;
-            mini.active_sizes_per_layer   = c.active_sizes_per_layer;
-            mini.labels                   = c.labels;
-            mini.label_mask               = c.label_mask;
-            mini.num_seeds                = c.num_seeds;
-            mini.num_nodes                = c.num_nodes;
-            mini.num_labeled              = c.num_labeled;
-
-            // Minimal placeholder sample for the v2 gather: only the SIZE of
-            // all_unique_nodes and batch_id are consulted by the addr_table
-            // path (verified: load_batch_features_v2_ never reads node contents).
-            GraphSample ms;
-            ms.batch_id = batch_id;
-            ms.split    = mini.split;
-            ms.all_unique_nodes.assign(static_cast<size_t>(c.num_nodes), ObjectId());
-
-            if (!load_self_contained_features_(batch_id, ms, mini)) return false;
-            return true;
-        }
+        if (!load_self_contained_features_(batch_id, ms, mini)) return false;
+        return true;
     }
 
     // ---- Fast path B: structural-cache miss — build from the block ------
@@ -519,40 +507,7 @@ bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& 
     if (!load_self_contained_features_(batch_id, ms, mini)) return false;
 
     // Cache the structural bundle (same budget/LRU dance as assemble()'s miss).
-    if (struct_budget_ > 0) {
-        std::lock_guard<std::mutex> lk(struct_mu_);
-        if (struct_cache_.find(batch_id) == struct_cache_.end()) {
-            size_t sz = estimate_struct_bytes(mini.edge_indices,
-                                              mini.active_indices_per_layer,
-                                              mini.labels, mini.label_mask);
-            while (struct_bytes_ + sz > struct_budget_ && !struct_lru_.empty()) {
-                uint64_t victim = struct_lru_.back();
-                struct_lru_.pop_back();
-                auto vit = struct_cache_.find(victim);
-                if (vit != struct_cache_.end()) {
-                    struct_bytes_ -= vit->second.bytes;
-                    struct_cache_.erase(vit);
-                    ++struct_evictions_;
-                }
-            }
-            if (sz <= struct_budget_) {
-                CachedStruct c;
-                c.edge_indices             = mini.edge_indices;
-                c.active_indices_per_layer = mini.active_indices_per_layer;
-                c.active_sizes_per_layer   = mini.active_sizes_per_layer;
-                c.labels                   = mini.labels;
-                c.label_mask               = mini.label_mask;
-                c.num_seeds                = mini.num_seeds;
-                c.num_nodes                = mini.num_nodes;
-                c.num_labeled              = mini.num_labeled;
-                c.split                    = static_cast<uint32_t>(mini.split);
-                struct_lru_.push_front(batch_id);
-                struct_cache_.emplace(
-                    batch_id, StructCacheEntry{std::move(c), struct_lru_.begin(), sz});
-                struct_bytes_ += sz;
-            }
-        }
-    }
+    cache_struct_(batch_id, mini);
 
     return true;
 }

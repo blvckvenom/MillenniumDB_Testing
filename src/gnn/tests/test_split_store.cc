@@ -87,6 +87,9 @@ TEST_F(SplitStoreTest, GatherMaskTest) {
 TEST_F(SplitStoreTest, ParseSplitString) {
     EXPECT_EQ(mdb::gnn::SplitStore::parse_split_string("train"),      mdb::gnn::SplitStore::TRAIN);
     EXPECT_EQ(mdb::gnn::SplitStore::parse_split_string("val"),        mdb::gnn::SplitStore::VAL);
+    // "valid" is the OGB split token; mapping it to UNLABELED silently wipes
+    // every validation node (the ogbn-products bestValAccuracy=0 failure).
+    EXPECT_EQ(mdb::gnn::SplitStore::parse_split_string("valid"),      mdb::gnn::SplitStore::VAL);
     EXPECT_EQ(mdb::gnn::SplitStore::parse_split_string("validation"), mdb::gnn::SplitStore::VAL);
     EXPECT_EQ(mdb::gnn::SplitStore::parse_split_string("test"),       mdb::gnn::SplitStore::TEST);
     EXPECT_EQ(mdb::gnn::SplitStore::parse_split_string("other"),      mdb::gnn::SplitStore::UNLABELED);

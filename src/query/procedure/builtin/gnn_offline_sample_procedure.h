@@ -51,6 +51,7 @@ namespace Procedures {
  * | l1CacheMb | INT | 0 | L1 (RAM hot) budget in MiB; 0 = auto-detect from /proc/meminfo |
  * | l2CacheMb | INT | 0 | L2 (RAM warm) budget in MiB; 0 = auto-detect from /proc/meminfo |
  * | useL3MmapSidecar | BOOL | true | Open Spec #4-B sidecar as L3 cold tier; falls through to L4 if absent |
+ * | force | BOOL | false | Drop and re-create the sample set if it already exists |
  *
  * ## Examples
  *
@@ -167,7 +168,9 @@ private:
      * @param[out] random_seed Parsed random seed
      * @param[out] orientation Parsed orientation string
      * @param[out] use_predefined_splits Whether to use splits.bin from projection
+     * @param[out] use_predefined_splits_explicit True iff usePredefinedSplits was present in the map
      * @param[out] use_adjacency_cache Whether to build the in-memory adjacency cache (Spec #11)
+     * @param[out] force Whether to drop and re-create an existing sample set
      */
     void parse_options(
         ProcedureContext& ctx,
@@ -179,6 +182,7 @@ private:
         uint64_t& random_seed,
         std::string& orientation,
         bool& use_predefined_splits,
+        bool& use_predefined_splits_explicit,
         bool& use_adjacency_cache,
         bool& use_four_level_topology_store,
         uint64_t& l1_cache_mb,
@@ -187,7 +191,8 @@ private:
         bool& auto_profile_on_cold_start,
         uint64_t& profile_num_walks,
         uint64_t& profile_walk_length,
-        uint64_t& num_workers
+        uint64_t& num_workers,
+        bool& force
     );
 };
 

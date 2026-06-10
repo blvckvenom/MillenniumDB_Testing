@@ -546,6 +546,15 @@ DirectIoReader::ReadResult DirectIoReader::read_range(uint64_t offset, uint64_t 
     if (size == 0) {
         return {AlignedBuffer(nullptr), 0, 0, 0};
     }
+    // Overflow-safe past-EOF check. In the O_DIRECT path below, the scratch
+    // region is clamped to align_up(file_size_), so a past-EOF range would
+    // make the final memcpy read past the scratch allocation.
+    if (offset > file_size_ || size > file_size_ - offset) {
+        throw std::out_of_range(
+            "DirectIoReader: read_range past EOF (offset=" +
+            std::to_string(offset) + ", size=" + std::to_string(size) +
+            ", file_size=" + std::to_string(file_size_) + ")");
+    }
 
     auto out = alloc_aligned(size, block_align_);
 

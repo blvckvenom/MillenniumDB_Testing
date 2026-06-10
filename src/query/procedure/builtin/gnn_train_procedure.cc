@@ -58,6 +58,19 @@ namespace GQL::Procedures {
 // references unqualified.
 using CacheStatsSnapshot = mdb::gnn::CacheStatsSnapshot;
 
+namespace {
+
+// Thrown when the feature<->label integrity gate returns a FAILED verdict.
+// A distinct type so the gate's catch can propagate the verdict while
+// treating every other exception (e.g. a corrupt or unreadable fmat, which
+// merely prevents RUNNING the check — gnn_train itself never reads the
+// source fmat) as a non-fatal skip.
+struct FeatureLabelIntegrityError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+} // namespace
+
 static void write_training_log(
     const fs::path&                          output_dir,
     const std::string&                       model_name,
@@ -676,11 +689,11 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                                 "(via graph_project / re-import). Bypass with "
                                 "MDB_GNN_SKIP_INTEGRITY=1.",
                                 res.accuracy, res.threshold, res.chance, res.num_scored);
-                            throw std::runtime_error(buf);
+                            throw FeatureLabelIntegrityError(buf);
                         }
                     }
                 }
-            } catch (const std::runtime_error&) {
+            } catch (const FeatureLabelIntegrityError&) {
                 throw;  // integrity failure — propagate
             } catch (const std::exception& e) {
                 // Non-fatal: could not run the check (e.g. fmat open issue). Warn, do not block.
@@ -763,18 +776,27 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // SC-5a: per-call override of the block-consumption mode for same-session
     // A/B/C measurement (online / Option-A / self-contained). The ctor already
     // ran its env/auto detection; we only override it when the caller explicitly
-    // passed at least one of noBlocks / noSelfContained, so the default path
-    // (neither param) is byte-identical to today. The override re-runs the SAME
-    // eligibility logic, so it can never force an unsafe (unservable) mode.
+    // passed at least one of noBlocks / noSelfContained / noPackedFull, so the
+    // default path (no params) is byte-identical to today. Toggles the caller
+    // did NOT pass keep their MDB_GNN_NO_* env default (same "1" semantics as
+    // BatchAssembler::init_blocks_) instead of resetting to false, so a partial
+    // per-call override cannot silently cancel an env pin set on the server.
+    // The override re-runs the SAME eligibility logic, so it can never force
+    // an unsafe (unservable) mode.
     if (ctx.arguments.size() == 3) {
         DictOptions block_opts(ctx.get_argument(2));
         auto nb  = block_opts.get_bool("noBlocks");
         auto nsc = block_opts.get_bool("noSelfContained");
         auto npf = block_opts.get_bool("noPackedFull");
         if (nb.has_value() || nsc.has_value() || npf.has_value()) {
-            assembler.set_block_mode_override(nb.value_or(false),
-                                              nsc.value_or(false),
-                                              npf.value_or(false));
+            auto env_on = [](const char* name) {
+                const char* v = std::getenv(name);
+                return v && std::string(v) == "1";
+            };
+            assembler.set_block_mode_override(
+                nb.value_or(env_on("MDB_GNN_NO_BLOCKS")),
+                nsc.value_or(env_on("MDB_GNN_NO_SELF_CONTAINED")),
+                npf.value_or(env_on("MDB_GNN_NO_PACKED_FULL")));
         }
     }
 
@@ -951,8 +973,12 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // Opens ProjectionStorage for the EmbeddingWriter which needs topology
     // access (Phase B: on-the-fly k-hop inference for non-seed nodes) and
     // property write access (Phase C: persist embeddings as tensor properties).
-    // Fanouts and orientation are taken from the SampleCatalog so that
-    // Phase B sampling is consistent with the original offline sampling.
+    // Fanouts are taken from the SampleCatalog so the Phase B sampling depth
+    // matches the original offline sampling. Orientation is NOT persisted in
+    // the SampleCatalog and EmbeddingWriter's Phase B always builds an
+    // UNDIRECTED adjacency cache (Config::orientation is not consulted), so
+    // for samples built with NATURAL or REVERSE orientation the non-seed
+    // inference neighborhoods differ from the training-time neighborhoods.
     // =========================================================================
     uint64_t nodes_written  = 0;
     uint64_t nodes_inferred = 0;
@@ -963,7 +989,6 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         EmbeddingWriter::Config wconfig;
         wconfig.property_name      = write_property;
         wconfig.fanouts            = catalog.fanouts;
-        wconfig.orientation        = EdgeOrientation::UNDIRECTED;
         wconfig.feature_matrix_path = fmat_path;
         if (inference_batch_size > 0) {
             wconfig.batch_size = inference_batch_size;

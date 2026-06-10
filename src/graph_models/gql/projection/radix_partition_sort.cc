@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bitset>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -72,6 +73,30 @@ void close_checked_output(std::ofstream& out, const std::string& path) {
         throw_write_error(path);
     }
 }
+
+#ifdef MDB_GPU_ENABLED
+// mdb::gpu::execute_gpu_radix_sort sorts by the low 32 bits of each field's
+// 56-bit ObjectId counter and drops the 8-bit type prefix, so its output
+// matches the full 64-bit CPU ordering only when every counter fits in
+// 32 bits and each field's type prefix is constant across the partition.
+// Records violating either condition would silently mis-sort on the GPU;
+// callers must route such partitions to the CPU std::sort path instead.
+template<std::size_t N>
+bool gpu_sort_preconditions_hold(const std::vector<Record<N>>& records) {
+    if (records.empty()) return true;
+    constexpr std::uint64_t kCounterMask = 0x00FFFFFFFFFFFFFFULL;
+    for (std::size_t f = 0; f < N; ++f) {
+        const std::uint64_t prefix = records[0][f] >> 56;
+        for (const auto& rec : records) {
+            if ((rec[f] & kCounterMask) > 0xFFFFFFFFULL
+                || (rec[f] >> 56) != prefix) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif  // MDB_GPU_ENABLED
 
 }  // namespace
 
@@ -629,15 +654,15 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
 // (default 500 K, see resource_planner.h:27).
 //
 // Output equivalence note: mdb::gpu::execute_gpu_radix_sort extracts only
-// the lower 32 bits of each ObjectId value (gpu_radix_sort.cu:230, mask
+// the lower 32 bits of each ObjectId value (gpu_radix_sort.cu, mask
 // 0x00FFFFFFFFFFFFFFULL truncated to uint32_t). For B+Tree records this is
-// safe because (a) every record in a given index shares the same top-8-bit
+// safe when (a) every record in a given index shares the same top-8-bit
 // type prefix, so masking it is a no-op for ordering, and (b) the value
-// field fits in 32 bits for any graph with < 4 B objects per type — which
-// includes all current and projected MillenniumDB workloads (papers100M is
-// ~111 M nodes; ogbn-products ~2.5 M). Inputs that violate either
-// precondition would silently sort by truncated keys; the precondition
-// holds for every projection-sort caller today.
+// field fits in 32 bits. gpu_sort_preconditions_hold verifies both before
+// the GPU branch engages; partitions that violate either condition (e.g.
+// counters past 4 B objects, or property values whose type bytes differ
+// across records) take the in-process std::sort path below instead of
+// silently sorting by truncated keys.
 template<std::size_t N>
 void RadixPartitionSort<N>::sort_partition_in_memory(
     std::size_t partition_idx, const std::string& sorted_output_path)
@@ -666,7 +691,15 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
             (gpu_off != nullptr && std::string(gpu_off) == "0") ||
             cpu_only != nullptr;
 
-        if (!radix_gpu_disabled && !buffer.empty()) {
+        bool gpu_eligible = !radix_gpu_disabled && !buffer.empty();
+        if (gpu_eligible && !gpu_sort_preconditions_hold<N>(buffer)) {
+            gpu_eligible = false;
+            std::fprintf(stderr,
+                         "RadixPartitionSort: partition %zu has keys outside "
+                         "the GPU sort's 32-bit range; using CPU sort\n",
+                         partition_idx);
+        }
+        if (gpu_eligible) {
             std::ofstream out = open_checked_output(sorted_output_path);
             std::function<void(const Record<N>&)> emit =
                 [&out, &sorted_output_path](const Record<N>& rec) {

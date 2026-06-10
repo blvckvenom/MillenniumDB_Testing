@@ -5,6 +5,8 @@
 #include <numeric>
 #include <random>
 
+#include "graph_models/object_id.h"
+
 namespace mdb::gnn {
 
 namespace {
@@ -190,8 +192,7 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
             // 15276209936111918080 (= 0xD4 << 56 | 0x2A2EFC0), causing
             // 100% of walks to falsely restart on the out-of-range
             // defensive check.
-            constexpr uint64_t kObjectIdValueMask = 0x00FFFFFFFFFFFFFFULL;
-            const uint64_t next = walk_scratch[picked] & kObjectIdValueMask;
+            const uint64_t next = walk_scratch[picked] & ObjectId::VALUE_MASK;
 
             // Guard against malformed sidecars whose row_idx exceeds
             // the declared num_nodes. Genuine corruption only — the

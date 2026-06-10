@@ -219,12 +219,18 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
 
     uint64_t fwd_bytes = 0;
     uint64_t rev_bytes = 0;
+    // Per-direction outcome surfaced to the client: bytes alone cannot
+    // distinguish "skipped by IndexSet" from "failed" (both report 0).
+    std::string fwd_status = "skipped";
+    std::string rev_status = "skipped";
 
     if (fwd_eligible) {
         try {
             fwd_bytes = build_one_snapshot_post_hoc(
                 storage, TopologySnapshotWriter::Direction::FORWARD);
+            fwd_status = "built";
         } catch (const std::exception& e) {
+            fwd_status = std::string("failed: ") + e.what();
             std::cerr << "gnn_build_topology_snapshot: failed to build "
                          "topology_fwd.csr for projection '"
                       << projection_name << "': " << e.what() << std::endl;
@@ -234,11 +240,24 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
         try {
             rev_bytes = build_one_snapshot_post_hoc(
                 storage, TopologySnapshotWriter::Direction::REVERSE);
+            rev_status = "built";
         } catch (const std::exception& e) {
+            rev_status = std::string("failed: ") + e.what();
             std::cerr << "gnn_build_topology_snapshot: failed to build "
                          "topology_rev.csr for projection '"
                       << projection_name << "': " << e.what() << std::endl;
         }
+    }
+
+    // When every eligible direction failed nothing was materialized — raise
+    // instead of yielding a row a remote client would read as success.
+    const bool any_built = (fwd_eligible && fwd_status == "built")
+                        || (rev_eligible && rev_status == "built");
+    if (!any_built) {
+        throw QueryException(
+            "gnn_build_topology_snapshot: no sidecar could be built for "
+            "projection '" + projection_name + "'. fwd: " + fwd_status
+            + "; rev: " + rev_status);
     }
 
     const auto t_end = std::chrono::steady_clock::now();
@@ -251,6 +270,8 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("projectionName", ctx.create_string(projection_name));
     ctx.yield("fwdBytes",       ctx.create_int(static_cast<int64_t>(fwd_bytes)));
     ctx.yield("revBytes",       ctx.create_int(static_cast<int64_t>(rev_bytes)));
+    ctx.yield("fwdStatus",      ctx.create_string(fwd_status));
+    ctx.yield("revStatus",      ctx.create_string(rev_status));
     ctx.yield("durationMillis", ctx.create_int(duration_ms));
     ctx.yield_row();
 }

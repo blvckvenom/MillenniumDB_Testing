@@ -480,9 +480,17 @@ FeatureMatrix FeatureMatrix::create_streaming(
     }
 
     if (::fsync(fd) < 0) {
+        // Remove the not-known-durable output so this error exit leaves the
+        // same clean state as the writer-exception path above — a later
+        // open() would otherwise happily adopt the file.
+        int fsync_errno = errno;
+        ::close(fd);
+        guard.release();
+        std::error_code ec;
+        fs::remove(path, ec);
         throw std::runtime_error(
             "FeatureMatrix::create_streaming: fsync failed: " +
-            std::string(std::strerror(errno)));
+            std::string(std::strerror(fsync_errno)));
     }
 
     // Best-effort parent directory fsync for crash consistency
@@ -618,9 +626,16 @@ FeatureMatrix FeatureMatrix::create_parallel(
     }
 
     if (::fsync(fd) < 0) {
+        // Mirror the worker-error path: remove the not-known-durable output
+        // before throwing so all error exits leave the same clean state.
+        int fsync_errno = errno;
+        ::close(fd);
+        guard.release();
+        std::error_code ec;
+        fs::remove(path, ec);
         throw std::runtime_error(
             "FeatureMatrix::create_parallel: fsync failed: " +
-            std::string(std::strerror(errno)));
+            std::string(std::strerror(fsync_errno)));
     }
 
     {
@@ -734,7 +749,30 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
             "create_reordered_external_sort: bucket_rows exceeds uint32_t");
     }
 
-    auto temp_dir = output_path.parent_path() / ".reorder_tmp";
+    // Scratch dir name is derived from the output file plus the pid:
+    // multiple reorder builds (different feature names, or two sessions
+    // against the same server) share the same parent gnn_features dir, so
+    // a fixed ".reorder_tmp" would let one build remove_all the other's
+    // live bucket files mid-pass. Stale leftovers from crashed runs of
+    // THIS output are swept by prefix; other outputs' scratch dirs may be
+    // live and are left alone.
+    const std::string scratch_prefix = output_path.filename().string() + ".reorder_tmp.";
+    {
+        std::error_code ec;
+        fs::directory_iterator it(output_path.parent_path(), ec);
+        fs::directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.size() > scratch_prefix.size()
+                && name.compare(0, scratch_prefix.size(), scratch_prefix) == 0)
+            {
+                std::error_code rm_ec;
+                fs::remove_all(it->path(), rm_ec);
+            }
+        }
+    }
+    auto temp_dir = output_path.parent_path()
+                  / (scratch_prefix + std::to_string(::getpid()));
     fs::remove_all(temp_dir);
     fs::create_directories(temp_dir);
 
@@ -746,9 +784,12 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
 
     // --- Pass 1: split ---
     // For each src in [0, N), write (out_local: u32, row_data) to its
-    // bucket file. Per-bucket 1 MB buffer to amortise small writes.
+    // bucket file. Per-bucket 1 MB buffer to amortise small writes; grown
+    // to hold at least one entry when a single row exceeds 1 MB (mirrors
+    // the bucket_bytes >= rb clamp above — the flush check only empties
+    // the buffer, it cannot make a too-large entry fit).
     const size_t entry_size = sizeof(uint32_t) + rb;
-    const size_t per_bucket_buf = 1ULL * 1024 * 1024;
+    const size_t per_bucket_buf = std::max<size_t>(1ULL * 1024 * 1024, entry_size);
 
     struct Bucket {
         int fd;
@@ -874,7 +915,9 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
         for (auto& bk : buckets) {
             if (bk.used > 0) write_all(bk.fd, bk.buf.data(), bk.used);
             if (::fsync(bk.fd) < 0) {
-                // Non-fatal — temp files; just log
+                // Non-fatal — temp files only live until Pass 2 consumes them
+                std::cerr << "[create_reordered/ext] warning: bucket fsync failed: "
+                          << std::strerror(errno) << "\n" << std::flush;
             }
             // Fix #22: bucket file is sequential append-only and now fully
             // flushed; clean pages can be evicted before Pass 2 starts
@@ -1118,8 +1161,17 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
               << "s)\n" << std::flush;
 
     if (::fsync(out_fd) < 0) {
+        // Mirror the Pass 1/2 catch blocks: remove the scratch dir and the
+        // not-known-durable output so all error exits leave the same state.
+        int fsync_errno = errno;
+        fs::remove_all(temp_dir);
+        ::close(out_fd);
+        out_guard.release();
+        std::error_code ec;
+        fs::remove(output_path, ec);
         throw std::runtime_error(
-            "create_reordered_external_sort: fsync failed");
+            "create_reordered_external_sort: fsync failed: " +
+            std::string(std::strerror(fsync_errno)));
     }
     {
         int dir_fd = ::open(output_path.parent_path().c_str(), O_RDONLY);
@@ -1457,9 +1509,16 @@ FeatureMatrix FeatureMatrix::create_reordered(
     }
 
     if (::fsync(fd) < 0) {
+        // Mirror the catch block above: remove the not-known-durable output
+        // before throwing so all error exits leave the same clean state.
+        int fsync_errno = errno;
+        ::close(fd);
+        guard.release();
+        std::error_code ec;
+        fs::remove(output_path, ec);
         throw std::runtime_error(
             "FeatureMatrix::create_reordered: fsync failed: " +
-            std::string(std::strerror(errno)));
+            std::string(std::strerror(fsync_errno)));
     }
     {
         int dir_fd = ::open(output_path.parent_path().c_str(), O_RDONLY);

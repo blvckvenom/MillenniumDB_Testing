@@ -56,11 +56,16 @@ struct BlockReader {
         const std::filesystem::path& path, uint64_t expected_store_fp);
 
     // Cheap freshness check: reads ONLY the 64-byte header and returns true iff
-    // magic+version valid AND sample_fp == expected. Does NOT read the body.
+    // the header carries the CURRENT format version (a readable-but-older v1
+    // block is stale and must be re-baked) AND sample_fp == expected. When
+    // expected_store_fp != 0 (a self-contained bake) the block must also be
+    // self-contained with a matching store_fp, so stale-provenance blocks are
+    // rewritten instead of silently kept. Does NOT read the body.
     // For the bake-skip decision; a torn block (header ok, body truncated) is
     // impossible post-crash (atomic fsync+rename) and would still fall back to
     // online at train time via open() returning nullopt.
-    static bool is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp);
+    static bool is_fresh(const std::filesystem::path& path, uint64_t expected_sample_fp,
+                         uint64_t expected_store_fp = 0);
 
     // Header-only read of the store-level fingerprint (catalog.sample_content_fp at bake).
     // Returns 0 on open-fail / short-read / invalid header. Used at train setup to compare

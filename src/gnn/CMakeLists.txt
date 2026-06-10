@@ -61,7 +61,6 @@ endif()
 add_library(mdb_gnn_core STATIC
     # Phase 0: Core LibTorch Foundation
     core/cuda_context.cc
-    core/tensor_utils.cc
     core/memory_pool.cc
     core/sparse_ops.cc
     core/feature_assembler.cc
@@ -284,41 +283,9 @@ if(BUILD_TESTING)
     find_package(GTest QUIET)
 
     if(GTest_FOUND)
-        # test_gnn_core: only build if source files exist (created in later phases)
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_context.cc")
-            add_executable(test_gnn_core
-                # Phase 0: Core tests
-                tests/test_cuda_context.cc
-                tests/test_tensor_utils.cc
-                tests/test_memory_pool.cc
-                tests/test_sparse_ops.cc
-
-                # GNN Tensor Storage tests
-                tests/test_gnn_tensor_store.cc
-
-                # Phase 1: Projection integration tests
-                tests/test_projection_accessors.cc
-
-                # DVM-1: TopologyAccessor correctness verification
-                tests/test_topology_accessor_correctness.cc
-
-                # DVM-2: UNDIRECTED orientation bidirectional traversal
-                tests/test_undirected_orientation.cc
-            )
-
-            target_link_libraries(test_gnn_core
-                mdb_gnn_core
-                GTest::gtest_main
-            )
-
-            # Set RPATH for test executable to find LibTorch at runtime
-            set_target_properties(test_gnn_core PROPERTIES
-                BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
-                INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
-            )
-
-            add_test(NAME GNNCoreTests COMMAND test_gnn_core)
-        endif()
+        # NOTE: cuda_context / memory_pool / sparse_ops have no dedicated unit
+        # tests yet — sparse_ops (scatter_sum) is covered indirectly via
+        # test_graphsage_model and the E2E gates.
 
         # GNN Storage tests (Step 0: FeatureMatrix + RowMapping)
         # Multiple .cc files → one executable, filtered via --gtest_filter
@@ -777,6 +744,7 @@ if(BUILD_TESTING)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_checkpoint.cc")
             add_executable(test_model_checkpoint
                 tests/test_model_checkpoint.cc
+                tests/test_model_checkpoint_corrupt_meta.cc
             )
             target_link_libraries(test_model_checkpoint
                 GTest::gtest_main

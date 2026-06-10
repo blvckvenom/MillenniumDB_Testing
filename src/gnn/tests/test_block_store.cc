@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <unordered_map>
 #include <vector>
 #include <torch/torch.h>
@@ -265,4 +267,113 @@ TEST(BlockStore, ReadStoreFpHeaderOnly) {
                        /*store_fp=*/0x1234ull);
     EXPECT_EQ(BlockReader::read_store_fp(tmp / "b.blk"), 0x1234ull);
     EXPECT_EQ(BlockReader::read_store_fp(tmp / "does_not_exist.blk"), 0u);  // missing -> 0
+}
+
+// ---------------------------------------------------------------------------
+// Freshness-guard hardening: the bake-skip predicate must reject legacy-format
+// and stale-store_fp blocks so a re-bake rewrites them instead of silently
+// keeping them (which would quietly disable the self-contained train path).
+// ---------------------------------------------------------------------------
+
+// Overwrite n bytes at offset `off` of an existing file (header fields are at
+// fixed offsets: version u32 @4, num_layers u32 @16, num_seeds u64 @48; the
+// first conv-layer count E[0] of a K=1 block sits at 64 + 2*8 = 80).
+static void patch_bytes(const std::filesystem::path& p, std::streamoff off,
+                        const void* data, size_t n) {
+    std::fstream f(p, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(f.is_open());
+    f.seekp(off);
+    f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+    ASSERT_TRUE(f.good());
+}
+
+TEST(BlockStore, IsFreshRejectsLegacyVersionBlock) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_fresh_v1";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {2, 1};                       // K=1 conv layer
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    BlockWriter::write(tmp / "b.blk", /*sample_fp=*/0xABCDull, /*batch_id=*/0, sizes, edges);
+    EXPECT_TRUE(BlockReader::is_fresh(tmp / "b.blk", /*expected=*/0xABCDull));
+    // Downgrade the on-disk header to format v1: still readable (back-compat)...
+    const uint32_t v1 = 1u;
+    patch_bytes(tmp / "b.blk", /*off=version*/4, &v1, sizeof(v1));
+    EXPECT_TRUE(BlockReader::open(tmp / "b.blk", /*expected=*/0xABCDull).has_value());
+    // ...but NOT fresh: a re-bake must rewrite it at the current version.
+    EXPECT_FALSE(BlockReader::is_fresh(tmp / "b.blk", /*expected=*/0xABCDull));
+}
+
+TEST(BlockStore, IsFreshChecksStoreFpForSelfContainedBake) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_fresh_storefp";
+    std::filesystem::create_directories(tmp);
+    std::vector<int64_t> sizes = {2, 1};                       // K=1 conv layer
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    std::vector<uint64_t> seeds = {7, 8};
+    BlockWriter::write(tmp / "sc.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges,
+                       /*store_fp=*/0x1234ull, /*num_unique_nodes=*/9, /*seed_ids=*/seeds,
+                       /*split=*/1);
+    // Store-agnostic caller (expected_store_fp omitted) keeps the old contract.
+    EXPECT_TRUE (BlockReader::is_fresh(tmp / "sc.blk", /*expected=*/0xFEEDull));
+    // A self-contained bake passes the store fingerprint: match -> fresh,
+    // stale -> re-bake.
+    EXPECT_TRUE (BlockReader::is_fresh(tmp / "sc.blk", 0xFEEDull, /*store_fp=*/0x1234ull));
+    EXPECT_FALSE(BlockReader::is_fresh(tmp / "sc.blk", 0xFEEDull, /*store_fp=*/0x9999ull));
+    // A non-self-contained block can never satisfy a self-contained bake.
+    BlockWriter::write(tmp / "legacy.blk", /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges);
+    EXPECT_FALSE(BlockReader::is_fresh(tmp / "legacy.blk", 0xFEEDull, /*store_fp=*/0x1234ull));
+}
+
+// ---------------------------------------------------------------------------
+// Corrupt on-disk counts (bit rot / tampering past the magic+fp checks) must
+// degrade to nullopt — the graceful fall-back-to-online contract — instead of
+// throwing bad_alloc / c10::Error out of the reader.
+// ---------------------------------------------------------------------------
+
+static void write_k1_block(const std::filesystem::path& path) {
+    std::vector<int64_t> sizes = {2, 1};                       // K=1 conv layer
+    std::vector<torch::Tensor> edges = { torch::tensor({{0},{1}}, torch::kInt64) };
+    std::vector<uint64_t> seeds = {5, 6};
+    BlockWriter::write(path, /*sample_fp=*/0xFEEDull, /*batch_id=*/0, sizes, edges,
+                       /*store_fp=*/0xBEEFull, /*num_unique_nodes=*/9, /*seed_ids=*/seeds,
+                       /*split=*/1);
+}
+
+TEST(BlockStore, OpenRejectsNegativeEdgeCount) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_neg_edges";
+    std::filesystem::create_directories(tmp);
+    write_k1_block(tmp / "b.blk");
+    const int64_t neg = -1;
+    patch_bytes(tmp / "b.blk", /*off=E[0]*/80, &neg, sizeof(neg));
+    EXPECT_FALSE(BlockReader::open(tmp / "b.blk", /*expected=*/0xFEEDull).has_value());
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "b.blk", /*expected=*/0xBEEFull).has_value());
+}
+
+TEST(BlockStore, OpenRejectsHugeSeedCount) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_huge_seeds";
+    std::filesystem::create_directories(tmp);
+    write_k1_block(tmp / "b.blk");
+    const uint64_t huge = 0x4000000000000000ull;
+    patch_bytes(tmp / "b.blk", /*off=num_seeds*/48, &huge, sizeof(huge));
+    EXPECT_FALSE(BlockReader::open(tmp / "b.blk", /*expected=*/0xFEEDull).has_value());
+    EXPECT_FALSE(BlockReader::open_self_contained(tmp / "b.blk", /*expected=*/0xBEEFull).has_value());
+}
+
+TEST(BlockStore, OpenRejectsOutOfBoundLayerCount) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_huge_layers";
+    std::filesystem::create_directories(tmp);
+    write_k1_block(tmp / "b.blk");
+    const uint32_t layers = 65u;  // just past the reader's sanity bound
+    patch_bytes(tmp / "b.blk", /*off=num_layers*/16, &layers, sizeof(layers));
+    EXPECT_FALSE(BlockReader::open(tmp / "b.blk", /*expected=*/0xFEEDull).has_value());
+}
+
+TEST(BlockStore, OpenRejectsBodySizeMismatch) {
+    auto tmp = std::filesystem::temp_directory_path() / "blk_size_mismatch";
+    std::filesystem::create_directories(tmp);
+    write_k1_block(tmp / "b.blk");
+    // Inflate E[0] within the int32 bound: the implied body size no longer
+    // matches the file size, so the reader must reject rather than decode
+    // the seed tail as edge bytes.
+    const int64_t inflated = 3;
+    patch_bytes(tmp / "b.blk", /*off=E[0]*/80, &inflated, sizeof(inflated));
+    EXPECT_FALSE(BlockReader::open(tmp / "b.blk", /*expected=*/0xFEEDull).has_value());
 }

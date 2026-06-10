@@ -259,3 +259,59 @@ TEST(GraphSAGEModelTest, EvalModeOutputRequiresNoGrad) {
     EXPECT_EQ(out.dim(), 2);
     EXPECT_TRUE(out.isfinite().all().item<bool>());
 }
+
+// ============================================================================
+// Test 12: get_embeddings enforces the same input invariants as forward
+// ============================================================================
+TEST(GraphSAGEModelTest, GetEmbeddingsValidatesLikeForward) {
+    auto cfg = small_config();  // num_layers = 2
+    GraphSAGEModel model(cfg);
+    model.eval();
+
+    auto x = torch::randn({10, 4});
+
+    // Mismatched edge_indices count
+    std::vector<torch::Tensor> one_edge = {
+        torch::tensor({{2, 3}, {0, 1}}, torch::kInt64),
+    };
+    EXPECT_THROW(model.get_embeddings(x, one_edge, two_layer_active_sizes()),
+                 std::invalid_argument);
+
+    // Wrong active_sizes_per_layer length
+    EXPECT_THROW(model.get_embeddings(x, two_layer_edges(), {3, 10}),
+                 std::invalid_argument);
+
+    // active_sizes_per_layer.back() != x.size(0)
+    EXPECT_THROW(model.get_embeddings(x, two_layer_edges(), {3, 6, 11}),
+                 std::invalid_argument);
+
+    // num_seeds (= active_sizes_per_layer[0]) must be > 0
+    EXPECT_THROW(model.get_embeddings(x, two_layer_edges(), {0, 6, 10}),
+                 std::invalid_argument);
+
+    // Valid inputs still produce hidden-dim embeddings for the seeds
+    auto emb = model.get_embeddings(x, two_layer_edges(), two_layer_active_sizes());
+    EXPECT_EQ(emb.size(0), 3);
+    EXPECT_EQ(emb.size(1), cfg.hidden_dim);
+}
+
+// ============================================================================
+// Test 13: forward == get_embeddings + classifier (shared message passing)
+// ============================================================================
+TEST(GraphSAGEModelTest, ForwardMatchesEmbeddingsPlusClassifier) {
+    auto cfg = small_config();
+    GraphSAGEModel model(cfg);
+    model.eval();  // disable dropout so both passes are deterministic
+
+    torch::NoGradGuard no_grad;
+    auto x      = torch::randn({10, 4});
+    auto edges  = two_layer_edges();
+    auto sizes  = two_layer_active_sizes();
+
+    auto logits = model.forward(x, edges, sizes);
+    auto emb    = model.get_embeddings(x, edges, sizes);
+
+    EXPECT_EQ(emb.size(0), logits.size(0));
+    EXPECT_EQ(emb.size(1), cfg.hidden_dim);
+    EXPECT_EQ(logits.size(1), cfg.num_classes);
+}
