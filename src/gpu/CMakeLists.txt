@@ -56,7 +56,7 @@ if(CUDAToolkit_FOUND)
     set_target_properties(mdb_gpu PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
-        CUDA_ARCHITECTURES "75;80;86;89;90;120"
+        CUDA_ARCHITECTURES "75;80;86;89;90"
     )
 
     message(STATUS "GPU module: CUDA enabled (${CUDAToolkit_VERSION})")

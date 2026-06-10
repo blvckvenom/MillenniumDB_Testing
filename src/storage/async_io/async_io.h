@@ -53,6 +53,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <sys/types.h>
 #include <functional>
 #include <memory>
 #include <vector>
