@@ -196,6 +196,13 @@ target_link_libraries(mdb_gnn_core PUBLIC
     ${TORCH_LIBRARIES}
 )
 
+# millenniumdb <-> mdb_gnn_core form a static-archive cycle (projection code
+# in millenniumdb calls RowMapping/FeatureMatrix; gnn code consumes the GQL
+# projection layer). This is the gnn-side half of the cycle declaration —
+# the millenniumdb side lives in the root CMakeLists. CMake repeats both
+# archives on consumer link lines so single-pass linking resolves the cycle.
+target_link_libraries(mdb_gnn_core PUBLIC millenniumdb)
+
 # LibTorch C++ ABI flag (required for binary compatibility with LibTorch).
 # Note: -foperator-names is no longer needed here — the global -fno-operator-names
 # flag was removed since no code in the project uses alternative tokens as identifiers.

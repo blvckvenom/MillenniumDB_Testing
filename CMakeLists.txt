@@ -237,6 +237,18 @@ endif()
 add_library(millenniumdb STATIC ${SRCS})
 target_link_libraries(millenniumdb PUBLIC mdb_gpu)
 target_compile_definitions(millenniumdb PUBLIC SERD_STATIC)
+# millenniumdb and mdb_gnn_core are mutually dependent static archives:
+# projection code in millenniumdb calls mdb::gnn::RowMapping/FeatureMatrix
+# (feature ingestion), while mdb_gnn_core consumes the GQL projection layer
+# (TopologySnapshotReader, ProjectionStorage). Declaring the cycle makes
+# CMake repeat both archives on consumer link lines, which single-pass
+# linking requires; Release -O3 masked the cycle by dead-stripping the
+# back-references that -O0 Debug objects keep.
+# (The inverse edge, mdb_gnn_core -> millenniumdb, is declared in
+# src/gnn/CMakeLists.txt — CMP0079 requires each half in its own directory.)
+if(ENABLE_GNN)
+    target_link_libraries(millenniumdb PUBLIC mdb_gnn_core)
+endif()
 set(BUILD_TARGETS
     mdb
     mdb_leaf_dump
