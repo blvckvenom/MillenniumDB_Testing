@@ -17,18 +17,21 @@ public:
             Parameter("featureName", ParamType::STRING, true,  "Feature name to create"),
             Parameter("nodeLabel",   ParamType::STRING, true,  "Node label to featurize"),
             Parameter("edgeType",    ParamType::STRING, true,  "Edge type used for structural counts"),
-            Parameter("options",     ParamType::ANY,    false, "Options: {normalize: 'none'|'zscore'}"),
+            Parameter("options",     ParamType::ANY,    false, "Options: {normalize: 'none'|'zscore', appendToFeature: STRING}"),
         };
     }
 
     std::vector<YieldField> yield_fields() const override {
         return {
-            YieldField{"featureName", YieldType::STRING, "Feature name created"},
-            YieldField{"nodeCount",   YieldType::INT,    "Number of feature rows"},
-            YieldField{"featureDim",  YieldType::INT,    "Feature dimension"},
-            YieldField{"fmatPath",    YieldType::STRING, "Path to FeatureMatrix file"},
-            YieldField{"rmapPath",    YieldType::STRING, "Path to RowMapping file"},
-            YieldField{"normalized",  YieldType::BOOL,   "Whether z-score normalization was applied"},
+            YieldField{"featureName",          YieldType::STRING, "Feature name created"},
+            YieldField{"nodeCount",            YieldType::INT,    "Number of feature rows"},
+            YieldField{"featureDim",           YieldType::INT,    "Feature dimension"},
+            YieldField{"baseFeatureDim",       YieldType::INT,    "Base feature dimension when appending, otherwise 0"},
+            YieldField{"structuralFeatureDim", YieldType::INT,    "Structural feature dimension"},
+            YieldField{"fmatPath",             YieldType::STRING, "Path to FeatureMatrix file"},
+            YieldField{"rmapPath",             YieldType::STRING, "Path to RowMapping file"},
+            YieldField{"normalized",           YieldType::BOOL,   "Whether z-score normalization was applied"},
+            YieldField{"appendedToFeature",    YieldType::STRING, "Base feature name when appending, otherwise empty"},
         };
     }
 
