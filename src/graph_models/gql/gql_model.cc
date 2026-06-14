@@ -27,6 +27,7 @@
 #include "query/procedure/builtin/gnn_materialize_batches_procedure.h"
 #include "query/procedure/builtin/gnn_build_feature_store_procedure.h"
 #include "query/procedure/builtin/gnn_create_structural_features_procedure.h"
+#include "query/procedure/builtin/gnn_create_features_from_query_procedure.h"
 #include "query/procedure/builtin/gnn_build_topology_snapshot_procedure.h"
 #include "query/procedure/builtin/gnn_train_procedure.h"
 #include "query/procedure/builtin/gnn_predict_procedure.h"
@@ -81,6 +82,9 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
 
     // Register native structural feature creation procedure (.fmat/.rmap)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnCreateStructuralFeaturesProcedure>());
+
+    // Register native feature creation from GQL query procedure (.fmat/.rmap)
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnCreateFeaturesFromQueryProcedure>());
 
     // Register post-hoc topology-snapshot builder procedure (Spec #4-B T4.9)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnBuildTopologySnapshotProcedure>());
