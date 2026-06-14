@@ -141,6 +141,9 @@ add_library(mdb_gnn_core STATIC
     # Phase 3: Four-Level Feature Store build procedure (L1-L4)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_feature_store_procedure.cc
 
+    # Native structural feature creation procedure (.fmat/.rmap)
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_create_structural_features_procedure.cc
+
     # Spec #4-B T4.9: Post-hoc topology snapshot build procedure
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.cc
 
