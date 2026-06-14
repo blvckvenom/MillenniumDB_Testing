@@ -16,18 +16,21 @@ public:
         return {
             Parameter("featureName", ParamType::STRING, true,  "Feature name to create"),
             Parameter("query",       ParamType::STRING, true,  "GQL query returning node_id and float features"),
-            Parameter("options",     ParamType::ANY,    false, "Options: {normalize: 'none'|'zscore'}"),
+            Parameter("options",     ParamType::ANY,    false, "Options: {normalize: 'none'|'zscore', appendToFeature: STRING}"),
         };
     }
 
     std::vector<YieldField> yield_fields() const override {
         return {
-            YieldField{"featureName", YieldType::STRING, "Feature name created"},
-            YieldField{"nodeCount",   YieldType::INT,    "Number of feature rows"},
-            YieldField{"featureDim",  YieldType::INT,    "Feature dimension"},
-            YieldField{"fmatPath",    YieldType::STRING, "Path to FeatureMatrix file"},
-            YieldField{"rmapPath",    YieldType::STRING, "Path to RowMapping file"},
-            YieldField{"normalized",  YieldType::BOOL,   "Whether z-score normalization was applied"},
+            YieldField{"featureName",       YieldType::STRING, "Feature name created"},
+            YieldField{"nodeCount",         YieldType::INT,    "Number of feature rows"},
+            YieldField{"featureDim",        YieldType::INT,    "Feature dimension"},
+            YieldField{"baseFeatureDim",    YieldType::INT,    "Base feature dimension when appending, otherwise 0"},
+            YieldField{"queryFeatureDim",   YieldType::INT,    "Query-generated feature dimension"},
+            YieldField{"fmatPath",          YieldType::STRING, "Path to FeatureMatrix file"},
+            YieldField{"rmapPath",          YieldType::STRING, "Path to RowMapping file"},
+            YieldField{"normalized",        YieldType::BOOL,   "Whether z-score normalization was applied to query feature columns"},
+            YieldField{"appendedToFeature", YieldType::STRING, "Base feature name when appending, otherwise empty"},
         };
     }
 
