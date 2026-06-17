@@ -161,6 +161,32 @@ public:
         // is limited by compute-pacing or by the read path itself (handoff
         // 2026-06-05 §3 — vs DiskGNN's isolated cold-load stage ~2.18 GB/s).
         bool        read_only_bench = false;
+
+        // Test-at-best-val protocol (2026-06-16). When true, every time the
+        // validation accuracy strictly improves (is_best), the test split is
+        // ALSO evaluated and the value is captured into
+        // Result::test_accuracy_at_best_val (the test accuracy of the model
+        // weights at the best-validation epoch). This matches the DiskGNN
+        // paper §7.1 reporting protocol ("test accuracy at the epoch with the
+        // best validation accuracy"), as opposed to the test-at-final-epoch
+        // number that gnn_train reports by default. ADDITIVE: the final-epoch
+        // testAccuracy yield is unchanged, so existing bit-identical gates
+        // (e.g. cora 0.8574939) are preserved. Default false to keep clean
+        // benchmark timing (each improving epoch pays one extra test-split
+        // eval pass); enable per-run via the trackTestAtBestVal procedure
+        // parameter. See docs/research/2026-06-16-accuracy-target/.
+        bool        track_test_at_best_val = false;
+
+        // Learning-rate schedule (2026-06-16). "" = constant lr (default,
+        // canonical). "cosine" = cosine annealing from learning_rate down to ~0
+        // over [start_epoch, start_epoch+epochs): at relative epoch t of T total,
+        // lr(t) = learning_rate * 0.5 * (1 + cos(pi * t / T)). Set on all Adam
+        // param groups at the top of each epoch. Accuracy lever for the
+        // late-epoch generalization gap (constant lr plateaus ~ep34 then val
+        // drifts down). Opt-in via the lrSchedule procedure parameter; default
+        // "" preserves the canonical constant-lr trajectory and bit-identical
+        // gates.
+        std::string lr_schedule = "";
     };
 
     // =========================================================================
@@ -211,6 +237,17 @@ public:
         bool                 addr_tables_used_ever    = false;
         double               addr_table_load_us_mean  = 0.0;
         uint64_t             addr_table_load_us_count = 0;
+
+        // Test-at-best-val protocol (2026-06-16). Populated only when
+        // Config::track_test_at_best_val is true; otherwise stays at -1.0.
+        // test_accuracy_at_best_val is the test-split accuracy of the model
+        // weights at the epoch where validation accuracy last strictly
+        // improved (the "best-val" epoch), i.e. the DiskGNN paper §7.1
+        // reporting protocol. best_val_epoch is the 0-indexed absolute epoch
+        // that produced best_val_accuracy. These are distinct from the
+        // procedure's end-of-train testAccuracy (test at the FINAL epoch).
+        double               test_accuracy_at_best_val = -1.0;
+        uint64_t             best_val_epoch            = 0;
     };
 
     // =========================================================================

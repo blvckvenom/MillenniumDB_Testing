@@ -93,6 +93,88 @@ TEST(ResourcePlannerTest, Record2Uses24BytesPerRecord) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 4.1 — GPU dataset safety ceiling gate
+// ---------------------------------------------------------------------------
+// enforce_gpu_dataset_ceiling downgrades GPU_FULL / GPU_CHUNKED to a CPU
+// strategy when the in-memory record vector would exceed the 2 GB ceiling.
+// This protects the legacy CLASSIC monolithic path (which can hand the GPU a
+// 38.7 GB host vector and OOM); the RADIX per-partition path is always far
+// under the ceiling, so a downgrade there never fires in practice.
+
+TEST(GpuDatasetCeiling, LargeGpuFullDowngradesToCpuParallel) {
+    SortPlan plan;
+    plan.strategy = SortStrategy::GPU_FULL;
+
+    SystemResources res;
+    res.has_tbb = true;
+
+    // 2 GB / sizeof(Record<3>=24B) = 89.5 M records is the boundary; pick a
+    // count well above it so total bytes exceed 2 GB.
+    const uint64_t total_records = 200ull * 1000 * 1000;  // 200 M × 24 B = 4.47 GB
+    enforce_gpu_dataset_ceiling<3>(plan, total_records, res);
+    EXPECT_EQ(plan.strategy, SortStrategy::CPU_PARALLEL);
+}
+
+TEST(GpuDatasetCeiling, LargeGpuChunkedDowngradesToCpuSequentialNoTbb) {
+    SortPlan plan;
+    plan.strategy = SortStrategy::GPU_CHUNKED;
+
+    SystemResources res;
+    res.has_tbb = false;  // no TBB → must fall to CPU_SEQUENTIAL
+
+    const uint64_t total_records = 200ull * 1000 * 1000;
+    enforce_gpu_dataset_ceiling<3>(plan, total_records, res);
+    EXPECT_EQ(plan.strategy, SortStrategy::CPU_SEQUENTIAL);
+}
+
+TEST(GpuDatasetCeiling, SmallGpuFullIsPreserved) {
+    SortPlan plan;
+    plan.strategy = SortStrategy::GPU_FULL;
+
+    SystemResources res;
+    res.has_tbb = true;
+
+    // 1 M records × 24 B = 24 MB ≪ 2 GB → GPU strategy preserved.
+    enforce_gpu_dataset_ceiling<3>(plan, 1ull * 1000 * 1000, res);
+    EXPECT_EQ(plan.strategy, SortStrategy::GPU_FULL);
+}
+
+TEST(GpuDatasetCeiling, CpuStrategiesUntouched) {
+    SystemResources res;
+    res.has_tbb = true;
+
+    // A huge record count on an already-CPU plan must be a no-op (gate only
+    // downgrades GPU strategies).
+    SortPlan p1;
+    p1.strategy = SortStrategy::CPU_PARALLEL;
+    enforce_gpu_dataset_ceiling<3>(p1, 200ull * 1000 * 1000, res);
+    EXPECT_EQ(p1.strategy, SortStrategy::CPU_PARALLEL);
+
+    SortPlan p2;
+    p2.strategy = SortStrategy::EXTERNAL_SORT;
+    enforce_gpu_dataset_ceiling<3>(p2, 200ull * 1000 * 1000, res);
+    EXPECT_EQ(p2.strategy, SortStrategy::EXTERNAL_SORT);
+}
+
+TEST(GpuDatasetCeiling, BoundaryRecordWidthRespected) {
+    SystemResources res;
+    res.has_tbb = true;
+
+    // Record<1> = 8 B. 2 GB / 8 = 268.4 M records is the boundary. 270 M
+    // records × 8 B = 2.01 GB > 2 GB → downgrade.
+    SortPlan over;
+    over.strategy = SortStrategy::GPU_FULL;
+    enforce_gpu_dataset_ceiling<1>(over, 270ull * 1000 * 1000, res);
+    EXPECT_EQ(over.strategy, SortStrategy::CPU_PARALLEL);
+
+    // 200 M records × 8 B = 1.6 GB < 2 GB → preserved.
+    SortPlan under;
+    under.strategy = SortStrategy::GPU_FULL;
+    enforce_gpu_dataset_ceiling<1>(under, 200ull * 1000 * 1000, res);
+    EXPECT_EQ(under.strategy, SortStrategy::GPU_FULL);
+}
+
+// ---------------------------------------------------------------------------
 // sort_and_stream tests
 // ---------------------------------------------------------------------------
 

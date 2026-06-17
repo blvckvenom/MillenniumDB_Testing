@@ -28,6 +28,7 @@
 
 #include <gtest/gtest.h>
 
+#include "gpu/gpu_device.h"
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
 #include "graph_models/gql/projection/radix_partition_sort.h"
@@ -587,6 +588,223 @@ TEST(RadixPartitionSortGpu, DeterministicRepeatedRuns) {
     ASSERT_EQ(a.size(), b.size());
     EXPECT_EQ(a, b) << "RADIX GPU-eligible path is non-deterministic";
     unsetenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS");
+}
+
+// ---------------------------------------------------------------------------
+// Task 4.2 — per-partition GPU/CPU sort telemetry
+// ---------------------------------------------------------------------------
+// gpu_partitions_sorted() + cpu_partitions_sorted() must equal the number of
+// NON-EMPTY partitions Phase 2 sorted. The split between gpu/cpu depends on
+// whether a CUDA device is available, MDB_FORCE_CPU_SORT / MDB_PROJECTION_RADIX_GPU
+// are set, and whether each partition reaches the planner's min_records_gpu
+// threshold (lowered here via MDB_PROJECTION_RADIX_GPU_MIN_RECORDS so small
+// synthetic partitions can engage the GPU path).
+namespace {
+
+// Build a RADIX sort over ObjectId-shaped data (constant 8-bit type prefix +
+// 32-bit value, so GPU preconditions hold) and return the (gpu, cpu, nonempty)
+// telemetry triple. `gpu_on` toggles MDB_PROJECTION_RADIX_GPU.
+struct RadixTelemetry {
+    std::size_t gpu;
+    std::size_t cpu;
+    std::size_t nonempty_partitions;
+};
+
+RadixTelemetry run_radix_telemetry(const char* label, bool gpu_on,
+                                   bool force_cpu_sort) {
+    constexpr uint64_t kTypePrefix = 0x4200000000000000ULL;
+    auto make_oid = [&](uint64_t v) { return kTypePrefix | (v & 0xFFFFFFFFULL); };
+
+    const std::string scratch =
+        std::string(kScratchBase) + "_tele_" + label;
+    const std::string output_base =
+        std::string("/tmp/radix_tele_output_") + label;
+    fs::remove_all(scratch);
+    fs::create_directories(scratch);
+    fs::remove(output_base + ".leaf");
+    fs::remove(output_base + ".dir");
+
+    if (gpu_on) {
+        unsetenv("MDB_PROJECTION_RADIX_GPU");
+    } else {
+        setenv("MDB_PROJECTION_RADIX_GPU", "0", 1);
+    }
+    if (force_cpu_sort) {
+        setenv("MDB_FORCE_CPU_SORT", "1", 1);
+    } else {
+        unsetenv("MDB_FORCE_CPU_SORT");
+    }
+    setenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS", "1000", 1);
+
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir    = scratch;
+    cfg.min_partitions = 8;
+    cfg.max_partitions = 8;
+    cfg.keep_sorted_parts = true;  // inspect per-partition non-emptiness
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input(scratch + "/input");
+    std::mt19937_64 rng(0x5A1AD);  // fixed seed → deterministic input
+    for (int i = 0; i < 60000; i++) {
+        Record<3> r{{ make_oid(rng()), make_oid(rng()), make_oid(rng()) }};
+        input.push_back(r);
+    }
+    rps.scan_and_partition(input, 60000);
+    rps.sort_and_write(output_base);
+
+    // Count non-empty partition input files.
+    std::size_t nonempty = 0;
+    for (std::size_t p = 0; p < 8; ++p) {
+        std::string path = output_base + ".sorted_part_" + std::to_string(p) + ".bin";
+        if (fs::exists(path) && fs::file_size(path) > 0) ++nonempty;
+        fs::remove(path);
+    }
+    fs::remove(output_base + ".leaf");
+    fs::remove(output_base + ".dir");
+
+    RadixTelemetry t;
+    t.gpu = rps.gpu_partitions_sorted();
+    t.cpu = rps.cpu_partitions_sorted();
+    t.nonempty_partitions = nonempty;
+
+    unsetenv("MDB_PROJECTION_RADIX_GPU");
+    unsetenv("MDB_FORCE_CPU_SORT");
+    unsetenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS");
+    return t;
+}
+
+}  // namespace
+
+TEST(RadixPartitionSortTelemetry, GpuPlusCpuEqualsNonEmptyPartitions) {
+    auto t = run_radix_telemetry("sum", /*gpu_on=*/true, /*force_cpu_sort=*/false);
+    EXPECT_GT(t.nonempty_partitions, 0u);
+    EXPECT_EQ(t.gpu + t.cpu, t.nonempty_partitions)
+        << "gpu(" << t.gpu << ") + cpu(" << t.cpu << ") must equal "
+        << "non-empty partitions (" << t.nonempty_partitions << ")";
+}
+
+TEST(RadixPartitionSortTelemetry, GpuPositiveWhenDeviceAvailable) {
+    const bool has_gpu = mdb::gpu::detect_resources().has_gpu;
+    auto t = run_radix_telemetry("gpu_on", /*gpu_on=*/true, /*force_cpu_sort=*/false);
+    if (has_gpu) {
+        EXPECT_GT(t.gpu, 0u)
+            << "with a CUDA device and GPU path enabled, at least one "
+               "partition (each ~7500 records ≥ min_records_gpu=1000) must "
+               "sort on the GPU";
+    } else {
+        EXPECT_EQ(t.gpu, 0u) << "no CUDA device → everything routes CPU";
+    }
+}
+
+TEST(RadixPartitionSortTelemetry, ForceCpuSortGivesZeroGpu) {
+    auto t = run_radix_telemetry("force_cpu", /*gpu_on=*/true,
+                                 /*force_cpu_sort=*/true);
+    EXPECT_EQ(t.gpu, 0u)
+        << "MDB_FORCE_CPU_SORT=1 must disable the GPU per-partition path";
+    EXPECT_EQ(t.cpu, t.nonempty_partitions);
+}
+
+TEST(RadixPartitionSortTelemetry, RadixGpuDisabledGivesZeroGpu) {
+    auto t = run_radix_telemetry("gpu_off", /*gpu_on=*/false,
+                                 /*force_cpu_sort=*/false);
+    EXPECT_EQ(t.gpu, 0u)
+        << "MDB_PROJECTION_RADIX_GPU=0 must disable the GPU per-partition path";
+    EXPECT_EQ(t.cpu, t.nonempty_partitions);
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.1 — GPU-submission concurrency semaphore bound
+// ---------------------------------------------------------------------------
+// At most kGpuConcurrency Phase 2 workers may be inside the GPU-submission
+// region at once (env MDB_PROJECTION_RADIX_GPU_CONCURRENCY, default 1). The
+// gpu_peak_in_flight() seam records the running maximum; we drive a RADIX
+// sort with MANY GPU-eligible partitions across MANY workers and assert the
+// observed peak never exceeds the configured bound.
+//
+// The GPU-half of the assertion (peak > 0 proving the region was actually
+// entered concurrently) is gated on a CUDA device being present — on a host
+// without a GPU every partition routes to CPU, gpu_peak stays 0, which
+// trivially satisfies `<= k` and still exercises the build/link path. On a
+// non-CUDA build the #ifdef'd GPU region is elided entirely, same outcome.
+namespace {
+
+// Run a RADIX sort tuned for concurrent GPU submission: many partitions, each
+// well above min_records_gpu, with enough workers (override) that several can
+// contend on the semaphore. Returns the observed gpu_peak_in_flight().
+int run_radix_gpu_peak(const char* label, int concurrency, int num_workers) {
+    constexpr uint64_t kTypePrefix = 0x4200000000000000ULL;
+    auto make_oid = [&](uint64_t v) { return kTypePrefix | (v & 0xFFFFFFFFULL); };
+
+    const std::string scratch = std::string(kScratchBase) + "_peak_" + label;
+    const std::string output_base = std::string("/tmp/radix_peak_output_") + label;
+    fs::remove_all(scratch);
+    fs::create_directories(scratch);
+    fs::remove(output_base + ".leaf");
+    fs::remove(output_base + ".dir");
+
+    unsetenv("MDB_PROJECTION_RADIX_GPU");          // GPU path enabled
+    unsetenv("MDB_FORCE_CPU_SORT");
+    setenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS", "1000", 1);
+    setenv("MDB_PROJECTION_RADIX_GPU_CONCURRENCY",
+           std::to_string(concurrency).c_str(), 1);
+
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir    = scratch;
+    cfg.min_partitions = 16;       // many partitions to dispatch concurrently
+    cfg.max_partitions = 16;
+    cfg.num_workers    = num_workers;  // force multi-worker Phase 2 dispatch
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input(scratch + "/input");
+    std::mt19937_64 rng(0x9EE71E);  // fixed seed → deterministic input
+    // ~200 K records across 16 partitions ⇒ ~12.5 K/partition ≥ min_records.
+    for (int i = 0; i < 200000; i++) {
+        Record<3> r{{ make_oid(rng()), make_oid(rng()), make_oid(rng()) }};
+        input.push_back(r);
+    }
+    rps.scan_and_partition(input, 200000);
+    rps.sort_and_write(output_base);
+
+    int peak = rps.gpu_peak_in_flight();
+
+    fs::remove(output_base + ".leaf");
+    fs::remove(output_base + ".dir");
+    fs::remove_all(scratch);
+    unsetenv("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS");
+    unsetenv("MDB_PROJECTION_RADIX_GPU_CONCURRENCY");
+    return peak;
+}
+
+}  // namespace
+
+TEST(RadixPartitionSortGpuConcurrency, PeakInFlightBoundedByOne) {
+    const bool has_gpu = mdb::gpu::detect_resources().has_gpu;
+    const int peak = run_radix_gpu_peak("c1", /*concurrency=*/1, /*workers=*/8);
+    EXPECT_LE(peak, 1)
+        << "MDB_PROJECTION_RADIX_GPU_CONCURRENCY=1 must bound concurrent GPU "
+           "submissions to 1, but observed peak=" << peak;
+    if (has_gpu) {
+        EXPECT_GE(peak, 1)
+            << "with a CUDA device the GPU-submission region must be entered "
+               "at least once (each partition ≈12.5 K ≥ min_records_gpu)";
+    } else {
+        EXPECT_EQ(peak, 0) << "no CUDA device → GPU region never entered";
+    }
+}
+
+TEST(RadixPartitionSortGpuConcurrency, PeakInFlightBoundedByTwo) {
+    const bool has_gpu = mdb::gpu::detect_resources().has_gpu;
+    const int peak = run_radix_gpu_peak("c2", /*concurrency=*/2, /*workers=*/8);
+    EXPECT_LE(peak, 2)
+        << "MDB_PROJECTION_RADIX_GPU_CONCURRENCY=2 must bound concurrent GPU "
+           "submissions to 2, but observed peak=" << peak;
+    if (has_gpu) {
+        EXPECT_GE(peak, 1)
+            << "with a CUDA device the GPU-submission region must be entered "
+               "at least once";
+    } else {
+        EXPECT_EQ(peak, 0) << "no CUDA device → GPU region never entered";
+    }
 }
 
 // --- T5.11b Test: empty index under DELTA_VARINT emits a single v2 page ---

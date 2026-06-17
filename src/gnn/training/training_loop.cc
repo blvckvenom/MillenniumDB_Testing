@@ -87,6 +87,13 @@ TrainingLoop::Result TrainingLoop::train()
     double   best_val_acc     = config_.start_best_val;
     uint64_t patience_counter = config_.start_patience;
 
+    // Test-at-best-val protocol (2026-06-16): captured each time validation
+    // strictly improves, when config_.track_test_at_best_val is on. Stays at
+    // its sentinel (-1.0 / start_epoch) when the flag is off so the procedure
+    // can tell "not tracked" from a genuine 0.0 test accuracy.
+    double   best_val_test_acc   = -1.0;
+    uint64_t best_val_epoch_seen = config_.start_epoch;
+
     // Spec B2 (2026-04-27): seed prev_disk before the loop so the first
     // epoch's delta == bytes accrued during epoch 0 (not since process start).
     // When provider is unset, prev/cur/delta stay zero and the conditional
@@ -172,6 +179,25 @@ TrainingLoop::Result TrainingLoop::train()
          ++epoch)
     {
         auto epoch_start = std::chrono::steady_clock::now();
+
+        // Cosine LR schedule (2026-06-16): set the Adam lr for this epoch BEFORE
+        // any forward/backward. Default ("") leaves the optimizer's lr untouched
+        // (constant, canonical). "cosine" anneals learning_rate -> ~0 over the
+        // run: lr(t) = learning_rate * 0.5 * (1 + cos(pi * t/T)).
+        if (config_.lr_schedule == "cosine") {
+            const double pi   = 3.14159265358979323846;
+            const double T    = static_cast<double>(config_.epochs > 0 ? config_.epochs : 1);
+            const double t    = static_cast<double>(epoch - config_.start_epoch);
+            const double frac = (t < T) ? (t / T) : 1.0;
+            const double new_lr = config_.learning_rate * 0.5 * (1.0 + std::cos(pi * frac));
+            for (auto& group : optimizer_.param_groups()) {
+                static_cast<torch::optim::AdamOptions&>(group.options()).lr(new_lr);
+            }
+            std::cout << "[TrainingLoop] lr_schedule=cosine epoch=" << (epoch + 1)
+                      << "/" << config_.epochs << "  lr="
+                      << std::scientific << std::setprecision(4) << new_lr
+                      << std::fixed << std::endl;
+        }
 
         // === Training phase ===
         model_.train();
@@ -517,8 +543,24 @@ TrainingLoop::Result TrainingLoop::train()
         if (is_best) {
             best_val_acc = val_accuracy;
             patience_counter = 0;
+            best_val_epoch_seen = epoch;
             // Checkpoint persistence is delegated to the on_epoch_end callback
             // (see AutoCheckpointer in Phase 3).
+
+            // Test-at-best-val protocol (2026-06-16): evaluate the test split
+            // on the current (best-val) weights so the procedure can report
+            // the paper §7.1 number (test@best-val) alongside the
+            // test@final-epoch number. Skipped under read_only_bench (no
+            // compute) and when there are no test batches.
+            if (config_.track_test_at_best_val && !config_.read_only_bench
+                && catalog_.test_batches > 0) {
+                best_val_test_acc = evaluate(
+                    train_batches + val_batches, catalog_.test_batches);
+                std::cout << "[TrainingLoop]   test@best_val(epoch "
+                          << (epoch + 1) << ")="
+                          << std::fixed << std::setprecision(4)
+                          << best_val_test_acc << std::endl;
+            }
         } else {
             ++patience_counter;
         }
@@ -577,6 +619,8 @@ TrainingLoop::Result TrainingLoop::train()
             ++epoch;  // account for this epoch before break
             result.ran_epochs = epoch - config_.start_epoch;
             result.best_val_accuracy = best_val_acc;
+            result.test_accuracy_at_best_val = best_val_test_acc;
+            result.best_val_epoch = best_val_epoch_seen;
 
             auto wall_end = std::chrono::steady_clock::now();
             result.train_seconds = std::chrono::duration<double>(
@@ -601,6 +645,8 @@ TrainingLoop::Result TrainingLoop::train()
                 result.converged  = true;
                 result.ran_epochs = (epoch - config_.start_epoch) + 1;
                 result.best_val_accuracy = best_val_acc;
+                result.test_accuracy_at_best_val = best_val_test_acc;
+                result.best_val_epoch = best_val_epoch_seen;
 
                 auto wall_end = std::chrono::steady_clock::now();
                 result.train_seconds = std::chrono::duration<double>(
@@ -619,6 +665,8 @@ TrainingLoop::Result TrainingLoop::train()
 
     result.ran_epochs        = config_.epochs;
     result.best_val_accuracy = best_val_acc;
+    result.test_accuracy_at_best_val = best_val_test_acc;
+    result.best_val_epoch = best_val_epoch_seen;
 
     auto wall_end = std::chrono::steady_clock::now();
     result.train_seconds = std::chrono::duration<double>(

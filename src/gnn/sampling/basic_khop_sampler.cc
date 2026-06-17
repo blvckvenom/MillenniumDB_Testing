@@ -345,6 +345,28 @@ struct BasicKHopSampler::Impl {
         Neighbors all_neighbors =
             topology->get_neighbors(node_id, config.orientation);
 
+        // ---- Self-loop ablation (env MDB_GNN_SAMPLE_SELF_LOOP=1, default OFF).
+        //
+        // GAP_REOPEN_2026-06-16: DiskGNN's papers100M graph prep does
+        // dgl.add_self_loop (load_graph.py:24), so the node itself is one of
+        // the (deg+1) candidates and is sampled w.p. ~min(1, fanout/(deg+1)) —
+        // its features then enter the neighbor-MEAN. MDB normally excludes self
+        // from the neighbor set (self handled separately by SAGEConv's
+        // CONCAT(x_self, mean(N))). This flag injects the self as a candidate
+        // BEFORE the empty-check + Fisher-Yates, faithfully emulating
+        // add_self_loop (self competes for the fanout slots, and even a
+        // degree-0 node gets a self-loop). Default OFF keeps cora bit-identical;
+        // ON is the accuracy-gap ablation (re-sample + rebuild store + train).
+        static const bool kSampleSelfLoop = [] {
+            const char* e = std::getenv("MDB_GNN_SAMPLE_SELF_LOOP");
+            return e != nullptr && std::string(e) != "0" &&
+                   std::string(e) != "false" && std::string(e) != "off";
+        }();
+        if (kSampleSelfLoop) {
+            all_neighbors.node_ids.push_back(node_id);
+            all_neighbors.edge_ids.push_back(node_id);  // self-edge sentinel
+        }
+
         std::vector<std::pair<ObjectId, ObjectId>> result;
 
         if (all_neighbors.node_ids.empty()) {

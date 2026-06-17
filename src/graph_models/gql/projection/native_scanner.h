@@ -167,6 +167,56 @@ public:
     );
 
     /**
+     * @brief Partitioned variant: scans each id sub-range IN its own TBB
+     *        worker WITHOUT the single-consumer funnel.
+     *
+     * Unlike scan_label_edge_with_endpoints (which preserves a
+     * single-threaded callback contract by draining per-partition queues on
+     * the main thread), this method invokes @p per_edge_cb directly inside
+     * the worker thread that scanned the partition. The callback therefore
+     * runs CONCURRENTLY across partitions and MUST be thread-safe with
+     * respect to itself; the canonical usage is for each worker to write
+     * only to its own partition's slot in a pre-sized
+     * `std::vector<std::vector<T>>` (one slot per partition index, no
+     * cross-partition sharing → no synchronization needed).
+     *
+     * Within a single partition the callback is invoked in B+Tree key order
+     * (ascending edge_id). Concatenating the per-partition outputs in
+     * ASCENDING partition index reproduces the exact global key order that
+     * the sequential scan_label_edge_with_endpoints emits — this is the
+     * invariant the builder-level PARALLEL scan mode relies on to feed the
+     * sorter byte-identical input.
+     *
+     * @p per_edge_cb signature: void(std::size_t partition_idx,
+     *                                ObjectId edge_id,
+     *                                ObjectId from_node, ObjectId to_node).
+     * partition_idx is in [0, returned_partition_count).
+     *
+     * The requested @p num_partitions is clamped exactly the same way as
+     * scan_label_edge_with_endpoints (the MDB_PROJECTION_EDGE_SCAN_PARTITIONS
+     * tuning knob applies); the effective partition count is returned. When
+     * TBB is unavailable or the effective count is 1, the scan runs
+     * sequentially on the calling thread (partition_idx always 0).
+     *
+     * Exceptions raised inside @p per_edge_cb (or by a worker's B+Tree
+     * reads) are captured under a mutex (first wins), the remaining workers
+     * are asked to wind down, and the first exception is rethrown on the
+     * calling thread after the parallel_for completes — never out of a
+     * worker thread (which would call std::terminate()).
+     *
+     * @param type_id ObjectId of the edge type
+     * @param num_partitions Requested partition count (0 = auto-resolve via
+     *        the MDB_PROJECTION_EDGE_SCAN_PARTITIONS knob).
+     * @param per_edge_cb Concurrent per-edge callback (see above).
+     * @return Effective number of partitions used.
+     */
+    std::size_t scan_label_edge_endpoints_partitioned(
+        ObjectId type_id,
+        std::size_t num_partitions,
+        const std::function<void(std::size_t, ObjectId, ObjectId, ObjectId)>& per_edge_cb
+    );
+
+    /**
      * @brief Counts edges with the given type without full enumeration.
      *
      * Uses B+Tree range scan to count edges efficiently.

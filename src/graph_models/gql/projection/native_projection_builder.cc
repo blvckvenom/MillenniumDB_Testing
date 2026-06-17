@@ -11,6 +11,7 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -52,12 +53,21 @@ using namespace GQL;
 // deterministically.
 // ============================================================================
 namespace {
-NativeProjectionBuilder::ScanMode init_scan_mode() {
-    const char* env = std::getenv("MDB_PROJECTION_SERIAL_SCAN");
-    if (env == nullptr) return NativeProjectionBuilder::ScanMode::CLASSIC;
+bool truthy_env_(const char* env) {
+    if (env == nullptr) return false;
     std::string v(env);
-    if (v == "1" || v == "true" || v == "yes") {
+    return v == "1" || v == "true" || v == "yes";
+}
+
+NativeProjectionBuilder::ScanMode init_scan_mode() {
+    // SERIALIZED is the more invasive pipeline and wins when both env vars
+    // are set. PARALLEL gates on its OWN separate env var so it never
+    // collides with the scanner's MDB_PROJECTION_PARALLEL_EDGE_SCAN knob.
+    if (truthy_env_(std::getenv("MDB_PROJECTION_SERIAL_SCAN"))) {
         return NativeProjectionBuilder::ScanMode::SERIALIZED;
+    }
+    if (truthy_env_(std::getenv("MDB_PROJECTION_PARALLEL_SCAN"))) {
+        return NativeProjectionBuilder::ScanMode::PARALLEL;
     }
     return NativeProjectionBuilder::ScanMode::CLASSIC;
 }
@@ -546,7 +556,36 @@ void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>
         scan_inputs_captured_ = true;
         return;
     }
+    if (get_scan_mode() == ScanMode::PARALLEL && all_single_no_aggprop_(types)) {
+        // Builder-level parallel edge scan: has_node + orientation in TBB
+        // workers, order-sensitive tail single-threaded in ascending merge.
+        // Only safe for SINGLE-no-aggprop, no-edge-property projections;
+        // anything else falls through to the byte-identical classic path.
+        scan_edges_impl_parallel_(types);
+        return;
+    }
     scan_edges_impl_classic_(types);
+}
+
+bool NativeProjectionBuilder::all_single_no_aggprop_(
+    const std::vector<std::string>& types) const
+{
+    // The parallel path replays only the windowed SINGLE detector + edge_batch
+    // + add_edge_label in its single-threaded merge. Any edge-property config
+    // would pull in the non-thread-safe property-write tail
+    // (extract_edge_properties / register_edge_key), so require it empty.
+    if (!edge_property_keys.empty() || !edge_prop_configs.empty()) {
+        return false;
+    }
+    for (const auto& type : types) {
+        if (get_aggregation_for_type(type) != Aggregation::SINGLE) {
+            return false;
+        }
+        if (!get_aggregation_property_for_type(type).empty()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void NativeProjectionBuilder::scan_nodes_impl_classic_(const std::vector<std::string>& labels) {
@@ -669,11 +708,71 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
     // This reduces peak memory from O(total_edges) to O(edges_per_type).
     // Memory savings: ~4 GB for large graphs (vs holding all detectors until end).
 
+    // ---- Edge-scan profiling (env MDB_PROJECTION_EDGE_SCAN_PROFILE=1).
+    //
+    // Isolates the SERIAL consumer cost from the PARALLEL B+Tree walk. The
+    // scanner (scan_label_edge_with_endpoints) walks + resolves endpoints in
+    // TBB workers, but invokes THIS callback single-threaded on the consumer
+    // thread, so consumer_ns_acc measures the funnel wall-time and
+    // detector_ns_acc the windowed-dedup share of it. If consumer_ns_acc
+    // approaches the edge-scan wall, the scan is consumer-bound (a serial-tail
+    // lever pays off); if it is a small fraction, the parallel walk dominates
+    // and a serial-tail lever cannot help. Zero overhead when the flag is off
+    // (a single predictable branch per edge).
+    const bool edge_scan_profile =
+        truthy_env_(std::getenv("MDB_PROJECTION_EDGE_SCAN_PROFILE"));
+    // ---- Serial-tail lever (env MDB_PROJECTION_SKIP_WINDOWED_DEDUP=1).
+    //
+    // For SINGLE aggregation with no aggregation property, the windowed
+    // ParallelEdgeDetector is a REDUNDANT early-drop: the authoritative dedup
+    // is the std::unique() during bulk index build (projection_storage.cc:981),
+    // a pure function of the edge multiset. Skipping process_edge here removes
+    // the largest serial-consumer cost while keeping the final sorted leaves
+    // identical (std::unique collapses any true duplicate the window would have
+    // dropped). The only semantic change is that a true duplicate no longer
+    // raises the SINGLE QueryException — it is silently deduped like COUNT-of-1,
+    // which is acceptable for GNN-equivalence projections (papers100M/cora_gnn
+    // have no duplicate (from,to,type) edges, so behavior is unchanged and the
+    // cora bit-identical gate holds). Default OFF; only engaged for the A/B.
+    const bool edge_scan_skip_dedup =
+        truthy_env_(std::getenv("MDB_PROJECTION_SKIP_WINDOWED_DEDUP"));
+    uint64_t consumer_ns_acc = 0;
+    uint64_t detector_ns_acc = 0;
+    uint64_t has_node_ns_acc = 0;
+    uint64_t consumer_calls = 0;
+    struct EdgeScanProfileGuard {
+        uint64_t& acc;
+        bool on;
+        std::chrono::steady_clock::time_point t;
+        EdgeScanProfileGuard(uint64_t& a, bool o) : acc(a), on(o) {
+            if (on) t = std::chrono::steady_clock::now();
+        }
+        ~EdgeScanProfileGuard() {
+            if (on) {
+                acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - t)
+                           .count();
+            }
+        }
+    };
+    const auto edge_scan_wall_t0 = std::chrono::steady_clock::now();
+
     for (const auto& type : types) {
         // Get per-type configuration (falls back to global defaults)
         Orientation type_orientation = get_orientation_for_type(type);
         Aggregation type_aggregation = get_aggregation_for_type(type);
         std::string type_agg_property = get_aggregation_property_for_type(type);
+
+        // Serial-tail lever: only SINGLE-no-aggprop can rely on sort-time
+        // std::unique for dedup; COUNT/SUM/MIN/MAX need the detector's
+        // accumulation, so never skip for those.
+        const bool skip_windowed_dedup = edge_scan_skip_dedup &&
+            (type_aggregation == Aggregation::SINGLE) && type_agg_property.empty();
+        if (skip_windowed_dedup) {
+            std::cout << "[Builder] SINGLE-no-aggprop '" << type
+                      << "': skipping windowed detector "
+                         "(authoritative dedup at sort-time std::unique)" << std::endl;
+        }
 
         // Get type_id from pre-built map
         ObjectId type_id = type_id_map[type];
@@ -685,11 +784,22 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
         scanner->scan_label_edge_with_endpoints(
             type_id,
             [this, &detector, type_id, type_orientation,
-             type_aggregation, &type_agg_property]
+             type_aggregation, &type_agg_property, skip_windowed_dedup,
+             edge_scan_profile, &consumer_ns_acc, &detector_ns_acc,
+             &has_node_ns_acc, &consumer_calls]
             (ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
+            EdgeScanProfileGuard _consumer_guard(consumer_ns_acc, edge_scan_profile);
+            if (edge_scan_profile) ++consumer_calls;
             // Filter: only include if both endpoints are in projection
+            std::chrono::steady_clock::time_point _hn_t0;
+            if (edge_scan_profile) _hn_t0 = std::chrono::steady_clock::now();
             bool has_from = storage->has_node(from_node);
             bool has_to = storage->has_node(to_node);
+            if (edge_scan_profile) {
+                has_node_ns_acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - _hn_t0)
+                                       .count();
+            }
 
             if (!has_from || !has_to) {
                 return; // Skip edge - endpoints not in projection
@@ -706,13 +816,26 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
             // For SINGLE mode: throws exception on duplicate
             // For MIN/MAX/SUM: aggregates based on property_value
             // For COUNT: just counts (property_value ignored)
-            bool is_first_occurrence = detector->process_edge(
-                from_node.id,
-                to_node.id,
-                type_id.id,
-                edge_id,
-                property_value
-            );
+            std::chrono::steady_clock::time_point _det_t0;
+            if (edge_scan_profile) _det_t0 = std::chrono::steady_clock::now();
+            bool is_first_occurrence;
+            if (skip_windowed_dedup) {
+                // Lever ON: rely on the bulk-build std::unique() for dedup.
+                is_first_occurrence = true;
+            } else {
+                is_first_occurrence = detector->process_edge(
+                    from_node.id,
+                    to_node.id,
+                    type_id.id,
+                    edge_id,
+                    property_value
+                );
+            }
+            if (edge_scan_profile) {
+                detector_ns_acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - _det_t0)
+                                       .count();
+            }
 
             if (!is_first_occurrence) {
                 return;  // Skip duplicate edge (aggregated)
@@ -843,6 +966,171 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
     // Flush any remaining edges
     if (!edge_batch.empty()) {
         flush_edges();
+    }
+
+    if (edge_scan_profile) {
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - edge_scan_wall_t0).count();
+        const double consumer_ms = static_cast<double>(consumer_ns_acc) / 1e6;
+        const double detector_ms = static_cast<double>(detector_ns_acc) / 1e6;
+        const double has_node_ms = static_cast<double>(has_node_ns_acc) / 1e6;
+        // emit = the order-independent record-emission tail (orientation +
+        // add_edge_label + flush_edges -> storage->add_edge to the streaming
+        // buffers). Derived: consumer minus the two measured regions. Includes
+        // a little per-edge timer overhead, so it is a slight over-estimate.
+        const double emit_ms = consumer_ms - detector_ms - has_node_ms;
+        const double consumer_pct = wall_ms > 0 ? 100.0 * consumer_ms / wall_ms : 0.0;
+        const double detector_pct =
+            consumer_ms > 0 ? 100.0 * detector_ms / consumer_ms : 0.0;
+        const double has_node_pct =
+            consumer_ms > 0 ? 100.0 * has_node_ms / consumer_ms : 0.0;
+        const double emit_pct = consumer_ms > 0 ? 100.0 * emit_ms / consumer_ms : 0.0;
+        std::cout << "[EDGE_SCAN_PROFILE]"
+                  << " edges_to_consumer=" << consumer_calls
+                  << " edge_scan_wall_ms=" << static_cast<uint64_t>(wall_ms)
+                  << " serial_consumer_ms=" << static_cast<uint64_t>(consumer_ms)
+                  << " (" << consumer_pct << "% of wall)"
+                  << " has_node_ms=" << static_cast<uint64_t>(has_node_ms)
+                  << " (" << has_node_pct << "% of consumer)"
+                  << " windowed_detector_ms=" << static_cast<uint64_t>(detector_ms)
+                  << " (" << detector_pct << "% of consumer)"
+                  << " emit_ms=" << static_cast<uint64_t>(emit_ms)
+                  << " (" << emit_pct << "% of consumer)"
+                  << std::endl;
+        std::cout << "[EDGE_SCAN_PROFILE] interpretation:"
+                  << " consumer>=~80% of wall => consumer-bound (serial-tail lever helps);"
+                  << " consumer<<wall => parallel-walk-bound (serial-tail lever cannot help)"
+                  << std::endl;
+    }
+
+    if (benchmark_timers_.enabled) {
+        benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - bench_t0).count();
+    }
+}
+
+void NativeProjectionBuilder::scan_edges_impl_parallel_(const std::vector<std::string>& types) {
+    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
+                                               : std::chrono::high_resolution_clock::time_point{};
+
+    std::cout << "[Builder] Using PARALLEL edge scan (has_node + orientation "
+                 "in TBB workers; mutex-guarded parallel emit, detector dropped)" << std::endl;
+
+    // Prelude mirrors scan_edges_impl_classic_'s type validation + Bloom
+    // filter sizing. (No streaming-aggregation branch: PARALLEL is gated on
+    // all-SINGLE via all_single_no_aggprop_, so the COUNT streaming path is
+    // never reachable here.)
+    std::unordered_map<std::string, ObjectId> type_id_map;
+    uint64_t estimated_edge_count = 0;
+    for (const auto& type : types) {
+        validate_type_exists(type);
+        auto it = gql_model.catalog.edge_labels2id.find(type);
+        if (it == gql_model.catalog.edge_labels2id.end()) {
+            throw std::runtime_error("Type '" + type + "' not found in catalog");
+        }
+        ObjectId type_id(it->second | ObjectId::MASK_EDGE_LABEL);
+        type_id_map[type] = type_id;
+        estimated_edge_count += scanner->count_edges_by_type(type_id);
+    }
+    if (estimated_edge_count > 0) {
+        storage->resize_bloom_filter(estimated_edge_count);
+    }
+
+    // ---- Parallel emit (bounded-memory, OOM-free). FACTUAL basis: the
+    // papers100M edge-scan profile (2026-06-16, MDB_PROJECTION_EDGE_SCAN_PROFILE)
+    // shows the serial consumer is 98% of the edge-scan wall, and within it
+    // has_node is ~72%, record-emission ~22%, the windowed detector ~6%. So the
+    // win is to run has_node + orientation IN the TBB workers (parallel; the
+    // has_node read is a const lock-free binary search over the finalized
+    // collected_nodes_) and serialize only the emit under one mutex.
+    //
+    // The windowed ParallelEdgeDetector is DROPPED here: this path is gated on
+    // all_single_no_aggprop_(), and for SINGLE-no-aggprop the authoritative dedup
+    // is the sort-time std::unique() in build_one_index — a pure function of the
+    // edge MULTISET. So emit order is irrelevant (workers race for the mutex in
+    // nondeterministic order, but the final sorted+deduped leaves are identical
+    // to the classic path), and NO ordered merge is needed — hence NO
+    // per-partition buffering, hence the 64 GB-on-papers100M OOM is gone (memory
+    // is bounded by edge_batch / BATCH_SIZE). The only behavior dropped vs the
+    // classic detector is the SINGLE duplicate-edge QueryException, which never
+    // fires on the no-duplicate GNN graphs this path targets (papers100M/cora).
+    // cora bit-identical (0.8574939) gates this. Opt-in via
+    // MDB_PROJECTION_PARALLEL_SCAN (ScanMode::PARALLEL); the default classic path
+    // is unchanged.
+    const bool edge_scan_profile_par =
+        truthy_env_(std::getenv("MDB_PROJECTION_EDGE_SCAN_PROFILE"));
+    const auto par_wall_t0 = std::chrono::steady_clock::now();
+    uint64_t emitted_count = 0;
+    std::mutex emit_mutex;
+
+    for (const auto& type : types) {
+        Orientation type_orientation = get_orientation_for_type(type);
+        ObjectId type_id = type_id_map[type];
+
+        scanner->scan_label_edge_endpoints_partitioned(
+            type_id,
+            /*num_partitions=*/0,  // auto-resolve via env knob; clamped <= 64
+            [&](std::size_t /*part_idx*/, ObjectId edge_id,
+                ObjectId from_node, ObjectId to_node) {
+                // has_node + orientation run IN the worker (parallel, lock-free).
+                if (!storage->has_node(from_node) || !storage->has_node(to_node)) {
+                    return;  // endpoint(s) not in projection — drop
+                }
+                ProjectedEdge edge;
+                switch (type_orientation) {
+                    case Orientation::NATURAL: {
+                        edge.from_node = from_node;
+                        edge.to_node = to_node;
+                        edge.edge_id = edge_id;
+                        uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
+                        edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
+                        break;
+                    }
+                    case Orientation::REVERSE: {
+                        edge.from_node = to_node;   // Swap endpoints
+                        edge.to_node = from_node;   // Swap endpoints
+                        edge.edge_id = edge_id;
+                        uint64_t edge_type = edge_id.id & ObjectId::SUB_TYPE_MASK;
+                        edge.is_directed = (edge_type != ObjectId::MASK_UNDIRECTED_EDGE);
+                        break;
+                    }
+                    case Orientation::UNDIRECTED: {
+                        if (from_node.id <= to_node.id) {
+                            edge.from_node = from_node;
+                            edge.to_node = to_node;
+                        } else {
+                            edge.from_node = to_node;
+                            edge.to_node = from_node;
+                        }
+                        edge.edge_id = edge_id;
+                        edge.is_directed = false;
+                        break;
+                    }
+                }
+                // Emit critical section: ALL shared-state mutation (edge_batch +
+                // storage streaming buffers via flush_edges/add_edge_label) is
+                // serialized here. has_node + orientation above ran in parallel.
+                std::lock_guard<std::mutex> lk(emit_mutex);
+                ++emitted_count;
+                edge_batch.push_back(edge);
+                storage->add_edge_label(edge.edge_id, type_id);
+                if (edge_batch.size() >= BATCH_SIZE) {
+                    flush_edges();
+                }
+            });
+    }
+
+    if (!edge_batch.empty()) {
+        flush_edges();
+    }
+
+    if (edge_scan_profile_par) {
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - par_wall_t0).count();
+        std::cout << "[EDGE_SCAN_PROFILE] edges_to_consumer=" << emitted_count
+                  << " edge_scan_wall_ms=" << static_cast<uint64_t>(wall_ms)
+                  << " (PARALLEL mutex-emit: has_node+orient in TBB workers, emit serialized)"
+                  << std::endl;
     }
 
     if (benchmark_timers_.enabled) {
@@ -1089,8 +1377,18 @@ void NativeProjectionBuilder::flush_nodes() {
 }
 
 void NativeProjectionBuilder::flush_edges() {
+    // Edge deduplication is handled upstream by ParallelEdgeDetector::process_edge
+    // (the windowed (from, to, type) pass in scan_edges_impl_classic_) and by the
+    // exact record dedup at index-build time. The ProjectionStorage edge Bloom
+    // filter keys on (from, to, EDGE_ID); because every projected edge carries a
+    // distinct edge_id it can NEVER match a true duplicate, so its only effect is
+    // the probabilistic false positive — which SILENTLY DROPS a legitimate unique
+    // edge (and the build-time std::unique() cannot recover an edge that was never
+    // inserted). At the configured ~1% terminal FPR the loss is invisible on small
+    // graphs but compounds to ~0.17% (2.69M dropped edges, 78k fully-isolated
+    // nodes) on papers100M-scale builds. Skip it, matching the streaming path.
     for (const auto& edge : edge_batch) {
-        storage->add_edge(edge);
+        storage->add_edge(edge, /*skip_bloom_check=*/true);
     }
     edge_batch.clear();
 }

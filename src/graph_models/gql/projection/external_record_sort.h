@@ -27,6 +27,37 @@
  *   - For 100M records at 256 MB buffer: R ≈ 20 runs, peak ≈ 320 MB
  * - I/O: ~3 passes over data (collection, sort, merge)
  *
+ * ## Memory model — what `MDB_SORT_BUFFER_MB` bounds (Task 3.2)
+ *
+ * `buffer_size_` is the single memory knob, sourced from `MDB_SORT_BUFFER_MB`
+ * (or the adaptive `MemAvailable * 3/4`, floored at 256 MB) via
+ * `compute_adaptive_sort_buffer_result`. It bounds, BY CONSTRUCTION, each
+ * distinct resident buffer used by the external sort:
+ *
+ *   (a) Per-run sort buffer — `sort_run_files` reads at most
+ *       `max_records_in_buffer = buffer_size_ / RECORD_SIZE` records of one run
+ *       into memory at a time (a run larger than this throws rather than
+ *       silently over-allocating).
+ *   (b) K-way merge blocks — `merge_runs` allocates
+ *       `block_records = (buffer_size_ / RECORD_SIZE) / (num_runs + 1)` per run,
+ *       so the sum of all merge blocks is ≤ `buffer_size_`.
+ *   (c) In-memory remainder — `add_memory_records()` may receive a vector of
+ *       ANY size. `stream_external` does NOT hold it fully resident: an
+ *       oversized `memory_records_` is sorted-and-flushed in `≤ buffer_size_`
+ *       chunks into additional run files (see `flush_memory_records_bounded_`),
+ *       so the resident tail never exceeds one buffer. (The production
+ *       `run_classic` driver only ever hands a ≤ 64 MB `STREAMING_BUFFER_THRESHOLD`
+ *       remainder, well under the 256 MB floor, so it already took the single-
+ *       chunk fast path before this guard existed — the guard makes the API
+ *       contract robust to any direct caller, not just the disciplined one.)
+ *
+ * Orthogonally, the Phase-1 run-sort fan-out is bounded by a
+ * `tbb::task_arena(hardware_concurrency()/2)` (see the MEMORY BOUND comment in
+ * `sort_run_files`): without it, `std::for_each(par)` over hundreds of runs
+ * keeps one ~run-sized buffer per in-flight task. Putting (a)+(b)+(c) and the
+ * arena together, peak RSS ≈ `buffer_size_ + arena_workers × run_bytes`, both
+ * terms gated by the two knobs — independent of total dataset size.
+ *
  * @see external_edge_sort.h for the EdgeAggregationRecord-specific version
  * @see streaming_record_buffer.h for record collection
  */
@@ -48,6 +79,8 @@
 // Parallel execution for std::sort and std::for_each (requires TBB on GCC/Clang)
 #ifdef HAS_TBB
 #include <execution>
+#include <thread>
+#include <tbb/task_arena.h>
 #endif
 
 #include "graph_models/gql/projection/spill_codec.h"
@@ -177,6 +210,30 @@ public:
     size_t total_records() const { return total_records_; }
 
     /**
+     * @brief Returns the active memory budget (bytes).
+     *
+     * This is the single bound described in the file-header memory model:
+     * the per-run sort buffer (a), the sum of K-way merge blocks (b), and the
+     * resident in-memory remainder (c) are each ≤ this value.
+     */
+    size_t buffer_size() const { return buffer_size_; }
+
+    /**
+     * @brief Bytes currently held resident in heap-owned record buffers.
+     *
+     * Counts the `memory_records_` tail (the only long-lived resident buffer
+     * outside the transient per-run / per-merge-block buffers, which are
+     * already bounded by `buffer_size_` by construction). After
+     * `stream_sorted` drains, `memory_records_` has been flushed in bounded
+     * chunks, so this is 0; before draining it reflects whatever the caller
+     * handed `add_memory_records`. Used by the regression test to assert the
+     * "resident ≤ buffer" invariant holds post-sort.
+     */
+    size_t resident_memory_bytes() const {
+        return memory_records_.size() * RECORD_SIZE;
+    }
+
+    /**
      * @brief Checks if all data fits in memory (no external sort needed).
      */
     bool fits_in_memory() const {
@@ -296,18 +353,13 @@ private:
         std::vector<std::string> sorted_run_files;
         sort_run_files(sorted_run_files);
 
-        // Handle pre-loaded memory records if any
+        // Handle pre-loaded memory records if any. The in-memory remainder is
+        // bounded by `buffer_size_` BY CONSTRUCTION here: if it exceeds one
+        // buffer it is sorted and flushed in `<= buffer_size_` chunks into
+        // additional run files instead of being held fully resident through the
+        // merge (see the file-header memory model, item (c)).
         if (!memory_records_.empty()) {
-#ifdef HAS_TBB
-            std::sort(std::execution::par_unseq, memory_records_.begin(), memory_records_.end());
-#else
-            std::sort(memory_records_.begin(), memory_records_.end());
-#endif
-            std::string mem_run_path = temp_dir_ + "/sorted_run_mem";
-            write_vector_to_file(memory_records_, mem_run_path);
-            sorted_run_files.push_back(mem_run_path);
-            memory_records_.clear();
-            memory_records_.shrink_to_fit();
+            flush_memory_records_bounded_(sorted_run_files);
         }
 
         // Phase 2: K-way merge
@@ -325,6 +377,91 @@ private:
         for (const auto& path : sorted_run_files) {
             std::filesystem::remove(path);
         }
+    }
+
+    /**
+     * @brief Sorts and flushes `memory_records_` into bounded sorted runs.
+     *
+     * The remainder handed to `add_memory_records()` may be larger than one
+     * sort buffer. To keep peak RSS bounded by `buffer_size_` (file-header
+     * memory model item (c)), this:
+     *
+     *   - Fast path (remainder ≤ one buffer): sorts in place and writes a
+     *     SINGLE run named `sorted_run_mem` — byte-identical to the historical
+     *     behavior, so production builds (≤ 64 MB remainder) and the
+     *     golden-compare are unaffected.
+     *   - Bounded path (remainder > one buffer): partitions into
+     *     `≤ max_records_in_buffer`-sized chunks, sorts each in its own buffer,
+     *     and writes them as `sorted_run_mem_0 .. sorted_run_mem_k`. Each chunk
+     *     is moved out of `memory_records_` before sorting, so the resident set
+     *     never exceeds one buffer's worth of records. The merge step then
+     *     folds these in like any other sorted run.
+     *
+     * In both cases `memory_records_` is emptied (and its capacity released)
+     * before returning, so `resident_memory_bytes()` is 0 afterward.
+     */
+    void flush_memory_records_bounded_(std::vector<std::string>& sorted_run_files) {
+        const size_t max_records_in_buffer =
+            buffer_size_ / RECORD_SIZE > 0 ? buffer_size_ / RECORD_SIZE : 1;
+
+        if (memory_records_.size() <= max_records_in_buffer) {
+            // Fast path: single run, byte-identical to the legacy code path.
+#ifdef HAS_TBB
+            std::sort(std::execution::par_unseq,
+                      memory_records_.begin(), memory_records_.end());
+#else
+            std::sort(memory_records_.begin(), memory_records_.end());
+#endif
+            std::string mem_run_path = temp_dir_ + "/sorted_run_mem";
+            write_vector_to_file(memory_records_, mem_run_path);
+            sorted_run_files.push_back(mem_run_path);
+            memory_records_.clear();
+            memory_records_.shrink_to_fit();
+            return;
+        }
+
+        // Bounded path: split the oversized remainder into buffer-sized chunks.
+        // Consume from the BACK so the source vector can release its tail each
+        // iteration (POD Record<N> elements: a trailing resize() drops them and
+        // a periodic shrink_to_fit() returns capacity to the allocator). Chunk
+        // order is irrelevant — each chunk becomes an independent sorted run and
+        // the K-way merge restores global order. Net resident records during the
+        // loop ≈ remaining source tail (shrinking) + one ≤ buffer chunk.
+        std::vector<Record<N>> chunk;
+        chunk.reserve(max_records_in_buffer);
+        size_t chunk_idx = 0;
+        while (!memory_records_.empty()) {
+            const size_t take =
+                std::min(max_records_in_buffer, memory_records_.size());
+            const size_t first = memory_records_.size() - take;
+
+            chunk.assign(
+                std::make_move_iterator(memory_records_.begin() + first),
+                std::make_move_iterator(memory_records_.end()));
+
+            // Release the consumed tail so the source shrinks as we go. resize()
+            // alone keeps capacity; shrink_to_fit() periodically reclaims it
+            // (every chunk would over-reallocate, so we only shrink when the
+            // freed capacity is large relative to what remains).
+            memory_records_.resize(first);
+            if (memory_records_.capacity() > 2 * (first + max_records_in_buffer)) {
+                memory_records_.shrink_to_fit();
+            }
+
+            // Sequential inner sort: each chunk is already ≤ one buffer, and a
+            // nested par_unseq sort would spawn extra transient buffers that
+            // break the single-chunk-resident bound.
+            std::sort(chunk.begin(), chunk.end());
+
+            std::string mem_run_path =
+                temp_dir_ + "/sorted_run_mem_" + std::to_string(chunk_idx++);
+            write_vector_to_file(chunk, mem_run_path);
+            sorted_run_files.push_back(mem_run_path);
+
+            chunk.clear();
+        }
+        memory_records_.clear();
+        memory_records_.shrink_to_fit();
     }
 
     /**
@@ -356,6 +493,19 @@ private:
         std::vector<size_t> indices(run_files_.size());
         std::iota(indices.begin(), indices.end(), 0);
 
+        // MEMORY BOUND (2026-06-15): cap the run-sort fan-out with a task_arena.
+        // Without it, std::for_each(par) over hundreds of spill runs lets TBB keep
+        // one ~run-sized buffer per IN-FLIGHT task and over-subscribes far beyond
+        // the core count, so peak RSS = O(in-flight tasks x run bytes) -- NOT
+        // bounded by buffer_size_/MDB_SORT_BUFFER_MB (which only gates the K-way
+        // merge below). On papers100M (606 x ~64 MB runs) this spiked ~18 GB and
+        // OOM-killed the build on a 30 GB shared host. Bounding the arena to
+        // ~cores/2 caps it to a few hundred MB. Byte-identical: same sort, same
+        // records, same writer -- only concurrency changes.
+        const unsigned hwt_ = std::thread::hardware_concurrency();
+        const int sort_arena_workers = static_cast<int>(hwt_ >= 2 ? hwt_ / 2 : 1);
+        tbb::task_arena sort_arena(sort_arena_workers);
+        sort_arena.execute([&]() {
         std::for_each(std::execution::par, indices.begin(), indices.end(), [&](size_t i) {
             const std::string& input_path = run_files_[i];
             size_t record_count = run_record_counts_[i];
@@ -375,10 +525,13 @@ private:
             buffer.reserve(record_count);
             read_file_to_vector(input_path, record_count, buffer);
 
-            // Sort using parallel algorithm (TBB handles nested parallelism)
-            std::sort(std::execution::par_unseq, buffer.begin(), buffer.end());
+            // Sequential inner sort: the outer task_arena already parallelizes
+            // across runs; a nested par_unseq sort would spawn extra TBB tasks
+            // (and transient buffers) inside each capped worker, breaking the bound.
+            std::sort(buffer.begin(), buffer.end());
 
             write_vector_to_file(buffer, sorted_path);
+        });
         });
 #else
         // Sequential fallback: reuse single buffer across iterations

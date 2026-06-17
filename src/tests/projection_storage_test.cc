@@ -6,7 +6,11 @@
 #include <vector>
 
 #include "graph_models/gql/gql_model.h"
+#include "graph_models/gql/projection/bloom_filter.h"
 #include "graph_models/gql/projection/index_set.h"
+#include "graph_models/gql/projection/leaf_compression.h"
+#include "storage/index/bplus_tree/bpt_mem_import.h"
+#include "storage/index/record.h"
 #include "graph_models/gql/projection/native_scanner.h"
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_manager.h"
@@ -45,6 +49,64 @@ int main() {
         auto& manager = GQL::ProjectionManager::get_instance();
         manager.init("test_db_storage");
         std::cout << " OK" << std::endl;
+
+        // ================================================================
+        // Bloom-filter edge-dedup loss regression (2026-06-15)
+        //
+        // ProjectionStorage::add_edge can dedup edges with a Bloom filter
+        // keyed on (from, to, edge_id). Because edge_id is unique per edge,
+        // the filter never catches a true duplicate — its only effect is the
+        // probabilistic FALSE POSITIVE, which silently DROPS a legitimate
+        // unique edge (and the build-time std::unique() cannot recover an
+        // edge that was never inserted). On papers100M (1.6B edges into a
+        // 1%-FPR filter) this dropped 2,689,259 unique edges and left ~78k
+        // nodes fully isolated. The fix: NativeProjectionBuilder::flush_edges
+        // passes skip_bloom_check=true. These checks guard the mechanism.
+        std::cout << "Test BLOOM-1: Bloom filter false positives near capacity...";
+        {
+            GQL::BloomFilter bf(1000, 0.01);
+            for (uint64_t i = 0; i < 1000; ++i) {
+                bf.add_edge(i, i + 5000000ULL, i + 9000000ULL);  // 1000 distinct, fills to capacity
+            }
+            size_t fp = 0;
+            for (uint64_t i = 50000000ULL; i < 50100000ULL; ++i) {  // 100k distinct, NONE inserted
+                if (bf.probably_contains_edge(i, i + 5000000ULL, i + 9000000ULL)) ++fp;
+            }
+            if (fp == 0) {
+                std::cerr << "\nFAIL Test BLOOM-1: expected >0 false positives at "
+                             "capacity (proves add_edge's Bloom dedup is lossy), got 0"
+                          << std::endl;
+                return 1;
+            }
+            std::cout << " OK (" << fp << " FP / 100k probes)" << std::endl;
+        }
+
+        std::cout << "Test BLOOM-2: add_edge(skip_bloom_check=true) conserves all distinct edges...";
+        {
+            std::string pdir = manager.create_projection("bloom_skip");
+            {
+                GQL::ProjectionStorage storage(pdir, "test_db_storage");
+                storage.init();
+                constexpr uint64_t K = 5000;
+                for (uint64_t i = 0; i < K; ++i) {
+                    GQL::ProjectedEdge edge;
+                    edge.from_node = ObjectId(i + 1);
+                    edge.to_node   = ObjectId(i + 1000001ULL);
+                    edge.edge_id   = ObjectId(i + 2000001ULL);
+                    edge.is_directed = true;
+                    storage.add_edge(edge, /*skip_bloom_check=*/true);
+                }
+                storage.flush();
+                auto ec = storage.get_edge_count();
+                if (ec != K) {
+                    std::cerr << "\nFAIL Test BLOOM-2: expected " << K
+                              << " distinct edges conserved, got " << ec << std::endl;
+                    return 1;
+                }
+                std::cout << " OK (count: " << ec << ")" << std::endl;
+            }
+            manager.drop_projection("bloom_skip");
+        }
 
         // Test 2: Create a projection
         std::cout << "Test 2: Creating projection...";
@@ -1013,6 +1075,179 @@ int main() {
             }
 
             manager.drop_projection("gnnmin");
+        }
+        std::cout << " OK" << std::endl;
+
+        // ================================================================
+        // Leaf redundant-byte compression roundtrip (2026-06-16)
+        //
+        // ProjectionStorage's bulk/streaming index builders had been writing
+        // BTREE+BITSET leaves UNCOMPRESSED (all-zero bitset). GQL::
+        // compute_redundant_bitset + GQL::pack_compressed_page now emit the
+        // redundant-byte layout the reader (BPTLeafV1) already decodes. These
+        // tests drive the REAL BPTLeafWriter::process_block and read the page
+        // back with the reader's exact set_record formula, asserting:
+        //   (a) byte-exact roundtrip of every record,
+        //   (b) the on-disk payload shrinks when bytes are redundant,
+        //   (c) the control case (no shared bytes) yields count()==0 and the
+        //       full uncompressed size, still roundtripping.
+        //
+        // The readback uses the SAME decode arithmetic as BPTLeafV1::set_record
+        // (bplus_tree_leaf.cc:79) so a mismatch here is a layout bug.
+        std::cout << "Test LEAFCOMP: redundant-byte compression roundtrip...";
+        {
+            constexpr std::size_t TN = 3;            // edge index width (src,dst,eid)
+            constexpr std::size_t REC = sizeof(uint64_t) * TN; // 24 bytes
+
+            // Decode a single page's records the way BPTLeafV1 does, directly
+            // from the 4096-byte page buffer. Returns the decoded records.
+            auto decode_page = [&](const char* page,
+                                   std::vector<Record<TN>>& out) {
+                const uint32_t value_count =
+                    *reinterpret_cast<const uint32_t*>(page);
+                const unsigned char* bitset_ptr =
+                    reinterpret_cast<const unsigned char*>(page + 2 * sizeof(uint32_t));
+                // Rebuild the bitset exactly like the reader ctor.
+                std::bitset<REC> rb;
+                std::size_t pos_bitset = 0;
+                for (std::size_t i = 0; i < TN; ++i) {
+                    for (int bit = 0; bit < 8; ++bit) {
+                        rb.set(pos_bitset++, (bitset_ptr[i] >> bit) & 1);
+                    }
+                }
+                const std::size_t redundant_count = rb.count();
+                const unsigned char* redundant_bytes =
+                    bitset_ptr + TN;
+                const unsigned char* records =
+                    bitset_ptr + TN + redundant_count;
+
+                out.clear();
+                for (uint32_t r = 0; r < value_count; ++r) {
+                    Record<TN> rec{};
+                    unsigned char* oc = reinterpret_cast<unsigned char*>(&rec);
+                    const unsigned char* cur =
+                        records + r * (REC - redundant_count);
+                    std::size_t rpos = 0, upos = 0;
+                    for (std::size_t i = 0; i < REC; ++i) {
+                        if (rb[i]) {
+                            oc[i] = redundant_bytes[rpos++];
+                        } else {
+                            oc[i] = cur[upos++];
+                        }
+                    }
+                    out.push_back(rec);
+                }
+            };
+
+            // Write one page via the real writer, read it back, verify.
+            auto write_and_check = [&](const std::vector<Record<TN>>& recs,
+                                       std::size_t expect_min_count,
+                                       const char* label) -> bool {
+                const auto bitset =
+                    GQL::compute_redundant_bitset<TN>(recs.data(),
+                                                      static_cast<uint32_t>(recs.size()));
+                if (bitset.count() < expect_min_count) {
+                    std::cerr << "\nFAIL LEAFCOMP[" << label << "]: bitset.count()="
+                              << bitset.count() << " < expected >= "
+                              << expect_min_count << std::endl;
+                    return false;
+                }
+
+                // Pack + write via the real BPTLeafWriter::process_block.
+                std::vector<char> buf(REC + bitset.count()
+                                      + recs.size() * (REC - bitset.count()) + 16);
+                GQL::pack_compressed_page<TN>(recs.data(),
+                                              static_cast<uint32_t>(recs.size()),
+                                              bitset, buf.data());
+
+                const std::string fn = "test_db_storage/leafcomp_" + std::string(label) + ".leaf";
+                {
+                    BPTLeafWriter<TN> w(fn);
+                    w.process_block(buf.data(),
+                                    static_cast<uint32_t>(recs.size()),
+                                    bitset, 0);
+                } // dtor flushes/closes
+
+                // Read the single 4096-byte page back.
+                std::ifstream in(fn, std::ios::binary);
+                std::vector<char> page(4096);
+                in.read(page.data(), 4096);
+                if (in.gcount() != 4096) {
+                    std::cerr << "\nFAIL LEAFCOMP[" << label
+                              << "]: page read short" << std::endl;
+                    return false;
+                }
+
+                std::vector<Record<TN>> decoded;
+                decode_page(page.data(), decoded);
+                if (decoded.size() != recs.size()) {
+                    std::cerr << "\nFAIL LEAFCOMP[" << label << "]: decoded "
+                              << decoded.size() << " != " << recs.size() << std::endl;
+                    return false;
+                }
+                for (std::size_t r = 0; r < recs.size(); ++r) {
+                    if (decoded[r] != recs[r]) {
+                        std::cerr << "\nFAIL LEAFCOMP[" << label
+                                  << "]: record " << r << " mismatch" << std::endl;
+                        return false;
+                    }
+                }
+                std::filesystem::remove(fn);
+                return true;
+            };
+
+            // Case A: dense IDs sharing constant high bytes (top ~5 bytes are
+            // zero/constant across all records ⇒ many redundant bits).
+            {
+                std::vector<Record<TN>> recs = {
+                    Record<TN>{0x0000001234567ULL, 0x00000022aabbULL, 0x000000300001ULL},
+                    Record<TN>{0x0000001234599ULL, 0x00000022aaccULL, 0x000000300002ULL},
+                    Record<TN>{0x00000012346abULL, 0x00000022aaddULL, 0x000000300003ULL},
+                };
+                // Compute on-disk compressed payload size vs uncompressed.
+                const auto bs = GQL::compute_redundant_bitset<TN>(recs.data(), 3);
+                const std::size_t compressed =
+                    TN + bs.count() + recs.size() * (REC - bs.count());
+                const std::size_t uncompressed = TN + recs.size() * REC;
+                if (compressed >= uncompressed) {
+                    std::cerr << "\nFAIL LEAFCOMP[A]: compressed " << compressed
+                              << " not < uncompressed " << uncompressed << std::endl;
+                    return 1;
+                }
+                if (!write_and_check(recs, /*expect_min_count=*/1, "A")) return 1;
+            }
+
+            // Case B (control): records share NO constant byte position in any
+            // field ⇒ count()==0, full uncompressed size, still roundtrips.
+            {
+                std::vector<Record<TN>> recs = {
+                    Record<TN>{0x0102030405060708ULL, 0x1112131415161718ULL, 0x2122232425262728ULL},
+                    Record<TN>{0xF1F2F3F4F5F6F7F8ULL, 0xE1E2E3E4E5E6E7E8ULL, 0xD1D2D3D4D5D6D7D8ULL},
+                };
+                const auto bs = GQL::compute_redundant_bitset<TN>(recs.data(), 2);
+                if (bs.count() != 0) {
+                    std::cerr << "\nFAIL LEAFCOMP[B]: expected count()==0, got "
+                              << bs.count() << std::endl;
+                    return 1;
+                }
+                if (!write_and_check(recs, /*expect_min_count=*/0, "B")) return 1;
+            }
+
+            // Case C: single-record page (degenerate fully-redundant page —
+            // every byte trivially constant ⇒ all bits set, records section
+            // empty). The reader must reconstruct from redundant_bytes only.
+            {
+                std::vector<Record<TN>> recs = {
+                    Record<TN>{0xdeadbeefULL, 0xcafef00dULL, 0x12345678ULL},
+                };
+                const auto bs = GQL::compute_redundant_bitset<TN>(recs.data(), 1);
+                if (bs.count() != REC) {
+                    std::cerr << "\nFAIL LEAFCOMP[C]: 1-record page expected "
+                              << REC << " set bits, got " << bs.count() << std::endl;
+                    return 1;
+                }
+                if (!write_and_check(recs, /*expect_min_count=*/REC, "C")) return 1;
+            }
         }
         std::cout << " OK" << std::endl;
 

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -23,6 +24,7 @@
 #include <tbb/parallel_for.h>
 #include <tbb/task_arena.h>
 
+#include "graph_models/gql/projection/leaf_compression.h"
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
 #include "misc/available_ram.h"
@@ -140,9 +142,9 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
     constexpr std::size_t max_records_per_leaf =
         (Page::SIZE - 2 * sizeof(uint32_t) - N) / (sizeof(uint64_t) * N);
 
-    // Scratch buffer: one leaf page worth of "bitset + record bytes".
-    constexpr std::size_t max_buffer_size =
-        N + max_records_per_leaf * sizeof(uint64_t) * N;
+    // Scratch buffer: one leaf page. Compression packs more records per page,
+    // so size to the Page::SIZE compressed-payload upper bound.
+    const std::size_t max_buffer_size = Page::SIZE;
     auto leaf_buffer = std::make_unique<char[]>(max_buffer_size);
 
     std::vector<Record<N>> page_records;
@@ -153,7 +155,27 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
     std::size_t unique_count     = 0;
     std::size_t leaf_page_number = 0;
 
+    const bool compress_leaves = !GQL::leaf_compression_disabled();
     std::bitset<N * 8> no_compression;  // all zeros ⇒ no compression applied
+
+    // Running redundant-byte bitset over buffered page records (see the
+    // identical logic in ProjectionStorage::build_index_streaming).
+    std::bitset<N * 8> running_bitset;
+    running_bitset.set();
+    auto page_overflows_with = [&](const Record<N>& candidate) -> bool {
+        std::bitset<N * 8> bs = running_bitset;
+        const unsigned char* first =
+            reinterpret_cast<const unsigned char*>(&page_records[0]);
+        const unsigned char* cand =
+            reinterpret_cast<const unsigned char*>(&candidate);
+        for (std::size_t b = 0; b < N * 8; ++b) {
+            if (bs[b] && cand[b] != first[b]) bs.set(b, false);
+        }
+        const std::size_t rc = bs.count();
+        const std::size_t n  = page_records.size() + 1;
+        return 2 * sizeof(uint32_t) + N + rc
+             + n * (sizeof(uint64_t) * N - rc) > Page::SIZE;
+    };
 
     auto write_leaf_page = [&](bool is_last_page) {
         if (page_records.empty()) return;
@@ -170,21 +192,33 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
                 static_cast<int32_t>(leaf_page_number));
         }
 
-        // Format: [N-byte bitset (zeros)] + [packed record bytes].
-        unsigned long bits_ul = no_compression.to_ulong();
-        std::memcpy(leaf_buffer.get(), &bits_ul, N);
-        std::memcpy(leaf_buffer.get() + N,
-                    reinterpret_cast<const char*>(page_records.data()),
-                    page_records.size() * sizeof(uint64_t) * N);
+        // Format: [N-byte bitset] + [redundant bytes] + [non-redundant
+        // per-record bytes] — the exact layout BPTLeafV1 decodes, identical
+        // to ProjectionStorage::build_index_streaming so the radix/classic/GPU
+        // backends stay byte-identical (golden-compare gate). Default
+        // compresses; MDB_PROJECTION_NO_LEAF_COMPRESSION restores raw bytes.
+        std::bitset<N * 8> page_bitset =
+            compress_leaves
+                ? GQL::compute_redundant_bitset<N>(
+                      page_records.data(),
+                      static_cast<uint32_t>(page_records.size()))
+                : no_compression;
+
+        GQL::pack_compressed_page<N>(
+            page_records.data(),
+            static_cast<uint32_t>(page_records.size()),
+            page_bitset,
+            leaf_buffer.get());
 
         leaf_writer.process_block(
             leaf_buffer.get(),
             static_cast<uint32_t>(page_records.size()),
-            no_compression,
+            page_bitset,
             next_page);
 
         ++leaf_page_number;
         page_records.clear();
+        running_bitset.set();  // fresh page: a single record is all-redundant
     };
 
     // Stream across all partitions in order. Each partition is already sorted,
@@ -211,9 +245,29 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
                 has_prev    = true;
                 ++unique_count;
 
-                page_records.push_back(r);
-                if (page_records.size() >= max_records_per_leaf) {
-                    write_leaf_page(/*is_last_page=*/false);
+                if (compress_leaves) {
+                    if (!page_records.empty() && page_overflows_with(r)) {
+                        write_leaf_page(/*is_last_page=*/false);
+                    }
+                    if (page_records.empty()) {
+                        running_bitset.set();
+                    } else {
+                        const unsigned char* first =
+                            reinterpret_cast<const unsigned char*>(&page_records[0]);
+                        const unsigned char* rec =
+                            reinterpret_cast<const unsigned char*>(&r);
+                        for (std::size_t b = 0; b < N * 8; ++b) {
+                            if (running_bitset[b] && rec[b] != first[b]) {
+                                running_bitset.set(b, false);
+                            }
+                        }
+                    }
+                    page_records.push_back(r);
+                } else {
+                    page_records.push_back(r);
+                    if (page_records.size() >= max_records_per_leaf) {
+                        write_leaf_page(/*is_last_page=*/false);
+                    }
                 }
             }
             if (got < kReadBatch) break;
@@ -436,6 +490,24 @@ RadixPartitionSort<N>::RadixPartitionSort(Config config)
         throw std::invalid_argument("RadixPartitionSort: scratch_dir is required");
     }
     fs::create_directories(config_.scratch_dir);
+
+    // Task 5.1: size the GPU-submission semaphore once, from the environment.
+    // Default 1 (serialize all GPU submits — the single device sorts one
+    // partition at a time while the other workers run CPU sorts in parallel).
+    // Clamp to [1, 8] to keep a bound on contention even on a misconfigured
+    // env value. Read once: the count is fixed for this sort's lifetime.
+    gpu_concurrency_ = 1;
+    if (const char* env = std::getenv("MDB_PROJECTION_RADIX_GPU_CONCURRENCY")) {
+        try {
+            long parsed = std::stol(env);
+            if (parsed < 1) parsed = 1;
+            if (parsed > 8) parsed = 8;
+            gpu_concurrency_ = static_cast<int>(parsed);
+        } catch (...) {
+            gpu_concurrency_ = 1;  // leave default on parse failure
+        }
+    }
+    gpu_semaphore_ = std::make_unique<CountingSemaphore>(gpu_concurrency_);
 }
 
 template<std::size_t N>
@@ -630,6 +702,13 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
         }
     }
 
+    // Task 4.2: one-line summary of where Phase 2 sorted each partition.
+    // Proves the GPU per-partition path actually ran (gpu>0) vs everything
+    // routing to CPU (gpu==0, e.g. partitions below the planner's
+    // min_records_gpu threshold or a non-CUDA build).
+    std::cerr << "[RADIX] partitions sorted: gpu=" << gpu_partitions_.load()
+              << " cpu=" << cpu_partitions_.load() << "\n";
+
     return total_written;
 }
 
@@ -700,6 +779,23 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
                          partition_idx);
         }
         if (gpu_eligible) {
+            // Task 5.1: bound concurrent GPU submissions. Acquire the
+            // semaphore immediately before the GPU-submission region and
+            // release it on every exit/exception path via the RAII guard;
+            // the other Phase 2 workers sort their partitions on the CPU
+            // concurrently (they never reach this block). The in_flight /
+            // peak counters are maintained around the same region so the
+            // unit test can assert the observed peak never exceeds
+            // gpu_concurrency_. Inc/dec straddle the guard so the peak
+            // reflects everyone who held (or is waiting just past) a permit.
+            CountingSemaphoreGuard gpu_guard(*gpu_semaphore_);
+            int now = gpu_in_flight_.fetch_add(1, std::memory_order_relaxed) + 1;
+            bump_gpu_peak_(now);
+            struct InFlightExit {
+                std::atomic<int>& in_flight;
+                ~InFlightExit() { in_flight.fetch_sub(1, std::memory_order_relaxed); }
+            } in_flight_exit{gpu_in_flight_};
+
             std::ofstream out = open_checked_output(sorted_output_path);
             std::function<void(const Record<N>&)> emit =
                 [&out, &sorted_output_path](const Record<N>& rec) {
@@ -724,6 +820,20 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
             std::vector<std::string> empty_spill_files;
             std::vector<std::size_t> empty_spill_counts;
 
+            // Task 4.2: determine whether the GPU will *actually* sort this
+            // partition (vs sort_and_stream internally downgrading to CPU for a
+            // sub-threshold or oversized partition) by replaying the same plan
+            // the wrapper computes. Without this the telemetry would count a
+            // planner CPU-downgrade as a GPU sort and falsely report gpu>0 on
+            // small inputs (e.g. cora partitions below min_records_gpu).
+            auto plan = mdb::gpu::plan_sort(
+                static_cast<std::uint64_t>(buffer.size()), N, resources, pcfg);
+            mdb::gpu::enforce_gpu_dataset_ceiling<N>(
+                plan, static_cast<std::uint64_t>(buffer.size()), resources);
+            const bool gpu_strategy =
+                (plan.strategy == mdb::gpu::SortStrategy::GPU_FULL ||
+                 plan.strategy == mdb::gpu::SortStrategy::GPU_CHUNKED);
+
             const bool used = mdb::gpu::sort_and_stream<N>(
                 buffer, empty_spill_files, empty_spill_counts,
                 static_cast<std::uint64_t>(buffer.size()),
@@ -731,8 +841,13 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
 
             if (used) {
                 // sort_and_stream moved out of `buffer` and either sorted on
-                // GPU or on CPU; either way the records are now in
-                // `sorted_output_path`.
+                // GPU or on CPU (planner downgrade); either way the records are
+                // now in `sorted_output_path`. Tally by the actual strategy.
+                if (gpu_strategy) {
+                    gpu_partitions_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    cpu_partitions_.fetch_add(1, std::memory_order_relaxed);
+                }
                 close_checked_output(out, sorted_output_path);
                 return;
             }
@@ -743,6 +858,12 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
     }
 #endif  // MDB_GPU_ENABLED
 
+    // CPU std::sort fallback path: GPU disabled, build lacks CUDA, partition
+    // preconditions failed, or planner returned EXTERNAL_SORT. Empty
+    // partitions are not counted (telemetry tracks non-empty partitions only).
+    if (!buffer.empty()) {
+        cpu_partitions_.fetch_add(1, std::memory_order_relaxed);
+    }
     std::sort(buffer.begin(), buffer.end());
     std::ofstream out = open_checked_output(sorted_output_path);
     try {
@@ -759,7 +880,9 @@ void RadixPartitionSort<N>::sort_partition_external(
     std::size_t partition_idx, const std::string& sorted_output_path)
 {
     // Defensive path: partition exceeds worker_memory_budget. Chunk-sort
-    // to intermediate "run" files, then K-way merge.
+    // to intermediate "run" files, then K-way merge. Always CPU — too large
+    // for the in-memory GPU buffer path.
+    cpu_partitions_.fetch_add(1, std::memory_order_relaxed);
     std::vector<Record<N>> chunk;
     std::size_t chunk_cap = config_.worker_memory_budget / sizeof(Record<N>) / 2;
     if (chunk_cap == 0) chunk_cap = 1;  // minimum: handle tiny worker_memory_budget in tests

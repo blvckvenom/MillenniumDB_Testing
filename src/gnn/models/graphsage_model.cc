@@ -1,7 +1,12 @@
 #include "gnn/models/graphsage_model.h"
 
+#include <cstdlib>
+#include <cmath>
+#include <iostream>
 #include <stdexcept>
 #include <string>
+
+#include <torch/nn/init.h>
 
 #include "gnn/core/sparse_ops.h"
 
@@ -37,6 +42,34 @@ GraphSAGEModel::GraphSAGEModel(const GraphSAGEConfig& config) : config_(config) 
     classifier_ = register_module(
         "classifier",
         torch::nn::Linear(config.hidden_dim, config.num_classes));
+
+    // Opt-in (MDB_GNN_XAVIER_INIT=1): re-initialize the Linear weights with
+    // Glorot/Xavier-uniform using the ReLU gain (gain = sqrt(2)) for the conv
+    // layers and gain 1 for the linear classifier head, matching DGL's
+    // SAGEConv.reset_parameters. Default (unset) preserves PyTorch's
+    // kaiming_uniform_(a=sqrt(5)) Linear default exactly, so the bit-identical
+    // gates are unaffected. Rationale: docs/research/2026-06-10-thesis-measurements/
+    // WEIGHT_INIT_THEORY.md (the live candidate for the MDB<->DiskGNN ~1pt gap).
+    {
+        const char* xe = std::getenv("MDB_GNN_XAVIER_INIT");
+        const bool xavier = xe && (std::string(xe) == "1" ||
+                                   std::string(xe) == "true" ||
+                                   std::string(xe) == "yes");
+        if (xavier) {
+            torch::NoGradGuard no_grad;
+            const double relu_gain = std::sqrt(2.0);  // He/DGL ReLU gain
+            for (auto& conv : convs_) {
+                torch::nn::init::xavier_uniform_(conv->weight, relu_gain);
+                if (conv->bias.defined()) torch::nn::init::zeros_(conv->bias);
+            }
+            torch::nn::init::xavier_uniform_(classifier_->weight, 1.0);
+            if (classifier_->bias.defined())
+                torch::nn::init::zeros_(classifier_->bias);
+            std::cerr << "[GraphSAGEModel] weight init: xavier_uniform "
+                         "(conv gain=sqrt(2) ReLU, classifier gain=1) "
+                         "[MDB_GNN_XAVIER_INIT]\n";
+        }
+    }
 }
 
 // ============================================================================

@@ -14,12 +14,15 @@
  *   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "graph_models/gql/projection/counting_semaphore.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/record.h"
@@ -105,10 +108,56 @@ public:
         std::size_t worker_memory_budget,
         std::size_t override_value);
 
+    /// Task 4.2 telemetry: how many partitions Phase 2 sorted on the GPU vs
+    /// the CPU. Populated during sort_and_write(); a single summary line is
+    /// also emitted to stderr at the end of that call. On non-CUDA builds (or
+    /// when the GPU path is disabled / planner-downgraded) every partition is
+    /// counted as CPU.
+    std::size_t gpu_partitions_sorted() const { return gpu_partitions_.load(); }
+    std::size_t cpu_partitions_sorted() const { return cpu_partitions_.load(); }
+
+    /// Task 5.1 test seam: the running maximum number of Phase 2 workers that
+    /// were simultaneously inside the GPU-submission region. The GPU
+    /// concurrency semaphore (sized from MDB_PROJECTION_RADIX_GPU_CONCURRENCY,
+    /// default 1) bounds this to kGpuConcurrency; the unit test asserts the
+    /// observed peak never exceeds that bound. On a non-CUDA build (or when
+    /// no GPU is present and every partition routes to CPU) this stays 0.
+    int gpu_peak_in_flight() const { return gpu_peak_in_flight_.load(); }
+
 private:
     Config config_;
     std::size_t num_partitions_ = 0;
     std::vector<std::string> partition_paths_;  // per-partition merged files
+
+    // Task 4.2: per-partition GPU/CPU sort tallies. Atomic because Phase 2
+    // dispatches partitions across a tbb::parallel_for worker pool.
+    std::atomic<std::size_t> gpu_partitions_{0};
+    std::atomic<std::size_t> cpu_partitions_{0};
+
+    // Task 5.1: bound how many Phase 2 workers submit to the single GPU at
+    // once. Sized once in the ctor from MDB_PROJECTION_RADIX_GPU_CONCURRENCY
+    // (default 1, clamped to [1, 8]); the remaining workers sort their
+    // partitions on the CPU concurrently — that overlap is the "CPU and GPU
+    // both busy" win. unique_ptr because CountingSemaphore is non-copyable
+    // and the permit count is only known at construction time.
+    int gpu_concurrency_ = 1;
+    std::unique_ptr<CountingSemaphore> gpu_semaphore_;
+
+    // Test seam: current / peak workers inside the GPU-submission region.
+    // Incremented before acquiring the semaphore's effect is observable and
+    // decremented on region exit; the peak is maintained via a CAS loop.
+    std::atomic<int> gpu_in_flight_{0};
+    std::atomic<int> gpu_peak_in_flight_{0};
+
+    // Update gpu_peak_in_flight_ to max(current, candidate) via CAS.
+    void bump_gpu_peak_(int candidate) {
+        int prev = gpu_peak_in_flight_.load(std::memory_order_relaxed);
+        while (candidate > prev &&
+               !gpu_peak_in_flight_.compare_exchange_weak(
+                   prev, candidate, std::memory_order_relaxed)) {
+            // prev reloaded by compare_exchange_weak; retry.
+        }
+    }
 
     std::uint32_t radix_bucket(const Record<N>& r) const;
     void sort_partition_in_memory(std::size_t partition_idx,

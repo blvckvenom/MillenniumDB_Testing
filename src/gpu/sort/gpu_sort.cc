@@ -225,6 +225,12 @@ bool sort_and_stream(
 #endif
     auto plan = plan_sort(total_records, N, resources, config);
 
+    // Memory-safety gate: downgrade a GPU plan to CPU when the full record
+    // vector exceeds the 2 GB ceiling. Protects the CLASSIC monolithic path
+    // from OOMing the GPU on a multi-GB host vector; a no-op for the RADIX
+    // per-partition path (always well under 2 GB).
+    enforce_gpu_dataset_ceiling<N>(plan, total_records, resources);
+
     // EXTERNAL_SORT: signal caller to use its own external merge-sort
     if (plan.strategy == SortStrategy::EXTERNAL_SORT) {
         return false;

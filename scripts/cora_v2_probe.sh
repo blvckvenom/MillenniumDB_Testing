@@ -53,7 +53,10 @@ if [ "$PACKFULL" = "1" ]; then
   PFR=$(gql "CALL gnn_build_feature_store('s','node_features',{packFullFeatures:true}) YIELD packedFullMb RETURN *"); chk "$PFR" packfull_build
   echo "packed_full build: $(echo "$PFR" | tail -1)" >&2
 fi
-TRAINOPTS="epochs:5,randomSeed:42,dropout:${DROPOUT},patience:999,saveOnBestVal:false,saveFinal:false,prefetchNumWorkers:${WORKERS},prefetchQueueSize:6"
+# lrSchedule:'' pins the CONSTANT-lr path so the 0.8574939 bit-identical invariant holds
+# even though cosine LR decay is the gnn_train DEFAULT since 2026-06-17. The gate tests
+# feature/model determinism, which is orthogonal to the (deterministic) LR schedule.
+TRAINOPTS="epochs:5,randomSeed:42,dropout:${DROPOUT},patience:999,saveOnBestVal:false,saveFinal:false,prefetchNumWorkers:${WORKERS},prefetchQueueSize:6,lrSchedule:''"
 if [ "$PACKFULL" = "1" ]; then
   OUT_ON=$(gql "CALL gnn_train('s','node_features',{${TRAINOPTS}}) YIELD testAccuracy RETURN *"); chk "$OUT_ON" train_packfull_on
   MODE_ON=$(grep -i "feature-load mode" "$DB/server.log" 2>/dev/null | tail -1)

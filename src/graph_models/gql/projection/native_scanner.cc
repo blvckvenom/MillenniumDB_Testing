@@ -15,6 +15,7 @@
 #ifdef HAS_TBB
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 #endif
 
 #include "query/query_context.h"
@@ -803,6 +804,116 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
 #else
     // Unreachable (parallel_enabled forced false above when !HAS_TBB).
     return 0;
+#endif
+}
+
+std::size_t NativeScanner::scan_label_edge_endpoints_partitioned(
+    ObjectId type_id,
+    std::size_t num_partitions,
+    const std::function<void(std::size_t, ObjectId, ObjectId, ObjectId)>& per_edge_cb
+) {
+    const uint64_t search_type_id = type_id.id;
+
+    // Resolve the effective partition count. 0 = auto via the env knob,
+    // otherwise honor the caller's request (clamped to the same [2, 64]
+    // advisory band used everywhere else). A request of 1 (or TBB absent)
+    // collapses to the sequential path.
+    std::size_t k = (num_partitions == 0)
+                        ? resolve_edge_scan_partitions()
+                        : std::clamp<std::size_t>(num_partitions, 1, 64);
+
+#ifndef HAS_TBB
+    k = 1;
+#endif
+
+    // ---- Sequential fallback: single partition on the calling thread.
+    if (k < 2) {
+        auto ranges = build_uniform_subranges(1);
+        scan_label_edge_with_endpoints_subrange_cb(
+            label_edge_index,
+            edge_from_to_index, from_to_edge_index,
+            edge_n1_n2_index,   n1_n2_edge_index,
+            search_type_id,
+            ranges[0].first, ranges[0].second,
+            [&](ObjectId eid, ObjectId fn, ObjectId tn) {
+                per_edge_cb(0, eid, fn, tn);
+                return true;
+            });
+        return 1;
+    }
+
+#ifdef HAS_TBB
+    // TBB worker threads do not inherit the main thread's thread_local
+    // QueryContext (consulted on every BPT leaf decode); propagate it.
+    QueryContext* parent_ctx = QueryContext::_query_ctx;
+
+    auto ranges = build_uniform_subranges(k);
+
+    // First-wins exception capture. An exception escaping a TBB worker would
+    // unwind out of the worker body and call std::terminate(); instead each
+    // worker swallows its own exception, records it under the mutex, and
+    // requests the remaining work to wind down. Rethrown on the main thread
+    // after parallel_for returns.
+    std::atomic<bool> abort_requested{false};
+    std::exception_ptr first_exception;
+    std::mutex exception_mutex;
+
+    auto record_first_exception = [&]() {
+        std::lock_guard<std::mutex> lk(exception_mutex);
+        if (!first_exception) {
+            first_exception = std::current_exception();
+        }
+        abort_requested.store(true, std::memory_order_relaxed);
+    };
+
+    // Bound the worker pool to hardware_concurrency, mirroring the producer's
+    // existing arena discipline elsewhere in the projection build.
+    std::size_t hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    tbb::task_arena arena(static_cast<int>(std::min<std::size_t>(hw, k)));
+
+    arena.execute([&]() {
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, k, 1),
+            [&, parent_ctx](const tbb::blocked_range<std::size_t>& r) {
+                // Inherit the parent's QueryContext (TBB pool threads persist
+                // across queries; overwrite unconditionally).
+                QueryContext::set_query_ctx(parent_ctx);
+                for (std::size_t p = r.begin(); p < r.end(); ++p) {
+                    if (abort_requested.load(std::memory_order_relaxed)) {
+                        continue;
+                    }
+                    try {
+                        scan_label_edge_with_endpoints_subrange_cb(
+                            label_edge_index,
+                            edge_from_to_index, from_to_edge_index,
+                            edge_n1_n2_index,   n1_n2_edge_index,
+                            search_type_id,
+                            ranges[p].first, ranges[p].second,
+                            [&](ObjectId eid, ObjectId fn, ObjectId tn) {
+                                if (abort_requested.load(
+                                        std::memory_order_relaxed)) {
+                                    return false;  // wind down promptly
+                                }
+                                // Invoked IN the worker thread — the callback
+                                // writes only to partition p's private slot,
+                                // so no synchronization is needed.
+                                per_edge_cb(p, eid, fn, tn);
+                                return true;
+                            });
+                    } catch (...) {
+                        record_first_exception();
+                    }
+                }
+            });
+    });
+
+    if (first_exception) {
+        std::rethrow_exception(first_exception);
+    }
+    return k;
+#else
+    return 1;  // Unreachable (k forced to 1 above when !HAS_TBB).
 #endif
 }
 

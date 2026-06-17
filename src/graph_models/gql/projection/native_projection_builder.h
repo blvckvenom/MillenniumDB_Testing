@@ -364,12 +364,25 @@ public:
      *                       pre-Spec-#2 code.
      * SERIALIZED          — new pipeline: one scan pass per target B+Tree,
      *                       each pass emits only to a single-index mask.
+     * PARALLEL            — builder-level parallel edge scan: has_node() +
+     *                       endpoint orientation run inside TBB workers; the
+     *                       order-sensitive tail (ParallelEdgeDetector window,
+     *                       edge_batch push, add_edge_label) replays on the
+     *                       main thread in ascending-partition / key order so
+     *                       the sorter input is byte-identical to CLASSIC.
+     *                       Only engaged when every type is SINGLE-aggregation
+     *                       with no aggregation property and the projection has
+     *                       no edge-property config; otherwise falls back to
+     *                       the CLASSIC edge scan. Node scan is unaffected.
      *
-     * Selected at process start via the MDB_PROJECTION_SERIAL_SCAN env var
-     * ("1" / "true" / "yes" => SERIALIZED, anything else => CLASSIC) and
-     * cached for the process lifetime via get_scan_mode().
+     * CLASSIC / SERIALIZED are selected at process start via the
+     * MDB_PROJECTION_SERIAL_SCAN env var ("1" / "true" / "yes" =>
+     * SERIALIZED). PARALLEL is selected via the SEPARATE
+     * MDB_PROJECTION_PARALLEL_SCAN env var ("1" / "true" / "yes"). When both
+     * are set, SERIALIZED wins (it is the more invasive pipeline). The result
+     * is cached for the process lifetime via get_scan_mode().
      */
-    enum class ScanMode { CLASSIC, SERIALIZED };
+    enum class ScanMode { CLASSIC, SERIALIZED, PARALLEL };
 
     static constexpr size_t BATCH_SIZE = 1000;
 
@@ -576,6 +589,40 @@ private:
     // from the public API when ScanMode == CLASSIC (default).
     void scan_nodes_impl_classic_(const std::vector<std::string>& labels);
     void scan_edges_impl_classic_(const std::vector<std::string>& types);
+
+    /**
+     * @brief Builder-level PARALLEL edge scan (ScanMode::PARALLEL).
+     *
+     * Runs the per-edge has_node() membership filter + endpoint orientation
+     * INSIDE TBB workers (one per id sub-range), accumulating kept
+     * ProjectedEdges into a thread-local per-partition vector. Then, on the
+     * main thread, replays the kept edges in ASCENDING partition / key order
+     * through the EXACT sequential tail the CLASSIC path runs
+     * (ParallelEdgeDetector::process_edge windowed dedup, edge_batch push,
+     * add_edge_label, BATCH_SIZE flush + detector->clear()). This reproduces
+     * the CLASSIC global scan order, hence byte-identical sorter input.
+     *
+     * Precondition: all_single_no_aggprop_(types) is true. The caller
+     * (scan_edges_by_types) gates on it and otherwise dispatches to
+     * scan_edges_impl_classic_. SINGLE-only with no aggregation property and
+     * no edge-property config keeps the parallelized part a pure per-edge
+     * function and avoids the non-thread-safe property/aggregation tails.
+     */
+    void scan_edges_impl_parallel_(const std::vector<std::string>& types);
+
+    /**
+     * @brief Predicate gating ScanMode::PARALLEL eligibility.
+     *
+     * True iff every type in @p types resolves to Aggregation::SINGLE with an
+     * empty aggregation property, AND the projection has no edge-property
+     * configuration (edge_property_keys + edge_prop_configs both empty). Under
+     * those conditions the per-edge work parallelized in
+     * scan_edges_impl_parallel_ (has_node + orientation) is a pure function of
+     * each edge and the order-sensitive tail is limited to the windowed
+     * SINGLE-duplicate detector + edge_batch + add_edge_label, all of which
+     * are replayed single-threaded in the ordered merge.
+     */
+    bool all_single_no_aggprop_(const std::vector<std::string>& types) const;
 
     // Serialized multi-pass scan implementations (Spec #2). Each call
     // emits records ONLY to buffers matching target_mask. Called in a

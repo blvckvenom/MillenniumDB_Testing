@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -175,6 +176,62 @@ constexpr std::size_t kLeafRecordBytes = kLeafRecordArity * sizeof(uint64_t);
 constexpr std::size_t kLeafBitsetBytes = kLeafRecordArity;   // N bytes (N==3)
 constexpr std::size_t kLeafHeaderBytes = 2 * sizeof(uint32_t);
 
+// Per-page redundant-byte view. BPTLeafWriter<3>::process_block may emit
+// COMPRESSED leaves (default since 2026-06-16): bytes that are constant across
+// every record on the page are stored ONCE in a "redundant" section right
+// after the N-byte bitset, and only the non-constant bytes are stored per
+// record. This direct-byte walker must decode that exactly the way BPTLeafV1
+// does (bplus_tree_leaf.cc:79 set_record). When the bitset is all-zero
+// (MDB_PROJECTION_NO_LEAF_COMPRESSION=1 or no redundancy) this degrades to the
+// legacy fixed-stride layout with zero overhead.
+struct LeafPageDecoder {
+    const uint8_t* redundant_bytes; // start of the shared redundant section
+    const uint8_t* records;         // start of the per-record non-redundant data
+    std::size_t    redundant_count; // number of set bits = redundant byte count
+    std::size_t    unique_bytes;    // bytes per record on disk = 24 - redundant_count
+    std::array<uint8_t, kLeafRecordBytes> redundant_bit; // 1 if byte pos is redundant
+    std::array<std::size_t, kLeafRecordBytes> redundant_idx; // pos -> index into redundant section
+
+    explicit LeafPageDecoder(const uint8_t* page) {
+        const uint8_t* bitset_ptr = page + kLeafHeaderBytes;
+        redundant_count = 0;
+        for (std::size_t i = 0; i < kLeafRecordBytes; ++i) {
+            const uint8_t byte_pos_bit =
+                (bitset_ptr[i / 8] >> (i % 8)) & 1u;
+            redundant_bit[i] = byte_pos_bit;
+            if (byte_pos_bit) {
+                redundant_idx[i] = redundant_count;
+                ++redundant_count;
+            } else {
+                redundant_idx[i] = 0;
+            }
+        }
+        unique_bytes    = kLeafRecordBytes - redundant_count;
+        redundant_bytes = bitset_ptr + kLeafBitsetBytes;
+        records         = redundant_bytes + redundant_count;
+    }
+
+    // Total on-disk bytes from the start of the page through `count` records.
+    std::size_t page_bytes(uint32_t count) const {
+        return kLeafHeaderBytes + kLeafBitsetBytes + redundant_count
+             + static_cast<std::size_t>(count) * unique_bytes;
+    }
+
+    // Reconstruct record `idx` into out[0..2] (3 uint64), honoring the bitset.
+    void decode_record(uint32_t idx, uint64_t out[kLeafRecordArity]) const {
+        unsigned char* oc = reinterpret_cast<unsigned char*>(out);
+        const uint8_t* cur = records + static_cast<std::size_t>(idx) * unique_bytes;
+        std::size_t upos = 0;
+        for (std::size_t i = 0; i < kLeafRecordBytes; ++i) {
+            if (redundant_bit[i]) {
+                oc[i] = redundant_bytes[redundant_idx[i]];
+            } else {
+                oc[i] = cur[upos++];
+            }
+        }
+    }
+};
+
 // Walk leaf pages in `[page_lo, page_hi)` and invoke
 // `visit(src_u64_raw, dst_u64, eid_u64)` once per record, in the exact
 // order they were written by BPTLeafWriter<3>::process_block.
@@ -213,11 +270,12 @@ void visit_leaf_records_in_range(const MappedFile& mm,
             continue;
         }
 
-        const uint8_t* rec = p + kLeafHeaderBytes + kLeafBitsetBytes;
+        // Decode the redundant-byte bitset so compressed pages reconstruct
+        // correctly (see LeafPageDecoder). On uncompressed pages this is the
+        // legacy fixed-stride layout.
+        const LeafPageDecoder dec(p);
 
-        const std::size_t needed =
-            kLeafHeaderBytes + kLeafBitsetBytes +
-            static_cast<std::size_t>(value_count) * kLeafRecordBytes;
+        const std::size_t needed = dec.page_bytes(value_count);
         if (needed > kLeafPageSize) {
             throw std::runtime_error(
                 "topology_snapshot_from_leaf: corrupt leaf page "
@@ -228,12 +286,9 @@ void visit_leaf_records_in_range(const MappedFile& mm,
         }
 
         for (uint32_t i = 0; i < value_count; ++i) {
-            uint64_t k0 = 0, k1 = 0, k2 = 0;
-            std::memcpy(&k0, rec + 0 * sizeof(uint64_t), sizeof(uint64_t));
-            std::memcpy(&k1, rec + 1 * sizeof(uint64_t), sizeof(uint64_t));
-            std::memcpy(&k2, rec + 2 * sizeof(uint64_t), sizeof(uint64_t));
-            visit(k0, k1, k2);
-            rec += kLeafRecordBytes;
+            uint64_t r[kLeafRecordArity] = {0, 0, 0};
+            dec.decode_record(i, r);
+            visit(r[0], r[1], r[2]);
         }
     }
 }
@@ -295,24 +350,23 @@ std::vector<LeafPageBoundary> build_page_boundaries(const MappedFile& mm) {
         if (value_count == 0) {
             continue;
         }
-        const uint8_t* first_rec = p + kLeafHeaderBytes + kLeafBitsetBytes;
-        uint64_t first_k0 = 0;
-        std::memcpy(&first_k0, first_rec, sizeof(uint64_t));
-
-        const std::size_t last_off =
-            kLeafHeaderBytes + kLeafBitsetBytes
-            + (static_cast<std::size_t>(value_count) - 1) * kLeafRecordBytes;
-        if (last_off + sizeof(uint64_t) > kLeafPageSize) {
+        // Honor the redundant-byte bitset (compressed leaves). key[0] (src)
+        // may itself be partly redundant, so reconstruct the full record.
+        const LeafPageDecoder dec(p);
+        if (dec.page_bytes(value_count) > kLeafPageSize) {
             throw std::runtime_error(
                 "topology_snapshot_from_leaf: corrupt leaf page "
                 + std::to_string(page) + " (value_count="
                 + std::to_string(value_count) + ")");
         }
-        uint64_t last_k0 = 0;
-        std::memcpy(&last_k0, p + last_off, sizeof(uint64_t));
 
-        out[page].first_src = first_k0 & ObjectId::VALUE_MASK;
-        out[page].last_src  = last_k0 & ObjectId::VALUE_MASK;
+        uint64_t first_r[kLeafRecordArity] = {0, 0, 0};
+        dec.decode_record(0, first_r);
+        uint64_t last_r[kLeafRecordArity] = {0, 0, 0};
+        dec.decode_record(value_count - 1, last_r);
+
+        out[page].first_src = first_r[0] & ObjectId::VALUE_MASK;
+        out[page].last_src  = last_r[0] & ObjectId::VALUE_MASK;
     }
     return out;
 }

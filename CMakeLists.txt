@@ -395,6 +395,47 @@ else()
 endif()
 
 # ============================================================================
+# CLASSIC external-sort spill/merge roundtrip unit tests
+# ----------------------------------------------------------------------------
+# Pins the correctness of GQL::ExternalRecordSort<N>'s spill -> sort_run_files
+# -> merge_runs path (the CLASSIC projection sorter backend). Guards the
+# task_arena fan-out cap and the K-way merge against future refactors.
+# Mirrors the radix_partition_sort_test target above.
+# ============================================================================
+if(GTest_FOUND)
+    add_executable(external_record_sort_test
+        ${CMAKE_SOURCE_DIR}/src/tests/external_record_sort_test.cc
+    )
+    set_target_properties(external_record_sort_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins over
+    # the main() in src/third_party/serd/serdi.cc (same constraint as the
+    # radix_partition_sort_test target above).
+    target_link_libraries(external_record_sort_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(external_record_sort_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME ExternalRecordSortSpillTests
+        COMMAND $<TARGET_FILE:external_record_sort_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # Parallel edge-scan abort/exception-propagation unit tests
 # ============================================================================
 if(GTest_FOUND)
@@ -425,6 +466,40 @@ if(GTest_FOUND)
     add_test(
         NAME NativeScannerParallelAbortTests
         COMMAND $<TARGET_FILE:native_scanner_parallel_abort_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
+# Partitioned edge-scan seam unit tests (builder-level PARALLEL scan mode)
+# ============================================================================
+if(GTest_FOUND)
+    add_executable(native_scanner_partitioned_test
+        ${CMAKE_SOURCE_DIR}/src/tests/native_scanner_partitioned_test.cc
+    )
+    set_target_properties(native_scanner_partitioned_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # gtest_main must precede millenniumdb so its main() wins over serdi.cc's.
+    target_link_libraries(native_scanner_partitioned_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(native_scanner_partitioned_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME NativeScannerPartitionedTests
+        COMMAND $<TARGET_FILE:native_scanner_partitioned_test>
         WORKING_DIRECTORY tests
     )
 endif()

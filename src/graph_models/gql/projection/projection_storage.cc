@@ -19,6 +19,7 @@
 
 #include "external_record_sort.h"
 #include "graph_models/gql/projection/index_set.h"
+#include "graph_models/gql/projection/leaf_compression.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/sorter_dispatch.h"
 #include "graph_models/gql/projection/topology_snapshot_from_leaf.h"
@@ -989,10 +990,12 @@ size_t ProjectionStorage::build_index_bulk(std::vector<Record<N>>& records, cons
     // Correct formula: (Page::SIZE - header - bitset) / record_size
     constexpr size_t max_records_per_leaf = (Page::SIZE - 2*sizeof(uint32_t) - N) / (sizeof(uint64_t) * N);
 
-    // Allocate buffer for formatted leaf data
-    // Format: [bitset (N bytes)] + [records (size * N * 8 bytes)]
-    // With no compression (bitset=0), we need N + records * N * 8 bytes max
-    constexpr size_t max_buffer_size = N + max_records_per_leaf * sizeof(uint64_t) * N;
+    // Allocate buffer for formatted leaf data.
+    // Compression packs MORE than max_records_per_leaf records into a page
+    // (each record costs fewer than N*8 bytes once redundant bytes are shared),
+    // but the on-disk payload is always bounded by Page::SIZE. Size the buffer
+    // to Page::SIZE so a fully-packed compressed page fits.
+    const size_t max_buffer_size = Page::SIZE;
     auto leaf_buffer = std::make_unique<char[]>(max_buffer_size);
 
     // Write records to leaf pages
@@ -1000,14 +1003,32 @@ size_t ProjectionStorage::build_index_bulk(std::vector<Record<N>>& records, cons
     size_t leaf_page_number = 0;
     size_t records_written = 0;
 
+    const bool compress_leaves = !leaf_compression_disabled();
+    // Upper bound on records per compressed page (a fully-redundant page holds
+    // at most Page::SIZE entries; the planner clamps to the real budget).
+    const size_t records_per_page_cap = compress_leaves ? Page::SIZE : max_records_per_leaf;
     std::bitset<N * 8> no_compression;  // All zeros = no compression
 
     while (records_written < total_records) {
-        // Calculate records for this leaf page
-        size_t records_in_page = std::min(max_records_per_leaf, total_records - records_written);
-
         // Get pointer to first record of this leaf
         Record<N>* page_start = &records[records_written];
+        const size_t remaining = total_records - records_written;
+
+        // Decide how many records fit on this (possibly compressed) page and
+        // the redundant-byte bitset for exactly those records. When
+        // compression is disabled, this is the fixed max_records_per_leaf with
+        // an all-zero bitset.
+        size_t records_in_page;
+        std::bitset<N * 8> page_bitset;
+        if (compress_leaves) {
+            auto plan = plan_compressed_page<N>(page_start, remaining,
+                                                records_per_page_cap);
+            records_in_page = plan.records_in_page;
+            page_bitset     = plan.bitset;
+        } else {
+            records_in_page = std::min(max_records_per_leaf, remaining);
+            page_bitset     = no_compression;
+        }
 
         // Determine next leaf page number (0 for last page)
         uint32_t next_page = (records_written + records_in_page < total_records)
@@ -1019,26 +1040,19 @@ size_t ProjectionStorage::build_index_bulk(std::vector<Record<N>>& records, cons
             dir_writer.bulk_insert(page_start, 0, static_cast<int32_t>(leaf_page_number));
         }
 
-        // Format data for process_block():
-        // [bitset as N bytes] + [all record bytes]
-        // With no compression, bitset=0 so just N zero bytes followed by raw records
-        size_t buffer_pos = 0;
-
-        // Write bitset (N zero bytes for no compression)
-        unsigned long bits_ul = no_compression.to_ulong();
-        std::memcpy(leaf_buffer.get(), &bits_ul, N);
-        buffer_pos += N;
-
-        // Write all record bytes (no compression = full records)
-        std::memcpy(leaf_buffer.get() + buffer_pos,
-                    reinterpret_cast<char*>(page_start),
-                    records_in_page * sizeof(uint64_t) * N);
+        // Format data for process_block(): the leaf buffer holds the exact
+        // [N bitset bytes] + [redundant_count shared bytes] + [non-redundant
+        // per-record bytes] layout BPTLeafV1 decodes.
+        pack_compressed_page<N>(page_start,
+                                static_cast<uint32_t>(records_in_page),
+                                page_bitset,
+                                leaf_buffer.get());
 
         // Write leaf page
         leaf_writer.process_block(
             leaf_buffer.get(),
             static_cast<uint32_t>(records_in_page),
-            no_compression,
+            page_bitset,
             next_page
         );
 
@@ -1118,8 +1132,9 @@ size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, c
     // Calculate leaf page capacity (same formula as build_index_bulk)
     constexpr size_t max_records_per_leaf = (Page::SIZE - 2*sizeof(uint32_t) - N) / (sizeof(uint64_t) * N);
 
-    // Allocate buffer for formatted leaf data
-    constexpr size_t max_buffer_size = N + max_records_per_leaf * sizeof(uint64_t) * N;
+    // Allocate buffer for formatted leaf data. Compression packs more records
+    // per page, so size to Page::SIZE (the compressed payload upper bound).
+    const size_t max_buffer_size = Page::SIZE;
     auto leaf_buffer = std::make_unique<char[]>(max_buffer_size);
 
     // Streaming state
@@ -1131,7 +1146,31 @@ size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, c
     size_t unique_count = 0;
     size_t leaf_page_number = 0;
 
+    const bool compress_leaves = !leaf_compression_disabled();
     std::bitset<N * 8> no_compression;  // All zeros = no compression
+
+    // Running redundant-byte bitset over the records currently buffered on the
+    // page; kept in sync with page_records so the compressed flush trigger can
+    // measure the on-disk page cost without rescanning every record. Reset to
+    // all-set whenever a page is flushed (a single record is all-redundant).
+    std::bitset<N * 8> running_bitset;
+    running_bitset.set();
+    auto page_overflows_with = [&](const Record<N>& candidate) -> bool {
+        // Fold the candidate into a copy of the running bitset and test the
+        // resulting page cost against Page::SIZE — identical budget arithmetic
+        // to BPTLeafV1::get_page_size and plan_compressed_page.
+        std::bitset<N * 8> bs = running_bitset;
+        const unsigned char* first =
+            reinterpret_cast<const unsigned char*>(&page_records[0]);
+        const unsigned char* cand =
+            reinterpret_cast<const unsigned char*>(&candidate);
+        for (size_t b = 0; b < N * 8; ++b) {
+            if (bs[b] && cand[b] != first[b]) bs.set(b, false);
+        }
+        const size_t rc = bs.count();
+        const size_t n  = page_records.size() + 1;
+        return 2 * sizeof(uint32_t) + N + rc + n * (sizeof(uint64_t) * N - rc) > Page::SIZE;
+    };
 
     // Lambda to write a leaf page
     auto write_leaf_page = [&](bool is_last_page) {
@@ -1145,30 +1184,31 @@ size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, c
             dir_writer.bulk_insert(&page_records[0], 0, static_cast<int32_t>(leaf_page_number));
         }
 
-        // Format data for process_block():
-        // [bitset as N bytes] + [all record bytes]
-        size_t buffer_pos = 0;
+        // Format data for process_block(): see build_index_bulk for the exact
+        // [N bitset bytes] + [redundant bytes] + [non-redundant per-record
+        // bytes] layout. Default compresses; escape hatch restores raw bytes.
+        std::bitset<N * 8> page_bitset =
+            compress_leaves
+                ? compute_redundant_bitset<N>(page_records.data(),
+                                              static_cast<uint32_t>(page_records.size()))
+                : no_compression;
 
-        // Write bitset (N zero bytes for no compression)
-        unsigned long bits_ul = no_compression.to_ulong();
-        std::memcpy(leaf_buffer.get(), &bits_ul, N);
-        buffer_pos += N;
-
-        // Write all record bytes
-        std::memcpy(leaf_buffer.get() + buffer_pos,
-                    reinterpret_cast<char*>(page_records.data()),
-                    page_records.size() * sizeof(uint64_t) * N);
+        pack_compressed_page<N>(page_records.data(),
+                                static_cast<uint32_t>(page_records.size()),
+                                page_bitset,
+                                leaf_buffer.get());
 
         // Write leaf page
         leaf_writer.process_block(
             leaf_buffer.get(),
             static_cast<uint32_t>(page_records.size()),
-            no_compression,
+            page_bitset,
             next_page
         );
 
         leaf_page_number++;
         page_records.clear();
+        running_bitset.set();  // fresh page: a single record is all-redundant
     };
 
     // Stream sorted records with inline deduplication
@@ -1181,11 +1221,34 @@ size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, c
         has_prev = true;
         unique_count++;
 
-        page_records.push_back(record);
-
-        // Write page when full
-        if (page_records.size() >= max_records_per_leaf) {
-            write_leaf_page(false);  // Not last page
+        if (compress_leaves) {
+            // Compressed: flush the current page when appending `record` would
+            // exceed the Page::SIZE budget, then start a new page with it. A
+            // single record always fits (8 + 9*N <= 4096 for N <= 3).
+            if (!page_records.empty() && page_overflows_with(record)) {
+                write_leaf_page(false);  // running_bitset reset inside
+            }
+            // Fold `record` into the running bitset for the (possibly new) page.
+            if (page_records.empty()) {
+                running_bitset.set();
+            } else {
+                const unsigned char* first =
+                    reinterpret_cast<const unsigned char*>(&page_records[0]);
+                const unsigned char* rec =
+                    reinterpret_cast<const unsigned char*>(&record);
+                for (size_t b = 0; b < N * 8; ++b) {
+                    if (running_bitset[b] && rec[b] != first[b]) {
+                        running_bitset.set(b, false);
+                    }
+                }
+            }
+            page_records.push_back(record);
+        } else {
+            page_records.push_back(record);
+            // Write page when full (fixed record count, no compression).
+            if (page_records.size() >= max_records_per_leaf) {
+                write_leaf_page(false);  // Not last page
+            }
         }
     });
 
