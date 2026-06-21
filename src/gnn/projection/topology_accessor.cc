@@ -25,21 +25,25 @@ struct TopologyAccessor::Impl {
     torch::Device target_device;
     std::mt19937_64 rng;
 
-    // CSR fast-path sidecars (Spec #4-B T4.7). Each reader holds its own mmap +
-    // fd state; `has_data()` reports whether the fast path is usable for this
-    // direction. Absent / stale / malformed sidecars leave the reader inert,
-    // in which case every accessor silently falls back to the B+Tree path
-    // below.
+    // Topology CSR sidecar readers for O(1) neighbor slice via mmap. Each
+    // reader maps topology_{fwd,rev}.csr and holds its own mmap + fd state;
+    // `has_data()` reports whether the fast path is usable for this direction.
+    // Absent / stale / malformed sidecars leave the reader inert, in which
+    // case every accessor silently falls back to the B+Tree path below.
     GQL::Projection::TopologySnapshotReader fwd_csr_;
     GQL::Projection::TopologySnapshotReader rev_csr_;
 
-    // ----- In-memory adjacency cache (Spec #11) -----
+    // ----- In-memory adjacency cache -----
     //
-    // When `cache_enabled_` is true and the corresponding direction map is
-    // populated, `get_out_neighbors` / `get_in_neighbors` consult these maps
-    // first instead of the B+Tree range query. Maps are keyed by source-side
-    // raw uint64 node id (matches B+Tree record convention) and hold a
-    // contiguous vector of `(neighbor_id, edge_id)` pairs.
+    // Populated by a single full-scan of the from_to_edge / to_from_edge
+    // B+Tree indexes into an unordered_map<src, vector<AdjEntry>>. Once built,
+    // get_out_neighbors / get_in_neighbors consult these maps first instead of
+    // issuing a B+Tree range query, turning O(log N) lookups into O(1) hash
+    // lookups. When `cache_enabled_` is true and the corresponding direction map
+    // is populated, `get_out_neighbors` / `get_in_neighbors` consult these maps
+    // first. Maps are keyed by source-side raw uint64 node id (matches B+Tree
+    // record convention) and hold a contiguous vector of `(neighbor_id,
+    // edge_id)` pairs.
     //
     // Always-empty sentinel returned for absent keys keeps `get_neighbors_*`
     // const-correct without per-call allocation. Built atomically once per
@@ -52,11 +56,13 @@ struct TopologyAccessor::Impl {
     uint64_t fwd_cache_entries_ = 0;
     uint64_t rev_cache_entries_ = 0;
 
-    // ----- Four-Level Topology Store (Spec #13) -----
+    // ----- Four-Level Topology Store -----
     //
-    // Owned by the accessor when enable_four_level_store() has been called.
-    // Null otherwise — every existing dispatch path (Spec #11 cache, Spec #4-B
-    // sidecar, B+Tree direct) is preserved byte-for-byte for backwards-compat.
+    // Frequency-tiered neighbor store (L1 RAM hash / L2 compact uint32 CSR /
+    // L3 mmap sidecar / L4 direct B+Tree). Owned by the accessor when
+    // enable_four_level_store() has been called. Null otherwise — every
+    // existing dispatch path (in-memory adjacency cache, topology CSR sidecar
+    // mmap, B+Tree direct) is preserved byte-for-byte for backwards-compat.
     std::unique_ptr<FourLevelTopologyStore> four_level_store_;
 
     explicit Impl(GQL::ProjectionStorage& storage_)
@@ -76,7 +82,7 @@ struct TopologyAccessor::Impl {
     }
 
     // -------------------------------------------------------------------------
-    // Adjacency cache helpers (Spec #11)
+    // Adjacency cache helpers — full B+Tree scan into unordered_map
     // -------------------------------------------------------------------------
 
     // Full-scan a single B+Tree edge index and merge every record into
@@ -171,6 +177,28 @@ struct TopologyAccessor::Impl {
         return result;
     }
 
+    // Buffer-reusing variant of materialise_from_cache_: fills the caller's
+    // `out` (capacity retained) instead of allocating a fresh Neighbors per
+    // node. Byte-identical content + order; only the allocation is avoided.
+    static void materialise_from_cache_into_(
+        const std::unordered_map<uint64_t, std::vector<TopologyAccessor::AdjEntry>>& cache,
+        uint64_t node_id, Neighbors& out)
+    {
+        out.node_ids.clear();
+        out.edge_ids.clear();
+        auto it = cache.find(node_id);
+        if (it == cache.end()) {
+            return;
+        }
+        const auto& entries = it->second;
+        out.node_ids.reserve(entries.size());
+        out.edge_ids.reserve(entries.size());
+        for (const auto& e : entries) {
+            out.node_ids.push_back(ObjectId(e.node_id));
+            out.edge_ids.push_back(ObjectId(e.edge_id));
+        }
+    }
+
     // CSR fast-path for outgoing neighbors. Returns std::nullopt when the
     // fast-path is not viable (reader inert, node_idx out of range) so the
     // caller falls through to the B+Tree path.
@@ -183,11 +211,12 @@ struct TopologyAccessor::Impl {
         if (!fwd_csr_.has_data() || row_idx >= fwd_csr_.num_nodes()) {
             return std::nullopt;
         }
-        // Width-agnostic copy: handles both id_width==8 (full tagged
-        // ObjectIds, memcpy) and id_width==4 (Spec #6 tag-stripped uint32,
-        // widened + re-tagged by the reader). The values returned are the
-        // exact same tagged uint64s either way, so ObjectId() wrapping is
-        // identical across widths.
+        // Width-agnostic copy: handles both id_width==8 (full tagged ObjectIds,
+        // memcpy) and id_width==4 (uint32 sidecar where the 8-bit ObjectId
+        // type tag is stripped at write time and reconstructed by the reader,
+        // halving topology size). The values returned are the exact same
+        // tagged uint64s either way, so ObjectId() wrapping is identical
+        // across widths.
         std::vector<uint64_t> dst_tmp;
         fwd_csr_.copy_neighbors(row_idx, dst_tmp);
         std::vector<uint64_t> eid_tmp;
@@ -212,7 +241,7 @@ struct TopologyAccessor::Impl {
         if (!rev_csr_.has_data() || row_idx >= rev_csr_.num_nodes()) {
             return std::nullopt;
         }
-        // Width-agnostic copy — see try_csr_out_neighbors.
+        // Width-agnostic copy — see try_csr_out_neighbors for explanation.
         std::vector<uint64_t> dst_tmp;
         rev_csr_.copy_neighbors(row_idx, dst_tmp);
         std::vector<uint64_t> eid_tmp;
@@ -246,9 +275,10 @@ struct TopologyAccessor::Impl {
      *
      * The same-key filter is preserved verbatim from
      * `get_neighbors_from_index` to keep the count semantically identical
-     * to that of the materialised path under both BTREE and CSR_HYBRID
-     * storage. See `get_neighbors_from_index`'s comment block for the
-     * CSR cross-page motivation.
+     * to that of the materialised path under both BTREE and CSR-hybrid
+     * storage (where edge-index B+Tree leaves contain the CSR layout
+     * directly). See `get_neighbors_from_index`'s comment block for the
+     * cross-page range-iterator motivation.
      */
     int64_t count_neighbors_from_index(ObjectId node_id, BPlusTree<3>* index) {
         if (!index) {
@@ -275,18 +305,18 @@ struct TopologyAccessor::Impl {
      * Filters emitted records by exact src-id match as a defensive post-pass.
      * The BPT range iterator (BptIter<3>::next) emits every record in
      * [min, max] by pairwise-comparing each field against max only. Under
-     * BTREE storage, page ordering guarantees records with src < seed_id
+     * plain BTREE storage, page ordering guarantees records with src < seed_id
      * never reach the iterator because search_leaf + search_index position
-     * past min exactly. Under CSR_HYBRID v3 storage (Spec #8 ADR 008),
-     * cross-page transitions reset current_pos to 0 on the new page;
-     * continuation pages carry the correct src automatically, but a
-     * chain-head page reached immediately after the query's own tail
-     * may surface tuples whose src is strictly less than max[0] yet
-     * unrelated to the queried seed. Because those records satisfy
-     * record[0] < max[0] in next()'s inequality check, they are returned.
-     * We discard them here by comparing against the queried src_id.
-     * This post-filter is O(1) per tuple and preserves correctness
-     * regardless of the underlying leaf format.
+     * past min exactly. Under CSR-hybrid storage (where each edge-index
+     * B+Tree leaf page IS a CSR row and v3 leaves embed the CSR layout
+     * directly), cross-page transitions reset current_pos to 0 on the new
+     * page; continuation pages carry the correct src automatically, but a
+     * chain-head page reached immediately after the query's own tail may
+     * surface tuples whose src is strictly less than max[0] yet unrelated
+     * to the queried seed. Because those records satisfy record[0] < max[0]
+     * in next()'s inequality check, they are returned. We discard them here
+     * by comparing against the queried src_id. This post-filter is O(1) per
+     * tuple and preserves correctness regardless of the underlying leaf format.
      */
     Neighbors get_neighbors_from_index(ObjectId node_id, BPlusTree<3>* index) {
         Neighbors result;
@@ -306,7 +336,7 @@ struct TopologyAccessor::Impl {
         while ((record = it.next()) != nullptr) {
             // from_to_edge: (from, to, edge_id)
             // Defensive: drop records whose src does not exactly match.
-            // See function-level comment above for the CSR_HYBRID motivation.
+            // See function-level comment above for the cross-page range-iterator motivation.
             if (std::get<0>(*record) != node_id.id) {
                 continue;
             }
@@ -375,21 +405,42 @@ Neighbors materialise_from_four_level_(
     return out;
 }
 
+// Buffer-reusing variant: fill the caller's `out` (capacity retained across
+// calls) instead of allocating a fresh Neighbors per node. Byte-identical
+// content + order to materialise_from_four_level_; only the allocation is
+// avoided. Measured: the per-node Neighbors allocation in the UNDIRECTED fetch
+// is the dominant expand sub-cost.
+void materialise_from_four_level_into_(
+    const FourLevelTopologyStore::Neighbors& src, Neighbors& out)
+{
+    out.node_ids.clear();
+    out.edge_ids.clear();
+    out.node_ids.reserve(src.size());
+    out.edge_ids.reserve(src.size());
+    src.for_each_with_edge_id([&](uint64_t dst, uint64_t eid) {
+        out.node_ids.push_back(ObjectId(dst));
+        out.edge_ids.push_back(ObjectId(eid));
+    });
+}
+
 }  // namespace
 
 Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
-    // Spec #13 four-level store: dispatched first when enabled.
+    // Highest-priority path: frequency-tiered Four-Level Topology Store
+    // (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar / L4 B+Tree).
+    // Dispatched first when enabled via enable_four_level_store().
     if (impl_->four_level_store_) {
         return materialise_from_four_level_(
             impl_->four_level_store_->get_out_neighbors(node_id));
     }
-    // Fastest path (Spec #11): in-memory adjacency cache. Built once on
-    // demand, supersedes both the CSR mmap and the B+Tree range query.
+    // Fast path: in-memory adjacency cache (full B+Tree scan into
+    // unordered_map<src, vector<AdjEntry>>, built once on demand). Supersedes
+    // both the CSR mmap and the B+Tree range query when populated.
     if (impl_->cache_enabled_ && impl_->fwd_cache_built_) {
         return Impl::materialise_from_cache_(impl_->fwd_cache_, node_id.id);
     }
-    // Fast path: mmap'd topology_fwd.csr (Spec #4-B T4.7). Absent / stale /
-    // out-of-range → fall through to the B+Tree path below.
+    // mmap path: mmap'd topology_fwd.csr (O(1) neighbor slice). Absent /
+    // stale / out-of-range → fall through to the B+Tree path below.
     if (auto fast = impl_->try_csr_out_neighbors(node_id)) {
         return std::move(*fast);
     }
@@ -398,16 +449,18 @@ Neighbors TopologyAccessor::get_out_neighbors(ObjectId node_id) {
 }
 
 Neighbors TopologyAccessor::get_in_neighbors(ObjectId node_id) {
-    // Spec #13 four-level store: dispatched first when enabled.
+    // Highest-priority path: frequency-tiered Four-Level Topology Store.
+    // Dispatched first when enabled via enable_four_level_store().
     if (impl_->four_level_store_) {
         return materialise_from_four_level_(
             impl_->four_level_store_->get_in_neighbors(node_id));
     }
-    // Fastest path (Spec #11): in-memory adjacency cache.
+    // Fast path: in-memory adjacency cache (full B+Tree scan into
+    // unordered_map<src, vector<AdjEntry>>, built once on demand).
     if (impl_->cache_enabled_ && impl_->rev_cache_built_) {
         return Impl::materialise_from_cache_(impl_->rev_cache_, node_id.id);
     }
-    // Fast path: mmap'd topology_rev.csr (Spec #4-B T4.7).
+    // mmap path: mmap'd topology_rev.csr (O(1) neighbor slice).
     if (auto fast = impl_->try_csr_in_neighbors(node_id)) {
         return std::move(*fast);
     }
@@ -430,7 +483,7 @@ Neighbors TopologyAccessor::get_in_neighbors(ObjectId node_id) {
     while ((record = it.next()) != nullptr) {
         // to_from_edge: (to, from, edge_id)
         // Defensive: same-key post-filter as in get_neighbors_from_index().
-        // See that function's comment for CSR_HYBRID range-iterator rationale.
+        // See that function's comment for the cross-page range-iterator rationale.
         if (std::get<0>(*record) != node_id.id) {
             continue;
         }
@@ -445,25 +498,72 @@ Neighbors TopologyAccessor::get_neighbors(ObjectId node_id) {
     return get_neighbors(node_id, EdgeOrientation::UNDIRECTED);
 }
 
+// Buffer-reusing variants: dispatch the hot tiers (four-level store / in-memory
+// adjacency cache) directly into `out`, avoiding the per-node Neighbors
+// allocation. Cold paths (B+Tree / mmap) fall back to the by-value path and
+// move-assign — rare and small-scale, so the allocation there is not on the hot
+// path. Content + order are byte-identical to get_out_neighbors / get_in_neighbors.
+void TopologyAccessor::get_out_neighbors_into(ObjectId node_id, Neighbors& out) {
+    if (impl_->four_level_store_) {
+        materialise_from_four_level_into_(
+            impl_->four_level_store_->get_out_neighbors(node_id), out);
+        return;
+    }
+    if (impl_->cache_enabled_ && impl_->fwd_cache_built_) {
+        Impl::materialise_from_cache_into_(impl_->fwd_cache_, node_id.id, out);
+        return;
+    }
+    out = get_out_neighbors(node_id);  // cold path (mmap / B+Tree)
+}
+
+void TopologyAccessor::get_in_neighbors_into(ObjectId node_id, Neighbors& out) {
+    if (impl_->four_level_store_) {
+        materialise_from_four_level_into_(
+            impl_->four_level_store_->get_in_neighbors(node_id), out);
+        return;
+    }
+    if (impl_->cache_enabled_ && impl_->rev_cache_built_) {
+        Impl::materialise_from_cache_into_(impl_->rev_cache_, node_id.id, out);
+        return;
+    }
+    out = get_in_neighbors(node_id);  // cold path (mmap / B+Tree)
+}
+
 Neighbors TopologyAccessor::get_neighbors(ObjectId node_id, EdgeOrientation orientation) {
+    // Thin wrapper over the buffer-reusing path — a single dedup implementation.
+    Neighbors out;
+    get_neighbors_into(node_id, orientation, out);
+    return out;
+}
+
+void TopologyAccessor::get_neighbors_into(ObjectId node_id,
+                                          EdgeOrientation orientation,
+                                          Neighbors& out) {
     switch (orientation) {
         case EdgeOrientation::NATURAL:
-            return get_out_neighbors(node_id);
+            get_out_neighbors_into(node_id, out);
+            return;
 
         case EdgeOrientation::REVERSE:
-            return get_in_neighbors(node_id);
+            get_in_neighbors_into(node_id, out);
+            return;
 
         case EdgeOrientation::UNDIRECTED: {
-            Neighbors out_neighbors = get_out_neighbors(node_id);
-            Neighbors in_neighbors = get_in_neighbors(node_id);
+            // Per-worker reusable scratch for the two directions (each parallel
+            // sampler thread gets its own via thread_local). Filled in place so
+            // the UNDIRECTED fetch allocates no fresh Neighbors per node.
+            thread_local Neighbors out_neighbors;
+            thread_local Neighbors in_neighbors;
+            get_out_neighbors_into(node_id, out_neighbors);
+            get_in_neighbors_into(node_id, in_neighbors);
 
             // Deduplicate to merge results from both out- and in- index lookups.
             //
             // Historically we deduplicated by EDGE ID. That works for BTREE
             // storage where each edge has a unique id, but breaks under
-            // Spec #8 CSR_HYBRID storage which currently omits edge_id from
-            // the v3 layout (edge_id = 0 for every tuple — see ADR 008
-            // "Known limitations" caveat #1). An all-zero dedup key collapses
+            // CSR-hybrid storage (where edge-index B+Tree leaves ARE the CSR
+            // layout) because the v3 leaf format omits edge_id (edge_id = 0
+            // for every tuple). An all-zero dedup key collapses
             // ALL neighbors of the node to a single element, which in turn
             // makes Phase B k-hop sampling degenerate (layer-1 node count
             // always = 1) and drags chunk-level wall-clock time into the
@@ -487,25 +587,28 @@ Neighbors TopologyAccessor::get_neighbors(ObjectId node_id, EdgeOrientation orie
                 || (!in_neighbors.edge_ids.empty()
                      && in_neighbors.edge_ids.front().id != 0);
 
-            Neighbors result;
+            // Merge into the caller's `out` buffer (capacity retained across
+            // calls). Cleared here; same dedup order as before.
+            out.node_ids.clear();
+            out.edge_ids.clear();
             // Per-thread dedup arena reused across UNDIRECTED lookups.
-            // Avoids per-call hash-table reallocation; Plan F workers each
-            // get their own arena via thread_local.
+            // Avoids per-call hash-table reallocation; parallel sampling
+            // workers each get their own arena via thread_local.
             thread_local std::unordered_set<uint64_t> seen_arena;
             seen_arena.clear();
             const size_t total = out_neighbors.node_ids.size()
                                + in_neighbors.node_ids.size();
             seen_arena.reserve(total);
-            result.node_ids.reserve(total);
-            result.edge_ids.reserve(total);
+            out.node_ids.reserve(total);
+            out.edge_ids.reserve(total);
 
             for (size_t i = 0; i < out_neighbors.node_ids.size(); ++i) {
                 const uint64_t key = has_edge_ids
                     ? out_neighbors.edge_ids[i].id
                     : out_neighbors.node_ids[i].id;
                 if (seen_arena.insert(key).second) {
-                    result.node_ids.push_back(out_neighbors.node_ids[i]);
-                    result.edge_ids.push_back(out_neighbors.edge_ids[i]);
+                    out.node_ids.push_back(out_neighbors.node_ids[i]);
+                    out.edge_ids.push_back(out_neighbors.edge_ids[i]);
                 }
             }
 
@@ -514,17 +617,14 @@ Neighbors TopologyAccessor::get_neighbors(ObjectId node_id, EdgeOrientation orie
                     ? in_neighbors.edge_ids[i].id
                     : in_neighbors.node_ids[i].id;
                 if (seen_arena.insert(key).second) {
-                    result.node_ids.push_back(in_neighbors.node_ids[i]);
-                    result.edge_ids.push_back(in_neighbors.edge_ids[i]);
+                    out.node_ids.push_back(in_neighbors.node_ids[i]);
+                    out.edge_ids.push_back(in_neighbors.edge_ids[i]);
                 }
             }
 
-            return result;
+            return;
         }
     }
-
-    // Should never reach here, but satisfy compiler
-    return Neighbors{};
 }
 
 // ----- Batch Neighbor Access -----
@@ -810,16 +910,17 @@ std::vector<SampledSubgraph> TopologyAccessor::sample_khop_neighbors(
 // ----- Statistics -----
 
 int64_t TopologyAccessor::get_out_degree(ObjectId node_id) {
-    // Fastest path: in-memory adjacency cache (Spec #11). Hash lookup
-    // returns the entry vector size directly — no copies.
+    // Fastest path: in-memory adjacency cache (full B+Tree scan stored as
+    // unordered_map). Hash lookup returns the entry vector size directly —
+    // no copies.
     if (impl_->cache_enabled_ && impl_->fwd_cache_built_) {
         auto it = impl_->fwd_cache_.find(node_id.id);
         return it == impl_->fwd_cache_.end()
             ? 0
             : static_cast<int64_t>(it->second.size());
     }
-    // Fast path: mmap'd topology_fwd.csr (Spec #4-B). The reader exposes
-    // the per-row span O(1); we only need its size.
+    // Fast path: mmap'd topology_fwd.csr (O(1) ROW_PTR span). The reader
+    // exposes the per-row span directly; we only need its size.
     const uint64_t row_idx = node_id.get_value();
     if (impl_->fwd_csr_.has_data() && row_idx < impl_->fwd_csr_.num_nodes()) {
         // degree() is width-agnostic (ROW_PTR is uint64 for both id widths)
@@ -832,14 +933,15 @@ int64_t TopologyAccessor::get_out_degree(ObjectId node_id) {
 }
 
 int64_t TopologyAccessor::get_in_degree(ObjectId node_id) {
-    // Fastest path: in-memory adjacency cache (Spec #11).
+    // Fastest path: in-memory adjacency cache (full B+Tree scan stored as
+    // unordered_map).
     if (impl_->cache_enabled_ && impl_->rev_cache_built_) {
         auto it = impl_->rev_cache_.find(node_id.id);
         return it == impl_->rev_cache_.end()
             ? 0
             : static_cast<int64_t>(it->second.size());
     }
-    // Fast path: mmap'd topology_rev.csr (Spec #4-B).
+    // Fast path: mmap'd topology_rev.csr (O(1) ROW_PTR span).
     const uint64_t row_idx = node_id.get_value();
     if (impl_->rev_csr_.has_data() && row_idx < impl_->rev_csr_.num_nodes()) {
         // Width-agnostic degree — see get_out_degree.
@@ -868,7 +970,7 @@ void TopologyAccessor::set_target_device(torch::Device device) {
     impl_->target_device = device;
 }
 
-// ----- Adjacency cache (Spec #11) -----
+// ----- In-memory adjacency cache (full B+Tree scan into unordered_map) -----
 
 void TopologyAccessor::enable_adjacency_cache(bool enabled) {
     impl_->cache_enabled_ = enabled;
@@ -954,7 +1056,8 @@ uint64_t TopologyAccessor::get_adjacency_cache_rev_entries() const {
     return impl_->rev_cache_entries_;
 }
 
-// ----- Four-Level Topology Store (Spec #13) -----
+// ----- Four-Level Topology Store (L1 RAM hash / L2 compact uint32 CSR /
+//       L3 mmap sidecar / L4 direct B+Tree, frequency-tiered) -----
 
 void TopologyAccessor::enable_four_level_store(
     const FourLevelTopologyStore::Config& config)
@@ -965,9 +1068,9 @@ void TopologyAccessor::enable_four_level_store(
             "drop the accessor and recreate to swap configurations");
     }
 
-    // Drop the Spec #11 single-tier cache if it was populated. The
-    // four-level store contains its own L1 hash that subsumes the
-    // legacy cache; keeping both alive doubles RAM accounting.
+    // Drop the single-tier in-memory adjacency cache if it was populated.
+    // The four-level store contains its own L1 hash that subsumes it;
+    // keeping both alive doubles RAM accounting.
     impl_->cache_enabled_ = false;
     impl_->fwd_cache_.clear();
     impl_->rev_cache_.clear();
@@ -992,6 +1095,33 @@ void TopologyAccessor::enable_four_level_store(
 
 bool TopologyAccessor::is_four_level_store_enabled() const {
     return static_cast<bool>(impl_->four_level_store_);
+}
+
+const L2CompactCsr* TopologyAccessor::l2_fwd() const {
+    return impl_->four_level_store_ ? impl_->four_level_store_->l2_fwd() : nullptr;
+}
+
+const L2CompactCsr* TopologyAccessor::l2_rev() const {
+    return impl_->four_level_store_ ? impl_->four_level_store_->l2_rev() : nullptr;
+}
+
+const GQL::Projection::TopologySnapshotReader* TopologyAccessor::l3_fwd() const {
+    return impl_->four_level_store_ ? impl_->four_level_store_->l3_fwd() : nullptr;
+}
+
+const GQL::Projection::TopologySnapshotReader* TopologyAccessor::l3_rev() const {
+    return impl_->four_level_store_ ? impl_->four_level_store_->l3_rev() : nullptr;
+}
+
+void TopologyAccessor::enable_pinned_gpu_view(const SamplingBackendPlan& plan) {
+    if (impl_->four_level_store_) {
+        impl_->four_level_store_->enable_pinned_gpu_view(plan);
+    }
+}
+
+const PinnedTopologyView* TopologyAccessor::pinned_view() const {
+    return impl_->four_level_store_ ? impl_->four_level_store_->pinned_view()
+                                    : nullptr;
 }
 
 // ============================================================================

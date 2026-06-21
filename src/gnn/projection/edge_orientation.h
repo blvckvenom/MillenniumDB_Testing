@@ -7,19 +7,16 @@
 // includes torch + projection_storage + a sizeable portion of the GNN
 // public surface).
 //
-// Hoisted out of `topology_accessor.h` in Spec #13 Phase 3 (T13.7
-// carry-forward (b)) so that consumers that only need the orientation
-// enum — `sampling_config.h`, `four_level_topology_store.h`, and the
-// future `RowMapping` shared header — do not pay the full transitive
-// include cost.
+// Hoisted out of `topology_accessor.h` when the Four-Level Topology Store
+// (frequency-tiered L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar /
+// L4 direct B+Tree) was introduced, so that consumers that only need the
+// orientation enum — `sampling_config.h`, `four_level_topology_store.h`, and
+// `RowMapping` — do not pay the full transitive include cost of pulling in
+// torch, projection_storage, and the rest of the GNN public surface.
 //
 // `topology_accessor.h` keeps its existing definition as a re-include
 // of this header; downstream files that already include
 // `topology_accessor.h` see the enum unchanged.
-//
-// Spec reference:
-//   docs/superpowers/specs/2026-04-25-four-level-topology-store-design.md
-//   §3.2 (C++ class) — Config::orientation field type.
 //
 // This header is intentionally header-only and dependency-free (no
 // project includes, no STL beyond what the enum itself requires) so it

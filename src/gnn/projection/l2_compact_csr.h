@@ -13,7 +13,9 @@ namespace mdb::gnn {
 
 /**
  * @brief Tier-2 compact-CSR adjacency cache for the Four-Level Topology
- *        Store (Spec #13 Phase 2 / T13.5).
+ *        Store (frequency-tiered L1 RAM hash / L2 compact uint32 CSR /
+ *        L3 mmap sidecar / L4 direct B+Tree), holding the warm-tier
+ *        nodes assigned during the build phase's tier-2 population step.
  *
  * Holds the warm-tier adjacency in three flat arrays:
  *
@@ -134,6 +136,22 @@ public:
     bool        is_frozen()   const noexcept { return frozen_; }
     std::size_t node_count()  const noexcept { return node_to_l2_idx_.size(); }
     std::size_t edge_count()  const noexcept { return col_idx_.size(); }
+
+    /**
+     * @brief Raw flat-array accessors for pinning the L2 CSR as a GPU substrate.
+     *
+     * Expose the immutable post-freeze `row_ptr_` / `col_idx_` so the dynamic
+     * GPU sampling path can register them with `cudaHostRegister` (no copy, no
+     * layout change, no loss of immutability). `row_ptr_len()` is the prefix-sum
+     * length (`node_count() + 1` after freeze, 0 before). The col_idx values are
+     * tag-stripped uint32 ordinals — a consumer reconstructs full ObjectIds via
+     * `dst_type_tag()`. Pointers are valid for the lifetime of this (move-only)
+     * object; do NOT cache them across a move.
+     */
+    const uint64_t* row_ptr_data() const noexcept { return row_ptr_.data(); }
+    std::size_t     row_ptr_len()  const noexcept { return row_ptr_.size(); }
+    const uint32_t* col_idx_data() const noexcept { return col_idx_.data(); }
+    std::size_t     col_idx_size() const noexcept { return col_idx_.size(); }
 
     /**
      * @brief Per-direction dst ObjectId type tag, PRE-SHIFTED into the top

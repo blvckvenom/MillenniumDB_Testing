@@ -29,12 +29,20 @@ namespace mdb::gnn {
 
 class TopologyAccessor;
 class TopologyFrequencyProfiler;
+class PinnedTopologyView;
+struct SamplingBackendPlan;
 
 /**
- * @brief Coordinator for the Four-Level Topology Store (Spec #13).
+ * @brief Coordinator for the frequency-tiered Four-Level Topology Store.
  *
- * Phase 3 (T13.7) replaces the Phase 2 dispatcher-only skeleton with a
- * full coordinator that:
+ * Implements a four-tier neighbor lookup hierarchy (L1 RAM hash / L2
+ * compact uint32 CSR / L3 mmap sidecar / L4 direct B+Tree) where tier
+ * assignment is driven by per-node access frequency: high-frequency hub
+ * nodes go to fast RAM tiers, cold-tail nodes are served from disk.
+ *
+ * The full coordinator (constructed with the Phase 3 B+Tree constructor):
+ * replaces the earlier dispatcher-only skeleton (Phase 2 constructor, kept
+ * for unit tests) with a full build+dispatch cycle that:
  *
  *   1. Owns the four tier sources internally (forward + reverse L1
  *      hash caches and L2 compact CSRs, plus optional non-owning L3
@@ -75,11 +83,14 @@ public:
         //   0 for an empty L2 (harmless: empty spans emit nothing).
         uint64_t                  l2_dst_tag = 0;
         // L3: dst node ids, length l3_size. Owned by mmap (zero-copy).
-        // Two on-disk widths (Spec #6):
+        // Two on-disk widths (the topology CSR sidecar may be stored as
+        // uint64 or uint32 depending on how the projection was built):
         //   id_width==8 → l3_col_idx / l3_edge_ids point at uint64 sections
         //                 (full tagged ObjectIds; l3_*_32 stay nullptr).
         //   id_width==4 → l3_col_idx32 / l3_edge_ids32 point at uint32
-        //                 sections (tag-stripped ordinals); l3_dst_tag /
+        //                 sections (tag-stripped ordinals; the 8-bit ObjectId
+        //                 type tag is stripped when building the sidecar and
+        //                 must be reconstructed at read time). l3_dst_tag /
         //                 l3_eid_tag carry the per-section ObjectId type tag
         //                 PRE-SHIFTED into the top byte (tag << 56), OR'd onto
         //                 each widened value by the for_each_* helpers to
@@ -226,10 +237,13 @@ public:
         /// (75% of 70% of MemAvailable).
         std::size_t l2_budget_mb = 0;
 
-        /// Open the Spec #4-B mmap sidecar files for the L3 cold tier
-        /// when present. Composes with `indexSet` — the sidecar is
-        /// silently absent when the projection wasn't built with
-        /// `buildTopologySnapshot:true`.
+        /// Open the topology CSR sidecar files (`topology_fwd.csr` /
+        /// `topology_rev.csr`) as the L3 cold-tier source when they are
+        /// present on disk. These mmap-backed CSR files provide O(1)
+        /// per-node neighbor slices (no B+Tree directory walk). The sidecar
+        /// is silently absent when the projection wasn't built with
+        /// `buildTopologySnapshot:true`, in which case L3 is skipped and
+        /// cold-tail nodes fall through to the L4 B+Tree.
         bool use_l3_mmap_sidecar = false;
 
         /// Edge orientation that drives which directions to build:
@@ -310,8 +324,10 @@ public:
      *   3. Compute tier_assignment[] greedily by descending frequency.
      *   4. Walk the live B+Trees, populating L1 (reserve+move) and L2
      *      (add_node + freeze) per tier_assignment[].
-     *   5. When `use_l3_mmap_sidecar`, open the Spec #4-B sidecar
-     *      readers (silently no-op when the files are absent).
+     *   5. When `use_l3_mmap_sidecar`, open the topology CSR sidecar
+     *      readers (`topology_fwd.csr` / `topology_rev.csr`) for mmap-backed
+     *      O(1) neighbor slices at the L3 cold tier (silently no-op when the
+     *      files are absent from the projection directory).
      *   6. Mark the store built.
      *
      * Throws std::logic_error when called on the dispatcher
@@ -328,6 +344,56 @@ public:
      * successful `build()`.
      */
     bool is_built() const noexcept;
+
+    /**
+     * @brief Read-only access to the tier-2 compact CSR for each direction.
+     *
+     * Used only to SIZE the dynamic GPU/CPU sampling backend decision
+     * (`plan_sampling_backend` reads node_count()/edge_count()). Returns the
+     * active L2 CSR pointer for that direction (post-build, frozen, immutable)
+     * or nullptr when that direction has no L2 tier. Callers must NOT cache the
+     * raw row_ptr_/col_idx_ data pointers across the store's lifetime.
+     */
+    const L2CompactCsr* l2_fwd() const noexcept { return l2_fwd_; }
+    const L2CompactCsr* l2_rev() const noexcept { return l2_rev_; }
+
+    /**
+     * @brief The active L3 global topology sidecar reader per direction.
+     *
+     * This is the substrate `enable_pinned_gpu_view` actually pins, so the GPU
+     * sampling-backend decision must SIZE on these (num_nodes/num_edges over the
+     * whole graph), not the warm-tier L2. Returns nullptr when no L3 sidecar is
+     * active for that direction.
+     */
+    const GQL::Projection::TopologySnapshotReader* l3_fwd() const noexcept {
+        return l3_fwd_;
+    }
+    const GQL::Projection::TopologySnapshotReader* l3_rev() const noexcept {
+        return l3_rev_;
+    }
+
+    /**
+     * @brief Pin the global topology CSR as a device-visible GPU substrate.
+     *
+     * Builds a `PinnedTopologyView` over the active L3 sidecar arrays (the
+     * global ROW_PTR + narrow COL_IDX, correctness-complete across all nodes)
+     * for whichever directions `plan.directions` selects, registering them with
+     * `cudaHostRegister` so a k-hop kernel can walk them over PCIe.
+     *
+     * No-op when `plan.backend == CPU_OUT_OF_CORE`, when no capable GPU is
+     * present at runtime, when the build has no CUDA, or when the L3 sidecar is
+     * absent / not the narrow uint32 layout (the only pinnable global substrate
+     * today). Idempotent: re-enabling first releases the prior view. The store
+     * stays read-only and the CPU sampling path is unchanged, so output remains
+     * byte-identical when the view is unused.
+     */
+    void enable_pinned_gpu_view(const SamplingBackendPlan& plan);
+
+    /// The registered GPU view, or nullptr when none was enabled. Owned by the
+    /// store; valid until the next `enable_pinned_gpu_view()` or destruction.
+    const PinnedTopologyView* pinned_view() const noexcept {
+        return pinned_view_.get();
+    }
 
     /**
      * @brief Get outgoing neighbors (NATURAL).
@@ -370,10 +436,11 @@ public:
     /// resident and do not count toward in-RAM accounting.
     std::size_t total_ram_used() const noexcept;
 
-    /// Phase 4 / T13.11: MinHash permutation over L3-tier nodes (empty
-    /// on cold start). Exposed for testing and for future Phase 5+
-    /// consumers that will apply the permutation to the on-disk L3
-    /// sidecar.
+    /// MinHash reorder permutation over L3-tier nodes (empty on cold
+    /// start; populated only when `node_counts.bin` was available at
+    /// build time). Exposed for testing and for future consumers that
+    /// will apply the permutation to the on-disk L3 sidecar to improve
+    /// disk-read locality.
     const std::vector<uint64_t>& l3_reorder_permutation() const noexcept {
         return l3_reorder_permutation_;
     }
@@ -424,8 +491,9 @@ private:
         std::unique_ptr<L1HashCache>&                                  l1_out,
         std::unique_ptr<L2CompactCsr>&                                 l2_out) const;
     /**
-     * @brief Fast L1+L2 build path that reads the Spec #4-B sidecar
-     *        directly instead of walking the B+Tree (Phase 4 / T13.10).
+     * @brief Fast L1+L2 build path that reads the topology CSR sidecar
+     *        (`topology_fwd.csr` / `topology_rev.csr`) directly instead
+     *        of walking the B+Tree.
      *
      * Walks `row_idx` in [0, sidecar.num_nodes()), looks up the tier,
      * and dispatches the slice into L1 (reserve+move) or L2 (add_node).
@@ -447,21 +515,23 @@ private:
         std::unique_ptr<L2CompactCsr>&                 l2_out) const;
     void open_l3_sidecars_();
     /**
-     * @brief Compute a permutation that clusters L3-tier nodes by
-     *        sample-set similarity (Phase 4 / T13.11).
+     * @brief Compute a MinHash permutation that clusters L3-tier nodes by
+     *        sample-set similarity so that nearby seeds in the random-walk
+     *        order share L3 mmap pages, improving disk read locality.
      *
-     * Uses `MinHashReorderer::Strategy::SEGMENTED` (DiskGNN Algorithm
-     * 1, validated by Spec #5). Only fires when the frequency profiler
-     * consumed `<projection_dir>/node_counts.bin` (warm start). On
-     * cold start the permutation is left empty and a one-line cerr
-     * message is emitted documenting the skip reason.
+     * Uses `MinHashReorderer::Strategy::SEGMENTED` (the GLOBAL composite-hash
+     * ordering `(segment_id<<32) | minhash` from DiskGNN Algorithm 1). Only
+     * fires when the frequency profiler has consumed
+     * `<projection_dir>/node_counts.bin` (warm start — requires a prior
+     * completed sample run to have written that file). On a cold start (no
+     * `node_counts.bin` present) the permutation is left empty and a one-line
+     * diagnostic is written to stderr documenting the skip reason.
      *
-     * @note The permutation is STORED but not APPLIED. Rewriting the
-     *       on-disk `topology_*.csr` sidecar requires a full rebuild
-     *       and is deferred to a future Phase 5+ task. The infra is
-     *       laid here so when `gnn_offline_sample` learns to persist
-     *       `node_counts.bin` (Phase 5), the permutation becomes
-     *       available to downstream consumers.
+     * @note The permutation is STORED but not APPLIED to disk. Rewriting the
+     *       on-disk `topology_*.csr` sidecar to the reordered layout requires
+     *       a full file rebuild pass and is not yet implemented; the
+     *       permutation vector is exposed here so that a future pass can
+     *       consume it directly without re-running the MinHash computation.
      */
     void compute_l3_minhash_reorder_(bool warm_start_used);
 
@@ -477,10 +547,11 @@ private:
                                                        owned_l3_rev_;
     std::vector<uint8_t>                               owned_tier_assignment_;
 
-    // Phase 4 / T13.11: MinHash permutation over L3-tier nodes. Empty on
-    // cold start (no `node_counts.bin` yet) — populated only when warm
-    // start is reached. Currently stored but not applied; future work
-    // (Phase 5+) consumes it to rewrite the L3 sidecar layout.
+    // MinHash permutation over L3-tier nodes for disk-read locality.
+    // Empty on cold start (no `node_counts.bin` yet) — populated only when
+    // a prior sample run has written that access-count file (warm start).
+    // Currently stored but not applied to the on-disk sidecar; a future
+    // reorder pass will consume it to rewrite the L3 sidecar layout.
     std::vector<uint64_t>                              l3_reorder_permutation_;
 
     // References to whichever tier sources are active (owned-or-borrowed).
@@ -507,6 +578,12 @@ private:
     bool                                               built_         = false;
 
     Config                                             config_;
+
+    // Optional device-visible view over the global topology CSR for GPU-UVA
+    // sampling. Declared LAST so it is destroyed FIRST — its cudaHostUnregister
+    // must run before the L3 sidecar readers / L2 caches it pins are freed.
+    // nullptr unless enable_pinned_gpu_view() registered one.
+    std::unique_ptr<PinnedTopologyView>                pinned_view_;
 };
 
 }  // namespace mdb::gnn

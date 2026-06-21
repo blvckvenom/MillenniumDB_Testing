@@ -58,8 +58,9 @@ void TopologyFrequencyProfiler::compute(EdgeOrientation direction) {
 }
 
 bool TopologyFrequencyProfiler::compute_from_node_counts_(EdgeOrientation direction) {
-    // Spec #13 Phase 5 (T13.2 reader half) — read `<projection_dir>/
-    // node_counts.bin` if present. Format:
+    // Warm-start reader for the Four-Level Topology Store (L1 RAM hash /
+    // L2 compact uint32 CSR / L3 mmap sidecar / L4 direct B+Tree): reads
+    // `<projection_dir>/node_counts.bin` if present. Format:
     //
     //   [8B magic "NODECNT0"]
     //   [uint64_t num_nodes]
@@ -164,8 +165,8 @@ void TopologyFrequencyProfiler::compute_from_degrees_(EdgeOrientation direction)
     // 8-bit type tag plus the 56-bit value. Production projected nodes carry
     // `ObjectId::MASK_NODE` (0xD4'00...) and enumerate row ordinals 0..N-1
     // in the value bits (`row_idx == ObjectId.id & VALUE_MASK`, the same
-    // invariant `FourLevelTopologyStore::row_lookup_` and the Spec #4-B
-    // sidecar ROW_PTR layout rely on). Ranging with the bare ordinal
+    // invariant `FourLevelTopologyStore::row_lookup_` and the mmap-backed
+    // topology CSR sidecar ROW_PTR layout (topology_{fwd,rev}.csr) rely on). Ranging with the bare ordinal
     // `ObjectId(i)` matches no tagged key, so every node would profile as
     // degree 0 — collapsing `avg_degree` to 0 and letting the L1/L2 budget
     // account only the fixed per-node overhead against a 56 + 16*deg

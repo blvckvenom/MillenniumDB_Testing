@@ -14,14 +14,14 @@
 // Fallback-first architecture (§3.4): missing / malformed / stale sidecars
 // are NOT errors. `open()` always succeeds (modulo out-of-memory during its
 // own construction) and returns a reader whose `has_data() == false`. The
-// caller — today `TopologyAccessor::Impl` (T4.7), tomorrow anything that
+// caller — today `TopologyAccessor::Impl`, tomorrow anything that
 // wants the fast path — is expected to branch on `has_data()` and fall back
 // to the existing B+Tree path when the sidecar is absent. A single log line
 // per failure mode is emitted on stderr for debuggability; there is no
 // throw / no return-code on open.
 //
 // Staleness (SHA-256 of the source `.leaf`) is validated separately by
-// `verify_source_sha256()`. As of T4.10, `open()` runs the verification
+// `verify_source_sha256()`. `open()` runs the verification
 // after structural validation and collapses a mismatch into the same
 // has_data()==false fallback path used for the "sidecar absent" case.
 //
@@ -106,10 +106,13 @@ public:
     }
 
     /// On-disk COL_IDX / EDGE_IDS element width in bytes: 8 (full tagged
-    /// ObjectId, default) or 4 (Spec #6 tag-stripped uint32). Returns the
-    /// default width when `has_data() == false`. Callers that need a single
-    /// width-agnostic code path should use `copy_neighbors()` / `degree()`
-    /// rather than branching on this.
+    /// ObjectId, default) or 4 (compact uint32 sidecar variant, which strips
+    /// the 8-bit ObjectId type tag and stores only the 56-bit payload ordinal,
+    /// halving sidecar size; the type tag is reconstructed on read via
+    /// `dst_type_tag()` / `edge_type_tag()`). Returns the default width when
+    /// `has_data() == false`. Callers that need a single width-agnostic code
+    /// path should use `copy_neighbors()` / `degree()` rather than branching
+    /// on this.
     uint8_t  id_width() const noexcept {
         return has_data_ ? header_.id_width : kTopologySnapshotIdWidth;
     }
@@ -174,6 +177,16 @@ public:
     /// Returns nullptr unless `has_data()`, `id_width()==4`, and `has_edge_ids()`.
     const uint32_t* edge_ids32_row(uint64_t node_idx) const;
 
+    /// Base pointer of the full ROW_PTR[num_nodes()+1] section (always uint64).
+    /// nullptr when `has_data() == false`. This whole-section view exists so the
+    /// dynamic GPU sampling path can pin the entire global CSR (ROW_PTR + the
+    /// narrow COL_IDX) as one device-visible substrate without a per-node walk.
+    const uint64_t* row_ptr_base() const noexcept { return row_ptr_; }
+    /// Base pointer of the full narrow (id_width==4) COL_IDX[num_edges()] section.
+    /// nullptr unless `has_data()` and `id_width() == 4` (the uint32 layout).
+    /// Values are tag-stripped uint32 ordinals; reconstruct via `dst_type_tag()`.
+    const uint32_t* col_idx32_base() const noexcept { return col_idx32_; }
+
     /// Re-advise the kernel about the access pattern over the mmap'd file.
     /// `open()` sets MADV_RANDOM (correct for the seed-driven runtime sampler).
     /// A forward, offset-monotone scan (the four-level populate) should flip to
@@ -184,9 +197,17 @@ public:
     /// `sequential=true` → MADV_SEQUENTIAL; `false` → MADV_RANDOM.
     void advise_access(bool sequential) const noexcept;
 
+    /// Asynchronously prefetch the COL_IDX bytes of rows [start_row, end_row)
+    /// via `madvise(MADV_WILLNEED)`. Used by the ascending populate scan to keep
+    /// a window of the sidecar in flight AHEAD of the cursor — raising the NVMe
+    /// queue depth above the default readahead window that MADV_SEQUENTIAL alone
+    /// reaches (the populate is QD1-I/O-bound on the 27.6 GB sidecar). Best-
+    /// effort perf hint only: clamped to range, no-op when no data, never throws.
+    void prefetch_rows(uint64_t start_row, uint64_t end_row) const noexcept;
+
     /// Access the parsed header. Zero-initialized when `has_data() == false`.
-    /// Downstream components (T4.10) use `header().source_sha256` as the
-    /// staleness gate against the projection's source `.leaf`.
+    /// Downstream components use `header().source_sha256` as the staleness
+    /// gate against the projection's source `.leaf`.
     const TopologySnapshotHeader& header() const noexcept { return header_; }
 
     /// Staleness check vs the source `.leaf` file.

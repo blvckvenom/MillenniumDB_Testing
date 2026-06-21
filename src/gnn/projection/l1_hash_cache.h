@@ -11,10 +11,12 @@ namespace mdb::gnn {
 
 /**
  * @brief Tier-1 (RAM hot) adjacency cache for the Four-Level Topology
- *        Store (Spec #13 Phase 2 / T13.4).
+ *        Store (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar /
+ *        L4 direct B+Tree), frequency-tiered.
  *
  * Lifts the in-memory `unordered_map<uint64_t, vector<AdjEntry>>` that
- * Spec #11 (`TopologyAccessor::Impl::fwd_cache_` / `rev_cache_`) builds
+ * the earlier in-memory adjacency cache
+ * (`TopologyAccessor::Impl::fwd_cache_` / `rev_cache_`) built
  * unconditionally for ALL nodes into a free-standing class that only
  * accepts inserts for nodes flagged tier 1 by the
  * `TopologyFrequencyProfiler`'s `compute_tier_assignment()` output.
@@ -22,16 +24,16 @@ namespace mdb::gnn {
  * the upper-tier dispatch in `FourLevelTopologyStore` stays uniform
  * (every cache "tries" to insert; only the right one keeps the data).
  *
- * The cache is **build-time mutable, runtime read-only** (Spec #13
- * design D7). Callers populate it once during `build()`, then issue
- * `get()` queries from any number of sampler threads. There is no
- * concurrent `insert()` after the build completes — enforcing that is
- * the orchestrator's responsibility.
+ * The cache is **build-time mutable, runtime read-only**. Callers
+ * populate it once during `build()`, then issue `get()` queries from
+ * any number of sampler threads. There is no concurrent `insert()` after
+ * the build completes — enforcing that is the orchestrator's
+ * responsibility.
  *
  * Memory accounting consumes the `kL1*` constants from
- * `topology_frequency_profiler.h` (Spec #13 Phase 1 contract) so the
- * profiler's tier-sizing math and the runtime's `total_bytes()`
- * diagnostic stay in lockstep.
+ * `topology_frequency_profiler.h` (the frequency-profiler's tier-sizing
+ * contract) so the profiler's tier-sizing math and the runtime's
+ * `total_bytes()` diagnostic stay in lockstep.
  */
 class L1HashCache {
 public:
@@ -40,9 +42,10 @@ public:
      *        per-node neighbor vector.
      *
      * Mirrors the `ConstU64Span`-style return shape used by
-     * `TopologySnapshotReader::neighbors()` (Spec #4-B), but typed for
-     * `AdjEntry`. The `data` pointer is owned by the cache and remains
-     * valid until the cache is destroyed.
+     * `TopologySnapshotReader::neighbors()` (the mmap-backed CSR sidecar
+     * reader that delivers O(1) neighbor slices from topology_{fwd,rev}.csr),
+     * but typed for `AdjEntry`. The `data` pointer is owned by the cache
+     * and remains valid until the cache is destroyed.
      */
     struct Span {
         const AdjEntry* data = nullptr;

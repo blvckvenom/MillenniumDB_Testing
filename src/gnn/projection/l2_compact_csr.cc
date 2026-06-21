@@ -131,7 +131,8 @@ L2CompactCsr::ColIdxSpan L2CompactCsr::get(uint64_t src_node_id) const {
 }
 
 std::size_t L2CompactCsr::total_bytes() const {
-    // Per Spec #13 Phase 1 contract:
+    // Cost model used by the Four-Level Topology Store tier-assignment
+    // phase to decide how many nodes can fit in the L2 budget:
     //   bytes(node) = kL2NodeFixedOverhead + kL2PerEdgeBytes * degree
     // (Upper bound — see header note on the edge_ids decision.)
     std::size_t bytes = 0;

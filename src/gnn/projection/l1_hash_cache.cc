@@ -36,13 +36,14 @@ bool L1HashCache::contains(uint64_t src_node_id) const {
 }
 
 std::size_t L1HashCache::total_bytes() const {
-    // Per Spec #13 Phase 1 contract (topology_frequency_profiler.h):
+    // Per the topology-frequency profiler contract (topology_frequency_profiler.h):
     //   bytes(node) = kL1NodeFixedOverhead + kL1PerEdgeBytes * degree
     //
     // The constant captures the hash-bucket + vector-header overhead
     // (kL1NodeFixedOverhead = 56) plus 16 bytes per AdjEntry
-    // (kL1PerEdgeBytes = 16). The profiler relies on this same number
-    // to size L1 from the configured budget.
+    // (kL1PerEdgeBytes = 16). The profiler relies on this same formula
+    // to compute how many high-frequency nodes fit in the L1 RAM budget
+    // before spilling the remainder to the L2 compact CSR or lower tiers.
     std::size_t bytes = 0;
     for (const auto& kv : entries_) {
         bytes += kL1NodeFixedOverhead;

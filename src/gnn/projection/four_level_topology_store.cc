@@ -8,17 +8,22 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
+#include "gnn/projection/pinned_topology_view.h"
 #include "gnn/projection/topology_accessor.h"
 #include "gnn/projection/topology_frequency_profiler.h"
 #include "gnn/sampling/minhash_reorderer.h"
+#include "gnn/sampling/sampling_backend_plan.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
 #include "misc/available_ram.h"
@@ -52,7 +57,8 @@ void scan_index_into_(
 // Read the cumulative "read_bytes" counter from /proc/self/io — the bytes
 // this process actually fetched from the block device (NOT page-cache hits).
 // Used to measure the physical/logical read amplification of the populate
-// phase under MADV_RANDOM (Spec #6 rank-1 instrumentation). Returns 0 on any
+// phase under MADV_RANDOM (i.e., how many bytes the kernel had to read from
+// disk vs. how many logical bytes the L1/L2 tier covers). Returns 0 on any
 // failure (non-Linux, permission, parse) so the diagnostic degrades silently.
 uint64_t read_proc_io_read_bytes_() {
     std::ifstream f("/proc/self/io");
@@ -156,6 +162,56 @@ bool FourLevelTopologyStore::is_built() const noexcept {
     return built_;
 }
 
+void FourLevelTopologyStore::enable_pinned_gpu_view(
+    const SamplingBackendPlan& plan)
+{
+    // Always drop any prior view first (idempotent; unregisters before re-pin).
+    pinned_view_.reset();
+
+    if (plan.backend == SamplingBackend::CPU_OUT_OF_CORE) {
+        return;  // CPU path: nothing to pin.
+    }
+
+    // Substrate A: the global L3 sidecar (full ROW_PTR + narrow uint32 COL_IDX)
+    // covers every node by dense row, so it is the correctness-complete pinnable
+    // CSR. Only the narrow (id_width==4) layout is pinnable as uint32.
+    auto make_arrays =
+        [](const GQL::Projection::TopologySnapshotReader* r) -> HostCsrArrays {
+        HostCsrArrays a;
+        if (r != nullptr && r->has_data() && r->id_width() == 4) {
+            a.row_ptr      = r->row_ptr_base();
+            a.col_idx      = r->col_idx32_base();
+            a.n_rows       = r->num_nodes();
+            a.n_edges      = r->num_edges();
+            a.dst_type_tag = static_cast<uint64_t>(r->dst_type_tag()) << 56;
+        }
+        return a;  // null arrays => the view skips this direction
+    };
+
+    const bool want_fwd = plan.directions == GpuDirections::FORWARD_ONLY ||
+                          plan.directions == GpuDirections::BOTH;
+    const bool want_rev = plan.directions == GpuDirections::REVERSE_ONLY ||
+                          plan.directions == GpuDirections::BOTH;
+
+    HostCsrArrays fwd = want_fwd ? make_arrays(l3_fwd_) : HostCsrArrays{};
+    HostCsrArrays rev = want_rev ? make_arrays(l3_rev_) : HostCsrArrays{};
+
+    // No pinnable global substrate present (no narrow L3 sidecar for the wanted
+    // directions) => stay on the CPU path.
+    if (fwd.row_ptr == nullptr && rev.row_ptr == nullptr) {
+        return;
+    }
+
+    auto view = std::make_unique<PinnedTopologyView>();
+    view->build_and_register(fwd, rev);
+    // Keep the view only if registration actually happened (a GPU was present).
+    // Without a GPU at runtime build_and_register is a no-op and the CPU path is
+    // left entirely unaffected.
+    if (view->is_registered()) {
+        pinned_view_ = std::move(view);
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  build()
 // ---------------------------------------------------------------------------
@@ -165,7 +221,8 @@ void FourLevelTopologyStore::auto_detect_budgets_(
     std::size_t& l2_bytes) const
 {
     // Total cache budget = 70% of MemAvailable. Of that, 25% goes to
-    // L1 and 75% goes to L2 — as documented in design §2.2 / D2.
+    // L1 and 75% goes to L2 — the default RAM split for the two in-memory
+    // tiers.
     const uint64_t mem_available = get_mem_available();
     const uint64_t total_cache = (mem_available * 7ULL) / 10ULL;
     if (config_.l1_budget_mb > 0) {
@@ -188,12 +245,12 @@ void FourLevelTopologyStore::populate_direction_(
     std::unique_ptr<L1HashCache>&                          l1_out,
     std::unique_ptr<L2CompactCsr>&                         l2_out) const
 {
-    // Phase 4 / T13.10: prefer the Spec #4-B sidecar fast path when one
-    // was opened for this direction. The sidecar exposes O(1) per-node
-    // mmap reads, so populating L1/L2 from it is ~10-20× faster than
-    // walking the BPT directory + leaf chain. Streaming determinism is
-    // preserved because both paths traverse row_idx ascending and call
-    // `L2CompactCsr::add_node` in the same order — `node_to_l2_idx_`
+    // Prefer the mmap-backed CSR sidecar fast path (topology_{fwd,rev}.csr)
+    // when one was opened for this direction. The sidecar exposes O(1)
+    // per-node neighbor slices via mmap, so populating L1/L2 from it is
+    // ~10-20× faster than walking the BPT directory + leaf chain. Streaming
+    // determinism is preserved because both paths traverse row_idx ascending
+    // and call `L2CompactCsr::add_node` in the same order — `node_to_l2_idx_`
     // is bit-identical between the two paths.
     if (sidecar != nullptr && sidecar->has_data()) {
         populate_direction_via_sidecar_(*sidecar, tiers, frequency,
@@ -209,17 +266,18 @@ void FourLevelTopologyStore::populate_direction_(
         return;
     }
 
-    // Streaming distribution (Spec #13 Phase 3, refined for papers100M
-    // peak-RSS bound): walk the BPT once in (src, dst, edge_id) lex
-    // order, buffer the current src's neighbors in a single staging
-    // vector, and flush to L1 / L2 / drop the moment src advances.
+    // Streaming distribution into the Four-Level Topology Store tiers
+    // (designed to bound peak RSS on large graphs): walk the BPT once in
+    // (src, dst, edge_id) lex order, buffer the current src's neighbors
+    // in a single staging vector, and flush to L1 / L2 / drop the moment
+    // src advances.
     //
     // Why streaming: the previous "materialize vector<vector<AdjEntry>>(N)
     // first" approach allocated an outer header (24 B × N) plus per-node
     // inner vectors for ALL N nodes — including tier-3 / tier-4 nodes that
     // get immediately dropped. On papers100M (110 M nodes × ~30 directed
     // edges/node) the transient peak was ~50 GB, exceeding the 30 GB
-    // commodity-RAM target Spec #13 was designed to hit.
+    // commodity-RAM target the Four-Level Topology Store was designed to hit.
     //
     // Streaming bounds the transient at:
     //   O(max_node_degree × sizeof(AdjEntry)) = O(deg_max × 16 B).
@@ -247,7 +305,7 @@ void FourLevelTopologyStore::populate_direction_(
 
     // BPT records carry the full ObjectId (8-bit type tag in the high byte
     // + 56-bit value payload). The tier vector and L1/L2 caches are dense-
-    // row-indexed (matching the Spec #4-B sidecar's ROW_PTR layout and
+    // row-indexed (matching the mmap CSR sidecar's ROW_PTR layout and
     // mirroring the masking convention that
     // populate_direction_via_sidecar_ uses), so we strip the type tag
     // here at the boundary. Without this both:
@@ -334,15 +392,16 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     l1_out = std::make_unique<L1HashCache>(tiers);
     l2_out = std::make_unique<L2CompactCsr>(/*hint=*/0);
 
-    // Rank-2 (Spec #6 follow-up): the populate scans the sidecar forward in
-    // file offset (ascending row_idx → ascending row_ptr). The open()-time
-    // MADV_RANDOM disables readahead → the scan faults pages one-at-a-time at
-    // QD1 (measured: ~98% of the 27.6 GB sidecar faulted @ 55 MB/s, dominating
-    // build() at 489s/62%). MADV_SEQUENTIAL for the scan gives the kernel
-    // aggressive readahead AND frees pages behind the cursor (lower peak cache
-    // than RANDOM — addresses the 5.5 GB-margin worry), then we restore
-    // MADV_RANDOM for the seed-driven runtime sampler. Pure perf hint (cannot
-    // change the bytes read), RAII-restored on any exit. Opt-out:
+    // The sidecar is opened with MADV_RANDOM (disables readahead) for the
+    // runtime sampler, but this populate scan reads rows in ascending order
+    // (row_idx 0..N-1 → ascending file offset). Without sequential advice
+    // the scan faults pages one-at-a-time at QD1 (measured: ~98% of the
+    // 27.6 GB uint32 topology sidecar faulted @ 55 MB/s, dominating build()
+    // at 489s/62%). Issuing MADV_SEQUENTIAL for the duration of the scan
+    // gives the kernel aggressive readahead AND frees pages behind the
+    // cursor (lower peak cache pressure), then restores MADV_RANDOM for the
+    // seed-driven runtime sampler. Pure perf hint (cannot change the bytes
+    // read), RAII-restored on any exit. Opt-out:
     // MDB_GNN_NO_POPULATE_SEQUENTIAL=1 for A/B.
     struct SeqAdviseGuard {
         const GQL::Projection::TopologySnapshotReader* r;
@@ -361,6 +420,22 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     const uint64_t num_nodes = sidecar.num_nodes();
     const bool     has_eids  = sidecar.has_edge_ids();
 
+    // MADV_WILLNEED ahead-prefetch (default ON; opt-out MDB_GNN_NO_POPULATE_PREFETCH=1).
+    // MADV_SEQUENTIAL above gives readahead but is capped by the kernel's default
+    // window; explicitly prefetching a large COL_IDX window AHEAD of the cursor
+    // keeps more of the 27.6 GB sidecar in flight, raising the NVMe queue depth.
+    // Pure perf hint; correctness-neutral.
+    const bool do_prefetch = []() {
+        const char* off = std::getenv("MDB_GNN_NO_POPULATE_PREFETCH");
+        return !(off && (off[0] == '1' || off[0] == 't' || off[0] == 'T'));
+    }();
+    constexpr uint64_t kPrefetchStride = 1ull << 20;  // ~1M rows / window
+    uint64_t next_prefetch_row = 0;
+    if (do_prefetch) {
+        sidecar.prefetch_rows(0, std::min<uint64_t>(2 * kPrefetchStride, num_nodes));
+        next_prefetch_row = 2 * kPrefetchStride;
+    }
+
     // Walk row_idx in [0, num_nodes) ascending — same order the BPT path
     // observes via lex-sorted (src, dst, edge_id) iteration. `tier_lookup_`
     // is also indexed by row_idx (== ObjectId.id under the current
@@ -376,6 +451,11 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     std::vector<uint64_t> dst_scratch;
     std::vector<uint64_t> eid_scratch;
     for (uint64_t row_idx = 0; row_idx < num_nodes; ++row_idx) {
+        if (do_prefetch && row_idx >= next_prefetch_row && next_prefetch_row < num_nodes) {
+            sidecar.prefetch_rows(next_prefetch_row,
+                                  std::min<uint64_t>(next_prefetch_row + kPrefetchStride, num_nodes));
+            next_prefetch_row += kPrefetchStride;
+        }
         if (row_idx >= tiers.size()) break;  // tier vector exhausted
         const uint8_t tier = tiers[row_idx];
         if (tier != 1 && tier != 2) continue;  // skip L3 / L4
@@ -447,27 +527,28 @@ void FourLevelTopologyStore::open_l3_sidecars_() {
 }
 
 void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
-    // Phase 5 / T13.11 — frequency-aware L3 reorder via Spec #5
-    // MinHashReorderer (DiskGNN Algorithm 1, SEGMENTED variant).
+    // Compute a frequency-aware MinHash reorder permutation for the L3
+    // tier, using the SEGMENTED variant of the MinHashReorderer
+    // (matching DiskGNN Algorithm 1).
     //
-    // The reorder originally calls for per-batch access sets (the
-    // `BatchProvider` callback drives MinHash through every batch's
-    // accessed-node set). Phase 5 ships **Option B** of the design:
-    // frequency-band clustering using only the per-node access counts
-    // already persisted in `<projection_dir>/node_counts.bin`. Nodes
-    // are bucketed into N synthetic frequency bins (log-spaced) and
-    // each bin is fed to MinHash as a "batch". The resulting
-    // permutation clusters L3-tier nodes by access-frequency similarity
-    // instead of true co-access (DiskGNN's Option A), which captures
-    // ~50 % of the spatial-locality value with zero new on-disk
-    // artifact. Option A (`batch_access_sets.bin`) is reserved for a
-    // follow-up spec; the call site here is shaped so the upgrade is
-    // purely a `BatchProvider` swap.
+    // The reorder ideally uses per-batch access sets (the `BatchProvider`
+    // callback drives MinHash through every batch's accessed-node set).
+    // This implementation uses **Option B**: frequency-band clustering
+    // from the per-node access counts already persisted in
+    // `<projection_dir>/node_counts.bin`. Nodes are bucketed into N
+    // synthetic frequency bins (log-spaced) and each bin is fed to
+    // MinHash as a "batch". The resulting permutation clusters L3-tier
+    // nodes by access-frequency similarity instead of true co-access
+    // (DiskGNN's Option A), which captures ~50% of the spatial-locality
+    // value with zero new on-disk artifact. Option A
+    // (`batch_access_sets.bin`) can be wired in later as a pure
+    // `BatchProvider` swap.
     //
-    // SCOPE LIMIT (carry-over from Phase 4): the permutation is STORED
-    // in `l3_reorder_permutation_` but NOT applied to the on-disk
+    // SCOPE LIMIT: the permutation is STORED in
+    // `l3_reorder_permutation_` but NOT applied to the on-disk
     // `topology_*.csr` sidecar — that rewrite requires a full sidecar
-    // rebuild and is deferred to Spec #14+.
+    // rebuild and is deferred to a future pass that rewrites the sidecar
+    // in-place using the computed permutation.
     l3_reorder_permutation_.clear();
 
     if (!warm_start_used) {
@@ -595,8 +676,9 @@ void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
     std::cerr << "[FourLevelTopologyStore] Warm start activated — "
               << "computed MinHash permutation over " << l3_node_ids.size()
               << " L3-tier nodes via " << kNumBins
-              << " frequency bins (Option B; stored only — Spec #14+ "
-              << "applies it to the on-disk sidecar).\n";
+              << " frequency bins (frequency-band clustering; stored only "
+              << "— applying it to the on-disk sidecar is deferred to a "
+              << "future pass).\n";
 }
 
 void FourLevelTopologyStore::build() {
@@ -611,13 +693,13 @@ void FourLevelTopologyStore::build() {
             "store to rebuild");
     }
 
-    // Rank-1 build-phase instrumentation (Spec #6 follow-up): split the
-    // otherwise-opaque build() wall-clock into open/SHA, profile, MinHash,
-    // and populate spans, plus the physical bytes faulted during populate
+    // Build-phase per-span instrumentation: split the otherwise-opaque
+    // build() wall-clock into open/SHA, profile, MinHash, and populate
+    // spans, plus the physical bytes faulted during populate
     // (/proc/self/io read_bytes). Emitted once to stderr next to the
-    // "built — ..." summary so the server log carries the breakdown without
-    // any cross-layer yield plumbing. Pure observation — never branches the
-    // build, cannot perturb sampling output.
+    // "built — ..." summary so the server log carries the breakdown
+    // without any cross-layer yield plumbing. Pure observation — never
+    // branches the build, cannot perturb sampling output.
     using clk_ = std::chrono::steady_clock;
     double sha_ms = 0.0, profile_ms = 0.0, minhash_ms = 0.0, populate_ms = 0.0;
     uint64_t io_read_before = 0, io_read_after = 0;
@@ -627,9 +709,10 @@ void FourLevelTopologyStore::build() {
     std::size_t l2_bytes = 0;
     auto_detect_budgets_(l1_bytes, l2_bytes);
 
-    // Step 1.5: open Spec #4-B sidecars early (Phase 4 / T13.10) so that
-    // populate_direction_ can use the mmap fast path instead of walking
-    // the BPT. The opens are no-ops when the sidecar files are absent
+    // Step 1.5: open the mmap-backed CSR sidecar files (topology_fwd.csr /
+    // topology_rev.csr) early so that populate_direction_ can use the
+    // O(1)-slice fast path instead of walking the BPT directory + leaf
+    // chain. The opens are no-ops when the sidecar files are absent
     // (e.g., projection built without buildTopologySnapshot:true) or
     // stale — in which case populate_direction_ falls through to the
     // BPT path automatically. open() also runs the source-.leaf SHA-256
@@ -716,21 +799,21 @@ void FourLevelTopologyStore::build() {
         // The `avg_degree` passed to `compute_tier_assignment` is used
         // ONLY to estimate bytes-per-node when packing the L1/L2
         // budgets. It must reflect actual graph degree, NOT access
-        // frequency: when the `frequency` vector is sparse (e.g. the
-        // Plan E walk-profiler counts after a cold start, where many
-        // entries are 0 or 1), `total_freq/N` collapses to near zero
-        // and the heuristic mistakenly believes every node costs only
-        // its fixed overhead — packing the entire graph into L1/L2 and
-        // leaving L3 empty. Real per-node cost is then 10-100× higher,
-        // causing populate_direction_ to overrun the intended RAM
-        // envelope and dominate the build phase.
+        // frequency: when the `frequency` vector is sparse (e.g. after
+        // a cold-start random-walk profile pass where many entries are
+        // 0 or 1), `total_freq/N` collapses to near zero and the
+        // heuristic mistakenly believes every node costs only its fixed
+        // overhead — packing the entire graph into L1/L2 and leaving
+        // L3 empty. Real per-node cost is then 10-100× higher, causing
+        // populate_direction_ to overrun the intended RAM envelope and
+        // dominate the build phase.
         //
-        // Prefer the Spec #4-B sidecar's `num_edges` / `num_nodes`
-        // ratio when available (constant-time read from the mmap'd
-        // header). Fall back to the access-count proxy only when no
-        // sidecar is open — in that case the cold-start path is
-        // already running with limited info and the heuristic can
-        // misestimate (callers can override via explicit budgets).
+        // Prefer the mmap CSR sidecar's `num_edges` / `num_nodes` ratio
+        // when available (constant-time read from the mmap'd header).
+        // Fall back to the access-count proxy only when no sidecar is
+        // open — in that case the cold-start path is already running
+        // with limited info and the heuristic can misestimate (callers
+        // can override via explicit budgets).
         double avg_degree = 0.0;
         if (l3_rev_ != nullptr && l3_rev_->has_data() && l3_rev_->num_nodes() > 0) {
             avg_degree = static_cast<double>(l3_rev_->num_edges()) /
@@ -748,10 +831,11 @@ void FourLevelTopologyStore::build() {
             freq, l1_bytes, l2_bytes, avg_degree);
         tier_lookup_ref_ = &owned_tier_assignment_;
 
-        // Phase 4 / T13.11: compute MinHash reorder permutation when
-        // warm-start data is available. Cold-start path emits a single
-        // info log and leaves the permutation empty (no-op until Phase
-        // 5 wires up node_counts.bin in gnn_offline_sample).
+        // Compute the MinHash reorder permutation for the L3 tier when
+        // warm-start data (node_counts.bin) is available. On a cold
+        // start, compute_l3_minhash_reorder_ emits a single info log
+        // and leaves the permutation empty (no-op until a prior
+        // gnn_offline_sample run has written node_counts.bin).
         {
             auto t0 = clk_::now();
             compute_l3_minhash_reorder_(profiler.warm_start_used());
@@ -763,6 +847,39 @@ void FourLevelTopologyStore::build() {
         // read_bytes around them to expose the physical read amplification.
         io_read_before = read_proc_io_read_bytes_();
         auto t_pop = clk_::now();
+
+        // Opt-in parallel populate (MDB_GNN_POPULATE_PARALLEL=1, default OFF):
+        // for UNDIRECTED orientation both directions must be populated, and they
+        // are INDEPENDENT — disjoint L1/L2 outputs (owned_l1_fwd_/owned_l2_fwd_
+        // vs *_rev_), read-only shared tier_assignment + freq, separate L3
+        // sidecars. The sidecar populate path is mmap-only (no BPT walk, hence
+        // no QueryContext thread_local requirement). Running fwd on a worker
+        // thread and rev on this thread overlaps the QD1-I/O-bound populate
+        // (the dominant build cost on papers100M). Output is bit-identical to
+        // the sequential path (each direction writes only its own caches);
+        // validate via sampleContentFp OFF==ON. Default OFF => sequential.
+        const bool s1a_parallel_populate =
+            (config_.orientation == EdgeOrientation::UNDIRECTED) &&
+            []() {
+                const char* e = std::getenv("MDB_GNN_POPULATE_PARALLEL");
+                return e != nullptr && std::string(e) == "1";
+            }();
+
+        if (s1a_parallel_populate) {
+            std::exception_ptr fwd_ex;
+            std::thread tf([&]() {
+                try {
+                    populate_direction_(fwd_bpt_, owned_tier_assignment_, freq,
+                                        l3_fwd_, owned_l1_fwd_, owned_l2_fwd_);
+                } catch (...) {
+                    fwd_ex = std::current_exception();
+                }
+            });
+            populate_direction_(rev_bpt_, owned_tier_assignment_, freq,
+                                l3_rev_, owned_l1_rev_, owned_l2_rev_);
+            tf.join();
+            if (fwd_ex) std::rethrow_exception(fwd_ex);
+        } else {
 
         // Build forward direction when needed.
         if (config_.orientation == EdgeOrientation::NATURAL ||
@@ -789,6 +906,8 @@ void FourLevelTopologyStore::build() {
             owned_l2_rev_ = std::make_unique<L2CompactCsr>(0);
             owned_l2_rev_->freeze();
         }
+
+        }  // end sequential populate (MDB_GNN_POPULATE_PARALLEL=0)
 
         populate_ms = elapsed_ms_(t_pop, clk_::now());
         io_read_after = read_proc_io_read_bytes_();
@@ -838,20 +957,20 @@ void FourLevelTopologyStore::build() {
         };
     }
 
-    // Default row_lookup_ for the Phase 3 ctor: strip the 8-bit ObjectId
+    // Default row_lookup_ for the build-ctor path: strip the 8-bit ObjectId
     // type tag to recover the dense row index. Production projections
     // (cora_gnn, ogbn-*, papers100M) enumerate row indices 0..N-1 and the
     // row_idx == (ObjectId.id & VALUE_MASK) assumption holds — matching
     // the TopologyFrequencyProfiler's degree pass that ran at row index
-    // `i == ObjectId(i).get_value()` and the Spec #4-B sidecar's dense
+    // `i == ObjectId(i).get_value()` and the mmap CSR sidecar's dense
     // ROW_PTR layout (writer at native_projection_builder.cc:2552 uses
     // `(*rec)[0] & ObjectId::VALUE_MASK` for the same reason). The
     // tag-bearing variant (`v.id`) drove every lookup past
     // `tier_lookup_ref_->size()` and silently fell through to the L4
     // BPT path, defeating the entire cache hierarchy and emitting the
-    // "ObjectId.id=… exceeds tier_lookup_ size=…" warning observed by
-    // the Spec #13 bench harness. When a projection ever moves to a
-    // non-identity RowMapping this closure is the single point of update.
+    // "ObjectId.id=… exceeds tier_lookup_ size=…" out-of-range warning.
+    // When a projection ever moves to a non-identity RowMapping this
+    // closure is the single point of update.
     row_lookup_ = [](ObjectId v) -> uint64_t { return v.get_value(); };
 
     built_ = true;
@@ -868,9 +987,10 @@ void FourLevelTopologyStore::build() {
               << " ram_used=" << total_ram_used()
               << " bytes\n";
 
-    // Rank-1 build-phase split (Spec #6 follow-up). populateBytesFaulted is
-    // the physical block-device read during populate; compare to the logical
-    // tier-1/2 sidecar bytes to see the MADV_RANDOM read amplification.
+    // Emit per-span build timing. populateBytesFaulted is the physical
+    // block-device read during populate (/proc/self/io read_bytes delta);
+    // compare to the logical tier-1/2 sidecar bytes to measure the
+    // MADV_RANDOM read amplification of the populate phase.
     const double pop_mb_per_s =
         (populate_ms > 0.0)
             ? (static_cast<double>(io_read_after - io_read_before) / 1e6)
@@ -964,9 +1084,9 @@ FourLevelTopologyStore::dispatch_(
     const bool row_in_range = (row_idx < tier_lookup_ref_->size());
 
     if (!row_in_range) {
-        // Spec #13 RowMapping assumption guard: production projections
-        // built today have an identity row_idx == ObjectId.id. A miss
-        // here means a future projection moved to a non-identity
+        // The Four-Level Topology Store currently assumes an identity
+        // RowMapping (row_idx == ObjectId.id with type tag stripped). A
+        // miss here means a future projection moved to a non-identity
         // RowMapping without updating the row_lookup_ closure (or the
         // caller queried a node id outside the projection altogether).
         // We fall through to L4 (correct, just slow) and emit a single
@@ -978,7 +1098,7 @@ FourLevelTopologyStore::dispatch_(
                       << v.id << " exceeds tier_lookup_ size="
                       << tier_lookup_ref_->size()
                       << " - falling through to L4. The projection's "
-                      << "RowMapping may not be identity (Spec #13 "
+                      << "RowMapping may not be identity (the tiered store "
                       << "currently assumes ObjectId.id == row_idx). "
                       << "Subsequent warnings suppressed.\n";
         }

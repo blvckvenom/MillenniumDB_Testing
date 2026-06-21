@@ -10,7 +10,7 @@
 namespace mdb::gnn {
 
 // ===========================================================================
-// Per-tier memory accounting constants (Spec #13 design §1 / §2.6)
+// Per-tier memory accounting constants for the Four-Level Topology Store
 // ===========================================================================
 //
 // These four constants describe the bytes-per-node and bytes-per-edge cost
@@ -37,7 +37,8 @@ constexpr std::size_t kL2PerEdgeBytes      = 8;
 
 /**
  * @brief Frequency profile of nodes in a projection, used to seed the
- *        Four-Level Topology Store tier assignment (Spec #13).
+ *        Four-Level Topology Store tier assignment (L1 RAM hash / L2 compact
+ *        uint32 CSR / L3 mmap sidecar / L4 direct B+Tree, frequency-tiered).
  *
  * The profiler exposes two source paths:
  *
@@ -46,7 +47,7 @@ constexpr std::size_t kL2PerEdgeBytes      = 8;
  *      This file mirrors DiskGNN's "node access count" technique. Phase 1
  *      keeps this method as a stub that returns false (no warm-start file
  *      consumed) until `gnn_offline_sample` learns to persist the counts
- *      (tracked separately as Spec #13 Phase 2).
+ *      (tracked separately as a future phase).
  *
  *   2. **Cold start** (`compute_from_degrees`): falls back to the node's
  *      out / in / out+in degree (depending on `EdgeOrientation`) as a
@@ -123,14 +124,14 @@ private:
 };
 
 /**
- * @brief Tier assignment helper (Spec #13 D2 / D6).
+ * @brief Tier assignment helper for the Four-Level Topology Store.
  *
  * Greedy partition: nodes are sorted by frequency descending; entries are
  * packed into tier 1 (L1 RAM hash) until `l1_budget_bytes` is exhausted,
  * then into tier 2 (L2 compact CSR) until `l2_budget_bytes` is exhausted,
  * then everything else goes to tier 3 (L3 mmap sidecar / L4 BPT direct).
  *
- * Per-node memory accounting from design §1 / §2.6:
+ * Per-node memory accounting (see constants declared at top of this header):
  *   - L1: `degree(i) * 16 + 56` bytes (16 B per AdjEntry +
  *         24 B vector header + ~32 B hash bucket overhead).
  *   - L2: `degree(i) * 8  +  8` bytes (uint32 col_idx + uint32 edge_id

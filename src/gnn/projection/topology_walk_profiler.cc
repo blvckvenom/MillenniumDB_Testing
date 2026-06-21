@@ -138,7 +138,9 @@ TopologyWalkProfiler::Result TopologyWalkProfiler::profile(
     eligible_weights.reserve(static_cast<std::size_t>(n));
     for (uint64_t i = 0; i < n; ++i) {
         // degree() is width-agnostic and never throws on the narrow (uint32)
-        // layout, unlike neighbors() — see TopologySnapshotReader (Spec #6).
+        // layout, unlike neighbors() — see TopologySnapshotReader (uint32 topology
+        // sidecar: strips the 8-bit ObjectId type tag and reconstructs it on read,
+        // halving topology size; files topology_{fwd,rev}.csr).
         const uint64_t deg = reader.degree(i);
         if (deg > 0) {
             eligible_nodes.push_back(i);

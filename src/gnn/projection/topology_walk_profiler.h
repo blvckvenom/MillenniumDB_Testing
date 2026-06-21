@@ -1,26 +1,29 @@
 #pragma once
 
-// TopologyWalkProfiler — Phase 0 cheap profiler for Spec #13's warm-start
-// dependency.
+// TopologyWalkProfiler — Phase 0 cheap profiler that generates the
+// warm-start dependency for the Four-Level Topology Store
+// (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar / L4 direct
+// B+Tree).
 //
 // Problem this solves
 // -------------------
-// Spec #13's `FourLevelTopologyStore` requires `<projection_dir>/
-// node_counts.bin` to enable the L3 MinHash reorder. The file is normally
-// produced as a side-effect of `gnn_offline_sample` AT THE END of a sample
-// build (after all batches have been generated). This creates a chicken-
-// and-egg dependency: the very first sample on a projection runs in
-// "cold-start" mode where L3 has no reorder, falling back to random mmap
-// access over the Spec #4-B sidecar. On graphs whose sidecar exceeds
+// The `FourLevelTopologyStore` requires `<projection_dir>/node_counts.bin`
+// to enable the L3 MinHash reorder. The file is normally produced as a
+// side-effect of `gnn_offline_sample` AT THE END of a sample build (after
+// all batches have been generated). This creates a chicken-and-egg
+// dependency: the very first sample on a projection runs in "cold-start"
+// mode where L3 has no reorder, falling back to random mmap access over
+// the topology CSR sidecar (mmap-backed files `topology_{fwd,rev}.csr`
+// that provide O(1) neighbor slices). On graphs whose sidecar exceeds
 // available RAM (e.g. papers100M topology_*.csr = 53 GB on a 30 GB host),
 // the cold path thrashes the page cache and the sample never completes.
 //
 // What this profiler does
 // -----------------------
-// Performs `num_walks` random walks of length `walk_length` over the Spec
-// #4-B reverse sidecar (`topology_rev.csr`), incrementing a per-node
-// access-frequency counter at every step. The counts are written in the
-// same on-disk format consumed by `TopologyFrequencyProfiler::
+// Performs `num_walks` random walks of length `walk_length` over the
+// mmap-backed reverse sidecar (`topology_rev.csr`), incrementing a
+// per-node access-frequency counter at every step. The counts are written
+// in the same on-disk format consumed by `TopologyFrequencyProfiler::
 // compute_from_node_counts_`, so the next call to `enable_four_level_store`
 // finds the file and activates the warm-start path automatically.
 //
@@ -83,11 +86,12 @@ public:
     /**
      * @brief Random-walk-based access frequency profiler.
      *
-     * @param reader        Spec #4-B sidecar reader (typically
-     *                      `topology_rev.csr` for REVERSE-orientation
-     *                      sampling). When `!reader.has_data()` the
-     *                      profiler returns an empty Result without
-     *                      performing any walks.
+     * @param reader        Mmap-backed topology CSR sidecar reader
+     *                      (typically `topology_rev.csr` for REVERSE-
+     *                      orientation sampling; provides O(1) neighbor
+     *                      slices via `neighbors(node)`). When
+     *                      `!reader.has_data()` the profiler returns an
+     *                      empty Result without performing any walks.
      * @param num_walks     Number of random walks to perform. Larger →
      *                      higher fidelity, longer runtime. Default
      *                      `kDefaultNumWalks` is calibrated for graphs

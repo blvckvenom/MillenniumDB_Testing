@@ -208,7 +208,7 @@ TopologySnapshotReader TopologySnapshotReader::open(
     }
     const std::size_t file_size = static_cast<std::size_t>(st.st_size);
 
-    // Step 4 — parse header via the T4.3 validator (magic / version /
+    // Step 4 — parse header (validates magic bytes, format version, and
     // id_width). We read via pread here rather than reading through the
     // eventual mmap so that a header-only failure does not leave an mmap
     // mapped + discarded. One syscall is cheap.
@@ -245,9 +245,13 @@ TopologySnapshotReader TopologySnapshotReader::open(
         return reader;
     }
 
-    // Step 5 — file-size invariant (§5.2 step 4).
+    // Step 5 — file-size invariant: verify the file is exactly the size the
+    // header metadata implies.
     // ROW_PTR is always uint64; COL_IDX / EDGE_IDS use the header's id_width
-    // (8 = full tagged ObjectId, 4 = Spec #6 tag-stripped uint32).
+    // (8 = full tagged ObjectId; 4 = tag-stripped uint32, where the 8-bit
+    // ObjectId type tag is stripped at write time and reconstructed on read
+    // by OR-ing the per-section type tag stored in the header, losslessly
+    // halving the topology file size for large graphs).
     // expected = 64 + 8 * (N + 1) + W * M * (has_edge_ids ? 2 : 1)
     const bool has_edge_ids_flag =
         (header.flags & TopologySnapshotFlags::kHasEdgeIds) != 0;
@@ -286,7 +290,8 @@ TopologySnapshotReader TopologySnapshotReader::open(
         // want to log spuriously on every open.
     }
 
-    // Step 8 — ROW_PTR structural invariants (§5.2 step 5).
+    // Step 8 — ROW_PTR structural invariants: ROW_PTR[0]==0, ROW_PTR[N]==M,
+    // and monotonically non-decreasing (verified up to kMonotonicityScanNodeLimit).
     // ROW_PTR lives immediately after the 64-byte header.
     auto* map_bytes = static_cast<const uint8_t*>(map_base);
     const uint64_t* row_ptr = reinterpret_cast<const uint64_t*>(
@@ -369,10 +374,13 @@ TopologySnapshotReader TopologySnapshotReader::open(
     }
     reader.has_data_ = true;
 
-    // Step 9 — staleness gate (§3.3 / T4.10). Re-hash the source `.leaf`
-    // and compare against the digest the writer embedded in the header.
+    // Step 9 — staleness gate: re-hash the source `.leaf` with SHA-256 and
+    // compare the result against the digest the writer embedded in the sidecar
+    // header at build time. If the .leaf has changed since the sidecar was
+    // written (e.g. the projection was rebuilt), the digest will differ and
+    // the sidecar must be considered stale and unsafe to use.
     // On mismatch (or any I/O / OpenSSL failure) emit a one-line warning
-    // and fall back to B+Tree by wiping this reader's state, so the
+    // and fall back to the B+Tree by wiping this reader's state, so the
     // caller sees has_data() == false — identical to the "file absent"
     // contract. Missing source file or unreadable source both collapse
     // to "mismatch" via compute_sha256_64k() returning false.
@@ -672,15 +680,40 @@ void TopologySnapshotReader::advise_access(bool sequential) const noexcept {
     ::madvise(map_base_, file_size_, sequential ? MADV_SEQUENTIAL : MADV_RANDOM);
 }
 
+void TopologySnapshotReader::prefetch_rows(uint64_t start_row,
+                                           uint64_t end_row) const noexcept {
+    if (!has_data_ || map_base_ == nullptr || row_ptr_ == nullptr) {
+        return;
+    }
+    if (end_row > header_.num_nodes) end_row = header_.num_nodes;
+    if (start_row >= end_row) return;
+
+    const uint64_t elem_start = row_ptr_[start_row];
+    const uint64_t elem_end   = row_ptr_[end_row];
+    if (elem_end <= elem_start) return;
+
+    const bool narrow = header_.id_width == kTopologySnapshotIdWidthNarrow;
+    const std::size_t width = narrow ? sizeof(uint32_t) : sizeof(uint64_t);
+    const char* base = narrow ? reinterpret_cast<const char*>(col_idx32_)
+                              : reinterpret_cast<const char*>(col_idx_);
+    if (base == nullptr) return;
+
+    char* ptr = const_cast<char*>(base) + elem_start * width;
+    const std::size_t len = static_cast<std::size_t>(elem_end - elem_start) * width;
+    ::madvise(ptr, len, MADV_WILLNEED);  // best-effort; ignore failures
+}
+
 // ---------------------------------------------------------------------------
-// verify_source_sha256 — streaming SHA-256 staleness gate (§3.3, T4.10).
+// verify_source_sha256 — streaming SHA-256 staleness gate.
 // ---------------------------------------------------------------------------
 //
-// Returns true iff `source_leaf_path` hashes byte-for-byte to the digest
-// embedded in the CSR header at write time. Any failure mode (reader has
-// no data, source file absent, I/O error, OpenSSL context allocation)
-// returns false and is treated by callers as equivalent to a mismatch —
-// conservative by design: an unverifiable sidecar must not be trusted.
+// Streams the source .leaf file through SHA-256 and compares the result
+// against the digest embedded in the CSR sidecar header at write time.
+// Returns true iff the digest matches, confirming the sidecar is fresh.
+// Any failure mode (reader has no data, source file absent, I/O error,
+// OpenSSL context allocation) returns false and is treated by callers as
+// equivalent to a mismatch — conservative by design: an unverifiable
+// sidecar must not be trusted.
 
 bool TopologySnapshotReader::verify_source_sha256(
     const std::filesystem::path& source_leaf_path) const {

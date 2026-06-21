@@ -14,6 +14,9 @@
 
 namespace GQL {
 class ProjectionStorage;
+namespace Projection {
+class TopologySnapshotReader;
+}
 }
 
 namespace mdb::gnn {
@@ -261,6 +264,26 @@ public:
      */
     Neighbors get_neighbors(ObjectId node_id, EdgeOrientation orientation);
 
+    /**
+     * @brief Buffer-reusing variant of get_neighbors(node, orientation).
+     *
+     * Writes the neighbors into the caller-owned `out` (whose capacity is
+     * retained across calls) instead of allocating a fresh Neighbors per call.
+     * The content and order are byte-identical to get_neighbors(); only the
+     * per-node allocation is avoided. Each parallel sampler worker passes its
+     * own scratch buffer (single-threaded per worker), so no synchronisation is
+     * needed. This is the hot path for k-hop sampling — the per-node Neighbors
+     * allocation in the UNDIRECTED fetch was measured to be the dominant expand
+     * sub-cost.
+     */
+    void get_neighbors_into(ObjectId node_id, EdgeOrientation orientation,
+                            Neighbors& out);
+
+    /// Buffer-reusing variants of get_out_neighbors / get_in_neighbors — see
+    /// get_neighbors_into. Fill `out` (capacity retained); byte-identical result.
+    void get_out_neighbors_into(ObjectId node_id, Neighbors& out);
+    void get_in_neighbors_into(ObjectId node_id, Neighbors& out);
+
     // =========================================================================
     // Batch Neighbor Access
     // =========================================================================
@@ -418,7 +441,7 @@ public:
     void set_target_device(torch::Device device);
 
     // =========================================================================
-    // In-memory adjacency cache (Spec #11)
+    // In-memory adjacency cache (one full B+Tree scan into hash map)
     // =========================================================================
     //
     // Opt-in performance path that materialises every projection edge into a
@@ -483,32 +506,37 @@ public:
     uint64_t get_adjacency_cache_rev_entries() const;
 
     // =========================================================================
-    // Four-Level Topology Store (Spec #13)
+    // Four-Level Topology Store (frequency-tiered RAM/mmap/B+Tree cache)
     // =========================================================================
     //
     // When the four-level store is enabled, every neighbor lookup is
-    // routed through it INSTEAD of the Spec #11 / Spec #4-B / B+Tree
-    // dispatch chain. The store is a tiered cache (L1 RAM hash, L2 RAM
-    // compact CSR, L3 mmap sidecar, L4 BPT fallback) that targets
-    // commodity-RAM scenarios on >100M-node graphs where the simple
-    // Spec #11 cache would OOM.
+    // routed through it INSTEAD of the flat in-memory adjacency cache /
+    // mmap CSR sidecar / B+Tree dispatch chain. The store is a
+    // frequency-tiered cache — L1 RAM hash (hottest hubs), L2 RAM
+    // compact uint32 CSR (warm nodes), L3 mmap CSR sidecar
+    // (topology_{fwd,rev}.csr, cold nodes), L4 direct B+Tree (fallback
+    // when no sidecar is present) — that targets commodity-RAM scenarios
+    // on >100M-node graphs where the flat in-memory adjacency cache
+    // (one unordered_map per direction holding all edges) would exhaust
+    // available RAM.
     //
     // When unset (default), all existing dispatch logic is preserved
     // byte-for-byte — the regression contract every existing test
     // relies on.
 
     /**
-     * @brief Build and enable the Four-Level Topology Store (Spec #13).
+     * @brief Build and enable the frequency-tiered Four-Level Topology Store.
      *
      * Constructs a `FourLevelTopologyStore` over the underlying
      * projection's B+Tree edge indexes, runs `build()` to populate
      * tiers, and registers the result as the dispatch target for
      * every subsequent `get_*_neighbors` call.
      *
-     * Once enabled, the Spec #11 single-tier cache is bypassed (the
-     * four-level store has its own internal L1 hash cache that
-     * subsumes it; populating both would double-count RAM). Calling
-     * `enable_adjacency_cache(false)` after this method is a no-op.
+     * Once enabled, the flat in-memory adjacency cache (which holds all
+     * edges in a single unordered_map per direction) is bypassed: the
+     * four-level store's own L1 RAM hash cache subsumes that role, and
+     * populating both structures simultaneously would double-count RAM.
+     * Calling `enable_adjacency_cache(false)` after this method is a no-op.
      *
      * Idempotent: calling twice throws `std::logic_error`. To swap
      * configurations, drop the accessor and recreate.
@@ -528,6 +556,41 @@ public:
 
     /// Returns true iff `enable_four_level_store()` has run successfully.
     bool is_four_level_store_enabled() const;
+
+    /**
+     * @brief Tier-2 compact CSR per direction, for SIZING the dynamic GPU/CPU
+     *        sampling backend decision (`plan_sampling_backend`).
+     *
+     * Delegates to the Four-Level Topology Store when enabled; returns nullptr
+     * otherwise (the GPU sampling path needs that in-RAM CSR to pin, so an
+     * absent store means the decision falls back to the CPU backend). The
+     * returned object is frozen/immutable post-build; callers read only
+     * node_count()/edge_count() and must NOT cache its raw data pointers.
+     */
+    const L2CompactCsr* l2_fwd() const;
+    const L2CompactCsr* l2_rev() const;
+
+    /**
+     * @brief The active L3 global topology sidecar reader per direction, for
+     *        SIZING the GPU sampling-backend decision on the substrate actually
+     *        pinned (the full graph), not the warm-tier L2. nullptr when absent.
+     */
+    const GQL::Projection::TopologySnapshotReader* l3_fwd() const;
+    const GQL::Projection::TopologySnapshotReader* l3_rev() const;
+
+    /**
+     * @brief Pin the global topology CSR as a device-visible GPU substrate.
+     *
+     * Delegates to the Four-Level Topology Store's `enable_pinned_gpu_view`.
+     * No-op when the store is absent, the plan chose the CPU backend, no GPU is
+     * present, or the build has no CUDA. Mutates only the device-page
+     * registration (the topology data stays read-only), so the sampling output
+     * is unchanged when the view is unused.
+     */
+    void enable_pinned_gpu_view(const SamplingBackendPlan& plan);
+
+    /// The registered GPU view, or nullptr when none was enabled / no store.
+    const PinnedTopologyView* pinned_view() const;
 
 private:
     struct Impl;
