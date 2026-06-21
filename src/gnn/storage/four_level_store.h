@@ -138,17 +138,18 @@ public:
         bool   reorder = true;
         bool   force   = false;
 
-        // Fix #15 (2026-05-13): granular force flags. When `force=true`,
-        // these toggles let callers preserve specific outputs across a
-        // rebuild. Useful for validating individual phases without
-        // paying the cost of recomputing parts that are still valid.
+        // Granular force flags (2026-05-13): when `force=true`, these toggles
+        // let callers preserve specific outputs across a rebuild. Useful for
+        // validating individual phases without paying the cost of recomputing
+        // parts that are still valid.
         //
         // Each defaults to `true` so legacy callers passing only `force`
         // get the historical full-clobber behaviour. Set to `false` to
         // keep that output across a force rebuild — the matching build
         // phase will skip if the file already exists with the right
-        // header (Fix #14 idempotency in L1/L2; existing reordered.fmat
-        // bypasses the MinHash recompute in L3).
+        // header (L1/L2 cache files are checked for validity before
+        // overwriting; an existing reordered.fmat bypasses the MinHash
+        // recompute in L3).
         bool   force_caches      = true;  // delete L1 gpu_cache + L2 cpu_cache
         bool   force_reorder     = true;  // delete reordered.fmat + .rmap
         bool   force_packed_slim = true;  // delete packed_slim/
@@ -174,8 +175,8 @@ public:
         // prefers this pack. Default OFF.
         bool   pack_full = false;
 
-        // DiskGNN-adoption Plan 1: also emit a single consolidated cold-feature
-        // file (packed_slim/consolidated.slim) during the partitioned L4 pack, so
+        // When true, also emit a single consolidated cold-feature file
+        // (packed_slim/consolidated.slim) during the partitioned L4 pack, so
         // the runtime can serve each batch's cold features with ONE O_DIRECT
         // sequential pread instead of opening ~1512 small per-batch files. When
         // true, the addr_table sidecars are written as v2 (carrying per-batch
@@ -191,12 +192,12 @@ public:
         // compatibility with a training path that still reads packed/.
         bool   cleanup_materialize_scratch = true;
 
-        // Spec D (telemetry, 2026-05-07): disk space budget for the feature
-        // store. 0 = unlimited (current behavior). When > 0, build() emits
-        // a warning if the actual usage exceeds the budget. Future Spec C2
-        // will use this to drive the heuristic search for segment_size that
-        // satisfies the constraint. Mirrors DiskGNN's `disk_size` parameter
-        // (cf. SIGMOD'25 §6 API `DiskGNN_train(..., disk_size, ...)`).
+        // Disk space budget for the Four-Level Feature Store (2026-05-07):
+        // 0 = unlimited (current behavior). When > 0, build() emits
+        // a warning if the actual on-disk usage exceeds the budget. A future
+        // heuristic-search phase would use this to find the disk-cache segment
+        // size that satisfies the constraint. Mirrors DiskGNN's `disk_size`
+        // parameter (cf. SIGMOD'25 §6 API `DiskGNN_train(..., disk_size, ...)`).
         size_t disk_budget_bytes = 0;
         MinHashReorderer::Config minhash;
     };
@@ -209,8 +210,9 @@ public:
         int64_t  build_time_ms = 0;
         std::string packed_slim_dir;
 
-        // Spec D telemetry: per-tier on-disk byte accounting. All values are
-        // post-build, measured from the actual filesystem (NOT estimated).
+        // Per-tier on-disk byte accounting for the Four-Level Feature Store.
+        // All values are post-build, measured from the actual filesystem (NOT
+        // estimated).
         // - slim_bytes:       sum of packed_slim/*.bin file sizes
         // - reordered_bytes:  size of *_reordered.fmat (0 if reorder=false)
         // - gpu_cache_bytes:  size of *_gpu_cache.bin
@@ -262,8 +264,8 @@ public:
     /// Destructor: releases the persistent pinned host buffer (if any).
     ~FourLevelStore();
 
-    /// Path 4 (2026-05-20): rebuild addr_tables/ sidecars from this loaded
-    /// runtime instance's already-resolved caches (gpu/cpu/reordered_rm).
+    /// Rebuild addr_tables/ sidecars from this loaded runtime instance's
+    /// already-resolved caches (gpu/cpu/reordered_rm) (2026-05-20).
     /// Used when the source FeatureMatrix is unavailable (placeholder /
     /// deleted), but the rest of the feature store is intact. Idempotent —
     /// overwrites any existing addr_tables/. Returns total bytes written.
@@ -285,7 +287,7 @@ public:
         const std::filesystem::path& db_folder,
         const std::string&           projection_name);
 
-    /// STEP 8: return true iff a built feature store for `feature_name` exists
+    /// Staleness check: return true iff a built feature store for `feature_name` exists
     /// AND its persisted content fingerprint (`<feature>_store.fp`) matches the
     /// given sample's content fingerprint mixed with the store's own identity
     /// (feature dim + dtype, read from store.meta). Used by the
@@ -305,8 +307,8 @@ public:
     /// to the overload below. Pays the deserialize cost once.
     torch::Tensor load_batch_features(uint64_t batch_id);
 
-    /// Round 2B (2026-05-15): Load batch features given an already-deserialized
-    /// GraphSample. Avoids re-reading + re-parsing the sample when the caller
+    /// Load batch features given an already-deserialized GraphSample (2026-05-15).
+    /// Avoids re-reading + re-parsing the sample when the caller
     /// (e.g., BatchAssembler::assemble_from_sample) already has it in hand.
     ///
     /// out_used_v2 (optional): receives whether THIS call was served by the v2
@@ -323,9 +325,8 @@ public:
         std::atomic<uint64_t> l3_reads{0}, l4_reads{0};
         std::atomic<uint64_t> total_requests{0};
 
-        // Spec A1 (2026-04-27): byte-level counters for paper-comparable
-        // disk-traffic accounting (cf. DiskGNN SIGMOD'25 Table 1
-        // "Disk access volume (GB)").
+        // Byte-level counters for paper-comparable disk-traffic accounting
+        // (2026-04-27) (cf. DiskGNN SIGMOD'25 Table 1 "Disk access volume (GB)").
         //
         // *_bytes_served — bytes copied from RAM/GPU caches into output.
         //                  Useful for hit-rate by data volume vs node count.
@@ -333,7 +334,8 @@ public:
         // l3_bytes_disk   — physical bytes read from disk via O_DIRECT.
         //                   Equals l3_bytes_wanted only if every row was
         //                   block-aligned and adjacent; otherwise reflects
-        //                   alignment overhead (Spec A2 will reduce it).
+        //                   alignment overhead (a future alignment-reduction
+        //                   pass would narrow this gap).
         // l4_bytes_wanted — feature payload bytes extracted from L4 slim.
         // l4_bytes_disk   — bytes read from slim files (header + OID table
         //                   + feature data); counted once per batch read.
@@ -401,12 +403,11 @@ public:
     uint64_t last_addr_load_us() const { return last_addr_load_ns_.load() / 1000; }
     bool last_used_addr_tables() const { return last_used_v2_.load(); }
 
-    // Round 3B-mw (2026-06-01): multi-worker prefetch support.
-    //
-    // The AsyncBatchPrefetcher can now drive load_batch_features() from N
-    // concurrent worker threads (prefetchNumWorkers>1). Every shared mutable
-    // resource on the hot path that is NOT thread-safe is replicated per
-    // worker so there is no cross-worker data race on feature content:
+    // Multi-worker prefetch support (2026-06-01): the AsyncBatchPrefetcher
+    // can drive load_batch_features() from N concurrent worker threads
+    // (prefetchNumWorkers>1). Every shared mutable resource on the hot path
+    // that is NOT thread-safe is replicated per worker so there is no
+    // cross-worker data race on feature content:
     //   - the DirectIoReader (its own 4 io_uring rings, "one ring per thread"
     //     per direct_io_reader.h) — worker 0 uses the primary l3_reader_;
     //     workers 1..N-1 use extra_workers_[w-1].l3_reader.
@@ -445,11 +446,10 @@ private:
     uint64_t       l3_header_size_ = FeatureMatrixHeader::SIZE; // data offset past header
     Stats          stats_;
 
-    // Round 1A optimization (2026-05-15): persistent pinned host buffer reused
-    // across load_batch_features() calls. Replaces per-batch
-    // cudaHostAlloc + cudaFreeHost (each is a synchronous driver call
-    // ~100-500 us). On papers100M with 1300+ batches/epoch the old path
-    // burned ~150-600 ms/epoch on alloc churn alone.
+    // Persistent pinned host buffer reused across load_batch_features() calls
+    // (2026-05-15). Replaces per-batch cudaHostAlloc + cudaFreeHost (each is a
+    // synchronous driver call ~100-500 us). On papers100M with 1300+ batches/
+    // epoch the old path burned ~150-600 ms/epoch on alloc churn alone.
     //
     // ensure_pinned_capacity(bytes) grows the buffer if needed (geometric
     // x1.5 plus 64-byte alignment headroom) and is thread-safe via
@@ -459,7 +459,7 @@ private:
     void*              pinned_ptr_      = nullptr;
     size_t             pinned_capacity_ = 0;
 
-    // Round 3B-mw (2026-06-01): per-worker IO resources for safe N>1 prefetch.
+    // Per-worker IO resources for safe N>1 prefetch (2026-06-01).
     // Worker id 0 uses the primary l3_reader_ + pinned_ptr_ above (so the
     // single-worker path is byte-identical to pre-change). Workers 1..N-1 use
     // extra_workers_[id-1]. prepare_worker_io(N) populates this vector ONCE,
@@ -488,9 +488,9 @@ private:
     // nanoseconds (high precision to avoid integer-microsecond truncation of
     // sub-μs hash lookups). Accessors below convert to μs at the API boundary.
     // rmap_lookup_ns is a SUB-counter: already included in the L3 total;
-    // tracked separately to quantify Phase 1 address-table candidate.
-    // Round 3B-mw: atomic so concurrent prefetch workers do not data-race on
-    // these telemetry counters. Values are only meaningful single-worker
+    // tracked separately to quantify the address-table fast-path candidate.
+    // Made atomic so concurrent multi-worker prefetch threads do not data-race
+    // on these telemetry counters. Values are only meaningful single-worker
     // (under N>1 every worker accumulates into the same counter, so the sum is
     // not a per-batch figure) and are NOT read on the prefetcher path; the
     // atomics exist purely to keep the writes well-defined under N>1.
@@ -525,16 +525,17 @@ private:
     mutable std::atomic<uint64_t> last_addr_load_ns_{0};
     mutable std::atomic<bool>     last_used_v2_{false};
 
-    // DiskGNN-adoption Plan 1 Phase 2: consolidated cold-feature read path.
-    // When `use_consolidated_slim_`, load_batch_features_v2_ serves each batch's
-    // cold features with ONE pread of [slim_offset, slim_length) (from the v2
-    // addr_table header) from the single consolidated.slim file, instead of
-    // opening the per-batch .bin. The O_DIRECT fd is shared across prefetch
-    // workers (pread is offset-based, so concurrent reads at distinct offsets are
-    // safe); each read uses a private posix_memalign'd buffer. consolidated_buf_fd_
-    // is the buffered fallback when O_DIRECT is unavailable/fails. Opt-in (env
-    // MDB_GNN_CONSOLIDATED_SLIM), validated against the perm/meta fingerprints at
-    // ctor; any mismatch leaves use_consolidated_slim_ false → per-batch read.
+    // Consolidated cold-feature read path: when `use_consolidated_slim_`,
+    // load_batch_features_v2_ serves each batch's cold features with ONE pread
+    // of [slim_offset, slim_length) (from the v2 addr_table header) from the
+    // single consolidated.slim file, instead of opening the per-batch .bin.
+    // This collapses ~1512 small file opens per epoch into one sequential read
+    // per batch. The O_DIRECT fd is shared across prefetch workers (pread is
+    // offset-based, so concurrent reads at distinct offsets are safe); each
+    // read uses a private posix_memalign'd buffer. consolidated_buf_fd_ is the
+    // buffered fallback when O_DIRECT is unavailable/fails. Opt-in (env
+    // MDB_GNN_CONSOLIDATED_SLIM), validated against the perm/meta fingerprints
+    // at ctor; any mismatch leaves use_consolidated_slim_ false → per-batch read.
     bool   use_consolidated_slim_ = false;
     int    consolidated_od_fd_    = -1;     // O_DIRECT fd (shared)
     int    consolidated_buf_fd_   = -1;     // buffered fallback fd (shared)

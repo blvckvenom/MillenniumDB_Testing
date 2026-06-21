@@ -159,22 +159,25 @@ void AsyncBatchPrefetcher::worker_loop(unsigned worker_idx) {
 }
 
 void AsyncBatchPrefetcher::worker_loop_impl(unsigned worker_idx) {
-    // Round 3B-mw (2026-06-01): bind this thread's worker id so the
-    // FourLevelStore hot path routes to this worker's PRIVATE DirectIoReader
-    // + pinned staging buffer (no cross-worker race on feature content).
+    // Bind this thread's worker id so the Four-Level Feature Store (L1 GPU /
+    // L2 pinned CPU / L3 on-disk reordered fmat / L4 per-batch packed) hot
+    // path routes L4 reads to this worker's PRIVATE DirectIoReader + pinned
+    // staging buffer, avoiding cross-worker data races on feature content.
     // Harmless in FeatureMatrix-fallback mode (the id is simply unread there).
     FourLevelStore::bind_worker_id(worker_idx);
 
-    // Spec C3 stage 3: when use_cuda_streams_ is true, each worker keeps a
-    // single pool stream for its lifetime. All assemblies run under
-    // CUDAStreamGuard(worker_stream); we record a CUDAEvent into the
-    // produced MiniBatch so the consumer can sync via event.block().
+    // When use_cuda_streams_ is true, each worker keeps a single CUDA pool
+    // stream for its lifetime to overlap the assemble kernel with the main
+    // thread's model forward+backward on a separate stream. All assemblies
+    // run under CUDAStreamGuard(worker_stream); a CUDAEvent is recorded into
+    // the produced MiniBatch so the consumer can sync via event.block()
+    // before launching compute that depends on the assembled tensors.
     //
-    // Acquired lazily on the first request, INSIDE the per-request try:
-    // getStreamFromPool can throw c10::Error on a degraded CUDA runtime,
-    // and there the per-request catch turns it into an err_map_ entry the
-    // consumer rethrows cleanly. It also keeps CUDA dependencies off the
-    // constructor path when use_cuda_streams_ is false.
+    // The stream is acquired lazily on the first request, INSIDE the
+    // per-request try: getStreamFromPool can throw c10::Error on a degraded
+    // CUDA runtime, and the per-request catch turns it into an err_map_ entry
+    // the consumer rethrows cleanly. Lazy acquisition also keeps CUDA
+    // dependencies off the constructor path when use_cuda_streams_ is false.
 #ifdef ENABLE_CUDA_ASSEMBLER
     std::optional<c10::cuda::CUDAStream> worker_stream;
 #endif

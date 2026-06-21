@@ -1,12 +1,12 @@
 #pragma once
 
-// Spec C3 stage 1 (2026-05-07): async batch prefetcher.
+// Async batch prefetcher — training pipeline overlap.
 //
 // Hides the per-batch assemble cost (sample read + feature gather +
 // host→device transfer, measured at 65.7% of train wall-time on
-// papers100M Stage 0 baseline) behind the model forward+backward
-// compute on the GPU. Mirrors the producer-consumer queue pattern from
-// DiskGNN SIGMOD'25 §5.3 with queue size 2 (paper §6 default).
+// papers100M baseline) behind the model forward+backward compute on
+// the GPU. Mirrors the producer-consumer queue pattern from DiskGNN
+// SIGMOD'25 §5.3 with queue size 2 (paper §6 default).
 //
 // Thread model:
 //   producer thread   → prefetch(batch_id): enqueue assembly request
@@ -17,10 +17,11 @@
 // when the bound is reached, preventing memory blow-up if the consumer
 // stalls.
 //
-// In Stage 1 the producer and consumer are the same training thread:
-// it calls prefetch(b+1) and next() interleaved with model.forward / .backward.
+// In single-worker mode the producer and consumer are the same training
+// thread: it calls prefetch(b+1) and next() interleaved with
+// model.forward / .backward.
 //
-// Round 3B (2026-05-15): the prefetcher can now spawn `num_workers` worker
+// Multi-worker extension: the prefetcher can spawn `num_workers` worker
 // threads. Order is preserved at the consumer: each prefetch() is assigned
 // a monotonically-increasing "submission position", and next() retrieves
 // the result for the next-expected position (waiting if the matching
@@ -34,8 +35,9 @@
 //     unordered_maps and tensors; no shared mutable state.
 //   - In FeatureMatrix fallback mode (BatchAssembler with FeatureMatrix
 //     ctor) features are read concurrent-safe via extract_rows.
-//   - In FourLevelStore full mode (Round 3B-mw, 2026-06-01) num_workers>1
-//     is safe ONLY IF the per-worker IO slots were provisioned BEFORE this
+//   - In FourLevelStore full mode (where each worker gets a private
+//     DirectIoReader + pinned host buffer) num_workers>1 is safe ONLY IF the
+//     per-worker IO slots were provisioned BEFORE this
 //     prefetcher is constructed, via
 //     BatchAssembler::prepare_feature_store_workers(num_workers) →
 //     FourLevelStore::prepare_worker_io(num_workers). Each worker thread
@@ -76,19 +78,20 @@ public:
     /// queue_size=2 matches DiskGNN SIGMOD'25 §6 ("the sizes of all shared
     /// queues are set to 2").
     ///
-    /// `use_cuda_streams` (Stage 3, default false): when true, each worker
-    /// thread acquires its own pool stream, runs assembly under
-    /// CUDAStreamGuard, and records a CUDAEvent into MiniBatch.ready_event
-    /// after each assembly. Consumers MUST call ready_event.block() on
-    /// their training stream before reading GPU tensors.
+    /// `use_cuda_streams` (default false): when true, splits the assembly
+    /// kernel and the model forward+backward onto separate CUDA streams to
+    /// allow overlap. Each worker thread acquires its own pool stream, runs
+    /// assembly under CUDAStreamGuard, and records a CUDAEvent into
+    /// MiniBatch.ready_event after each assembly. Consumers MUST call
+    /// ready_event.block() on their training stream before reading GPU tensors.
     /// Has no effect when ENABLE_CUDA_ASSEMBLER is undefined.
     ///
-    /// `num_workers` (Round 3B, default 1): number of background worker
-    /// threads consuming the request queue in parallel. The consumer
-    /// re-orders results so next() returns batches in submission order.
-    /// Values > queue_size are useless (in_flight is capped by queue_size).
-    /// 0 is rejected. See the file-level comment for multi-worker
-    /// thread-safety constraints (FourLevelStore mode requires
+    /// `num_workers` (default 1): number of background worker threads
+    /// consuming the request queue in parallel. The consumer re-orders
+    /// results so next() returns batches in submission order. Values >
+    /// queue_size are useless (in_flight is capped by queue_size). 0 is
+    /// rejected. See the file-level comment for multi-worker thread-safety
+    /// constraints (FourLevelStore mode requires
     /// prepare_feature_store_workers(num_workers) BEFORE construction).
     explicit AsyncBatchPrefetcher(BatchAssembler& assembler,
                                   size_t queue_size = 2,
@@ -137,10 +140,10 @@ public:
     unsigned num_workers() const { return static_cast<unsigned>(workers_.size()); }
 
 private:
-    // Round 3B-mw (2026-06-01): each worker thread is assigned a stable index
-    // 0..num_workers-1 at spawn. It binds that index via
-    // FourLevelStore::bind_worker_id() at thread start so the FourLevelStore
-    // hot path selects this worker's private DirectIoReader + pinned buffer.
+    // Each worker thread is assigned a stable index 0..num_workers-1 at
+    // spawn. It binds that index via FourLevelStore::bind_worker_id() at
+    // thread start so the FourLevelStore hot path selects this worker's
+    // private DirectIoReader + pinned buffer.
     //
     // worker_loop is a catch-all shell around worker_loop_impl: an exception
     // escaping a std::thread body calls std::terminate (whole-process death),
@@ -157,11 +160,11 @@ private:
     std::condition_variable space_cv_;  // notified when in_flight decreases
     std::condition_variable item_cv_;   // notified when resp_map_ gains item OR new req available
 
-    // Round 3B: submission-position-keyed request queue. Each entry is
-    // (submission_position, batch_id). Workers pop in FIFO order off
-    // req_queue_, perform assembly, and write the result into resp_map_
-    // under the submission_position key. Consumer reads resp_map_ at
-    // next_consume_pos_ in strict order.
+    // Submission-position-keyed request queue for multi-worker ordering.
+    // Each entry is (submission_position, batch_id). Workers pop in FIFO
+    // order off req_queue_, perform assembly, and write the result into
+    // resp_map_ under the submission_position key. Consumer reads resp_map_
+    // at next_consume_pos_ in strict order.
     struct Request {
         uint64_t position;
         uint64_t batch_id;

@@ -98,9 +98,10 @@ public:
 
     // --- Reordering (for MinHash L3) ---
     // permutation[i] = source row that goes to position i in output.
-    // STEP 8: `fingerprint` (default 0) is embedded in header.reserved[0..7] so
-    // the feature store can detect a reordered.fmat built for a different sample
-    // and recompute it instead of opening it with the wrong shape.
+    // `fingerprint` (default 0) is embedded in header.reserved[0..7] so
+    // the feature store can detect a reordered.fmat built for a different
+    // permutation (e.g. after a sample rebuild that changes the MinHash order)
+    // and recompute it instead of silently opening it with the wrong row mapping.
     static FeatureMatrix create_reordered(
         const FeatureMatrix& source,
         const std::vector<uint64_t>& permutation,
@@ -116,8 +117,10 @@ public:
     size_t      total_bytes() const { return header_.data_bytes(); }
     const std::filesystem::path& path()    const { return path_; }
 
-    // STEP 8: content fingerprint embedded in header.reserved[0..7] at
+    // Content fingerprint embedded in header.reserved[0..7] at
     // create_reordered() time. 0 = absent (legacy files, or non-reordered FMs).
+    // Used by the feature store to detect stale reordered files whose permutation
+    // no longer matches the current sample; a mismatch triggers a rebuild.
     uint64_t fingerprint() const {
         uint64_t f;
         std::memcpy(&f, header_.reserved, sizeof(f));
@@ -129,17 +132,20 @@ public:
      *        the page cache. Useful after a single-pass scan where the
      *        caller won't read these pages again soon.
      *
-     * Fix #22: papers100M's 56 GB source + 56 GB reordered + 8 GB caches
-     * exceed the 30 GB host RAM. At the end of gnn_build_feature_store,
-     * downstream callers (e.g. gnn_train running immediately after)
-     * benefit from a clean page-cache budget instead of inheriting 100+ GB
-     * of stale pages competing for eviction.
+     * On large graphs (e.g. papers100M) the 56 GB source matrix plus the
+     * 56 GB reordered matrix plus on-disk caches easily exceed 30 GB of host
+     * RAM. At the end of gnn_build_feature_store, downstream callers such as
+     * gnn_train benefit from a clean page-cache budget instead of inheriting
+     * over 100 GB of stale mapped pages competing for eviction.
      */
     void release_cache() const;
 
 private:
-    // Fix #15 helper — needs access to private mmap members for source
-    // mmap and to construct the result via the same path as create_reordered.
+    // External-sort reorder helper — needs access to private mmap members for
+    // the source mapping and to construct the result via the same path as
+    // create_reordered. Used when the source matrix is larger than available
+    // RAM and a bucket-based external-sort pass is required to apply the
+    // permutation without loading the full matrix into memory at once.
     static FeatureMatrix create_reordered_external_sort_(
         const FeatureMatrix& source,
         const std::vector<uint64_t>& permutation,

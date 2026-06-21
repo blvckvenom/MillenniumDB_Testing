@@ -35,12 +35,13 @@ inline bool disabled() {
  * not break the surrounding I/O. Disabled by env var
  * MDB_GNN_NO_FADVISE=1 (for ablation studies).
  *
- * Fix #22 motivation: papers100M's 56 GB reordered.fmat + 87 GB
- * batches.dat + ~8 GB caches exceed the 30 GB host RAM. Without
- * explicit hints the kernel keeps already-consumed pages in cache
- * until LRU eviction forces them out — by which point productive
- * pages have been swapped. With DONTNEED the working set stays
- * bounded to whatever we're actively reading or writing.
+ * Motivation: at papers100M scale the combined working set
+ * (56 GB reordered.fmat + 87 GB batches.dat + ~8 GB tier caches)
+ * exceeds a 30 GB host. Without explicit hints the kernel keeps
+ * already-consumed pages in the page cache until LRU eviction forces
+ * them out — by which point productive pages have been swapped.
+ * Issuing DONTNEED after each region is consumed keeps the active
+ * working set bounded to whatever is currently being read or written.
  */
 inline int fadvise_dontneed(int fd, off_t offset, off_t len) {
     if (pch_detail::disabled()) return 0;

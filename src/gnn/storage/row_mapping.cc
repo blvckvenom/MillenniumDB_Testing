@@ -265,9 +265,10 @@ RowMapping RowMapping::open(const fs::path& path) {
     rm.mmap_ptr_  = ptr;
     rm.mmap_size_ = file_size;
     rm.count_     = count;
-    // Fix #17: try to mmap a persisted sorted-index sidecar. If present
-    // and matches (count, magic), find() will use it directly and we
-    // skip the O(N log N) lazy build entirely (~30 s on papers100M).
+    // Try to mmap a persisted sorted-index sidecar (<path>.idx). If present
+    // and the header matches (magic, version, count, and permutation fingerprint),
+    // find() will use it directly and skip the O(N log N) lazy build entirely
+    // (~30 s on papers100M-scale mappings).
     rm.try_load_persisted_index_();
     return rm;
 }
@@ -293,8 +294,9 @@ std::optional<uint64_t> RowMapping::find(ObjectId target) const {
         throw std::runtime_error("RowMapping::find: not mapped");
     }
 
-    // Fast path (Fix #17): a mmap'd sidecar `<path>.idx` was loaded at
-    // open() — search it directly without paying the lazy build cost.
+    // Fast path: a mmap'd sorted-index sidecar (<path>.idx) was loaded at
+    // open() — search it directly via binary search without paying the
+    // O(N log N) lazy build cost.
     if (idx_data_ != nullptr) {
         auto it = std::lower_bound(idx_data_, idx_data_ + count_,
             std::make_pair(target.id, uint64_t(0)),
@@ -307,9 +309,10 @@ std::optional<uint64_t> RowMapping::find(ObjectId target) const {
 
     std::call_once(*build_index_flag_, [this] {
         build_index();
-        // Fix #17: best-effort persist after first build, so next open
-        // benefits from the fast path. Ignore failures (the sidecar is
-        // strictly optional — the in-memory sorted_index_ remains valid).
+        // Best-effort: persist the sorted index to <path>.idx after the first
+        // lazy build, so subsequent open() calls can mmap it directly and skip
+        // the build entirely. Ignore failures — the sidecar is strictly optional
+        // and the in-memory sorted_index_ remains valid regardless.
         try { persist_sorted_index_(); } catch (...) { /* ignore */ }
     });
 
@@ -331,10 +334,10 @@ void RowMapping::build_index() const {
     for (uint64_t i = 0; i < count_; ++i) {
         sorted_index_[i] = {arr[i].id, i};
     }
-    // Fix #18 (2026-05-13): use parallel sort when TBB is linked. With
-    // libstdc++ ≥ 9 + libtbb the C++17 par_unseq policy speeds the
-    // 111M-entry sort from ~30 s to ~6-8 s on a 20-core host. Falls
-    // back to serial sort when <execution> is unavailable.
+    // Use parallel sort when the C++17 execution-policy header is available
+    // (libstdc++ ≥ 9 + libtbb). The par_unseq policy speeds the 111M-entry
+    // sort from ~30 s to ~6-8 s on a 20-core host. Falls back to serial
+    // std::sort when <execution> is unavailable.
 #ifdef MDB_GNN_HAS_PAR_EXECUTION
     std::sort(std::execution::par_unseq,
               sorted_index_.begin(), sorted_index_.end());
@@ -370,7 +373,7 @@ uint64_t RowMapping::perm_fingerprint() const {
     return compute_perm_fingerprint_();
 }
 
-// --- Fix #17: persistent sorted-index sidecar ---
+// --- Persistent sorted-index sidecar (<path>.idx) ---
 
 void RowMapping::persist_sorted_index_() const {
     if (count_ == 0 || sorted_index_.empty()) return;

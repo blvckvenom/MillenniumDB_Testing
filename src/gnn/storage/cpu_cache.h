@@ -74,7 +74,7 @@ public:
     /// feature region. Caller MUST NOT free or modify the returned pointers;
     /// they remain valid for the CpuCache lifetime.
     ///
-    /// Round 1B (2026-05-15): zero-copy variant of lookup() — avoids the
+    /// Zero-copy variant of lookup() (2026-05-15) — avoids the
     /// per-call std::vector<char> allocation + memcpy that the standard
     /// lookup() performs. The DiskGNN paper accesses L2 features via UVA
     /// directly from the pinned host region; this method exposes the same
@@ -89,13 +89,13 @@ public:
 
     UvaLookupResult lookup_uva(const std::vector<ObjectId>& oids) const;
 
-    /// Round 1C (2026-05-15): single-hash lookup returning the cache row
+    /// Single-hash lookup (2026-05-15) returning the cache row
     /// index if present, nullopt otherwise. Used by FourLevelStore to
     /// eliminate the double hash on the L2 hit path (previously contains()
     /// then lookup_uva() both call find()).
     std::optional<uint32_t> find_index(ObjectId oid) const;
 
-    /// Round 1C (2026-05-15): return a UVA-accessible pointer to the row at
+    /// Return a UVA-accessible pointer to the row at
     /// the given pre-validated cache index. Same lifetime contract as
     /// lookup_uva: pointer is valid for the CpuCache lifetime, caller MUST
     /// NOT free or modify. No bounds-check is performed; caller is

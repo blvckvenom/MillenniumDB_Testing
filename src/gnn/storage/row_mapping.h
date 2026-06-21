@@ -67,18 +67,20 @@ private:
     static constexpr uint32_t MAGIC   = 0x524D4150; // "RMAP"
     static constexpr uint32_t VERSION = 1;
 
-    // Fix #17: persistent sorted index. Sidecar file `<path>.idx` stores
+    // Persistent sorted index: sidecar file `<path>.idx` stores
     // the (oid, row) pairs already sorted by oid. On open() we mmap it
     // and find() works directly off the mmap'd region — skipping the
     // O(N log N) build_index() that takes ~30 s on papers100M-scale.
     static constexpr uint32_t IDX_MAGIC   = 0x52494458; // "RIDX"
-    // IDX_VERSION 2 (2026-06-01): the .idx header now carries a 64-bit
-    // fingerprint of the .rmap permutation it indexes. The previous v1
-    // guard validated only magic+version+count, so a sidecar built from a
-    // DIFFERENT permutation at the same N was silently adopted and find()
-    // returned wrong rows. v2 binds the sidecar to its permutation; a v1
-    // (no-fingerprint) sidecar is rejected by the version check and lazily
-    // rebuilt. Header grows 16 -> 24 bytes.
+    // IDX_VERSION 2: the .idx header now carries a 64-bit fingerprint of
+    // the .rmap permutation it indexes. The previous v1 guard validated
+    // only magic+version+count, so a sidecar built from a DIFFERENT
+    // permutation at the same N was silently adopted and find() returned
+    // wrong rows (e.g. after a MinHash reorder rebuilds the feature matrix
+    // permutation without invalidating the sidecar). v2 binds the sidecar
+    // to its exact permutation via perm_fingerprint(); a v1 (no-fingerprint)
+    // sidecar is rejected by the version check and lazily rebuilt.
+    // Header grows 16 -> 24 bytes.
     static constexpr uint32_t IDX_VERSION     = 2;
     static constexpr size_t   IDX_HEADER_SIZE = 24; // magic(4)+version(4)+count(8)+perm_fp(8)
 
@@ -99,8 +101,8 @@ private:
     size_t   mmap_size_ = 0;
     uint64_t count_     = 0;
 
-    // Fix #17: separate mmap region for the sidecar index. Non-null iff
-    // we loaded the persisted index successfully.
+    // Separate mmap region for the persisted sorted index sidecar (.idx).
+    // Non-null iff we loaded the persisted index successfully.
     void*    idx_mmap_ptr_  = nullptr;
     size_t   idx_mmap_size_ = 0;
     const std::pair<uint64_t, uint64_t>* idx_data_ = nullptr;

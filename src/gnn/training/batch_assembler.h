@@ -115,18 +115,17 @@ public:
      * @brief Whether this BatchAssembler routes feature lookups through a
      *        FourLevelStore (full mode) vs a flat FeatureMatrix fallback.
      *
-     * Used by Round 3B (multi-worker AsyncBatchPrefetcher) to refuse
-     * concurrent execution against FourLevelStore: that store currently
-     * has shared mutable state (DirectIoReader io_uring rings + pinned
-     * host buffer reused across calls) that races silently under N>1
-     * workers.
+     * Used by the multi-worker AsyncBatchPrefetcher to refuse concurrent
+     * execution against FourLevelStore: that store currently has shared
+     * mutable state (DirectIoReader io_uring rings + pinned host buffer
+     * reused across calls) that races silently under N>1 workers.
      */
     bool uses_feature_store() const { return feature_store_ != nullptr; }
 
     /**
-     * @brief Round 3B-mw (2026-06-01): prepare the FourLevelStore for N
-     *        concurrent prefetch workers (per-worker DirectIoReader + pinned
-     *        buffer). No-op in FeatureMatrix-fallback mode. MUST be called
+     * @brief Prepare the FourLevelStore for N concurrent prefetch workers by
+     *        allocating per-worker DirectIoReader instances and pinned host
+     *        buffers. No-op in FeatureMatrix-fallback mode. MUST be called
      *        once before an N>1 AsyncBatchPrefetcher is constructed. May throw
      *        std::runtime_error if per-worker O_DIRECT readers cannot be
      *        opened — TrainingLoop catches and falls back to a single worker.
@@ -225,7 +224,7 @@ public:
     }
 
     /**
-     * @brief SC-5a: per-gnn_train-call override of the block-consumption mode.
+     * @brief Per-gnn_train-call override of the block-consumption mode.
      *
      * Re-runs the SAME eligibility logic as the constructor's env/auto
      * detection (apply_block_mode_), but with the two booleans supplied by the
@@ -256,15 +255,15 @@ private:
      * When absent (the default today, since blocks/ won't exist), use_blocks_
      * stays false and behavior is byte-identical to the online build.
      *
-     * SC-5a: this now reads the env toggles into booleans (truthy values
+     * This now reads the env toggles into booleans (truthy values
      * 1/true/yes, like every other MDB_GNN_* boolean flag) and delegates to
      * apply_block_mode_ (the shared mode-selection body). With no env var
-     * set, the result is byte-identical to the pre-SC-5a auto-detection.
+     * set, the result is byte-identical to the pre-env-toggle auto-detection.
      */
     void init_blocks_();
 
     /**
-     * @brief SC-5a: shared block-mode selection used by both init_blocks_()
+     * @brief Shared block-mode selection used by both init_blocks_()
      *        (with env-derived booleans) and set_block_mode_override() (with
      *        per-call booleans).
      *
@@ -300,7 +299,7 @@ private:
     void cache_struct_(uint64_t batch_id, const MiniBatch& mini);
 
     /**
-     * @brief SC-3: try to assemble batch @p batch_id WITHOUT reading batches.dat.
+     * @brief Try to assemble batch @p batch_id WITHOUT reading batches.dat.
      *
      * Reads ONLY the baked self-contained block (active_sizes + edge_index +
      * num_unique_nodes + seeds + split) and builds a MINIMAL GraphSample whose
@@ -368,11 +367,11 @@ private:
      * This eliminates the need for an extra remap in the model — index_select
      * directly into x = features[active_indices_per_layer[k+1]] works.
      *
-     * Round 2C (2026-05-15): takes the per-layer oid_to_local maps produced
-     * by build_active_indices so each edge endpoint costs ONE hash lookup
-     * (ObjectId.id -> local idx) instead of two (oid -> global -> local).
+     * Takes the per-layer oid_to_local maps produced by build_active_indices
+     * so each edge endpoint costs ONE hash lookup (ObjectId.id -> local idx)
+     * instead of two (oid -> global -> local).
      *
-     * Fast path (2026-06-04): when active.oid_to_local_per_layer is EMPTY, the
+     * Fast path: when active.oid_to_local_per_layer is EMPTY, the
      * active sets are identity prefixes (local index == global position), so each
      * endpoint is remapped by pure array indexing into active.layer_global_pos
      * (precomputed in build_active_indices) — ZERO per-edge hash lookups. When
@@ -388,9 +387,9 @@ private:
      *
      * Routes through FourLevelStore (if in full mode) or FeatureMatrix fallback.
      *
-     * Round 2B (2026-05-15): takes a `const GraphSample&` so the FourLevelStore
-     * path can reuse the already-deserialized sample instead of re-reading it
-     * from disk inside load_batch_features (eliminates the double-deserialize).
+     * Takes a `const GraphSample&` so the FourLevelStore path can reuse the
+     * already-deserialized sample instead of re-reading it from disk inside
+     * load_batch_features (eliminates the double-deserialize).
      *
      * @param sample  Source sample whose `all_unique_nodes` define the feature rows
      * @param used_addr_tables  Optional out-param: whether THIS call was served
@@ -433,7 +432,7 @@ private:
     // assembler (the first stale/missing batch), not once per batch per epoch.
     std::atomic<bool> block_fallback_warned_{false};
 
-    // --- SC-3: self-contained-block train mode ---
+    // --- Self-contained-block train mode (skip batches.dat deserialization) ---
     // When true, assemble(batch_id) reads ONLY the baked self-contained block
     // (active_sizes + edge_index + num_unique_nodes + seeds + split) and SKIPS
     // deserializing batches.dat (the dominant per-epoch cost). Eligibility
@@ -472,7 +471,7 @@ private:
         uint64_t                   num_seeds = 0;
         uint64_t                   num_nodes = 0;
         uint64_t                   num_labeled = 0;
-        // SC-3: the batch's SplitType (as the SplitType ordinal). Cached so the
+        // The batch's SplitType (as the SplitType ordinal). Cached so the
         // self-contained hit path can restore mini.split without reopening the
         // block header. (The real-sample hit path still restores split from
         // sample.split — it has the live sample; c.split exists for the

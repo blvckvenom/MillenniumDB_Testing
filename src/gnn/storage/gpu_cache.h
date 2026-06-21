@@ -57,14 +57,14 @@ public:
     /// Returns hits gathered into a contiguous tensor, plus position vectors.
     LookupResult lookup(const std::vector<ObjectId>& oids) const;
 
-    /// Round 1C (2026-05-15): single-hash lookup returning the cache row index
+    /// Single-hash lookup (2026-05-15) returning the cache row index
     /// if present, nullopt otherwise. Used by FourLevelStore to eliminate the
     /// double hash on the L1 hit path (previously contains() then lookup()
     /// both call find()).
     std::optional<uint32_t> find_index(ObjectId oid) const;
 
-    /// Round 1C (2026-05-15): gather feature rows by pre-validated cache row
-    /// indices (e.g. from find_index). Skips the per-oid find loop in
+    /// Gather feature rows by pre-validated cache row indices (2026-05-15)
+    /// (e.g. from find_index). Skips the per-oid find loop in
     /// lookup() and just calls index_select(0, ...). Caller is responsible
     /// for ensuring all indices are valid (< num_nodes_).
     torch::Tensor gather_by_indices(const std::vector<uint32_t>& cache_indices) const;

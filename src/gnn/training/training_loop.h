@@ -86,25 +86,26 @@ public:
         // the four-level cache implementation.
         std::function<uint64_t()> cumulative_disk_bytes_provider;
 
-        // Spec C3 stage 1 (delivered 2026-05-07): async batch prefetcher.
+        // Training pipeline overlap — async batch prefetcher.
         // When true, the inner train loop uses AsyncBatchPrefetcher to run
         // BatchAssembler::assemble() + host→device transfer on a background
         // thread, overlapping with model forward+backward. The validation
-        // phase remains sequential. queue size matches DiskGNN paper §6
+        // phase remains sequential. Queue size matches DiskGNN paper §6
         // default of 2.
         //
-        // Default true since 2026-05-07: empirical 1.609× wall-clock
-        // speedup measured on papers100M_caminoD_sample with bit-identical
-        // accuracy (0.5942 vs 0.5940, within noise). Set false only for
-        // debugging or to compare against the legacy serial path.
+        // Default true: empirical 1.609× wall-clock speedup measured on
+        // papers100M_caminoD_sample with bit-identical accuracy (0.5942 vs
+        // 0.5940, within noise). Set false only for debugging or to compare
+        // against the legacy serial path.
         bool        use_async_prefetcher = true;
         size_t      prefetch_queue_size  = 2;
 
-        // Round 3B (2026-05-15): number of background worker threads inside
-        // AsyncBatchPrefetcher. Default 1 preserves Stage 1 semantics
-        // exactly. >1 lets multiple BatchAssembler::assemble() calls run
-        // concurrently (CPU-side prep work overlaps with the previous
-        // batch's GPU forward+backward).
+        // Number of background worker threads inside AsyncBatchPrefetcher.
+        // Default 1: a single producer thread assembles each batch and
+        // transfers it to the device while the main thread runs
+        // forward+backward on the previous batch. Values >1 let multiple
+        // BatchAssembler::assemble() calls run concurrently (CPU-side prep
+        // work overlaps with the previous batch's GPU forward+backward).
         //
         // IMPORTANT: multi-worker mode is correct ONLY when the
         // BatchAssembler runs in FeatureMatrix-fallback mode. In
@@ -116,15 +117,19 @@ public:
         // See async_batch_prefetcher.h for full constraints.
         unsigned    prefetch_num_workers = 1;
 
-        // Spec C3 stage 3 (started 2026-05-08): split assemble_kernel and
+        // Dual-CUDA-stream training overlap: split assemble_kernel and
         // model.forward+backward onto separate CUDA streams so the GPU can
         // execute them concurrently when SMs are free (DiskGNN SIGMOD'25
         // §5.3 "we run the model trainer and feature assembler on separate
-        // CUDA streams to improve GPU utilization").
+        // CUDA streams to improve GPU utilization"). Uses c10::cuda::CUDAStream
+        // pool acquisition and at::cuda::CUDAEvent for cross-stream
+        // synchronization.
         //
         // Effective only when use_async_prefetcher=true AND CUDA is available.
-        // Default false until empirical validation completes; flip to true
-        // once Module 6 confirms speedup + bit-identical accuracy.
+        // Empirically measured as neutral on RTX 5070 Ti (1.014× over
+        // async-prefetcher-only); default false because the assemble_kernel
+        // is small (microseconds) and host-blocking PyTorch syncs consume
+        // the concurrency window. Larger models or more SMs may benefit.
         bool        use_cuda_streams = false;
 
         // Periodic CUDA caching-allocator reclaim. When the receptive
@@ -200,11 +205,10 @@ public:
         std::vector<double>  epoch_losses;
         double               train_seconds    = 0.0;
 
-        // Spec C3 stage 0 (2026-05-07): per-stage cumulative wall-time
-        // breakdown of the inner training loop. All values are summed
-        // across all train batches across all epochs; validation/eval
-        // time is NOT counted here (only the train phase). Used to
-        // baseline the gain of subsequent pipeline-overlap stages.
+        // Per-stage cumulative wall-time breakdown of the inner training loop.
+        // All values are summed across all train batches across all epochs;
+        // validation/eval time is NOT counted here (only the train phase).
+        // Used to baseline the gain of training pipeline-overlap work.
         //
         // Invariant: assemble_seconds + forward_seconds + backward_seconds
         // ≈ time spent inside the inner train loop (i.e., excluding
@@ -218,14 +222,14 @@ public:
         double               forward_seconds  = 0.0;
         double               backward_seconds = 0.0;
 
-        // Round 3B (2026-05-15): the actual number of AsyncBatchPrefetcher
-        // workers used during train(). Equals config.prefetch_num_workers
-        // unless (a) it was 0 (resolved to 1) or (b) the BatchAssembler runs
-        // in FourLevelStore mode and N>1 was requested (clamped to 1; a
-        // stderr warning is also emitted, see train() implementation).
+        // The actual number of AsyncBatchPrefetcher workers used during
+        // train(). Equals config.prefetch_num_workers unless (a) it was 0
+        // (resolved to 1) or (b) the BatchAssembler runs in FourLevelStore
+        // mode and N>1 was requested (clamped to 1; a stderr warning is also
+        // emitted, see train() implementation).
         //
-        // Surface this from procedures (e.g., gnn_train) to make the
-        // multi-worker activation diagnostic without parsing stderr.
+        // Surfaced from procedures (e.g., gnn_train) to make the multi-worker
+        // activation diagnostic without parsing stderr.
         unsigned             effective_prefetch_workers = 1;
 
         // Path 4 (2026-05-19): Track whether the v2 addr_table fast path was
@@ -313,9 +317,11 @@ private:
     // TrainingLoop; flushed on epoch boundaries and on destruction.
     std::unique_ptr<BatchTimingLog> profile_log_;
 
-    // Round 3B-mw (2026-06-01): the FourLevelStore per-worker IO count that
-    // train() successfully provisioned (via prepare_feature_store_workers).
-    // 1 = single-worker / multi-worker not enabled. evaluate() reuses EXACTLY
+    // The FourLevelStore per-worker IO count that train() successfully
+    // provisioned (via prepare_feature_store_workers). Each provisioned slot
+    // receives its own DirectIoReader io_uring ring and pinned host buffer so
+    // concurrent assemble() calls do not share mutable IO state. 1 =
+    // single-worker / multi-worker not enabled. evaluate() reuses EXACTLY
     // this count for its own prefetcher so a validation worker can never
     // exceed the provisioned slots and fall back to the shared primary reader
     // (which would race). Set in train(); 1 if evaluate() is ever called

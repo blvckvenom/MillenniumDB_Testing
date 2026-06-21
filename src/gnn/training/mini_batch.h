@@ -32,7 +32,7 @@ struct BatchTimingSubrecord {
     uint64_t assembler_kernel_ns = 0;  ///< feature_store->load_batch_features(sample)
     uint64_t edge_ns             = 0;  ///< build_edge_indices(...)
 
-    /// Path 4 / STEP 6 (2026-05-31): v2 addr-table dispatch result for THIS
+    /// v2 addr-table dispatch result for THIS
     /// batch, captured by BatchAssembler immediately after load_batch_features
     /// (while FourLevelStore::last_used_addr_tables() still refers to it) and
     /// carried with the batch. This makes the v2 telemetry correct on the async
@@ -45,8 +45,8 @@ struct BatchTimingSubrecord {
 /// Data contract between BatchAssembler and TrainingLoop.
 /// Contains everything needed for one forward/backward pass.
 ///
-/// Spec C3 stage 3: when populated by an AsyncBatchPrefetcher running with
-/// use_cuda_streams=true, ready_event is recorded on the worker's stream
+/// Cross-stream synchronization: when populated by an AsyncBatchPrefetcher
+/// running with use_cuda_streams=true, ready_event is recorded on the worker's stream
 /// after assembly completes. Consumers (training loop) must call
 /// ready_event.block(consumer_stream) before reading any GPU tensors,
 /// otherwise they risk reading stale memory or racing with the worker.
@@ -84,7 +84,7 @@ struct MiniBatch {
     torch::Tensor label_mask;                      // [num_seeds] bool — true if label != -1
     uint64_t num_seeds = 0;                        // target nodes (layer 0)
     uint64_t num_nodes = 0;                        // total nodes in computational subgraph
-    /// Round 1E (2026-05-15): number of seeds with label != -1, computed
+    /// Number of seeds with label != -1, computed
     /// on the CPU during assembly so the training loop can decide whether
     /// to run backward without a `.item<bool>()` GPU sync per batch.
     uint64_t num_labeled = 0;

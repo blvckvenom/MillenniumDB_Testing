@@ -1,6 +1,8 @@
 #include "gnn/storage/gpu_cache.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <thread>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -91,8 +93,8 @@ torch::ScalarType to_torch_dtype(GnnDtype dt) {
 // build() — write GNNC file
 // ---------------------------------------------------------------------------
 
-// Fix #14 (2026-05-13): skip rebuild if the existing cache file's
-// header matches the requested dims. Same trick as cpu_cache.cc.
+// Skip rebuild if the existing cache file's header already matches the
+// requested node count, feature dimension, and dtype. Same pattern as cpu_cache.cc.
 static bool gpu_cache_matches(
     const fs::path& path,
     uint64_t        expected_N,
@@ -123,7 +125,7 @@ void GpuCache::build(
     const GnnDtype dt = features.dtype();
 
     if (gpu_cache_matches(output_path, N, D, dt)) {
-        // Fix #14: existing cache header matches → reusable. Skip rebuild.
+        // Existing cache header matches the requested dims → reusable. Skip rebuild.
         return;
     }
 
@@ -131,9 +133,8 @@ void GpuCache::build(
     const size_t row_bytes = features.row_bytes();
 
     // Resolve OID -> row and sort by row to make the source mmap reads
-    // sequential (Fix #12 trick). The on-disk index is reordered but
-    // oid_table[i] still maps to data[i] so the cache reader is
-    // semantically unchanged.
+    // sequential. The on-disk index is reordered but oid_table[i] still
+    // maps to data[i] so the cache reader is semantically unchanged.
     struct Entry { uint64_t row; ObjectId oid; };
     std::vector<Entry> entries;
     entries.reserve(N);
@@ -159,10 +160,38 @@ void GpuCache::build(
     std::memcpy(out_buf.data(), &header, sizeof(header));
     auto* oid_ptr  = reinterpret_cast<uint64_t*>(out_buf.data() + sizeof(header));
     char*  feat_ptr = out_buf.data() + sizeof(header) + oid_block;
-    for (uint64_t i = 0; i < N; ++i) {
-        oid_ptr[i] = entries[i].oid.id;
-        std::memcpy(feat_ptr + i * row_bytes,
-                    features.row(entries[i].row), row_bytes);
+    // Optional multi-threaded gather (env MDB_GNN_CACHE_WORKERS, default 1 = sequential):
+    // each row scatter writes to a disjoint output slot (oid_ptr[i], feat_ptr[i*..])
+    // and reads from the const mmap source via features.row(), so splitting the
+    // i-range across threads is both thread-safe and bit-identical.
+    {
+        unsigned cache_workers = 1;
+        if (const char* env = std::getenv("MDB_GNN_CACHE_WORKERS")) {
+            long v = std::strtol(env, nullptr, 10);
+            if (v > 1) cache_workers = static_cast<unsigned>(v);
+        }
+        const unsigned hw = std::thread::hardware_concurrency();
+        if (hw > 0 && cache_workers > hw) cache_workers = hw;
+        auto gather_range = [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) {
+                oid_ptr[i] = entries[i].oid.id;
+                std::memcpy(feat_ptr + i * row_bytes,
+                            features.row(entries[i].row), row_bytes);
+            }
+        };
+        if (cache_workers <= 1 || N < cache_workers) {
+            gather_range(0, N);
+        } else {
+            std::vector<std::thread> gw;
+            const uint64_t chunk = (N + cache_workers - 1) / cache_workers;
+            for (unsigned w = 0; w < cache_workers; ++w) {
+                const uint64_t lo = static_cast<uint64_t>(w) * chunk;
+                const uint64_t hi = std::min<uint64_t>(lo + chunk, N);
+                if (lo >= hi) break;
+                gw.emplace_back(gather_range, lo, hi);
+            }
+            for (auto& t : gw) t.join();
+        }
     }
 
     int fd = ::open(output_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -320,15 +349,14 @@ GpuCache::LookupResult GpuCache::lookup(const std::vector<ObjectId>& oids) const
 }
 
 // ---------------------------------------------------------------------------
-// find_index() / gather_by_indices() — Round 1C
+// find_index() / gather_by_indices()
 // ---------------------------------------------------------------------------
 //
-// Round 1C (2026-05-15): split the work of lookup() into a single-hash
-// find_index() (used in the FourLevelStore classification loop) and a
-// gather_by_indices() that takes pre-validated cache row indices and
-// returns a feature tensor on the cache device. Together these replace
-// the previous double-hash pattern (contains() then lookup()) with one
-// hash per L1 hit.
+// Split the work of lookup() into a single-hash find_index() (used in the
+// Four-Level Feature Store classification loop) and a gather_by_indices()
+// that takes pre-validated cache row indices and returns a feature tensor
+// on the cache device. Together these replace the previous double-hash
+// pattern (contains() then lookup()) with one hash lookup per L1 hit.
 
 std::optional<uint32_t> GpuCache::find_index(ObjectId oid) const {
     auto it = oid_to_idx_.find(oid.id);

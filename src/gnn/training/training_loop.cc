@@ -94,10 +94,11 @@ TrainingLoop::Result TrainingLoop::train()
     double   best_val_test_acc   = -1.0;
     uint64_t best_val_epoch_seen = config_.start_epoch;
 
-    // Spec B2 (2026-04-27): seed prev_disk before the loop so the first
-    // epoch's delta == bytes accrued during epoch 0 (not since process start).
-    // When provider is unset, prev/cur/delta stay zero and the conditional
-    // print below is suppressed, preserving pre-B2 line format.
+    // Per-epoch disk-traffic accounting (2026-04-27): seed prev_disk before
+    // the loop so the first epoch's delta == bytes accrued during epoch 0 (not
+    // since process start). When provider is unset, prev/cur/delta stay zero
+    // and the conditional print below is suppressed, preserving the original
+    // line format (the one without the per-epoch disk-bytes column).
     uint64_t prev_disk = 0;
     if (config_.cumulative_disk_bytes_provider) {
         prev_disk = config_.cumulative_disk_bytes_provider();
@@ -130,11 +131,11 @@ TrainingLoop::Result TrainingLoop::train()
               << "========================================================\n"
               << std::flush;
 
-    // Round 3B (2026-05-15): resolve effective worker count ONCE before the
-    // epoch loop so the stderr warning (if any) and the result yield are
-    // emitted exactly once per train() invocation rather than per-epoch.
-    // Multi-worker (N>1) is supported ONLY for FeatureMatrix-fallback
-    // BatchAssemblers; the FourLevelStore path has shared state inside
+    // Resolve effective worker count ONCE before the epoch loop so the
+    // stderr warning (if any) and the result yield are emitted exactly
+    // once per train() invocation rather than per-epoch. Multi-worker
+    // (N>1) is supported ONLY for FeatureMatrix-fallback BatchAssemblers;
+    // the Four-Level Feature Store path has shared state inside
     // load_batch_features (DirectIoReader io_uring rings + pinned host
     // buffer) that races silently under concurrent calls. CLAMP to 1
     // rather than throw — keeping the API "more is fine, we just may not
@@ -146,13 +147,13 @@ TrainingLoop::Result TrainingLoop::train()
     }
     if (config_.use_async_prefetcher && assembler_.uses_feature_store()
         && effective_workers > 1) {
-        // Round 3B-mw (2026-06-01): the FourLevelStore path is now
-        // multi-worker-safe — each worker owns a private DirectIoReader (its
-        // own io_uring rings) and a private pinned staging buffer, so there is
-        // no shared mutable state on the feature hot path. Provision those
-        // resources up front. If per-worker O_DIRECT readers cannot be opened
-        // (e.g. fd exhaustion) we clamp to 1 rather than let a worker read
-        // zeros — fail safe, never silently corrupt features.
+        // The Four-Level Feature Store path is multi-worker-safe — each
+        // worker owns a private DirectIoReader (its own io_uring rings) and
+        // a private pinned staging buffer, so there is no shared mutable
+        // state on the feature hot path. Provision those resources up front.
+        // If per-worker O_DIRECT readers cannot be opened (e.g. fd
+        // exhaustion) we clamp to 1 rather than let a worker read zeros —
+        // fail safe, never silently corrupt features.
         try {
             assembler_.prepare_feature_store_workers(effective_workers);
             fls_prefetch_workers_ = effective_workers;  // evaluate() reuses this
@@ -202,9 +203,9 @@ TrainingLoop::Result TrainingLoop::train()
         // === Training phase ===
         model_.train();
 
-        // Round 1E (2026-05-15): on-device loss accumulator. Replaces the
-        // per-batch `loss.item<double>()` (GPU→CPU sync) with a single
-        // `.item()` at end-of-epoch. Stays on `device` so loss.detach()
+        // On-device loss accumulator (GPU-sync reduction, 2026-05-15).
+        // Replaces the per-batch `loss.item<double>()` (GPU→CPU sync) with a
+        // single `.item()` at end-of-epoch. Stays on `device` so loss.detach()
         // accumulates without crossing the PCIe bus.
         torch::Tensor epoch_loss_sum;
         if (device.is_cpu()) {
@@ -217,15 +218,17 @@ TrainingLoop::Result TrainingLoop::train()
         uint64_t num_labeled_batches = 0;
         uint64_t num_train_batches   = 0;
 
-        // Spec C3 stage 1.B: optional async prefetcher fronted by a single
-        // worker thread (DiskGNN paper §5.3 producer-consumer pattern).
-        // The prefetcher is per-epoch — destroyed at scope exit, joining
-        // its worker. Cost is ~100 μs per epoch (Linux thread spawn),
-        // negligible vs the per-batch assembly cost it hides.
+        // Optional async prefetcher (training pipeline overlap): a single
+        // producer-consumer worker thread overlaps each batch's assemble +
+        // host→device transfer with the previous batch's forward+backward
+        // (DiskGNN paper §5.3 pattern). The prefetcher is per-epoch —
+        // destroyed at scope exit, joining its worker. Cost is ~100 μs per
+        // epoch (Linux thread spawn), negligible vs the per-batch assembly
+        // cost it hides.
         //
-        // Spec C3 stage 3: when stage3_active, the prefetcher worker uses
-        // its own pool stream and records a CUDAEvent into MiniBatch.
-        // The training thread (this loop) uses a separate train_stream and
+        // When stage3_active (dual CUDA streams), the prefetcher worker uses
+        // its own pool stream and records a CUDAEvent into MiniBatch. The
+        // training thread (this loop) uses a separate train_stream and
         // event.block()s on it before forward — letting the GPU schedule
         // assemble_kernel and forward+backward concurrently when SMs allow.
 #ifdef ENABLE_CUDA_ASSEMBLER
@@ -262,11 +265,11 @@ TrainingLoop::Result TrainingLoop::train()
             bt.batch_id = bid;
             bt.split    = 0;  // TRAIN
 
-            // Spec C3 stage 0: assemble + device transfer is the work an
-            // async prefetcher (stage 1) would hide behind compute.
-            // When the prefetcher is on, this measurement reflects only
-            // the wait-for-ready-batch + device transfer time, not the
-            // actual disk + CPU assembly which has overlapped.
+            // Assemble + device transfer is the work the async prefetcher
+            // hides behind compute (pipeline overlap). When the prefetcher
+            // is on, this measurement reflects only the wait-for-ready-batch
+            // + device transfer time, not the actual disk + CPU assembly
+            // which has already overlapped with the previous iteration.
             auto t_assem_start = std::chrono::steady_clock::now();
 
             MiniBatch mini;
@@ -285,11 +288,11 @@ TrainingLoop::Result TrainingLoop::train()
                 mini = assembler_.assemble(bid);
             }
 
-            // Phase A (2026-05-19): sub-stage timings populated by
-            // BatchAssembler are now propagated via MiniBatch::timing on
-            // BOTH paths (sequential and async prefetcher). The worker
-            // stamps mini.timing before pushing into the queue, so the
-            // consumer reads safely after next() returns.
+            // Per-batch sub-stage timing breakdown (2026-05-19): sub-stage
+            // timings populated by BatchAssembler are now propagated via
+            // MiniBatch::timing on BOTH paths (sequential and async
+            // prefetcher). The worker stamps mini.timing before pushing into
+            // the queue, so the consumer reads safely after next() returns.
             bt.sample_read_us      = mini.timing.sample_read_ns      / 1000;
             bt.active_us           = mini.timing.active_ns           / 1000;
             bt.assembler_kernel_us = mini.timing.assembler_kernel_ns / 1000;
@@ -311,8 +314,8 @@ TrainingLoop::Result TrainingLoop::train()
                 }
             }
 
-            // Path 4 / STEP 6 (2026-05-31): v2 addr_table fast-path telemetry,
-            // read from the MiniBatch (stamped by BatchAssembler immediately
+            // Address-table fast-path telemetry (2026-05-31): v2 addr_table
+            // metrics, read from the MiniBatch (stamped by BatchAssembler immediately
             // after the load) rather than from the FourLevelStore. This makes it
             // correct on BOTH the sequential and async-prefetcher paths — under
             // the prefetcher the store's last_used_addr_tables()/last_addr_load_us()
@@ -330,12 +333,12 @@ TrainingLoop::Result TrainingLoop::train()
                     static_cast<double>(result.addr_table_load_us_count);
             }
 
-            // Spec C3 stage 3: cross-stream sync + record_stream BEFORE any
-            // tensor reads on the train stream. event.block makes train
-            // stream wait for worker's assemble_kernel + .to(device); it
-            // does NOT block the host. record_stream prevents the caching
-            // allocator from freeing the worker-allocated tensors while
-            // train_stream is still using them.
+            // Dual-stream CUDA overlap: cross-stream sync + record_stream
+            // BEFORE any tensor reads on the train stream. event.block makes
+            // train_stream wait for the prefetch worker's assemble_kernel +
+            // .to(device); it does NOT block the host. record_stream prevents
+            // the caching allocator from freeing the worker-allocated tensors
+            // while train_stream is still using them.
 #ifdef ENABLE_CUDA_ASSEMBLER
             std::optional<c10::cuda::CUDAStreamGuard> stage3_guard;
             if (stage3_active && train_stream) {
@@ -420,9 +423,10 @@ TrainingLoop::Result TrainingLoop::train()
             bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_fwd_end - t_fwd_start).count();
 
-            // Round 1E (2026-05-15): guard backward on CPU-side num_labeled
-            // (computed in BatchAssembler) instead of `label_mask.any().item<bool>()`
-            // — the latter incurs a per-batch GPU→CPU sync.
+            // Sync-avoidance optimization (2026-05-15): guard backward on
+            // CPU-side num_labeled (computed in BatchAssembler) instead of
+            // `label_mask.any().item<bool>()` — the latter incurs a per-batch
+            // GPU→CPU sync.
             if (mini.num_labeled > 0) {
                 auto masked_logits = logits.index({mini.label_mask});
                 auto masked_labels = mini.labels.index({mini.label_mask});
@@ -441,9 +445,9 @@ TrainingLoop::Result TrainingLoop::train()
                 bt.backward_us = std::chrono::duration_cast<std::chrono::microseconds>(
                     t_bwd_end - t_bwd_start).count();
 
-                // Round 1E: defer .item() to end-of-epoch. loss.detach() keeps
-                // the scalar on-device; the add is a tiny GPU kernel. One sync
-                // per epoch instead of ~train_batches per epoch.
+                // Defer .item() to end-of-epoch (sync-avoidance). loss.detach()
+                // keeps the scalar on-device; the add is a tiny GPU kernel. One
+                // sync per epoch instead of ~train_batches per epoch.
                 epoch_loss_sum += loss.detach().to(epoch_loss_sum.dtype());
                 ++num_labeled_batches;
             }
@@ -470,9 +474,10 @@ TrainingLoop::Result TrainingLoop::train()
 #endif
         }
 
-        // Spec C3 stage 3: synchronize train_stream before validation reads
-        // any tensors. evaluate() runs on the default stream (sequentially)
-        // and may read tensors that were last written on train_stream.
+        // Synchronize train_stream before validation reads any tensors.
+        // evaluate() runs on the default stream (sequentially) and may read
+        // tensors that were last written on train_stream by the dual-stream
+        // overlap path.
 #ifdef ENABLE_CUDA_ASSEMBLER
         if (train_stream) {
             train_stream->synchronize();
@@ -487,8 +492,8 @@ TrainingLoop::Result TrainingLoop::train()
         }
 #endif
 
-        // Round 1E (2026-05-15): single end-of-epoch sync to read accumulated
-        // loss off-device. The .item() fires exactly once per epoch instead
+        // Sync-avoidance optimization (2026-05-15): single end-of-epoch sync to
+        // read accumulated loss off-device. The .item() fires exactly once per epoch instead
         // of once per labeled batch (~1300× on papers100M scale). Division
         // by num_train_batches preserves the previous behavior exactly —
         // total_loss only accrues from labeled batches, but the average is
@@ -524,9 +529,9 @@ TrainingLoop::Result TrainingLoop::train()
             profile_log_->flush();
         }
 
-        // Spec B2: capture cumulative L3+L4 disk bytes post-validation so
-        // the delta covers train + eval activity for this epoch. The
-        // single uint64_t return keeps the Config callback ABI-stable.
+        // Capture cumulative L3+L4 disk bytes post-validation so the delta
+        // covers train + eval activity for this epoch. The single uint64_t
+        // return keeps the Config callback ABI-stable.
         uint64_t cur_disk = 0;
         uint64_t delta_disk = 0;
         if (config_.cumulative_disk_bytes_provider) {
@@ -594,9 +599,10 @@ TrainingLoop::Result TrainingLoop::train()
                   << "  (train=" << std::fixed << std::setprecision(1) << train_phase_s
                   << "s val=" << std::fixed << std::setprecision(1) << val_phase_s << "s)"
                   << "  total_t=" << std::fixed << std::setprecision(0) << wall_so_far << "s";
-        // Spec B2: per-epoch L3+L4 disk-traffic delta inline. Suppressed
-        // when provider is unset (delta stays zero) or the delta is
-        // < 1 MB (dominant case for small datasets where the line would
+        // Per-epoch L3+L4 disk-traffic delta inline (bytes read from the
+        // on-disk reordered feature matrix and per-batch packed store).
+        // Suppressed when provider is unset (delta stays zero) or the delta
+        // is < 1 MB (dominant case for small datasets where the line would
         // just clutter).
         if (delta_disk >= (1ULL << 20)) {  // >= 1 MB
             constexpr double GB = 1024.0 * 1024.0 * 1024.0;
@@ -697,19 +703,19 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
     // tests) the model's first parameter still carries the canonical device.
     const torch::Device device = model_.parameters().begin()->device();
 
-    // Round 1D (2026-05-15): mirror train()'s AsyncBatchPrefetcher to hide
-    // validation-batch assemble + host→device cost behind the model forward
-    // on GPU. evaluate() is called once per epoch from train() AFTER the
-    // training prefetcher has drained (last train batch consumed, no more
-    // prefetch() calls issued), so the train prefetcher's worker is idle
-    // on its req_queue cv and there is no concurrent BatchAssembler access.
-    // The eval prefetcher owns its own worker that is destructed (join) at
+    // Mirror train()'s async prefetcher to hide validation-batch assemble +
+    // host→device cost behind the model forward on GPU (pipeline overlap).
+    // evaluate() is called once per epoch from train() AFTER the training
+    // prefetcher has drained (last train batch consumed, no more prefetch()
+    // calls issued), so the train prefetcher's worker is idle on its
+    // req_queue cv and there is no concurrent BatchAssembler access. The
+    // eval prefetcher owns its own worker that is destructed (join) at
     // scope exit.
     //
-    // Spec C3 stage 3: when enabled, the eval prefetcher's worker runs
-    // assemble on a pool stream and records a CUDAEvent into MiniBatch;
-    // this thread uses a separate eval_stream and event.block()s before
-    // forward, mirroring train()'s lines 193-216 exactly.
+    // When dual CUDA streams are enabled, the eval prefetcher's worker runs
+    // assemble on a pool stream and records a CUDAEvent into MiniBatch; this
+    // thread uses a separate eval_stream and event.block()s before forward,
+    // mirroring train()'s cross-stream sync block exactly.
 #ifdef ENABLE_CUDA_ASSEMBLER
     const bool stage3_active = config_.use_async_prefetcher
                             && config_.use_cuda_streams
@@ -722,21 +728,21 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
     constexpr bool stage3_active = false;
 #endif
 
-    // Round 3B (2026-05-15): same FourLevelStore guard as train(). See
-    // train()'s comment for rationale. evaluate() is called once per epoch
-    // so the warning would be spammy — we suppress it here (train() already
-    // emitted it once on the first epoch).
+    // Same Four-Level Feature Store worker guard as train(). See train()'s
+    // comment for rationale. evaluate() is called once per epoch so the
+    // warning would be spammy — we suppress it here (train() already emitted
+    // it once on the first epoch).
     unsigned effective_eval_workers = config_.prefetch_num_workers;
     if (effective_eval_workers == 0) {
         effective_eval_workers = 1;
     }
     if (assembler_.uses_feature_store()) {
-        // Round 3B-mw: reuse EXACTLY the per-worker IO count train() already
-        // provisioned (fls_prefetch_workers_; 1 if multi-worker was not
-        // enabled). Never exceed it — a worker id beyond the provisioned slots
-        // would fall back to the shared primary DirectIoReader and race.
-        // prepare_feature_store_workers() ran in train() before the epoch loop
-        // (single-threaded), so the slots already exist here.
+        // Reuse EXACTLY the per-worker IO count train() already provisioned
+        // (fls_prefetch_workers_; 1 if multi-worker was not enabled). Never
+        // exceed it — a worker id beyond the provisioned slots would fall
+        // back to the shared primary DirectIoReader and race.
+        // prepare_feature_store_workers() ran in train() before the epoch
+        // loop (single-threaded), so the slots already exist here.
         effective_eval_workers = fls_prefetch_workers_;
     }
 
@@ -800,8 +806,9 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
             }
         }
 
-        // Spec C3 stage 3: cross-stream sync + record_stream BEFORE any
-        // tensor reads on the eval stream. Mirrors train()'s lines 193-216.
+        // Dual-stream CUDA overlap: cross-stream sync + record_stream BEFORE
+        // any tensor reads on the eval stream. Mirrors train()'s cross-stream
+        // sync block for the training loop.
 #ifdef ENABLE_CUDA_ASSEMBLER
         std::optional<c10::cuda::CUDAStreamGuard> stage3_guard;
         if (stage3_active && eval_stream) {
@@ -857,10 +864,11 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
             t_fwd_end - t_fwd_start).count();
 
-        // Round 1E (2026-05-15): guard on CPU-side num_labeled (computed in
-        // BatchAssembler) to avoid the `label_mask.any().item<bool>()`
-        // per-batch GPU→CPU sync. The remaining `.sum().item<int64_t>()`
-        // collects validation accuracy — out of scope for Round 1E.
+        // Sync-avoidance optimization (2026-05-15): guard on CPU-side
+        // num_labeled (computed in BatchAssembler) to avoid the
+        // `label_mask.any().item<bool>()` per-batch GPU→CPU sync. The remaining
+        // `.sum().item<int64_t>()` collects validation accuracy — out of scope
+        // for this sync-avoidance change.
         if (mini.num_labeled > 0) {
             auto masked_logits = logits.index({mini.label_mask});
             auto masked_labels = mini.labels.index({mini.label_mask});
@@ -886,12 +894,12 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         profile_log_->flush();
     }
 
-    // Spec C3 stage 3: synchronize eval_stream before returning so any
-    // tensor reads following this call (e.g., the next epoch's train
-    // prefetcher reading model state) observe a coherent view. The
-    // per-batch .item<int64_t>() on `correct` is already an implicit sync
-    // point, but the explicit synchronize matches train()'s lines 283-287
-    // and survives future refactors that might remove the .item() calls.
+    // Synchronize eval_stream before returning so any tensor reads following
+    // this call (e.g., the next epoch's train prefetcher reading model state)
+    // observe a coherent view. The per-batch .item<int64_t>() on `correct`
+    // is already an implicit sync point, but the explicit synchronize mirrors
+    // train()'s train_stream synchronize and survives future refactors that
+    // might remove the .item() calls.
 #ifdef ENABLE_CUDA_ASSEMBLER
     if (eval_stream) {
         eval_stream->synchronize();

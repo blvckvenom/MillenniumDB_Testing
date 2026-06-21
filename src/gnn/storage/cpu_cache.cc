@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <thread>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -25,9 +26,10 @@ namespace fs = std::filesystem;
 // build() — write GNNC file from selected nodes
 // =============================================================================
 
-// Fix #14 (2026-05-13): skip rebuild if an existing cache file's header
-// already matches the requested (num_nodes, feature_dim, dtype). Cuts
-// 19 min off papers100M L2 build on idempotent re-runs.
+// Skip rebuild if an existing cache file's header already matches the
+// requested (num_nodes, feature_dim, dtype). Cuts ~19 min off papers100M
+// L2 build on idempotent re-runs by avoiding a re-read of the source
+// feature matrix.
 static bool cache_header_matches(
     const fs::path& path,
     uint64_t        expected_N,
@@ -60,9 +62,9 @@ void CpuCache::build(
     size_t row_bytes = D * elem;
 
     if (cache_header_matches(output_path, N, D, dtype)) {
-        // Fix #14: header matches expected dims → existing cache is
-        // reusable. Skipping the rebuild avoids re-reading the source
-        // FM (random row access, expensive on cold cache).
+        // Header matches expected dims — existing cache is reusable.
+        // Skipping the rebuild avoids re-reading the source feature
+        // matrix (random row access, expensive on cold page cache).
         return;
     }
 
@@ -71,9 +73,10 @@ void CpuCache::build(
     // Resolve OID -> row before opening the output file so any error
     // surfaces without leaving a partial file behind. While we're at
     // it, sort by row_index to convert random source reads into
-    // sequential ones (same trick as Fix #12 in create_reordered).
-    // The (oid, row) pairing on disk is preserved — the on-disk index
-    // is arbitrary as long as oid_table[i] still maps to data[i].
+    // sequential ones (same technique used in the reordered-fmat builder
+    // in create_reordered). The (oid, row) pairing on disk is preserved
+    // — the on-disk index is arbitrary as long as oid_table[i] still
+    // maps to data[i].
     struct Entry { uint64_t row; ObjectId oid; };
     std::vector<Entry> entries;
     entries.reserve(N);
@@ -97,10 +100,39 @@ void CpuCache::build(
     std::memcpy(out_buf.data(), &header, sizeof(header));
     auto* oid_ptr  = reinterpret_cast<uint64_t*>(out_buf.data() + sizeof(header));
     char*  feat_ptr = out_buf.data() + sizeof(header) + oid_block;
-    for (uint64_t i = 0; i < N; ++i) {
-        oid_ptr[i] = entries[i].oid.id;
-        std::memcpy(feat_ptr + i * row_bytes,
-                    features.row(entries[i].row), row_bytes);
+    // Optional parallel gather (env MDB_GNN_CACHE_WORKERS, default 1 = sequential):
+    // each gather iteration writes into disjoint output slots (oid_ptr[i] and
+    // feat_ptr[i*row_bytes]) while reading the mmap source via features.row()
+    // (a thread-safe const operation), so splitting the index range across threads
+    // produces bit-identical output (each thread owns a non-overlapping slice).
+    {
+        unsigned cache_workers = 1;
+        if (const char* env = std::getenv("MDB_GNN_CACHE_WORKERS")) {
+            long v = std::strtol(env, nullptr, 10);
+            if (v > 1) cache_workers = static_cast<unsigned>(v);
+        }
+        const unsigned hw = std::thread::hardware_concurrency();
+        if (hw > 0 && cache_workers > hw) cache_workers = hw;
+        auto gather_range = [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) {
+                oid_ptr[i] = entries[i].oid.id;
+                std::memcpy(feat_ptr + i * row_bytes,
+                            features.row(entries[i].row), row_bytes);
+            }
+        };
+        if (cache_workers <= 1 || N < cache_workers) {
+            gather_range(0, N);
+        } else {
+            std::vector<std::thread> gw;
+            const uint64_t chunk = (N + cache_workers - 1) / cache_workers;
+            for (unsigned w = 0; w < cache_workers; ++w) {
+                const uint64_t lo = static_cast<uint64_t>(w) * chunk;
+                const uint64_t hi = std::min<uint64_t>(lo + chunk, N);
+                if (lo >= hi) break;
+                gw.emplace_back(gather_range, lo, hi);
+            }
+            for (auto& t : gw) t.join();
+        }
     }
 
     int fd = ::open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -311,11 +343,11 @@ CpuCache::LookupResult CpuCache::lookup(const std::vector<ObjectId>& oids) const
 // lookup_uva() — zero-copy pointer-based lookup
 // =============================================================================
 //
-// Round 1B (2026-05-15): unlike lookup(), this does not allocate or memcpy
-// row bytes. Each hit returns a const void* into the already-pinned
-// feature_data_ region. The pointer is valid for the lifetime of this
-// CpuCache (or until the cache is moved-from). Callers either memcpy into
-// their own destination or pass the pointer to a CUDA kernel for UVA reads.
+// Unlike lookup(), this does not allocate or memcpy row bytes. Each hit
+// returns a const void* into the already-pinned feature_data_ region.
+// The pointer is valid for the lifetime of this CpuCache (or until the
+// cache is moved-from). Callers either memcpy into their own destination
+// or pass the pointer to a CUDA kernel for Unified Virtual Addressing reads.
 
 CpuCache::UvaLookupResult CpuCache::lookup_uva(const std::vector<ObjectId>& oids) const {
     UvaLookupResult result;
@@ -339,15 +371,15 @@ CpuCache::UvaLookupResult CpuCache::lookup_uva(const std::vector<ObjectId>& oids
 }
 
 // =============================================================================
-// find_index() / row_ptr() — Round 1C
+// find_index() / row_ptr()
 // =============================================================================
 //
-// Round 1C (2026-05-15): split the work of lookup_uva() into a single-hash
-// find_index() (used in the FourLevelStore classification loop) and a
-// row_ptr() accessor that returns the UVA pointer to the row at a
-// pre-validated cache index. Together these replace the previous
-// double-hash pattern (contains() then lookup_uva()) with one hash per
-// L2 hit.
+// Splits the work of lookup_uva() into a single-hash find_index() (used
+// in the Four-Level Feature Store classification loop to check whether a
+// node falls in the L2 CPU-pinned cache) and a row_ptr() accessor that
+// returns the pointer to the feature row at a pre-validated cache index.
+// Together these replace the previous double-hash pattern (contains() then
+// lookup_uva()) with one hash lookup per L2 hit.
 
 std::optional<uint32_t> CpuCache::find_index(ObjectId oid) const {
     auto it = oid_to_idx_.find(oid.id);

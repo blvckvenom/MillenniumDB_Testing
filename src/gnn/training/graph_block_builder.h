@@ -13,8 +13,8 @@ namespace mdb::gnn::graph_block {
 /**
  * @brief Output bundle from build_active_indices.
  *
- * Round 2C (2026-05-15): in addition to the per-layer global-position
- * tensors used by the model gather, also produce a per-layer
+ * Edge-remap optimization (2026-05-15): in addition to the per-layer
+ * global-position tensors used by the model gather, also produce a per-layer
  * `ObjectId.id -> local-position-in-A_k` hash table. These are the
  * direct map build_edge_indices needs to remap edges from layer-local
  * indices straight into the active set, halving the number of hash
@@ -79,9 +79,10 @@ build_active_indices(
  * This eliminates the need for an extra remap in the model — index_select
  * directly into x = features[active_indices_per_layer[k+1]] works.
  *
- * Round 2C (2026-05-15): takes the per-layer oid_to_local maps produced
- * by build_active_indices so each edge endpoint costs ONE hash lookup
- * (ObjectId.id -> local idx) instead of two (oid -> global -> local).
+ * Edge-endpoint single-lookup optimization (2026-05-15): takes the per-layer
+ * oid_to_local maps produced by build_active_indices so each edge endpoint
+ * costs ONE hash lookup (ObjectId.id -> local idx) instead of two
+ * (oid -> global -> local).
  *
  * Fast path (2026-06-04): when active.oid_to_local_per_layer is EMPTY, the
  * active sets are identity prefixes (local index == global position), so each

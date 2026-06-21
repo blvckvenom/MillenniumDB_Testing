@@ -1,7 +1,7 @@
 #include "gnn/storage/feature_matrix.h"
 
-#include "gnn/common/page_cache_hint.h"   // Fix #22
-#include "gnn/common/pipeline_overlap.h"  // Fix #21
+#include "gnn/common/page_cache_hint.h"   // fadvise_dontneed / madvise_dontneed: page-cache relief after sequential writes
+#include "gnn/common/pipeline_overlap.h"  // ChunkPipeline: opt-in producer-consumer overlap for reorder passes
 
 #include <algorithm>
 #include <atomic>
@@ -80,10 +80,10 @@ void write_all(int fd, const void* buf, size_t count) {
     }
 }
 
-// Fix #20: physical pre-allocation. fallocate(2) reserves disk blocks
-// up-front, so subsequent pwrites don't have to allocate extents on the
-// fly. Falls back to ftruncate if fallocate is unsupported (e.g. tmpfs).
-// Returns 0 on success, errno on failure.
+// Physical pre-allocation: fallocate(2) reserves disk blocks up-front so
+// subsequent pwrites don't have to allocate extents on the fly. Falls back
+// to ftruncate if fallocate is unsupported (e.g. tmpfs). Returns 0 on
+// success, errno on failure.
 int reserve_file_size(int fd, off_t size) {
 #if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
     // mode=0 → allocate blocks AND grow the file. EOPNOTSUPP on
@@ -569,7 +569,7 @@ FeatureMatrix FeatureMatrix::create_parallel(
     }
     FdGuard guard(fd);
 
-    // Pre-allocate via fallocate (Fix #20) to reserve physical blocks,
+    // Pre-allocate via fallocate to reserve physical blocks up-front,
     // avoiding per-pwrite extent allocation. Falls back to ftruncate
     // on filesystems that don't support fallocate.
     if (int err = reserve_file_size(fd, static_cast<off_t>(file_size))) {
@@ -656,44 +656,42 @@ FeatureMatrix FeatureMatrix::create_parallel(
 
 // --- create_reordered() ---
 //
-// Spec D L3 reorder is the hottest path in `gnn_build_feature_store`: it
-// writes the entire feature matrix (papers100M: 56.86 GB) in a new row
-// permutation. The original implementation drove `create_streaming` with a
-// callback that did `source.row(perm[output_row])` — random reads keyed by
-// the destination row, which is uncorrelated with the source position.
-// With 30 GB RAM hosting a 56 GB source mmap, the page cache thrashed and
-// the phase took 3 h 21 min wall-clock on celebi.
+// The L3 on-disk feature reorder is the hottest path in `gnn_build_feature_store`:
+// it writes the entire feature matrix (papers100M: 56.86 GB) in a new row
+// permutation so that the MinHash-reordered layout places frequently co-accessed
+// rows contiguously on disk. The original implementation drove `create_streaming`
+// with a callback that did `source.row(perm[output_row])` — random reads keyed by
+// the destination row, which is uncorrelated with the source position. With 30 GB
+// RAM hosting a 56 GB source mmap, the page cache thrashed and the phase took
+// 3 h 21 min wall-clock on celebi.
 //
 // This implementation supports two strategies, selected by env var
 // MDB_GNN_REORDER_STRATEGY:
-//   chunked         (default, Fix #13): chunked output writes, random
-//                   source reads. Best when source FM fits comfortably
-//                   in RAM (e.g. < ~30% of total RAM).
-//   external_sort   (Fix #15, 2026-05-13): two-pass radix partition.
-//                   Pass 1 reads source sequentially and scatters rows
-//                   into per-bucket temp files. Pass 2 reads each
-//                   bucket sequentially, assembles the output range
-//                   in memory and writes it with a single pwrite.
-//                   Both passes are sequential I/O; eliminates the
-//                   source page-cache thrash that dominates `chunked`
-//                   when the FM exceeds ~70% of RAM.
-//
-// The legacy `chunked` strategy uses CHUNKED OUTPUT WRITES:
+//   chunked       (default before 2026-06-01): chunked output writes, random
+//                 source reads. Best when source FM fits comfortably in RAM
+//                 (e.g. < ~30% of total RAM). Avoids per-row pwrite amplification
+//                 by gathering a contiguous output chunk into a heap buffer then
+//                 issuing one large pwrite per chunk.
+//   external_sort (default since 2026-06-01): two-pass radix partition. Pass 1
+//                 reads source sequentially and scatters rows into per-bucket temp
+//                 files. Pass 2 reads each bucket sequentially, assembles the
+//                 output range in memory and writes it with a single pwrite. Both
+//                 passes are sequential I/O; eliminates the source page-cache
+//                 thrash that dominates `chunked` when the FM exceeds ~70% of RAM.
 //
 // Earlier history for posterity:
-//   Original (pre-Fix #12, 2026-04-22): per-row write_all with random
-//     mmap reads keyed by `perm[output_row]`. 3 h 21 min on papers100M.
-//   Fix #12 (2026-05-13, intermediate): sorted (src,out) moves, per-row
-//     pwrite to scattered offsets. 1 h 24 min — write amplification (22×)
-//     dominated.
-//   Fix #13 (current): chunked sequential writes. Target sub-30 min.
-// Fix #15 helper: two-pass external radix sort. Used when env var
-// MDB_GNN_REORDER_STRATEGY=external_sort. Pass 1 scans source mmap
-// sequentially and scatters rows into per-bucket temp files keyed by
-// the output position. Pass 2 reads each bucket sequentially, places
-// rows into an in-memory chunk buffer at their out_local positions, and
-// pwrites the contiguous chunk to the final output. Both source and
-// output I/O become sequential; the only random access is across the
+//   Original (2026-04-22): per-row write_all with random mmap reads keyed by
+//     `perm[output_row]`. 3 h 21 min on papers100M.
+//   Intermediate (2026-05-13): sorted (src,out) moves, per-row pwrite to scattered
+//     offsets. 1 h 24 min — write amplification (22×) dominated.
+//   Chunked sequential writes: target sub-30 min. Still slow when source > RAM.
+//
+// Two-pass external radix sort helper: used when env var
+// MDB_GNN_REORDER_STRATEGY=external_sort. Pass 1 scans source mmap sequentially
+// and scatters rows into per-bucket temp files keyed by the output position. Pass 2
+// reads each bucket sequentially, places rows into an in-memory chunk buffer at
+// their out_local positions, and pwrites the contiguous chunk to the final output.
+// Both source and output I/O become sequential; the only random access is across the
 // (few-dozen) bucket file handles, which the kernel batches well.
 FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     const FeatureMatrix& source,
@@ -707,7 +705,9 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     const GnnDtype dt = source.dtype();
 
     auto header = FeatureMatrixHeader::make(N, D, dt);
-    // STEP 8: embed the sample/feature content fingerprint in reserved[0..7].
+    // Embed the sample/feature content fingerprint in reserved[0..7] so the
+    // staleness check can detect when this reordered file no longer matches
+    // the sample/feature data it was built from.
     std::memcpy(header.reserved, &fingerprint, sizeof(fingerprint));
     const size_t rb = header.row_bytes();
     size_t data_size = header.data_bytes();
@@ -813,20 +813,20 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
             buckets[b].entries = 0;
         }
 
-        // Fix (2026-06-01): make Pass 1's SOURCE reads sequential when possible.
-        // Historically Pass 1 read source.row(permutation[out]) in OUTPUT order,
-        // i.e. RANDOM mmap access keyed by the permutation. On a box where the
-        // source FM exceeds RAM (papers100M: 56 GB on 30 GB) that random gather
-        // thrashes the page cache at ~37 MB/s — the exact pathology ext_sort was
-        // meant to avoid but never actually fixed on the read side (it only made
-        // the WRITES sequential). Build the inverse permutation (src -> out) once
-        // in O(N); when `permutation` is a true bijection of [0,N) — the
-        // production case (all callers feed MinHashReorderer::compute_permutation,
-        // a partition of [0,N)) — iterate SOURCE rows instead, so source.row(src)
-        // walks the mmap in strictly increasing offset (sequential). The bucket /
-        // out_local assignment stays a pure function of out = inv[src], so each
-        // bucket receives the identical (out_local, row) SET and Pass 2 (a pure
-        // scatter-by-out_local) yields a BYTE-IDENTICAL reordered.fmat.
+        // Make Pass 1's SOURCE reads sequential when possible. Historically Pass 1
+        // read source.row(permutation[out]) in OUTPUT order, i.e. RANDOM mmap
+        // access keyed by the permutation. On a box where the source FM exceeds RAM
+        // (papers100M: 56 GB on 30 GB) that random gather thrashes the page cache at
+        // ~37 MB/s — the exact pathology the external-sort strategy was meant to
+        // avoid but which was not fixed on the read side (it only made the WRITES
+        // sequential). Build the inverse permutation (src -> out) once in O(N); when
+        // `permutation` is a true bijection of [0,N) — the production case (all
+        // callers feed MinHashReorderer::compute_permutation, a partition of [0,N))
+        // — iterate SOURCE rows instead, so source.row(src) walks the mmap in
+        // strictly increasing offset (sequential). The bucket / out_local assignment
+        // stays a pure function of out = inv[src], so each bucket receives the
+        // identical (out_local, row) SET and Pass 2 (a pure scatter-by-out_local)
+        // yields a BYTE-IDENTICAL reordered.fmat.
         //
         // create_reordered() validates permutation[i] < N but NOT uniqueness, so
         // a non-injective permutation (duplicates/gaps — e.g. the documented
@@ -919,11 +919,11 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
                 std::cerr << "[create_reordered/ext] warning: bucket fsync failed: "
                           << std::strerror(errno) << "\n" << std::flush;
             }
-            // Fix #22: bucket file is sequential append-only and now fully
-            // flushed; clean pages can be evicted before Pass 2 starts
-            // reading bucket files. Without this hint the kernel keeps the
-            // 56+57 GB of bucket-file pages resident, evicting productive
-            // reordered.fmat pages under memory pressure.
+            // Bucket file is sequential append-only and now fully flushed; its
+            // pages are no longer needed until Pass 2 reopens it sequentially.
+            // Release them now so the kernel can reclaim the ~56 GB of bucket-file
+            // pages rather than evicting productive reordered.fmat pages under
+            // memory pressure.
             fadvise_dontneed(bk.fd, 0, 0);  // 0,0 = "entire file"
             ::close(bk.fd);
             bk.fd = -1;
@@ -945,17 +945,17 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
               << std::chrono::duration<double>(t_pass1 - t_start).count()
               << "s)\n" << std::flush;
 
-    // Fix #22: source FM was scanned sequentially in Pass 1; pages are
-    // no longer needed for Pass 2 (which only reads bucket files).
-    // Release them before allocating the per-chunk buffer for Pass 2.
-    // On papers100M (56 GB source) this is the single biggest page-cache
-    // liberation in the whole feature-store build.
+    // Source FM was fully consumed by Pass 1's sequential scan; its pages are no
+    // longer needed for Pass 2 (which only reads bucket files). Release them before
+    // allocating the per-chunk buffer for Pass 2. On papers100M (56 GB source) this
+    // is the single biggest page-cache liberation in the whole feature-store build.
     madvise_dontneed(source.mmap_ptr_, source.mmap_size_);
 
-    // Fix #21: opt-in pipelined Pass 2. Producer (open + read + scatter)
-    // overlaps with consumer (pwrite + close + remove + log) via a
-    // bounded queue of capacity 2 (DiskGNN §6). Disabled by default to
-    // preserve byte-identical behavior with the legacy serial path.
+    // Opt-in pipelined Pass 2: producer (open + read + scatter) overlaps with
+    // consumer (pwrite + close + remove + log) via a bounded queue of capacity 2.
+    // Disabled by default because empirical measurement shows it is neutral-to-
+    // negative on the external_sort path (+8% on Pass 2) and a regression on the
+    // chunked path; enable with MDB_GNN_PIPELINE_OVERLAP=1 for ablation only.
     bool use_pipeline_overlap = false;
     if (const char* env = std::getenv("MDB_GNN_PIPELINE_OVERLAP")) {
         std::string s(env);
@@ -1024,8 +1024,9 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
                         buf_pos += rb;
                     }
 
-                    // Fix #22: bucket file fully consumed — release its pages
-                    // before close (close() doesn't itself flush page cache).
+                    // Bucket file fully consumed — release its pages before close.
+                    // close() does not itself flush the page cache, so an explicit
+                    // POSIX_FADV_DONTNEED hint is required to reclaim the memory.
                     fadvise_dontneed(in_fd, 0, 0);  // 0,0 = "entire file"
 
                     uint64_t chunk_start = b * bucket_rows;
@@ -1046,8 +1047,9 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
                     FeatureMatrixHeader::SIZE + rb_ready.chunk_start * rb);
                 pwrite_all(out_fd, rb_ready.chunk_buf.data(),
                            rb_ready.actual_rows * rb, off);
-                // Fix #22: the chunk's output pages are now flushed; hint
-                // for eviction before the next bucket arrives.
+                // This chunk's output pages are now written to disk; hint the kernel
+                // that they can leave the page cache before the next bucket arrives,
+                // preventing accumulation of stale output pages under memory pressure.
                 fadvise_dontneed(out_fd, off,
                                  static_cast<off_t>(rb_ready.actual_rows * rb));
                 // Now safe to remove the consumed bucket file.
@@ -1063,7 +1065,8 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
             producer.join();
         } catch (...) {
             // Critical: drain + join even on error so the std::thread destructor
-            // doesn't trigger std::terminate(). Same pattern as Task 3.
+            // doesn't trigger std::terminate(). Same drain-then-join pattern used
+            // by the other pipeline-overlap producer/consumer loops in this file.
             pipe.set_error(std::current_exception());
             if (producer.joinable()) producer.join();
             fs::remove_all(temp_dir);
@@ -1134,8 +1137,9 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
                 off_t off = static_cast<off_t>(
                     FeatureMatrixHeader::SIZE + chunk_start * rb);
                 pwrite_all(out_fd, chunk_buf.data(), chunk_actual_rows * rb, off);
-                // Fix #22: hint kernel that this chunk's output pages can
-                // leave the page cache. Mirrors the pipeline-branch hint.
+                // Hint kernel that this chunk's output pages can leave the page
+                // cache. Mirrors the pipeline-branch hint to keep memory pressure
+                // symmetric between the two Pass 2 code paths.
                 fadvise_dontneed(out_fd, off,
                                  static_cast<off_t>(chunk_actual_rows * rb));
 
@@ -1211,15 +1215,14 @@ FeatureMatrix FeatureMatrix::create_reordered(
     const uint64_t D  = source.num_cols();
     const GnnDtype dt = source.dtype();
 
-    // Strategy selector — env-var driven. DEFAULT external_sort (Fix #15)
-    // since 2026-06-01: two sequential passes (radix-partition into buckets,
-    // then merge) keep BOTH reads and writes sequential, avoiding the
-    // random-gather source page-cache thrash that collapses the legacy
+    // Strategy selector — env-var driven. DEFAULT external_sort since 2026-06-01:
+    // the two-pass radix-partition strategy keeps BOTH reads and writes sequential,
+    // avoiding the random-gather source page-cache thrash that collapses the legacy
     // `chunked` path to ~27 MB/s whenever the source FM exceeds host RAM
     // (papers100M on 30 GB celebi: chunked ~34 min vs external_sort ~7 min).
     // Override with MDB_GNN_REORDER_STRATEGY=chunked when temp disk for the
     // bucket files (~N * row_bytes) is tight. Pipeline overlap stays opt-in
-    // OFF: the documented A/B/C/D bench shows it is neutral-to-negative on the
+    // OFF: empirical A/B/C/D bench shows it is neutral-to-negative on the
     // external_sort path (Pass 2 +8%) and a regression on chunked.
     bool use_external_sort = true;
     if (const char* env = std::getenv("MDB_GNN_REORDER_STRATEGY")) {
@@ -1242,7 +1245,9 @@ FeatureMatrix FeatureMatrix::create_reordered(
     }
 
     auto header = FeatureMatrixHeader::make(N, D, dt);
-    // STEP 8: embed the sample/feature content fingerprint in reserved[0..7].
+    // Embed the sample/feature content fingerprint in reserved[0..7] so the
+    // staleness check can detect when this reordered file no longer matches
+    // the data it was built from.
     std::memcpy(header.reserved, &fingerprint, sizeof(fingerprint));
     const size_t rb = header.row_bytes();
     if (rb > 0 && N > SIZE_MAX / rb) {
@@ -1336,12 +1341,12 @@ FeatureMatrix FeatureMatrix::create_reordered(
         // when consecutive reads land on unrelated pages.
         MadviseGuard madvise_guard(source.mmap_ptr_, source.mmap_size_, MADV_RANDOM);
 
-        // Fix #21: opt-in pipeline overlap mode.
-        // One producer thread packs the next chunk while the main consumer
-        // pwrites the previous one. Bounded queue (capacity 2, DiskGNN §6).
-        // MDB_GNN_REORDER_WORKERS is ignored in this mode — pipeline already
-        // provides I/O/compute overlap without the kernel-side pwrite contention
-        // that multi-worker concurrent pwrites cause on a single NVMe.
+        // Opt-in pipeline overlap mode: one producer thread gathers and packs the
+        // next chunk into a heap buffer while the main consumer thread pwrites the
+        // previous packed chunk. Bounded queue of capacity 2. MDB_GNN_REORDER_WORKERS
+        // is ignored in this mode — the pipeline already provides I/O/compute overlap
+        // without the kernel-side pwrite contention that concurrent multi-worker
+        // pwrites cause on a single NVMe. Enable with MDB_GNN_PIPELINE_OVERLAP=1.
         bool use_pipeline_overlap = false;
         if (const char* env = std::getenv("MDB_GNN_PIPELINE_OVERLAP")) {
             std::string s(env);
@@ -1391,9 +1396,9 @@ FeatureMatrix FeatureMatrix::create_reordered(
                     off_t off = static_cast<off_t>(
                         FeatureMatrixHeader::SIZE + rc.out_start * rb);
                     pwrite_all(fd, rc.buf.data(), rc.rows * rb, off);
-                    // Fix #22: this chunk's output pages are now clean and on-disk;
-                    // hint the kernel that they can leave the page cache so
-                    // subsequent chunks aren't competing with stale pages.
+                    // This chunk's output pages are now written to disk; hint the
+                    // kernel that they can leave the page cache so subsequent chunks
+                    // don't compete with stale output pages for available RAM.
                     fadvise_dontneed(fd, off, static_cast<off_t>(rc.rows * rb));
 
                     uint64_t done = chunks_done.fetch_add(1,
@@ -1459,9 +1464,9 @@ FeatureMatrix FeatureMatrix::create_reordered(
                             off_t off = static_cast<off_t>(
                                 FeatureMatrixHeader::SIZE + out_start * rb);
                             pwrite_all(fd, chunk_buf.data(), actual_rows * rb, off);
-                            // Fix #22: hint kernel that this chunk's output
-                            // pages can leave the page cache. Mirrors the
-                            // pipeline-branch hint for symmetric coverage.
+                            // Hint kernel that this chunk's output pages can leave
+                            // the page cache. Mirrors the pipeline-branch hint for
+                            // symmetric page-cache relief across both code paths.
                             fadvise_dontneed(fd, off,
                                              static_cast<off_t>(actual_rows * rb));
 

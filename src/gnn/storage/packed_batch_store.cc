@@ -85,12 +85,13 @@ void PackedBatchWriter::write_batch(uint64_t batch_id, const void* data,
                 "PackedBatchWriter: fsync failed for " + path_str + ": " + safe_strerror(errno));
         }
     } catch (...) {
-        // Clean up partial file on failure (Fix #10)
+        // Remove the partially-written file so a subsequent retry starts clean.
         fs::remove(path);
         throw;
     }
 
-    // Best-effort parent directory fsync for crash consistency (Fix #3)
+    // fsync the parent directory so the new file's directory entry is durable
+    // before returning, guarding against crash-after-write / lost-file scenarios.
     fsync_directory(path);
 
     ++batches_written_;
@@ -110,7 +111,8 @@ PackedBatchReader::PackedBatchReader(const fs::path& dir,
         throw std::runtime_error(
             "PackedBatchReader: directory not found: " + dir_.string());
     }
-    // Fix #5: symmetric with Writer validation
+    // Mirror the Writer's validation: reject zero feature_dim early rather than
+    // producing garbage header files or dividing by zero during row-size math.
     if (feature_dim_ == 0) {
         throw std::invalid_argument(
             "PackedBatchReader: feature_dim must be > 0");
@@ -161,7 +163,8 @@ PackedBatchHeader PackedBatchReader::read_header(uint64_t batch_id) const {
 
 uint64_t PackedBatchReader::read_batch(uint64_t batch_id, void* out,
                                        size_t out_capacity) const {
-    // Fix #1: Single-open — read header + data from the same fd.
+    // Open the file once and read the header followed immediately by the data
+    // payload, avoiding a second open() call that could race with concurrent writers.
     if (batch_id >= num_batches_) {
         throw std::out_of_range(
             "PackedBatchReader: batch_id " + std::to_string(batch_id) +
@@ -257,7 +260,8 @@ void generate_packed_batches(
             continue;
         }
 
-        // Fix #2: Overflow guard before buffer allocation
+        // Guard against size_t overflow before allocating the per-batch buffer:
+        // N * row_bytes could wrap on a 32-bit size_t or a pathologically large batch.
         if (row_bytes > 0 && N > SIZE_MAX / row_bytes) {
             throw std::overflow_error(
                 "generate_packed_batches: batch " + std::to_string(b) +
@@ -304,7 +308,16 @@ void generate_packed_batches(
 }
 
 // ===========================================================================
-// generate_packed_batches_partitioned (Spec B1 — DiskGNN-style inverted loop)
+// generate_packed_batches_partitioned — inverted-index partitioned packer
+//
+// Instead of buffering each batch's full receptive-field in RAM (which would
+// require total_refs * row_bytes, e.g. ~36 GB on papers100M and OOM-kills
+// hosts with 30 GB RAM), this function builds an inverted index from feature-
+// matrix row → (batch_id, position_in_batch), then performs a single sequential
+// pass over the FeatureMatrix partitioned into ~partition_bytes chunks.  For
+// each partition it sorts the inverted-index entries by batch_id and pwrite()s
+// each batch's contribution directly into its final file offset.  Peak RAM is
+// therefore O(partition_bytes + num_batches * sizeof(fd)) — a small constant.
 // ===========================================================================
 
 void generate_packed_batches_partitioned(
@@ -338,11 +351,13 @@ void generate_packed_batches_partitioned(
     const auto     dtype       = features.dtype();
     const bool     has_oids    = static_cast<bool>(oid_provider);
 
-    // --- DiskGNN-adoption Plan 1: optional consolidated cold-feature file ---
-    // One file = ConsolidatedSlimHeader + every batch's data section, batch b
-    // at a 4096-aligned offset. Written in the SAME .fmat scan as the per-batch
-    // .bin files (which are left unchanged). cons_offset[b] is the byte offset
-    // of batch b's payload; the payload is cons_length[b] = batch_size[b]*row_bytes.
+    // --- Optional consolidated cold-feature file ---
+    // Writes a single file (ConsolidatedSlimHeader + per-batch payloads) in the
+    // SAME .fmat scan pass as the individual per-batch .bin files, so the extra
+    // I/O cost is minimal.  Each batch b's payload is placed at a 4096-aligned
+    // offset cons_offset[b]; its byte length is cons_length[b] = batch_size[b]*row_bytes.
+    // This lets a reader load any batch's features with a single O_DIRECT read
+    // into a pre-allocated pinned buffer instead of opening individual .bin files.
     const bool write_consolidated = !consolidated_path.empty();
     ConsolidatedSlimHeader cons_header{};
     uint64_t cons_align = 4096;
