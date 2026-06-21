@@ -8,6 +8,7 @@
 
 #include "gnn/projection/edge_orientation.h"   // EdgeOrientation (lightweight header)
 #include "gnn/projection/topology_accessor.h"  // SamplingStrategy + BatchStrategy (still depends on torch)
+#include "gnn/sampling/sampling_backend_plan.h"  // SamplingBackendChoice (dynamic GPU/CPU backend)
 
 namespace mdb::gnn {
 
@@ -178,50 +179,53 @@ struct SamplingConfig {
     uint64_t reservoir_threshold = 10000;
 
     /**
-     * @brief Use the in-memory projection adjacency cache (Spec #11).
+     * @brief Use the in-memory adjacency cache built from a single full
+     *        B+Tree scan.
      *
-     * When true (default), the sampler full-scans `from_to_edge` +
-     * `to_from_edge` ONCE at construction and resolves every subsequent
-     * neighbour lookup in O(degree) from a hash map instead of paying an
-     * O(page_tuples) range query against the live B+Tree per seed.
+     * When true (default), the sampler performs one complete scan of the
+     * `from_to_edge` + `to_from_edge` B+Trees at construction time and
+     * populates an `unordered_map<src, vector<AdjEntry>>` covering every
+     * directed edge in the projection. Every subsequent neighbour lookup
+     * for a seed node then resolves in O(degree) from this map instead of
+     * paying an O(page_tuples) range query against the live B+Tree per seed.
      *
      * Empirically replaces an 11-minute run on ogbn-products (62 M edges)
-     * with a sub-30-second one — the same pattern that delivered ~700×
-     * speed-up in EmbeddingWriter Phase B (commit 6521cc21).
+     * with a sub-30-second one.
      *
      * Memory cost: ~16 bytes × num_directed_entries. Both UNDIRECTED
      * directions cached together: ogbn-arxiv (~2.1 M directed) ≈ 34 MB,
      * ogbn-products (~124 M directed) ≈ 3 GB.
      *
      * Disable with `useAdjacencyCache: false` for memory-constrained
-     * scenarios (papers100M scale needs partitioning before the cache fits
-     * — see master plan §11) or when bypassing the cache for benchmarking.
+     * scenarios (papers100M scale needs partitioning before the full cache
+     * fits in RAM) or when bypassing the cache for benchmarking.
      */
     bool use_adjacency_cache = true;
 
     // =========================================================================
-    // Four-Level Topology Store (Spec #13)
+    // Four-Level Topology Store
     // =========================================================================
 
     /**
-     * @brief Use the Four-Level Topology Store (Spec #13).
+     * @brief Use the frequency-tiered Four-Level Topology Store.
      *
      * When true, the sampler builds a tiered cache that partitions adjacency
-     * across four tiers:
+     * across four tiers based on per-node access frequency:
      *   - L1: RAM hash (hot nodes, ~5-20 ns/lookup)
-     *   - L2: RAM compact CSR (warm nodes, ~50-200 ns/lookup)
+     *   - L2: RAM compact uint32 CSR (warm nodes, ~50-200 ns/lookup)
      *   - L3: mmap-backed CSR sidecar (cold nodes, ~5-100 us/lookup)
-     *   - L4: B+Tree direct (rare fallback)
+     *   - L4: direct B+Tree lookup (rare fallback)
      *
      * Designed to enable papers100M-scale sampling on commodity 32 GB RAM
-     * hardware. Default true: strictly better than Spec #11 — matches it
-     * for small graphs (everything fits in L1) and avoids OOM on graphs
-     * larger than available RAM. Set false to opt out for A/B benchmarks
-     * or to force pure Spec #11 behavior.
+     * hardware. Default true: strictly better than the plain in-memory
+     * adjacency cache — matches it for small graphs (everything fits in L1)
+     * and avoids OOM on graphs larger than available RAM (where the full
+     * in-memory cache cannot be allocated). Set false to opt out for A/B
+     * benchmarks or to force the flat in-memory adjacency cache only.
      *
      * Validation: setting this true while `use_adjacency_cache=false` is
-     * an error — Spec #13 supersedes Spec #11 but does not bypass the cache
-     * gate (D8 in the design doc).
+     * an error — the Four-Level Topology Store supersedes the flat cache
+     * but does not bypass the cache gate (see validate()).
      */
     bool use_four_level_topology_store = true;
 
@@ -238,14 +242,15 @@ struct SamplingConfig {
     std::size_t l2_cache_mb = 0;
 
     /**
-     * @brief Use the mmap-backed L3 sidecar (Spec #4-B `topology_*.csr`
-     *        files) when present. Requires `buildTopologySnapshot:true`
-     *        at projection-build time.
+     * @brief Use the mmap-backed topology CSR sidecar files
+     *        (`topology_fwd.csr` / `topology_rev.csr`) as the L3 tier
+     *        when they are present. Requires `buildTopologySnapshot:true`
+     *        at projection-build time to produce those files.
      *
      * Default true: when the sidecar exists, tier-3 cold-tail nodes
      * are served at ~5-50 us/lookup (mmap + kernel page cache) instead
-     * of falling through to L4 BPT direct at ~30-100 us. When the
-     * sidecar is absent (projection built without buildTopologySnapshot),
+     * of falling through to the L4 direct B+Tree at ~30-100 us. When
+     * the sidecar is absent (projection built without buildTopologySnapshot),
      * dispatch silently falls through to L4 — no error, no behavior
      * change vs the false default. The flip is therefore strictly better:
      * faster when applicable, identical when not.
@@ -253,27 +258,31 @@ struct SamplingConfig {
     bool use_l3_mmap_sidecar = true;
 
     /**
-     * @brief Phase 0 auto-profile when Spec #13 cold-starts (Plan E,
-     *        2026-05-11).
+     * @brief Run a cheap random-walk profiler before the Four-Level
+     *        Topology Store first builds, when no prior `node_counts.bin`
+     *        exists (cold-start bootstrap).
      *
      * When true (default) AND `use_four_level_topology_store=true` AND
-     * the Spec #4-B `topology_rev.csr` sidecar exists AND no prior
-     * `node_counts.bin` is present, the sampler runs a cheap random-walk
-     * profiler (`TopologyWalkProfiler`) before `enable_four_level_store`,
-     * persisting `node_counts.bin` so the four-level store activates its
-     * warm-start L3 MinHash reorder on the very first run.
+     * the `topology_rev.csr` mmap sidecar exists AND no prior
+     * `node_counts.bin` is present, the sampler runs `TopologyWalkProfiler`
+     * before `enable_four_level_store`. The profiler issues degree-weighted
+     * random walks (Vose alias-method seeds) over the reverse CSR sidecar
+     * and writes the resulting per-node access counts to `node_counts.bin`,
+     * so the Four-Level Topology Store activates its warm-start L3 MinHash
+     * reorder on the very first sample build.
      *
-     * Resolves the chicken-and-egg: the warm-start file is normally
-     * written AT THE END of a sample build (acumulating real counts), so
-     * the first build is forced into the slow cold path. On graphs whose
-     * topology sidecar exceeds RAM (e.g. papers100M `topology_*.csr` =
-     * 53 GB on a 30 GB host) the cold path thrashes the page cache
-     * indefinitely. Phase 0 prevents that by approximating counts with
-     * ~500k random-walk lookups (vs ~5 B for a full 3-layer sample).
+     * Resolves the chicken-and-egg: `node_counts.bin` is normally written
+     * at the END of a sample build (accumulating real counts from that run),
+     * so the very first build is forced into the slow cold path. On graphs
+     * whose topology sidecar exceeds available RAM (e.g. papers100M
+     * `topology_*.csr` ≈ 53 GB on a 30 GB host), the cold path thrashes the
+     * page cache indefinitely. This pre-build profiler prevents that by
+     * approximating node access frequencies with ~500k random-walk lookups
+     * (vs ~5 B lookups for a full 3-layer `[10,15,20]` sample).
      *
-     * Set false to A/B compare vs the legacy "cold start = no reorder"
+     * Set false to compare against the legacy "cold start = no reorder"
      * behavior, or when you have an external `node_counts.bin` source
-     * you want to preserve.
+     * you want to preserve unchanged.
      */
     bool auto_profile_on_cold_start = true;
 
@@ -290,19 +299,21 @@ struct SamplingConfig {
     std::size_t profile_walk_length = 0;
 
     // =========================================================================
-    // Parallel sampling (Plan F, 2026-05-11)
+    // Parallel sampling (shared-memory worker pool)
     // =========================================================================
 
     /**
      * @brief Number of worker threads for the outer per-batch sampling loop.
      *
-     * Plan F (2026-05-11) — SALIENT-style shared-memory parallelization of
-     * the per-batch `khop_sampler->sample()` calls in
-     * `OfflineSamplingEngine::do_run`. Each worker thread owns a private
-     * `BasicKHopSampler` + `LeapfrogGnnSampler` + `SeekBasedGnnSampler`
-     * with its own RNG and per-node access-counts vector, while all of
-     * them borrow the primary's `TopologyAccessor` (FourLevelTopologyStore
-     * + adjacency caches) by reference — that part is read-only post-build.
+     * Enables a SALIENT-style shared-memory parallelization of the per-batch
+     * `khop_sampler->sample()` calls in `OfflineSamplingEngine::do_run`.
+     * Workers pull batches from a shared atomic counter and write results
+     * through a single mutex-serialized write call. Each worker thread owns
+     * a private `BasicKHopSampler` + `LeapfrogGnnSampler` +
+     * `SeekBasedGnnSampler` with its own RNG and per-node access-counts
+     * vector, while all of them borrow the primary's `TopologyAccessor`
+     * (Four-Level Topology Store + adjacency caches) by reference — that
+     * part is read-only post-build.
      *
      * Determinism is preserved bit-identically across `num_workers` values
      * because each batch is re-seeded as `random_seed XOR batch_id` before
@@ -310,7 +321,8 @@ struct SamplingConfig {
      * regardless of which thread executes it.
      *
      * Special values:
-     *   - 0 (default): single-threaded mode, identical to pre-Plan-F path.
+     *   - 0 (default): single-threaded mode, identical to the legacy
+     *        sequential path (no worker-pool overhead).
      *   - 1: parallel infrastructure runs with a single worker — useful for
      *        A/B benchmarks against the legacy single-threaded path
      *        (verifies the worker-pool overhead is negligible).
@@ -322,12 +334,12 @@ struct SamplingConfig {
      * overhead + cache contention limits linear scaling).
      *
      * **Thread-safety.** Workers borrow the primary's `TopologyAccessor`
-     * (the FourLevelTopologyStore + adjacency caches are read-only
+     * (the Four-Level Topology Store + adjacency caches are read-only
      * post-build) and own private RNG + access-counts vectors. The
-     * legacy "BPT direct" path (Spec #13 + Spec #11 both disabled) routes
-     * through `BufferManager::get_page_readonly`, which is already
-     * serialized by `vp_mutex` on the shared buffer pool — concurrent
-     * reads are safe.
+     * legacy "BPT direct" path (both the Four-Level Topology Store and
+     * the flat adjacency cache disabled) routes through
+     * `BufferManager::get_page_readonly`, which is already serialized by
+     * `vp_mutex` on the shared buffer pool — concurrent reads are safe.
      *
      * The only prerequisite is that each worker thread has a valid
      * `QueryContext::_query_ctx` pointer installed before any sampler
@@ -360,6 +372,26 @@ struct SamplingConfig {
      * higher cap. Default is 0 to preserve byte-identical legacy output.
      */
     std::uint64_t max_layer_nodes = 0;
+
+    // =========================================================================
+    // Sampling backend (dynamic GPU-UVA vs CPU out-of-core)
+    // =========================================================================
+
+    /**
+     * @brief Choose the neighbor-sampling backend by hardware (AUTO) or force it.
+     *
+     * AUTO (default) lets `plan_sampling_backend` decide GPU vs CPU from the
+     * detected hardware resources and the in-RAM CSR sizes: if a capable GPU is
+     * present and the adjacency CSR fits pinned in RAM with margin, the GPU path
+     * is chosen; otherwise the proven out-of-core CPU sampler runs. FORCE_CPU
+     * pins the CPU sampler (the bit-reproducible reference used by the
+     * determinism gates). FORCE_GPU demands the GPU path and therefore requires
+     * `use_four_level_topology_store=true` (there is no in-RAM CSR to pin
+     * otherwise).
+     *
+     * Override at runtime with env `MDB_GNN_SAMPLING_BACKEND={auto,cpu,gpu}`.
+     */
+    SamplingBackendChoice sampling_backend = SamplingBackendChoice::AUTO;
 
     // =========================================================================
     // Output
@@ -419,19 +451,33 @@ struct SamplingConfig {
             }
         }
 
-        // Spec #13 D8: useFourLevelTopologyStore implies useAdjacencyCache.
-        // Both flags being false is OK (legacy fallback through sidecar /
-        // BPT direct). Both true is OK (Spec #13 supersedes Spec #11
-        // transparently).  The single illegal combination is
-        // useFourLevelTopologyStore=true with useAdjacencyCache=false
-        // because the user is asking for a tiered cache while explicitly
-        // disabling the cache gate.
+        // The Four-Level Topology Store requires the adjacency cache to be
+        // enabled — it is layered on top of the same cache infrastructure.
+        // Both flags false is OK (legacy fallback through the mmap sidecar
+        // or direct B+Tree). Both flags true is the canonical configuration
+        // (the Four-Level Store supersedes and extends the flat cache
+        // transparently). The single illegal combination is
+        // use_four_level_topology_store=true with use_adjacency_cache=false
+        // because the user is requesting a frequency-tiered cache while
+        // explicitly disabling the cache gate.
         if (use_four_level_topology_store && !use_adjacency_cache) {
             throw std::invalid_argument(
                 "useFourLevelTopologyStore=true requires useAdjacencyCache=true. "
                 "Set useAdjacencyCache:true (or omit it; default is true) when "
                 "enabling the Four-Level Topology Store, OR disable both for "
                 "the sidecar/BPT-direct path.");
+        }
+
+        // The GPU sampling backend pins the in-RAM compact CSR produced by the
+        // Four-Level Topology Store; forcing it without that store has nothing
+        // to pin. (AUTO and FORCE_CPU are valid in any configuration.)
+        if (sampling_backend == SamplingBackendChoice::FORCE_GPU
+            && !use_four_level_topology_store) {
+            throw std::invalid_argument(
+                "samplingBackend:'gpu' (FORCE_GPU) requires "
+                "useFourLevelTopologyStore=true — there is no in-RAM CSR to pin "
+                "for the GPU path otherwise. Use samplingBackend:'auto' or 'cpu', "
+                "or enable the Four-Level Topology Store.");
         }
 
         // l1_cache_mb / l2_cache_mb are size_t and therefore non-negative

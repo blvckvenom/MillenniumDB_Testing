@@ -65,8 +65,12 @@ struct SamplingResult {
     uint64_t total_samples;       ///< Total samples generated
     bool cancelled;               ///< True if cancelled via callback
 
-    // Plan E Phase 0 telemetry (2026-05-11) — populated only when
-    // `auto_profile_on_cold_start=true` AND the profiler actually ran.
+    // Cold-start topology profiler telemetry — populated only when
+    // `auto_profile_on_cold_start=true` AND the random-walk profiler actually
+    // ran (i.e. no prior node_counts.bin existed).  The profiler issues
+    // degree-weighted Vose-alias random walks over the topology CSR sidecar
+    // (topology_{fwd,rev}.csr) to produce an initial node_counts.bin for the
+    // Four-Level Topology Store tier assignment before the first real sample.
     // See `BasicKHopSampler::Impl::Phase0Telemetry` for definitions.
     bool        phase0_triggered     = false;
     bool        phase0_succeeded     = false;
@@ -74,11 +78,22 @@ struct SamplingResult {
     uint64_t    phase0_lookups_done  = 0;
     double      phase0_elapsed_seconds = 0.0;
 
-    // Plan F (2026-05-11) — number of worker threads actually used. 1 when
-    // running the legacy single-threaded path (num_workers=0 in config);
-    // matches the resolved worker count otherwise (capped at
-    // std::thread::hardware_concurrency()).
+    // Number of worker threads actually used by the parallel offline sampling
+    // worker pool.  Set to 1 when running the legacy single-threaded path
+    // (num_workers=0 in config); otherwise equals the resolved pool size after
+    // capping at std::thread::hardware_concurrency().  Each worker owns a
+    // private sampler and RNG, pulls batches via a shared atomic index, and
+    // serializes writes through a mutex.
     std::uint32_t num_workers_used = 1;
+
+    // Dynamic sampling-backend decision (Phase 1). Which backend the
+    // hardware-based planner chose for the neighbor fetch, the directions it
+    // would serve on GPU, and the human-readable reason — exposed for the
+    // procedure yields. Phase 1 is INERT: GPU_* is logged but treated as the
+    // CPU out-of-core path (no kernel yet), so sampling output is byte-identical.
+    std::string sampling_backend     = "CPU_OUT_OF_CORE";
+    std::string sampling_directions  = "NONE";
+    std::string sampling_plan_reason;
 };
 
 /**

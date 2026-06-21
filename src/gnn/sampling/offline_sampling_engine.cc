@@ -2,22 +2,31 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 
 #include "gnn/projection/gnn_meta.h"
+#include "gnn/projection/pinned_topology_view.h"
 #include "gnn/projection/topology_accessor.h"
 #include "gnn/sampling/basic_khop_sampler.h"
+#include "gnn/sampling/gpu_khop_sampler.h"
 #include "gnn/sampling/node_counts_io.h"
+#include "gnn/sampling/sample_fingerprint.h"
 #include "gnn/sampling/sample_storage.h"
+#include "gnn/sampling/sampling_backend_plan.h"
 #include "gnn/sampling/seed_selector.h"
 #include "gnn/storage/row_mapping.h"
+#include "graph_models/gql/projection/topology_snapshot_reader.h"
+#include "gpu/gpu_device.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "query/query_context.h"
 
@@ -147,12 +156,22 @@ struct OfflineSamplingEngine::Impl {
                 return result;
             }
 
-            // Create storage
-            // TODO(FourLevelStore): When RowMapping is available from the projection
-            // context, pass it here to enable dense frequency tracking:
-            //   SampleStorage::create(db_folder, config, row_mapping)
-            // This would reduce RAM from ~9.5 GB to ~0.8 GB at 100M nodes.
-            SampleStorage sample_storage = SampleStorage::create(db_folder, config);
+            // Create storage. MDB_GNN_SHARD_WRITE=1 enables the sharded
+            // (lock-free) parallel write: each worker writes its own shard file,
+            // merged in batch_id order at the end — removing the single write
+            // mutex that dominates the parallel sample loop (inlock/wall ~0.96).
+            // It requires the dense (RowMapping) path + parallel workers; the
+            // final batches.dat/.idx/frequency.dat/catalog are byte-identical to
+            // the single-writer path. Falls back to the legacy sparse single
+            // writer otherwise (default OFF).
+            const bool want_shard_write = [&]() {
+                const char* e = std::getenv("MDB_GNN_SHARD_WRITE");
+                return e != nullptr && std::string(e) == "1"
+                    && config.num_workers >= 1 && row_mapping != nullptr;
+            }();
+            SampleStorage sample_storage = want_shard_write
+                ? SampleStorage::create(db_folder, config, *row_mapping)
+                : SampleStorage::create(db_folder, config);
 
             // Get seed split
             const auto t_seed0_ = std::chrono::steady_clock::now();
@@ -180,23 +199,94 @@ struct OfflineSamplingEngine::Impl {
             seedprep_ms_ = phase_ms_(t_seed0_, std::chrono::steady_clock::now());
 
             // -----------------------------------------------------------------
-            // Plan F (2026-05-11) — parallel-vs-legacy dispatch.
+            // Dynamic sampling-backend decision.
             //
-            // `num_workers == 0`: preserve the pre-Plan-F single-threaded path
-            //   bit-identically. The legacy lambda below loops sequentially
-            //   through (train, val, test) batches and uses the primary
-            //   sampler's persistent RNG. Outputs from earlier sessions stay
-            //   reproducible.
+            // Decide, from the detected hardware resources + the in-RAM compact
+            // CSR sizes, whether the GPU neighbor-fetch path runs (the kernel
+            // reads the pinned uint32 CSR via UVA, or a VRAM copy) vs the proven
+            // CPU out-of-core sampler. The decision is logged and exposed via the
+            // result for the procedure yields. env MDB_GNN_SAMPLING_BACKEND=
+            // {auto,cpu,gpu} overrides SamplingConfig.sampling_backend (the
+            // MDB_GNN_* convention, like MDB_FORCE_CPU_SORT for the sort planner).
             //
-            // `num_workers >= 1`: parallel path. Each batch is re-seeded as
-            //   `random_seed XOR batch_id` before sampling, so the output
-            //   depends only on `(random_seed, batch_id)` and is identical
-            //   across `num_workers ∈ {1, 2, 4, 20}`. Workers borrow the
-            //   primary's TopologyAccessor (FourLevelTopologyStore + caches
-            //   are read-only post-build) and own private LeapfrogGnnSampler,
+            // When the plan chooses a GPU backend AND a GPU is present AND the
+            // build has CUDA, the global topology CSR is pinned and the per-batch
+            // loop dispatches to the GPU kernel below; otherwise the CPU path
+            // runs unchanged (byte-identical output preserved).
+            bool                use_gpu_sampling = false;
+            SamplingBackendPlan active_gpu_plan;
+            {
+                SamplingBackendChoice backend_choice = config.sampling_backend;
+                if (const char* env = std::getenv("MDB_GNN_SAMPLING_BACKEND")) {
+                    const std::string e(env);
+                    if (e == "cpu")       backend_choice = SamplingBackendChoice::FORCE_CPU;
+                    else if (e == "gpu")  backend_choice = SamplingBackendChoice::FORCE_GPU;
+                    else if (e == "auto") backend_choice = SamplingBackendChoice::AUTO;
+                }
+                const mdb::gpu::SystemResources res = mdb::gpu::detect_resources();
+                const TopologyAccessor& topo = khop_sampler->get_topology();
+                // Size the decision on the L3 GLOBAL sidecar — the substrate
+                // enable_pinned_gpu_view actually pins (whole graph, narrow
+                // uint32) — NOT the warm-tier L2. present mirrors the pin
+                // condition exactly (has_data + id_width==4).
+                auto l3_dims = [](const GQL::Projection::TopologySnapshotReader* r)
+                    -> DirCsrDims {
+                    if (r != nullptr && r->has_data() && r->id_width() == 4) {
+                        return DirCsrDims{r->num_nodes(), r->num_edges(), true};
+                    }
+                    return DirCsrDims{};
+                };
+                const SamplingBackendPlan plan = plan_sampling_backend(
+                    res, config.orientation, l3_dims(topo.l3_fwd()),
+                    l3_dims(topo.l3_rev()), backend_choice);
+                result.sampling_backend     = to_string(plan.backend);
+                result.sampling_directions  = to_string(plan.directions);
+                result.sampling_plan_reason = plan.reason;
+                // FORCE_GPU with no capable GPU is a hard error: the planner
+                // signals it with a reason starting "ERROR:" (it cannot honor
+                // FORCE_GPU without OOMing). Surface it instead of silently
+                // running CPU.
+                if (plan.reason.rfind("ERROR:", 0) == 0) {
+                    result.error_message = plan.reason;
+                    return result;
+                }
+#ifdef GNN_CUDA_ENABLED
+                if (plan.backend != SamplingBackend::CPU_OUT_OF_CORE) {
+                    // Pin the global topology CSR (no-op without a GPU at runtime).
+                    khop_sampler->get_topology().enable_pinned_gpu_view(plan);
+                    const PinnedTopologyView* pv =
+                        khop_sampler->get_topology().pinned_view();
+                    if (pv != nullptr && pv->is_registered()) {
+                        use_gpu_sampling = true;
+                        active_gpu_plan  = plan;
+                    }
+                }
+#endif
+                std::cerr << "[OfflineSamplingEngine] sampling backend = "
+                          << result.sampling_backend << " (" << plan.reason << ") "
+                          << (use_gpu_sampling ? "[GPU kernel active]"
+                                               : "[CPU path]")
+                          << "\n";
+            }
+
+            // -----------------------------------------------------------------
+            // Parallel-vs-legacy dispatch for the offline k-hop sampling loop.
+            //
+            // `num_workers == 0`: single-threaded (legacy) path. The lambda
+            //   below loops sequentially through (train, val, test) batches
+            //   and uses the primary sampler's persistent RNG. Outputs from
+            //   earlier sessions remain bit-identical.
+            //
+            // `num_workers >= 1`: parallel worker-pool path. Each batch is
+            //   re-seeded as `random_seed XOR batch_id` before sampling, so
+            //   the output depends only on `(random_seed, batch_id)` and is
+            //   identical regardless of how many workers are used. Workers
+            //   borrow the primary's TopologyAccessor (the Four-Level
+            //   Topology Store and its L1/L2/L3 caches are read-only
+            //   post-build) and own private LeapfrogGnnSampler,
             //   SeekBasedGnnSampler, RNG, and node_access_counts vector.
             //   `sample_storage.write_sample` is serialized via a single
-            //   mutex; per-batch sampling work runs concurrently.
+            //   mutex; per-batch k-hop expansion runs concurrently.
             // -----------------------------------------------------------------
 
             // Resolve effective worker count. 0 = legacy path; otherwise cap
@@ -207,6 +297,12 @@ struct OfflineSamplingEngine::Impl {
                 if (hw > 0 && effective_workers > hw) {
                     effective_workers = static_cast<uint32_t>(hw);
                 }
+            }
+            // The GPU sampling path runs the sequential (legacy) loop on the main
+            // thread: the GPU parallelizes WITHIN each batch (across the frontier),
+            // so a CPU worker pool would only contend for the single CUDA context.
+            if (use_gpu_sampling) {
+                effective_workers = 0;
             }
             result.num_workers_used = effective_workers == 0
                 ? 1
@@ -237,14 +333,33 @@ struct OfflineSamplingEngine::Impl {
                     // silently DIFFERED between W=0 and any W>=1 run (verified on
                     // cora: testAcc 0.8722 vs 0.8624). numWorkers must not change
                     // the sample; gated by scripts/test_plan_f_parity.sh.
-                    khop_sampler->reseed_for_batch(batch_id);
-
-                    // Sample k-hop neighborhood (no epoch parameter)
-                    GraphSample sample = khop_sampler->sample(
-                        batch_seeds,
-                        batch_id,
-                        split_type
-                    );
+                    GraphSample sample;
+#ifdef GNN_CUDA_ENABLED
+                    if (use_gpu_sampling) {
+                        // GPU path: the kernel samples each batch's frontier in
+                        // parallel over the pinned CSR. Output is NOT bit-identical
+                        // to the CPU mt19937 path (Philox RNG) but honors the same
+                        // uniform-without-replacement distribution. tally_nodes
+                        // keeps node_counts.bin populated for the next warm start.
+                        const PinnedTopologyView* pv =
+                            khop_sampler->get_topology().pinned_view();
+                        std::vector<int> fanouts_i(config.fanouts.begin(),
+                                                   config.fanouts.end());
+                        sample = sample_khop_gpu(batch_seeds, batch_id, split_type,
+                                                 fanouts_i, *pv, active_gpu_plan,
+                                                 config.random_seed);
+                        khop_sampler->tally_nodes(sample.all_unique_nodes);
+                    } else
+#endif
+                    {
+                        khop_sampler->reseed_for_batch(batch_id);
+                        // Sample k-hop neighborhood (no epoch parameter)
+                        sample = khop_sampler->sample(
+                            batch_seeds,
+                            batch_id,
+                            split_type
+                        );
+                    }
 
                     // Write to storage
                     sample_storage.write_sample(sample);
@@ -274,11 +389,11 @@ struct OfflineSamplingEngine::Impl {
             };
 
             // -----------------------------------------------------------------
-            // Plan F parallel path. Builds a flat work-queue across all three
-            // splits (train, val, test) tagged with the destination split, so
-            // a single atomic counter can dispatch any batch to any worker
-            // and the `batch_id` assigned matches the legacy monotonic order
-            // (train batches first, then val, then test).
+            // Parallel worker-pool path. Builds a flat work-queue across all
+            // three splits (train, val, test) tagged with the destination
+            // split, so a single atomic counter can dispatch any batch to any
+            // worker and the `batch_id` assigned matches the legacy monotonic
+            // order (train batches first, then val, then test).
             // -----------------------------------------------------------------
             auto process_batches_parallel = [&]() -> bool {
                 const auto t_wsetup0_ = std::chrono::steady_clock::now();
@@ -326,14 +441,14 @@ struct OfflineSamplingEngine::Impl {
                     }
                 }
 
-                // R1.1 (2026-05-29) — single SHARED atomic access-counts array
-                // for all workers, replacing each worker's private N-sized
-                // `node_access_counts` (0.83 GB each on papers100M — the wall
-                // that capped numWorkers on a 30 GB box). Pre-sized to the
+                // Single SHARED atomic access-counts array for all workers,
+                // replacing each worker's private N-sized `node_access_counts`
+                // vector (0.83 GB each on papers100M — the allocation that
+                // capped numWorkers on a 30 GB host). Pre-sized to the
                 // projection node count, zero-initialized (C++17 std::atomic
                 // default-init is indeterminate, so the explicit store-0 loop
                 // is required). Declared on this frame, which outlives every
-                // worker (all joined below before the frame returns).
+                // worker (all threads are joined below before the frame returns).
                 const std::size_t tally_n = static_cast<std::size_t>(
                     khop_sampler->get_topology().get_node_count());
                 std::vector<std::atomic<uint64_t>> shared_counts(tally_n);
@@ -347,6 +462,14 @@ struct OfflineSamplingEngine::Impl {
 
                 std::atomic<std::size_t> next_idx{0};
                 std::mutex               write_mutex;
+                // Sharded path: tiny lock for the periodic progress block only
+                // (the byte-write + freq tally are lock-free per worker).
+                std::mutex               progress_mutex;
+
+                // Open one shard file per worker when sharded write is enabled.
+                if (want_shard_write) {
+                    sample_storage.begin_sharded_write(effective_workers);
+                }
 
                 // Sample-loop sub-stage instrumentation (analogous to the
                 // FourLevelTopologyStore::build() rank-1 split). Three atomic
@@ -377,17 +500,30 @@ struct OfflineSamplingEngine::Impl {
                 // QueryContext without contention on the worker_index slot.
                 QueryContext* primary_ctx = &get_query_ctx();
 
-                // R1.1 hardening (2026-05-29): an exception escaping a
-                // std::thread body — or unwinding the primary past the join
+                // Exception safety for the worker pool: an exception escaping
+                // a std::thread body — or unwinding the primary past the join
                 // below — calls std::terminate(). sampler->sample() can throw
                 // (e.g. the max_layer_nodes cap on dense UNDIRECTED graphs).
                 // Capture the first exception, request cancellation so peers
-                // wind down, and rethrow ONCE after all threads join + the
+                // wind down, and rethrow ONCE after all threads join and the
                 // shared tally array is detached (no use-after-free / abort).
                 std::exception_ptr worker_exception;
                 std::mutex         exception_mutex;
 
-                auto worker_fn = [&](BasicKHopSampler* sampler) {
+                // MDB_GNN_PARALLEL_WRITE_PREP (default OFF): do the per-batch
+                // serialize() + compute_batch_content_hash() on the worker thread,
+                // OFF the write_mutex. The measured bottleneck is the serial write
+                // critical section (inlock/wall ≈ 0.96 at numWorkers=16); both ops
+                // are pure functions of the sample, so moving them out is
+                // bit-identical (batches.dat + content_fp unchanged) and shrinks the
+                // serial section to just the shared disk write + freq + bookkeeping.
+                const bool parallel_write_prep = []() {
+                    const char* e = std::getenv("MDB_GNN_PARALLEL_WRITE_PREP");
+                    return e != nullptr && std::string(e) == "1";
+                }();
+
+                auto worker_fn = [&](BasicKHopSampler* sampler,
+                                     uint32_t worker_index) {
                     QueryContext::set_query_ctx(primary_ctx);
                     try {
                     while (true) {
@@ -403,16 +539,57 @@ struct OfflineSamplingEngine::Impl {
                         const auto t_exp0 = std::chrono::steady_clock::now();
                         GraphSample sample = sampler->sample(
                             *item.seeds, item.batch_id, item.split);
+                        // Off-lock prep: serialize() + content-hash on the worker
+                        // (concurrent, counted as expand). Pure functions of sample.
+                        // Always done in the sharded path (the write is lock-free).
+                        std::string prep_data;
+                        uint64_t    prep_hash = 0;
+                        if (parallel_write_prep || want_shard_write) {
+                            std::ostringstream pbuf(std::ios::binary);
+                            sample.serialize(pbuf);
+                            prep_data = pbuf.str();
+                            prep_hash = compute_batch_content_hash(sample);
+                        }
                         const auto t_exp1 = std::chrono::steady_clock::now();
                         expand_us.fetch_add(dur_us_(t_exp0, t_exp1),
                                             std::memory_order_relaxed);
+
+                        if (want_shard_write) {
+                            // Lock-free: worker owns its shard file; the only
+                            // shared state (atomic freq array) is updated inside.
+                            sample_storage.shard_write(worker_index, sample,
+                                                       prep_data, prep_hash);
+                            std::lock_guard<std::mutex> lk(progress_mutex);
+                            progress.samples_written++;
+                            progress.current_batch = item.batch_id + 1;
+                            progress.current_split = item.split;
+                            if (progress.samples_written % progress_interval == 0) {
+                                auto now = std::chrono::steady_clock::now();
+                                progress.elapsed_seconds =
+                                    std::chrono::duration<double>(now - start_time).count();
+                                double rate = progress.throughput();
+                                uint64_t remaining =
+                                    total_batches - progress.samples_written;
+                                progress.estimated_remaining =
+                                    rate > 0 ? remaining / rate : 0;
+                                if (!report_progress(progress)) {
+                                    cancel_requested.store(true);
+                                }
+                            }
+                            continue;
+                        }
 
                         const auto t_wait0 = std::chrono::steady_clock::now();
                         std::lock_guard<std::mutex> lk(write_mutex);
                         const auto t_lock = std::chrono::steady_clock::now();
                         wait_us.fetch_add(dur_us_(t_wait0, t_lock),
                                           std::memory_order_relaxed);
-                        sample_storage.write_sample(sample);
+                        if (parallel_write_prep) {
+                            sample_storage.write_sample_prepared(
+                                sample, prep_data, prep_hash);
+                        } else {
+                            sample_storage.write_sample(sample);
+                        }
                         progress.samples_written++;
                         progress.current_batch  = item.batch_id + 1;
                         progress.current_split  = item.split;
@@ -451,8 +628,9 @@ struct OfflineSamplingEngine::Impl {
                 std::vector<std::thread> threads;
                 threads.reserve(effective_workers - 1);
                 try {
+                    uint32_t w_index = 1;  // worker 0 == primary (runs in-thread)
                     for (auto& w : worker_samplers) {
-                        threads.emplace_back(worker_fn, w.get());
+                        threads.emplace_back(worker_fn, w.get(), w_index++);
                     }
                 } catch (...) {
                     // std::thread construction can throw std::system_error
@@ -469,7 +647,7 @@ struct OfflineSamplingEngine::Impl {
                     }
                     throw;
                 }
-                worker_fn(khop_sampler.get());
+                worker_fn(khop_sampler.get(), 0);
                 for (auto& t : threads) t.join();
 
                 // Sample-loop sub-stage split. loop_wall is the parallel
@@ -507,11 +685,12 @@ struct OfflineSamplingEngine::Impl {
                               << " (initMs includes the four-level build split logged above)\n";
                 }
 
-                // R1.1 — snapshot the single shared atomic tally into the
-                // primary's plain vector (no per-worker merge: there was one
-                // shared array). Detach primary + workers from the shared
-                // array FIRST so the about-to-be-destroyed `shared_counts`
-                // stack object is never referenced after this frame returns.
+                // Snapshot the single shared atomic tally into the primary's
+                // plain vector (no per-worker merge needed: all workers wrote
+                // into the same shared array). Detach primary and workers from
+                // the shared array FIRST so the about-to-be-destroyed
+                // `shared_counts` stack object is never referenced after this
+                // frame returns.
                 {
                     std::vector<uint64_t> materialized(tally_n);
                     for (std::size_t i = 0; i < tally_n; ++i) {
@@ -555,22 +734,36 @@ struct OfflineSamplingEngine::Impl {
             // truncated sample. The worker-exception path (rethrow above)
             // unwinds past this point; the SampleStorage destructor then
             // aborts the partial write for the same reason.
+            // Expand-stage sub-cost breakdown (env MDB_GNN_EXPAND_PROFILE=1).
+            // Logged once after sampling completes, covering both the legacy and
+            // parallel paths. Empty (no-op) when profiling is disabled.
+            {
+                std::string ep = BasicKHopSampler::dump_expand_profile();
+                if (!ep.empty()) {
+                    std::cerr << "[OfflineSamplingEngine] " << ep << "\n";
+                }
+            }
+
             if (result.cancelled) {
                 sample_storage.abort();
+            } else if (sample_storage.sharded_write_active()) {
+                // Sharded path: concat shards in batch_id order into the final
+                // byte-identical batches.dat/.idx/frequency.dat/catalog.
+                sample_storage.merge_shards();
             } else {
                 sample_storage.finalize();
             }
 
-            // Spec #13 Phase 5 (T13.2 writer half) — persist
-            // `<projection_dir>/node_counts.bin` so the next
-            // `gnn_offline_sample` run can warm-start the
-            // Four-Level Topology Store. Guarded by
-            // `useFourLevelTopologyStore`: when the user opted out of
-            // the tiered cache there is no consumer for the file, so
-            // skip the I/O. Failures inside `node_counts_io::persist` log
-            // to stderr but never throw — the sample itself already
-            // succeeded; persistence is an optimization for future
-            // runs.
+            // Persist `<projection_dir>/node_counts.bin` so the next
+            // `gnn_offline_sample` run can warm-start the Four-Level
+            // Topology Store (L1 RAM hash / L2 compact uint32 CSR /
+            // L3 mmap sidecar / L4 direct B+Tree) with the per-node
+            // access frequencies measured during this sample. Guarded by
+            // `useFourLevelTopologyStore`: when the user opted out of the
+            // tiered cache there is no consumer for the file, so skip the
+            // I/O. Failures inside `node_counts_io::persist` log to stderr
+            // but never throw — the sample itself already succeeded;
+            // persistence is an optimization for future runs.
             if (config.use_four_level_topology_store) {
                 auto proj_dir =
                     std::filesystem::path(storage.get_projection_dir());
@@ -585,11 +778,14 @@ struct OfflineSamplingEngine::Impl {
             result.total_samples = batch_id;
             result.catalog = sample_storage.get_catalog();
 
-            // Plan E (2026-05-11) — pull Phase 0 telemetry out of the
-            // sampler so the procedure can yield it. Populated even when
-            // the auto-profiler chose not to run (triggered=false) so
-            // bench harnesses can tell apart "warm-start ready" from
-            // "profiler ran and succeeded".
+            // Pull cold-start topology profiler telemetry out of the
+            // sampler so the procedure can yield it. The cold-start
+            // profiler (a degree-weighted random-walk pass using a
+            // Vose-alias table) runs before the Four-Level Topology
+            // Store's build() when node_counts.bin is absent. Fields are
+            // populated even when the profiler chose not to run
+            // (triggered=false) so bench harnesses can distinguish
+            // "warm-start ready" from "profiler ran and succeeded".
             if (khop_sampler) {
                 auto rep = khop_sampler->phase0_report();
                 result.phase0_triggered       = rep.triggered;

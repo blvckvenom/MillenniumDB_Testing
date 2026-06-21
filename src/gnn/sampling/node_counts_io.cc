@@ -2,10 +2,12 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <unistd.h>
 
 namespace mdb::gnn::node_counts_io {
@@ -38,6 +40,30 @@ void persist(const std::filesystem::path&  projection_dir,
 {
     if (projection_dir.empty()) return;
     if (counts.empty())         return;
+
+    // Part 2 reproducibility fix (c), opt-in via env MDB_GNN_FREEZE_NODE_COUNTS=1 (default OFF):
+    // once node_counts.bin exists, do NOT overwrite it. The frequency-based four-level TIER ASSIGNMENT
+    // reads these per-node access counts; rewriting them each run with THIS run's post-sample counts makes
+    // the tier assignment — and thus the served neighbor sets — drift run-to-run, so a fixed seed yields a
+    // DIFFERENT sample each warm run (root cause: cold-start reproduces 46f7, warm-start drifts — see
+    // docs/research/2026-06-18-feature-store-study/FINAL_REPORT.md). Freezing the counts gives every warm run
+    // an identical tier layout => bit-reproducible sample (det4-proven: identical counts => identical sample;
+    // and validated to be the SUFFICIENT fix where canonical neighbor order alone was not). Default OFF =>
+    // unchanged behavior. Seed deterministic counts by doing ONE cold-start build (no node_counts.bin) first.
+    {
+        static const bool kFreeze = []() {
+            const char* e = std::getenv("MDB_GNN_FREEZE_NODE_COUNTS");
+            return e != nullptr && std::string(e) == "1";
+        }();
+        if (kFreeze) {
+            std::error_code fec;
+            if (std::filesystem::exists(projection_dir / "node_counts.bin", fec)) {
+                std::cerr << "[node_counts_io] MDB_GNN_FREEZE_NODE_COUNTS: node_counts.bin "
+                             "exists — skipping overwrite (frozen for reproducible sampling).\n";
+                return;
+            }
+        }
+    }
 
     std::error_code ec;
     std::filesystem::create_directories(projection_dir, ec);

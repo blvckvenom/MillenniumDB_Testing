@@ -1,6 +1,7 @@
 #include "gnn/sampling/sample_storage.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
@@ -16,8 +17,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "gnn/common/page_cache_hint.h"  // Fix #22
-#include "gnn/sampling/sample_fingerprint.h"  // STEP 8 content fingerprint
+#include "gnn/common/page_cache_hint.h"  // page-cache relief via posix_fadvise/madvise DONTNEED
+#include "gnn/sampling/sample_fingerprint.h"  // per-batch content fingerprint (staleness check)
 #include "gnn/storage/row_mapping.h"
 #include "misc/logger.h"
 
@@ -87,7 +88,7 @@ inline size_t estimate_sample_bytes(const GraphSample& s) {
     return b;
 }
 
-// Fix #19 (2026-05-13): membuf wrapping an mmap'd region so we can drive
+// A read-only streambuf wrapping an mmap'd region so we can drive
 // GraphSample::deserialize(istream&) without copying batches.dat into a
 // user-space buffer. Eliminates ~87 GB of memcpy on papers100M MinHash.
 class MmapStreamBuf : public std::streambuf {
@@ -144,9 +145,9 @@ struct SampleStorage::Impl {
     std::unique_ptr<std::ofstream> batch_data_stream;
     std::unique_ptr<std::ofstream> batch_index_stream;
 
-    // Fix #19: read-mode mmap of batches.dat. Populated by init_read_mode
-    // when the file is accessible; falls back to per-call ifstream if
-    // mmap fails (e.g. tmpfs, very large file > address space).
+    // Read-mode mmap of batches.dat for zero-copy deserialization. Populated
+    // by init_read_mode when the file is accessible; falls back to per-call
+    // ifstream if mmap fails (e.g. tmpfs, very large file > address space).
     void*  data_mmap_ptr_  = nullptr;
     size_t data_mmap_size_ = 0;
 
@@ -177,10 +178,36 @@ struct SampleStorage::Impl {
     std::unordered_set<uint64_t> unique_nodes_seen;  // sparse fallback
     uint64_t total_edges_written = 0;
 
-    // STEP 8: order-independent XOR fold of per-batch content hashes. Commutative
-    // so it is invariant to worker write-completion order (numWorkers>=2); each
-    // batch_id contributes exactly once via write_sample_impl.
+    // Sample content fingerprint: an order-independent XOR fold of per-batch
+    // content hashes. Commutative so it is invariant to worker write-completion
+    // order (numWorkers>=2); each batch_id contributes exactly once via
+    // write_sample_impl.
     uint64_t content_fp_accumulator_ = 0;
+
+    // ---- Sharded (lock-free) parallel write -------------------------------
+    // Each worker owns one shard: it appends serialized batches to its OWN file
+    // (no shared offset, no lock) and records a per-batch entry. The only shared
+    // state is `shard_freq_` (an atomic dense frequency array). merge_shards()
+    // then concatenates the shards in ascending batch_id order into the final
+    // batches.dat — byte-identical to the single-writer path — and rebuilds the
+    // index / frequency / catalog. Requires the dense (RowMapping) path.
+    struct ShardEntry {
+        uint64_t batch_id;
+        uint8_t  split;
+        uint64_t offset;  // offset within the shard file
+        uint64_t size;
+    };
+    struct ShardCtx {
+        std::unique_ptr<std::ofstream> stream;
+        std::filesystem::path          path;
+        std::vector<ShardEntry>        entries;
+        uint64_t train = 0, validation = 0, test = 0;
+        uint64_t edges = 0;
+        uint64_t content_fp = 0;  // XOR of this shard's per-batch content hashes
+    };
+    bool                              sharded_ = false;
+    std::vector<ShardCtx>             shards_;
+    std::vector<std::atomic<uint64_t>> shard_freq_;  // dense, row-indexed
 
     // Deserialized-sample LRU cache (read-mode hot path). 0 budget = disabled.
     // Guarded by cache_mu_; the disk read + deserialize itself happens OUTSIDE
@@ -235,18 +262,32 @@ struct SampleStorage::Impl {
     }
 
     void write_sample_impl(const GraphSample& sample) {
+        // Default path: serialize + content-hash inline, then commit. The
+        // MDB_GNN_PARALLEL_WRITE_PREP path (offline_sampling_engine) instead
+        // does the serialize + content-hash on the worker thread BEFORE taking
+        // the write_mutex, then calls write_sample_impl_prepared — shrinking the
+        // serial critical section to just the shared disk write + bookkeeping.
+        std::ostringstream buffer(std::ios::binary);
+        sample.serialize(buffer);
+        write_sample_impl_prepared(sample, buffer.str(),
+                                   compute_batch_content_hash(sample));
+    }
+
+    // Commit a sample whose serialized bytes (`data`) and content hash
+    // (`content_hash`) were computed by the caller. Bit-identical to the inline
+    // path: both are PURE functions of `sample` (same result on any thread) and
+    // content_fp_accumulator_ is XOR-folded (commutative, order-independent).
+    // Only this body touches shared state (the stream + stats + freq maps), so
+    // only this needs the caller's write_mutex.
+    void write_sample_impl_prepared(const GraphSample& sample,
+                                    const std::string& data,
+                                    uint64_t content_hash) {
         if (!write_mode || finalized) {
             throw std::runtime_error("Storage not in write mode");
         }
 
         // Record offset before writing
         uint64_t offset = batch_data_stream->tellp();
-
-        // Serialize sample to an in-memory buffer first.
-        // If serialize() throws, no side-effects have occurred.
-        std::ostringstream buffer(std::ios::binary);
-        sample.serialize(buffer);
-        std::string data = buffer.str();
 
         // Write to file. If write fails, we must not update any statistics.
         batch_data_stream->write(data.data(), data.size());
@@ -313,11 +354,167 @@ struct SampleStorage::Impl {
         // Update split index
         split_index[static_cast<int>(sample.split)].push_back(sample.batch_id);
 
-        // STEP 8: fold this batch's layout-independent content hash into the
-        // sample fingerprint. XOR is commutative so the result is invariant to
+        // Fold this batch's layout-independent content hash into the sample
+        // fingerprint (the staleness check). XOR is commutative so the result is invariant to
         // worker write-completion order; the per-batch hash is keyed by batch_id
-        // so distinct batches do not cancel.
-        content_fp_accumulator_ ^= compute_batch_content_hash(sample);
+        // so distinct batches do not cancel. `content_hash` was computed by the
+        // caller (pure function of `sample`) — identical to computing it here.
+        content_fp_accumulator_ ^= content_hash;
+    }
+
+    // Begin a sharded (lock-free) parallel write: one shard file per worker +
+    // an atomic dense frequency array. Requires the dense (RowMapping) path.
+    void begin_sharded_write_impl(uint32_t num_workers) {
+        if (!write_mode || finalized) {
+            throw std::runtime_error("begin_sharded_write: storage not in write mode");
+        }
+        if (row_mapping_ == nullptr) {
+            throw std::runtime_error(
+                "begin_sharded_write requires the dense (RowMapping) path");
+        }
+        if (num_workers == 0) num_workers = 1;
+        // Close the create()-opened main stream; merge_shards reopens batches.dat.
+        batch_data_stream.reset();
+        // The only shared write-state: a dense atomic frequency array.
+        shard_freq_ = std::vector<std::atomic<uint64_t>>(node_freq_dense.size());
+        for (auto& a : shard_freq_) a.store(0, std::memory_order_relaxed);
+        shards_.clear();
+        shards_.resize(num_workers);
+        for (uint32_t w = 0; w < num_workers; ++w) {
+            auto& sh = shards_[w];
+            sh.path = storage_path / ("batches_shard_" + std::to_string(w) + ".dat");
+            sh.stream = std::make_unique<std::ofstream>(sh.path, std::ios::binary);
+            if (!*sh.stream) {
+                throw std::runtime_error("Failed to create shard file: " + sh.path.string());
+            }
+        }
+        sharded_ = true;
+    }
+
+    // Append a serialized batch to worker `w`'s shard (no lock — each worker owns
+    // its index) and tally its frequency into the shared atomic array. `data` /
+    // `content_hash` are pure functions of `sample` (computed off-thread).
+    void shard_write_impl(uint32_t w, const GraphSample& sample,
+                          const std::string& data, uint64_t content_hash) {
+        auto& sh = shards_[w];
+        const uint64_t off = static_cast<uint64_t>(sh.stream->tellp());
+        sh.stream->write(data.data(), data.size());
+        if (!sh.stream->good()) {
+            throw std::runtime_error("Failed to write shard batch "
+                                     + std::to_string(sample.batch_id));
+        }
+        sh.entries.push_back({sample.batch_id,
+                              static_cast<uint8_t>(sample.split), off, data.size()});
+        sh.edges += sample.total_edges();
+        switch (sample.split) {
+            case SplitType::TRAIN:      sh.train++;      break;
+            case SplitType::VALIDATION: sh.validation++; break;
+            case SplitType::TEST:       sh.test++;       break;
+        }
+        sh.content_fp ^= content_hash;
+        for (const auto& node : sample.all_unique_nodes) {
+            auto row = row_mapping_->find(node);
+            if (row.has_value() && *row < shard_freq_.size()) {
+                shard_freq_[*row].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // Merge all shards into the final batches.dat/.idx/frequency.dat/catalog,
+    // concatenating in ASCENDING batch_id order — byte-identical to the single-
+    // writer path. Per-shard entries are already ascending (next_idx is monotone)
+    // so the K-way merge reads each shard near-sequentially.
+    void merge_shards_impl() {
+        if (!sharded_) {
+            throw std::runtime_error("merge_shards: not in sharded mode");
+        }
+        for (auto& sh : shards_) {
+            if (sh.stream) { sh.stream->flush(); sh.stream.reset(); }
+        }
+
+        struct GEntry { uint64_t batch_id, offset, size; uint32_t shard; uint8_t split; };
+        std::vector<GEntry> all;
+        std::size_t total = 0;
+        for (auto& sh : shards_) total += sh.entries.size();
+        all.reserve(total);
+        uint64_t max_batch_id = 0;
+        for (uint32_t s = 0; s < shards_.size(); ++s) {
+            for (const auto& e : shards_[s].entries) {
+                all.push_back({e.batch_id, e.offset, e.size, s, e.split});
+                if (e.batch_id > max_batch_id) max_batch_id = e.batch_id;
+            }
+        }
+        std::sort(all.begin(), all.end(),
+                  [](const GEntry& a, const GEntry& b) { return a.batch_id < b.batch_id; });
+
+        std::vector<std::ifstream> readers(shards_.size());
+        for (uint32_t s = 0; s < shards_.size(); ++s) {
+            readers[s].open(shards_[s].path, std::ios::binary);
+            if (!readers[s]) {
+                throw std::runtime_error("Failed to reopen shard: " + shards_[s].path.string());
+            }
+        }
+
+        batch_data_stream = std::make_unique<std::ofstream>(
+            storage_path / BATCH_DATA_FILE, std::ios::binary | std::ios::trunc);
+        if (!*batch_data_stream) {
+            throw std::runtime_error("Failed to reopen batches.dat for merge");
+        }
+        write_value(*batch_data_stream, BATCH_MAGIC);
+        write_value(*batch_data_stream, static_cast<uint32_t>(1));
+
+        batch_index.assign(static_cast<std::size_t>(max_batch_id) + 1, {0, 0});
+        uint64_t global = 2 * sizeof(uint32_t);  // header bytes
+        std::string buf;
+        for (const auto& e : all) {
+            buf.resize(e.size);
+            readers[e.shard].seekg(static_cast<std::streamoff>(e.offset));
+            readers[e.shard].read(&buf[0], static_cast<std::streamsize>(e.size));
+            if (!readers[e.shard]) {
+                throw std::runtime_error("Failed to read shard blob for batch "
+                                         + std::to_string(e.batch_id));
+            }
+            batch_data_stream->write(buf.data(), static_cast<std::streamsize>(e.size));
+            batch_index[e.batch_id] = {global, e.size};
+            global += e.size;
+        }
+        for (auto& r : readers) r.close();
+
+        // Reduce per-shard partial statistics.
+        total_batches_written      = all.size();
+        train_batches_written      = 0;
+        validation_batches_written = 0;
+        test_batches_written       = 0;
+        total_edges_written        = 0;
+        content_fp_accumulator_    = 0;
+        for (auto& sh : shards_) {
+            train_batches_written      += sh.train;
+            validation_batches_written += sh.validation;
+            test_batches_written       += sh.test;
+            total_edges_written        += sh.edges;
+            content_fp_accumulator_    ^= sh.content_fp;
+        }
+
+        // Materialize the dense frequency vector + unique count from the atomics.
+        node_freq_dense.assign(shard_freq_.size(), 0);
+        dense_unique_count = 0;
+        for (std::size_t i = 0; i < shard_freq_.size(); ++i) {
+            const uint64_t c = shard_freq_[i].load(std::memory_order_relaxed);
+            node_freq_dense[i] = c;
+            if (c > 0) dense_unique_count++;
+        }
+
+        split_index.clear();
+        for (const auto& e : all) split_index[e.split].push_back(e.batch_id);
+
+        sharded_ = false;
+        finalize_impl();  // writes idx + frequency.dat (dense) + catalog
+        for (auto& sh : shards_) {
+            std::error_code ec;
+            std::filesystem::remove(sh.path, ec);
+        }
+        shards_.clear();
+        shard_freq_ = std::vector<std::atomic<uint64_t>>();
     }
 
     void finalize_impl() {
@@ -379,7 +576,7 @@ struct SampleStorage::Impl {
         catalog.unique_nodes = row_mapping_ ? dense_unique_count : unique_nodes_seen.size();
         catalog.total_edges = total_edges_written;
 
-        // STEP 8: persist the content fingerprint. 0 is reserved for
+        // Persist the content fingerprint. 0 is reserved for
         // "absent/UNKNOWN", so map a (vanishingly rare) all-XOR-cancelled 0 to 1.
         catalog.sample_content_fp =
             (content_fp_accumulator_ == 0) ? 1 : content_fp_accumulator_;
@@ -399,6 +596,10 @@ struct SampleStorage::Impl {
         // files — the on-disk state must not look like a valid sample.
         batch_data_stream.reset();
         batch_index_stream.reset();
+        // Release any open shard write handles before removing the dir.
+        shards_.clear();
+        shard_freq_ = std::vector<std::atomic<uint64_t>>();
+        sharded_ = false;
         write_mode = false;
         aborted = true;
 
@@ -477,14 +678,14 @@ struct SampleStorage::Impl {
             }
         }
 
-        // Fix #19: mmap batches.dat for zero-copy read_sample. OPT-IN
-        // via env var MDB_GNN_MMAP_BATCHES_DAT=1 because empirical
-        // validation on papers100M (30 GB RAM) showed the mmap'd 87 GB
-        // region competes with reordered.fmat + cache files for page
-        // cache, pushing L4 packed_slim throughput from 5.5 → 3.6
-        // batches/s (+121 s wall-clock penalty) despite saving ~6 s
-        // on MinHash compute. Net loss on memory-constrained systems.
-        // Enable when the host has >> file size in RAM.
+        // Optionally mmap batches.dat for zero-copy deserialization during
+        // read_sample. Opt-in via env var MDB_GNN_MMAP_BATCHES_DAT=1 because
+        // empirical validation on papers100M (30 GB RAM) showed the mmap'd
+        // 87 GB region competes with reordered.fmat + L4 packed-batch cache
+        // files for page cache, pushing L4 packed_slim throughput from
+        // 5.5 → 3.6 batches/s (+121 s wall-clock penalty) despite saving
+        // ~6 s on MinHash compute. Net loss on memory-constrained systems.
+        // Enable only when the host has >> file size in RAM.
         bool enable_mmap = false;
         if (const char* env = std::getenv("MDB_GNN_MMAP_BATCHES_DAT")) {
             std::string s(env);
@@ -543,18 +744,19 @@ struct SampleStorage::Impl {
         }
 
         GraphSample sample;
-        // Fix #19: prefer the mmap'd region (zero-copy parse) when
-        // init_read_mode succeeded in mmap'ing batches.dat. Fall back to
-        // the legacy ifstream open per call if mmap was unavailable.
+        // Prefer the mmap'd region (zero-copy parse) when init_read_mode
+        // succeeded in mmap'ing batches.dat. Fall back to the legacy
+        // ifstream open per call if mmap was unavailable.
         if (data_mmap_ptr_ != nullptr &&
             offset + size <= data_mmap_size_)
         {
             const char* base = static_cast<const char*>(data_mmap_ptr_);
             MmapIStream stream(base + offset, size);
             sample = GraphSample::deserialize(stream, skip_edge_ids_, skip_edges_);
-            // Fix #22: release this region of batches.dat from the page cache.
-            // The MmapStreamBuf wraps a const-pointer view; the underlying memory
-            // is read-only, so the cast away const is safe (madvise doesn't write).
+            // Release this region of batches.dat from the page cache via
+            // madvise(MADV_DONTNEED). The MmapStreamBuf wraps a const-pointer
+            // view; the underlying memory is read-only, so the cast away const
+            // is safe (madvise doesn't write).
             madvise_dontneed(const_cast<char*>(base + offset), size);
         } else {
             // Legacy path — fresh ifstream per call.
@@ -566,10 +768,12 @@ struct SampleStorage::Impl {
             data_in.seekg(offset);
             sample = GraphSample::deserialize(data_in, skip_edge_ids_, skip_edges_);
 
-            // Fix #22: tell the kernel we're done with [offset, offset+size).
-            // ifstream doesn't expose its underlying fd, so we open a brief
-            // read-only fd just to issue the hint. Adds one open+close per
-            // batch but avoids 87 GB of stale batches.dat pages in the cache
+            // Tell the kernel we're done with [offset, offset+size) so the
+            // consumed region of batches.dat can be reclaimed from the page
+            // cache via posix_fadvise(POSIX_FADV_DONTNEED). ifstream doesn't
+            // expose its underlying fd, so we open a brief read-only fd just
+            // to issue the hint. Adds one open+close per batch but avoids
+            // 87 GB of stale batches.dat pages accumulating in the page cache
             // on papers100M-scale runs.
             int hint_fd = ::open(data_path.c_str(), O_RDONLY);
             if (hint_fd >= 0) {
@@ -580,8 +784,9 @@ struct SampleStorage::Impl {
         }
 
         // Cache insert (with LRU eviction to stay under budget). We keep our own
-        // deserialized copy in RAM, so the Fix #22 DONTNEED above is fine — the
-        // page cache is freed while our cache retains the hot working set.
+        // deserialized copy in RAM, so the DONTNEED page-cache hints issued above
+        // are safe — the page cache is freed while our in-RAM cache retains the
+        // hot working set.
         if (cache_budget_ > 0) {
             std::lock_guard<std::mutex> lk(cache_mu_);
             if (sample_cache_.find(batch_id) == sample_cache_.end()) {
@@ -832,6 +1037,29 @@ std::filesystem::path SampleStorage::get_storage_path(
 
 void SampleStorage::write_sample(const GraphSample& sample) {
     impl_->write_sample_impl(sample);
+}
+
+void SampleStorage::begin_sharded_write(uint32_t num_workers) {
+    impl_->begin_sharded_write_impl(num_workers);
+}
+
+bool SampleStorage::sharded_write_active() const {
+    return impl_->sharded_;
+}
+
+void SampleStorage::shard_write(uint32_t worker_index, const GraphSample& sample,
+                                const std::string& data, uint64_t content_hash) {
+    impl_->shard_write_impl(worker_index, sample, data, content_hash);
+}
+
+void SampleStorage::merge_shards() {
+    impl_->merge_shards_impl();
+}
+
+void SampleStorage::write_sample_prepared(const GraphSample& sample,
+                                          const std::string& data,
+                                          uint64_t content_hash) {
+    impl_->write_sample_impl_prepared(sample, data, content_hash);
 }
 
 void SampleStorage::finalize() {

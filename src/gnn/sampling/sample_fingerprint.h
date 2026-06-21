@@ -9,7 +9,8 @@
 namespace mdb::gnn {
 
 // =============================================================================
-// Sample content fingerprint (STEP 8, approach B)
+// Sample content fingerprint (content-hash approach: hash the actual batch
+// contents rather than scalar counts)
 // =============================================================================
 //
 // A layout-independent content fingerprint used to decide whether a previously

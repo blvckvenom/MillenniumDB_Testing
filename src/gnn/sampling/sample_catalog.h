@@ -90,13 +90,14 @@ struct SampleCatalog {
     uint64_t total_edges;         ///< Total edges across all samples
 
     // =========================================================================
-    // Content fingerprint (STEP 8)
+    // Content fingerprint (staleness check)
     // =========================================================================
 
     /// Layout-independent XOR fold of per-batch content hashes (see
     /// sample_fingerprint.h). 0 = absent/UNKNOWN (v1/v2 catalogs, or a sample
-    /// written before STEP 8). Consumed by FourLevelStore to decide reuse vs
-    /// recompute of the feature store. Persisted only in catalog v3+.
+    /// written before the content-fingerprint field was added). Consumed by
+    /// FourLevelStore to decide reuse vs recompute of the feature store.
+    /// Persisted only in catalog v3+.
     uint64_t sample_content_fp = 0;
 
     // =========================================================================

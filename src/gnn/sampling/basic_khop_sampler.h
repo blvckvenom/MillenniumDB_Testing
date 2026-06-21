@@ -69,14 +69,14 @@ public:
     /**
      * @brief Construct a worker sampler that shares a pre-built TopologyAccessor.
      *
-     * Plan F (2026-05-11) — parallel sampling. Each worker thread builds its
-     * own `BasicKHopSampler` with private RNG + per-node access counts, but
-     * borrows the topology (FourLevelTopologyStore + adjacency caches) from
-     * a primary instance. The primary owns the topology; workers reference
-     * it through the raw pointer. The shared topology must outlive every
-     * worker.
+     * Used by the parallel offline sampling worker pool. Each worker thread
+     * builds its own `BasicKHopSampler` with private RNG + per-node access
+     * counts, but borrows the topology (Four-Level Topology Store + adjacency
+     * caches) from a primary instance. The primary owns the topology; workers
+     * reference it through the raw pointer. The shared topology must outlive
+     * every worker.
      *
-     * Worker ctors skip Phase 0 auto-profile, `enable_four_level_store`,
+     * Worker ctors skip the cold-start auto-profiler, `enable_four_level_store`,
      * and `prebuild_adjacency_cache` — those are assumed to have already
      * happened on the primary. RNG is seeded from `config.random_seed` plus
      * the worker_offset, but the recommended usage is to call
@@ -184,7 +184,7 @@ public:
     bool get_use_leapfrog() const;
 
     // =========================================================================
-    // Spec #13 Phase 5 — node access count tally (warm-start producer)
+    // Four-Level Topology Store — node access count tally (warm-start producer)
     // =========================================================================
 
     /**
@@ -204,79 +204,113 @@ public:
     const std::vector<uint64_t>& node_access_counts() const;
 
     // =========================================================================
-    // Plan F — parallel sampling support
+    // Expand-stage profiling (env MDB_GNN_EXPAND_PROFILE=1, default off)
+    // =========================================================================
+
+    /**
+     * @brief One-line summary of the accumulated per-sub-cost expand timings,
+     *        then reset the accumulators.
+     *
+     * Breaks the k-hop expand into its four sub-costs — the per-node sampling
+     * loop, the convert-to-edges + next-layer dedup, the edge-index build, and
+     * the unique-node rebuild — in milliseconds summed across all worker
+     * threads. Returns an empty string when MDB_GNN_EXPAND_PROFILE is unset.
+     * The offline sampling engine calls this once after the worker pool joins.
+     * Profiling adds a few clock reads per batch (negligible) and is off by
+     * default; it never changes the sampled output.
+     */
+    static std::string dump_expand_profile();
+
+    // =========================================================================
+    // Parallel offline sampling support (shared-memory worker pool)
     // =========================================================================
 
     /**
      * @brief Borrow this sampler's TopologyAccessor (non-owning).
      *
-     * Plan F (2026-05-11) — used by the parallel scheduler to share the
-     * expensive FourLevelTopologyStore + adjacency caches across worker
-     * sampler instances. The returned reference is valid for the lifetime
-     * of this sampler.
+     * Used by the parallel offline sampling scheduler to share the
+     * expensive Four-Level Topology Store (L1 RAM hash / L2 compact uint32
+     * CSR / L3 mmap sidecar / L4 direct B+Tree) and adjacency caches across
+     * worker sampler instances. The returned reference is valid for the
+     * lifetime of this sampler.
      */
     TopologyAccessor& get_topology();
 
     /**
      * @brief Re-seed all internal RNGs deterministically for a batch.
      *
-     * Plan F (2026-05-11) — call before `sample(batch_seeds, batch_id, split)`
-     * inside a parallel scheduler to make each batch's output invariant to
-     * which worker thread picks it up. Seeds = `config.random_seed XOR
-     * batch_id` mixing function, applied to the BasicKHopSampler's own
-     * `rng`, the LeapfrogGnnSampler, and the SeekBasedGnnSampler.
+     * Call before `sample(batch_seeds, batch_id, split)` inside a parallel
+     * sampling scheduler to make each batch's output invariant to which worker
+     * thread picks it up. The new seed is derived as `config.random_seed XOR
+     * batch_id` and is applied to the BasicKHopSampler's own `rng`, the
+     * LeapfrogGnnSampler, and the SeekBasedGnnSampler.
      */
     void reseed_for_batch(uint64_t batch_id);
 
     /**
+     * @brief Add one access count for each of `nodes` to the warm-start tally.
+     *
+     * Used by the GPU sampling path, which produces a GraphSample directly
+     * without going through `sample_neighbors_uniform` (where the CPU path
+     * tallies per visit). Tallying the sample's unique nodes keeps
+     * `node_counts.bin` populated for the next warm-start. This counts a node
+     * once per batch it appears in (not once per visit like the CPU path) — an
+     * approximation acceptable for the frequency-based tier heuristic, since the
+     * GPU path is not bit-identical to the CPU path anyway.
+     */
+    void tally_nodes(const std::vector<ObjectId>& nodes);
+
+    /**
      * @brief Merge per-node access counts from a worker sampler.
      *
-     * Plan F (2026-05-11) — after all workers finish sampling, the
-     * scheduler reduces their per-thread `node_access_counts()` vectors
-     * into the primary's tally so the warm-start `node_counts.bin`
-     * reflects the entire run.
+     * After all parallel workers finish sampling, the offline sampling
+     * engine reduces their per-thread `node_access_counts()` vectors into
+     * the primary's tally so the warm-start `node_counts.bin` file
+     * reflects the full run's access pattern.
      */
     void merge_counts_from(const std::vector<uint64_t>& other);
 
     /**
-     * @brief R1.1 (2026-05-29) — install a SHARED atomic access-counts array.
+     * @brief Install a SHARED atomic access-counts array.
      *
      * Replaces the per-worker N-sized `node_access_counts` vector (0.83 GB
      * each on papers100M) with a single shared `std::atomic<uint64_t>` array
      * of size `n`, owned by the OfflineSamplingEngine and pointed-to by every
      * worker sampler. `tally_` then does a relaxed `fetch_add` into it instead
      * of growing its private vector, so total tally RAM is 0.83 GB regardless
-     * of `numWorkers` (was 0.83 GB × numWorkers — the wall that capped worker
-     * count on a 30 GB box). The array MUST be pre-sized to the projection's
-     * node count and zero-initialized before sampling; it must outlive every
-     * sampler. Correctness: the final per-node count is a commutative sum, so
-     * it is identical regardless of thread interleaving (and `node_counts.bin`
-     * is consumed by dict-equality). Passing `base == nullptr` reverts to the
+     * of the number of parallel workers (with per-worker vectors, cost grew
+     * linearly and capped worker count on memory-constrained machines). The
+     * array MUST be pre-sized to the projection's node count and
+     * zero-initialized before sampling; it must outlive every sampler.
+     * Correctness: the final per-node count is a commutative sum, so it is
+     * identical regardless of thread interleaving (and `node_counts.bin` is
+     * consumed by dict-equality). Passing `base == nullptr` reverts to the
      * private-vector path (legacy / single-thread). Does NOT affect the sample
      * output (batches.dat) — the tally is a side channel only.
      */
     void set_shared_access_counts(std::atomic<uint64_t>* base, std::size_t n);
 
     /**
-     * @brief R1.1 (2026-05-29) — adopt a materialized counts vector.
+     * @brief Adopt a materialized counts vector (replaces internal tally).
      *
-     * After the parallel run, the engine snapshots the shared atomic array
-     * into a plain `std::vector<uint64_t>` and hands it to the primary so the
-     * existing `node_access_counts()` accessor (consumed by
-     * `persist_node_counts_`) returns the full run's tally without a
-     * per-worker merge pass.
+     * After the parallel run, the offline sampling engine snapshots the
+     * shared atomic array into a plain `std::vector<uint64_t>` and hands it
+     * to the primary so the existing `node_access_counts()` accessor
+     * (consumed by `persist_node_counts_`) returns the full run's tally
+     * without requiring a per-worker merge pass.
      */
     void adopt_counts(std::vector<uint64_t> counts);
 
     /**
-     * @brief Plan E Phase 0 telemetry (2026-05-11).
+     * @brief Telemetry from the cold-start random-walk topology profiler.
      *
-     * Reports whether the cold-start auto-profiler ran during this
-     * sampler's construction, how many walks it performed, and how long
-     * it took. Always populated (with `triggered=false` when the
-     * auto-profiler decided not to run — typically because
-     * `node_counts.bin` already existed or the user opted out via
-     * `auto_profile_on_cold_start=false`).
+     * Reports whether the cold-start auto-profiler (a degree-weighted
+     * Vose-alias random-walk pass that writes `node_counts.bin` before the
+     * Four-Level Topology Store is built) ran during this sampler's
+     * construction, how many walks it performed, and how long it took.
+     * Always populated (with `triggered=false` when the auto-profiler
+     * decided not to run — typically because `node_counts.bin` already
+     * existed or the user opted out via `auto_profile_on_cold_start=false`).
      */
     struct Phase0Report {
         bool        triggered     = false;

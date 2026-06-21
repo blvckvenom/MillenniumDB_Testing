@@ -1,7 +1,12 @@
 #include "gnn/sampling/basic_khop_sampler.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -19,6 +24,38 @@
 
 namespace mdb::gnn {
 
+// ---------------------------------------------------------------------------
+// Expand-stage profiling (env MDB_GNN_EXPAND_PROFILE=1, default off). Splits the
+// k-hop expand into four sub-costs so we measure where the time actually goes
+// before optimizing. Microsecond accumulators, summed across all worker threads
+// via relaxed atomics; a few clock reads per batch when enabled, zero overhead
+// (one branch) when off. Never affects the sampled output.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ExpandProfile {
+    std::atomic<uint64_t> sample_us{0};   // per-node neighbor sampling loop
+    std::atomic<uint64_t> fetch_us{0};    // ...of which: topology get_neighbors
+    std::atomic<uint64_t> convert_us{0};  // convert-to-edges + next-layer dedup
+    std::atomic<uint64_t> edges_us{0};    // build_edges local-index maps
+    std::atomic<uint64_t> unique_us{0};   // rebuild_unique_nodes dedup
+};
+ExpandProfile g_expand_profile;
+
+const bool g_expand_profile_on = [] {
+    const char* e = std::getenv("MDB_GNN_EXPAND_PROFILE");
+    return e != nullptr && std::string(e) == "1";
+}();
+
+inline uint64_t now_us_() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+}  // namespace
+
 // =============================================================================
 // Implementation Details
 // =============================================================================
@@ -26,8 +63,9 @@ namespace mdb::gnn {
 struct BasicKHopSampler::Impl {
     GQL::ProjectionStorage& storage;
     SamplingConfig config;
-    // Plan F (2026-05-11) — split ownership: `owned_topology` is non-null
-    // on the primary sampler and null on workers; `topology` is the raw
+    // Split ownership for parallel offline sampling: `owned_topology` is
+    // non-null on the primary sampler and null on workers (which borrow the
+    // primary's already-initialised TopologyAccessor). `topology` is the raw
     // pointer used throughout the code, so existing call sites keep using
     // `topology->...` regardless of who actually owns it. Workers must
     // not destroy their borrowed topology; that's the primary's job.
@@ -38,16 +76,22 @@ struct BasicKHopSampler::Impl {
     std::mt19937_64 rng;
     bool use_leapfrog = true;  ///< Enable batch optimization by default
 
-    // Spec #13 Phase 5 (T13.2 writer half) — per-node access tally.
+    // Per-node access tally used by the Four-Level Topology Store to build
+    // the frequency-based tier assignment on the next warm-start run.
     // Indexed by dense row_idx == ObjectId::get_value(). The vector is
     // sized lazily on first access so test doubles / synthetic graphs
     // that never query topology->get_node_count() avoid the alloc.
     std::vector<uint64_t> node_access_counts;
 
-    // R1.1 (2026-05-29) — optional SHARED atomic tally. When non-null, all
-    // workers fetch_add into this single N-sized array instead of each
-    // growing its own `node_access_counts` (0.83 GB × numWorkers on
-    // papers100M). Owned by OfflineSamplingEngine; pre-sized + zero-init;
+    // Reusable per-sampler neighbor buffer for the hot fetch path. Each sampler
+    // (one per worker thread) owns its own, so get_neighbors_into can fill it
+    // without a fresh per-node allocation. The measured dominant expand cost.
+    Neighbors nbr_scratch_;
+
+    // Optional shared atomic tally. When non-null, all parallel workers
+    // fetch_add into this single N-sized array instead of each growing its
+    // own `node_access_counts` vector (which would cost 0.83 GB × numWorkers
+    // on papers100M). Owned by OfflineSamplingEngine; pre-sized + zero-init;
     // outlives every sampler. nullptr ⇒ legacy private-vector path.
     std::atomic<uint64_t>* shared_counts_   = nullptr;
     std::size_t            shared_counts_n_  = 0;
@@ -55,13 +99,14 @@ struct BasicKHopSampler::Impl {
     // Increment the access count for `id`, growing the vector on demand.
     // The 8-bit ObjectId type tag is masked off here at the boundary —
     // the same convention the FourLevelTopologyStore uses to align with
-    // `tier_lookup_` and the Spec #4-B sidecar's dense ROW_PTR layout
-    // (commit 2bfad825 fixed the same class of bug for row_lookup_).
+    // `tier_lookup_` and the topology CSR sidecar's dense ROW_PTR layout
+    // (the sidecar stores stripped uint64 node indices, not tagged ObjectIds).
     inline void tally_(ObjectId id) {
         const uint64_t row_idx = id.get_value();
-        // R1.1 shared-array fast path (parallel runs). Relaxed is sufficient:
-        // we only need the final per-node sum, which is interleave-invariant
-        // (commutative add); no inter-thread ordering is implied by a tally.
+        // Shared-array fast path for parallel sampling runs. Relaxed is
+        // sufficient: we only need the final per-node sum, which is
+        // interleave-invariant (commutative add); no inter-thread ordering
+        // is implied by a tally.
         if (shared_counts_ != nullptr) {
             if (row_idx < shared_counts_n_) {
                 shared_counts_[static_cast<std::size_t>(row_idx)]
@@ -95,18 +140,19 @@ struct BasicKHopSampler::Impl {
         leapfrog_sampler->set_random_seed(config_.random_seed);
         seek_sampler->set_random_seed(config_.random_seed);
 
-        // Spec #13 supersedes Spec #11. When the four-level store is
-        // enabled, we delegate the entire neighbor lookup pipeline to it
-        // (it owns its own L1 hash + L2 compact CSR + optional L3 mmap +
-        // L4 BPT fallback) and disable the legacy single-tier cache to
-        // avoid double-RAM accounting.
+        // The Four-Level Topology Store (L1 RAM hash / L2 compact uint32 CSR /
+        // L3 mmap sidecar / L4 direct B+Tree) supersedes the simpler
+        // in-memory adjacency cache. When the four-level store is enabled,
+        // we delegate the entire neighbor lookup pipeline to it and skip
+        // building the single-tier adjacency cache to avoid double-RAM
+        // accounting.
         if (config_.use_four_level_topology_store) {
-            // Plan E Phase 0 (2026-05-11) — bootstrap `node_counts.bin`
-            // via a cheap random-walk profile when no warm-start file
-            // exists yet and the Spec #4-B reverse sidecar is on disk.
-            // Without this, Spec #13's cold-start path skips the L3
+            // Bootstrap `node_counts.bin` via a cheap random-walk profile
+            // when no warm-start file exists yet and the mmap'd topology
+            // CSR sidecar (topology_{fwd,rev}.csr) is on disk. Without this,
+            // the Four-Level Topology Store's cold-start path skips the L3
             // MinHash reorder, and on graphs whose sidecar exceeds RAM
-            // (e.g. papers100M `topology_*.csr` at 53 GB / 30 GB host)
+            // (e.g. papers100M topology_*.csr at 53 GB on a 30 GB host)
             // the resulting random mmap access pattern thrashes the page
             // cache and the sample never completes. The profiler issues
             // ~500k lookups (vs ~5 B for a full 3-layer sample) and
@@ -122,19 +168,21 @@ struct BasicKHopSampler::Impl {
             tcfg.use_l3_mmap_sidecar = config_.use_l3_mmap_sidecar;
             tcfg.orientation         = config_.orientation;
             topology->enable_four_level_store(tcfg);
-            // Force PER_NODE: the four-level store dispatch is O(1)
-            // hash / CSR slice and beats Leapfrog/Seek under cached
-            // paths just as Spec #11 did.
+            // Force PER_NODE: the four-level store dispatch is O(1) per
+            // node (L1 hash lookup or L2 CSR slice), which beats the
+            // Leapfrog range-sweep and SeekBased B+Tree seeks under
+            // cached paths.
             use_leapfrog = false;
         }
-        // Spec #11: opt into the in-memory adjacency cache up front so the
-        // O(|E|) full-scan is amortised across every batch in this sampling
-        // run. When the cache is built we force PER_NODE for every layer:
-        // PER_NODE → topology->get_neighbors → O(degree) hash lookup, which
-        // beats Leapfrog's O(|E|) per-batch range scan and SeekBased's per-
-        // node O(log E) seek under the cached path. Bit-identical sampling
+        // In-memory adjacency cache path: perform a single full B+Tree scan
+        // up front (O(|E|)) to populate an unordered_map<src, vector<AdjEntry>>
+        // so that the O(|E|) cost is amortised across every batch in this
+        // sampling run. When the cache is built we force PER_NODE for every
+        // layer: PER_NODE → topology->get_neighbors → O(degree) hash lookup,
+        // which beats Leapfrog's O(|E|) per-batch range scan and SeekBased's
+        // per-node O(log E) seek under the cached path. Bit-identical sampling
         // output is preserved because the cache holds the same edges the
-        // BPT path returns.
+        // B+Tree path returns.
         else if (config_.use_adjacency_cache) {
             topology->enable_adjacency_cache(true);
             topology->prebuild_adjacency_cache(config_.orientation);
@@ -144,11 +192,11 @@ struct BasicKHopSampler::Impl {
         }
     }
 
-    // Plan F (2026-05-11) — worker ctor. Borrows the primary's
-    // TopologyAccessor (already through Phase 0 + four-level enable +
-    // adjacency cache build) and creates fresh Leapfrog/Seek samplers
-    // owning their own RNG state. Skip the expensive Phase 0 / cache
-    // setup since the primary did all that work.
+    // Worker constructor for parallel offline sampling. Borrows the primary's
+    // TopologyAccessor (which has already completed the cold-start profile,
+    // four-level store initialisation, and adjacency-cache build) and creates
+    // fresh Leapfrog/Seek samplers owning their own RNG state. Skips the
+    // expensive Phase 0 / cache setup since the primary did all that work.
     Impl(GQL::ProjectionStorage& storage_,
          const SamplingConfig& config_,
          TopologyAccessor* shared_topology,
@@ -171,8 +219,8 @@ struct BasicKHopSampler::Impl {
             config_.random_seed ^ static_cast<uint64_t>(worker_offset);
         leapfrog_sampler->set_random_seed(worker_seed);
         seek_sampler->set_random_seed(worker_seed);
-        // Mirror the primary's strategy choice. The primary forced
-        // PER_NODE iff Spec #13 four-level or Spec #11 adjacency cache is
+        // Mirror the primary's strategy choice. The primary forced PER_NODE
+        // iff the Four-Level Topology Store or in-memory adjacency cache is
         // active; workers inherit the same toggle by inspecting the same
         // config flags. We never rebuild the cache or re-enable the four-
         // level store here — that's the primary's responsibility.
@@ -182,9 +230,13 @@ struct BasicKHopSampler::Impl {
         }
     }
 
-    // Plan E Phase 0 (2026-05-11) — see comment in the Spec #13 branch
-    // above. Runs `TopologyWalkProfiler` over the Spec #4-B reverse
-    // sidecar and persists `node_counts.bin`. No-op when:
+    // Cold-start topology profiler — see comment in the Four-Level Store
+    // branch of the primary constructor above. Runs `TopologyWalkProfiler`
+    // over the mmap'd reverse topology CSR sidecar (topology_rev.csr) using
+    // degree-weighted Vose-alias seed selection, and persists the resulting
+    // per-node access counts to `node_counts.bin` so the Four-Level Topology
+    // Store can activate its L3 MinHash reorder on this very build. No-op
+    // when:
     //   - `auto_profile_on_cold_start` is false (user opt-out)
     //   - `node_counts.bin` already exists (warm-start ready)
     //   - the sidecar is absent (projection built without
@@ -243,7 +295,7 @@ struct BasicKHopSampler::Impl {
                   << (config.profile_num_walks
                           ? config.profile_num_walks
                           : TopologyWalkProfiler::kDefaultNumWalks)
-                  << " random walks over Spec #4-B sidecar to bootstrap "
+                  << " random walks over the mmap'd topology CSR sidecar to bootstrap "
                   << "warm-start...\n";
 
         auto result = TopologyWalkProfiler::profile(
@@ -342,8 +394,13 @@ struct BasicKHopSampler::Impl {
         ObjectId node_id,
         uint64_t fanout
     ) {
-        Neighbors all_neighbors =
-            topology->get_neighbors(node_id, config.orientation);
+        const uint64_t tf = g_expand_profile_on ? now_us_() : 0;
+        topology->get_neighbors_into(node_id, config.orientation, nbr_scratch_);
+        Neighbors& all_neighbors = nbr_scratch_;
+        if (g_expand_profile_on) {
+            g_expand_profile.fetch_us.fetch_add(now_us_() - tf,
+                                                std::memory_order_relaxed);
+        }
 
         // ---- Self-loop ablation (env MDB_GNN_SAMPLE_SELF_LOOP=1, default OFF).
         //
@@ -382,10 +439,10 @@ struct BasicKHopSampler::Impl {
             // Take all neighbors
             for (size_t i = 0; i < n; ++i) {
                 result.emplace_back(all_neighbors.node_ids[i], all_neighbors.edge_ids[i]);
-                // Spec #13 Phase 5 — count each visited neighbour. This
-                // matches DiskGNN's `node_counts[v] += 1` in
-                // mega_batch_sampling.py:50: a node's "frequency" is
-                // its visit count across the sampling run.
+                // Count each visited neighbour for the frequency-based tier
+                // assignment: a node's "frequency" is its total visit count
+                // across the sampling run, matching DiskGNN's
+                // `node_counts[v] += 1` in mega_batch_sampling.py:50.
                 tally_(all_neighbors.node_ids[i]);
             }
         } else {
@@ -403,9 +460,9 @@ struct BasicKHopSampler::Impl {
             for (size_t i = 0; i < k; ++i) {
                 size_t idx = indices[i];
                 result.emplace_back(all_neighbors.node_ids[idx], all_neighbors.edge_ids[idx]);
-                // Spec #13 Phase 5 — count each sampled neighbour
-                // (only the k actually visited ones, mirroring the
-                // PER_NODE strategy below).
+                // Count each sampled neighbour for frequency-based tier
+                // assignment (only the k actually visited ones, not the full
+                // degree, mirroring the PER_NODE strategy below).
                 tally_(all_neighbors.node_ids[idx]);
             }
         }
@@ -489,12 +546,12 @@ struct BasicKHopSampler::Impl {
         // Get total edge count for strategy selection
         uint64_t total_edges = topology->get_edge_count();
 
-        // Spec #13 Phase 5 — tally the seed nodes themselves. They are
-        // touched by every sample (their adjacency drives the layer-0
-        // expansion), so they belong in the access-count vector even
-        // though `sample_neighbors_uniform` only counts the neighbours
-        // it returns. Done before the layer loop so the seed counts
-        // are deterministic w.r.t. the per-layer paths chosen.
+        // Tally the seed nodes themselves for the frequency-based tier
+        // assignment. Seeds are touched by every sample (their adjacency
+        // drives the layer-0 expansion), so they belong in the access-count
+        // vector even though `sample_neighbors_uniform` only counts the
+        // neighbours it returns. Done before the layer loop so the seed
+        // counts are deterministic w.r.t. the per-layer paths chosen.
         for (const ObjectId& seed_id : seeds) {
             tally_(seed_id);
         }
@@ -511,6 +568,9 @@ struct BasicKHopSampler::Impl {
                 : BatchStrategy::PER_NODE;
 
             BatchNeighbors batch_result;
+
+            const bool prof = g_expand_profile_on;
+            uint64_t   ts   = prof ? now_us_() : 0;
 
             switch (strategy) {
                 case BatchStrategy::SWEEP:
@@ -544,6 +604,12 @@ struct BasicKHopSampler::Impl {
                     break;
             }
 
+            if (prof) {
+                g_expand_profile.sample_us.fetch_add(now_us_() - ts,
+                                                     std::memory_order_relaxed);
+                ts = now_us_();
+            }
+
             // Convert batch results to sampled_edges format
             for (const ObjectId& node_id : current_layer) {
                 auto it = batch_result.neighbors.find(node_id.id);
@@ -552,11 +618,12 @@ struct BasicKHopSampler::Impl {
 
                     for (const auto& [neighbor_node, edge_id] : it->second) {
                         next_layer_set.insert(neighbor_node.id);
-                        // Spec #13 Phase 5 — tally each neighbor visited
-                        // by SWEEP / SEEK strategies (PER_NODE already
-                        // tallied inside sample_neighbors_uniform). Same
-                        // semantic for all three strategies: count once
-                        // per visit during this sampling run.
+                        // Tally each neighbour visited by SWEEP / SEEK
+                        // strategies for the frequency-based tier assignment
+                        // (PER_NODE already tallies inside
+                        // sample_neighbors_uniform). Same semantic for all
+                        // three strategies: count once per visit during this
+                        // sampling run.
                         if (strategy == BatchStrategy::SWEEP ||
                             strategy == BatchStrategy::SEEK)
                         {
@@ -589,13 +656,28 @@ struct BasicKHopSampler::Impl {
             for (uint64_t node_id : next_layer_set) {
                 sample.nodes_per_layer[k + 1].emplace_back(node_id);
             }
+
+            if (prof) {
+                g_expand_profile.convert_us.fetch_add(now_us_() - ts,
+                                                      std::memory_order_relaxed);
+            }
         }
 
         // Build edge indices
+        uint64_t te = g_expand_profile_on ? now_us_() : 0;
         build_edges(sample, sampled_edges);
+        if (g_expand_profile_on) {
+            g_expand_profile.edges_us.fetch_add(now_us_() - te,
+                                                std::memory_order_relaxed);
+            te = now_us_();
+        }
 
         // Build all_unique_nodes
         sample.rebuild_unique_nodes();
+        if (g_expand_profile_on) {
+            g_expand_profile.unique_us.fetch_add(now_us_() - te,
+                                                 std::memory_order_relaxed);
+        }
 
         return sample;
     }
@@ -668,6 +750,29 @@ const std::vector<uint64_t>& BasicKHopSampler::node_access_counts() const {
     return impl_->node_access_counts;
 }
 
+std::string BasicKHopSampler::dump_expand_profile() {
+    if (!g_expand_profile_on) return "";
+    auto take = [](std::atomic<uint64_t>& a) {
+        return a.exchange(0, std::memory_order_relaxed) / 1000.0;  // us -> ms
+    };
+    const double s = take(g_expand_profile.sample_us);
+    const double f = take(g_expand_profile.fetch_us);
+    const double c = take(g_expand_profile.convert_us);
+    const double e = take(g_expand_profile.edges_us);
+    const double u = take(g_expand_profile.unique_us);
+    const double tot = s + c + e + u;
+    auto pct = [&](double x) { return tot > 0 ? 100.0 * x / tot : 0.0; };
+    char buf[640];
+    std::snprintf(buf, sizeof(buf),
+        "expand-profile (ms, summed over workers): sample=%.0f (%.1f%%) "
+        "[of which fetch=%.0f (%.1f%%), reservoir+alloc=%.0f (%.1f%%)] "
+        "convert+dedup=%.0f (%.1f%%) build_edges=%.0f (%.1f%%) "
+        "unique=%.0f (%.1f%%) total=%.0f",
+        s, pct(s), f, pct(f), s - f, pct(s - f), c, pct(c), e, pct(e),
+        u, pct(u), tot);
+    return std::string(buf);
+}
+
 TopologyAccessor& BasicKHopSampler::get_topology() {
     return *impl_->topology;
 }
@@ -681,6 +786,12 @@ void BasicKHopSampler::reseed_for_batch(uint64_t batch_id) {
     impl_->rng.seed(batch_seed);
     impl_->leapfrog_sampler->set_random_seed(batch_seed);
     impl_->seek_sampler->set_random_seed(batch_seed);
+}
+
+void BasicKHopSampler::tally_nodes(const std::vector<ObjectId>& nodes) {
+    for (const ObjectId& n : nodes) {
+        impl_->tally_(n);
+    }
 }
 
 void BasicKHopSampler::merge_counts_from(const std::vector<uint64_t>& other) {

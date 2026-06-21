@@ -171,6 +171,64 @@ public:
     void write_sample(const GraphSample& sample);
 
     /**
+     * @brief Commit a sample whose serialized bytes + content hash were
+     *        already computed by the caller (on a worker thread, off the
+     *        write_mutex). Bit-identical to write_sample(): `data` and
+     *        `content_hash` are pure functions of `sample`. Used by the
+     *        MDB_GNN_PARALLEL_WRITE_PREP path to shrink the serial section.
+     * @param sample        Sample to write (for stats/freq/index).
+     * @param data          Result of sample.serialize() done by the caller.
+     * @param content_hash  Result of compute_batch_content_hash(sample) by the caller.
+     */
+    void write_sample_prepared(const GraphSample& sample,
+                               const std::string& data,
+                               uint64_t content_hash);
+
+    // =========================================================================
+    // Sharded (lock-free) parallel write
+    // =========================================================================
+
+    /**
+     * @brief Begin a sharded parallel write: one shard file per worker.
+     *
+     * Removes the single write mutex from the parallel sampling loop. Each
+     * worker `w` appends serialized batches to its OWN `batches_shard_<w>.dat`
+     * (no shared offset, no lock) via shard_write(w, ...); the only shared
+     * write-state is an internal atomic dense frequency array. merge_shards()
+     * then concatenates the shards in ascending batch_id order into the final
+     * batches.dat — BYTE-IDENTICAL to the single-writer path — and rebuilds the
+     * index / frequency / catalog.
+     *
+     * Requires the dense (RowMapping) create() path. @throws if not in write
+     * mode or no RowMapping.
+     */
+    void begin_sharded_write(uint32_t num_workers);
+
+    /// True between begin_sharded_write() and merge_shards().
+    bool sharded_write_active() const;
+
+    /**
+     * @brief Append a serialized batch to worker `worker_index`'s shard.
+     *
+     * Thread-safe across DISTINCT worker_index values (each worker owns its
+     * index) plus the internal atomic frequency array — NO external lock needed.
+     * `data` / `content_hash` are pure functions of `sample` (caller computes
+     * them off-thread, identical to write_sample_prepared).
+     */
+    void shard_write(uint32_t worker_index, const GraphSample& sample,
+                     const std::string& data, uint64_t content_hash);
+
+    /**
+     * @brief Merge all shards into the final files (single thread).
+     *
+     * Replaces finalize() for the sharded path: concatenates shard payloads in
+     * ascending batch_id order, rebuilds batches.idx / frequency.dat / catalog,
+     * and deletes the temp shard files. The result is byte-identical to a
+     * single-writer finalize().
+     */
+    void merge_shards();
+
+    /**
      * @brief Finalize storage after writing all samples.
      *
      * Must be called after all samples are written and before reading.
@@ -218,8 +276,9 @@ public:
      *
      * The cost model showed gnn_train re-reads + re-deserializes the entire
      * batches.dat from disk on EVERY epoch (the per-batch read_sample on the
-     * assemble hot path), and Fix #22's fadvise/madvise DONTNEED evicts those
-     * pages so even a sample set that fits in RAM is re-fetched each epoch.
+     * assemble hot path), and the page-cache relief pass (posix_fadvise /
+     * madvise MADV_DONTNEED applied to consumed batches.dat regions) evicts
+     * those pages so even a sample set that fits in RAM is re-fetched each epoch.
      *
      * With a budget set, read_sample serves a previously-read batch from an
      * in-RAM LRU of deserialized samples — skipping both the disk read and the

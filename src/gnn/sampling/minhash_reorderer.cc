@@ -32,8 +32,8 @@ MinHashReorderer::MinHashReorderer(const Config& config) : config_(config) {
         throw std::invalid_argument("MinHashReorderer: hashes_per_pass must be > 0");
     }
 
-    // Fix #4: Largest prime below 2^32, so all hash outputs fit in 32 bits
-    // without truncation when used in composite keys.
+    // Choose the largest prime below 2^32 so all hash outputs fit in 32 bits
+    // without truncation when used as the low 32 bits of composite keys.
     // Broder et al. (2000): h(x) = (a*x + b) mod p is a sound approximation
     // for min-wise independence.
     prime_ = 4294967291ULL; // 2^32 - 5
@@ -48,7 +48,7 @@ MinHashReorderer::MinHashReorderer(const Config& config) : config_(config) {
 }
 
 MinHashReorderer::~MinHashReorderer() {
-    // Fix #3: Clean up temp files if Strategy B was used
+    // Clean up temp files created by Strategy B (MULTIPASS_BOUNDED), if any
     cleanup_temp_dir();
 }
 
@@ -88,8 +88,8 @@ void MinHashReorderer::build_access_graph(uint64_t num_batches, const BatchProvi
             break;
     }
 
-    // Fix #2: Set graph_built_ AFTER the strategy call succeeds.
-    // If the strategy throws, graph_built_ remains false.
+    // Set graph_built_ only after the strategy call completes successfully.
+    // If the strategy throws, graph_built_ remains false so callers can detect the failure.
     graph_built_ = true;
 }
 
@@ -277,7 +277,7 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider
         uint32_t h_end = std::min(h_start + K, total_hashes);
         uint32_t num_h = h_end - h_start;
 
-        // Fix #5: Overflow guard before allocation
+        // Guard against size_t overflow before allocating N * num_h * sizeof(uint64_t) bytes
         if (N > 0 && num_h > SIZE_MAX / N / sizeof(uint64_t)) {
             throw std::overflow_error(
                 "MinHashReorderer: min_val allocation would overflow ("
@@ -295,7 +295,7 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider
         }
         FdGuard guard(fd);
 
-        // Fix #6: Pre-allocate buffer for bulk reading row_ids
+        // Pre-allocate a reusable buffer outside the batch loop so we bulk-read all row_ids at once
         std::vector<uint64_t> row_id_buf;
 
         for (uint64_t b = 0; b < num_batches; ++b) {
@@ -311,7 +311,7 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider
 
             if (count == 0) continue;
 
-            // Fix #6: Bulk read all row_ids at once
+            // Bulk read all row_ids for this batch in a single read_all call
             row_id_buf.resize(count);
             read_all(fd, row_id_buf.data(), count * 8, temp_path.string());
 
@@ -319,7 +319,7 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider
             for (uint64_t i = 0; i < count; ++i) {
                 uint64_t rid = row_id_buf[i];
 
-                // Fix #1: Bounds check on rid from temp file
+                // Bounds-check each row_id read from the temp file against N to catch corruption
                 if (rid >= N) {
                     throw std::runtime_error(
                         "MinHashReorderer: corrupted temp file — row_id "
@@ -417,7 +417,8 @@ MinHashReorderer::Stats MinHashReorderer::get_stats() const {
     for (size_t i = 0; i < accessed_.size(); ++i) {
         if (accessed_[i]) ++accessed;
     }
-    // Fix #9: avg_batches_per_node = total_accesses / accessed_nodes (not total_batches / accessed)
+    // avg_batches_per_node is total_accesses divided by accessed_nodes (not total_batches / accessed);
+    // total_accesses counts every (node, batch) occurrence, giving the true mean co-occurrence rate
     return Stats{
         accessed,
         total_batches_,

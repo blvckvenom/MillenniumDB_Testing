@@ -3,12 +3,14 @@
 // node_counts_io — read/write helpers for `<projection_dir>/node_counts.bin`.
 //
 // `node_counts.bin` is the warm-start artifact consumed by
-// `TopologyFrequencyProfiler::compute_from_node_counts_` (Spec #13 Phase 1)
-// and produced by:
+// `TopologyFrequencyProfiler::compute_from_node_counts_` (the frequency-profiling
+// phase of the Four-Level Topology Store: L1 RAM hash / L2 compact uint32 CSR /
+// L3 mmap sidecar / L4 direct B+Tree) and produced by:
 //   (a) `OfflineSamplingEngine::run()` at the END of a sample build
 //       (acumulates real access counts during sampling), and
-//   (b) `TopologyWalkProfiler` as a Phase-0 cheap profiler (random walks
-//       over the Spec #4-B sidecar) when no `node_counts.bin` exists yet.
+//   (b) `TopologyWalkProfiler` as a Phase-0 cheap profiler (random walks over
+//       the mmap-backed topology CSR sidecar files topology_{fwd,rev}.csr that
+//       provide O(1) neighbor slices) when no `node_counts.bin` exists yet.
 //
 // Both (a) and (b) write the SAME on-disk format so the reader path in
 // `TopologyFrequencyProfiler::compute_from_node_counts_` doesn't care

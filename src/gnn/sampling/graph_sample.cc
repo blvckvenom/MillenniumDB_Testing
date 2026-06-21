@@ -32,7 +32,8 @@ T read_value(std::istream& in) {
 
 // -----------------------------------------------------------------------------
 // v2 (legacy) per-element helpers — preserved for backward compatibility
-// when reading v1/v2 samples written before Round 2A (2026-05-15).
+// when reading v1/v2 samples written before the v3 bulk-I/O format
+// (2026-05-15).
 // -----------------------------------------------------------------------------
 
 void write_object_id_vector(std::ostream& out, const std::vector<ObjectId>& vec) {
@@ -70,7 +71,7 @@ std::vector<int32_t> read_int32_vector(std::istream& in) {
 }
 
 // -----------------------------------------------------------------------------
-// v3 bulk helpers — Round 2A hot-path optimization (2026-05-15)
+// v3 bulk helpers — serialization hot-path optimization (2026-05-15)
 //
 // Format: uint64_t size + (size * sizeof(T)) raw bytes.
 // Eliminates per-element istream::read/ostream::write overhead (vtable dispatch
@@ -174,7 +175,7 @@ void GraphSample::serialize(std::ostream& out) const {
     write_value(out, batch_id);
     write_value(out, static_cast<uint8_t>(split));
 
-    // Nodes per layer — bulk write (Round 2A, 2026-05-15)
+    // Nodes per layer — bulk write (v3 bulk format, 2026-05-15)
     write_value(out, static_cast<uint64_t>(nodes_per_layer.size()));
     for (const auto& layer : nodes_per_layer) {
         write_object_id_vector_bulk(out, layer);
