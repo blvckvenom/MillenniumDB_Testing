@@ -1,11 +1,15 @@
 // four_level_topology_store_test.cc
 //
-// Spec #13 Phase 2 — FourLevelTopologyStore dispatcher unit tests (T13.6).
+// FourLevelTopologyStore dispatcher unit tests.
 //
-// Phase 2 only ships the dispatch skeleton — no `build()` orchestration, no
-// profiler integration, no real RowMapping. These tests therefore drive the
-// dispatcher with synthetically populated L1/L2 caches plus pluggable
-// L4 callables (and optionally a real `TopologySnapshotReader` for L3).
+// The Four-Level Topology Store (L1 RAM hash / L2 compact uint32 CSR /
+// L3 mmap sidecar / L4 direct B+Tree) is frequency-tiered: high-access
+// nodes live in L1/L2, cold nodes fall back to the mmap sidecar (L3) or the
+// B+Tree directly (L4). These tests cover only the dispatch skeleton —
+// no `build()` orchestration, no profiler integration, no real RowMapping.
+// The dispatcher is driven with synthetically populated L1/L2 caches plus
+// pluggable L4 callables (and optionally a real `TopologySnapshotReader` for
+// L3).
 //
 // To keep the suite light we DO NOT spin up a `System` / `ProjectionStorage`
 // fixture (the GQL projection layer is a heavy dependency for what is
@@ -32,11 +36,12 @@
 //      throws otherwise.
 //
 // Note on Tier 3 (L3 mmap sidecar): rather than build a real sidecar fixture
-// per-test (Spec #4-B writer needs a fake source-leaf for SHA-256 + a
-// projection_dir + OpenSSL), we exercise the absent-sidecar path symbolically
-// via `nullptr` and document via an explicit comment in test 3 that the real
-// L3-hit path is covered by `topology_snapshot_reader_test.cc` + Phase 3
-// integration tests.
+// per-test (the topology CSR sidecar writer needs a fake source-leaf for
+// SHA-256 + a projection_dir + OpenSSL), we exercise the absent-sidecar path
+// symbolically via `nullptr` and document via an explicit comment in test 3
+// that the real L3-hit path is covered by
+// `topology_snapshot_reader_test.cc` + the build-orchestration integration
+// tests.
 
 #include <algorithm>
 #include <cstddef>
@@ -427,9 +432,9 @@ TEST(FourLevelTopologyStore, MultiTierGraph_ConsistentResults) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 (T13.7) tests — `Neighbors::for_each_dst` callback contract.
+// `Neighbors::for_each_dst` callback contract tests.
 //
-// Test 9: ForEachDst_Visits_AllNeighbors. Verifies the new helper visits
+// Test 9: ForEachDst_Visits_AllNeighbors. Verifies the helper visits
 // every dst exactly once across L1, L2, L3-fallback-to-L4, and L4 paths.
 // ---------------------------------------------------------------------------
 TEST(FourLevelTopologyStore, ForEachDst_Visits_AllNeighbors) {
@@ -470,21 +475,21 @@ TEST(FourLevelTopologyStore, ForEachDst_Visits_AllNeighbors) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 (T13.7) build-orchestration tests.
+// Build-orchestration tests.
 //
-// These tests construct a FourLevelTopologyStore via the Phase 3 BPT-pointer
+// These tests construct a FourLevelTopologyStore via the BPT-pointer
 // constructor (no live ProjectionStorage; the synthetic-graph code path
 // inside build() walks raw BPT pointers — see four_level_topology_store.cc
 // `if (storage_ == nullptr)` branch). For the synthetic path we hand-build a
 // pair of `unordered_map<uint64_t, vector<AdjEntry>>` "oracles" and verify
 // the dispatcher returns the correct adjacency for each node.
 //
-// Note: Phase 3 also adds a production path through TopologyAccessor +
-// TopologyFrequencyProfiler. That path is exercised by the integration test
-// in `topology_accessor_four_level_integration_test.cc` (created in T13.8).
+// Note: the production path through TopologyAccessor +
+// TopologyFrequencyProfiler is exercised by the integration test in
+// `topology_accessor_four_level_integration_test.cc`.
 // ---------------------------------------------------------------------------
 
-// Phase 3 tests construct with raw BPT pointers; they don't have access to a
+// These tests construct with raw BPT pointers; they don't have access to a
 // real BPlusTree<3> in this lightweight unit-test environment. To still
 // exercise build() end-to-end we manually instantiate a store with the
 // synthetic-storage code path and pre-built tier sources, then verify the

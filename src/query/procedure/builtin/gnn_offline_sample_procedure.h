@@ -46,11 +46,11 @@ namespace Procedures {
  * | randomSeed | INT | 42 | Seed for reproducibility |
  * | orientation | STRING | 'UNDIRECTED' | Edge direction: NATURAL, REVERSE, UNDIRECTED |
  * | usePredefinedSplits | BOOL | false | Use splits.bin from projection for train/val/test |
- * | useAdjacencyCache | BOOL | true | Build in-memory adjacency cache for fast lookups (Spec #11) |
- * | useFourLevelTopologyStore | BOOL | true | Build the Four-Level Topology Store (Spec #13) |
+ * | useAdjacencyCache | BOOL | true | Build an in-memory adjacency cache by performing one full B+Tree scan into an unordered_map<src, vector<AdjEntry>>; subsequent neighbor lookups become O(1) hash lookups instead of O(log N) B+Tree walks |
+ * | useFourLevelTopologyStore | BOOL | true | Build the frequency-tiered Four-Level Topology Store: L1 RAM hash for hot hubs, L2 compact uint32 CSR for warm nodes, L3 mmap CSR sidecar for cold nodes, L4 direct B+Tree fallback; tier assignment is driven by per-node access-frequency counts |
  * | l1CacheMb | INT | 0 | L1 (RAM hot) budget in MiB; 0 = auto-detect from /proc/meminfo |
  * | l2CacheMb | INT | 0 | L2 (RAM warm) budget in MiB; 0 = auto-detect from /proc/meminfo |
- * | useL3MmapSidecar | BOOL | true | Open Spec #4-B sidecar as L3 cold tier; falls through to L4 if absent |
+ * | useL3MmapSidecar | BOOL | true | Open the mmap-backed CSR sidecar files (topology_{fwd,rev}.csr) as the L3 cold tier, providing O(1) neighbor slices; falls through to L4 direct B+Tree access if the sidecar files are absent |
  * | force | BOOL | false | Drop and re-create the sample set if it already exists |
  *
  * ## Examples
@@ -128,21 +128,34 @@ public:
             YieldField{"computeMillis", YieldType::INT,
                 "Time taken to compute samples (milliseconds)"},
             YieldField{"phase0Triggered", YieldType::BOOL,
-                "Plan E (2026-05-11): true iff cold-start auto-profiler ran"},
+                "True iff the cold-start topology random-walk profiler ran "
+                "(triggered when node_counts.bin is absent and the sidecar is available)"},
             YieldField{"phase0Succeeded", YieldType::BOOL,
-                "Plan E (2026-05-11): true iff Phase 0 persisted node_counts.bin"},
+                "True iff the cold-start profiler successfully wrote node_counts.bin "
+                "so the Four-Level Topology Store can warm-start on the next sample build"},
             YieldField{"phase0WalksDone", YieldType::INT,
-                "Plan E (2026-05-11): random walks issued by Phase 0 profiler"},
+                "Number of random walks issued by the cold-start profiler "
+                "(degree-weighted Vose-alias seed selection)"},
             YieldField{"phase0LookupsDone", YieldType::INT,
-                "Plan E (2026-05-11): total neighbor lookups during Phase 0"},
+                "Total neighbor lookups performed during the cold-start profiling walks"},
             YieldField{"phase0Millis", YieldType::INT,
-                "Plan E (2026-05-11): Phase 0 elapsed time in milliseconds"},
+                "Elapsed time in milliseconds for the cold-start profiling pass"},
             YieldField{"sampleContentFp", YieldType::STRING,
-                "Content fingerprint of the sample (STEP 8): hex of the "
+                "Content fingerprint of the sample (the staleness/equality check): hex of the "
                 "order-independent XOR fold over batch node-sets + layer shapes "
                 "+ edge endpoints. Worker/order-invariant — use as the O(1) "
                 "semantic-equality gate across numWorkers and single-vs-parallel "
-                "populate instead of re-running train and comparing testAccuracy."}
+                "populate instead of re-running train and comparing testAccuracy."},
+            YieldField{"samplingBackend", YieldType::STRING,
+                "Sampling backend chosen by the hardware-based planner: "
+                "CPU_OUT_OF_CORE, GPU_UVA, or GPU_VRAM_COPY. Phase 1 is inert — "
+                "GPU_* is reported but the sampling ran on the CPU out-of-core path."},
+            YieldField{"samplingDirections", YieldType::STRING,
+                "Graph directions the GPU path would serve under the chosen "
+                "backend: NONE, FORWARD_ONLY, REVERSE_ONLY, or BOTH."},
+            YieldField{"samplingPlanReason", YieldType::STRING,
+                "Human-readable reason for the sampling-backend decision "
+                "(which gate passed or failed)."}
         };
     }
 
@@ -169,7 +182,7 @@ private:
      * @param[out] orientation Parsed orientation string
      * @param[out] use_predefined_splits Whether to use splits.bin from projection
      * @param[out] use_predefined_splits_explicit True iff usePredefinedSplits was present in the map
-     * @param[out] use_adjacency_cache Whether to build the in-memory adjacency cache (Spec #11)
+     * @param[out] use_adjacency_cache Whether to build the in-memory adjacency cache (one full B+Tree scan into unordered_map for O(1) neighbor lookups)
      * @param[out] force Whether to drop and re-create an existing sample set
      */
     void parse_options(
@@ -192,7 +205,8 @@ private:
         uint64_t& profile_num_walks,
         uint64_t& profile_walk_length,
         uint64_t& num_workers,
-        bool& force
+        bool& force,
+        std::string& sampling_backend
     );
 };
 

@@ -1,6 +1,10 @@
 // topology_frequency_profiler_test.cc
 //
-// Spec #13 Phase 1 — TopologyFrequencyProfiler unit tests.
+// Four-Level Topology Store (frequency-tiered: L1 RAM hash / L2 compact uint32 CSR /
+// L3 mmap sidecar / L4 direct B+Tree) — TopologyFrequencyProfiler unit tests.
+// This covers Phase 1 of the store build: scanning the edge B+Trees to derive
+// per-node degree (cold start) or reading previously persisted node_counts.bin
+// (warm start), then assigning every node to a tier based on access frequency.
 //
 // Coverage:
 //   1. ColdStart_FallsBackToDegree — without `node_counts.bin`, the cold

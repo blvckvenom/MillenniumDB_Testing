@@ -307,7 +307,7 @@ int main() {
         } // storage and catalog destruct here, before drop
 
         // ================================================================
-        // Catalog v1.4 IndexSet persistence tests (Spec #3 T3.6)
+        // Catalog v1.4 IndexSet persistence tests (reduced index-set presets)
         // ================================================================
         // These guard the round-trip of the new IndexSet byte appended to
         // the catalog in v1.4, and the backwards-compat path for v1.3
@@ -467,7 +467,7 @@ int main() {
         std::cout << " OK" << std::endl;
 
         // ================================================================
-        // Spec #18 — parallel reader-opening parity tests
+        // Parallel index-reader-opening parity tests
         // ================================================================
         // Verify MDB_PROJECTION_PARALLEL_READERS=0 (sequential, legacy)
         // and the default (parallel TBB) produce IDENTICAL reader sets.
@@ -566,7 +566,7 @@ int main() {
         manager.drop_projection("test_proj_par");
 
         // ================================================================
-        // Spec #15 — parallel B+Tree node-scan parity tests
+        // Parallel B+Tree node-scan parity tests
         // ================================================================
         // Verify MDB_PROJECTION_PARALLEL_NODE_SCAN=0 (sequential, legacy)
         // and the default (parallel TBB) produce IDENTICAL ordered node
@@ -726,7 +726,7 @@ int main() {
         std::cout << " OK" << std::endl;
 
         // ================================================================
-        // Spec #16 — parallel B+Tree edge-scan parity tests
+        // Parallel B+Tree edge-scan parity tests
         // ================================================================
         // Verify MDB_PROJECTION_PARALLEL_EDGE_SCAN=0 (sequential, legacy)
         // and the default (parallel TBB) produce IDENTICAL ordered

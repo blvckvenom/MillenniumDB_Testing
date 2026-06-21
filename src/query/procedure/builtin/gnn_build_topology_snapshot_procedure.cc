@@ -106,7 +106,8 @@ uint64_t build_one_snapshot_post_hoc(
         while ((rec = iter.next()) != nullptr) {
             // Pass the dense row id (tag stripped) as the CSR row key; dst and
             // edge_id stay tag-bearing — COL_IDX/EDGE_IDS store raw ObjectId.id
-            // and the sampler masks on read (Spec #4-B convention, f71b3bf0).
+            // and the sampler masks away the 8-bit ObjectId type tag on read
+            // (consistent with the topology CSR sidecar read convention).
             writer.append_edge(
                 ObjectId{ObjectId{(*rec)[0]}.get_value()},
                 ObjectId{(*rec)[1]},

@@ -1,7 +1,8 @@
 // topology_accessor_csr_path_test.cc
 //
-// Spec #4-B T4.7 integration tests — TopologyAccessor's CSR fast path and
-// its fallback to the B+Tree path when the mmap'd sidecar is absent, stale,
+// Integration tests for TopologyAccessor's mmap-backed CSR sidecar fast path
+// (files topology_fwd.csr / topology_rev.csr, providing O(1) neighbor slices)
+// and its fallback to the B+Tree path when either sidecar is absent, stale,
 // or structurally invalid.
 //
 // Fixture approach mirrors native_projection_builder_topology_snapshot_test.cc:
@@ -11,7 +12,7 @@
 // constructed on top of that storage and its neighbor-query + sampling
 // behavior is compared against the ground truth.
 //
-// Coverage per T4.7 acceptance:
+// Coverage (the CSR fast-path acceptance criteria):
 //   1. No CSR present → B+Tree path still works transparently.
 //   2. FWD CSR only → get_out_neighbors uses fast path, get_in_neighbors
 //      falls back.

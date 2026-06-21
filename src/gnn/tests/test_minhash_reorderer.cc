@@ -61,7 +61,7 @@ TEST(MinHashConfigTest, StatsBeforeBuildThrows) {
 // Deterministic expected values (golden test)
 // ===========================================================================
 
-// Fix C4: Hardcoded expected values — catches any change to hash function,
+// Hardcoded expected values — catches any change to hash function,
 // prime, sort order, or composite key layout.
 // Generated with: seed=42, prime=4294967291, num_hashes=2
 // To update after intentional algorithm changes: run the test, capture actual,
@@ -100,7 +100,7 @@ TEST(MinHashGoldenTest, MultipassKnownPermutation) {
         << "Multipass permutation changed — hash function, fingerprint mixing, or sort modified?";
 }
 
-// Fix C5: Verify the hash function actually differentiates nodes.
+// Verify the hash function actually differentiates nodes.
 // Each node has a UNIQUE batch membership set → each gets a different hash value
 // → the permutation must NOT be identity.
 TEST(MinHashGoldenTest, HashProducesNonTrivialReordering) {
@@ -270,7 +270,7 @@ TEST(MinHashSegmentedTest, DifferentSeedDifferentResult) {
     EXPECT_NE(make(42), make(123));
 }
 
-// Fix #10: Relaxed assertion — allows minor interleaving due to hash collisions
+// Relaxed assertion — allows minor interleaving due to hash collisions
 TEST(MinHashSegmentedTest, SimilarNodesGrouped) {
     MinHashReorderer r(make_config(MinHashReorderer::Strategy::SEGMENTED, 4, 8, 0, 42));
 
@@ -308,7 +308,7 @@ TEST(MinHashSegmentedTest, StatsAfterBuild) {
     EXPECT_DOUBLE_EQ(stats.avg_batches_per_node, 1.0); // 6 accesses / 6 nodes
 }
 
-// Fix #14: Duplicate row IDs in a batch are harmless
+// Duplicate row IDs in a batch are harmless
 TEST(MinHashSegmentedTest, DuplicateRowIdsHarmless) {
     MinHashReorderer r(make_config());
     // Batch has duplicate row IDs
@@ -412,7 +412,7 @@ TEST(MinHashMultipassTest, StatsAfterBuild) {
     EXPECT_EQ(stats.total_accesses, 6u);
 }
 
-// Fix #11: Strategy B LargeScale — exercises temp file I/O at scale
+// Strategy B LargeScale — exercises temp file I/O at scale
 TEST(MinHashMultipassTest, LargeScale) {
     const uint64_t N = 5000;
     MinHashReorderer r(make_config(MinHashReorderer::Strategy::MULTIPASS_BOUNDED, 4, 2));

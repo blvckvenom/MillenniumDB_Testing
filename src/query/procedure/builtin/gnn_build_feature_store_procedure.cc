@@ -1,7 +1,9 @@
 #include "query/procedure/builtin/gnn_build_feature_store_procedure.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <string>
 
 #include "query/procedure/procedure_context.h"
@@ -12,6 +14,7 @@
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
+#include "gpu/gpu_device.h"
 #include "graph_models/gql/gql_model.h"
 #include "query/procedure/builtin/gnn_procedure_utils.h"
 
@@ -124,6 +127,12 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     FourLevelStore::Config config;
 
+    // Dynamic per-hardware budgets: track whether the caller passed explicit
+    // budgets. When MDB_GNN_AUTO_RESOURCES=1 (default OFF) and a budget is NOT
+    // explicit, it is derived from the detected machine below. Explicit always wins.
+    bool gpu_budget_explicit = false;
+    bool cpu_budget_explicit = false;
+
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
         assert_known_option_keys(ctx.get_argument(2));
@@ -140,10 +149,12 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         if (auto v = get_int_opt("gpu_budget_mb", "gpuBudgetMb")) {
             if (*v < 0) throw std::runtime_error("gpu_budget_mb must be non-negative, got: " + std::to_string(*v));
             config.gpu.budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
+            gpu_budget_explicit = true;
         }
         if (auto v = get_int_opt("cpu_budget_mb", "cpuBudgetMb")) {
             if (*v <= 0) throw std::runtime_error("cpu_budget_mb must be positive, got: " + std::to_string(*v));
             config.cpu.budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
+            cpu_budget_explicit = true;
         }
         if (auto v = opts.get_bool("reorder")) {
             config.reorder = *v;
@@ -151,36 +162,38 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_bool("force")) {
             config.force = *v;
         }
-        // Fix #15: granular force flags. Each defaults to true, so passing
-        // `force: true` alone preserves legacy behaviour. Set to false to
-        // preserve a specific output across a force rebuild. Examples:
+        // Granular force flags, each defaulting to true when the top-level
+        // `force: true` is set, preserving legacy all-or-nothing behaviour.
+        // Setting individual flags to false lets a caller preserve a specific
+        // build artifact while forcing the rest. Examples:
         //   {force: true, force_reorder: false}
         //       Rebuild L1/L2 caches + packed_slim, KEEP reordered.fmat.
         //       Skips the MinHash recompute (typically the L3 wall-clock
         //       leader on papers100M-scale graphs).
         //   {force: true, force_caches: false, force_reorder: false}
-        //       Rebuild only packed_slim + meta. Useful to re-bench Fix #1-4.
+        //       Rebuild only packed_slim + meta. Useful to isolate L4 timing.
         if (auto v = get_bool_opt("force_caches", "forceCaches"))           config.force_caches = *v;
         if (auto v = get_bool_opt("force_reorder", "forceReorder"))         config.force_reorder = *v;
         if (auto v = get_bool_opt("force_packed_slim", "forcePackedSlim"))  config.force_packed_slim = *v;
         if (auto v = get_bool_opt("force_meta", "forceMeta"))               config.force_meta = *v;
-        // Path 4 (2026-05-19): pre-resolve per-batch classification offline.
+        // Pre-resolve per-batch node classification offline (added 2026-05-19).
         // Default true — enables the fast runtime path in gnn_train via
-        // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip Phase 5.
+        // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip building
+        // the offline address tables.
         if (auto v = opts.get_bool("buildAddrTables")) config.build_addr_tables = *v;
-        // Task 6: bake per-batch computation-graph blocks (blocks/block_NNNNNN.blk)
+        // Bake per-batch computation-graph blocks (blocks/block_NNNNNN.blk)
         // keyed by sample content hash, idempotent across re-runs. Default OFF —
         // when off the build is byte-identical to before. NOTE: bakeBlocks on a
         // reused store requires buildAddrTables (the default) to be on; with
         // buildAddrTables:false + reuse, pass force to bake.
         if (auto v = opts.get_bool("bakeBlocks")) config.bake_blocks = *v;
-        // Task 4: packed-full feature pack (additive). Writes ONLY packed_full/;
+        // Packed-full feature pack (additive). Writes ONLY packed_full/;
         // never builds/deletes the 4-tier or blocks/. Requires store.meta +
         // blocks/ from a prior bakeBlocks build. Default OFF.
         if (auto v = opts.get_bool("packFullFeatures")) config.pack_full = *v;
-        // DiskGNN-adoption Plan 1: also emit packed_slim/consolidated.slim during
-        // the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF. The
-        // runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
+        // Also emit a single consolidated packed_slim/consolidated.slim file
+        // during the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF.
+        // The runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
         if (auto v = opts.get_bool("writeConsolidatedSlim")) config.write_consolidated_slim = *v;
         // cleanupIntermediate: delete the non-slim packed/ from materialize_batches
         // after build succeeds. Default true. Set false only for debugging.
@@ -207,15 +220,58 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
             if (*v <= 0) throw std::runtime_error("segmentSize must be positive, got: " + std::to_string(*v));
             config.minhash.segment_size = static_cast<uint32_t>(*v);
         }
-        // Spec D telemetry (2026-05-07): expose disk_budget as a procedure
-        // parameter. 0 (default) = unlimited; otherwise a soft constraint
-        // that triggers a warning when actual footprint exceeds it.
-        // Future Spec C2 will use this value to drive heuristic search of
-        // segment_size that satisfies the constraint without warning.
+        // Expose disk_budget as a procedure parameter. 0 (default) = unlimited;
+        // otherwise a soft constraint that triggers a warning when the actual
+        // on-disk footprint of the Four-Level Feature Store (L1 GPU cache +
+        // L2 CPU cache + L3 reordered fmat + L4 packed-slim) exceeds it. A
+        // future heuristic search over MinHash segment_size could use this
+        // value to find the smallest segment_size that keeps total disk usage
+        // within budget without warning.
         if (auto v = opts.get_int("diskBudgetMb")) {
             if (*v < 0) throw std::runtime_error("diskBudgetMb must be non-negative, got: " + std::to_string(*v));
             config.disk_budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
         }
+    }
+
+    // =========================================================================
+    // Step 2b: dynamic per-hardware — auto-detect cache budgets.
+    // =========================================================================
+    // Opt-in via env MDB_GNN_AUTO_RESOURCES=1 (default OFF). When a budget was
+    // NOT passed explicitly, derive it from the actual machine via the same
+    // probe the GPU sort planner uses (mdb::gpu::detect_resources()). This is
+    // the missing wire identified in HARDWARE_ADAPTIVITY_AUDIT.md: the GNN
+    // feature store otherwise uses fixed 2 GB GPU / 4 GB CPU defaults regardless
+    // of the host's VRAM/RAM. Budgets choose cache TIER placement only (which
+    // nodes live in L1 GPU / L2 CPU vs L3/L4 disk) — never the gathered feature
+    // values — so the trained result is INVARIANT to the budget (validate via
+    // cora 0.8574939 + a papers100M feature checksum). Explicit gpu_budget_mb /
+    // cpu_budget_mb always win. First-cut heuristic; tune the reserves via A/B.
+    if (const char* e = std::getenv("MDB_GNN_AUTO_RESOURCES"); e && std::string(e) == "1") {
+        auto res = mdb::gpu::detect_resources();
+        if (!gpu_budget_explicit && res.has_gpu) {
+            // CONSERVATIVE by design: the L1 GPU cache lives in VRAM DURING TRAINING,
+            // competing with the model + activations + the assembler's per-batch
+            // device tensors. Giving L1 most of the VRAM would OOM the train step.
+            // free_vram is already 20%-margined (gpu_device VRAM_SAFETY_FACTOR); take
+            // a quarter of it for L1 (~0.2x total VRAM), matching the empirically-safe
+            // hand-tuned ratio (e.g. 2 GB L1 on a ~12 GB free card) while adapting to
+            // bigger/smaller GPUs. A smaller L1 only shifts reads to L3/L4 disk (slower,
+            // never OOM). Tune the fraction via A/B (see HARDWARE_ADAPTIVITY_AUDIT.md).
+            config.gpu.budget_bytes = res.gpu.free_vram / 4;
+        }
+        if (!cpu_budget_explicit && res.ram_available > 0) {
+            // A quarter of available RAM for the L2 CPU cache, leaving room for the
+            // build working set (mmap'd fmat + reorder) + page cache.
+            config.cpu.budget_bytes = res.ram_available / 4;
+        }
+        std::cerr << "[gnn_build_feature_store] MDB_GNN_AUTO_RESOURCES: "
+                  << "gpu_budget=" << (config.gpu.budget_bytes >> 20) << "MB "
+                  << "cpu_budget=" << (config.cpu.budget_bytes >> 20) << "MB "
+                  << "(has_gpu=" << (res.has_gpu ? 1 : 0)
+                  << " free_vram=" << (res.gpu.free_vram >> 20) << "MB"
+                  << " ram_avail=" << (res.ram_available >> 20) << "MB"
+                  << " gpu_explicit=" << (gpu_budget_explicit ? 1 : 0)
+                  << " cpu_explicit=" << (cpu_budget_explicit ? 1 : 0) << ")\n";
     }
 
     // =========================================================================
@@ -235,14 +291,14 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
     auto rmap_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".rmap");
 
-    // Path 4 (2026-05-20): Phase-5-only mode — when the caller asks for ONLY
+    // Address-tables-only mode (added 2026-05-20) — when the caller asks for ONLY
     // buildAddrTables=true with all force flags off AND the prior feature store
     // is fully on disk (store.meta exists), we can rebuild addr_tables/
     // sidecars without re-opening the source FeatureMatrix. This unblocks
-    // re-running Phase 5 when node_features.fmat has been cleaned up but the
-    // gpu_cache/cpu_cache/reordered files remain. The runtime ctor will load
-    // those caches directly; this avoids the FeatureMatrix::open's strict
-    // header-size check on the source fmat.
+    // re-running the address-table build when node_features.fmat has been
+    // cleaned up but the gpu_cache/cpu_cache/reordered files remain. The runtime
+    // ctor will load those caches directly; this avoids the FeatureMatrix::open's
+    // strict header-size check on the source fmat.
     bool phase5_only_mode =
         config.build_addr_tables && !config.pack_full &&
         !config.force && !config.force_caches && !config.force_reorder &&
@@ -285,7 +341,7 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     FourLevelStore::BuildResult result;
 
     if (phase5_only_mode && store_already_built) {
-        // STEP 8: refuse to reuse addr_tables built from a DIFFERENT sample.
+        // Refuse to reuse addr_tables built from a DIFFERENT sample.
         // The fast path skips the source FeatureMatrix, so a content mismatch
         // here cannot be repaired in-place — surface a clear error instead of
         // silently serving stale L1/L2/L3 membership.
@@ -297,9 +353,9 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
                 "(content fingerprint mismatch). Re-run with force:1 to rebuild "
                 "it (requires " + feature_name + ".fmat).");
         }
-        // Path 4 fast path: rebuild only addr_tables/ via the runtime ctor.
-        // No source FeatureMatrix needed. Tier counts / disk sizes in the
-        // BuildResult stay at their default zero values — only the
+        // Address-tables-only fast path: rebuild only addr_tables/ via the
+        // runtime ctor. No source FeatureMatrix needed. Tier counts / disk sizes
+        // in the BuildResult stay at their default zero values — only the
         // addrTablesMb / addrTablesBuiltOk yields are meaningful here.
         FourLevelStore store(db_folder, feature_name, samples);
         uint64_t blocks_bytes = 0;
@@ -347,24 +403,24 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l4Nodes",      ctx.create_int(static_cast<int64_t>(result.l4_nodes)));
     ctx.yield("gpuAvailable", ctx.create_bool(result.gpu_available));
     ctx.yield("buildTimeMs",  ctx.create_int(result.build_time_ms));
-    // Spec D telemetry yields (post-build, measured from filesystem)
+    // Four-Level Feature Store telemetry yields (post-build, measured from filesystem)
     ctx.yield("slimMb",       ctx.create_int(bytes_to_mb(result.slim_bytes)));
     ctx.yield("reorderedMb",  ctx.create_int(bytes_to_mb(result.reordered_bytes)));
     ctx.yield("gpuCacheMb",   ctx.create_int(bytes_to_mb(result.gpu_cache_bytes)));
     ctx.yield("cpuCacheMb",   ctx.create_int(bytes_to_mb(result.cpu_cache_bytes)));
     ctx.yield("totalDiskMb",  ctx.create_int(bytes_to_mb(result.total_disk_bytes)));
     ctx.yield("overBudget",   ctx.create_bool(result.over_budget));
-    // Path 4 (2026-05-19): Phase 5 telemetry.
+    // Offline address-table build telemetry (added 2026-05-19).
     ctx.yield("addrTablesMb",
               ctx.create_int(bytes_to_mb(result.addr_tables_bytes)));
     ctx.yield("addrTablesBuiltOk",
               ctx.create_bool(result.addr_tables_built_ok));
-    // Task 6: baked computation-graph block telemetry.
+    // Baked computation-graph block telemetry.
     ctx.yield("blocksMb",
               ctx.create_int(bytes_to_mb(result.blocks_bytes)));
     ctx.yield("blocksBuiltOk",
               ctx.create_bool(result.blocks_built_ok));
-    // Task 4: packed-full feature pack telemetry.
+    // Packed-full feature pack telemetry.
     ctx.yield("packedFullMb",
               ctx.create_int(bytes_to_mb(result.packed_full_bytes)));
     ctx.yield_row();

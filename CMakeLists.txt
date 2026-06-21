@@ -1718,6 +1718,121 @@ if(GTest_FOUND AND ENABLE_GNN AND
     endif()
 endif()
 
+# sampling_backend_plan tests — pure GPU/CPU sampling-backend decision table.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/sampling_backend_plan_test.cc")
+    add_executable(sampling_backend_plan_test
+        ${CMAKE_SOURCE_DIR}/src/tests/sampling_backend_plan_test.cc
+    )
+    set_target_properties(sampling_backend_plan_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(sampling_backend_plan_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SamplingBackendPlanTests
+        COMMAND $<TARGET_FILE:sampling_backend_plan_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST SamplingBackendPlanTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# pinned_topology_view tests — cudaHostRegister round-trip for the GPU substrate.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/pinned_topology_view_test.cc")
+    add_executable(pinned_topology_view_test
+        ${CMAKE_SOURCE_DIR}/src/tests/pinned_topology_view_test.cc
+    )
+    set_target_properties(pinned_topology_view_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(pinned_topology_view_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME PinnedTopologyViewTests
+        COMMAND $<TARGET_FILE:pinned_topology_view_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST PinnedTopologyViewTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# gpu_khop_sampler tests — statistical validation of the GPU reservoir+Philox
+# sampling kernel (short-circuit, no-replacement, uniformity, determinism).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gpu_khop_sampler_test.cc")
+    add_executable(gpu_khop_sampler_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gpu_khop_sampler_test.cc
+    )
+    set_target_properties(gpu_khop_sampler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(gpu_khop_sampler_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GpuKhopSamplerTests
+        COMMAND $<TARGET_FILE:gpu_khop_sampler_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST GpuKhopSamplerTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
 # ============================================================================
 # FourLevelTopologyStore dispatcher tests (Spec #13 Phase 2 / T13.6)
 # ============================================================================
@@ -2050,6 +2165,39 @@ if(GTest_FOUND AND ENABLE_GNN AND
     add_test(
         NAME SampleStorageTests
         COMMAND $<TARGET_FILE:sample_storage_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# sample_storage_shard tests — golden compare: sharded write == legacy write.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/sample_storage_shard_test.cc")
+    add_executable(sample_storage_shard_test
+        ${CMAKE_SOURCE_DIR}/src/tests/sample_storage_shard_test.cc
+    )
+    set_target_properties(sample_storage_shard_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(sample_storage_shard_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SampleStorageShardTests
+        COMMAND $<TARGET_FILE:sample_storage_shard_test>
         WORKING_DIRECTORY tests
     )
 endif()

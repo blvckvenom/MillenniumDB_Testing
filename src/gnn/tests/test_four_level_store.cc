@@ -962,12 +962,12 @@ TEST_F(FourLevelStoreCoordTest, Build_LargerBudget) {
 }
 
 // =============================================================================
-// Build: same sample + no force -> reuse (STEP 8 content fingerprint)
+// Build: same sample + no force -> reuse (via the content fingerprint)
 //
-// Pre-STEP-8 this threw "already exists". STEP 8 replaces that with a
-// reuse-or-recompute gate: a second build of the SAME sample without force must
-// detect the matching content fingerprint and REUSE the existing artifacts
-// (return tier counts from store.meta, no throw, no rebuild).
+// Earlier this threw "already exists". The content-fingerprint gate replaces
+// that with a reuse-or-recompute decision: a second build of the SAME sample
+// without force must detect the matching content fingerprint and REUSE the
+// existing artifacts (return tier counts from store.meta, no throw, no rebuild).
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, Build_SameSampleReuses) {
@@ -1168,7 +1168,8 @@ TEST_F(FourLevelStoreCoordTest, Constructor_NoMetadataThrows) {
 }
 
 // =============================================================================
-// S4 Property: load_batch_features matches original features for ALL batches
+// Round-trip correctness: load_batch_features matches original features for
+// ALL batches (every node's features survive the four-level store unchanged)
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4Property) {
@@ -1186,7 +1187,7 @@ TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4Property) {
 
     auto rm = RowMapping::open(rmap_path_);
 
-    // S4: for every node in every batch, features match original
+    // Round-trip: for every node in every batch, features match the original
     for (uint64_t b = 0; b < 5; ++b) {
         auto sample = samples2.read_sample(b);
         auto tensor = store.load_batch_features(b);
@@ -1209,7 +1210,8 @@ TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4Property) {
 }
 
 // =============================================================================
-// S4 Property with reorder: features still match after MinHash reordering
+// Round-trip correctness with reorder: features still match after MinHash
+// reordering of the feature matrix
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4WithReorder) {
@@ -1372,7 +1374,7 @@ TEST_F(FourLevelStoreCoordTest, Stats_ResetClears) {
     EXPECT_EQ(stats.l3_reads.load(), 0u);
     EXPECT_EQ(stats.l4_reads.load(), 0u);
     EXPECT_EQ(stats.total_requests.load(), 0u);
-    // Spec A1 (2026-04-27): byte-level counters must also clear.
+    // The byte-level served/wanted/disk counters must also clear.
     EXPECT_EQ(stats.l1_bytes_served.load(), 0u);
     EXPECT_EQ(stats.l2_bytes_served.load(), 0u);
     EXPECT_EQ(stats.l3_bytes_wanted.load(), 0u);
@@ -1415,7 +1417,7 @@ TEST_F(FourLevelStoreCoordTest, Stats_AccumulateAcrossBatches) {
 }
 
 // =============================================================================
-// Spec A1 (2026-04-27): byte-level counters track served / wanted / disk
+// Byte-level counters track bytes served / wanted / read from disk
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, Stats_ByteCountersAccumulate) {
@@ -1456,7 +1458,7 @@ TEST_F(FourLevelStoreCoordTest, Stats_ByteCountersAccumulate) {
 }
 
 // =============================================================================
-// Spec A1: L3 bytes_disk is monotonically >= bytes_wanted (alignment overhead)
+// L3 bytes_disk is monotonically >= bytes_wanted (alignment overhead)
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, Stats_L3DiskAmplificationMonotone) {
@@ -1560,7 +1562,7 @@ TEST_F(FourLevelStoreCoordTest, Build_ZeroBudget) {
 }
 
 // =============================================================================
-// Build: Zero budget + S4 still holds
+// Build: Zero budget + round-trip feature correctness still holds
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, Build_ZeroBudget_S4) {
@@ -1650,7 +1652,7 @@ TEST_F(FourLevelStoreCoordTest, SingleBatch_S4) {
 }
 
 // =============================================================================
-// S4 Property with FLOAT64 end-to-end
+// Round-trip feature correctness with FLOAT64 end-to-end
 // Catches dtype conversion bugs in the pipeline
 // =============================================================================
 
@@ -1682,7 +1684,8 @@ TEST_F(FourLevelStoreCoordTest, LoadBatchFeatures_S4WithFloat64) {
 
     auto rm = RowMapping::open(rmap64_path);
 
-    // S4: for every node in every batch, features match original FLOAT64 values
+    // Round-trip: for every node in every batch, features match the original
+    // FLOAT64 values
     for (uint64_t b = 0; b < 5; ++b) {
         auto sample = samples2.read_sample(b);
         auto tensor = store.load_batch_features(b);
@@ -1815,7 +1818,7 @@ TEST_F(FourLevelStoreCoordTest, Build_BudgetExactlyFitsAll) {
     EXPECT_EQ(result.l3_nodes, 0u);
     EXPECT_EQ(result.l4_nodes, 0u);
 
-    // S4 property should still hold
+    // round-trip feature correctness should still hold
     auto samples2 = SampleStorage::open(
         SampleStorage::get_storage_path(db_folder_, "fls_exact"));
     FourLevelStore store(db_folder_, "test_feat", samples2);
@@ -1839,9 +1842,11 @@ TEST_F(FourLevelStoreCoordTest, Build_BudgetExactlyFitsAll) {
 }
 
 // =============================================================================
-// Spec D telemetry (2026-05-07): on-disk byte accounting
-// Validates that BuildResult populates the new size fields and that
-// over_budget triggers correctly when disk_budget_bytes is set.
+// Four-Level Feature Store telemetry: on-disk byte accounting
+// Validates that BuildResult populates the on-disk size fields
+// (slim_bytes, reordered_bytes, gpu_cache_bytes, cpu_cache_bytes,
+// total_disk_bytes) and that over_budget triggers correctly when
+// disk_budget_bytes is set.
 // =============================================================================
 
 TEST_F(FourLevelStoreCoordTest, SpecD_TelemetryFieldsPopulated) {
@@ -1901,7 +1906,7 @@ TEST_F(FourLevelStoreCoordTest, SpecD_ReorderedBytesNonzero) {
 }
 
 // =============================================================================
-// STEP 1 regression: addr-table staleness marker resolves the PROJECTION dir.
+// Regression: the addr-table staleness marker resolves the PROJECTION dir.
 //
 // Bug: compute_meta_sha_head() was called on <db_folder>/gnn_meta.bin, but
 // graph_project writes gnn_meta.bin into <db_folder>/projections/<name>/. The

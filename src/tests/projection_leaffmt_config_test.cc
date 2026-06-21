@@ -1,5 +1,5 @@
-// Unit tests for the Spec #5 T5.11 end-to-end plumbing of the
-// `leafFormat` GQL config key. Covers:
+// Unit tests for the end-to-end plumbing of the delta + LEB128-varint leaf
+// encoding feature exposed as the `leafFormat` GQL config key. Covers:
 //
 //   1. LeafFormatConfig_Absent_DefaultsBitset     — default builder ctor
 //      plus ProjectionStorage field wiring leave leaf_format == BITSET and
@@ -32,7 +32,8 @@
 // builder actually writes through in save_catalog().
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-// Plan reference: docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md §T5.11
+// Plan reference: docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md
+//   (config-plumbing unit-test task for the delta-varint leaf encoding)
 
 #include <cstdint>
 #include <filesystem>
@@ -96,9 +97,10 @@ void populate_minimum(GQL::ProjectionCatalog& cat,
 
 // ============================================================================
 // Test 1: Absent `leafFormat` key leaves the projection at the BITSET default.
-// This test pins the on-disk invariant that pre-Spec-#5 builds continue to
-// produce: when the GQL caller does not set the key, the catalog records
-// BITSET (byte 1) for every materialized index.
+// This test pins the on-disk invariant that builds without the delta +
+// LEB128-varint leaf encoding continue to produce: when the GQL caller does
+// not set the key, the catalog records BITSET (byte 1) for every materialized
+// index.
 // ============================================================================
 TEST(LeafFormatConfig, Absent_DefaultsBitset) {
     const auto dir = make_tempdir("Absent_DefaultsBitset");

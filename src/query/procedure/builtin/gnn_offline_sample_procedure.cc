@@ -119,8 +119,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     bool auto_profile_on_cold_start = true;
     uint64_t profile_num_walks = 0;
     uint64_t profile_walk_length = 0;
-    uint64_t num_workers = std::numeric_limits<uint64_t>::max();  // F#1 sentinel: unset
+    uint64_t num_workers = std::numeric_limits<uint64_t>::max();  // sentinel: max = unset (auto-detect below)
     bool force = false;
+    std::string sampling_backend_str = "auto";  // dynamic GPU/CPU backend choice
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -134,7 +135,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                           use_l3_mmap_sidecar,
                           auto_profile_on_cold_start,
                           profile_num_walks, profile_walk_length,
-                          num_workers, force);
+                          num_workers, force, sampling_backend_str);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -146,11 +147,11 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - randomSeed (INT): For reproducibility (default: 42)\n"
                 "  - orientation (STRING): NATURAL, REVERSE, or UNDIRECTED\n"
                 "  - usePredefinedSplits (BOOL): Use splits.bin (default: false)\n"
-                "  - useAdjacencyCache (BOOL): Spec #11 cache (default: true)\n"
-                "  - useFourLevelTopologyStore (BOOL): Spec #13 (default: true)\n"
+                "  - useAdjacencyCache (BOOL): in-memory adjacency cache (default: true)\n"
+                "  - useFourLevelTopologyStore (BOOL): frequency-tiered topology store (default: true)\n"
                 "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
                 "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
-                "  - useL3MmapSidecar (BOOL): Spec #4-B sidecar as L3 (default: true)\n"
+                "  - useL3MmapSidecar (BOOL): mmap'd topology CSR sidecar as L3 (default: true)\n"
                 "  - force (BOOL): Drop + re-create an existing sample set (default: false)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
@@ -183,7 +184,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // Step 7: Check if sample already exists
     std::string db_folder = get_db_folder();
 
-    // STEP 7 (2026-05-31): `force` opt — when the sample already exists, drop it
+    // `force` opt (2026-05-31) — when the sample already exists, drop it
     // and re-sample (matches gnn_materialize_batches / gnn_build_feature_store
     // force semantics) instead of hard-failing. The sample dir is self-contained,
     // so remove_all is an atomic-enough drop. Default false preserves the
@@ -224,12 +225,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     }
 
     // =========================================================================
-    // F (2026-05-31) — environment-adaptive defaults. Both respect explicit
-    // user values; they only fill in a better default when the caller was silent.
+    // Environment-adaptive defaults. Both respect explicit user values; they
+    // only fill in a better default when the caller was silent.
     // =========================================================================
-    // F#1: auto-parallelize the sampler when numWorkers was not specified. The
-    // Plan F determinism fix (reseed in the legacy path) makes numWorkers
-    // irrelevant to the trained model, so a parallel default is a free speedup.
+    // Auto-parallelize the sampler when numWorkers was not specified. The
+    // per-batch re-seeding (each batch uses random_seed XOR batch_id) makes
+    // the sampled output deterministic regardless of how many workers pick
+    // up batches, so using multiple workers is a free speedup over sequential.
     // Explicit numWorkers (including 0 = legacy sequential) always wins.
     if (num_workers == std::numeric_limits<uint64_t>::max()) {
         unsigned hc = std::thread::hardware_concurrency();
@@ -239,7 +241,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                      "explicitly to override (0 = legacy sequential).\n";
     }
 
-    // F#2: auto-use predefined splits when the projection has splits.bin and the
+    // Auto-use predefined splits when the projection has splits.bin and the
     // caller did not set usePredefinedSplits. Otherwise a random ratio split
     // silently ignores splits.bin -> validation collapses on labeled-subset
     // datasets (e.g. OGB). Explicit usePredefinedSplits always wins.
@@ -266,6 +268,17 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.test_ratio = test_ratio;
     config.random_seed = random_seed;
     config.orientation = orientation;
+    {
+        std::string sb_lower = sampling_backend_str;
+        std::transform(sb_lower.begin(), sb_lower.end(), sb_lower.begin(), ::tolower);
+        if (sb_lower == "cpu") {
+            config.sampling_backend = SamplingBackendChoice::FORCE_CPU;
+        } else if (sb_lower == "gpu") {
+            config.sampling_backend = SamplingBackendChoice::FORCE_GPU;
+        } else {
+            config.sampling_backend = SamplingBackendChoice::AUTO;  // "auto" or unknown
+        }
+    }
     config.use_predefined_splits = use_predefined_splits;
     config.use_adjacency_cache = use_adjacency_cache;
     config.use_four_level_topology_store = use_four_level_topology_store;
@@ -336,7 +349,11 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("storagePath", ctx.create_string(storage_path.string()));
     ctx.yield("computeMillis", ctx.create_int(compute_millis));
 
-    // Plan E Phase 0 telemetry (2026-05-11).
+    // Cold-start topology profiler telemetry: if node_counts.bin was absent,
+    // a degree-weighted random-walk pass (Vose alias seeds) ran before sampling
+    // to produce access-frequency estimates for Four-Level Topology Store tier
+    // assignment. These yields report whether that profiler was triggered,
+    // whether it succeeded, and the number of walks and neighbor lookups done.
     ctx.yield("phase0Triggered", ctx.create_bool(result.phase0_triggered));
     ctx.yield("phase0Succeeded", ctx.create_bool(result.phase0_succeeded));
     ctx.yield("phase0WalksDone",   ctx.create_int(static_cast<int64_t>(result.phase0_walks_done)));
@@ -344,12 +361,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("phase0Millis",      ctx.create_int(
         static_cast<int64_t>(result.phase0_elapsed_seconds * 1000.0)));
 
-    // Plan F (2026-05-11) — resolved worker count. 1 for legacy single-thread
-    // path (numWorkers=0); matches the parallel pool size otherwise.
+    // Resolved parallel sampler worker count. Reports 1 for the legacy
+    // single-thread path (numWorkers=0); matches the actual pool size otherwise.
     ctx.yield("numWorkersUsed", ctx.create_int(
         static_cast<int64_t>(result.num_workers_used)));
 
-    // STEP 8 content fingerprint, surfaced as a 16-char hex STRING (avoids the
+    // Sample content fingerprint (the staleness/reproducibility check),
+    // surfaced as a 16-char hex STRING (avoids the
     // signed-int64 high-bit wrap a numeric yield would suffer). Order/worker-
     // invariant (sort-then-XOR-fold) — the O(1) semantic-equality gate for
     // parallelism work (numWorkers, single-vs-parallel populate).
@@ -359,6 +377,14 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                       static_cast<unsigned long long>(result.catalog.sample_content_fp));
         ctx.yield("sampleContentFp", ctx.create_string(std::string(fp_hex)));
     }
+
+    // Dynamic sampling-backend decision (Phase 1, INERT). The backend chosen by
+    // the hardware-based planner, the directions it would serve on GPU, and the
+    // reason. GPU_* is reported but the sampling ran on the CPU path (no kernel
+    // yet), so the output is byte-identical.
+    ctx.yield("samplingBackend",    ctx.create_string(result.sampling_backend));
+    ctx.yield("samplingDirections", ctx.create_string(result.sampling_directions));
+    ctx.yield("samplingPlanReason", ctx.create_string(result.sampling_plan_reason));
 
     ctx.yield_row();
 }
@@ -437,7 +463,8 @@ void GnnOfflineSampleProcedure::parse_options(
     uint64_t& profile_num_walks,
     uint64_t& profile_walk_length,
     uint64_t& num_workers,
-    bool& force
+    bool& force,
+    std::string& sampling_backend
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -474,7 +501,8 @@ void GnnOfflineSampleProcedure::parse_options(
     }
 
     // Parse usePredefinedSplits (before ratio validation). The explicitness
-    // flag lets the F#2 splits.bin auto-default defer to the caller's choice.
+    // flag lets the splits.bin auto-default logic above defer to the caller's
+    // choice when the user sets this option explicitly.
     if (auto v = opts.get_bool("usePredefinedSplits")) {
         use_predefined_splits = *v;
         use_predefined_splits_explicit = true;
@@ -501,12 +529,28 @@ void GnnOfflineSampleProcedure::parse_options(
         orientation = *v;
     }
 
-    // Parse useAdjacencyCache (Spec #11)
+    // Parse samplingBackend: 'auto' (default; decide GPU vs CPU by hardware),
+    // 'cpu' (force the CPU out-of-core sampler, bit-reproducible reference), or
+    // 'gpu' (force the GPU path; requires the Four-Level Topology Store).
+    if (auto v = opts.get_string("samplingBackend")) {
+        sampling_backend = *v;
+    }
+
+    // Parse useAdjacencyCache: when true, a single full B+Tree scan over
+    // from_to_edge and to_from_edge is performed at sampler startup and the
+    // results are stored in an in-memory unordered_map<src, vector<AdjEntry>>,
+    // turning each subsequent get_neighbors() call from O(log N) B+Tree lookup
+    // into an O(1) hash lookup.
     if (auto v = opts.get_bool("useAdjacencyCache")) {
         use_adjacency_cache = *v;
     }
 
-    // Spec #13 — Four-Level Topology Store opt-ins.
+    // Four-Level Topology Store opt-ins. When enabled, the sampler assigns
+    // nodes to four tiers based on access frequency: L1 (RAM hash for the
+    // hottest hubs), L2 (compact uint32 CSR for warm nodes), L3 (mmap-backed
+    // CSR sidecar files topology_{fwd,rev}.csr for the cold tail), and L4
+    // (direct B+Tree fallback). l1CacheMb and l2CacheMb set the RAM budget
+    // for each tier (0 = auto-detect from /proc/meminfo).
     if (auto v = opts.get_bool("useFourLevelTopologyStore")) {
         use_four_level_topology_store = *v;
     }
@@ -528,7 +572,12 @@ void GnnOfflineSampleProcedure::parse_options(
         use_l3_mmap_sidecar = *v;
     }
 
-    // Plan E (2026-05-11) — Phase 0 auto-profile opt-out + tuning.
+    // Cold-start topology profiler opt-out and tuning. When node_counts.bin
+    // is absent, the sampler can run a lightweight degree-weighted random-walk
+    // pass (using a Vose alias table for seed selection) to estimate per-node
+    // access frequencies before building the Four-Level Topology Store tier
+    // assignments. autoProfileOnColdStart=false disables this pass entirely.
+    // profileNumWalks and profileWalkLength tune the walk count and step depth.
     if (auto v = opts.get_bool("autoProfileOnColdStart")) {
         auto_profile_on_cold_start = *v;
     }
@@ -547,7 +596,11 @@ void GnnOfflineSampleProcedure::parse_options(
         profile_walk_length = static_cast<uint64_t>(*v);
     }
 
-    // Plan F (2026-05-11) — parallel sampling worker count.
+    // Parallel sampling worker count. Workers pull batches from a shared
+    // atomic counter; each worker owns a private RNG + sampler state and
+    // re-seeds deterministically per batch (random_seed XOR batch_id) so
+    // output is reproducible regardless of which thread processes which batch.
+    // 0 selects the legacy single-thread path; >= 1 activates the worker pool.
     if (auto v = opts.get_int("numWorkers")) {
         if (*v < 0) {
             throw std::runtime_error(

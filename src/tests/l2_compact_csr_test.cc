@@ -1,6 +1,11 @@
 // l2_compact_csr_test.cc
 //
-// Spec #13 Phase 2 — L2CompactCsr unit tests.
+// L2CompactCsr unit tests — the compact uint32 CSR that holds the warm-tier
+// neighbors in the Four-Level Topology Store (L1 RAM hash / L2 compact uint32
+// CSR / L3 mmap sidecar / L4 direct B+Tree).  L2 is built from a single
+// full-scan of the from_to_edge or to_from_edge B+Tree, storing each src's
+// neighbor list as a contiguous uint32 array (stripping the 8-bit ObjectId
+// type tag from every dst and re-applying it uniformly on read).
 //
 // Coverage:
 //   1. BuildAndLookup_RoundTrip — 100 nodes with varying degrees; freeze;

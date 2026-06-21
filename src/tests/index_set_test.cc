@@ -1,7 +1,8 @@
 // src/tests/index_set_test.cc
 //
-// Unit tests for the IndexSet enum and preset mask helper introduced by
-// Spec #3 T3.3. Validates the preset-to-ProjectionIndex bitmask mapping,
+// Unit tests for the IndexSet enum and preset mask helper that controls which
+// B+Tree indexes are materialized for a projection (ALL, GNN_MINIMAL,
+// READONLY_TRAVERSAL). Validates the preset-to-ProjectionIndex bitmask mapping,
 // string parsing (including rejection of invalid / lowercase input), and
 // canonical name conversion.
 

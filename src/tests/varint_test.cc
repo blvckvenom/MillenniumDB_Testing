@@ -1,9 +1,11 @@
-// Unit tests for the LEB128 varint codec used by the v2 leaf format
-// (Spec #5 — Delta+Varint Leaf Encoding, task T5.4).
+// Unit tests for the LEB128 varint codec used by the delta+LEB128-varint
+// B+Tree leaf encoding (the v2 leaf format that compresses sorted B+Tree
+// records by storing record 0 as full LEB128 varints and records 1..k-1 as
+// zigzag-delta LEB128 varints relative to the previous record).
 //
 // The codec lives in src/storage/index/bplus_tree/varint.{h,cc}. These tests
-// pin the canonical-encoding contract that subsequent v2 reader/writer code
-// (T5.7, T5.8) and the disk-format determinism test (T5.14) rely on.
+// pin the canonical-encoding contract that the v2 leaf reader, v2 leaf writer,
+// and the disk-format determinism tests rely on.
 
 #include "storage/index/bplus_tree/varint.h"
 
@@ -271,7 +273,7 @@ TEST(Varint, Exception_ContainsOffset) {
     }
 }
 
-// ----- Zigzag encoder/decoder tests (T5.5) ---------------------------------
+// ----- Zigzag encoder/decoder tests ----------------------------------------
 //
 // Zigzag folds the sign bit into the LSB of a uint64, so that small-magnitude
 // signed integers (positive or negative) encode to small uint64 values. When

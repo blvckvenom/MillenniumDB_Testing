@@ -1,16 +1,17 @@
-// Unit tests for RadixPartitionSort<N> (TDD RED state).
+// Unit tests for RadixPartitionSort<N>.
 //
-// These tests intentionally fail to compile/link at the current commit:
+// These tests intentionally fail to compile/link when the implementation
+// files are absent:
 //
-//   - The `partition_file.h` include is unresolved (created in Task 5).
-//   - The `RadixPartitionSort<N>` template has no backing .cc yet
-//     (implementations are added in Tasks 6-11).
+//   - The `partition_file.h` include is unresolved until the header is created.
+//   - The `RadixPartitionSort<N>` template has no backing .cc until the
+//     implementation is added.
 //
 // That unresolved state is the expected TDD RED confirmation. The main
 // `mdb` target must still build because this header is only included
 // here and by the implementation file once it is added.
 //
-// Spec reference:
+// Design reference:
 //   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2
 
 #include <sys/resource.h>
@@ -144,14 +145,15 @@ TEST(RadixPartitionSort, Phase2EachPartitionIsSorted) {
     fs::remove("/tmp/test_output3.dir");
 }
 
-// --- Test 4: Concatenation is globally sorted (SUPERSEDED by Task 13) ---
+// --- Test 4: Concatenation is globally sorted (SUPERSEDED by golden comparison) ---
 //
-// This test was written during TDD RED (Task 4) when the Phase 3 output
-// format was not yet designed. At that time the plan assumed `sort_and_write`
-// would leave `.sorted_part_N.bin` files as its final output, and the test
-// asserted that concatenating them produced a globally-sorted stream.
+// This test was written during the initial TDD RED phase when the Phase 3
+// output format was not yet designed. At that time the plan assumed
+// `sort_and_write` would leave `.sorted_part_N.bin` files as its final
+// output, and the test asserted that concatenating them produced a
+// globally-sorted stream.
 //
-// The real Phase 3 (Task 10, commit 3669282b) writes the records into
+// The real Phase 3 (commit 3669282b) writes the records into
 // BPTLeafWriter / BPTDirWriter (`.leaf` / `.dir` B+Tree pages) and REMOVES
 // the intermediate `.sorted_part_*.bin` files as post-phase cleanup — they
 // are scratch artifacts, not API output. So the original assertion cannot
@@ -162,7 +164,7 @@ TEST(RadixPartitionSort, Phase2EachPartitionIsSorted) {
 // radix concatenation") is preserved — it is validated end-to-end by
 // scripts/test_projection_radix.sh on cora_gnn, which performs a
 // byte-identical `cmp` of the B+Tree `.leaf`/`.dir` files produced by
-// RADIX against the CLASSIC backend. See Task 13 in the plan.
+// the RADIX backend against the CLASSIC backend.
 //
 // Disabled via gtest convention to keep the test visible in reports
 // without counting as a failure.
@@ -325,7 +327,7 @@ static std::vector<uint8_t> read_first_16_bytes(const std::string& path) {
     return out;
 }
 
-// --- T5.11b Test: BITSET backend produces byte 0 != 0x02 ---
+// --- BITSET backend produces byte 0 != 0x02 ---
 TEST(RadixPartitionSort, BitsetBackend_ByteZeroNotTwo) {
     wipe_scratch();
     GQL::RadixPartitionSort<3>::Config cfg;
@@ -354,7 +356,7 @@ TEST(RadixPartitionSort, BitsetBackend_ByteZeroNotTwo) {
     fs::remove(out_base + ".dir");
 }
 
-// --- T5.11b Test: DELTA_VARINT backend produces byte 0 == 0x02 ---
+// --- DELTA_VARINT backend produces byte 0 == 0x02 ---
 TEST(RadixPartitionSort, DeltaVarintBackend_ByteZeroIsTwo) {
     wipe_scratch();
     GQL::RadixPartitionSort<3>::Config cfg;
@@ -383,16 +385,16 @@ TEST(RadixPartitionSort, DeltaVarintBackend_ByteZeroIsTwo) {
 }
 
 // ---------------------------------------------------------------------------
-// Spec #24 — GPU vs CPU bit-equal output (RADIX Phase 2 per-partition sort)
+// GPU vs CPU bit-equal output (RADIX Phase 2 per-partition sort)
 // ---------------------------------------------------------------------------
 // Two fixed-seed runs of the same dataset MUST produce byte-identical
 // `.sorted_part_*.bin` outputs regardless of whether the GPU code path
 // engaged or not. The GPU path is gated by MDB_PROJECTION_RADIX_GPU; the
-// MDB_PROJECTION_RADIX_GPU_MIN_RECORDS knob (introduced by Spec #24) lets
-// us reach the GPU planner on small test datasets without lowering it
-// globally. When the build lacks CUDA the GPU run is identical to the CPU
-// run by construction (the #ifdef block in sort_partition_in_memory is
-// elided). Either way the byte-identical assertion below must hold.
+// MDB_PROJECTION_RADIX_GPU_MIN_RECORDS knob lets us reach the GPU planner
+// on small test datasets without lowering it globally. When the build lacks
+// CUDA the GPU run is identical to the CPU run by construction (the #ifdef
+// block in sort_partition_in_memory is elided). Either way the byte-identical
+// assertion below must hold.
 //
 // IMPORTANT: the underlying `mdb::gpu::execute_gpu_radix_sort` extracts the
 // lower 32 bits of each ObjectId value (mask 0x00FFFFFFFFFFFFFFULL then
@@ -591,7 +593,7 @@ TEST(RadixPartitionSortGpu, DeterministicRepeatedRuns) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 4.2 — per-partition GPU/CPU sort telemetry
+// Per-partition GPU/CPU sort telemetry
 // ---------------------------------------------------------------------------
 // gpu_partitions_sorted() + cpu_partitions_sorted() must equal the number of
 // NON-EMPTY partitions Phase 2 sorted. The split between gpu/cpu depends on
@@ -713,7 +715,7 @@ TEST(RadixPartitionSortTelemetry, RadixGpuDisabledGivesZeroGpu) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 5.1 — GPU-submission concurrency semaphore bound
+// GPU-submission concurrency semaphore bound
 // ---------------------------------------------------------------------------
 // At most kGpuConcurrency Phase 2 workers may be inside the GPU-submission
 // region at once (env MDB_PROJECTION_RADIX_GPU_CONCURRENCY, default 1). The
@@ -807,7 +809,7 @@ TEST(RadixPartitionSortGpuConcurrency, PeakInFlightBoundedByTwo) {
     }
 }
 
-// --- T5.11b Test: empty index under DELTA_VARINT emits a single v2 page ---
+// --- Empty index under DELTA_VARINT emits a single v2 page ---
 TEST(RadixPartitionSort, DeltaVarintEmpty_EmitsSingleV2Page) {
     wipe_scratch();
     GQL::RadixPartitionSort<3>::Config cfg;
@@ -832,7 +834,7 @@ TEST(RadixPartitionSort, DeltaVarintEmpty_EmitsSingleV2Page) {
 }
 
 // ---------------------------------------------------------------------------
-// Spec #25 — Phase 1 parallel partition fill bit-equal vs sequential.
+// Phase 1 parallel partition fill bit-equal vs sequential.
 // ---------------------------------------------------------------------------
 // Two runs of `scan_and_partition` + `sort_and_write` with identical inputs
 // MUST produce byte-identical `.leaf` outputs regardless of whether the

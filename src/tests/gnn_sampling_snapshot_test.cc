@@ -1,10 +1,11 @@
 // gnn_sampling_snapshot_test.cc
 //
-// Spec #4-B T4.11 integration tests — multi-layer k-hop sampling determinism
-// across the CSR fast-path and the B+Tree fallback.
+// Integration tests for multi-layer k-hop sampling determinism across the
+// topology CSR sidecar fast-path (mmap-backed topology_{fwd,rev}.csr files
+// that provide O(1) neighbor slices) and the B+Tree fallback path.
 //
-// Complements T4.7's single-layer `DeterministicSampleMatchesBpt` test
-// (topology_accessor_csr_path_test.cc). Where T4.7 locked down one call to
+// Complements the single-layer `DeterministicSampleMatchesBpt` test in
+// topology_accessor_csr_path_test.cc. Where that test locked down one call to
 // `sample_neighbors`, this file exercises `sample_khop_neighbors` across
 // realistic GraphSAGE fanout shapes and orientations so downstream training
 // reproducibility is guarded end-to-end.
@@ -148,7 +149,8 @@ struct FixtureGraph {
 };
 
 // Build a projection, populate with FixtureGraph, flush, and optionally
-// produce CSR sidecars via the test-only hook shared by T4.6.
+// produce CSR sidecars (topology_fwd.csr / topology_rev.csr) via the
+// test-only hook used by the topology snapshot builder integration tests.
 //
 // Returns (storage, projection_dir). Caller owns storage.
 std::pair<std::unique_ptr<GQL::ProjectionStorage>, std::string>

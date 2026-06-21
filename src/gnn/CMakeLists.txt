@@ -90,17 +90,22 @@ add_library(mdb_gnn_core STATIC
     projection/topology_accessor.cc
     projection/gnn_projection_adapter.cc
 
-    # Spec #13 Phase 1: Frequency profiler for Four-Level Topology Store
+    # Access-frequency profiler for the frequency-tiered topology store
     projection/topology_frequency_profiler.cc
 
-    # Plan E Phase 0 (2026-05-11): random-walk profiler to bootstrap
-    # node_counts.bin on first run (resolves cold-start L3 thrashing).
+    # Random-walk profiler (2026-05-11): bootstraps node_counts.bin on the
+    # first run so the cold-start L3 mmap tier does not thrash the page cache.
     projection/topology_walk_profiler.cc
 
-    # Spec #13 Phase 2: L1/L2 caches + dispatcher (T13.4 / T13.5 / T13.6)
+    # Frequency-tiered topology cache: L1 RAM hash + L2 compact CSR caches
+    # and the runtime tier dispatcher
     projection/l1_hash_cache.cc
     projection/l2_compact_csr.cc
     projection/four_level_topology_store.cc
+
+    # Dynamic GPU-UVA sampling: pin the global topology CSR as a device-visible
+    # substrate (cudaHostRegister). No-op without CUDA / without a GPU.
+    projection/pinned_topology_view.cc
 
     # Phase 2: Offline Sampling Engine
     sampling/graph_sample.cc
@@ -113,6 +118,7 @@ add_library(mdb_gnn_core STATIC
     sampling/offline_sampling_engine.cc
     sampling/node_counts_io.cc
     sampling/minhash_reorderer.cc
+    sampling/sampling_backend_plan.cc
 
     # Phase 7: Leapfrog Triejoin Optimization
     sampling/leapfrog_gnn_sampler.cc
@@ -141,7 +147,8 @@ add_library(mdb_gnn_core STATIC
     # Phase 3: Four-Level Feature Store build procedure (L1-L4)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_feature_store_procedure.cc
 
-    # Spec #4-B T4.9: Post-hoc topology snapshot build procedure
+    # Post-hoc CSR topology-snapshot build procedure (for projections built
+    # without the snapshot, builds the mmap'd neighbor-lookup sidecar)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.cc
 
     # Phase 4: GNN Training procedure (GraphSAGE training orchestration)
@@ -173,10 +180,11 @@ add_library(mdb_gnn_core STATIC
     # Phase 4: GNN Models
     models/graphsage_model.cc
 
-    # Task 9: Training Loop
+    # Training Loop
     training/training_loop.cc
 
-    # Spec C3 stage 1: Async batch prefetcher
+    # Async batch prefetcher (overlaps assemble+transfer of the next batch
+    # with forward/backward of the current one)
     training/async_batch_prefetcher.cc
 
     # Phase 6: Output / Embedding Writer
@@ -256,9 +264,11 @@ if(GNN_CUDA_ENABLED AND CUDAToolkit_FOUND)
     enable_language(CUDA)
     target_sources(mdb_gnn_core PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/core/feature_assembler.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/sampling/gpu_khop_sampler.cu
     )
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/core/feature_assembler.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/sampling/gpu_khop_sampler.cu
         PROPERTIES LANGUAGE CUDA
     )
     target_compile_options(mdb_gnn_core PRIVATE
@@ -287,7 +297,7 @@ if(BUILD_TESTING)
         # tests yet — sparse_ops (scatter_sum) is covered indirectly via
         # test_graphsage_model and the E2E gates.
 
-        # GNN Storage tests (Step 0: FeatureMatrix + RowMapping)
+        # GNN Storage tests (FeatureMatrix + RowMapping)
         # Multiple .cc files → one executable, filtered via --gtest_filter
         add_executable(test_gnn_storage
             tests/test_feature_matrix.cc
@@ -302,7 +312,7 @@ if(BUILD_TESTING)
         )
         add_test(NAME GnnStorageTests COMMAND test_gnn_storage)
 
-        # PackedBatchStore tests (Step 1: L4 per-batch packed features)
+        # PackedBatchStore tests (L4 per-batch packed features)
         add_executable(test_packed_batch_store
             tests/test_packed_batch_store.cc
         )
@@ -313,7 +323,7 @@ if(BUILD_TESTING)
         )
         add_test(NAME PackedBatchStoreTests COMMAND test_packed_batch_store)
 
-        # MinHash Reorderer tests (Step 2: L3 disk cache reordering)
+        # MinHash Reorderer tests (L3 disk cache reordering)
         add_executable(test_minhash_reorderer
             tests/test_minhash_reorderer.cc
         )
@@ -363,7 +373,7 @@ if(BUILD_TESTING)
         )
         add_test(NAME PackedFullStoreTests COMMAND test_packed_full_store)
 
-        # Sample content fingerprint tests (STEP 8 — staleness, isolable)
+        # Sample content fingerprint tests (staleness check, isolable)
         add_executable(test_sample_fingerprint
             tests/test_sample_fingerprint.cc
         )
@@ -491,34 +501,34 @@ if(BUILD_TESTING)
         target_link_libraries(test_batch_timing_log PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME BatchTimingLogTests COMMAND test_batch_timing_log)
 
-        # AddrTable format header tests (Path 4 Task 1: on-disk format + header invariants)
+        # AddrTable format header tests (on-disk format + header invariants)
         add_executable(test_addr_table_format tests/test_addr_table_format.cc)
         target_link_libraries(test_addr_table_format PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME AddrTableFormatTests COMMAND test_addr_table_format)
 
-        # AddrTable writer tests (Path 4 Task 2: classify + serialize per-batch sidecar)
+        # AddrTable writer tests (classify + serialize per-batch sidecar)
         add_executable(test_addr_table_writer tests/test_addr_table_writer.cc)
         target_link_libraries(test_addr_table_writer PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME AddrTableWriterTests COMMAND test_addr_table_writer)
 
-        # ConsolidatedSlim format tests (DiskGNN-adoption Plan 1 Phase 0.1:
-        # on-disk header for the consolidated cold-feature file)
+        # ConsolidatedSlim format tests (on-disk header for the consolidated
+        # cold-feature file)
         add_executable(test_consolidated_slim_format tests/test_consolidated_slim_format.cc)
         target_link_libraries(test_consolidated_slim_format PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME ConsolidatedSlimFormatTests COMMAND test_consolidated_slim_format)
 
-        # ConsolidatedSlim reader tests (DiskGNN-adoption Plan 1 Phase 2:
-        # header validation + O_DIRECT-capable pread_exact)
+        # ConsolidatedSlim reader tests (header validation + O_DIRECT-capable
+        # pread_exact)
         add_executable(test_consolidated_slim_reader tests/test_consolidated_slim_reader.cc)
         target_link_libraries(test_consolidated_slim_reader PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME ConsolidatedSlimReaderTests COMMAND test_consolidated_slim_reader)
 
-        # AddrTable reader tests (Path 4 Task 3: open + validate + parse 9 arrays)
+        # AddrTable reader tests (open + validate + parse 9 arrays)
         add_executable(test_addr_table_reader tests/test_addr_table_reader.cc)
         target_link_libraries(test_addr_table_reader PRIVATE mdb_gnn_core gtest gtest_main)
         add_test(NAME AddrTableReaderTests COMMAND test_addr_table_reader)
 
-        # SplitStore tests (Task 3: split assignments for training)
+        # SplitStore tests (split assignments for training)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_split_store.cc")
             add_executable(test_split_store tests/test_split_store.cc)
             target_link_libraries(test_split_store mdb_gnn_core GTest::gtest_main)
@@ -529,7 +539,7 @@ if(BUILD_TESTING)
             add_test(NAME SplitStoreTests COMMAND test_split_store)
         endif()
 
-        # BatchAssembler tests (Task 6: assemble MiniBatch from features+topology+labels)
+        # BatchAssembler tests (assemble MiniBatch from features+topology+labels)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_batch_assembler.cc")
             add_executable(test_batch_assembler tests/test_batch_assembler.cc)
             # Link gtest_main FIRST so its main() takes precedence over serdi's main()
@@ -568,7 +578,7 @@ if(BUILD_TESTING)
             endif()
         endif()
 
-        # NpyWriter tests (Task 8: export tensors as .npy files)
+        # NpyWriter tests (export tensors as .npy files)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_npy_writer.cc")
             add_executable(test_npy_writer tests/test_npy_writer.cc)
             target_link_libraries(test_npy_writer mdb_gnn_core GTest::gtest_main)
@@ -579,7 +589,7 @@ if(BUILD_TESTING)
             add_test(NAME NpyWriterTests COMMAND test_npy_writer)
         endif()
 
-        # TrainingLoop tests (Task 9: epoch iteration, early stopping, validation)
+        # TrainingLoop tests (epoch iteration, early stopping, validation)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_training_loop.cc")
             add_executable(test_training_loop tests/test_training_loop.cc)
             target_link_libraries(test_training_loop
@@ -601,7 +611,7 @@ if(BUILD_TESTING)
             endif()
         endif()
 
-        # Spec C3 stage 3: CUDA streams (Module 1) tests
+        # CUDA streams tests (separate streams for assemble vs forward/backward)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stage3_streams.cc")
             add_executable(test_stage3_streams tests/test_stage3_streams.cc)
             target_link_libraries(test_stage3_streams
@@ -623,7 +633,7 @@ if(BUILD_TESTING)
             endif()
         endif()
 
-        # Spec C3 stage 1: AsyncBatchPrefetcher tests
+        # AsyncBatchPrefetcher tests (batch prefetch / pipeline overlap)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_async_batch_prefetcher.cc")
             add_executable(test_async_batch_prefetcher tests/test_async_batch_prefetcher.cc)
             target_link_libraries(test_async_batch_prefetcher
@@ -665,7 +675,7 @@ if(BUILD_TESTING)
         )
         add_test(NAME PageCacheHintTests COMMAND page_cache_hint_test)
 
-        # TrainingLoop resume / callback tests (Phase 6 Sub-2 Task 4.3)
+        # TrainingLoop resume / callback tests (checkpoint resume)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_training_loop_resume.cc")
             add_executable(test_training_loop_resume tests/test_training_loop_resume.cc)
             target_link_libraries(test_training_loop_resume
@@ -687,7 +697,7 @@ if(BUILD_TESTING)
             endif()
         endif()
 
-        # GnnMeta tests (Task 1: metadata reader/writer)
+        # GnnMeta tests (metadata reader/writer)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gnn_meta.cc")
             add_executable(test_gnn_meta tests/test_gnn_meta.cc)
             target_link_libraries(test_gnn_meta mdb_gnn_core GTest::gtest_main)
@@ -698,7 +708,7 @@ if(BUILD_TESTING)
             add_test(NAME GnnMetaTests COMMAND test_gnn_meta)
         endif()
 
-        # GraphSAGE MEAN model tests (Task 7)
+        # GraphSAGE MEAN model tests
         add_executable(test_graphsage_model tests/test_graphsage_model.cc)
         target_link_libraries(test_graphsage_model mdb_gnn_core GTest::gtest_main)
         set_target_properties(test_graphsage_model PROPERTIES
@@ -716,7 +726,7 @@ if(BUILD_TESTING)
         )
         add_test(NAME ActiveSetEquivalenceTests COMMAND test_active_set_equivalence)
 
-        # EmbeddingWriter tests (Task 8: Phase A/B logic in isolation)
+        # EmbeddingWriter tests (seed write-back / non-seed inference logic in isolation)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_embedding_writer.cc")
             add_executable(test_embedding_writer tests/test_embedding_writer.cc)
             # Link gtest_main FIRST so its main() takes precedence over serdi's main()
@@ -740,7 +750,7 @@ if(BUILD_TESTING)
             endif()
         endif()
 
-        # Model Checkpoint tests (Phase 6 Sub-2: save/load/list/exists/delete)
+        # Model Checkpoint tests (save/load/list/exists/delete)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_checkpoint.cc")
             add_executable(test_model_checkpoint
                 tests/test_model_checkpoint.cc
@@ -765,7 +775,7 @@ if(BUILD_TESTING)
             endif()
         endif()
 
-        # AutoCheckpointer tests (Phase 6 Sub-2)
+        # AutoCheckpointer tests (auto best-val / final checkpoint policy)
         add_executable(test_auto_checkpointer tests/test_auto_checkpointer.cc)
         target_link_libraries(test_auto_checkpointer
             GTest::gtest_main

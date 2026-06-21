@@ -1,5 +1,7 @@
 // Unit tests for ProjectionCatalog v1.5 — per-index leaf_format byte array
-// (Spec #5 T5.10). Validates:
+// (catalog extension that persists the delta + LEB128-varint leaf encoding
+// choice per B+Tree index, introduced alongside the DELTA_VARINT leaf format).
+// Validates:
 //
 //   1. CatalogV5_Roundtrip_AllBitset          — all entries = 1
 //   2. CatalogV5_Roundtrip_AllDeltaVarint     — all entries = 2
@@ -15,8 +17,8 @@
 // the v1.5 save_to_file code path (projection_catalog.cc) and documented
 // inline at each modification site.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-// Plan reference: docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md §T5.10
+// Design reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
+// Plan reference:   docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md
 
 #include "graph_models/gql/projection/projection_catalog.h"
 

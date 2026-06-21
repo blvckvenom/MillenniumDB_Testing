@@ -1,12 +1,12 @@
 // topology_accessor_four_level_integration_test.cc
 //
-// Spec #13 Phase 3 (T13.8) integration tests — verifies that
-// `TopologyAccessor::enable_four_level_store()` builds a real
-// FourLevelTopologyStore from a live ProjectionStorage's B+Tree edge
-// indexes and that all subsequent `get_*_neighbors` calls dispatch
-// through it.
+// Integration tests for `TopologyAccessor::enable_four_level_store()`.
+// Verifies that building the Four-Level Topology Store (L1 RAM hash /
+// L2 compact uint32 CSR / L3 mmap sidecar / L4 direct B+Tree) from a
+// live ProjectionStorage's B+Tree edge indexes works correctly, and
+// that all subsequent `get_*_neighbors` calls dispatch through it.
 //
-// Coverage (3 tests as specified in the Phase 3 plan):
+// Coverage (3 tests):
 //
 //   1. EnableDisable_Roundtrip
 //      Build the four-level store, look up neighbours for every
@@ -15,10 +15,10 @@
 //
 //   2. BackwardsCompat_DefaultPath
 //      Without enabling the four-level store, the existing dispatch
-//      chain (Spec #11 cache → Spec #4-B sidecar → BPT direct)
-//      preserves byte-identical behaviour. Sub-cases:
+//      chain (in-memory adjacency cache → topology CSR sidecar →
+//      direct B+Tree) preserves byte-identical behaviour. Sub-cases:
 //          (a) cache disabled
-//          (b) cache enabled + prebuilt
+//          (b) in-memory adjacency cache enabled + prebuilt
 //      Both must match the BPT-oracle accessor.
 //
 //   3. Conflict_AdjCacheFalseAndFourLevelTrue_Throws
@@ -227,8 +227,9 @@ TEST(TopologyAccessorFourLevel, EnableDisable_Roundtrip) {
 // Test 2 — BackwardsCompat_DefaultPath.
 //
 // Without enabling the four-level store, both (a) the cache-disabled path
-// and (b) the Spec #11 cache-enabled path return the same data they
-// returned pre-Spec-#13. Compared by-value to a pristine BPT accessor.
+// and (b) the in-memory adjacency cache path return the same data they
+// returned before the Four-Level Topology Store was introduced.
+// Compared by-value to a pristine BPT accessor.
 // ---------------------------------------------------------------------------
 TEST(TopologyAccessorFourLevel, BackwardsCompat_DefaultPath) {
     (void)MdbFixture::instance();
@@ -236,7 +237,7 @@ TEST(TopologyAccessorFourLevel, BackwardsCompat_DefaultPath) {
 
     mdb::gnn::TopologyAccessor acc_oracle(*storage);
 
-    // Sub-case (a): cache disabled. Default state pre-Spec-#13.
+    // Sub-case (a): cache disabled. Default BPT-direct path.
     {
         mdb::gnn::TopologyAccessor acc(*storage);
         EXPECT_FALSE(acc.is_four_level_store_enabled());
@@ -252,8 +253,9 @@ TEST(TopologyAccessorFourLevel, BackwardsCompat_DefaultPath) {
         }
     }
 
-    // Sub-case (b): Spec #11 cache enabled + prebuilt. Existing pre-
-    // Spec-#13 path; the four-level store must NOT have hijacked it.
+    // Sub-case (b): in-memory adjacency cache (one full B+Tree scan into
+    // unordered_map<src, vector<AdjEntry>>) enabled + prebuilt. The
+    // four-level store must NOT have hijacked this existing path.
     {
         mdb::gnn::TopologyAccessor acc(*storage);
         acc.enable_adjacency_cache(true);
@@ -275,11 +277,13 @@ TEST(TopologyAccessorFourLevel, BackwardsCompat_DefaultPath) {
 // ---------------------------------------------------------------------------
 // Test 3 — Conflict_AdjCacheFalseAndFourLevelTrue_Throws.
 //
-// SamplingConfig::validate() should reject the invalid combination per
-// design §2.8 / D8. Both flags being false is OK (sidecar/BPT-direct
-// path); both true is OK (Spec #13 supersedes Spec #11 transparently);
-// only `useFourLevelTopologyStore=true && useAdjacencyCache=false` is
-// rejected.
+// SamplingConfig::validate() should reject the invalid combination where
+// `useFourLevelTopologyStore=true` but `useAdjacencyCache=false`.
+// Both flags being false is OK (falls back to topology CSR sidecar or
+// direct B+Tree); both true is OK (Four-Level Topology Store is built on
+// top of the adjacency cache infrastructure and supersedes it); only the
+// asymmetric `useFourLevelTopologyStore=true && useAdjacencyCache=false`
+// combination is rejected.
 // ---------------------------------------------------------------------------
 TEST(TopologyAccessorFourLevel, Conflict_AdjCacheFalseAndFourLevelTrue_Throws) {
     auto make_base_config = []() {
@@ -291,28 +295,31 @@ TEST(TopologyAccessorFourLevel, Conflict_AdjCacheFalseAndFourLevelTrue_Throws) {
     };
 
     {
-        // OK: both false (legacy fallback to sidecar/BPT direct).
+        // OK: both false (legacy fallback to topology CSR sidecar or direct B+Tree).
         auto cfg = make_base_config();
         cfg.use_four_level_topology_store = false;
         cfg.use_adjacency_cache           = false;
         EXPECT_NO_THROW(cfg.validate());
     }
     {
-        // OK: both true (Spec #13 supersedes Spec #11).
+        // OK: both true (Four-Level Topology Store uses and supersedes the
+        // in-memory adjacency cache path).
         auto cfg = make_base_config();
         cfg.use_four_level_topology_store = true;
         cfg.use_adjacency_cache           = true;
         EXPECT_NO_THROW(cfg.validate());
     }
     {
-        // OK: legacy Spec #11 only.
+        // OK: in-memory adjacency cache only (one full B+Tree scan, O(1)
+        // hash lookup thereafter), without the frequency-tiered four-level store.
         auto cfg = make_base_config();
         cfg.use_four_level_topology_store = false;
         cfg.use_adjacency_cache           = true;
         EXPECT_NO_THROW(cfg.validate());
     }
     {
-        // ERROR: D8 violation.
+        // ERROR: Four-Level Topology Store requires the adjacency cache
+        // infrastructure to be active; this combination is invalid.
         auto cfg = make_base_config();
         cfg.use_four_level_topology_store = true;
         cfg.use_adjacency_cache           = false;
@@ -321,10 +328,11 @@ TEST(TopologyAccessorFourLevel, Conflict_AdjCacheFalseAndFourLevelTrue_Throws) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 (T13.10) — Build_UsesSidecarWhenAvailable.
+// Build_UsesSidecarWhenAvailable.
 //
 // When `use_l3_mmap_sidecar:true` is set on a projection that already has
-// `topology_*.csr` sidecar files, `populate_direction_` takes the fast
+// `topology_*.csr` sidecar files (the mmap-backed CSR sidecar that gives
+// O(1) neighbor slices), `populate_direction_` takes the fast
 // path (sidecar walk) instead of the BPT walk. Streaming determinism + L1
 // node counts must remain bit-identical to the BPT path, so this test:
 //
@@ -445,13 +453,13 @@ TEST(TopologyAccessorFourLevel, Build_UsesSidecarWhenAvailable) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4 (T13.11) — Build_ColdStartSkipsMinHashReorder.
+// Build_ColdStartSkipsMinHashReorder.
 //
 // Confirms the cold-start branch of `compute_l3_minhash_reorder_` leaves
-// the permutation empty when `node_counts.bin` is absent. Today every
-// build is a cold start (the file is never persisted), so this test
-// pins the invariant against future regressions in the warm-start
-// activation logic.
+// the permutation empty when `node_counts.bin` is absent. When no prior
+// per-node access-count file exists the MinHash reorder cannot be computed,
+// so this test pins the invariant against future regressions in the
+// warm-start activation logic.
 // ---------------------------------------------------------------------------
 TEST(TopologyAccessorFourLevel, Build_ColdStartSkipsMinHashReorder) {
     (void)MdbFixture::instance();

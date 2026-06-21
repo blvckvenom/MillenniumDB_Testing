@@ -1,6 +1,10 @@
 // l1_hash_cache_test.cc
 //
-// Spec #13 Phase 2 — L1HashCache unit tests.
+// Four-Level Topology Store — L1HashCache unit tests.
+// L1HashCache is the hottest tier of the Four-Level Topology Store
+// (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar / L4 direct B+Tree).
+// It holds the highest-frequency hub nodes in a plain unordered_map so that
+// get_out_neighbors() on those nodes is an O(1) hash lookup (~10-20 ns).
 //
 // Coverage:
 //   1. EmptyCache_GetMissReturnsEmpty — fresh cache reports miss as empty span.

@@ -1,7 +1,9 @@
-// Spec #8 T8.9 — integration tests for the CSR_HYBRID graph-storage mode.
+// Integration tests for the CSR_HYBRID graph-storage mode (edge-index B+Tree
+// leaves that embed the CSR layout directly, allowing O(1) neighbor access
+// without a separate sidecar file).
 //
-// These tests exercise the end-to-end plumbing added by T8.9 at the unit
-// level where it is reachable without booting a live mdb server:
+// These tests exercise the end-to-end plumbing at the unit level where it is
+// reachable without booting a live mdb server:
 //
 //   - `BPTLeafCSRWriter` emits v3 leaf pages with byte 0 == 0x03.
 //   - `BPTDirWriter` emits a trivial root dir (one zero-initialized page).
@@ -22,8 +24,8 @@
 // the gql integration suite run via scripts/run-tests gql; those tests
 // spin a full mdb server which is out of scope for the gtest unit target.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.6-§3.10
-// Plan reference: docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md §T8.9
+// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.6-§3.10
+// Implementation reference: docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md
 
 #include <array>
 #include <cstdint>
@@ -63,10 +65,10 @@ uint8_t read_leaf_byte0(const fs::path& leaf_path) {
 }
 
 // Write a minimal Record<3> CSR-formatted leaf + dir pair to `base_path`.
-// Mirrors the T8.9 CSR path in sorter_dispatch.cc (CLASSIC branch) and
-// radix_partition_sort.cc (Phase 3). The absence of explicit dir entries
-// is intentional — the CSR_HYBRID MVP walks the leaf chain via next_leaf
-// from the root.
+// Mirrors the CSR_HYBRID branch in sorter_dispatch.cc (CLASSIC path) and
+// radix_partition_sort.cc (Phase 3 concatenation). The absence of explicit
+// dir entries is intentional — the CSR_HYBRID reader walks the leaf chain
+// via next_leaf from the root.
 void write_csr_index_3(const std::string& base_path,
                        const std::vector<std::array<uint64_t, 3>>& records) {
     BPTLeafCSRWriter<3> leaf_writer(base_path + ".leaf");
@@ -118,24 +120,25 @@ TEST(CSRHybridIntegration, EdgeIndexLeafBytesHaveV3Magic) {
 // their leaf files, regardless of byte 0 content (BITSET byte 0 is the
 // compression mask, which may coincidentally land on 0x03 for certain
 // record sets), are opened by the BPlusTree<1> ctor with LeafFormat::BITSET
-// under CSR_HYBRID because the T8.9 open-path gate is edge-only.
+// under CSR_HYBRID because the CSR_HYBRID open-path is gated to edge-only
+// indexes (N == 3 with FROM_TO_EDGE / TO_FROM_EDGE catalog slots).
 // The structural invariant we pin here: the catalog's leaf_format vector
 // distinguishes edge vs non-edge slots so the reader never mis-decodes.
 // ============================================================================
 TEST(CSRHybridIntegration, NonEdgeIndexesRetainLeafFormat) {
     // The invariant this test pins is catalog-side, not filesystem-side:
     // ProjectionStorage::save_catalog patches FROM_TO_EDGE / TO_FROM_EDGE
-    // slots to CSR_HYBRID (3) under graphStorage='CSR_HYBRID' while
+    // slots to CSR_HYBRID (3) under graphStorage='CSR_HYBRID', while
     // leaving the NODES / property-index slots at the projection-wide
-    // leaf_format preset. Enum contract:
+    // leaf_format preset (BITSET or DELTA_VARINT). Enum contract:
     EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::BITSET),       1u);
     EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::DELTA_VARINT), 2u);
     EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::CSR_HYBRID),   3u);
 
-    // The patch operates on leaf_formats slots matching enum bit positions
-    // FROM_TO_EDGE = 1<<5 and TO_FROM_EDGE = 1<<6. Validate those are the
-    // only two bits eligible — pin the mask so a rename or enum reorder
-    // gets caught here before a silent mis-patch ships.
+    // The catalog patch targets only the two edge-index slots (FROM_TO_EDGE
+    // at bit position 5 and TO_FROM_EDGE at bit position 6). Pin those
+    // values so any rename or enum reorder is caught here before a silent
+    // mis-patch ships.
     EXPECT_EQ(uint32_t{1u << 5}, 32u) << "FROM_TO_EDGE slot index (bit 5)";
     EXPECT_EQ(uint32_t{1u << 6}, 64u) << "TO_FROM_EDGE slot index (bit 6)";
 }
@@ -235,9 +238,9 @@ TEST(CSRHybridIntegration, USEQueryReadsCorrectV3Header) {
 //   - the same set of unique (src, dst) pairs on decode (edge_id is
 //     encoded in BITSET but dropped in CSR — design §3.4);
 //   - different byte-0 magics (0x03 vs 0x00).
-// The (src, dst) equality across the two formats is what T8.12's Gate D
-// benchmark uses as its correctness anchor; pin it here so the regression
-// is caught at unit-test time.
+// The (src, dst) equality across the two formats is the correctness anchor
+// used by the CSR_HYBRID scan throughput benchmark (scripts/bench_csr_hybrid.sh);
+// pin it here so the regression is caught at unit-test time.
 // ============================================================================
 TEST(CSRHybridIntegration, CSRvsBitsetProducesSameSrcDstPairs) {
     const auto dir = make_tempdir("CSRvsBitsetProducesSameSrcDstPairs");

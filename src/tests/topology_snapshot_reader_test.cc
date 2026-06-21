@@ -1,6 +1,10 @@
-// Unit tests for TopologySnapshotReader (Spec #4-B, T4.5).
+// Unit tests for TopologySnapshotReader — the mmap-backed reader for the
+// topology CSR sidecar files (topology_fwd.csr / topology_rev.csr). Each
+// sidecar stores a 64-byte header, a ROW_PTR prefix-sum array, a COL_IDX
+// neighbor array, and an optional parallel EDGE_IDS array, allowing O(1)
+// neighbor slicing without a B+Tree lookup.
 //
-// Scope (per plan T4.5 acceptance criteria):
+// Scope:
 //   - Absent / truncated / magic-invalid / version-invalid → has_data()=false.
 //   - File-size vs declared N/M mismatch → has_data()=false.
 //   - ROW_PTR invariant violations → has_data()=false.
@@ -11,8 +15,8 @@
 //   - Out-of-range node_idx → throws (always-on bounds enforcement).
 //   - Two concurrent readers produce identical results (no shared state).
 //
-// Not tested here: SHA-256 staleness (T4.10), TopologyAccessor fast-path
-// integration (T4.7).
+// Not tested here: SHA-256 staleness (see VerifySourceSha256MatchesHeader and
+// surrounding tests), TopologyAccessor fast-path integration.
 
 #include <cstdint>
 #include <cstdlib>
@@ -495,10 +499,13 @@ TEST_F(TopologySnapshotReaderTest, ConcurrentReadersNoCorruption) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 13 — Producer/consumer SHA-256 invariant (T4.10).
+// Test 13 — Producer/consumer SHA-256 invariant.
 // The writer stamps SHA-256(source.leaf) into the header; the reader
 // recomputes the same digest and must accept it. This is the matching
-// half of the staleness gate, paired with the two negative tests below.
+// half of the staleness gate: when the source B+Tree leaf file matches the
+// digest embedded in the sidecar header, the reader accepts the sidecar
+// as current. Paired with the two negative tests below (mutated leaf and
+// deleted leaf) that exercise the fallback-to-absent behavior.
 // ---------------------------------------------------------------------------
 TEST_F(TopologySnapshotReaderTest, VerifySourceSha256MatchesHeader) {
     write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,
@@ -678,10 +685,15 @@ TEST_F(TopologySnapshotReaderTest, MoveSemanticsPreserveData) {
 }
 
 // ===========================================================================
-// Spec #6 — narrow (uint32) layout round-trip + losslessness vs the uint64
-// layout. The writer selects the narrow layout only under the
-// MDB_GNN_TOPOLOGY_UINT32 env opt-in; these tests force it via a RAII guard,
-// then prove the reader reconstructs byte-identical tagged ObjectIds.
+// Narrow (uint32) topology sidecar layout — round-trip + losslessness vs the
+// default uint64 layout. When the MDB_GNN_TOPOLOGY_UINT32 environment variable
+// is set, the writer strips the 8-bit ObjectId type tag from each node and
+// edge id, stores only the lower 32 bits, and records the type tag once in
+// the sidecar header. On read, the reader reconstructs the full tagged
+// ObjectId by OR-ing the stored tag back in — achieving lossless round-trip
+// at roughly half the sidecar size. These tests force the narrow layout via a
+// RAII environment guard and verify that copy_neighbors / copy_edge_ids return
+// byte-identical tagged values compared with the default wide layout.
 // ===========================================================================
 
 namespace {

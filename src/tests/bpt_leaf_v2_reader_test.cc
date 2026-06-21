@@ -1,4 +1,8 @@
-// Unit tests for the BPTLeafV2 read-path reader (Spec #5 T5.8).
+// Unit tests for the BPTLeafV2 read-path reader.
+// BPTLeafV2 is the delta + LEB128-varint B+Tree leaf encoding: record 0 is
+// stored as N full LEB128 varints; records 1..k-1 are stored as N zigzag-
+// encoded LEB128 deltas from the previous record.  This encoding is the
+// B+Tree leaf compression format for projection indexes.
 //
 // Scope: ReadTag constructor (header validation per design §5.5),
 // get_record(pos) linear-decode semantics, search_index(target) linear scan
@@ -6,13 +10,13 @@
 // next_leaf round-trip, and cross-check that V2-encoded pages decode to the
 // same Record<N> sequence as the V1 reader on a byte-identical test corpus.
 //
-// The writer used to produce test pages is the T5.7 BPTLeafV2<N> writer
+// The writer used to produce test pages is the BPTLeafV2<N> writer
 // constructor (non-tag overload). The reader under test is the new
 // BPTLeafV2<N>(page_bytes, ReadTag) overload plus the get_record /
 // search_index / check / print / check_range member functions.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-//                 (§3.4 linear scan / §5.2 layout / §5.5 page-open validation)
+// Design reference: delta + LEB128-varint leaf format (§3.4 linear scan /
+//                   §5.2 page layout / §5.5 page-open validation)
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
 
@@ -606,10 +610,13 @@ TEST(BPTLeafV2Reader, Mutation_Delete_Throws) {
     EXPECT_THROW(reader.delete_record(Record<3>{1, 2, 3}), std::logic_error);
 }
 
-// Exercise the T5.13b sequential-decode cache: a fast-path forward scan
+// Exercise the sequential-decode cursor cache: a fast-path forward scan
 // followed by random-access queries must both return correct values. The
-// cache logic covers three paths (pos == cache_pos_, pos > cache_pos_
-// resume, pos < cache_pos_ restart), and this test ensures all three yield
+// sequential-decode cursor cache makes search_index O(k) per iteration
+// instead of O(k²) by remembering the last decoded position so forward
+// steps can resume rather than restart from record 0. The cache logic
+// covers three paths (pos == cache_pos_, pos > cache_pos_ resume,
+// pos < cache_pos_ restart), and this test ensures all three yield
 // identical results to a stateless decode.
 TEST(BPTLeafV2Reader, SequentialGetRecord_FastPath) {
     AlignedPageBuffer page;

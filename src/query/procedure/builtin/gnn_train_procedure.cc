@@ -52,10 +52,9 @@ namespace GQL::Procedures {
 // Helper: write training_log.json
 // =============================================================================
 
-// Spec B2 (2026-04-27): CacheStatsSnapshot moved to a public header so
-// TrainingLoop can take it as a callback return type. Re-export under the
-// GQL::Procedures namespace via using-alias to keep this file's internal
-// references unqualified.
+// CacheStatsSnapshot was moved to a public header so TrainingLoop can take it
+// as a callback return type. Re-export under the GQL::Procedures namespace via
+// using-alias to keep this file's internal references unqualified.
 using CacheStatsSnapshot = mdb::gnn::CacheStatsSnapshot;
 
 namespace {
@@ -121,9 +120,8 @@ static void write_training_log(
     f << "    \"best_val_accuracy\": " << result.best_val_accuracy << ",\n";
     f << "    \"test_accuracy\": " << test_accuracy << ",\n";
     f << "    \"train_seconds\": " << result.train_seconds << ",\n";
-    // Spec C3 stage 0: per-stage timing breakdown (sum across all train
-    // batches across all epochs). Per-session, NOT accumulated across
-    // resume_from continuations.
+    // Per-stage timing breakdown (sum across all train batches across all
+    // epochs). Per-session, NOT accumulated across resume_from continuations.
     f << "    \"assemble_seconds\": " << result.assemble_seconds << ",\n";
     f << "    \"forward_seconds\": "  << result.forward_seconds  << ",\n";
     f << "    \"backward_seconds\": " << result.backward_seconds << "\n";
@@ -144,9 +142,9 @@ static void write_training_log(
     // when every requested node was resolved (note that l3 also accumulates
     // misses where the node was outside the projection — see four_level_store.cc).
     //
-    // Spec A1 (2026-04-27): byte-level fields added for paper-comparable
-    // disk-traffic accounting (DiskGNN SIGMOD'25 Table 1 column
-    // "Disk access volume (GB)" = total_bytes_disk).
+    // Byte-level fields are included for paper-comparable disk-traffic
+    // accounting (DiskGNN SIGMOD'25 Table 1 column "Disk access volume (GB)"
+    // = total_bytes_disk).
     f << "  \"cache_stats\": {\n";
     f << "    \"l1_hits\": "              << cache_stats.l1_hits              << ",\n";
     f << "    \"l2_hits\": "              << cache_stats.l2_hits              << ",\n";
@@ -305,25 +303,26 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // no downside; constant lr is the paper-faithful baseline that caps ~0.640.
     // See docs/research/2026-06-16-accuracy-target/GAP_FINAL_SYNTHESIS.md.
     std::string lr_schedule = "cosine";
-    // Spec C3 stage 1 (default true since 2026-05-07): async prefetcher.
+    // Async batch prefetcher: overlaps each batch's assemble+host-to-device
+    // transfer with the previous batch's model forward+backward via a
+    // single-worker bounded-queue producer-consumer. Default true;
     // 1.609× speedup measured on papers100M, bit-identical accuracy.
     bool        use_async_prefetcher = true;
-    // Spec C3 stage 3 (started 2026-05-08): split assemble_kernel and
-    // model.forward+backward onto separate CUDA streams. Default false
-    // until empirical validation in Module 6.
+    // Split assemble_kernel and model.forward+backward onto separate CUDA
+    // streams (c10::cuda::CUDAStream + at::cuda::CUDAEvent cross-stream sync).
+    // Default false: measured neutral on celebi RTX 5070 Ti (1.4% over
+    // async prefetcher alone), so it remains opt-in.
     bool        use_cuda_streams     = false;
-    // Round 3B (2026-05-15): number of worker threads in AsyncBatchPrefetcher.
-    // Default 1 = byte-identical to Stage 1 behavior. >1 has effect only
-    // when the BatchAssembler runs in FeatureMatrix-fallback mode (see
-    // TrainingLoop::Config::prefetch_num_workers for thread-safety notes
-    // and the FourLevelStore clamp).
-    // 2026-06-01: default 0 = AUTO (host-adaptive, resolved below from
-    // hardware_concurrency); explicit prefetchNumWorkers (>=1) overrides.
+    // Number of worker threads in AsyncBatchPrefetcher. Each worker owns a
+    // private DirectIoReader and pinned host buffer so workers do not share
+    // mutable I/O state. Default 0 = AUTO (host-adaptive, resolved below from
+    // hardware_concurrency or MDB_GNN_PREFETCH_WORKERS env); explicit
+    // prefetchNumWorkers (>=1) overrides.
     uint64_t    prefetch_num_workers = 0;
-    // Round 3B-mw (2026-06-01): AsyncBatchPrefetcher shared-queue size. The
-    // prefetcher caps live workers at min(prefetch_num_workers, this), so N>2
-    // workers need a larger queue. Default 2 (DiskGNN §6); auto-raised to the
-    // worker count below if the caller bumped workers but left this default.
+    // AsyncBatchPrefetcher shared-queue size. The prefetcher caps live workers
+    // at min(prefetch_num_workers, this), so N>2 workers need a larger queue.
+    // Default 2 (matching DiskGNN §6); auto-raised to the worker count below
+    // if the caller bumped workers but left this default.
     uint64_t    prefetch_queue_size = 2;
 
     if (ctx.arguments.size() == 3) {
@@ -370,15 +369,18 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_int("sampleCacheMb")) {
             sample_cache_mb = *v;
         }
-        // Spec C3 stage 1.B: opt-in async batch prefetcher.
+        // Opt-in async batch prefetcher (producer-consumer overlap of assemble
+        // + transfer with model forward+backward).
         if (auto v = opts.get_bool("useAsyncPrefetcher")) {
             use_async_prefetcher = *v;
         }
-        // Spec C3 stage 3: opt-in CUDA streams for assemble vs train overlap.
+        // Opt-in CUDA streams for overlapping assemble_kernel with model
+        // forward+backward on separate GPU streams.
         if (auto v = opts.get_bool("useCudaStreams")) {
             use_cuda_streams = *v;
         }
-        // Round 3B (2026-05-15): multi-worker AsyncBatchPrefetcher.
+        // Multi-worker AsyncBatchPrefetcher: each worker has its own
+        // DirectIoReader + pinned buffer to avoid shared mutable I/O state.
         if (auto v = opts.get_int("prefetchNumWorkers")) {
             if (*v < 1) {
                 throw std::runtime_error(
@@ -387,11 +389,11 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             }
             prefetch_num_workers = static_cast<uint64_t>(*v);
         }
-        // Round 3B-mw (2026-06-01): the AsyncBatchPrefetcher caps the live
-        // worker count at min(prefetchNumWorkers, prefetchQueueSize), so N>2
-        // workers require a larger queue. Expose the queue size; default
-        // stays 2 (DiskGNN §6). Auto-raise to prefetchNumWorkers below if the
-        // caller bumped workers but left the queue at the default.
+        // The AsyncBatchPrefetcher caps the live worker count at
+        // min(prefetchNumWorkers, prefetchQueueSize), so N>2 workers require a
+        // larger queue. Expose the queue size; default stays 2 (DiskGNN §6).
+        // Auto-raised to prefetchNumWorkers below if the caller bumped workers
+        // but left the queue at the default.
         if (auto v = opts.get_int("prefetchQueueSize")) {
             if (*v < 1) {
                 throw std::runtime_error(
@@ -531,18 +533,18 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     auto rm = RowMapping::open(rmap_path);
     auto samples = SampleStorage::open(storage_path);
 
-    // Round 3B-mw (2026-06-01): resolve prefetchNumWorkers when unset (sentinel
-    // 0). The DEFAULT is 1 (single worker) to preserve REPRODUCIBILITY: the
-    // multi-worker prefetcher delivers batches in a timing-dependent order, so
-    // N>1 training is NOT bit-reproducible across runs at a fixed seed (measured:
-    // cora testAcc wobbles 0.8796<->0.8870 at N=4; features ARE bit-identical, it
-    // is the batch ORDER that varies the SGD trajectory). Multi-worker is a SPEED
+    // Resolve prefetchNumWorkers when unset (sentinel 0). The DEFAULT is 1
+    // (single worker) to preserve REPRODUCIBILITY: the multi-worker prefetcher
+    // delivers batches in a timing-dependent order, so N>1 training is NOT
+    // bit-reproducible across runs at a fixed seed (measured: cora testAcc
+    // wobbles 0.8796<->0.8870 at N=4; features ARE bit-identical, it is the
+    // batch ORDER that varies the SGD trajectory). Multi-worker is a SPEED
     // opt-in (4.32x at N=8) enabled via the prefetchNumWorkers param or the env
     // MDB_GNN_PREFETCH_WORKERS (a number, or "auto" = clamp(cores-4, 2, 8),
-    // NVMe-bound). Making it the safe default requires in-order batch delivery in
-    // AsyncBatchPrefetcher (a reorder buffer) — deferred. The OOM-safe cache cap
-    // below still applies whenever N>1, so explicit multi-worker no longer needs
-    // a manual sampleCacheMb to avoid the documented N>1 OOM.
+    // NVMe-bound). Making it the safe default requires in-order batch delivery
+    // in AsyncBatchPrefetcher (a reorder buffer) — deferred. The OOM-safe cache
+    // cap below still applies whenever N>1, so explicit multi-worker no longer
+    // needs a manual sampleCacheMb to avoid the documented N>1 OOM.
     if (prefetch_num_workers == 0) {
         unsigned auto_n = 1;
         if (const char* env = std::getenv("MDB_GNN_PREFETCH_WORKERS")) {
@@ -780,7 +782,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     mdb::gnn::FourLevelStore feature_store(db_folder, feature_name, samples);
 
-    // STEP 2 contract guard: the projection's gnn_meta.bin and the feature
+    // feature_dim contract guard: the projection's gnn_meta.bin and the feature
     // store's store.meta are two independent sources of feature_dim. If they
     // disagree (projection re-imported / rebuilt with a different feature width
     // but the feature store not rebuilt), the model is sized to meta.feature_dim
@@ -797,7 +799,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     }
     BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
 
-    // SC-5a: per-call override of the block-consumption mode for same-session
+    // Per-call override of the block-consumption mode for same-session
     // A/B/C measurement (online / Option-A / self-contained). The ctor already
     // ran its env/auto detection; we only override it when the caller explicitly
     // passed at least one of noBlocks / noSelfContained / noPackedFull, so the
@@ -848,9 +850,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     loop_config.use_async_prefetcher = use_async_prefetcher;
     loop_config.use_cuda_streams     = use_cuda_streams;
     loop_config.prefetch_num_workers = static_cast<unsigned>(prefetch_num_workers);
-    // Round 3B-mw: the prefetcher caps live workers at min(workers, queue).
-    // If the caller raised workers but left the queue at the default 2,
-    // auto-raise the queue so the requested workers are actually honored.
+    // The prefetcher caps live workers at min(workers, queue). If the caller
+    // raised workers but left the queue at the default 2, auto-raise the queue
+    // so the requested workers are actually honored.
     if (prefetch_queue_size < prefetch_num_workers) {
         prefetch_queue_size = prefetch_num_workers;
     }
@@ -924,11 +926,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     mdb::gnn::AutoCheckpointer autockpt(
         model, optimizer, ckpt_dir, base_state, ac_policy);
 
-    // Spec B2 (2026-04-27): wire cumulative L3+L4 disk-bytes provider so
-    // the training loop can compute per-epoch deltas inline. Returns a
-    // single uint64_t (not a struct) to keep TrainingLoop::Config ABI
-    // stable across translation units. Captured by reference —
-    // feature_store outlives the lambda.
+    // Wire cumulative L3+L4 disk-bytes provider so the training loop can
+    // compute per-epoch deltas inline. Returns a single uint64_t (not a
+    // struct) to keep TrainingLoop::Config ABI stable across translation
+    // units. Captured by reference — feature_store outlives the lambda.
     loop_config.cumulative_disk_bytes_provider =
         [&feature_store]() -> uint64_t {
             const auto& s = feature_store.get_stats();
@@ -1050,9 +1051,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     auto cache_stats = CacheStatsSnapshot::from(feature_store.get_stats());
 
-    // Spec A1: headline disk-traffic print so the user sees the
-    // paper-comparable number directly in their server terminal
-    // (alongside the per-epoch lines from training_loop.cc).
+    // Print total disk traffic so the user sees the paper-comparable number
+    // directly in their server terminal (alongside the per-epoch lines from
+    // training_loop.cc).
     {
         constexpr double GB = 1024.0 * 1024.0 * 1024.0;
         double total_gb = static_cast<double>(cache_stats.total_bytes_disk()) / GB;
@@ -1086,11 +1087,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("testAccuracyAtBestVal", ctx.create_float(static_cast<float>(result.test_accuracy_at_best_val)));
     ctx.yield("bestValEpoch",    ctx.create_int(static_cast<int64_t>(result.best_val_epoch)));
     ctx.yield("trainSeconds",    ctx.create_float(static_cast<float>(result.train_seconds)));
-    // Spec C3 stage 0 (2026-05-07): per-stage cumulative timings for
-    // baselining the upcoming async-prefetcher / pipeline-overlap work.
-    // assemble + forward + backward should sum to ≈ train phase wall time
-    // (excluding eval). On a typical run, asssembleSeconds is the upper
-    // bound on what stage 1 prefetcher can hide behind compute.
+    // Per-stage cumulative timings for diagnosing the async-prefetcher and
+    // pipeline-overlap behavior. assemble + forward + backward should sum to
+    // approximately the train phase wall time (excluding eval). assembleSeconds
+    // is the upper bound on what the async prefetcher can hide behind compute.
     ctx.yield("assembleSeconds", ctx.create_float(static_cast<float>(result.assemble_seconds)));
     ctx.yield("forwardSeconds",  ctx.create_float(static_cast<float>(result.forward_seconds)));
     ctx.yield("backwardSeconds", ctx.create_float(static_cast<float>(result.backward_seconds)));
@@ -1098,7 +1098,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
     ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
     ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
-    // Spec A1: byte-level disk-traffic surface — paper comparable.
+    // Byte-level disk-traffic surface for paper-comparable accounting.
     ctx.yield("l3BytesDisk",
               ctx.create_int(static_cast<int64_t>(cache_stats.l3_bytes_disk)));
     ctx.yield("l4BytesDisk",
@@ -1116,7 +1116,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
     ctx.yield("effectivePrefetchWorkers",
               ctx.create_int(static_cast<int64_t>(result.effective_prefetch_workers)));
-    // Path 4 (2026-05-19): v2 addr_table fast-path telemetry from TrainingLoop::Result.
+    // Address-table fast-path telemetry: whether the v2 addr_table path
+    // was active during training and its mean load latency in microseconds.
     ctx.yield("useAddrTablesEffective",
               ctx.create_bool(result.addr_tables_used_ever));
     ctx.yield("addrTableLoadUs",

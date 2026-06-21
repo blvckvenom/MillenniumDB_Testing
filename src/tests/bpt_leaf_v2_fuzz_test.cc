@@ -1,5 +1,7 @@
-// Randomized encode->decode fuzz harness for the Spec #5 v2 leaf format
-// (design §7.4 correctness gate). Runs hundreds of thousands of
+// Randomized encode->decode fuzz harness for the delta + LEB128-varint v2
+// leaf format (B+Tree leaf compression where record 0 is stored as N full
+// LEB128 varints and records 1..k-1 as N zigzag-delta LEB128 varints).
+// Runs hundreds of thousands of
 // iterations under a deterministic mt19937_64 seed, cycling through N
 // in {1,2,3} and four distribution families (dense-monotonic,
 // sparse-random, clustered, adversarial). Every iteration encodes a
@@ -8,8 +10,8 @@
 //
 // The default iteration budget is 500k in Release and 50k under ASan,
 // chosen to stay within the 60 s Release and 5 min Debug wall-clock
-// budgets from plan doc §T5.14. A developer can override to 1M (design
-// §7.4 target) by rebuilding with `-D MAIN_ITERATIONS_OVERRIDE=1000000`
+// budgets. A developer can override to 1M (the full correctness-gate
+// target) by rebuilding with `-D MAIN_ITERATIONS_OVERRIDE=1000000`
 // for a full-strength pre-merge check.
 //
 // A dedicated boundary sub-test injects explicit inputs at varint-length
@@ -64,18 +66,16 @@ constexpr uint64_t SMOKE_SEED = MAIN_SEED + 1ULL;
     #define MDB_FUZZ_UNDER_ASAN 0
 #endif
 
-// Number of iterations per seed. Design §7.4 calls for a 1M-iteration
-// main run. Benchmark on benito_pc (Release, -march=native, glibc malloc)
-// measured 1M at ~97 us/iter under the size-skewed k distribution used
-// here, putting the full 1M run at ~97 s wall-clock. Plan doc §T5.14
-// "Performance Tuning" explicitly permits scaling to 500k with
-// documentation when the 60 s budget is at risk, so the Release run
-// uses 500k for CI friendliness; the smoke + boundary + tamper subtests
-// remain at their original iteration counts. Debug/ASan builds clamp
-// further (50k) so the sanitizer-instrumented run still fits the 5 min
-// ASan budget. A developer can restore the 1M target by recompiling
-// with `-D MAIN_ITERATIONS_OVERRIDE=1000000` for a pre-merge full-
-// strength check.
+// Number of iterations per seed. The design target for the full correctness
+// gate is 1M iterations. Benchmark on benito_pc (Release, -march=native,
+// glibc malloc) measured 1M at ~97 us/iter under the size-skewed k
+// distribution used here, putting the full 1M run at ~97 s wall-clock.
+// To stay within the 60 s CI budget, the Release run uses 500k; the smoke
+// + boundary + tamper subtests remain at their original iteration counts.
+// Debug/ASan builds clamp further (50k) so the sanitizer-instrumented run
+// still fits the 5 min ASan budget. A developer can restore the 1M target
+// by recompiling with `-D MAIN_ITERATIONS_OVERRIDE=1000000` for a pre-merge
+// full-strength check.
 #ifdef MAIN_ITERATIONS_OVERRIDE
 constexpr size_t MAIN_ITERATIONS  = MAIN_ITERATIONS_OVERRIDE;
 #elif MDB_FUZZ_UNDER_ASAN

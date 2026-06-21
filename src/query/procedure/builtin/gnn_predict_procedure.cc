@@ -147,7 +147,7 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     auto rm        = RowMapping::open(rmap_path);
     FourLevelStore feature_store(db_folder, feature_name, samples);
 
-    // STEP 2 contract guard (mirrors gnn_train): projection gnn_meta.bin and the
+    // Feature-dim contract guard (mirrors gnn_train): projection gnn_meta.bin and the
     // feature store's store.meta are independent feature_dim sources; a mismatch
     // means the feature store is stale for this projection and would otherwise
     // surface as an opaque torch shape error mid-inference.
@@ -230,7 +230,7 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     double l1r = tot > 0 ? double(l1h) / double(tot) : 0.0;
     double l2r = tot > 0 ? double(l2h) / double(tot) : 0.0;
 
-    // Spec A1 (2026-04-27): byte-level disk-traffic accounting.
+    // Byte-level disk-traffic accounting (2026-04-27).
     uint64_t l3_bytes_disk   = stats.l3_bytes_disk.load();
     uint64_t l4_bytes_disk   = stats.l4_bytes_disk.load();
     uint64_t l3_bytes_wanted = stats.l3_bytes_wanted.load();
@@ -254,7 +254,7 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",            ctx.create_float(static_cast<float>(l2r)));
     ctx.yield("l3Reads",               ctx.create_int(static_cast<int64_t>(l3r_count)));
     ctx.yield("l4Reads",               ctx.create_int(static_cast<int64_t>(l4r_count)));
-    // Spec A1: byte-level disk-traffic surface — paper comparable.
+    // Byte-level disk-traffic surface — paper comparable.
     ctx.yield("l3BytesDisk",           ctx.create_int(static_cast<int64_t>(l3_bytes_disk)));
     ctx.yield("l4BytesDisk",           ctx.create_int(static_cast<int64_t>(l4_bytes_disk)));
     ctx.yield("totalBytesDisk",        ctx.create_int(static_cast<int64_t>(total_bytes_disk)));

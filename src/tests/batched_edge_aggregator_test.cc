@@ -1,6 +1,6 @@
 // src/tests/batched_edge_aggregator_test.cc
 //
-// Spec #26 — unit tests for BatchedEdgeAggregator (CPU + future GPU stub).
+// Unit tests for BatchedEdgeAggregator (CPU + future GPU stub).
 //
 // Coverage:
 //   - empty input: aggregator emits nothing, returns success.
@@ -241,7 +241,7 @@ TEST(BatchedEdgeAggregator, SingleModeAcceptsUniqueKeys) {
 }
 
 // ----------------------------------------------------------------------
-// CPU vs GPU parity (Spec #26 v1: GPU stub == CPU output)
+// CPU vs GPU parity (v1: the GPU stub must reproduce the CPU output)
 // ----------------------------------------------------------------------
 
 TEST(BatchedEdgeAggregator, CpuGpuParityCount) {

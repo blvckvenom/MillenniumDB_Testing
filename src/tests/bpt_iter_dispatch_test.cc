@@ -1,14 +1,14 @@
 // Unit tests for the BptIter / BPlusTree<N> polymorphic leaf dispatch
-// (Spec #5 T5.9). This test follows the *narrower dispatch-helper* option
-// documented in the plan (§T5.9 "If the existing test infrastructure makes
-// this prohibitively awkward, a more narrowly-scoped dispatch test is
-// acceptable") rather than the end-to-end tree-level variant.
+// for the delta + LEB128-varint leaf encoding (B+Tree leaf compression).
+// This test follows the *narrower dispatch-helper* option rather than the
+// end-to-end tree-level variant.
 //
 // Rationale for the narrow approach:
 //   * BPlusTree<N> construction requires a filename hooked to the global
 //     BufferManager + FileManager singletons; building a full database
 //     harness here would dwarf the actual unit under test.
-//   * The T5.7 / T5.8 test files already exercise BPTLeafV2<N> directly
+//   * The existing delta-varint leaf writer and reader test files already
+//     exercise BPTLeafV2<N> directly
 //     over 4 KB aligned heap buffers. We reuse that pattern: construct V1
 //     and V2 on standalone pages, put both behind
 //     std::unique_ptr<BPTLeafBase<N>>, and verify that
@@ -16,7 +16,8 @@
 //     virtual BPTLeafBase<N> contract works uniformly through the base
 //     pointer.
 //
-// Scope (eight cases per plan §T5.9, adapted to the narrow path):
+// Scope (eight cases for the dispatch-helper test plan, adapted to the
+// narrow path):
 //   1. open_leaf_page(BITSET) on a V1-format page returns a BPTLeafV1<N>.
 //   2. open_leaf_page(DELTA_VARINT) on a V2-format page returns a
 //      BPTLeafV2<N>.
@@ -33,8 +34,9 @@
 //   8. Repeated construct + destruct of the polymorphic leaf holder in a
 //      tight loop leaks no memory (ASan assertion; Debug-build gate).
 //
-// Direct BPlusTree<N> / BptIter<N> end-to-end tests are left for T5.10,
-// at which point the dispatch plumbing threads through the catalog and a
+// Direct BPlusTree<N> / BptIter<N> end-to-end tests are left for a later
+// stage, at which point the dispatch plumbing threads through the catalog
+// and a
 // real DELTA_VARINT tree can be constructed via the public API.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
@@ -83,7 +85,7 @@ struct AlignedPageBuffer {
 };
 
 // Build a valid V2-encoded page with the given records. Helper used by
-// multiple tests; borrowed from the T5.8 reader test pattern.
+// multiple tests; borrowed from the delta-varint leaf reader test pattern.
 template <std::size_t N>
 void write_v2_page(AlignedPageBuffer& page,
                    const std::vector<Record<N>>& records,
@@ -98,12 +100,11 @@ void write_v2_page(AlignedPageBuffer& page,
 
 // ----------------------------------------------------------------------------
 // Synthetic CSR (v3) page builder. Borrowed byte-for-byte from
-// bpt_leaf_csr_reader_test.cc so the T8.6 dispatch tests stay self-
-// contained at task level (no cross-test-file shared header needed —
-// T8.5's writer lands in parallel and may supersede this helper
-// downstream).
+// bpt_leaf_csr_reader_test.cc so the CSR-hybrid dispatch tests stay
+// self-contained at task level (no cross-test-file shared header needed).
 //
-// Emits the chain-head layout per Spec #8 design §5.1:
+// Emits the chain-head layout for the CSR-hybrid graph storage (where
+// edge-index B+Tree leaves contain the CSR layout directly):
 //   16-byte header, uint16 offset_table[value_count], then per-src
 //   entry [src_id varint, degree varint, dst0 full varint,
 //   dst1..zigzag-delta varints].
@@ -263,9 +264,10 @@ TEST(BptIterDispatch, DeltaVarint_OnV1LikePage_RaisesDecodeException) {
 // DELTA_VARINT branch.
 //
 // We verify by checking that the BITSET branch in open_leaf_page contains
-// no byte-0 cross-check — which is exactly the spec-mandated behavior
-// ("The BITSET branch does not cross-check byte 0 because pre-Spec-#5
-// pages legitimately have value_count=2 at byte 0").
+// no byte-0 cross-check — which is by design: before the delta +
+// LEB128-varint leaf format was introduced, V1 pages legitimately have
+// value_count=2 stored at byte 0, so the BITSET branch must not interpret
+// that byte as a format version discriminator.
 TEST(BptIterDispatch, Bitset_AcceptsPageByteEquals2) {
     AlignedPageBuffer page;
     // Simulate a V1 page with value_count = 2 (bytes 0..3 little-endian).
@@ -418,14 +420,15 @@ TEST(BptIterDispatch, GetLeafFormat_AccessorSignatureIsConst) {
 
 
 // ============================================================================
-// Spec #8 T8.6: 3-way dispatch to BPTLeafCSR<N> on CSR_HYBRID leaf_format
+// 3-way dispatch to BPTLeafCSR<N> on CSR_HYBRID leaf_format
+// (CSR-hybrid graph storage: edge-index B+Tree leaves ARE the CSR layout)
 // ============================================================================
 //
-// We mirror the narrow test pattern established for T5.9 above: invoking
-// BPlusTree<N>::open_leaf_page() directly would require a live Page& (and
-// by extension a BufferManager + FileManager pool), which is disproportionate
-// for a dispatch-site unit test. Instead we exercise the exact code path
-// open_leaf_page's CSR_HYBRID branch executes — construct a
+// We mirror the narrow test pattern established for the delta-varint dispatch
+// above: invoking BPlusTree<N>::open_leaf_page() directly would require a
+// live Page& (and by extension a BufferManager + FileManager pool), which is
+// disproportionate for a dispatch-site unit test. Instead we exercise the
+// exact code path open_leaf_page's CSR_HYBRID branch executes — construct a
 // BPTLeafCSR<N>::ReadTag over an AlignedPageBuffer — behind the polymorphic
 // std::unique_ptr<BPTLeafBase<N>> holder, and then assert on both the type
 // identity of the returned reader and the cross-check guards documented in
@@ -512,15 +515,18 @@ TEST(BptIterDispatch, CSRHybrid_OnContinuationPage_RaisesDecodeException) {
     EXPECT_THROW(guard(), BPT::BPTLeafV2DecodeException);
 
     // End-to-end: even if the guard were bypassed, the BPTLeafCSR ReadTag
-    // ctor itself rejects continuation pages (Spec #8 I6) — so the
-    // composite behavior at the dispatch site is always a raise.
+    // ctor itself rejects continuation pages (the CSR-hybrid leaf reader
+    // enforces that a directory-routed open always lands on a chain-head,
+    // never a continuation page) — so the composite behavior at the
+    // dispatch site is always a raise.
     EXPECT_THROW(
         (BPTLeafCSR<3>(page.data(), BPTLeafCSR<3>::ReadTag{})),
         BPT::BPTLeafCSRDecodeException);
 }
 
 // Case 12: integration smoke — populate a v3 page manually (directly via the
-// synthetic page builder, without depending on T8.5's writer) and verify
+// synthetic page builder, without depending on the CSR-hybrid leaf writer)
+// and verify
 // that records iterated through the polymorphic base pointer match the
 // synthetic input. This is the analogue of Case 5 for the CSR_HYBRID path.
 TEST(BptIterDispatch, CSRHybrid_FindsRecordsOnPage) {
@@ -543,7 +549,7 @@ TEST(BptIterDispatch, CSRHybrid_FindsRecordsOnPage) {
     std::vector<Record<3>> expected;
     for (const auto& e : entries) {
         for (uint64_t dst : e.dsts) {
-            // T8.4's BPTLeafBase<N> contract fills edge_id with 0 on v3
+            // The BPTLeafBase<N> contract fills edge_id with 0 on v3
             // pages (see bplus_tree_leaf_csr.cc decode_tuple_ comment).
             expected.push_back({e.src_id, dst, 0});
         }
@@ -604,13 +610,13 @@ TEST(BptIterDispatch, CSRHybrid_ThreeWayCoexistenceSmoke) {
     const auto first_v3 = v3_holder->get_record(0);
     EXPECT_EQ(first_v3[0], 100u);   // src_id
     EXPECT_EQ(first_v3[1], 1u);     // first dst
-    EXPECT_EQ(first_v3[2], 0u);     // edge_id placeholder (T8.4 contract)
+    EXPECT_EQ(first_v3[2], 0u);     // edge_id placeholder (base-class contract)
 }
 
 // Case 14: open_leaf_page() signature still accepts the new CSR_HYBRID enum
 // value without link-failing for the N in {2, 3} instantiations. We take a
 // function pointer to ensure the symbol is emitted for both widths.
-// N==1 is NOT covered (CSR_HYBRID is edge-index-only per §3.6 D6); we
+// N==1 is NOT covered (CSR_HYBRID is edge-index-only by design); we
 // separately confirm the N>=2 guard fires below.
 TEST(BptIterDispatch, CSRHybrid_OpenLeafPage_InstantiatedForN2AndN3) {
     using FnPtr2 = std::unique_ptr<BPTLeafBase<2>>(*)(Page&, BPT::LeafFormat);
@@ -642,7 +648,8 @@ TEST(BptIterDispatch, CSRHybrid_Destruct_NoLeak) {
 }
 
 // Case 16: the LeafFormat enum has exactly three documented values after
-// T8.3. A static_cast from any bit pattern outside {1, 2, 3} is treated as
+// the CSR_HYBRID format was added. A static_cast from any bit pattern
+// outside {1, 2, 3} is treated as
 // unknown by the dispatch switch. This test guards against a fourth value
 // being added without an accompanying dispatch arm.
 TEST(BptIterDispatch, CSRHybrid_EnumTrivia) {
@@ -650,7 +657,8 @@ TEST(BptIterDispatch, CSRHybrid_EnumTrivia) {
     EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::DELTA_VARINT), 2u);
     EXPECT_EQ(static_cast<uint8_t>(BPT::LeafFormat::CSR_HYBRID),   3u);
 
-    // Replica of the 3-way dispatch switch post-T8.6. Any enum value
+    // Replica of the 3-way dispatch switch once CSR_HYBRID was wired in.
+    // Any enum value
     // outside {1, 2, 3} must still reach the logic_error fall-through.
     auto dispatch_replica = [](BPT::LeafFormat fmt) -> int {
         switch (fmt) {

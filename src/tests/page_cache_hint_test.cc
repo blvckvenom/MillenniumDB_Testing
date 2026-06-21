@@ -1,4 +1,10 @@
-// Tests for posix_fadvise/madvise convenience wrappers used by Fix #22.
+// Tests for posix_fadvise/madvise convenience wrappers (fadvise_dontneed /
+// madvise_dontneed) that release kernel page-cache pressure during GNN
+// feature-store builds.  The wrappers are issued on reordered-feature
+// chunks, packed-slim batch files, and batches.dat regions once each is
+// fully consumed, preventing the combined working set (reordered.fmat +
+// batches.dat + per-batch output) from saturating available RAM and
+// causing late-phase throughput collapse.
 //
 // These helpers must remain safe and idempotent: callers always invoke
 // them on regions they're *about to stop using*, so an error must NEVER

@@ -1,6 +1,7 @@
 // native_projection_builder_topology_snapshot_test.cc
 //
-// Integration tests for Spec #4-B T4.6 — TopologySnapshotWriter wired into
+// Integration tests for the topology CSR sidecar (mmap-backed files
+// topology_fwd.csr / topology_rev.csr) — TopologySnapshotWriter wired into
 // NativeProjectionBuilder's finalize path.
 //
 // Rather than spinning up the full GQL graph catalog (which would require
@@ -20,8 +21,8 @@
 //   3. Neighbor slices returned by the reader match the hand-authored
 //      adjacency list exactly.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
-//                 §3.7 (integration point), §5.1 / §5.2 (reader validation).
+// Design reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
+//                   §3.7 (integration point), §5.1 / §5.2 (reader validation).
 
 #include <cstdint>
 #include <filesystem>
@@ -291,7 +292,7 @@ TEST(NativeProjectionBuilderTopologySnapshot, ReverseNeighborSlicesAreCorrect) {
 }
 
 // ---------------------------------------------------------------------------
-// Spec #4-B T4.18 — golden compare: integrated path vs post-hoc path.
+// Golden compare: integrated path vs post-hoc path for the topology CSR sidecar.
 //
 // Builds the same fixture two ways:
 //   A. Integrated path: set_build_topology_snapshot(true) before flush(),
@@ -386,8 +387,9 @@ TEST(NativeProjectionBuilderTopologySnapshot,
     const std::string integrated_dir = build_projection_without_snapshot(
         "topo_snap_integrated_proj", /*set_flag=*/true);
 
-    // Path B (post-hoc — the pre-T4.18 BPT-iterator walker driven via the
-    // test detail hook).
+    // Path B (post-hoc — the legacy BPT-iterator walker driven via the
+    // test detail hook, equivalent to calling build_topology_snapshots_for_test
+    // after flush() without the integrated flag set).
     const std::string posthoc_dir = build_projection_without_snapshot(
         "topo_snap_posthoc_proj", /*set_flag=*/false);
 
@@ -431,9 +433,9 @@ TEST(NativeProjectionBuilderTopologySnapshot,
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Spec #19 — parallel vs sequential byte-identity. Builds the same fixture
-// twice through the integrated mmap path: once with the parallel snapshot
-// builder enabled (default), once with MDB_PROJECTION_PARALLEL_SNAPSHOT=0.
+// Parallel-snapshot-builder vs sequential byte-identity. Builds the same
+// fixture twice through the integrated mmap path: once with the parallel
+// snapshot builder enabled (default), once with MDB_PROJECTION_PARALLEL_SNAPSHOT=0.
 // Both `topology_fwd.csr` and `topology_rev.csr` must hash identically;
 // any divergence indicates a partition-boundary off-by-one or an output
 // reordering across worker boundaries.
@@ -474,7 +476,8 @@ TEST(NativeProjectionBuilderTopologySnapshot,
             << " sequential=" << b_bytes.size();
         EXPECT_EQ(a_bytes, b_bytes)
             << basename << " bytes differ between parallel and sequential "
-               "snapshot builders — Spec #19 partition output reorder bug";
+               "snapshot builders — partition output reorder bug in the "
+               "parallel snapshot builder";
     }
 }
 

@@ -315,7 +315,7 @@ TEST_F(PackedBatchTest, ReadEmptyBatch) {
     EXPECT_EQ(nodes, 0u);
 }
 
-// Fix C3: Verify ALL values after close+reopen, not just out[0] and out[5]
+// Verify ALL values after close+reopen, not just the first and last elements
 TEST_F(PackedBatchTest, PersistsAcrossOpenClose) {
     const uint64_t N = 3, D = 2;
     std::vector<float> data = {1,2, 3,4, 5,6};
@@ -493,7 +493,7 @@ TEST_F(PackedBatchTest, ConcurrentReads) {
     EXPECT_EQ(errors.load(), 0u);
 }
 
-// Fix #6: Concurrent reads on the SAME batch (true contention test)
+// Concurrent reads on the SAME batch from multiple threads (true contention test)
 TEST_F(PackedBatchTest, ConcurrentReadsSameBatch) {
     const uint64_t D = 4, N = 100;
     auto dir = test_path("concurrent_same");
@@ -529,7 +529,7 @@ TEST_F(PackedBatchTest, ConcurrentReadsSameBatch) {
 // Additional edge cases (from review)
 // ===========================================================================
 
-// Fix #7: Dtype mismatch between writer and reader
+// Dtype mismatch between writer (FLOAT32) and reader (FLOAT64) must throw
 TEST_F(PackedBatchTest, ReaderDtypeMismatchThrows) {
     auto dir = test_path("dtype_mismatch");
     PackedBatchWriter writer(dir, 4, GnnDtype::FLOAT32);
@@ -578,7 +578,7 @@ TEST_F(PackedBatchTest, EmptyBatchInMiddle) {
     EXPECT_FLOAT_EQ(out[0], 5.0f);
 }
 
-// Fix #8: read_header() out-of-bounds directly
+// read_header() must throw std::out_of_range for batch ids beyond the declared count
 TEST_F(PackedBatchTest, ReadHeaderOutOfBoundsThrows) {
     auto dir = test_path("header_oob");
     PackedBatchWriter writer(dir, 4, GnnDtype::FLOAT32);
@@ -590,7 +590,7 @@ TEST_F(PackedBatchTest, ReadHeaderOutOfBoundsThrows) {
     EXPECT_THROW(reader.read_header(999), std::out_of_range);
 }
 
-// Fix #14: INT64 dtype roundtrip
+// INT64 dtype roundtrip: values including negatives must survive write+read unchanged
 TEST_F(PackedBatchTest, WriteAndReadInt64) {
     const uint64_t N = 3, D = 2;
     std::vector<int64_t> data = {-100, 200, -300, 400, -500, 600};
@@ -607,7 +607,7 @@ TEST_F(PackedBatchTest, WriteAndReadInt64) {
     }
 }
 
-// Fix #15: Reserved bytes — non-zero reserved bytes are accepted (forward-compat)
+// Reserved bytes — non-zero reserved bytes must be accepted for forward compatibility
 TEST_F(PackedBatchTest, HeaderNonZeroReservedBytesAccepted) {
     auto h = PackedBatchHeader::make(10, 128, GnnDtype::FLOAT32);
     h.reserved[0] = 0xFF;
@@ -615,7 +615,7 @@ TEST_F(PackedBatchTest, HeaderNonZeroReservedBytesAccepted) {
     EXPECT_TRUE(h.is_valid()) << "is_valid() should accept non-zero reserved bytes for forward compatibility";
 }
 
-// Fix #16a: Empty assignments (0 batches)
+// Empty assignment list (0 batches): directory is created but no batch files are written
 TEST_F(PackedBatchTest, GenerateEmptyAssignments) {
     const uint64_t N = 5, D = 2;
     std::vector<float> features(N * D, 1.0f);
@@ -631,7 +631,7 @@ TEST_F(PackedBatchTest, GenerateEmptyAssignments) {
     EXPECT_FALSE(fs::exists(packed_dir / "batch_000000.bin"));
 }
 
-// Fix #16b: Re-read same batch (idempotency)
+// Re-reading the same batch twice must return identical data (idempotency)
 TEST_F(PackedBatchTest, ReReadSameBatch) {
     const uint64_t N = 5, D = 3;
     std::vector<float> data(N * D);
@@ -652,7 +652,7 @@ TEST_F(PackedBatchTest, ReReadSameBatch) {
     }
 }
 
-// Fix #16c: Large batch_id (>999999) filename correctness
+// Large batch_id (>999999) filename correctness: format string widens past 6 digits
 TEST_F(PackedBatchTest, LargeBatchIdFilename) {
     auto dir = test_path("large_id");
     PackedBatchWriter writer(dir, 2, GnnDtype::FLOAT32);
@@ -692,7 +692,7 @@ TEST_F(PackedBatchTest, LargeBatchIdFilename) {
     EXPECT_EQ(out[1], 8.0f);
 }
 
-// Fix #5 (test): Reader rejects feature_dim=0
+// Reader must reject feature_dim=0 with std::invalid_argument at construction
 TEST_F(PackedBatchTest, ReaderFeatureDimZeroThrows) {
     auto dir = test_path("reader_dim0");
     fs::create_directories(dir);
@@ -767,13 +767,13 @@ TEST_F(PackedBatchTest, ReaderSkipsOidTableCorrectly) {
 }
 
 // ===========================================================================
-// Spec B1 (2026-04-27): partitioned packer functional equivalence with classic
+// Partitioned packer: functional equivalence with the classic (sequential) packer
 // ===========================================================================
 //
-// The partitioned packer (post-B1-fix) writes rows in PARTITION ITERATION
-// ORDER, not sample-input order. That breaks bit-identity with the classic
-// packer, but preserves the multiset of feature rows per batch. The test
-// compares the multisets row-by-row to verify functional equivalence.
+// The partitioned packer writes rows in PARTITION ITERATION ORDER, not
+// sample-input order. That breaks bit-identity with the classic packer, but
+// preserves the multiset of feature rows per batch. The tests below compare
+// the multisets row-by-row to verify functional equivalence.
 
 namespace {
 
@@ -947,12 +947,14 @@ TEST_F(PackedBatchTest, Partitioned_PartitionSmallerThanSingleRow) {
 }
 
 // ===========================================================================
-// DiskGNN-adoption Plan 1: consolidated cold-feature file (Phase 1.1)
+// Consolidated cold-feature file (consolidated.slim): round-trip correctness
 // ===========================================================================
 
-// The consolidated file's per-batch payload must be byte-identical to the
-// per-batch .bin data section, at a 4096-aligned offset, with v2 stale-rejection
-// fingerprints stamped in the header. Empty batches occupy zero payload bytes.
+// The consolidated file concatenates per-batch feature payloads into a single
+// file at 4096-aligned offsets, with permutation fingerprint and meta SHA-256
+// in the header for stale-rejection. Each per-batch payload must be byte-identical
+// to the data section of the corresponding per-batch .bin file. Empty batches
+// occupy zero payload bytes.
 TEST_F(PackedBatchTest, ConsolidatedRoundTrip) {
     const uint64_t N = 64, D = 4;
     std::vector<float> features(N * D);

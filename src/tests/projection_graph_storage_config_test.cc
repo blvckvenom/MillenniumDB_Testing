@@ -1,9 +1,17 @@
-// Unit tests for the Spec #8 T8.8 end-to-end plumbing of the
-// `graphStorage` GQL config key. Covers:
+// Unit tests for the end-to-end plumbing of the `graphStorage` GQL config
+// key, which selects between two edge-index storage modes:
+//   BTREE      (byte 1) — legacy per-index B+Tree; leaf encoding follows
+//              `leafFormat` (BITSET or DELTA_VARINT).
+//   CSR_HYBRID (byte 2) — edge-index B+Tree leaves ARE the CSR layout; the
+//              FROM_TO_EDGE and TO_FROM_EDGE indexes emit v3 leaves whose
+//              header + offset table + DELTA_VARINT dst stream provide O(1)
+//              neighbor access without a separate topology sidecar file.
 //
+// Covers:
 //   1. GraphStorageConfig_Absent_DefaultsBTree      — default builder ctor
 //      path + catalog roundtrip leave graph_storage == 1 (BTREE), matching
-//      pre-Spec-#8 byte-for-byte behavior.
+//      pre-CSR-hybrid byte-for-byte behavior on projections that omit the
+//      `graphStorage` key.
 //   2. GraphStorageConfig_CSRHybrid_Accepted        — parse_graph_storage
 //      returns CSR_HYBRID; persisting with ProjectionCatalog round-trips
 //      the v1.6 byte as 2.
@@ -17,8 +25,9 @@
 //      (the closest stand-in reachable without a live DictionaryObject).
 //   5. GraphStorageConfig_Roundtrip_ViaStorage      — populate a catalog
 //      with CSR_HYBRID, save, reload through ProjectionCatalog, assert the
-//      byte round-trips. Mirrors the storage-level accessor that T8.9 will
-//      consume (ProjectionStorage::requested_graph_storage).
+//      byte round-trips. Mirrors the storage-level accessor that
+//      ProjectionStorage::requested_graph_storage exposes to choose the
+//      correct edge-index writer at build time.
 //
 // As with projection_leaffmt_config_test.cc, reaching a live builder + full
 // System + QueryContext boot from a unit test is overkill for the
@@ -26,9 +35,6 @@
 // pin the on-disk byte contract that save_catalog() writes and the end-to-
 // end smoke test (config → builder → catalog byte) is covered by the
 // project_procedure.cc instrumentation plus the integration suite.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.7
-// Plan reference: docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md §T8.8
 
 #include <cstdint>
 #include <filesystem>
@@ -99,9 +105,10 @@ void populate_minimum(GQL::ProjectionCatalog& cat,
 
 // ============================================================================
 // Test 1: Absent `graphStorage` key leaves the projection at the BTREE
-// default. Pins the on-disk invariant that pre-Spec-#8 builds continue to
-// produce: when the GQL caller does not set the key, the catalog records
-// BTREE (byte 1) at the v1.6 graph_storage slot.
+// default. Pins the on-disk invariant that projections built without the
+// CSR-hybrid mode continue to produce: when the GQL caller does not set
+// the key, the catalog records BTREE (byte 1) at the v1.6 graph_storage
+// slot.
 // ============================================================================
 TEST(GraphStorageConfig, Absent_DefaultsBTree) {
     const auto dir = make_tempdir("Absent_DefaultsBTree");
@@ -129,7 +136,9 @@ TEST(GraphStorageConfig, Absent_DefaultsBTree) {
 // threaded all the way to the on-disk v1.6 catalog byte.
 // ============================================================================
 TEST(GraphStorageConfig, CSRHybrid_Accepted) {
-    // Parser layer — mirrors what project_procedure.cc's T8.8 block does.
+    // Parser layer — mirrors what project_procedure.cc's graphStorage
+    // parsing block does when it calls parse_graph_storage on the value
+    // extracted from the GQL config map.
     const auto parsed = BPT::parse_graph_storage("CSR_HYBRID");
     ASSERT_EQ(parsed, BPT::GraphStorage::CSR_HYBRID);
 
@@ -199,10 +208,11 @@ TEST(GraphStorageConfig, NonString_Rejected) {
 // ============================================================================
 // Test 5: Structural invariant — a catalog saved with CSR_HYBRID and then
 // reopened reports the same byte through every accessor. This guards the
-// contract that T8.9 relies on when it reads ProjectionStorage::
-// requested_graph_storage to pick the edge-index writer. The invariant
-// holds across IndexSet presets because the v1.6 graph_storage byte is a
-// single per-projection slot (not per-index), unlike leaf_formats.
+// contract that ProjectionStorage::requested_graph_storage relies on when
+// it reads the catalog to choose the correct edge-index writer (BTREE vs
+// CSR-hybrid v3 leaves) at build time. The invariant holds across IndexSet
+// presets because the v1.6 graph_storage byte is a single per-projection
+// slot (not per-index), unlike leaf_formats.
 // ============================================================================
 TEST(GraphStorageConfig, Roundtrip_ViaStorage) {
     // Parser contract — exactly two valid values.

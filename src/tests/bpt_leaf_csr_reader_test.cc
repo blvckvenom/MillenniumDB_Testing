@@ -1,15 +1,17 @@
-// Unit tests for the v3 CSR_HYBRID B+Tree leaf reader (Spec #8 T8.4).
+// Unit tests for the v3 CSR-hybrid B+Tree leaf reader (CSR-hybrid graph
+// storage: edge-index B+Tree leaves encode the full CSR layout directly,
+// enabling O(1) neighbor slicing without a separate sidecar file).
 //
 // Scope: ReadTag constructor (header + offset-table validation per design
 // §5.5), find_src_entry binary search, get_dst_at sequential + random-access
 // decoding with cursor cache, is_chain_head accessor, and the BPTLeafBase<N>
 // contract methods (get_record linear-scan + search_index).
 //
-// Since T8.5's writer does not yet exist, test pages are hand-synthesized:
-// write the 16-byte header, then the uint16 offset table, then for each src
-// entry [src_id varint, degree varint, dst0 full varint, dst1..dstk-1
-// zigzag-delta varints]. Reuses BPT::varint_encode + BPT::zigzag_encode_i64
-// from Spec #5 T5.4/T5.5.
+// Since the v3 CSR leaf writer is not yet implemented, test pages are
+// hand-synthesized: write the 16-byte header, then the uint16 offset table,
+// then for each src entry [src_id varint, degree varint, dst0 full varint,
+// dst1..dstk-1 zigzag-delta varints]. Reuses BPT::varint_encode +
+// BPT::zigzag_encode_i64 from the delta + LEB128-varint leaf encoding layer.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
 //   §3.1 (D1 layout), §3.3 (D3 offset table), §3.5 (D5 varint composition),
@@ -54,16 +56,16 @@ struct AlignedPageBuffer {
 };
 
 // ----------------------------------------------------------------------------
-// Synthetic CSR page builder (T8.5 writer does not exist yet).
+// Synthetic CSR page builder (the v3 CSR leaf writer is not yet implemented).
 //
 // Emits the v3 chain-head layout per design §5.1: 16-byte header,
 // uint16 offset_table[value_count], then per-src entry
 // [src_id varint, degree varint, dst0 full varint, dst1..zigzag-delta varints].
 //
 // This helper does NOT support has_edge_ids (flags bit 1) or chain
-// continuation (flags bit 0) — those are covered by T8.5 writer tests
+// continuation (flags bit 0) — those are covered by writer-side tests
 // once the writer lands. Simulating chain-head metadata is sufficient
-// for the tests specified in the T8.4 brief.
+// for the reader-contract tests in this file.
 // ----------------------------------------------------------------------------
 struct SrcEntry {
     uint64_t src_id;
@@ -455,8 +457,10 @@ TEST(BPTLeafCSRReader, GetRecord_IteratesAllTuples) {
         const auto r = reader.get_record(pos);
         EXPECT_EQ(r[0], expected[pos].first)  << "at pos " << pos;
         EXPECT_EQ(r[1], expected[pos].second) << "at pos " << pos;
-        // Edge_id is 0 in T8.4 read path (flags bit 1 has_edge_ids path is
-        // scope of T8.5+; design §3.4 comment in decode_tuple_).
+        // Edge_id is 0 when the kHasEdgeIds flag bit (flags bit 1) is clear,
+        // which is the case for all pages built by this test helper. Pages
+        // with edge ids are covered by the hub-chain and continuation tests
+        // below (design §3.4, decode_tuple_).
     }
 }
 
@@ -617,9 +621,11 @@ TEST(BPTLeafCSRReader, OffsetTable_PointsPastPageEnd_Rejected) {
 }
 
 // ============================================================================
-// T8-B.1 Bug-A: physical_degrees_ reflects varints actually on the page, NOT
-// the stored header degree (which for hub chain-heads is the total chain
-// size). The reader must refuse to iterate past the physical count.
+// Bug fix (hub chain-head physical degree): physical_degrees_ reflects the
+// number of destination varints actually serialized on the page, NOT the
+// stored header degree (which for hub chain-heads is the total chain size
+// spanning multiple continuation pages). The reader must refuse to iterate
+// past the physical count.
 // ============================================================================
 
 namespace {
@@ -787,8 +793,10 @@ TEST(BPTLeafCSRReader, PhysicalDegrees_BoundaryAtNextEntry) {
 }
 
 // ============================================================================
-// T8-B.1 Bug-B: ContinuationTag ctor opens continuation pages directly and
-// decodes their zigzag-delta varint stream against the carry-over dst.
+// Bug fix (ContinuationTag constructor): the ContinuationTag ctor opens
+// continuation pages directly and decodes their zigzag-delta varint stream
+// against the carry-over destination value (prev_dst_carry) passed by the
+// chain traversal caller.
 // ============================================================================
 
 namespace {
@@ -877,8 +885,8 @@ TEST(BPTLeafCSRReader, ContinuationTag_InheritsNextLeafAndHasNext) {
 }
 
 TEST(BPTLeafCSRReader, ContinuationTag_ReadTagStillRejectsContinuationPage) {
-    // Regression: Bug-B's fix MUST NOT weaken the ReadTag ctor — directory-
-    // routed opens still must not land on continuations.
+    // Regression: the ContinuationTag fix MUST NOT weaken the ReadTag ctor —
+    // directory-routed opens still must not land on continuation pages.
     std::vector<uint64_t> dsts = {100};
     auto page = build_synthetic_continuation(50, dsts);
     EXPECT_THROW(
@@ -887,15 +895,21 @@ TEST(BPTLeafCSRReader, ContinuationTag_ReadTagStillRejectsContinuationPage) {
 }
 
 // ============================================================================
-// Spec #8-B task #1 (hub completion) — reader-side tests
+// Hub chain-head completion — reader-side tests
 //
-// Validate that:
-//   (1) ChainHead ctor rejects kIsHubChainHead without kHasEdgeIds.
-//   (2) ChainHead ctor rejects kIsHubChainHead with value_count != 1.
-//   (3) Continuation ctor decodes a parallel eid stream when the
-//       continuation page advertises kHasEdgeIds, using prev_eid_carry.
+// The CSR-hybrid storage persists edge ids parallel to the destination stream
+// so that count(e) queries over CSR-hybrid projections return correct counts.
+// These tests validate that:
+//   (1) ChainHead ctor rejects kIsHubChainHead without kHasEdgeIds (edge ids
+//       must be present for hub chain-head pages; a hub without edge ids is a
+//       malformed page).
+//   (2) ChainHead ctor rejects kIsHubChainHead with value_count != 1 (each
+//       hub chain-head page holds exactly one src entry).
+//   (3) Continuation ctor decodes a parallel edge-id stream when the
+//       continuation page advertises kHasEdgeIds, using prev_eid_carry as the
+//       running zigzag-delta base.
 //   (4) Continuation ctor returns eid=0 when the page does NOT advertise
-//       kHasEdgeIds (legacy fallback preserved).
+//       kHasEdgeIds (legacy fallback for projections built without edge ids).
 // ============================================================================
 
 namespace {
@@ -1091,7 +1105,8 @@ TEST(BPTLeafCSRReader, ContinuationTag_DecodesEidStream) {
 
 TEST(BPTLeafCSRReader, ContinuationTag_NoEdgeIdsFlag_ReturnsZeroEid) {
     // Legacy continuation page (no kHasEdgeIds bit) must still produce
-    // eid=0 — preserves the ADR 008 fallback for pre-Spec-#8-B projections.
+    // eid=0 — preserves backwards compatibility for projections built before
+    // edge-id persistence was added to the CSR-hybrid leaf format.
     std::vector<uint64_t> dsts = {100, 110};
     auto page = build_synthetic_continuation(50, dsts);  // no eids
     BPTLeafCSR<3> reader(page.data(),

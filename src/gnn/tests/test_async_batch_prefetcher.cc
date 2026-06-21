@@ -1,10 +1,12 @@
 // =============================================================================
-// Spec C3 stage 1 (2026-05-07): AsyncBatchPrefetcher unit tests.
+// AsyncBatchPrefetcher unit tests.
 //
-// Verifies the producer-consumer queue contract with a real BatchAssembler
+// Verifies the producer-consumer queue contract implemented by
+// AsyncBatchPrefetcher, which overlaps each batch's assemble+transfer with
+// the previous batch's model forward+backward. Tests use a real BatchAssembler
 // over the synthetic 8-node fixture from training_loop_test_fixture.h.
-// Tests do NOT exercise the training loop — that integration is gated by
-// stage 1.B in the C3 plan.
+// Tests do NOT exercise the full training loop — only the prefetcher's
+// queue semantics (ordering, backpressure, shutdown, error propagation).
 // =============================================================================
 
 #include <gtest/gtest.h>
@@ -253,8 +255,10 @@ TEST_F(AsyncBatchPrefetcherTest, ZeroQueueSize_Rejected) {
 }
 
 // -----------------------------------------------------------------------------
-// Spec C3 stage 3 module 4 tests: prefetcher with use_cuda_streams=true
-// records a CUDAEvent into MiniBatch.ready_event.
+// CUDA stream integration tests: prefetcher with use_cuda_streams=true
+// runs assembly on a dedicated pool stream and records a CUDAEvent into
+// MiniBatch.ready_event so the consumer's train stream can block on it
+// before reading the assembled tensors.
 // -----------------------------------------------------------------------------
 
 #ifdef ENABLE_CUDA_ASSEMBLER
@@ -399,7 +403,12 @@ TEST_F(AsyncBatchPrefetcherTest, Destructor_CleanShutdown_WithBatchesInFlight) {
 }
 
 // -----------------------------------------------------------------------------
-// Round 3B (2026-05-15): multi-worker AsyncBatchPrefetcher.
+// Multi-worker AsyncBatchPrefetcher tests: each worker owns a per-worker
+// DirectIoReader and pinned host buffer so that prefetchNumWorkers > 1
+// works correctly with the Four-Level Feature Store (L1 GPU / L2 pinned
+// CPU / L3 on-disk / L4 packed per-batch) without serializing on a single
+// shared reader. Verifies construction constraints, FIFO order preservation,
+// bit-identical output vs. the single-worker path, and error propagation.
 // -----------------------------------------------------------------------------
 
 // Test 9: num_workers=0 is rejected at construction.

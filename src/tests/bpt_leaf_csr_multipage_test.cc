@@ -1,10 +1,14 @@
-// End-to-end multi-page test for the T8-B.1 fix (Spec #8-B).
+// End-to-end multi-page test for the CSR-hybrid graph storage bug fixes that
+// resolved three composed defects: the reader was inflating total_tuples_ for
+// hub nodes, the ContinuationTag constructor was missing, and the writer was
+// breaking the leaf chain for hubs that span multiple pages.
 //
 // This test exercises the integration between BPTLeafCSRWriter<N> (which
 // emits the hub chain-head + continuation pages), BPTLeafCSR<N>::ReadTag
 // (which opens chain-head pages via the original path), and
-// BPTLeafCSR<N>::ContinuationTag (the new T8-B.1 ctor that opens
-// continuation pages as a BPTLeafBase<N> view).
+// BPTLeafCSR<N>::ContinuationTag (the constructor that opens continuation
+// pages as a BPTLeafBase<N> view, carrying over the src_id and prev_dst
+// from the preceding chain-head or continuation page).
 //
 // Scenarios:
 //   1. Three srcs in order: non-hub, hub, non-hub. Full-file scan returns
@@ -94,7 +98,7 @@ simulate_full_scan(const std::vector<char>& bytes, uint32_t num_pages)
     uint32_t page = 0;
     uint64_t carry_src_id   = 0;
     uint64_t carry_prev_dst = 0;
-    uint64_t carry_prev_eid = 0;  // Spec #8-B hub completion
+    uint64_t carry_prev_eid = 0;  // carry-over edge_id for hub continuation pages (CSR-hybrid multi-page hub support)
     bool have_carry         = false;
 
     while (page < num_pages) {
@@ -367,8 +371,10 @@ TEST(BPTLeafCSRMultipage, HubAdjacency_ContinuationReconstruction)
 }
 
 // ============================================================================
-// Spec #8-B task #1 (hub completion) — full-scan with edge_ids on a
-// hub + continuations reproduces every (src, dst, eid) triple in order.
+// CSR-hybrid hub completion: full-scan with edge_ids on a hub that spans
+// multiple continuation pages reproduces every (src, dst, eid) triple in
+// order. This validates that edge_ids are correctly persisted alongside dst
+// values in the chain-head and all continuation pages.
 // ============================================================================
 
 TEST(BPTLeafCSRMultipage, HubAdjacency_WithEdgeIds_FullScanRoundtrip)

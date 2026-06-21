@@ -1,4 +1,8 @@
-// Unit tests for TopologySnapshotWriter (Spec #4-B, T4.4).
+// Unit tests for TopologySnapshotWriter.
+//
+// TopologySnapshotWriter produces mmap-backed CSR sidecar files
+// (topology_fwd.csr / topology_rev.csr) that enable O(1) neighbor slices
+// for GNN sampling, replacing O(log N) B+Tree lookups.
 //
 // Scope:
 //   - Header byte values in finalized file (magic / version / flags / counts).
@@ -8,7 +12,7 @@
 //   - Atomic commit: `.tmp` absent after finalize, final present.
 //   - `has_edge_ids` flag + EDGE_IDS section round-trip.
 //
-// What is NOT tested here (deferred to T4.5/T4.10):
+// What is NOT tested here (covered by the reader and integration test suites):
 //   - mmap + slice access via the reader.
 //   - Staleness rejection on hash / size mismatch.
 //   - Parallel reader safety.

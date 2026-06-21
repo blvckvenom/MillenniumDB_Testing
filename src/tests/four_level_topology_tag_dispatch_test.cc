@@ -1,6 +1,6 @@
 // four_level_topology_tag_dispatch_test.cc
 //
-// Spec #13 regression test — verifies that the FourLevelTopologyStore's
+// Four-Level Topology Store regression test — verifies that the FourLevelTopologyStore's
 // Phase 3 ctor + production dispatch path correctly handles ObjectIds whose
 // 8-bit type tag is non-zero (the production case: real GQL projections
 // store nodes as `(MASK_NODE | row_idx)`, not raw `row_idx`).
@@ -16,9 +16,10 @@
 // BPT-direct path — emitting the
 //     "[FourLevelTopologyStore] WARNING: ObjectId.id=… exceeds
 //      tier_lookup_ size=… - falling through to L4."
-// log line and defeating the entire cache hierarchy. The Phase 6 bench
-// (`scripts/bench_four_level_topology.sh`) measured the symptom as
-// spec13-mode sample wall clock 6-8× the spec11/caminoD/bpt baseline.
+// log line and defeating the entire cache hierarchy. The four-level topology
+// store benchmark (`scripts/bench_four_level_topology.sh`) measured the symptom
+// as the four-level store's sample wall clock running 6-8× slower than the
+// in-memory adjacency cache, CSR sidecar, and direct B+Tree baselines.
 //
 // The fix masks the type tag at row_lookup_ time:
 //     `row_lookup_ = [](ObjectId v) { return v.get_value(); };`

@@ -1,12 +1,15 @@
-// Unit tests for the v3 CSR_HYBRID B+Tree leaf header format (Spec #8 T8.3).
+// Unit tests for the v3 CSR_HYBRID B+Tree leaf header format.
+//
+// CSR_HYBRID is a graph storage mode in which the edge-index B+Tree leaves
+// ARE the CSR layout: each leaf page carries a 16-byte header followed by
+// a delta + LEB128-varint-encoded destination stream, so neighbor access
+// for GNN sampling is O(1) per page rather than O(log N) per lookup.
 //
 // Scope: enum identity, header size contract, serialize/deserialize round
 // trip for both the chain-head and continuation views, byte-position
 // invariants (format byte at offset 0, flags byte at offset 2), and the
 // is_csr_continuation flag-sniff helper. Reader/writer behavior and the
-// page-level dispatch are out of scope (T8.4-T8.6).
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
+// page-level dispatch are covered by the reader and writer test suites.
 
 #include <cstdint>
 #include <cstring>
@@ -126,7 +129,7 @@ TEST(BPTLeafCSRFormat, FormatVersionByteIsFirst_BothVariants) {
 TEST(BPTLeafCSRFormat, IsCSRContinuation_Detects_Flag) {
     // Hand-craft a 16-byte buffer whose flags byte is the only thing that
     // changes; verify the sniff returns the expected bool. This pins the
-    // dispatch contract used by T8.6.
+    // dispatch contract used by the page-level CSR leaf dispatcher.
     uint8_t buf[16] = {};
     buf[0] = 3;  // format_version
     buf[1] = 3;  // record_width
@@ -146,9 +149,11 @@ TEST(BPTLeafCSRFormat, IsCSRContinuation_Detects_Flag) {
 }
 
 TEST(BPTLeafCSRFormat, ParseLeafFormat_CSR_HYBRID_Returns3) {
-    // The enum extension landed alongside this format header — verify the
-    // catalog parser surface accepts the new literal and yields the right
-    // numeric value. Spec #5 BITSET / DELTA_VARINT remain unchanged.
+    // The CSR_HYBRID enum value was added alongside this format header —
+    // verify the catalog parser accepts the new literal and yields the right
+    // numeric value. The earlier BITSET and DELTA_VARINT leaf encodings
+    // (delta + LEB128-varint compression) remain unchanged at their existing
+    // numeric values.
     EXPECT_EQ(BPT::parse_leaf_format("CSR_HYBRID"),
               BPT::LeafFormat::CSR_HYBRID);
     EXPECT_EQ(static_cast<uint8_t>(BPT::parse_leaf_format("CSR_HYBRID")),
@@ -163,9 +168,10 @@ TEST(BPTLeafCSRFormat, LeafFormatToString_CSR_HYBRID_Returns_Literal) {
 }
 
 TEST(BPTLeafCSRFormat, ParseLeafFormat_CaseSensitive_RejectsLowercase) {
-    // The parser is case-sensitive by design (matches Spec #5 contract);
-    // lowercased / mixed-case variants of the new literal must throw,
-    // mirroring the BITSET / DELTA_VARINT behaviour pinned in T5.3.
+    // The parser is case-sensitive by design, consistent with the BITSET and
+    // DELTA_VARINT literals; lowercased or mixed-case variants of CSR_HYBRID
+    // must throw, mirroring the behaviour already pinned for the earlier
+    // leaf-format names.
     EXPECT_THROW(BPT::parse_leaf_format("csr_hybrid"),
                  std::invalid_argument);
     EXPECT_THROW(BPT::parse_leaf_format("Csr_Hybrid"),
@@ -175,7 +181,7 @@ TEST(BPTLeafCSRFormat, ParseLeafFormat_CaseSensitive_RejectsLowercase) {
 }
 
 TEST(BPTLeafCSRFormat, ChainHeader_FlagsByteIsAtOffset2) {
-    // The page-open dispatch (T8.6) reads byte 2 to decide chain-head vs
+    // The page-open dispatcher reads byte 2 to decide chain-head vs
     // continuation. Pin the offset so any future struct reordering is
     // caught in this format-only test rather than at integration time.
     BPT::BPTLeafCSRHeader h{};
@@ -189,15 +195,15 @@ TEST(BPTLeafCSRFormat, ChainHeader_FlagsByteIsAtOffset2) {
     EXPECT_EQ(buf[2], 0xA5u);
 
     // Round-trip preserves the byte even though kReservedMask bits are set;
-    // semantic validation belongs to the reader (T8.4), not the format layer.
+    // semantic validation belongs to the CSR leaf reader, not the format layer.
     BPT::BPTLeafCSRHeader out = BPT::deserialize_csr_header(buf);
     EXPECT_EQ(out.flags, 0xA5u);
 }
 
 TEST(BPTLeafCSRFormat, FlagConstants_HaveExpectedBitPositions) {
-    // Pin the wire-level bit positions — call sites under T8.4-T8.6 will
-    // depend on these values. A future reshuffle must update both the
-    // constants and this test deliberately.
+    // Pin the wire-level bit positions — the CSR leaf reader, writer, and
+    // page-level dispatcher all depend on these values. A future reshuffle
+    // must update both the constants and this test deliberately.
     EXPECT_EQ(BPT::CSRHybridFlags::kIsContinuation,  0x01u);
     EXPECT_EQ(BPT::CSRHybridFlags::kHasEdgeIds,      0x02u);
     EXPECT_EQ(BPT::CSRHybridFlags::kIsHubChainHead,  0x04u);

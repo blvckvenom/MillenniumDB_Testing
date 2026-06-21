@@ -1,11 +1,12 @@
-// Unit tests for the BPTLeafV2 write-path encoder (Spec #5 T5.7).
+// Unit tests for the BPTLeafV2 write-path encoder (delta + LEB128-varint
+// B+Tree leaf compression).
 //
 // Scope: append_record + flush byte-for-byte determinism against the
 // hand-computed examples in design doc §5.3, overflow handling, next_leaf
 // round-trip through the 16-byte header, padding invariants, and flush
 // idempotency. The read path (get_record, search_index, etc.) is stubbed
-// in the writer and is NOT exercised here — those stubs become real code
-// in T5.8 with their own test file.
+// in the writer and is NOT exercised here — those stubs are fully
+// implemented in bpt_leaf_v2_reader_test.cc.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
 //                 (§5.2 layout, §5.3 worked example, §5.4 padding).
@@ -365,11 +366,12 @@ TEST(BPTLeafV2Writer, FlushIdempotent) {
 
 
 // ============================================================================
-// Tests for BPTLeafV2Writer<N> — the BULK-LOAD sibling of BPTLeafWriter<N>
-// (Spec #5 T5.11b). Scope: file-level streaming API that wraps a
-// BPTLeafV2<N> and emits a chained sequence of 4 KB pages on overflow,
-// mirroring BPTLeafWriter's external contract (process_block + make_empty)
-// but record-at-a-time instead of page-at-a-time.
+// Tests for BPTLeafV2Writer<N> — the bulk-load sibling of BPTLeafWriter<N>
+// that uses the delta + LEB128-varint leaf compression format. Scope:
+// file-level streaming API that wraps a BPTLeafV2<N> and emits a chained
+// sequence of 4 KB pages on overflow, mirroring BPTLeafWriter's external
+// contract (process_block + make_empty) but record-at-a-time instead of
+// page-at-a-time.
 // ============================================================================
 
 #include <cstdio>

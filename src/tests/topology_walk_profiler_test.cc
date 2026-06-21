@@ -1,4 +1,9 @@
-// Unit tests for TopologyWalkProfiler (Plan E Phase 0, 2026-05-11).
+// Unit tests for TopologyWalkProfiler — the cold-start topology random-walk
+// profiler that runs degree-weighted Vose-alias random walks over the
+// topology CSR sidecar (mmap, O(1) neighbor slice) to estimate per-node
+// access frequencies and write node_counts.bin before the Four-Level
+// Topology Store (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar /
+// L4 direct B+Tree) is built for the first time.
 //
 // Covers:
 //   1. Empty reader (has_data=false) → empty Result.

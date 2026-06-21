@@ -1,6 +1,6 @@
 // four_level_topology_warm_start_test.cc
 //
-// Spec #13 Phase 5 (T13.2 + T13.11) — warm-start activation tests.
+// Four-Level Topology Store — warm-start activation tests.
 //
 // These tests cover the round-trip between the gnn_offline_sample-side
 // `node_counts.bin` writer (in offline_sampling_engine.cc) and the

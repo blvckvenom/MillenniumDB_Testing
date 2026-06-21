@@ -1,9 +1,16 @@
-// Unit tests for BPTLeafCSRWriter<N> (Spec #8 T8.5).
+// Unit tests for BPTLeafCSRWriter<N>.
+//
+// BPTLeafCSRWriter produces v3 B+Tree leaf pages where the edge-index B+Tree
+// leaves ARE the CSR (Compressed Sparse Row) layout — each page encodes a
+// set of (src, dst, edge_id) tuples grouped by src, with an offset table for
+// O(1) src lookup and a zigzag-delta LEB128-varint dst stream. High-degree
+// src nodes ("hubs") spill across a chain-head page followed by one or more
+// continuation pages linked via next_leaf.
 //
 // Exercises the third bulk-load writer sibling (alongside BPTLeafWriter/V1
 // and BPTLeafV2Writer). Tests are structured as:
 //   1. Run the writer with a synthetic sorted input stream to a temp file.
-//   2. Read the file back as raw bytes and/or via the T8.4 BPTLeafCSR<N>
+//   2. Read the file back as raw bytes and/or via BPTLeafCSR<N>
 //      reader to verify round-trip correctness.
 //   3. Assert on header bytes, offset-table invariants, and chain structure.
 //
@@ -11,8 +18,8 @@
 // hub overflow with 2- and 3-page chains, empty writer, offset-table
 // monotonicity, header byte-level checks, and reader round-trip.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.9,
-//                 §5.1, §5.2.
+// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.9,
+//                   §5.1, §5.2.
 
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 
@@ -110,7 +117,7 @@ decode_all_entries(const std::vector<char>& bytes, std::size_t num_pages)
 
         // Sniff format / flags.
         if (raw[0] != 3) {
-            // Not a v3 page (pre-Spec-#8 makeEmpty or corruption). Skip.
+            // Not a v3 page (makeEmpty placeholder or corruption). Skip.
             ++page;
             continue;
         }
@@ -121,7 +128,7 @@ decode_all_entries(const std::vector<char>& bytes, std::size_t num_pages)
             continue;
         }
 
-        // Chain-head page — use T8.4 reader.
+        // Chain-head page — open with the CSR leaf reader.
         BPTLeafCSR<3> leaf(p, BPTLeafCSR<3>::ReadTag{});
         const uint32_t vc = leaf.src_entry_count();
         for (uint32_t i = 0; i < vc; ++i) {
@@ -767,10 +774,11 @@ TEST(BPTLeafCSRWriterTest, HubReadback_ChainTraversal)
 }
 
 // ============================================================================
-// T8-B.1 Bug-C — last continuation of a hub chain that is FOLLOWED by
-// another src must have next_leaf pointing at the next chain-head page, not
-// 0. Pre-fix the writer emitted next_leaf=0 on the tail continuation and
-// left the leaf chain broken at hub boundaries.
+// Regression: last continuation of a hub chain that is FOLLOWED by another
+// src must have next_leaf pointing at the next chain-head page, not 0.
+// Before the fix, the writer emitted next_leaf=0 on the tail continuation,
+// leaving the leaf chain broken at hub boundaries so subsequent src entries
+// were unreachable via sequential page traversal.
 // ============================================================================
 
 TEST(BPTLeafCSRWriterTest, HubFollowedBySrc_LeafChainContinuous)
@@ -873,14 +881,15 @@ TEST(BPTLeafCSRWriterTest, HubIsLast_LastContinuationNextLeafZero)
 }
 
 // ============================================================================
-// Spec #8-B task #1 — parallel edge_id stream tests.
+// Parallel edge_id stream tests.
 //
-// These exercise the `emit_edge_ids` constructor flag introduced to close
-// the ADR 008 Known-limitation #1 caveat (`edge_id` persisted as zero on
-// CSR_HYBRID). The writer emits a parallel DELTA-zigzag varint chain
-// after every entry's dst chain, and advertises the stream via the
-// header bit `kHasEdgeIds` (0x02). The reader detects the flag and
-// returns real edge_ids through decode_tuple_.
+// These exercise the `emit_edge_ids` constructor flag that enables edge_id
+// persistence in the CSR-hybrid graph storage format. When enabled, the
+// writer emits a parallel zigzag-delta varint chain after every entry's dst
+// chain, and advertises the stream via the header bit `kHasEdgeIds` (0x02).
+// The reader detects the flag and returns real edge_ids through decode_tuple_,
+// so that edge_id-dependent queries (e.g., count(e)) over CSR-hybrid
+// projections return correct results instead of zero.
 // ============================================================================
 
 // Default-disabled: writer keeps legacy behavior unless opted in.
@@ -1012,14 +1021,14 @@ TEST(BPTLeafCSRWriterTest, EdgeIds_Disabled_ReaderReturnsZero)
 }
 
 // ============================================================================
-// Spec #8-B task #1 (hub completion) — edge_ids on hub chain-head + cont
+// Edge_ids on hub chain-head + continuation pages.
 //
-// These exercise the deferred portion of #1: extending the eid stream to
-// hub chain-heads (k_on_head dsts on the chain-head page when the hub spills
-// to continuation pages) AND continuation pages themselves. Pre-fix, the
-// hub chain only carried dsts; eids decoded as zero. After this fix, every
-// edge in a hub adjacency carries its real edge_id, so count(e) over a
-// CSR_HYBRID projection matches BTREE.
+// These exercise the extension of the parallel eid stream to hub chain-heads
+// (k_on_head dsts encoded on the chain-head page when the hub's adjacency
+// spills to continuation pages) AND the continuation pages themselves. Before
+// this fix, hub chains carried only dst values; eids decoded as zero. After
+// the fix, every edge in a hub adjacency carries its real edge_id, so
+// count(e) queries over a CSR-hybrid projection match the B+Tree result.
 // ============================================================================
 
 // Single hub fits on chain-head + 1 continuation, with parallel eids.

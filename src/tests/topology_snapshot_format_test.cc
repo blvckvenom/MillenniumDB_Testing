@@ -2,7 +2,7 @@
 //
 // Scope: header round-trip, magic / version / id_width validation, flag
 // bit preservation, and `sizeof == 64` compile-time contract. File I/O,
-// mmap, and SHA-256 are covered in later tasks (T4.4 writer, T4.5 reader).
+// mmap, and SHA-256 are covered by the topology snapshot writer and reader tests.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
 
@@ -48,8 +48,8 @@ TopologySnapshotHeader make_sentinel_header() {
 // ---------------------------------------------------------------------------
 // sizeof(TopologySnapshotHeader) must be exactly 64 bytes.
 //
-// The header struct is the shared contract between writer (T4.4) and
-// reader (T4.5). Any change that alters its size silently breaks
+// The header struct is the shared contract between the topology snapshot writer and
+// reader. Any change that alters its size silently breaks
 // cross-build compatibility; catch it at compile time AND at test time.
 // ---------------------------------------------------------------------------
 TEST(TopologySnapshotFormat, SizeofIs64Bytes) {
@@ -134,14 +134,16 @@ TEST(TopologySnapshotFormat, BadVersionRejected) {
 }
 
 // ---------------------------------------------------------------------------
-// id_width: 8 (full ObjectId) and 4 (Spec #6 tag-stripped uint32) are valid;
-// every other value is rejected. Catches off-by-one bugs in the validator.
+// id_width: 8 (full 64-bit ObjectId) and 4 (tag-stripped uint32, which strips the
+// 8-bit ObjectId type tag and reconstructs it on read, halving topology size) are
+// valid; every other value is rejected. Catches off-by-one bugs in the validator.
 // ---------------------------------------------------------------------------
 TEST(TopologySnapshotFormat, BadIdWidthRejected) {
     TopologySnapshotHeader src = make_sentinel_header();
     uint8_t buf[kTopologySnapshotHeaderSize] = {};
 
-    // Spec #6: id_width 4 (tag-stripped uint32) is now a VALID width.
+    // id_width 4: tag-stripped uint32 encoding (strips the 8-bit ObjectId type tag,
+    // reconstructs on read, halves topology sidecar size) is a VALID width.
     src.id_width = kTopologySnapshotIdWidthNarrow;  // 4
     serialize_topology_snapshot_header(src, buf);
     EXPECT_NO_THROW(parse_topology_snapshot_header(buf));

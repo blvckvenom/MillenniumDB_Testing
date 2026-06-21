@@ -11,7 +11,8 @@
 //   - Callback absence (default-constructed std::function) is safe.
 //
 // These tests serve double duty:
-//   (a) Validate the resume feature used by Phase 5 auto-checkpointing.
+//   (a) Validate the resume feature used by the automatic best-val/final
+//       checkpointing policy.
 //   (b) Act as regression guards for the callback-every-epoch + strict-greater
 //       is_best fixes.
 // =============================================================================
@@ -338,7 +339,9 @@ TEST_F(TrainingLoopResumeTest, ResumeStartBestValSeedAffectsIsBest)
 // =============================================================================
 // Test 6: ResumeStartPatienceTriggersEarlyStop
 //
-// CRITICAL — directly verifies Fix #1 (callback fires on patience-exhaust epoch).
+// CRITICAL — directly verifies that on_epoch_end fires on the epoch that
+// exhausts patience (the epoch that triggers early stop must still invoke
+// the callback before returning).
 //
 // Setup: start_patience = 4, patience = 5, start_best_val = 1.0 (unbeatable).
 // The single epoch of this invocation cannot improve, so patience_counter
@@ -381,7 +384,7 @@ TEST_F(TrainingLoopResumeTest, ResumeStartPatienceTriggersEarlyStop)
 
     // THE FIX: callback MUST fire on the final patience-exhaustion epoch.
     EXPECT_EQ(cb_count, 1)
-        << "Fix #1 regression: callback failed to fire on the "
+        << "callback-every-epoch regression: callback failed to fire on the "
            "patience-exhaustion epoch.";
     EXPECT_EQ(last_event.patience_counter, 5u);
     EXPECT_FALSE(last_event.is_best);

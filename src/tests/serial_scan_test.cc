@@ -100,8 +100,9 @@ TEST(ScanMode, UnknownValuesFallbackToClassic) {
 }
 
 // Smoke tests for build_one_index's dispatch surface. A full integration
-// test lives in the GQL suite under SERIAL_SCAN=1 (Task 12). These two
-// assertions serve as compile-time and runtime-API checks.
+// test lives in the GQL suite under SERIAL_SCAN=1 (the serialized edge-scan
+// integration test suite). These two assertions serve as compile-time and
+// runtime-API checks.
 
 TEST(BuildOneIndex, DispatcherCompilesForAllEnumerators) {
     // This test exists to verify the switch handles all 14 single-bit
@@ -112,10 +113,11 @@ TEST(BuildOneIndex, DispatcherCompilesForAllEnumerators) {
 }
 
 TEST(BuildOneIndex, ThrowsOnMultiBitMasks) {
-    // Post-Task-4 decomposition made this invariant testable in isolation
-    // for the first time. The default: branch in build_one_index throws
-    // before touching any streaming buffer, so this test exercises the
-    // throw path without needing a fully-populated projection.
+    // After build_one_index was decomposed to accept a single-bit
+    // ProjectionIndex at a time, this invariant became testable in isolation.
+    // The default: branch in build_one_index throws before touching any
+    // streaming buffer, so this test exercises the throw path without needing
+    // a fully-populated projection.
     //
     // Uses the 2-arg ProjectionStorage constructor (no projection_name),
     // which causes save_catalog() to early-return on destruction — keeping
@@ -138,7 +140,7 @@ TEST(BuildOneIndex, ThrowsOnMultiBitMasks) {
 }
 
 // =======================================================================
-// EdgeFilter tests (Spec #2 C1 fix)
+// EdgeFilter tests (counter-keyed membership-bitmap memory fix)
 //
 // EdgeFilter routes kept-bits into per-orientation EdgeKeepBitmaps keyed
 // by the 56-bit counter portion of the ObjectId (ObjectId::VALUE_MASK).
@@ -214,14 +216,14 @@ TEST(ScanEdgesSerialized, ThrowsOnNullFilter) {
     // line of the method body. We can't easily invoke it in isolation from
     // a unit test without the full builder, so we fall back to documenting
     // the contract here (identical to the BuildOneIndex dispatch-compile
-    // smoke test pattern). Task 12's SERIAL_SCAN=1 integration suite will
-    // exercise the positive path end-to-end.
+    // smoke test pattern). The serialized edge-scan integration suite (run
+    // with SERIAL_SCAN=1) exercises the positive path end-to-end.
     SUCCEED() << "scan_edges_impl_serialized_ throws std::logic_error on "
                  "nullptr filter (defensive; Phase B must run before Phase C).";
 }
 
 // =======================================================================
-// EdgeKeepBitmapGpuBatcher tests (Spec #27)
+// EdgeKeepBitmapGpuBatcher tests (GPU-batched edge membership filter)
 //
 // Goal: verify that the GPU-batched membership filter produces a bitmap
 // bit-identical to the historic CPU-only inline lambda from

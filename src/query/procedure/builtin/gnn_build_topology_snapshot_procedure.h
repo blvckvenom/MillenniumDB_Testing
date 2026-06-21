@@ -1,9 +1,11 @@
 #pragma once
 
-// gnn_build_topology_snapshot procedure (Spec #4-B T4.9).
+// gnn_build_topology_snapshot procedure.
 //
-// Post-hoc generator for `topology_fwd.csr` / `topology_rev.csr` sidecar
-// files on a projection that was built without `buildTopologySnapshot: true`.
+// Post-hoc generator for `topology_fwd.csr` / `topology_rev.csr` — the
+// mmap-backed CSR sidecar files that enable O(1) neighbor slicing during
+// GNN sampling — on a projection that was built without
+// `buildTopologySnapshot: true`.
 // Structurally mirrors `gnn_build_feature_store` — open an existing
 // projection, perform a bounded post-processing step, emit YIELD rows — but
 // touches only the projection directory (no FourLevelStore, no samples).
@@ -29,9 +31,9 @@
 //     status yields ('built', 'skipped', or 'failed: <error>') so a remote
 //     client can distinguish IndexSet-skip from a build failure.
 //   * Idempotent: when a sidecar file already exists it is overwritten with
-//     a one-line stderr warning. This matches the T4.4 writer's atomic
-//     `.tmp → rename` contract — the old file is replaced only if the new
-//     one finalizes cleanly.
+//     a one-line stderr warning. This matches the topology-snapshot writer's
+//     atomic `.tmp → rename` contract — the old file is replaced only if the
+//     new one finalizes cleanly.
 //   * Per-direction emission is gated by the active IndexSet mask
 //     (same check as the builder's `build_topology_snapshots_()` in
 //     `native_projection_builder.cc`), so a `READONLY_TRAVERSAL` projection
@@ -39,7 +41,7 @@
 //     just `topology_fwd.csr`.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md §4.2
-// Plan: docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md §T4.9
+// Plan: docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md
 
 #include <cstdint>
 #include <filesystem>

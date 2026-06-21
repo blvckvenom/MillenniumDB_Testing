@@ -787,7 +787,7 @@ TEST_F(FeatureMatrixTest, ConcurrentReadsDoNotCorrupt) {
 }
 
 // ===========================================================================
-// Fix C1: row_as<T> type-size mismatch detection
+// row_as<T> type-size mismatch detection
 // ===========================================================================
 
 // The assert in row_as<T> vanishes in Release. This test documents that
@@ -807,7 +807,7 @@ TEST_F(FeatureMatrixTest, RowAsWrongTypeSizeAsserts) {
 #endif
 
 // ===========================================================================
-// Fix C2: Overflow guard coverage in create() and open()
+// Overflow guard coverage in create() and open()
 // ===========================================================================
 
 TEST(FeatureMatrixHeaderTest, ZeroColsIsInvalid) {
@@ -860,7 +860,7 @@ TEST_F(FeatureMatrixTest, OpenCraftedOverflowHeaderThrows) {
 }
 
 // ===========================================================================
-// Spec #14: Parallel create (multi-thread pwrite into pre-allocated file)
+// Parallel create (multi-thread pwrite into pre-allocated file)
 // ===========================================================================
 
 // Build a deterministic input matrix and verify byte-equality against the

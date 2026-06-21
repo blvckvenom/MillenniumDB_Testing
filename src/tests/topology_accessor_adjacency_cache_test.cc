@@ -1,9 +1,13 @@
 // topology_accessor_adjacency_cache_test.cc
 //
-// Spec #11 unit tests — the in-memory adjacency cache mode of
-// `mdb::gnn::TopologyAccessor`. The cache is opt-in (default off) and is
-// expected to return bit-identical neighbour sets compared to the B+Tree
-// path under a fixed RNG seed. Coverage:
+// Unit tests for the in-memory adjacency cache mode of
+// `mdb::gnn::TopologyAccessor`. The cache is built by performing a single
+// full scan of the from_to_edge and to_from_edge B+Tree indexes and storing
+// every neighbour list in an unordered_map<src, vector<AdjEntry>>, making
+// subsequent get_*_neighbors calls O(1) hash lookups instead of O(log N)
+// B+Tree directory walks. The cache is opt-in (default off) and is expected
+// to return bit-identical neighbour sets compared to the direct B+Tree path
+// under a fixed RNG seed. Coverage:
 //
 //   1. Default state: cache disabled, no entries, no resident bytes.
 //   2. enable_adjacency_cache(true) without prebuild: subsequent
@@ -371,10 +375,12 @@ TEST(TopologyAccessorAdjacencyCache, DisableClearsCache) {
 // ---------------------------------------------------------------------------
 // Test 7 — K-hop sampling parity under fixed RNG seed.
 //
-// Spec #11 must NOT change sampler output under the same seed: the cache
-// stores the same edges the BPT path returns and the sample_layer helper
-// drives both with mt19937_64(42). The cached and the BPT-only iterations
-// must therefore produce identical per-seed neighbour selections.
+// The in-memory adjacency cache must NOT change sampler output under the same
+// seed: the cache stores the same edges the B+Tree path returns (loaded via a
+// single full scan of the from_to_edge / to_from_edge indexes into an
+// unordered_map), and the sample_layer helper drives both paths with
+// mt19937_64(42). The cached and the direct-B+Tree iterations must therefore
+// produce identical per-seed neighbour selections.
 // ---------------------------------------------------------------------------
 TEST(TopologyAccessorAdjacencyCache, KHopSamplingDeterministic) {
     (void)MdbFixture::instance();

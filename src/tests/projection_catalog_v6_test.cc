@@ -1,6 +1,12 @@
-// Unit tests for ProjectionCatalog v1.6 — per-projection graphStorage byte
-// (Spec #8 T8.7). Validates:
+// Unit tests for ProjectionCatalog v1.6 — per-projection graphStorage byte.
 //
+// catalog v1.6 extends the on-disk format with a single trailing uint8 that
+// records which graph storage mode was chosen when the projection was built:
+//   1 = BTREE  — edge-index B+Tree leaves use the standard leaf format
+//   2 = CSR_HYBRID — edge-index B+Tree leaves embed a CSR (Compressed Sparse
+//                    Row) layout so neighbor slices are O(1) without a sidecar
+//
+// This test suite validates:
 //   1. CatalogV6_Roundtrip_DefaultBTree      — default (1 = BTREE) round-trips
 //   2. CatalogV6_Roundtrip_CSRHybrid         — explicit 2 = CSR_HYBRID round-trips
 //   3. CatalogV5_ReadAsV6_DefaultsBTree      — pre-v1.6 catalog defaults to BTREE
@@ -8,14 +14,11 @@
 //   5. CatalogV6_TruncatedGraphStorage_Rejected   — minor=6 but file ends early
 //
 // The "craft a v1.5 file by hand" strategy (Test 3) writes the exact v1.5
-// byte layout that projection_catalog.cc's save() emitted before this task,
-// including the length-prefixed leaf_formats array. This avoids temporarily
-// reverting MINOR_VERSION in-tree just to regenerate fixtures. The offsets
-// for the corruption tests are derived from the v1.6 save() code path and
-// documented inline at each modification site.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.7
-// Plan reference: docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md §T8.7
+// byte layout that projection_catalog.cc's save() emitted before catalog v1.6
+// was introduced, including the length-prefixed leaf_formats array. This avoids
+// temporarily reverting MINOR_VERSION in-tree just to regenerate fixtures. The
+// offsets for the corruption tests are derived from the v1.6 save() code path
+// and documented inline at each modification site.
 
 #include "graph_models/gql/projection/projection_catalog.h"
 

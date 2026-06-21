@@ -1,11 +1,13 @@
-// Unit tests for the v2 B+Tree leaf header format (Spec #5 T5.3).
+// Unit tests for the v2 B+Tree leaf header format (delta + LEB128-varint
+// leaf encoding).
 //
 // Scope: enum identity, header size contract, serialize/deserialize round
 // trip, byte-position invariants (format byte is always at offset 0), and
 // case-sensitive enum parser including the documented error message format.
-// Varint codec / writer / reader behavior is out of scope (T5.4, T5.6+).
+// Varint codec / writer / reader behavior is out of scope (covered by the
+// varint unit tests and the v2 leaf reader/writer tests).
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
+// Design reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
 
 #include <cstdint>
 #include <cstring>

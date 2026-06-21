@@ -134,32 +134,39 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     // analysis doc §3.A for the rationale and safety analysis.
     bool include_label_indexes = true;
     GQL::IndexSet index_set = GQL::IndexSet::ALL;
-    // STEP 3 — track whether the caller explicitly set indexSet, so the
-    // GNN-intent auto-default below only fires when they did NOT.
+    // Track whether the caller explicitly set indexSet, so the GNN-intent
+    // auto-default below only fires when they did NOT.
     bool index_set_explicit = false;
 
-    // Spec #5 T5.11 — user-selectable leaf-page encoding. Defaults to BITSET
-    // (pre-Spec-#5 byte-identical behavior); the config key `leafFormat`
-    // opts the projection into DELTA_VARINT v2 leaves. Threaded through
+    // User-selectable leaf-page encoding for B+Tree indexes. Defaults to BITSET
+    // (legacy redundant-byte-bitset format, byte-identical to pre-compression
+    // behavior); the config key `leafFormat` opts the projection into
+    // DELTA_VARINT v2 leaves, which encode each record as delta + LEB128 varints
+    // and achieve ~80% size reduction on edge indexes. Threaded through
     // NativeProjectionBuilder -> ProjectionStorage -> per-index BPlusTree
     // readers, and persisted per materialized index in catalog v1.5.
     BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET;
 
-    // Spec #8 T8.8 — user-selectable per-projection graph-storage mode.
-    // Defaults to BTREE (pre-Spec-#8 byte-for-byte behavior); the config
-    // key `graphStorage` opts the projection into CSR_HYBRID edge leaves.
-    // Threaded through NativeProjectionBuilder -> ProjectionStorage into
-    // the v1.6 catalog byte. T8.8 plumbs the value only — the build
-    // pipeline still emits BTREE leaves regardless; T8.9 wires the actual
-    // CSR leaf writer into the edge-index sorter dispatch.
+    // User-selectable graph-storage mode for edge indexes. Defaults to BTREE
+    // (legacy per-index B+Tree, byte-for-byte identical to prior behavior);
+    // the config key `graphStorage: 'CSR_HYBRID'` opts the projection into
+    // CSR-hybrid edge leaves where the B+Tree leaf pages themselves encode the
+    // CSR layout (offset table + src + delta-varint dst stream), providing O(1)
+    // neighbor access without a separate sidecar file. Threaded through
+    // NativeProjectionBuilder -> ProjectionStorage into the v1.6 catalog byte.
+    // This variable plumbs the selected value; the actual CSR leaf writer is
+    // wired into the edge-index sorter dispatch separately.
     BPT::GraphStorage graph_storage = BPT::GraphStorage::BTREE;
 
-    // Spec #4-B T4.8 — opt-in CSR topology sidecar generation. Default
-    // false so existing projections remain byte-identical on disk and
-    // pre-Spec-#4-B callers see zero behavior change. The flag is parsed
-    // below from the config map; non-bool values raise QueryException.
+    // Opt-in generation of mmap-backed CSR topology sidecar files
+    // (topology_fwd.csr and topology_rev.csr). When true, the builder emits
+    // a pair of Compressed Sparse Row files alongside the B+Tree indexes,
+    // enabling O(1) neighbor slice lookups during GNN sampling instead of
+    // O(log N) B+Tree traversal. Default false so existing projections remain
+    // byte-identical on disk. The flag is parsed below from the config map;
+    // non-bool values raise QueryException.
     bool build_topology_snapshot = false;
-    // STEP 3 — track whether the caller explicitly set buildTopologySnapshot.
+    // Track whether the caller explicitly set buildTopologySnapshot.
     bool snapshot_explicit = false;
 
     // Keep config_holder alive so config_dict pointer remains valid
@@ -192,8 +199,10 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         label_property   = get_string_from_dict(config_dict, "labelProperty", "");
         split_property   = get_string_from_dict(config_dict, "splitProperty", "");
 
-        // Spec #3: user-selectable index set preset. Defaults to "ALL" which
-        // preserves the pre-Spec-#3 behavior of materializing every index.
+        // User-selectable index set preset controlling which B+Tree indexes are
+        // materialized. Defaults to "ALL" which materializes all 10 topology
+        // indexes, preserving existing behavior. "GNN_MINIMAL" emits only the 5
+        // indexes the GNN pipeline requires; "READONLY_TRAVERSAL" emits 7.
         // Invalid values raise QueryException from parse_index_set().
         {
             (void) get_value_from_dict(config_dict, "indexSet", index_set_explicit);
@@ -202,12 +211,14 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             index_set = GQL::parse_index_set(index_set_str);
         }
 
-        // Spec #5 T5.11 — user-selectable leaf-page encoding. Case-sensitive
-        // parse of "BITSET" / "DELTA_VARINT" via BPT::parse_leaf_format;
-        // unknown values raise std::invalid_argument which we convert to
-        // QueryException so GQL callers get a proper query-level error.
-        // Non-string config values are already rejected by
-        // get_string_from_dict() (throws runtime_error with type info).
+        // Parse the `leafFormat` config key to select B+Tree leaf-page encoding.
+        // Case-sensitive parse of "BITSET" (legacy redundant-byte format) or
+        // "DELTA_VARINT" (delta + LEB128-varint compressed v2 leaves, ~80%
+        // smaller on edge indexes) via BPT::parse_leaf_format. Unknown values
+        // raise std::invalid_argument which we convert to QueryException so GQL
+        // callers get a proper query-level error. Non-string config values are
+        // already rejected by get_string_from_dict() (throws runtime_error with
+        // type info).
         {
             bool lf_found = false;
             (void) get_value_from_dict(config_dict, "leafFormat", lf_found);
@@ -222,15 +233,17 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             }
         }
 
-        // Spec #8 T8.8 — user-selectable per-projection graph-storage mode.
-        // Case-sensitive parse of "BTREE" / "CSR_HYBRID" via
-        // BPT::parse_graph_storage; unknown values raise
-        // std::invalid_argument which we convert to QueryException so GQL
-        // callers get a proper query-level error. Non-string config values
-        // are already rejected by get_string_from_dict() (throws
-        // runtime_error with type info). T8.8 plumbs the value only — the
-        // build pipeline still emits BTREE leaves regardless; T8.9 wires
-        // BPTLeafCSRWriter into the edge-index sorter dispatch.
+        // Parse the `graphStorage` config key to select the edge-index storage
+        // mode. Case-sensitive parse of "BTREE" (legacy per-index B+Tree) or
+        // "CSR_HYBRID" (edge B+Tree leaves that directly encode CSR layout,
+        // enabling O(1) neighbor access without a separate sidecar) via
+        // BPT::parse_graph_storage. Unknown values raise std::invalid_argument
+        // which we convert to QueryException so GQL callers get a proper
+        // query-level error. Non-string config values are already rejected by
+        // get_string_from_dict() (throws runtime_error with type info). This
+        // block plumbs the parsed value; the actual CSR leaf writer
+        // (BPTLeafCSRWriter) is wired into the edge-index sorter dispatch
+        // separately during the build phase.
         {
             bool gs_found = false;
             (void) get_value_from_dict(config_dict, "graphStorage", gs_found);
@@ -262,10 +275,12 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             }
         }
 
-        // Spec #4-B T4.8 — `buildTopologySnapshot`. Parsed inline in the same
-        // style as `includeLabelIndexes`. Non-bool types are rejected up front
-        // with a clear QueryException so mis-typed values never silently fall
-        // through to the default.
+        // Parse the `buildTopologySnapshot` config key. When true, the builder
+        // emits mmap-backed CSR sidecar files (topology_fwd.csr / topology_rev.csr)
+        // that allow O(1) neighbor slice lookups during sampling. Parsed inline
+        // in the same style as `includeLabelIndexes`. Non-bool types are rejected
+        // up front with a clear QueryException so mis-typed values never silently
+        // fall through to the default.
         {
             bool found = false;
             ObjectId v = get_value_from_dict(
@@ -282,11 +297,12 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             }
         }
 
-        // Spec #8 T8.9 (design §3.8 D8) — when the user asks for both the
-        // CSR-in-B+Tree hybrid AND a topology sidecar, the sidecar is
-        // silently dropped because the in-leaf CSR supersedes it. Emit a
-        // one-line warning to stderr so the operator sees the flag had no
-        // effect; the projection itself remains valid.
+        // When the user requests both CSR-hybrid edge leaves (graphStorage='CSR_HYBRID')
+        // and the mmap CSR topology sidecar (buildTopologySnapshot=true), the sidecar
+        // is silently dropped: the in-leaf CSR already provides O(1) neighbor access
+        // and makes the external sidecar files redundant. Emit a one-line warning to
+        // stderr so the operator knows the flag had no effect; the projection itself
+        // remains valid.
         if (graph_storage == BPT::GraphStorage::CSR_HYBRID
             && build_topology_snapshot) {
             std::cerr << "[graph_project] warning: buildTopologySnapshot is "
@@ -296,7 +312,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             build_topology_snapshot = false;
         }
 
-        // STEP 3 — GNN-intent default. When the caller asks for GNN outputs
+        // GNN-intent default. When the caller asks for GNN outputs
         // (includeFeatures / labelProperty / splitProperty) but did NOT set an
         // explicit indexSet, default to GNN_MINIMAL (the 5 indexes the GNN
         // pipeline consumes) instead of ALL (14) — the single biggest
@@ -540,12 +556,12 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("featureDim", ctx.create_int(static_cast<int64_t>(stats.feature_dim)));
     ctx.yield("numClasses", ctx.create_int(static_cast<int64_t>(stats.num_classes)));
 
-    // Spec #4-B T4.8 — `topologySnapshotBytes`. Sum of the two CSR sidecar
-    // files actually produced by the builder. Reports 0 when the flag was
-    // false, when neither direction was eligible (IndexSet lacked both edge
-    // indexes), or when stat'ing the files fails for any reason (we never
-    // let stat errors surface to the client — the projection itself is the
-    // real build product).
+    // Compute `topologySnapshotBytes`: the combined byte size of the two mmap-backed
+    // CSR sidecar files (topology_fwd.csr and topology_rev.csr) produced by the
+    // builder when buildTopologySnapshot=true. Reports 0 when the flag was false,
+    // when neither direction was eligible (the active IndexSet lacked both edge
+    // indexes), or when stat'ing the files fails for any reason (filesystem errors
+    // are swallowed here — the projection itself is the real build product).
     int64_t snapshot_bytes = 0;
     try {
         std::string proj_dir = db_folder + "/projections/" + graph_name;

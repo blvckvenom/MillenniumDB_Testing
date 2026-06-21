@@ -1,6 +1,6 @@
 // src/tests/projection_missing_index_test.cc
 //
-// Unit tests for Spec #3 T3.9 — the missing-index diagnostic produced by
+// Unit tests for the missing-index diagnostic produced by
 // GQLModel getters when a query targets a projection built under a
 // restricted IndexSet preset (GNN_MINIMAL / READONLY_TRAVERSAL) and tries
 // to access an elided B+Tree.
@@ -301,7 +301,8 @@ TEST(ProjectionMissingIndex, ErrorMessageMentionsLeafBasename) {
 }
 
 TEST(ProjectionMissingIndex, PropertyIndexErrorMentionsIncludeProperties) {
-    // Property indexes aren't gated by IndexSet (Spec #3 §3.4), so the
+    // Property indexes are controlled by the includeNodeProperties /
+    // includeEdgeProperties projection config, not by IndexSet, so the
     // diagnostic for a missing node property index must point the user at
     // the includeNodeProperties config rather than suggesting an indexSet
     // upgrade by itself.

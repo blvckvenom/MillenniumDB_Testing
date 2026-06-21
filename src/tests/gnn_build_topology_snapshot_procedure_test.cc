@@ -1,6 +1,8 @@
 // gnn_build_topology_snapshot_procedure_test.cc
 //
-// Unit tests for the T4.9 post-hoc GQL procedure
+// Unit tests for the post-hoc GQL procedure that builds mmap-backed CSR
+// topology sidecar files (topology_fwd.csr / topology_rev.csr) for an
+// existing projection that was created without the buildTopologySnapshot flag.
 // (`src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.{h,cc}`).
 //
 // Coverage strategy mirrors `native_projection_builder_topology_snapshot_test.cc`:
@@ -10,7 +12,6 @@
 // exercising the exact BPT-scan + writer body that `execute()` runs.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md §4.2
-// Plan: docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md §T4.9
 
 #include <cstdint>
 #include <cstdio>
@@ -79,8 +80,9 @@ private:
 };
 
 // Builds a 4-node / 4-directed-edge projection-storage on disk. Returns
-// the absolute directory path. Identical topology to the T4.6 test fixture
-// so expected byte counts + adjacency slices match.
+// the absolute directory path. Identical topology to the inline-builder test
+// fixture (native_projection_builder_topology_snapshot_test.cc) so expected
+// byte counts + adjacency slices match.
 //
 // Topology:
 //   nodes: 0, 1, 2, 3
@@ -245,14 +247,18 @@ TEST(GnnBuildTopologySnapshotProcedure, IdempotentOverwrite) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 — post-hoc output matches inline (T4.6) output byte-for-byte.
+// Test 3 — post-hoc output matches inline-builder output byte-for-byte.
 // Both flows hash the same source .leaf and emit identical CSR bodies.
+// "Inline" means buildTopologySnapshot=true was given to graph_project, which
+// causes finalize() to call build_topology_snapshots_() immediately.
+// "Post-hoc" means the CALL gnn_build_topology_snapshot(...) procedure was
+// invoked after the fact on an already-finished projection.
 // ---------------------------------------------------------------------------
 TEST(GnnBuildTopologySnapshotProcedure, PostHocBytesMatchInlineBytes) {
     (void)MdbFixture::instance();
 
     // Projection A: sidecar generated via the builder's test hook (the same
-    // code path finalize() runs when build_topology_snapshot=true).
+    // code path that finalize() runs when buildTopologySnapshot=true is set).
     const std::string proj_inline = "inline_snapshot_proj";
     const std::string dir_inline  = build_small_projection(proj_inline);
     {

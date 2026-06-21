@@ -1,18 +1,22 @@
-// Randomized encode->decode fuzz harness for the Spec #8 CSR-hybrid leaf
-// format (design §3.9, §5.1, §5.2). Mirrors the T5.14 v2 fuzz harness
-// structurally: runs hundreds of thousands of iterations under a
-// deterministic mt19937_64 seed, cycling through N in {2, 3} and four
-// distribution families (dense_monotonic, sparse_random, clustered,
-// hub_heavy). Every iteration encodes a sorted sequence of
-// (src, dst, edge_id) records through BPTLeafCSRWriter<N> into a temp
-// file and asserts that the reader-side chain walk returns the same
-// (src, degree, dsts[]) tuples — edge_id is excluded from the invariant
-// because T8.5's writer emits flags=0 (no edge-id stream; T8.6+ scope).
+// Randomized encode->decode fuzz harness for the CSR-hybrid B+Tree leaf
+// format (edge-index leaves whose layout IS the CSR, encoding (src, dst,
+// edge_id) records with delta + LEB128-varint compression; design §3.9,
+// §5.1, §5.2). Mirrors the delta+varint leaf fuzz harness (for the
+// B+Tree leaf compression format used on non-edge indexes) structurally:
+// runs hundreds of thousands of iterations under a deterministic
+// mt19937_64 seed, cycling through N in {2, 3} and four distribution
+// families (dense_monotonic, sparse_random, clustered, hub_heavy). Every
+// iteration encodes a sorted sequence of (src, dst, edge_id) records
+// through BPTLeafCSRWriter<N> into a temp file and asserts that the
+// reader-side chain walk returns the same (src, degree, dsts[]) tuples —
+// edge_id is excluded from the invariant because the writer used here
+// emits flags=0 (no edge-id stream; edge-id persistence is handled by a
+// separate writer mode and tested in HubEdgeIds_RoundTripFuzz below).
 //
 // The iteration budget is 500k in Release, 50k under ASan (same basis
-// as T5.14 — ASan slows tight encode/decode loops by ~18x on benito_pc).
-// A developer can override via -D MAIN_ITERATIONS_OVERRIDE=... for a
-// pre-merge full-strength check.
+// as the delta+varint leaf fuzz harness — ASan slows tight encode/decode
+// loops by ~18x on benito_pc). A developer can override via
+// -D MAIN_ITERATIONS_OVERRIDE=... for a pre-merge full-strength check.
 //
 // Dedicated subtests:
 //   - BoundaryCases: ~10k explicit adversarial inputs hitting
@@ -27,8 +31,8 @@
 // Design reference:
 //   docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.9 §5.1 §5.2
 //
-// Seed: MAIN_SEED is distinct from T5.14's (0xDE1A4A4F12345678) to
-// diversify corpora. See comment on MAIN_SEED below.
+// Seed: MAIN_SEED is distinct from the delta+varint leaf fuzz harness seed
+// (0xDE1A4A4F12345678) to diversify corpora. See comment on MAIN_SEED below.
 
 #include <algorithm>
 #include <array>
@@ -56,8 +60,8 @@
 namespace {
 
 // Hardcoded seed — reproducibility contract for the full-strength fuzz
-// run. Distinct from T5.14's 0xDE1A4A4F12345678 so the two harnesses
-// cover independent corpora.
+// run. Distinct from the delta+varint leaf fuzz harness seed
+// (0xDE1A4A4F12345678) so the two harnesses cover independent corpora.
 constexpr uint64_t MAIN_SEED  = 0xCAFEBABEDE1A4A4FULL;
 constexpr uint64_t SMOKE_SEED = MAIN_SEED + 1ULL;
 
@@ -315,7 +319,7 @@ void append_hub_group(std::mt19937_64& rng,
 
 // ----------------------------------------------------------------------------
 // Write groups via BPTLeafCSRWriter<N> to a temp file, then read the file
-// back and decode via the T8.4 BPTLeafCSR<N> reader + chain walk. Compare
+// back and decode via the BPTLeafCSR<N> reader + chain walk. Compare
 // (src, degree, dsts[]) tuples with the original groups. Returns true on
 // mismatch (caller logs context).
 // ----------------------------------------------------------------------------
@@ -830,18 +834,22 @@ TEST(BPTLeafCSRFuzzTest, TamperInjection_AllDetected) {
     // Header fields that the reader cannot detect corruption in (by
     // design, per bpt_leaf_csr_format.h + bplus_tree_leaf_csr.cc):
     //
-    //   - flags bit 1 (kHasEdgeIds, byte 2 bit 1): writer emits 0; reader
-    //     tolerates 1 without using the bit in decode (T8.6+ scope, per
-    //     design §3.4). Flipping this bit is semantically harmless.
+    //   - flags bit 1 (kHasEdgeIds, byte 2 bit 1): writer emits 0 when
+    //     edge-id persistence is disabled; reader tolerates 1 without using
+    //     the bit in record decoding (edge-id stream is an additive
+    //     feature, per design §3.4). Flipping this bit is semantically
+    //     harmless.
     //   - next_leaf (bytes 8..11): cross-page pointer. Reader cannot
-    //     cross-check without opening the neighbour page. Matches T5.14's
-    //     documented exemption for BPTLeafV2's next_leaf.
+    //     cross-check without opening the neighbour page. Same exemption as
+    //     the delta+varint leaf fuzz harness applies for BPTLeafV2's
+    //     next_leaf field.
     //   - min_src_id_low (bytes 12..15): fsck-only cross-check against the
     //     directory routing key (design §3.4). Reader ctor does not
     //     validate this field because the directory side is what routes to
     //     a page, not the header side — corruption here does not affect
-    //     record decoding on this page. Matches the "next_leaf"-like
-    //     exemption documented in T5.14 for pointer-style header fields.
+    //     record decoding on this page. Same pointer-style header field
+    //     exemption as the delta+varint leaf fuzz harness documents for
+    //     next_leaf.
     //
     // The tamper loop below skips these bytes so detection is measured
     // only against bytes that participate in on-head decoding.
@@ -913,14 +921,15 @@ TEST(BPTLeafCSRFuzzTest, TamperInjection_AllDetected) {
 }
 
 // ============================================================================
-// Spec #8-B task #1 (hub completion) — focused fuzz over hubs with eids.
+// Hub adjacency list with parallel edge_ids — focused fuzz over the
+// edge-id persistence path of the CSR-hybrid leaf writer.
 //
 // Generates random hub adjacency lists with parallel edge_ids, runs them
 // through BPTLeafCSRWriter<3>(emit_edge_ids=true), and walks the chain via
 // the ReadTag + ContinuationTag readers, verifying every (src, dst, eid)
 // triple matches the input. Distinct from the main fuzz harness because:
 //   - the main harness uses the default writer (no eids), so its tamper
-//     coverage already pins the legacy contract;
+//     coverage already pins the no-edge-id contract;
 //   - here we exercise the writer's k_on_head packing + chain-head's
 //     extra varint + continuation eid stream end-to-end on randomized
 //     inputs.

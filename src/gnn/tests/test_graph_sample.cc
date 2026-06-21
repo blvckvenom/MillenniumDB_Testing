@@ -268,7 +268,7 @@ TEST(GraphSampleTest, DeserializeInvalidMagicThrows) {
 }
 
 // ---------------------------------------------------------------------------
-// Round 2A — v3 bulk format roundtrip and v2 backward compatibility
+// Bulk (v3) serialization format: roundtrip and v2 backward compatibility
 // ---------------------------------------------------------------------------
 
 // Manually write a v2-formatted sample (element-by-element layout) and verify
