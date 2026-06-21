@@ -1,12 +1,12 @@
-// BPTLeafV2 write-path (T5.7) and read-path (T5.8) implementation.
+// BPTLeafV2 write-path (writer) and read-path (reader) implementation.
 //
 // The writer (append_record + flush) serialises a Record<N> as delta +
 // LEB128 varint bytes against a running cursor, and flush() commits the
 // 16-byte v2 header plus the accumulated payload to the backing 4 KB page
 // buffer, zero-padding to Page::SIZE.
 //
-// The reader (ReadTag ctor + get_record + search_index) is fully live in
-// T5.8: ctor validates the header, get_record linear-decodes through the
+// The reader (ReadTag ctor + get_record + search_index): ctor validates
+// the header, get_record linear-decodes through the
 // varint stream accumulating the running cursor, and search_index scans
 // the records in-stream (design §3.4 — no binary search, no offset index).
 //
@@ -170,7 +170,7 @@ size_t BPTLeafV2<N>::bytes_used() const noexcept
 }
 
 
-// ===== Read-side implementation (T5.8). ======================================
+// ===== Read-side implementation. =============================================
 
 template <std::size_t N>
 BPTLeafV2<N>::BPTLeafV2(const char* page_bytes, ReadTag) :
@@ -197,7 +197,7 @@ BPTLeafV2<N>::BPTLeafV2(const char* page_bytes, ReadTag) :
     }
     if (read_header_.flags != 0) {
         throw BPT::BPTLeafV2DecodeException(
-            "non-zero flags byte at offset 2 (reserved in Spec #5)");
+            "non-zero flags byte at offset 2 (reserved in the v2 leaf format)");
     }
     if (read_header_.reserved != 0) {
         throw BPT::BPTLeafV2DecodeException(

@@ -148,12 +148,17 @@ TopologySnapshotWriter::TopologySnapshotWriter(
     }
     num_edges_ = running;
 
-    // Spec #6 narrow (uint32) eligibility. Opt-in via the `MDB_GNN_TOPOLOGY_UINT32`
+    // uint32 topology sidecar eligibility. Opt-in via the `MDB_GNN_TOPOLOGY_UINT32`
     // env var; default OFF keeps the legacy uint64 layout byte-identical. The
     // narrow layout stores tag-stripped ordinals (node id & VALUE_MASK, edge id
-    // & VALUE_MASK) as uint32, so it is lossless only when every such ordinal
-    // fits uint32 — node ordinals < num_nodes, edge ordinals < num_edges, both
-    // < 2^32. ROW_PTR stays uint64 (offsets can exceed 2^32 for M > 4B).
+    // & VALUE_MASK) as uint32, which is lossless because ObjectId encodes the
+    // 8-bit type tag in the top byte — stripping it and storing only the lower
+    // 56-bit value payload halves on-disk topology size (~27 GB vs ~54 GB for
+    // papers100M). The tag is captured once per section into the header and
+    // reconstructed by the reader via OR with the constant type tag. Lossless
+    // only when every stripped ordinal fits in uint32 — node ordinals < num_nodes,
+    // edge ordinals < num_edges, both < 2^32. ROW_PTR stays uint64 (offsets can
+    // exceed 2^32 for M > 4B).
     {
         bool want_narrow = false;
         if (const char* e = std::getenv("MDB_GNN_TOPOLOGY_UINT32")) {
@@ -561,9 +566,11 @@ void TopologySnapshotWriter::finalize() {
     if (include_edge_ids_) {
         header.flags |= TopologySnapshotFlags::kHasEdgeIds;
     }
-    // Spec #6: persist the per-section type tag the reader re-applies to the
-    // tag-stripped uint32 ordinals. An empty section never captured a tag —
-    // 0 is harmless (no values to reconstruct). Stays 0 for the wide layout.
+    // Narrow uint32 layout: persist the per-section ObjectId type tag the reader
+    // re-applies when reconstructing full 64-bit ObjectIds from the stored
+    // tag-stripped uint32 ordinals (tag << 56 | ordinal). An empty section
+    // never captured a tag — 0 is harmless (no values to reconstruct). Stays 0
+    // for the wide uint64 layout where full ObjectIds are stored verbatim.
     if (id_width_ == kTopologySnapshotIdWidthNarrow) {
         const uint16_t dt = dst_tag_.load(std::memory_order_relaxed);
         header.dst_type_tag = (dt == kTagUnset) ? 0 : static_cast<uint8_t>(dt);
@@ -622,7 +629,8 @@ void TopologySnapshotWriter::finalize() {
 }
 
 // ---------------------------------------------------------------------------
-// capture_tag_ — first-writer-wins capture + consistency assert (Spec #6)
+// capture_tag_ — first-writer-wins capture + consistency assert for the
+// narrow uint32 layout's per-section ObjectId type tag
 // ---------------------------------------------------------------------------
 
 void TopologySnapshotWriter::capture_tag_(std::atomic<uint16_t>& slot,

@@ -29,7 +29,7 @@ public:
     void run(std::function<void(
         std::function<void(const Record<N>&)>)> scan_fn);
 
-    /// Spec #25 (Option C — CPU TBB) — chunk-parallel partition fill.
+    /// CPU TBB-based chunk-parallel partition fill.
     ///
     /// Drives the scan by repeatedly pulling fixed-size chunks of records
     /// from `scan_fn` (single-threaded producer) and dispatching the

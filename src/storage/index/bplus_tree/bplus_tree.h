@@ -27,9 +27,9 @@ public:
     // BPlusTree<N>'s format constant and is paid through the iterator so
     // next-leaf transitions can dispatch without reaching back into the
     // tree. The SearchLeafResult always carries a BPTLeafV1<N> because the
-    // directory-layer search path is V1-only in Spec #5 T5.9; the V1 is
-    // moved into the polymorphic unique_ptr here. Wiring DELTA_VARINT
-    // through the directory is T5.10 / T5.11.
+    // directory-layer search path is V1-only for the BITSET encoding; the
+    // V1 is moved into the polymorphic unique_ptr here. Wiring the
+    // DELTA_VARINT encoding through the directory layer is deferred work.
     BptIter(bool* interruption_requested,
             SearchLeafResult<N>&& leaf_and_pos,
             const Record<N>& max,
@@ -65,14 +65,20 @@ private:
     // leaf_format_ == DELTA_VARINT. Views the same page bytes as
     // current_leaf_ under a BPTLeafV2<N> ReadTag decoder; all record
     // reads (get_value_count, update_record, has_next) dispatch here
-    // in v2 mode. See Spec #5 §5.2 for the on-disk format.
+    // in v2 mode. The v2 on-disk format stores a 16-byte header followed
+    // by record 0 as full LEB128 varints and records 1..k-1 as
+    // zigzag-delta LEB128 varints, exploiting the sort order of records
+    // to compress repeated prefixes.
     std::unique_ptr<BPTLeafBase<N>> v2_reader_;
     // CSR_HYBRID auxiliary reader. Populated only when
     // leaf_format_ == CSR_HYBRID. Views the same page bytes as
-    // current_leaf_ under a BPTLeafCSR<N> ReadTag decoder (Spec #8
-    // T8.4). The v1 held in current_leaf_ remains purely as a pin
-    // holder; all record reads dispatch to v3_reader_ when this slot
-    // is populated. See Spec #8 §5 for the on-disk format.
+    // current_leaf_ under a BPTLeafCSR<N> ReadTag decoder. In this
+    // mode the edge-index B+Tree leaves are themselves the CSR layout:
+    // a v3 leaf page stores a 16-byte header, an offset table, a src
+    // table, and a DELTA_VARINT-encoded dst stream, providing O(1)
+    // neighbor access without a separate sidecar. The v1 held in
+    // current_leaf_ remains purely as a pin holder; all record reads
+    // dispatch to v3_reader_ when this slot is populated.
     std::unique_ptr<BPTLeafBase<N>> v3_reader_;
     BPT::LeafFormat leaf_format_;
 };
@@ -84,12 +90,15 @@ public:
     static constexpr auto leaf_max_records = (Page::SIZE - 2*sizeof(int32_t) ) / (sizeof(uint64_t)*N);
     static constexpr auto dir_max_records  = (Page::SIZE - 2*sizeof(int32_t) ) / (sizeof(uint64_t)*N + sizeof(int32_t));
 
-    // Optional leaf_format selects between the pre-Spec-#5 BITSET encoding
-    // (default, byte-identical to pre-T5.9 behavior) and the Spec-#5
-    // DELTA_VARINT encoding. Every call site in the current codebase relies
-    // on the default, so pre-Spec-#5 trees are unaffected. The catalog
-    // plumbing that populates this parameter from on-disk metadata lands in
-    // T5.10; the GQL config plumbing in T5.11.
+    // Optional leaf_format selects between the legacy BITSET encoding
+    // (default, byte-identical to pre-compression behavior) and the
+    // DELTA_VARINT encoding (delta + LEB128-varint compression that
+    // exploits the sort order of records to shrink leaf pages, typically
+    // ~80% smaller on edge indexes). Every call site in the current
+    // codebase relies on the default, so existing trees are unaffected.
+    // The catalog plumbing that populates this parameter from on-disk
+    // metadata and the GQL config plumbing that exposes it to users are
+    // handled at a higher layer.
     BPlusTree(const std::string& name,
               BPT::LeafFormat leaf_format = BPT::LeafFormat::BITSET);
 
@@ -104,12 +113,12 @@ public:
     // `fmt`. When fmt == DELTA_VARINT the helper cross-checks that the page's
     // first byte is 2 (format_version); a mismatch raises
     // BPT::BPTLeafV2DecodeException. The BITSET branch does not cross-check
-    // byte 0 because pre-Spec-#5 pages legitimately have value_count=2 at
-    // byte 0 (design §6.1 edge case). The returned unique_ptr owns the
-    // Page* pin through BPTLeafV1's destructor in the BITSET path; the
-    // DELTA_VARINT path does NOT own the pin (V2 holds raw bytes only) —
-    // T5.10 will layer a pin-holding wrapper when threading format through
-    // the directory.
+    // byte 0 because legacy BITSET pages legitimately have value_count=2 at
+    // byte 0 (a known edge case in the original format). The returned
+    // unique_ptr owns the Page* pin through BPTLeafV1's destructor in the
+    // BITSET path; the DELTA_VARINT path does NOT own the pin (V2 holds raw
+    // bytes only) — a pin-holding wrapper is needed when threading the format
+    // through the directory layer.
     static std::unique_ptr<BPTLeafBase<N>> open_leaf_page(Page& page,
                                                           BPT::LeafFormat fmt);
 

@@ -1,6 +1,6 @@
 // src/graph_models/gql/projection/edge_keep_bitmap_gpu.h
 //
-// Spec #27 — GPU-accelerated batch membership filter feeding EdgeFilter.
+// GPU-accelerated batch membership filter feeding EdgeFilter.
 //
 // `precompute_edge_filter_` (Phase B of the SERIALIZED scan pipeline)
 // historically applied a per-edge has_node() membership test via two
@@ -22,9 +22,10 @@
 //
 //   2. CPU fallback. Sequential for-loop calling
 //      ProjectionStorage::has_node() per edge. Identical semantics to the
-//      pre-Spec-#27 inline lambda in precompute_edge_filter_ — used as
-//      the correctness baseline for unit tests and selected automatically
-//      when GPU is disabled / unavailable / unprofitable.
+//      original inline lambda in precompute_edge_filter_ that this class
+//      replaced — used as the correctness baseline for unit tests and
+//      selected automatically when GPU is disabled / unavailable /
+//      unprofitable.
 //
 // Either path produces the same `keep_flags[i]` array. The batcher then
 // walks the captured edge_ids and calls EdgeFilter::set_kept(edge_id) on
@@ -35,8 +36,9 @@
 // unset) keeps GPU enabled when the build supports it.
 //
 // Thread-safety: instances are not internally synchronised. Phase B is
-// single-threaded today (Spec #2 §4) so the batcher is owned by a single
-// scan loop. If Phase B parallelises across edge types in the future,
+// single-threaded today (the edge-scan loop in precompute_edge_filter_ is
+// not parallelised) so the batcher is owned by a single scan loop. If
+// Phase B parallelises across edge types in the future,
 // each worker should hold its own batcher (cheap — no GPU resources are
 // allocated until the first flush) and merge bits into the shared
 // EdgeFilter post-finalize.
@@ -135,8 +137,8 @@ private:
 
 #ifdef MDB_GPU_ENABLED
     // GPU implementation. Returns false on any CUDA failure so the caller
-    // can fall back to CPU (preserving the Spec #2 invariant that Phase
-    // B never aborts a projection on transient GPU issues).
+    // can fall back to CPU, ensuring Phase B never aborts a projection due
+    // to a transient GPU error.
     bool run_gpu_(std::size_t n);
 #endif
 };

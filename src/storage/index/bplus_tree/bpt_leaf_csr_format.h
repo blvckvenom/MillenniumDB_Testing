@@ -1,9 +1,12 @@
-// B+Tree leaf v3 header format — CSR-in-B+Tree hybrid (Spec #8 T8.3).
+// B+Tree leaf v3 header format — CSR-in-B+Tree hybrid graph storage.
 //
 // This header introduces the 16-byte on-disk header struct used by the
-// v3 leaf page format (LeafFormat::CSR_HYBRID). The layout is deliberately
-// the same size as the v2 (Spec #5) header so the upstream dispatcher can
-// read 16 bytes once and route to the v1/v2/v3 decoder based on byte 0.
+// v3 leaf page format (LeafFormat::CSR_HYBRID). In this format, the edge-index
+// B+Tree leaves directly encode a compressed-sparse-row adjacency layout,
+// making them the CSR itself rather than an index over separate adjacency data.
+// The layout is deliberately the same size as the v2 (delta + LEB128-varint
+// leaf encoding) header so the upstream dispatcher can read 16 bytes once and
+// route to the v1/v2/v3 decoder based on byte 0.
 //
 // A single struct covers BOTH page variants:
 //   - Chain-head pages (flags & kIsContinuation == 0): carry src entries
@@ -18,13 +21,9 @@
 // id of the chain head that owns this continuation, for fault isolation
 // and reader disambiguation).
 //
-// Scope of this file (T8.3): type definitions only. Reader (T8.4), writer
-// (T8.5), and dispatch integration (T8.6+) land in subsequent tasks.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
-//                 §3.4 (D4 — on-disk format per leaf page)
-//                 §4.2 (C++ types)
-//                 §5.1 / §5.2 (byte-level layout)
+// Scope of this file: type definitions only (header structs, flag constants,
+// serialization declarations, and the decode-exception type). The reader,
+// writer, and dispatch integration are in sibling translation units.
 
 #pragma once
 
@@ -69,12 +68,12 @@ struct BPTLeafCSRHeader {
     uint32_t min_src_id_low;
 };
 static_assert(sizeof(BPTLeafCSRHeader) == 16,
-              "BPTLeafCSRHeader must be exactly 16 bytes (Spec #8 disk format)");
+              "BPTLeafCSRHeader must be exactly 16 bytes (the CSR-hybrid v3 disk format)");
 
 // Continuation-page view of the same 16-byte v3 header. Identical memory
-// layout to BPTLeafCSRHeader (the on-disk format is single — see §3.4),
-// but field names reflect the continuation-page semantics so call-sites
-// can self-document. The dispatch site (T8.6) sniffs flags bit 0 via
+// layout to BPTLeafCSRHeader (the on-disk format is single for both page
+// variants), but field names reflect the continuation-page semantics so
+// call-sites can self-document. The dispatch site sniffs flags bit 0 via
 // is_csr_continuation() and then deserializes into the appropriate view.
 //
 // Layout (little-endian on disk, serialized via
@@ -100,7 +99,7 @@ struct BPTLeafCSRContinuationHeader {
     uint32_t chain_head_page_id;
 };
 static_assert(sizeof(BPTLeafCSRContinuationHeader) == 16,
-              "BPTLeafCSRContinuationHeader must be exactly 16 bytes (Spec #8 disk format)");
+              "BPTLeafCSRContinuationHeader must be exactly 16 bytes (the CSR-hybrid v3 disk format)");
 
 // Flag bit positions. Use namespace-scoped constants so the intent at call
 // sites reads `header.flags & BPT::CSRHybridFlags::kIsContinuation` rather
@@ -109,8 +108,8 @@ namespace CSRHybridFlags {
     inline constexpr uint8_t kIsContinuation = 0x01;
     inline constexpr uint8_t kHasEdgeIds     = 0x02;
 
-    // Spec #8-B task #1 (hub completion): set on the chain-head page of a
-    // hub when the writer is emitting parallel edge_ids. The single
+    // Set on the chain-head page of a hub node when the writer is emitting
+    // parallel edge_ids alongside destination ids. The single
     // (value_count == 1) entry on such a page encodes a third varint after
     // (src_id, total_degree): the count `k_on_head` of dsts (and parallel
     // eids) physically stored on the chain-head. The chain-head's eid
@@ -138,8 +137,7 @@ void serialize_csr_continuation_header(const BPTLeafCSRContinuationHeader& h,
 
 // Deserialize 16 little-endian bytes into a header struct. Does NOT
 // validate semantic invariants (format_version == 3, reserved bits zero,
-// etc.) — the caller owns that, and T8.4 will surface the full validation
-// pipeline per §5.5.
+// etc.) — the caller (the CSR leaf reader) owns that validation.
 BPTLeafCSRHeader deserialize_csr_header(const uint8_t in[16]) noexcept;
 
 // Same, for the continuation-page view. The byte layout being identical,
@@ -154,9 +152,9 @@ BPTLeafCSRContinuationHeader deserialize_csr_continuation_header(
 // full deserialize round trip. Does not validate any other invariant.
 bool is_csr_continuation(const uint8_t in[16]) noexcept;
 
-// Exception type raised by the (future, T8.4) reader on header validation
-// failure. Declared here alongside the struct so both reader and writer
-// tests can reference a single type.
+// Exception type raised by the CSR leaf reader on header validation failure.
+// Declared here alongside the struct so both reader and writer tests can
+// reference a single type.
 class BPTLeafCSRDecodeException : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;

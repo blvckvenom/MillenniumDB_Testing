@@ -1,11 +1,13 @@
 #pragma once
 
 // Abstract base for B+Tree leaf page views. Concrete subclasses:
-//   BPTLeafV1<N> — legacy redundant-bitset encoding (pre-Spec-#5, see
-//                  bplus_tree_leaf.h). Produces byte-identical output
-//                  to the pre-Spec-#5 format.
-//   BPTLeafV2<N> — delta + LEB128 varint encoding (Spec #5, see
-//                  bplus_tree_leaf_v2.h). Introduced in T5.7/T5.8.
+//   BPTLeafV1<N> — legacy redundant-bitset encoding (original leaf format,
+//                  see bplus_tree_leaf.h). Produces byte-identical output
+//                  to the original leaf format.
+//   BPTLeafV2<N> — delta + LEB128 varint leaf encoding (B+Tree leaf
+//                  compression: record 0 stored as full LEB128 varints,
+//                  subsequent records as zigzag-delta LEB128 varints;
+//                  see bplus_tree_leaf_v2.h).
 //
 // Virtual dispatch cost is paid once per page-open (via BptIter), not per
 // record access; the inner get_record / search_index loops are non-virtual
@@ -52,8 +54,9 @@ public:
     // implementation details. The clone() return type is BPTLeafV1<N> by
     // value (not the abstract base), so it cannot be expressed as a pure
     // virtual on this base. Polymorphic page cloning is introduced together
-    // with BptIter polymorphism in T5.9; until then, clone() is V1-only
-    // and reachable through the BPlusTreeLeaf<N> = BPTLeafV1<N> alias.
+    // with BptIter polymorphism when the iterator layer was extended to support
+    // both V1 and V2 leaf formats; until then, clone() is V1-only and
+    // reachable through the BPlusTreeLeaf<N> = BPTLeafV1<N> alias.
 
 protected:
     BPTLeafBase() = default;

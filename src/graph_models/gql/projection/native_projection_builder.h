@@ -14,7 +14,7 @@
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
 #include "query/procedure/builtin/project_procedure.h"  // For Orientation enum
-#include "storage/index/bplus_tree/bpt_leaf_format.h"   // For BPT::LeafFormat (Spec #5 T5.11)
+#include "storage/index/bplus_tree/bpt_leaf_format.h"   // For BPT::LeafFormat (delta + LEB128-varint leaf encoding)
 
 namespace GQL { enum class IndexSet : uint8_t; }  // fwd: defined in index_set.h
 
@@ -27,7 +27,8 @@ namespace GQL {
 /**
  * @brief Bitmask enum identifying which projection B+Tree index is being
  *        populated during a scan pass. Used by the serialized scan pipeline
- *        (Spec #2) to gate record emissions in scan callbacks.
+ *        to gate record emissions in scan callbacks (one pass per target
+ *        B+Tree, each pass emits only to a single-index mask).
  *
  * The 14 indexes correspond to the 6 core + 8 feature-gated B+Trees built
  * by ProjectionStorage::build_all_indexes_bulk. In CLASSIC mode the
@@ -123,7 +124,8 @@ using Procedures::PropertyConfig;
 // Forward declaration (NativeScanner implemented by another agent)
 class NativeScanner;
 
-// Forward declaration for the serialized-scan pipeline (Spec #2).
+// Forward declaration for the serialized-scan pipeline (one pass per
+// target B+Tree index, gated by a single-bit ProjectionIndex mask).
 // EdgeFilter lives in edge_filter.h; forward-declaring here keeps
 // the header free of that include so only the .cc compilation units that
 // actually touch the filter pay the cost.
@@ -357,11 +359,11 @@ ObjectId pack_aggregated_property_value(Aggregation aggregation, double agg_valu
 class NativeProjectionBuilder {
 public:
     /**
-     * @brief Scan-pipeline selection for the projection build (Spec #2).
+     * @brief Scan-pipeline selection for the projection build.
      *
      * CLASSIC (default)   — legacy pipeline: every scan pass emits to every
-     *                       buffer simultaneously. Identical behavior to
-     *                       pre-Spec-#2 code.
+     *                       buffer simultaneously. Identical behavior to the
+     *                       original single-pass code.
      * SERIALIZED          — new pipeline: one scan pass per target B+Tree,
      *                       each pass emits only to a single-index mask.
      * PARALLEL            — builder-level parallel edge scan: has_node() +
@@ -438,40 +440,44 @@ public:
      *        message suggesting re-creation.
      *        See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md §3.A.
      * @param index_set User-selected preset controlling which B+Tree indexes
-     *        will be materialized at build time (Spec #3). Defaults to
-     *        IndexSet::ALL which preserves prior behavior. The value is
-     *        stored on the builder for later consumption by T3.6 (catalog
-     *        serialization) and T3.7/T3.8 (build-phase gating). Does NOT
-     *        yet affect the indexes produced by this constructor.
-     * @param build_topology_snapshot Spec #4-B T4.6 — when true, emit
-     *        `topology_fwd.csr` and/or `topology_rev.csr` sidecar files
+     *        will be materialized at build time. Defaults to IndexSet::ALL
+     *        which preserves prior behavior. The value is stored on the
+     *        builder for later consumption by catalog serialization and
+     *        build-phase gating. Does NOT yet affect the indexes produced
+     *        by this constructor.
+     * @param build_topology_snapshot When true, emit `topology_fwd.csr`
+     *        and/or `topology_rev.csr` mmap-backed CSR sidecar files
      *        alongside the projection's B+Tree files after the normal
-     *        `finalize_serialized_()` / flush step completes. Each direction
-     *        is emitted only when the corresponding edge index
-     *        (FROM_TO_EDGE / TO_FROM_EDGE) is present in the active
-     *        IndexSet mask; otherwise the direction is skipped with a single
-     *        warning line. Errors during sidecar generation are non-fatal:
-     *        the projection remains valid and the user can retry via the
-     *        post-hoc procedure (T4.9). Default is false to preserve the
-     *        zero-regression contract for pre-Spec-#4-B callers. The GQL
-     *        surface (config key + YIELD field) is wired in T4.8; this
-     *        constructor parameter is the builder-level hook the test suite
-     *        drives directly.
-     * @param leaf_format Spec #5 T5.11 — selects the on-disk B+Tree leaf
-     *        encoding for every index materialized by this projection.
-     *        BPT::LeafFormat::BITSET (default) preserves the pre-Spec-#5
+     *        `finalize_serialized_()` / flush step completes. These sidecars
+     *        enable O(1) neighbor slicing for GNN sampling (versus O(log N)
+     *        B+Tree lookups). Each direction is emitted only when the
+     *        corresponding edge index (FROM_TO_EDGE / TO_FROM_EDGE) is
+     *        present in the active IndexSet mask; otherwise the direction is
+     *        skipped with a single warning line. Errors during sidecar
+     *        generation are non-fatal: the projection remains valid and the
+     *        user can retry via the post-hoc `gnn_build_topology_snapshot`
+     *        procedure. Default is false. The GQL surface (config key +
+     *        YIELD field) is wired in the project_procedure; this constructor
+     *        parameter is the builder-level hook the test suite drives
+     *        directly.
+     * @param leaf_format Selects the on-disk B+Tree leaf encoding for every
+     *        index materialized by this projection.
+     *        BPT::LeafFormat::BITSET (default) preserves the prior
      *        byte-identical behavior. BPT::LeafFormat::DELTA_VARINT opts
-     *        into the Spec-#5 v2 layout. The value is threaded to
-     *        ProjectionStorage (for per-index BPlusTree reader construction)
-     *        and persisted per materialized index in catalog v1.5.
-     * @param graph_storage Spec #8 T8.8 — selects the per-projection
-     *        graph-storage mode. BTREE (default) preserves pre-Spec-#8
-     *        behavior byte-for-byte. CSR_HYBRID opts the edge indexes into
-     *        CSR-in-B+Tree leaves; however, T8.8 only plumbs the config
-     *        through the builder and catalog — the build pipeline itself
-     *        still emits BTREE leaves regardless of this value. T8.9 will
-     *        wire BPTLeafCSRWriter into sorter_dispatch.cc to complete
-     *        the feature.
+     *        into the delta + LEB128-varint v2 leaf layout, which exploits
+     *        sort-order to reduce leaf disk size ~80% on typical graphs.
+     *        The value is threaded to ProjectionStorage (for per-index
+     *        BPlusTree reader construction) and persisted per materialized
+     *        index in catalog v1.5.
+     * @param graph_storage Selects the per-projection graph-storage mode.
+     *        BTREE (default) preserves prior behavior byte-for-byte.
+     *        CSR_HYBRID opts the edge-index B+Tree leaves into the CSR
+     *        layout directly (the leaf IS the CSR, enabling O(1) neighbor
+     *        access from the B+Tree itself); however, this constructor
+     *        parameter only plumbs the config through the builder and
+     *        catalog — the build pipeline itself still emits BTREE leaves
+     *        regardless of this value. Wiring BPTLeafCSRWriter into
+     *        sorter_dispatch.cc completes the feature.
      */
     NativeProjectionBuilder(
         const std::string& projection_name,
@@ -528,20 +534,22 @@ public:
     const Statistics& get_statistics() const { return stats; }
 
     /**
-     * @brief Returns the IndexSet preset stored on the builder (Spec #3 T3.5).
+     * @brief Returns the IndexSet preset stored on the builder.
      *
      * Reflects the value wired in by graph_project's `indexSet` config key
      * (or IndexSet::ALL when the key is absent / the legacy positional
-     * constructor is used). Exposed for testability of T3.4 parsing; the
-     * build pipeline itself does not yet consume this value (that work lands
-     * in T3.7 + T3.8). Defined out-of-line in the .cc so this header can
-     * keep IndexSet as a forward declaration.
+     * constructor is used). Exposed for testability of the parsing logic;
+     * the build pipeline itself does not yet consume this value (catalog
+     * serialization and build-phase gating consume it later). Defined
+     * out-of-line in the .cc so this header can keep IndexSet as a forward
+     * declaration.
      */
     IndexSet get_index_set() const noexcept;
 
     /**
-     * @brief Returns whether the builder will emit CSR topology sidecars
-     *        after finalize (Spec #4-B T4.6).
+     * @brief Returns whether the builder will emit mmap-backed CSR topology
+     *        sidecar files (topology_fwd.csr / topology_rev.csr) after
+     *        finalize.
      *
      * Mirrors the `build_topology_snapshot` constructor argument. A true
      * value is advisory: the builder still skips the emission for any
@@ -550,10 +558,11 @@ public:
     bool get_build_topology_snapshot() const noexcept { return build_topology_snapshot_; }
 
     /**
-     * @brief Returns the BPT::LeafFormat stored on the builder (Spec #5 T5.11).
+     * @brief Returns the BPT::LeafFormat stored on the builder.
      *
      * Reflects the value wired in by graph_project's `leafFormat` config key
-     * (or BPT::LeafFormat::BITSET when the key is absent / the legacy
+     * (BITSET = legacy shared-prefix bitset; DELTA_VARINT = delta + LEB128
+     * varint v2 layout; or BITSET when the key is absent / the legacy
      * positional constructor is used). Exposed for testability; the actual
      * propagation to ProjectionStorage and per-index BPlusTree readers
      * happens inside the ctor body.
@@ -561,13 +570,15 @@ public:
     BPT::LeafFormat get_leaf_format() const noexcept { return leaf_format_; }
 
     /**
-     * @brief Returns the BPT::GraphStorage stored on the builder (Spec #8 T8.8).
+     * @brief Returns the BPT::GraphStorage stored on the builder.
      *
      * Reflects the value wired in by graph_project's `graphStorage` config
-     * key (or BPT::GraphStorage::BTREE when the key is absent / the legacy
-     * positional constructor is used). Exposed for testability; the actual
-     * propagation to ProjectionStorage (and thence to the v1.6 catalog byte)
-     * happens inside the ctor body.
+     * key (BTREE = legacy B+Tree leaves; CSR_HYBRID = the edge-index B+Tree
+     * leaves store the CSR layout directly enabling O(1) neighbor access;
+     * or BTREE when the key is absent / the legacy positional constructor is
+     * used). Exposed for testability; the actual propagation to
+     * ProjectionStorage (and thence to the v1.6 catalog byte) happens inside
+     * the ctor body.
      */
     BPT::GraphStorage get_graph_storage() const noexcept {
         return graph_storage_;
@@ -579,8 +590,8 @@ private:
      *
      * Thread-safe via C++11 magic statics. Values "1"/"true"/"yes" enable
      * SERIALIZED; anything else (including unset) falls back to CLASSIC.
-     * Parallel to MDB_PROJECTION_SORTER from Spec #1 — same env-var-opt-in
-     * discipline, same process-lifetime caching.
+     * Follows the same env-var-opt-in discipline and process-lifetime
+     * caching pattern used by the MDB_PROJECTION_SORTER selector.
      */
     static ScanMode get_scan_mode();
 
@@ -624,10 +635,10 @@ private:
      */
     bool all_single_no_aggprop_(const std::vector<std::string>& types) const;
 
-    // Serialized multi-pass scan implementations (Spec #2). Each call
-    // emits records ONLY to buffers matching target_mask. Called in a
-    // loop by finalize_serialized_ with single-bit masks.
-    // Implementations land in Tasks 7 (nodes) and 9 (edges).
+    // Serialized multi-pass scan implementations. Each call emits records
+    // ONLY to buffers matching target_mask. Called in a loop by
+    // finalize_serialized_ with single-bit masks: one scan pass per
+    // target B+Tree index.
     void scan_nodes_impl_serialized_(const std::vector<std::string>& labels,
                                      ProjectionIndex target_mask);
     void scan_edges_impl_serialized_(const std::vector<std::string>& types,
@@ -668,7 +679,8 @@ private:
      * Papers100M (1.6B directed CITES edges): ~200 MB directed bitmap,
      * ~0 MB undirected bitmap.
      *
-     * Spec: §4 Phase B, §6 invariant I2 (filter is write-once).
+     * Invariant: the filter is written exactly once here (Phase B) and
+     *            consumed read-only by all subsequent Phase C edge-index passes.
      *
      * @param types Relationship type names to scan (same set accepted
      *        by scan_edges_by_types / scan_edges_impl_classic_).
@@ -680,26 +692,30 @@ private:
         const std::vector<std::string>& types);
 
     /**
-     * @brief Spec #2 orchestrator: executes Phase A + B + C when ScanMode is
-     *        SERIALIZED. Called by finalize() (wired in Task 11) after the
-     *        public scan_*_by_* methods have captured inputs into stored_labels_
-     *        / stored_types_.
+     * @brief Serialized-mode orchestrator: executes Phase A (node scan) +
+     *        Phase B (edge filter precomputation) + Phase C (per-index edge
+     *        scans) when ScanMode is SERIALIZED. Called by finalize() after
+     *        the public scan_*_by_* methods have captured inputs into
+     *        stored_labels_ / stored_types_.
      *
-     * Falls back to the classic single-pass path when has_non_single_
-     * aggregation_() returns true (spec §3 D8) because aggregation state
-     * would be too large to persist across 9 edge-index passes.
+     * Falls back to the classic single-pass path when
+     * has_non_single_aggregation_() returns true because aggregation state
+     * (COUNT/SUM/MIN/MAX maps) would be too large to persist across 9
+     * separate edge-index passes.
      */
     void finalize_serialized_();
 
     /**
-     * @brief Spec #4-B T4.6 — emit CSR topology sidecar files for the
-     *        projection when requested.
+     * @brief Emit mmap-backed CSR topology sidecar files for the projection
+     *        when requested.
      *
      * No-op when `build_topology_snapshot_` is false. Otherwise, for each
      * of the two directions (FORWARD / REVERSE), the corresponding edge
-     * index bit in the active IndexSet mask is probed; when the bit is
-     * set and the projection's B+Tree is open, a `topology_fwd.csr` or
+     * index bit in the active IndexSet mask is probed; when the bit is set
+     * and the projection's B+Tree is open, a `topology_fwd.csr` or
      * `topology_rev.csr` file is generated via TopologySnapshotWriter.
+     * These sidecar files enable O(1) neighbor slicing for GNN sampling
+     * instead of O(log N) B+Tree directory walks.
      *
      * Called at the tail of `finalize()` after `storage->flush()` so the
      * B+Tree `.leaf` / `.dir` files are complete and fsync'd on disk
@@ -707,19 +723,18 @@ private:
      *
      * Non-fatal: any exception raised while building a sidecar is caught
      * and logged; the projection remains valid and the user can retry
-     * through the post-hoc procedure (T4.9).
+     * through the post-hoc `gnn_build_topology_snapshot` procedure.
      */
     void build_topology_snapshots_();
 
     /**
-     * @brief Spec #4-B T4.6 — single-direction helper used by
-     *        `build_topology_snapshots_()`.
+     * @brief Single-direction helper used by `build_topology_snapshots_()`.
      *
      * Scans the supplied B+Tree twice: first to build the per-source
      * degree histogram, then to stream edges in src-monotonic order into
-     * a freshly constructed TopologySnapshotWriter. Caller is responsible
-     * for gating on the active IndexSet mask — this helper trusts its
-     * arguments.
+     * a freshly constructed TopologySnapshotWriter that emits the mmap-backed
+     * CSR sidecar file. Caller is responsible for gating on the active
+     * IndexSet mask — this helper trusts its arguments.
      */
     void build_one_topology_snapshot_(int direction /* 0=FORWARD, 1=REVERSE */,
                                       void* edge_bpt_opaque);
@@ -788,34 +803,36 @@ private:
     // initialization in ctor body without re-reading the constructor arg.
     bool include_label_indexes_ = true;
 
-    // Spec #3 T3.5: user-selected index preset. Stored here so later tasks
-    // (T3.6 catalog serialization, T3.7 + T3.8 build-phase gating) can
-    // consume it without re-plumbing the constructor. Default is ALL; the
-    // actual default-initialization lives in the ctor to keep the
-    // forward-declared enum viable as a class member.
+    // User-selected index preset controlling which B+Tree indexes are
+    // materialized. Stored here so catalog serialization and build-phase
+    // gating can consume it without re-plumbing the constructor. Default
+    // is ALL; the actual default-initialization lives in the ctor to keep
+    // the forward-declared enum viable as a class member.
     IndexSet index_set_;
 
-    // Spec #4-B T4.6: opt-in flag controlling CSR topology sidecar emission.
+    // Opt-in flag controlling mmap-backed CSR topology sidecar emission.
     // When true, `finalize()` emits `topology_fwd.csr` / `topology_rev.csr`
     // (gated per-direction by the active IndexSet mask) after the normal
-    // B+Tree build completes. Default false preserves pre-Spec-#4-B
-    // behavior for every existing caller of this constructor.
+    // B+Tree build completes, enabling O(1) neighbor slicing for GNN
+    // sampling. Default false preserves existing behavior for all callers
+    // that do not request sidecars.
     bool build_topology_snapshot_ = false;
 
-    // Spec #5 T5.11: on-disk B+Tree leaf encoding preset. Threaded through
-    // ProjectionStorage before build so each materialized B+Tree reader is
-    // constructed with the matching BPT::LeafFormat, and persisted per-index
-    // in catalog v1.5 (one byte per materialized index). Default BITSET
-    // preserves pre-Spec-#5 byte-identical behavior for every pre-T5.11
-    // caller of this constructor.
+    // On-disk B+Tree leaf encoding preset (BITSET = legacy shared-prefix
+    // bitset; DELTA_VARINT = delta + LEB128-varint v2 layout ~80% smaller).
+    // Threaded through ProjectionStorage before build so each materialized
+    // B+Tree reader is constructed with the matching BPT::LeafFormat, and
+    // persisted per-index in catalog v1.5 (one byte per materialized index).
+    // Default BITSET preserves byte-identical behavior for all prior callers.
     BPT::LeafFormat leaf_format_ = BPT::LeafFormat::BITSET;
 
-    // Spec #8 T8.8: per-projection graph-storage mode. Threaded through
+    // Per-projection graph-storage mode for edge indexes. Threaded through
     // ProjectionStorage so save_catalog() can populate the v1.6
-    // graph_storage byte. Default BTREE preserves pre-Spec-#8 byte-for-byte
-    // behavior for every existing caller; CSR_HYBRID is the opt-in that
-    // T8.9 will pick up when wiring BPTLeafCSRWriter into the edge-index
-    // sorter-dispatch path.
+    // graph_storage byte. BTREE (default) preserves prior byte-for-byte
+    // behavior. CSR_HYBRID opts the edge-index B+Tree leaves into the CSR
+    // layout (the leaf IS the CSR, enabling O(1) neighbor access directly
+    // from the B+Tree); wiring BPTLeafCSRWriter into the edge-index
+    // sorter-dispatch path completes the feature.
     BPT::GraphStorage graph_storage_ = BPT::GraphStorage::BTREE;
 
     // Per-type configuration overrides (Neo4j GDS per-type config)
@@ -945,17 +962,16 @@ namespace detail {
     NativeProjectionBuilder::ScanMode init_scan_mode_for_test(const char* env_val);
 
     /**
-     * @brief Spec #4-B T4.6 — test-only hook that runs the exact same CSR
-     *        emission logic that `NativeProjectionBuilder::finalize()`
-     *        invokes for a requested projection, but against a supplied
-     *        ProjectionStorage instead of a live builder.
+     * @brief Test-only hook that runs the exact same mmap-backed CSR sidecar
+     *        emission logic that `NativeProjectionBuilder::finalize()` invokes,
+     *        but against a supplied ProjectionStorage instead of a live builder.
      *
      * This is the cleanest hook the builder path exposes for gtest coverage
      * without requiring the full graph-load + catalog machinery. The
      * production builder method (`build_topology_snapshots_`) is a thin
      * gate over the same routine (it consults the IndexSet mask and calls
-     * per-direction builds); the underlying work — scan BPT twice, stream
-     * into TopologySnapshotWriter, finalize — is shared byte-for-byte.
+     * per-direction builds); the underlying work — scan B+Tree twice,
+     * stream into TopologySnapshotWriter, finalize — is shared byte-for-byte.
      *
      * @param storage Open projection storage with `from_to_edge_index` /
      *        `to_from_edge_index` already populated via

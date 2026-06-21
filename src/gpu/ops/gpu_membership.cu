@@ -1,6 +1,7 @@
 // gpu_membership.cu — Parallel binary-search membership kernel
 //
-// Spec #27 (EdgeKeepBitmap GPU acceleration).
+// GPU acceleration for building the edge-keep bitmap (deciding which edges
+// to retain based on whether both endpoints survive the node scan).
 //
 // Sister kernel to gpu_filter.cu's bitset filter: instead of testing
 // membership against a flat uint64 bitset (which only works when node IDs

@@ -58,8 +58,9 @@ public:
     /// @brief IndexSet preset this projection was built under.
     ///
     /// Cached at construction time from the opened storage / catalog. Consumed
-    /// by GQLModel::get_*() getters (Spec #3 T3.9) to name the active preset
-    /// when diagnosing a missing-index access.
+    /// by GQLModel::get_*() getters to name the active preset when diagnosing
+    /// a missing-index access (i.e., so the error message can tell the user
+    /// which minimum preset would include the queried index).
     IndexSet index_set = static_cast<IndexSet>(0);  // IndexSet::ALL default
 
     /// @name Required Index Pointers
@@ -142,7 +143,8 @@ public:
         node_keys2id = catalog.node_keys2id;
         edge_keys2id = catalog.edge_keys2id;
 
-        // Cache IndexSet preset — consumed by GQLModel getters (Spec #3 T3.9).
+        // Cache IndexSet preset — consumed by GQLModel getters to identify the
+        // active preset when a missing-index access needs to be diagnosed.
         // Prefer the storage's value (restored from catalog by open()); fall
         // back to a fresh catalog read if storage couldn't open the catalog.
         index_set = storage->get_index_set();

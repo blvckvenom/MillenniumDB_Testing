@@ -41,12 +41,11 @@
 using namespace GQL;
 
 // ============================================================================
-// ScanMode selector (Spec #2): MDB_PROJECTION_SERIAL_SCAN env-var parsing.
+// ScanMode selector: MDB_PROJECTION_SERIAL_SCAN env-var parsing.
 //
-// Parallel to MDB_PROJECTION_SORTER from Spec #1. The production path
-// (get_scan_mode) caches the result for the process lifetime via a C++11
-// magic static so downstream callers pay zero overhead after the first
-// invocation.
+// The production path (get_scan_mode) caches the result for the process
+// lifetime via a C++11 magic static so downstream callers pay zero overhead
+// after the first invocation.
 //
 // The detail::init_scan_mode_for_test helper exposes the same parse rules
 // without the cache so unit tests can cover truthy / unknown / null inputs
@@ -251,33 +250,37 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     }
 
     // Surface the IndexSet preset so ProjectionStorage can persist it in the
-    // v1.4 catalog. T3.6 is the serialization-only half; T3.9 will consume
-    // the persisted value to raise descriptive errors when a query needs an
-    // index that wasn't materialized (e.g., EDGE_LABEL under GNN_MINIMAL).
+    // v1.4 catalog. This is the serialization-only half; the query layer
+    // consumes the persisted value to raise descriptive errors when a query
+    // needs an index that wasn't materialized (e.g., EDGE_LABEL under
+    // GNN_MINIMAL).
     storage->requested_index_set = index_set_;
 
-    // Spec #5 T5.11 — push the leaf-format preset down so every BPlusTree
-    // reader constructed by ProjectionStorage uses the matching encoding,
-    // and save_catalog() can populate the v1.5 `leaf_formats` byte array
-    // (one byte per materialized index). Default BITSET is byte-identical
-    // to pre-Spec-#5 behavior for every caller that doesn't set the key.
+    // Push the leaf-format preset (BITSET or DELTA_VARINT) down so every
+    // BPlusTree reader constructed by ProjectionStorage uses the matching
+    // encoding, and save_catalog() can populate the v1.5 `leaf_formats`
+    // byte array (one byte per materialized index). Default BITSET is
+    // byte-identical to behavior for every caller that doesn't set the key.
     storage->requested_leaf_format = leaf_format_;
 
-    // Spec #8 T8.8 — push the graph-storage mode down so save_catalog()
-    // persists the v1.6 graph_storage byte. T8.8 plumbs the value only;
-    // the build pipeline still emits BTREE leaves regardless. T8.9 will
-    // consume requested_graph_storage from ProjectionStorage to dispatch
-    // the edge indexes through BPTLeafCSRWriter under CSR_HYBRID.
+    // Push the graph-storage mode (BTREE or CSR_HYBRID) down so
+    // save_catalog() persists the v1.6 graph_storage byte. The value is
+    // plumbed here; the build pipeline consumes requested_graph_storage
+    // from ProjectionStorage to dispatch the edge indexes through
+    // BPTLeafCSRWriter under CSR_HYBRID (where the edge-index B+Tree
+    // leaves ARE the CSR layout, providing O(1) neighbor access).
     storage->requested_graph_storage = graph_storage_;
 
-    // Spec #4-B T4.18: push the topology-snapshot opt-in down into storage
-    // so the two edge-index builders (build_from_to_edge_index_ and
-    // build_to_from_edge_index_) emit CSR sidecars via mmap over the fresh
-    // `.leaf`, instead of the 3-pass-per-direction post-hoc walker. The
-    // post-hoc walker is retained as a safety fallback: build_topology_snapshots_()
-    // skips any direction whose integrated emit already succeeded, and only
-    // runs the legacy BPT-iterator path for the others (should not occur on
-    // a successful build).
+    // Push the topology-snapshot opt-in down into storage so the two
+    // edge-index builders (build_from_to_edge_index_ and
+    // build_to_from_edge_index_) emit mmap-backed CSR sidecar files
+    // (topology_fwd.csr / topology_rev.csr) inline during the B+Tree
+    // build, instead of requiring a separate 3-pass-per-direction
+    // post-hoc walker. The post-hoc walker is retained as a safety
+    // fallback: build_topology_snapshots_() skips any direction whose
+    // integrated emit already succeeded, and only runs the legacy
+    // BPT-iterator path for the others (should not occur on a successful
+    // build).
     storage->set_build_topology_snapshot(build_topology_snapshot_);
 
     // Initialize native scanner with main graph indexes
@@ -539,8 +542,8 @@ std::string NativeProjectionBuilder::get_aggregation_property_for_type(const std
 
 void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string>& labels) {
     if (get_scan_mode() == ScanMode::SERIALIZED) {
-        // Defer actual scan: store inputs for finalize_serialized_ (Task 10)
-        // to replay via the 14-pass pipeline.
+        // Defer actual scan: store inputs for finalize_serialized_ to replay
+        // via the 14-pass (one-index-at-a-time) serialized pipeline.
         stored_labels_ = labels;
         scan_inputs_captured_ = true;
         return;
@@ -550,8 +553,8 @@ void NativeProjectionBuilder::scan_nodes_by_labels(const std::vector<std::string
 
 void NativeProjectionBuilder::scan_edges_by_types(const std::vector<std::string>& types) {
     if (get_scan_mode() == ScanMode::SERIALIZED) {
-        // Defer actual scan: store inputs for finalize_serialized_ (Task 10)
-        // to replay via the 14-pass pipeline.
+        // Defer actual scan: store inputs for finalize_serialized_ to replay
+        // via the 14-pass (one-index-at-a-time) serialized pipeline.
         stored_types_ = types;
         scan_inputs_captured_ = true;
         return;
@@ -1145,9 +1148,9 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
 
     finalized_ = true;
 
-    // Spec #2 Task 11: dispatch to the serialized orchestrator when
-    // MDB_PROJECTION_SERIAL_SCAN=1 and the public scan_*_by_* wrappers
-    // captured inputs (scan_inputs_captured_ = true).
+    // Dispatch to the serialized orchestrator when MDB_PROJECTION_SERIAL_SCAN=1
+    // and the public scan_*_by_* wrappers captured inputs
+    // (scan_inputs_captured_ = true).
     //
     // finalize_serialized_() runs the full Phase A/B/C pipeline:
     //   Phase A — 5 node-index passes (scan + sort + build + reset each)
@@ -1193,7 +1196,7 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     // (all streaming buffers were drained by finalize_serialized_()'s per-pass
     // build_one_index() calls).  Skip timer attribution in that case so the
     // save_catalog() wall time doesn't inflate sort_ms / btree_write_ms in the
-    // Tasks 14/15 benchmark CSVs — those buckets should reflect only sort +
+    // benchmark CSVs — those buckets should reflect only sort +
     // index-build work, both of which are already captured by the dispatch block
     // above (finalize_serialized_() timing).
     const bool serialized_flush_is_noop =
@@ -1229,7 +1232,7 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     // Write GNN metadata, labels, and splits to the projection directory.
     // These files are consumed by gnn_train and indexed by the same RowMapping
     // row order as the feature matrix.
-    // STEP 4 fail-loud contract guards: when a caller asks for GNN outputs
+    // Fail-loud contract guards: when a caller asks for GNN outputs
     // (features / labels / splits), refuse to silently produce a broken
     // projection. Each guard covers a misconfiguration that previously caused a
     // GNN sidecar (gnn_meta.bin / labels.bin / splits.bin) to be skipped without
@@ -1343,11 +1346,12 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     }
 #endif
 
-    // Spec #4-B T4.6: after the B+Tree .leaf / .dir files are fully written
-    // and fsync'd by storage->flush(), emit CSR sidecars when requested.
-    // build_topology_snapshots_() short-circuits when the opt-in flag is off
-    // and never throws (failures are logged and swallowed to keep the
-    // projection valid).
+    // After the B+Tree .leaf / .dir files are fully written and fsync'd by
+    // storage->flush(), emit the mmap-backed CSR topology sidecar files
+    // (topology_fwd.csr / topology_rev.csr) when the opt-in flag is set.
+    // build_topology_snapshots_() short-circuits when the flag is off and
+    // never throws (failures are logged and swallowed to keep the projection
+    // valid).
     build_topology_snapshots_();
 
     // Refresh projection cache so new projection is immediately visible
@@ -2156,31 +2160,29 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
 }
 
 // ============================================================================
-// Serialized scan implementations (Spec #2).
+// Serialized scan implementations (MDB_PROJECTION_SERIAL_SCAN pipeline).
 //
 // Serialized equivalents of scan_nodes_impl_classic_ / scan_edges_impl_classic_
 // that gate each storage emission on a target ProjectionIndex bitmask. These
-// are invoked once per node-related index (5 passes) by finalize_serialized_
-// (Task 10), so the main scan loop runs five times over the same labels.
+// are invoked once per node-related index (5 passes) by finalize_serialized_,
+// so the main scan loop runs five times over the same labels.
 //
-// Critical invariant (see spec §6, I1): finalize_node_scan() MUST be called
-// EXACTLY ONCE across all node-phase passes — specifically during the NODES
-// pass — because it populates ProjectionStorage::collected_nodes_ which the
-// edge filter's has_node() (Phase B) depends on. If we finalized on every
-// pass, subsequent passes would mutate the node set the edge filter has
-// already consulted.
+// Critical invariant: finalize_node_scan() MUST be called EXACTLY ONCE across
+// all node-phase passes — specifically during the NODES pass — because it
+// populates ProjectionStorage::collected_nodes_ which the edge filter's
+// has_node() (Phase B) depends on. If we finalized on every pass, subsequent
+// passes would mutate the node set the edge filter has already consulted.
 //
-// TODO(task10-gnn): The emit_properties gate here only consults the
-// target_mask. In GNN-only configs (includeFeatures + labelProperty +
+// TODO(serialized-gnn-property-pass): The emit_properties gate here only
+// consults the target_mask. In GNN-only configs (includeFeatures + labelProperty +
 // splitProperty with no explicit nodeProperties), classic's
 // extract_node_properties is called for its side effect of populating
 // labels_buffer_ / splits_buffer_ via try_extract_gnn_property, even
 // though no property records get emitted. For that to work under
-// SERIALIZED mode, Task 10's enabled_indexes_() MUST push
-// NODE_KEY_VALUE / KEY_VALUE_NODE into the pass list when
-// gnn_row_mapping_ != nullptr, regardless of
-// features.include_node_properties. Otherwise GNN training with
-// SERIAL_SCAN=1 trains on unlabeled data.
+// SERIALIZED mode, enabled_indexes_() MUST push NODE_KEY_VALUE /
+// KEY_VALUE_NODE into the pass list when gnn_row_mapping_ != nullptr,
+// regardless of features.include_node_properties. Otherwise GNN training
+// with SERIAL_SCAN=1 trains on unlabeled data.
 // ============================================================================
 
 void NativeProjectionBuilder::scan_nodes_impl_serialized_(
@@ -2250,7 +2252,7 @@ void NativeProjectionBuilder::scan_nodes_impl_serialized_(
 }
 
 // ============================================================================
-// Serialized scan Phase B: precompute_edge_filter_ (Spec #2 §4 Phase B).
+// Serialized scan Phase B: precompute_edge_filter_
 //
 // Single full edge scan that evaluates has_node() on both endpoints for every
 // edge of the requested types, recording the outcome bit-by-bit in an
@@ -2267,9 +2269,9 @@ void NativeProjectionBuilder::scan_nodes_impl_serialized_(
 // strips the prefix via ObjectId::VALUE_MASK and routes the kept-bit into
 // the correct per-orientation bitmap internally.
 //
-// Invariant I2 (spec §6): filter is finalized before return, so Phase C's
-// consumers see an immutable snapshot and can read concurrently without
-// synchronization if they later go parallel.
+// Invariant I2: filter is finalized before return, so Phase C's consumers see
+// an immutable snapshot and can read concurrently without synchronization if
+// they later go parallel.
 // ============================================================================
 std::unique_ptr<EdgeFilter>
 NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>& types)
@@ -2312,16 +2314,16 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
     // that survive the has_node() filter. No batch emission, no aggregation,
     // no property extraction: this phase is purely a filter pre-computation.
     //
-    // Spec #27 (2026-04-26): the per-edge has_node()×2 work is GPU-friendly
-    // (parallel binary search over the sorted collected_nodes_ array), so
-    // we now route edges through EdgeKeepBitmapGpuBatcher, which buffers
-    // (edge_id, from, to) triples and dispatches them either to
-    // mdb::gpu::edge_keep_membership_gpu (sister to the bitset filter in
-    // src/gpu/ops/gpu_filter.cu) or to a CPU fallback that is bit-identical
-    // to the historic inline lambda. Set MDB_PROJECTION_BITMAP_GPU=0 to
-    // force the CPU path for A/B benchmarking. Tiny graphs (cora_gnn) are
-    // never sent to the GPU regardless: the batcher's min_edges_for_gpu
-    // threshold dominates the heuristic.
+    // The per-edge has_node()×2 work is GPU-friendly (parallel binary search
+    // over the sorted collected_nodes_ array), so we route edges through
+    // EdgeKeepBitmapGpuBatcher, which buffers (edge_id, from, to) triples
+    // and dispatches them either to mdb::gpu::edge_keep_membership_gpu
+    // (sister to the bitset filter in src/gpu/ops/gpu_filter.cu) or to a
+    // CPU fallback that is bit-identical to the historic inline lambda.
+    // Set MDB_PROJECTION_BITMAP_GPU=0 to force the CPU path for A/B
+    // benchmarking. Tiny graphs (cora_gnn) are never sent to the GPU
+    // regardless: the batcher's min_edges_for_gpu threshold dominates the
+    // heuristic.
     //
     // NOTE: ParallelEdgeDetector is NOT run here.  A detector that is never
     // cleared grows to hold ALL kept edges (~138 bytes per entry), which
@@ -2346,28 +2348,28 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
 }
 
 // ============================================================================
-// Serialized scan Phase C: scan_edges_impl_serialized_ (Spec #2 §4 Phase C).
+// Serialized scan Phase C: scan_edges_impl_serialized_
 //
-// Mirror of scan_edges_impl_classic_ for the SERIALIZED pipeline. Task 10's
-// orchestrator (finalize_serialized_) calls this once per edge-related index
-// — typically with a single-bit target_mask — so each B+Tree pass does one
-// sequential scan of the label_edge index without redundantly re-running
+// Mirror of scan_edges_impl_classic_ for the SERIALIZED pipeline.
+// finalize_serialized_() calls this once per edge-related index — typically
+// with a single-bit target_mask — so each B+Tree pass does one sequential
+// scan of the label_edge index without redundantly re-running
 // ParallelEdgeDetector or has_node() lookups.
 //
 // The EdgeFilter produced by precompute_edge_filter_ (Phase B) is consumed
 // here read-only: filter->is_kept(edge_id) is an O(1) bitmap probe that
 // replaces the classic path's per-edge has_node(from) + has_node(to) pair.
 //
-// Aggregation modes (SUM/MIN/MAX/COUNT) are NOT handled here: Spec §3 D8
-// keeps classic as the gate-keeping path for aggregation; finalize_serialized_
-// routes those graphs to finalize_classic_ before this code is ever reached.
-// Only SINGLE mode reaches this function.
+// Aggregation modes (SUM/MIN/MAX/COUNT) are NOT handled here: graphs with any
+// non-SINGLE aggregation fall back to the classic path (see
+// has_non_single_aggregation_() + finalize_serialized_()). Only SINGLE mode
+// reaches this function.
 //
-// Invariant I1 (spec §6): Phase B must complete before any Phase C call.
-//   → Enforced by the nullptr guard below (Task 10's orchestrator holds the
+// Invariant I1: Phase B must complete before any Phase C call.
+//   → Enforced by the nullptr guard below (finalize_serialized_() holds the
 //     unique_ptr and passes a raw pointer here only after Phase B returns).
-// Invariant I2 (spec §6): filter is immutable after finalize() — safe to read
-//   concurrently if Task 10 later parallelises the per-index passes.
+// Invariant I2: filter is immutable after finalize() — safe to read
+//   concurrently if the per-index passes are later parallelised.
 // ============================================================================
 void NativeProjectionBuilder::scan_edges_impl_serialized_(
     const std::vector<std::string>& types,
@@ -2388,7 +2390,7 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
     // except for the two label indexes (EDGE_LABEL / LABEL_EDGE) and the
     // two property indexes (EDGE_KEY_VALUE / KEY_VALUE_EDGE) which share
     // the underlying emission: when either single-bit is passed, both the
-    // label buffer write (or property extraction) runs. Task 10's
+    // label buffer write (or property extraction) runs. The serialized
     // orchestrator dispatches each pass independently; build_one_index
     // then picks the correct B+Tree to sort-and-write.
     const bool emit_from_to         = has_flag(target_mask, ProjectionIndex::FROM_TO_EDGE);
@@ -2407,7 +2409,7 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
     const bool emit_any_edge_buffer = emit_from_to || emit_to_from || emit_edge_direction ||
                                       emit_edge_from_to || emit_edge_n1_n2;
 
-    // SINGLE-mode parallel edge detection (Spec §3 D8):
+    // SINGLE-mode parallel edge detection:
     // Run the ParallelEdgeDetector only on the first Phase C pass (FROM_TO_EDGE).
     // Gating on FROM_TO_EDGE avoids running detection 9× (once per edge index)
     // while still throwing the same QueryException before any B+Tree build begins.
@@ -2497,8 +2499,9 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
             }
 
             // Edges carry no GNN side-effects (labels/splits live on nodes — see the
-            // TODO(task10-gnn) block in scan_nodes_impl_serialized_), so the
-            // empty-key guard is a safe short-circuit here that it is NOT for nodes.
+            // TODO(serialized-gnn-property-pass) block in
+            // scan_nodes_impl_serialized_), so the empty-key guard is a safe
+            // short-circuit here that it is NOT for nodes.
             if (emit_edge_properties && !edge_property_keys.empty()) {
                 extract_edge_properties(edge_id);
             }
@@ -2541,12 +2544,12 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
 }
 
 // ============================================================================
-// Task 10: enabled_indexes_(), has_non_single_aggregation_(),
-// finalize_serialized_() — Spec #2 §4 full pipeline orchestrator.
+// enabled_indexes_(), has_non_single_aggregation_(), finalize_serialized_()
+// — serialized pipeline orchestrator.
 //
 // enabled_indexes_() computes the ordered list of single-bit ProjectionIndex
 // values to iterate in Phase A (node indexes) and Phase C (edge indexes).
-// The order within each phase is fixed by spec §4:
+// The order within each phase is fixed:
 //   Phase A: NODES → NODE_LABEL → LABEL_NODE → NODE_KEY_VALUE → KEY_VALUE_NODE
 //   Phase C: FROM_TO_EDGE → TO_FROM_EDGE → EDGE_DIRECTION → EDGE_FROM_TO →
 //             EDGE_N1_N2 → EDGE_LABEL → LABEL_EDGE → EDGE_KEY_VALUE →
@@ -2555,7 +2558,7 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
 // node_property_keys / edge_property_keys) are emitted — this is what bounds
 // peak scratch disk to O(max single index) instead of O(sum all indexes).
 //
-// GNN disjunct (Task 7 code-review finding, see TODO(task10-gnn)):
+// GNN disjunct (see TODO(serialized-gnn-property-pass)):
 //   classic's extract_node_properties populates labels_buffer_ / splits_buffer_
 //   via try_extract_gnn_property as a side-effect, even when node_property_keys
 //   is empty. Under SERIALIZED, property extraction only fires during
@@ -2564,10 +2567,10 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
 //   properties were explicitly configured. Failure to do so causes Cora's
 //   testAccuracy to drop from 0.7900 to random under SERIAL_SCAN=1.
 //
-// has_non_single_aggregation_() implements spec §3 D8: aggregation state
-//   (COUNT/SUM/MIN/MAX maps) would be too large to persist across 9 edge-index
-//   passes, so graphs with any non-SINGLE aggregation fall back to the classic
-//   single-pass path with a stderr warning.
+// has_non_single_aggregation_(): aggregation state (COUNT/SUM/MIN/MAX maps)
+//   would be too large to persist across 9 edge-index passes, so graphs with
+//   any non-SINGLE aggregation fall back to the classic single-pass path with
+//   a stderr warning.
 //
 // finalize_serialized_() orchestrates:
 //   Phase A: node-index passes (scan_nodes_impl_serialized_ + build_one_index
@@ -2601,7 +2604,7 @@ std::vector<ProjectionIndex> NativeProjectionBuilder::enabled_indexes_() const {
     // NODE_KEY_VALUE / KEY_VALUE_NODE passes — so we MUST include them
     // whenever GNN is active, regardless of features.include_node_properties.
     // Without this, Cora's testAccuracy drops from 0.7900 to random
-    // (Task 7 code-review finding, see TODO(task10-gnn) in
+    // (code-review finding, see TODO(serialized-gnn-property-pass) in
     // scan_nodes_impl_serialized_).
     bool needs_node_properties = !node_property_keys.empty() || !node_prop_configs.empty();
 #ifdef ENABLE_GNN
@@ -2671,9 +2674,9 @@ void NativeProjectionBuilder::finalize_serialized_() {
             "scan_nodes_by_labels + scan_edges_by_types must be called first");
     }
 
-    // Spec §3 D8: aggregation modes (COUNT/SUM/MIN/MAX) require the classic
-    // path because aggregation state would be too large to persist across 9
-    // edge-index passes. Warn and fall through to the classic impls.
+    // Aggregation modes (COUNT/SUM/MIN/MAX) require the classic path because
+    // aggregation state would be too large to persist across 9 edge-index
+    // passes. Warn and fall through to the classic impls.
     if (has_non_single_aggregation_()) {
         std::cerr << "[Projection] SERIAL_SCAN disabled for this projection: "
                      "aggregation mode (COUNT/SUM/MIN/MAX) requires the "
@@ -2686,14 +2689,14 @@ void NativeProjectionBuilder::finalize_serialized_() {
 
     auto all_idx = enabled_indexes_();
 
-    // Spec #3 T3.7: compute the active IndexSet preset mask once per build so
-    // each iteration of the Phase A / Phase C loops below can gate topology
-    // index materialization with a cheap bitwise probe (has_flag). Property
-    // indexes (NODE_KEY_VALUE, KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE)
-    // are NOT gated by IndexSet — their existing property-config gate (via
+    // Compute the active IndexSet preset mask once per build so each iteration
+    // of the Phase A / Phase C loops below can gate topology index
+    // materialization with a cheap bitwise probe (has_flag). Property indexes
+    // (NODE_KEY_VALUE, KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE) are NOT
+    // gated by IndexSet — their existing property-config gate (via
     // features.include_*_properties inside build_*_index_()) remains the sole
-    // controller, per Spec #3 §3.4. The mask below is only consulted for the
-    // 10 topology / label indexes.
+    // controller. The mask below is only consulted for the 10 topology / label
+    // indexes.
     const ProjectionIndex active_mask = project_index_mask_for(index_set_);
     auto is_property_index = [](ProjectionIndex idx) {
         return idx == ProjectionIndex::NODE_KEY_VALUE
@@ -2723,15 +2726,16 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // them. Without it, up to 249 records can remain un-flushed when the index
     // build runs, causing those records to be omitted from the B+Tree and later
     // re-processed by the flush() call, which overwrites the correct index with
-    // a partial dataset (Spec #2 §4 correctness fix — I4 golden compare guard).
+    // a partial dataset (correctness invariant: buffers must be fully flushed
+    // before build_one_index() reads them — I4 golden compare guard).
     for (auto idx : node_phase) {
-        // Spec #3 T3.7: skip topology index materialization when its bit is
-        // not in the active IndexSet preset. Property indexes bypass this gate
-        // (see is_property_index lambda); they remain controlled solely by
-        // their property-config gate inside build_one_index() → build_*_()
-        // helpers. NOTE: when the bit is masked out we skip the scan too —
-        // there is no buffer to populate since no downstream consumer would
-        // read it, so the scan work would be wasted I/O.
+        // Skip topology index materialization when its bit is not set in the
+        // active IndexSet preset mask. Property indexes bypass this gate (see
+        // is_property_index lambda); they remain controlled solely by their
+        // property-config gate inside build_one_index() → build_*_() helpers.
+        // When the bit is masked out we skip the scan too — there is no buffer
+        // to populate since no downstream consumer would read it, so the scan
+        // work would be wasted I/O.
         if (!is_property_index(idx) && !has_flag(active_mask, idx)) {
             continue;
         }
@@ -2759,11 +2763,11 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // drain_pending_batches() before each build ensures the streaming buffer
     // is fully populated (same correctness argument as Phase A above).
     for (auto idx : edge_phase) {
-        // Spec #3 T3.7: skip topology index materialization when its bit is
-        // not in the active IndexSet preset. Property indexes bypass this gate
-        // (see is_property_index lambda above). Skipping the scan too avoids
-        // wasted per-pass I/O (filter probe, spill read) when no downstream
-        // buffer would be populated.
+        // Skip topology index materialization when its bit is not set in the
+        // active IndexSet preset mask. Property indexes bypass this gate (see
+        // is_property_index lambda above). Skipping the scan too avoids wasted
+        // per-pass I/O (filter probe, spill read) when no downstream buffer
+        // would be populated.
         if (!is_property_index(idx) && !has_flag(active_mask, idx)) {
             continue;
         }
@@ -2787,38 +2791,41 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // heap pages to the kernel.
 
     // ---- Phase 4: open B+Tree readers ----
-    // Spec #2 Task 11: after all piecemeal build passes, open every
-    // .leaf/.dir reader so the projection is queryable.  Under CLASSIC,
-    // build_all_indexes_bulk() calls open_all_bplustree_readers_() itself;
-    // under SERIALIZED we must do it here because build_all_indexes_bulk()
-    // is bypassed (its backing buffers are all empty after Phase A/B/C).
+    // After all piecemeal build passes, open every .leaf/.dir reader so the
+    // projection is queryable. Under CLASSIC, build_all_indexes_bulk() calls
+    // open_all_bplustree_readers_() itself; under SERIALIZED we must do it
+    // here because build_all_indexes_bulk() is bypassed (its backing buffers
+    // are all empty after Phase A/B/C).
     storage->open_all_bplustree_readers_();
 }
 
 // ============================================================================
-// Spec #4-B T4.6 — CSR topology sidecar emission
+// CSR topology sidecar emission (topology_fwd.csr / topology_rev.csr)
 // ============================================================================
 //
-// build_topology_snapshots_() orchestrates per-direction emission gated by
-// the active IndexSet mask. Called from finalize() after storage->flush()
-// so the B+Tree `.leaf` / `.dir` files exist on disk and the BPT readers
-// held by ProjectionStorage point at them.
+// build_topology_snapshots_() orchestrates per-direction emission of
+// mmap-backed CSR sidecar files gated by the active IndexSet mask. Called
+// from finalize() after storage->flush() so the B+Tree `.leaf` / `.dir`
+// files exist on disk and the BPT readers held by ProjectionStorage point
+// at them.
 //
 // Per-direction failures are logged and swallowed: the projection stays
-// valid, and the user can retry through the T4.9 post-hoc procedure.
+// valid, and the user can retry through the post-hoc gnn_build_topology_snapshot
+// procedure.
 
 void NativeProjectionBuilder::build_topology_snapshots_() {
     if (!build_topology_snapshot_) {
         return;
     }
 
-    // Spec #8 T8.9 (design §3.8 D8) — under graphStorage='CSR_HYBRID' the
-    // in-leaf CSR on the FROM_TO_EDGE / TO_FROM_EDGE B+Trees supersedes
-    // any topology sidecar. If the user also set buildTopologySnapshot=true
-    // we silently drop the sidecar emission here; project_procedure.cc
-    // logs a single warning line so callers notice the flag had no effect.
-    // The projection itself remains valid and fully queryable via the
-    // CSR-aware BPT readers opened in ProjectionStorage.
+    // Under CSR_HYBRID graph storage, the edge-index B+Tree leaves ARE the
+    // CSR layout (FROM_TO_EDGE / TO_FROM_EDGE leaves embed the neighbor
+    // list directly), which supersedes any separate topology sidecar file.
+    // If the user also set buildTopologySnapshot=true we silently drop the
+    // sidecar emission here; project_procedure.cc logs a single warning line
+    // so callers notice the flag had no effect. The projection itself remains
+    // valid and fully queryable via the CSR-aware BPT readers opened in
+    // ProjectionStorage.
     if (graph_storage_ == BPT::GraphStorage::CSR_HYBRID) {
         return;
     }
@@ -2835,13 +2842,13 @@ void NativeProjectionBuilder::build_topology_snapshots_() {
         return;
     }
 
-    // Spec #4-B T4.18: fast path — if the integrated build path (invoked
-    // inline by ProjectionStorage::build_{from_to,to_from}_edge_index_)
-    // already emitted both sidecars, we have nothing to do. Fall through
-    // only for directions where the integrated path was disabled or
-    // failed, so the legacy post-hoc BPT walker retries them as a safety
-    // net. On a healthy build this branch is the common case and the
-    // whole function returns with a single fast check.
+    // Fast path: if the integrated build path (invoked inline by
+    // ProjectionStorage::build_{from_to,to_from}_edge_index_) already
+    // emitted both CSR sidecar files during the B+Tree build, we have
+    // nothing to do. Fall through only for directions where the integrated
+    // path was disabled or failed, so the legacy post-hoc BPT walker retries
+    // them as a safety net. On a healthy build this branch is the common
+    // case and the whole function returns with a single fast check.
     const bool fwd_done = storage->fwd_topology_snapshot_built();
     const bool rev_done = storage->rev_topology_snapshot_built();
 
@@ -2971,10 +2978,10 @@ void NativeProjectionBuilder::build_one_topology_snapshot_(
 }
 
 // ----------------------------------------------------------------------------
-// Test-only helper (Spec #4-B T4.6) — shares the BPT-scan + writer body of
-// build_one_topology_snapshot_ so the gtest exercises the real code path.
-// Deliberately surfaces exceptions (the production method swallows them to
-// keep the projection valid).
+// Test-only helper for CSR topology sidecar emission — shares the BPT-scan
+// + writer body of build_one_topology_snapshot_ so the gtest exercises the
+// real code path. Deliberately surfaces exceptions (the production method
+// swallows them to keep the projection valid).
 // ----------------------------------------------------------------------------
 
 namespace GQL {

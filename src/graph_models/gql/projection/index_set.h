@@ -11,8 +11,9 @@ namespace GQL {
  * @brief IndexSet — user-facing preset names for index selection in graph_project.
  *
  * Each preset corresponds to a specific subset of ProjectionIndex bits
- * appropriate for a workload class. Foundation for Spec #3 — user-selectable
- * index materialization for GNN workloads.
+ * appropriate for a workload class. Enables user-selectable index materialization
+ * so GNN workloads can skip the full set of 14 B+Tree indexes and build only
+ * the subset they actually query.
  *
  * Preset membership:
  *   ALL                = ProjectionIndex::ALL (all 14 bits)
@@ -81,7 +82,7 @@ const char* index_set_name(IndexSet preset) noexcept;
  *        value, matching the on-disk .leaf file naming (e.g. "edge_label"
  *        for ProjectionIndex::EDGE_LABEL, "from_to_edge" for FROM_TO_EDGE).
  *
- * Used by the query-layer error diagnostic (Spec #3 T3.9) to name the
+ * Used by the query-layer missing-index error diagnostic to name the
  * missing index in QueryException messages. Only accepts single-bit
  * values — composite masks (NONE, ALL_NODE, ALL_EDGE, ALL) return
  * "UNKNOWN" because they cannot be mapped to a unique .leaf file.
@@ -95,8 +96,8 @@ const char* projection_index_name(ProjectionIndex which) noexcept;
  * @brief Returns the LOWEST (most restrictive) IndexSet preset whose
  *        bitmask contains the given single-bit ProjectionIndex.
  *
- * Used by T3.9's query-layer diagnostic to suggest the minimum rebuild
- * required to unblock a query. For example:
+ * Used by the query-layer missing-index diagnostic to suggest the minimum
+ * rebuild required to unblock a query. For example:
  *   EDGE_LABEL, LABEL_EDGE              -> READONLY_TRAVERSAL
  *   NODES, FROM_TO_EDGE, TO_FROM_EDGE,
  *   NODE_LABEL, LABEL_NODE              -> GNN_MINIMAL
@@ -108,7 +109,8 @@ const char* projection_index_name(ProjectionIndex which) noexcept;
  *                                               not IndexSet — callers
  *                                               still need ALL + the
  *                                               appropriate includeProperties
- *                                               config; see Spec #3 §3.4)
+ *                                               config to enable property
+ *                                               index materialization)
  *
  * For composite masks or out-of-range casts, asserts in debug builds and
  * returns IndexSet::ALL in release (safe fallback: ALL always contains

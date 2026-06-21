@@ -42,9 +42,9 @@ enum class IndexSet : uint8_t;
  * | 1.1 | Added optional labels/properties support |
  * | 1.2 | Added property key mappings (index-based, DEPRECATED) |
  * | 1.3 | Fixed key mappings to persist actual IDs (not indices) |
- * | 1.4 | Added IndexSet preset byte (Spec #3 T3.6) |
- * | 1.5 | Added per-index leaf_format byte array (Spec #5 T5.10) |
- * | 1.6 | Added per-projection graphStorage byte (Spec #8 T8.7) |
+ * | 1.4 | Added IndexSet preset byte (selects which B+Tree indexes to materialize) |
+ * | 1.5 | Added per-index leaf_format byte array (delta + LEB128-varint leaf encoding) |
+ * | 1.6 | Added per-projection graphStorage byte (CSR-hybrid graph storage: edge-index B+Tree leaves store the CSR layout inline) |
  *
  * ## v1.5 additions
  *
@@ -55,19 +55,21 @@ enum class IndexSet : uint8_t;
  * LABEL_NODE, NODE_KEY_VALUE, KEY_VALUE_NODE, FROM_TO_EDGE, TO_FROM_EDGE,
  * EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2, EDGE_LABEL, LABEL_EDGE,
  * EDGE_KEY_VALUE, KEY_VALUE_EDGE). Values: 1 = BITSET (legacy redundant
- * bitset encoding), 2 = DELTA_VARINT (Spec #5 v2 encoding). Catalogs with
- * MINOR < 5 are read by populating leaf_formats with all-BITSET (1) for
- * every materialized index, preserving pre-Spec-#5 behavior.
+ * bitset encoding), 2 = DELTA_VARINT (delta + LEB128-varint v2 encoding).
+ * Catalogs with MINOR < 5 are read by populating leaf_formats with
+ * all-BITSET (1) for every materialized index, preserving the behavior of
+ * projections built before delta + LEB128-varint leaf encoding was introduced.
  *
  * ## v1.6 additions
  *
  * After the v1.5 leaf_formats section, v1.6 appends a single per-projection
  * graph_storage byte selecting the on-disk topology representation. Values:
  * 1 = BTREE (classic per-index B+Tree leaves using leaf_format), 2 =
- * CSR_HYBRID (edge indexes emit inline CSR leaves per Spec #8; other
- * indexes use leaf_format normally). Catalogs with MINOR < 6 are read by
- * defaulting graph_storage to 1 (BTREE), preserving pre-Spec-#8 behavior
- * byte-for-byte.
+ * CSR_HYBRID (edge-index B+Tree leaves store the CSR layout inline so that
+ * neighbor lookup is O(1) without a separate sidecar file; non-edge indexes
+ * continue to use leaf_format normally). Catalogs with MINOR < 6 are read
+ * by defaulting graph_storage to 1 (BTREE), preserving the behavior of
+ * projections built before CSR-hybrid storage was introduced.
  *
  * @see ProjectionStorage for the actual index storage
  * @see ProjectionManager for projection lifecycle management
@@ -77,7 +79,7 @@ public:
     /// @name Format Constants
     /// @{
     static constexpr uint8_t MAJOR_VERSION = 1;    ///< Catalog format major version
-    /// Minor version (1.6 adds per-projection graphStorage byte for Spec #8)
+    /// Minor version (1.6 adds per-projection graphStorage byte for CSR-hybrid graph storage)
     static constexpr uint8_t MINOR_VERSION = 6;
     static constexpr uint8_t magic_number[] = {0x10, 0x0D, 0xEC, 0xAD, 0xE5, 0xDB};  ///< File type identifier
     static constexpr uint8_t MODEL_ID = 255;       ///< Special ID distinguishing from GQL/RDF catalogs
@@ -183,25 +185,26 @@ public:
 
     /// @name Index Materialization (v1.4+)
     /// @brief Preset chosen at build time controlling which B+Tree indexes
-    /// were materialized. Consumed by the query layer (T3.9) to raise a
+    /// were materialized. Consumed by the query layer to raise a
     /// descriptive error when a query requires an index that wasn't built.
     /// For v1.3 and earlier catalogs, the reader defaults this to IndexSet::ALL
-    /// (the historical behavior before Spec #3).
+    /// (the historical behavior before the IndexSet preset was introduced).
     /// @{
     IndexSet index_set = static_cast<IndexSet>(0);  ///< IndexSet::ALL (fwd-declared)
     /// @}
 
     /// @name Per-Index Leaf Format (v1.5+)
-    /// @brief Per-index LeafFormat byte (Spec #5, v1.5+). Size == number of
-    /// materialized indexes (those whose bit is set in index_set). Order
-    /// follows the canonical ProjectionIndex enum (NODES, NODE_LABEL,
-    /// LABEL_NODE, NODE_KEY_VALUE, KEY_VALUE_NODE, FROM_TO_EDGE, TO_FROM_EDGE,
-    /// EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2, EDGE_LABEL, LABEL_EDGE,
-    /// EDGE_KEY_VALUE, KEY_VALUE_EDGE). Values: 1 = BITSET (legacy), 2 =
-    /// DELTA_VARINT (Spec #5 v2). v1.4 and earlier catalogs read under v1.5
-    /// code default every entry to BITSET (1). The on-disk representation is
-    /// uint8_t per slot; conversion to BPT::LeafFormat happens in consumers
-    /// (T5.11 wires this field into BPlusTree<N>::ctor).
+    /// @brief Per-index LeafFormat byte (delta + LEB128-varint leaf encoding,
+    /// v1.5+). Size == number of materialized indexes (those whose bit is set
+    /// in index_set). Order follows the canonical ProjectionIndex enum (NODES,
+    /// NODE_LABEL, LABEL_NODE, NODE_KEY_VALUE, KEY_VALUE_NODE, FROM_TO_EDGE,
+    /// TO_FROM_EDGE, EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2, EDGE_LABEL,
+    /// LABEL_EDGE, EDGE_KEY_VALUE, KEY_VALUE_EDGE). Values: 1 = BITSET
+    /// (legacy), 2 = DELTA_VARINT (delta + LEB128-varint v2 encoding). v1.4
+    /// and earlier catalogs read under v1.5 code default every entry to
+    /// BITSET (1). The on-disk representation is uint8_t per slot; conversion
+    /// to BPT::LeafFormat happens in consumers that wire this field into
+    /// BPlusTree<N>::ctor.
     /// @{
     std::vector<uint8_t> leaf_formats;
     /// @}
@@ -212,12 +215,16 @@ public:
 
     /// @name Graph Storage Mode (v1.6+)
     /// @{
-    /// Per-projection graph-storage mode byte (Spec #8, v1.6+). Values:
+    /// Per-projection graph-storage mode byte (CSR-hybrid graph storage,
+    /// v1.6+). Values:
     ///   1 = BTREE       — classic B+Tree leaves with per-index leaf_format
-    ///                      (default, preserves pre-Spec-#8 behavior).
-    ///   2 = CSR_HYBRID  — edge indexes (FROM_TO_EDGE, TO_FROM_EDGE) use
-    ///                      inline CSR leaves per Spec #8; other indexes
-    ///                      use leaf_format normally.
+    ///                      (default, preserves behavior of projections built
+    ///                      before CSR-hybrid storage was introduced).
+    ///   2 = CSR_HYBRID  — edge indexes (FROM_TO_EDGE, TO_FROM_EDGE) emit
+    ///                      B+Tree leaves that store the CSR layout inline,
+    ///                      enabling O(1) neighbor access without a separate
+    ///                      sidecar file; non-edge indexes use leaf_format
+    ///                      normally.
     ///
     /// Pre-v1.6 catalogs read under v1.6 code default to BTREE (1),
     /// preserving behavior.

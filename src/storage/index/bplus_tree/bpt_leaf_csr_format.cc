@@ -6,9 +6,10 @@
 // memcpy of the whole struct because that would couple the disk format
 // to the host's representation and to compiler-specific struct padding.
 //
-// Mirrors the pattern established by bpt_leaf_format.cc (Spec #5 T5.3).
+// Mirrors the pattern established by bpt_leaf_format.cc, which implements
+// the delta + LEB128-varint B+Tree leaf compression format.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
+// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
 
 #include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
 

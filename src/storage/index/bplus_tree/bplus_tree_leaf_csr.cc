@@ -1,17 +1,26 @@
-// BPTLeafCSR read-path implementation (Spec #8 T8.4).
+// BPTLeafCSR read-path implementation.
+//
+// This file implements the CSR-hybrid graph storage reader, where the
+// edge-index B+Tree leaves ARE the CSR (Compressed Sparse Row) layout
+// rather than storing records in the legacy bitset/delta-varint format.
+// Each v3 leaf page encodes one or more (src, [dst...], [eid...]) groups
+// in a compact offset-table + varint-stream layout.
 //
 // The reader validates the v3 header at construction (per design §5.5),
 // caches a pointer to the in-page offset table, and exposes:
 //   - find_src_entry(src_id) — O(log value_count) binary search over the
 //     offset table.
 //   - get_dst_at(start_offset, degree, i) — O(1) amortized sequential
-//     decode, backed by a cursor cache mirroring Spec #5 T5.13b.
+//     decode, backed by a cursor cache that avoids restarting the zigzag-
+//     delta varint walk on every successive tuple (analogous to the cursor
+//     cache in the delta + LEB128-varint leaf reader, bplus_tree_leaf_v2.cc).
 //   - The BPTLeafBase<N> contract surface (get_record / search_index /
 //     etc.) iterates the full (src, dst, edge_id) tuple stream for
 //     BptIter range-scan compatibility.
 //
 // Mutation paths (insert / delete_record / update_to_next_leaf) raise
-// std::logic_error per Spec #8 I6 — v3 pages are immutable post-build.
+// std::logic_error because v3 pages are immutable post-build; to modify
+// the graph, the projection must be rebuilt.
 //
 // Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
 
@@ -66,7 +75,7 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
     std::memcpy(raw, page_bytes_, sizeof(raw));
     header_ = BPT::deserialize_csr_header(raw);
 
-    // --- Per-byte header validation (design §5.5) ---
+    // --- Per-byte header validation ---
 
     if (header_.format_version != 3) {
         throw BPT::BPTLeafCSRDecodeException(
@@ -140,16 +149,15 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
         }
     }
 
-    // --- Compute physical tuple counts per entry (T8-B.1 Bug-A fix) ---
+    // --- Compute physical tuple counts per entry ---
     //
-    // Pre-fix, this loop accumulated stored `degree` values directly. But
-    // hub entries' stored degree is the TOTAL chain size (design §3.9), and
+    // Hub entries' stored `degree` is the TOTAL chain size (design §3.9), and
     // only a subset of those dsts is physically serialized on the chain-head
-    // page — the rest spills onto continuation pages. Summing stored degrees
-    // inflated total_tuples_, causing BptIter to walk past the physical end
-    // of the varint stream and crash in decode_tuple_.
+    // page — the rest spills onto continuation pages. Simply accumulating
+    // stored degrees would inflate total_tuples_, causing BptIter to walk
+    // past the physical end of the varint stream and crash in decode_tuple_.
     //
-    // The fix: count the actual varints present on THIS page per entry by
+    // Instead, count the actual varints present on THIS page per entry by
     // decoding the col_idx stream until one of:
     //   (a) stored `degree` varints consumed (non-hub or chain-head whose
     //       dsts all fit on the page),
@@ -168,9 +176,9 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
     entry_col_idx_start_.assign(vc, 0);
     entry_edge_id_start_.assign(vc, 0);
 
-    // Spec #8-B task #1: cache whether this page carries a parallel
-    // edge_id stream per entry. Checked once at construction so every
-    // subsequent decode_tuple_ / get_dst_at call is branch-predictable.
+    // Cache whether this page carries a parallel edge_id stream per entry.
+    // Checked once at construction so every subsequent decode_tuple_ /
+    // get_dst_at call is branch-predictable.
     page_has_edge_ids_ =
         (header_.flags & BPT::CSRHybridFlags::kHasEdgeIds) != 0;
     page_is_hub_chain_head_ =
@@ -215,12 +223,11 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
                 + " at src index " + std::to_string(i));
         }
 
-        // Spec #8-B hub completion: when kIsHubChainHead is set, an extra
-        // `k_on_head` varint follows the (src_id, degree) header, telling
-        // us exactly how many dsts (and parallel eids) are physically
-        // present on THIS page. Without it the dst-stream walker could
-        // not distinguish dst varints from the immediately-following eid
-        // stream when degree > k_on_head.
+        // Hub chain-head pages carry an extra `k_on_head` varint after the
+        // (src_id, degree) header, telling us exactly how many dsts (and
+        // parallel eids) are physically present on THIS page. Without it
+        // the dst-stream walker could not distinguish dst varints from the
+        // immediately-following eid stream when degree > k_on_head.
         uint64_t k_on_head_decl = 0;
         bool     have_k_on_head = false;
         if (page_is_hub_chain_head_) {
@@ -267,11 +274,11 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
         // This heuristic does NOT apply to position 0 (full varint, not a
         // delta — the first dst can legitimately be 0 for node id 0), nor
         // to continuation pages (chunk_count is authoritative and
-        // pre-decoded by the ContinuationTag ctor). Spec #8-B hub
-        // completion: when k_on_head is declared explicitly, we trust it
-        // and skip the heuristic — which is necessary because the eid
-        // stream now sits immediately after the dst stream with no
-        // padding, so the 0x00 sentinel would never trigger.
+        // pre-decoded by the ContinuationTag ctor). When k_on_head is
+        // declared explicitly (hub chain-head pages), we trust it and skip
+        // the heuristic — which is necessary because the parallel eid
+        // stream sits immediately after the dst stream with no padding,
+        // so the 0x00 sentinel would never trigger.
         const uint64_t walk_limit =
             have_k_on_head ? k_on_head_decl : degree;
         uint64_t phys = 0;
@@ -301,8 +308,8 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
 
         physical_degrees_[i] = static_cast<uint32_t>(phys);
 
-        // Spec #8-B: if the page advertises edge_ids, the parallel eid
-        // stream starts at the byte immediately after the dst stream's
+        // If the page advertises edge_ids (kHasEdgeIds flag), the parallel
+        // eid stream starts at the byte immediately after the dst stream's
         // last-consumed varint. Capture that offset now so decode_tuple_
         // can resolve eids in O(1) amortized alongside dsts.
         if (page_has_edge_ids_) {
@@ -322,17 +329,19 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
 
 
 // ============================================================================
-// Continuation-mode ctor (T8-B.1 Bug-B fix)
+// Continuation-mode ctor
 // ============================================================================
 //
-// Opens a v3 continuation page as a BPTLeafBase<N> view. Validates header,
+// Opens a v3 continuation page as a BPTLeafBase<N> view. Continuation pages
+// hold the overflow dsts (and eids) of a hub src entry whose total degree
+// does not fit on a single chain-head page. This ctor validates the header,
 // pre-decodes all `chunk_count` zigzag-delta varints starting from
 // `tag.prev_dst_carry` into cont_dsts_, and sets total_tuples_ = chunk_count
 // so BptIter can iterate the dsts via get_record / update_record.
 //
 // This is the ONLY legal path to open a continuation page. The ReadTag
-// ctor still rejects continuation pages per I6 — directory-routed opens
-// should never land on a continuation.
+// ctor rejects continuation pages (kIsContinuation flag set) — directory-
+// routed opens should never land on a continuation.
 
 template <std::size_t N>
 BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ContinuationTag tag) :
@@ -416,10 +425,11 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ContinuationTag tag) :
         cont_dsts_.push_back(running);
     }
 
-    // Spec #8-B task #1 (hub completion): if the continuation page
-    // advertises kHasEdgeIds, parse a parallel chunk_count-length eid
-    // stream from the byte immediately after the dst stream. Encoded as
-    // zigzag-deltas against tag.prev_eid_carry, mirroring the dst format.
+    // If the continuation page advertises kHasEdgeIds, parse a parallel
+    // chunk_count-length eid stream from the byte immediately after the
+    // dst stream. Encoded as zigzag-deltas against tag.prev_eid_carry,
+    // mirroring the dst format. This allows edge_id values to be recovered
+    // from continuation pages just as they are from chain-head pages.
     page_has_edge_ids_ =
         (header_.flags & BPT::CSRHybridFlags::kHasEdgeIds) != 0;
     if (page_has_edge_ids_) {
@@ -543,8 +553,8 @@ uint32_t BPTLeafCSR<N>::src_entry_count() const noexcept
 template <std::size_t N>
 bool BPTLeafCSR<N>::is_chain_head() const noexcept
 {
-    // Continuation-mode instances (T8-B.1) report false; ReadTag-opened
-    // instances report true.
+    // Continuation-mode instances (opened via the ContinuationTag ctor)
+    // report false; ReadTag-opened chain-head instances report true.
     return mode_ == Mode::ChainHead;
 }
 
@@ -578,15 +588,17 @@ bool BPTLeafCSR<N>::find_src_entry(uint64_t src_id,
     }
     (void)sid_check; // already validated equality via the binary search path
 
-    // Spec #8-B hub completion: hub chain-heads carry an extra `k_on_head`
-    // varint between (degree) and the dst stream. The cached
-    // entry_col_idx_start_[idx] already accounts for it, so we trust the
-    // cache for the start offset rather than re-walking the optional
-    // varint here. For non-hub pages this falls through to the legacy
-    // post-degree position which equals entry_col_idx_start_[idx] anyway.
+    // Hub chain-head pages carry an extra `k_on_head` varint between
+    // (degree) and the dst stream. The cached entry_col_idx_start_[idx]
+    // already accounts for it (recorded during construction), so we use
+    // the cache for the dst-stream start offset rather than re-walking
+    // the optional varint here. For non-hub pages the post-degree position
+    // equals entry_col_idx_start_[idx] anyway.
     out_start_offset = entry_col_idx_start_[idx];
-    // Stored degree (TOTAL across the chain for hubs) — preserves the
-    // pre-Spec-#8-B contract that callers expect from this getter.
+    // Stored degree (TOTAL across the chain for hubs) — callers that walk
+    // the full logical neighbor list use this to know when to follow
+    // continuation pages; callers that only read this page's physical dsts
+    // use physical_degrees_[idx] directly.
     out_degree       = static_cast<uint32_t>(degree);
 
     // Probing a new entry invalidates the cache (a cursor belonging to a
@@ -674,13 +686,16 @@ bool BPTLeafCSR<N>::get_dst_at(uint32_t start_offset,
 
 
 // ============================================================================
-// Spec #8-B task #1: parallel edge_id stream decoder
+// Parallel edge_id stream decoder
 // ============================================================================
 //
 // Standalone O(i) walk over the eid varint chain (no cache). Used only
 // from decode_tuple_'s fallback path; the sequential tuple cache above
 // collapses successive eid lookups into back-to-back O(i) calls whose
 // cost stays bounded by the degree of one src entry.
+// The eid stream is a separate zigzag-delta varint sequence that runs
+// parallel to the dst stream and enables recovery of edge_id values (e.g.
+// for count(e) and edge-id lookups) from CSR-hybrid edge index pages.
 
 template <std::size_t N>
 bool BPTLeafCSR<N>::get_eid_at(uint32_t eid_start_offset,
@@ -737,9 +752,9 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
 
     // Continuation mode: dsts are pre-decoded into cont_dsts_ during ctor,
     // all with the same owning src_id. Short-circuit ahead of the chain-head
-    // offset-table walk. Spec #8-B: when the continuation advertises
-    // kHasEdgeIds, parallel eids are pre-decoded into cont_eids_; otherwise
-    // we emit eid=0 to preserve the legacy ADR 008 fallback.
+    // offset-table walk. When the continuation page advertises kHasEdgeIds,
+    // parallel eids are pre-decoded into cont_eids_ during ctor; otherwise
+    // we emit eid=0 as the no-eid sentinel.
     if (mode_ == Mode::Continuation) {
         Record<N> rec{};
         if constexpr (N >= 1) rec[0] = cont_owning_src_id_;
@@ -755,7 +770,7 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
     const uint8_t* const page_start = reinterpret_cast<const uint8_t*>(page_bytes_);
     const uint8_t* const page_end   = page_start + kPageSize;
 
-    // ---- Fast path (T8.12b): sequential forward access ---------------------
+    // ---- Fast path: sequential forward access --------------------------------
     //
     // If the previous decode landed on pos = seq_tuple_pos_, and the caller
     // is now asking for pos + 1, we can advance in O(1) amortized without
@@ -775,9 +790,10 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
         && seq_tuple_entry_idx_ < header_.value_count)
     {
         // (a) Stay in the same src entry, advance within it. Note that
-        // seq_tuple_entry_degree_ is the PHYSICAL degree (T8-B.1 Bug-A fix),
-        // not the stored degree — so this bound reflects actual varints
-        // present on this page, not the hub-total stored in the entry header.
+        // seq_tuple_entry_degree_ is the PHYSICAL degree (actual varints
+        // present on this page), not the stored degree — the stored degree
+        // of a hub chain-head reflects the full chain total including dsts
+        // on continuation pages, which must not be walked here.
         if (seq_tuple_within_idx_ + 1 < seq_tuple_entry_degree_) {
             const uint_fast32_t next_within = seq_tuple_within_idx_ + 1;
             uint64_t dst_value = 0;
@@ -788,10 +804,10 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             {
                 seq_tuple_within_idx_ = next_within;
                 seq_tuple_pos_        = pos;
-                // Spec #8-B: when the page advertises edge_ids, decode the
-                // parallel eid stream at the same within-entry index so
-                // downstream consumers (count(e), edge-id lookups) see
-                // real values instead of the ADR 008 zero fallback.
+                // When the page advertises edge_ids (kHasEdgeIds flag),
+                // decode the parallel eid stream at the same within-entry
+                // index so downstream consumers (count(e), edge-id lookups)
+                // see real values instead of the zero fallback.
                 uint64_t eid_value = 0;
                 if (page_has_edge_ids_) {
                     get_eid_at(
@@ -809,7 +825,7 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             // get_dst_at failure falls through to the linear restart below.
         } else {
             // (b) Cross into the next src entry. Use cached start offset and
-            // physical degree (T8-B.1 Bug-A fix) — no header re-decode needed.
+            // physical degree (pre-computed at construction) — no header re-decode needed.
             const uint_fast32_t next_entry = seq_tuple_entry_idx_ + 1;
             if (next_entry < header_.value_count) {
                 const uint32_t off = offset_at_(next_entry);
@@ -844,8 +860,8 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
                         seq_tuple_within_idx_    = 0;
                         seq_tuple_pos_           = pos;
 
-                        // Spec #8-B: decode parallel eid for tuple 0 of
-                        // the newly-entered entry.
+                        // Decode parallel eid for tuple 0 of the newly-entered
+                        // entry when the page advertises edge_ids.
                         uint64_t eid_value = 0;
                         if (page_has_edge_ids_) {
                             get_eid_at(
@@ -874,10 +890,10 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
     // ---- Fallback: linear walk over the offset table ----------------------
     //
     // Used for random access, backwards access, the first call, or any
-    // fast-path failure. Walk physical degrees (T8-B.1 Bug-A fix) until
-    // the entry containing `pos` is located; then decode its within-entry
-    // dst. Populate the sequential cache so subsequent pos+1 calls take the
-    // fast path above.
+    // fast-path failure. Walk physical degrees (actual varint counts per
+    // entry, computed at construction) until the entry containing `pos`
+    // is located; then decode its within-entry dst. Populate the sequential
+    // cache so subsequent pos+1 calls take the fast path above.
 
     uint_fast32_t cumulative = 0;
     for (uint_fast32_t i = 0; i < header_.value_count; ++i) {
@@ -910,9 +926,10 @@ Record<N> BPTLeafCSR<N>::decode_tuple_(uint_fast32_t pos) const
             seq_tuple_dst_start_off_    = dst_start_off;
             seq_tuple_src_id_           = src_id;
 
-            // Spec #8-B: resolve parallel eid at the same within-entry
-            // index. Skipped (left as zero-sentinel) on pages that do not
-            // advertise edge_ids — preserves pre-Spec-#8-B behavior.
+            // Resolve parallel eid at the same within-entry index when the
+            // page advertises edge_ids (kHasEdgeIds flag). Left as zero on
+            // pages without that flag, so edge_id=0 acts as the no-eid
+            // sentinel and callers that do not need edge_ids pay no cost.
             uint64_t eid_value = 0;
             if (page_has_edge_ids_) {
                 get_eid_at(entry_edge_id_start_[i],
@@ -1011,8 +1028,11 @@ bool BPTLeafCSR<N>::check_range(const Record<N>& r) const
 
 
 // ============================================================================
-// Mutation: v3 pages are immutable (Spec #8 I6)
+// Mutation: v3 pages are immutable
 // ============================================================================
+//
+// CSR-hybrid edge index leaves are written once during projection build and
+// never modified afterward. All mutation entry points raise std::logic_error.
 
 template <std::size_t N>
 std::unique_ptr<BPlusTreeSplit<N>>

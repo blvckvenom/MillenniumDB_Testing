@@ -78,7 +78,10 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
     // Register GNN four-level feature store procedure (L1-L4 build)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnBuildFeatureStoreProcedure>());
 
-    // Register post-hoc topology-snapshot builder procedure (Spec #4-B T4.9)
+    // Register post-hoc topology CSR sidecar builder procedure.
+    // Builds topology_{fwd,rev}.csr mmap files for projections that were
+    // created without buildTopologySnapshot:true; provides O(1) neighbor
+    // slice access to the GNN sampler without rebuilding the full projection.
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnBuildTopologySnapshotProcedure>());
 
     // Register GNN training procedure (GraphSAGE training loop)
@@ -124,25 +127,25 @@ GQLModel::GQLModel() :
 
 // Dynamic index selection implementations for USE GRAPH projection support.
 //
-// Spec #3 T3.9: when a query opens a projection built under a restricted
-// IndexSet preset (GNN_MINIMAL or READONLY_TRAVERSAL) and attempts to access
-// a B+Tree that was not materialized, the corresponding getter raises a
-// QueryException naming:
+// When a query opens a projection built under a restricted IndexSet preset
+// (GNN_MINIMAL or READONLY_TRAVERSAL) and attempts to access a B+Tree that
+// was not materialized, the corresponding getter raises a QueryException
+// naming:
 //   1. the projection name,
 //   2. the missing .leaf index (e.g. "edge_label"),
 //   3. the current IndexSet preset (e.g. "GNN_MINIMAL"),
 //   4. the minimum preset that would satisfy the query
 //      (e.g. "READONLY_TRAVERSAL"), and
 //   5. the fallback suggestion "ALL".
-// Prior to this commit the reader slot held nullptr (from T3.8's gate in
+// Without this check the reader slot holds nullptr (elided by the gate in
 // open_all_bplustree_readers_), so access would segfault or surface a
 // generic null-deref error instead of an actionable message.
 namespace {
 // Returns true if `which` is a property-index bit (NODE_KEY_VALUE,
 // KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE). Property indexes are
 // gated by the includeNodeProperties / includeEdgeProperties config keys,
-// NOT by IndexSet (Spec #3 §3.4) — so the upgrade hint for these must
-// mention the property flag, not just a wider preset.
+// NOT by the index-set preset selection — so the upgrade hint for these
+// must mention the property flag, not just a wider preset.
 bool is_property_index(GQL::ProjectionIndex which) {
     return which == GQL::ProjectionIndex::NODE_KEY_VALUE
         || which == GQL::ProjectionIndex::KEY_VALUE_NODE
@@ -309,9 +312,10 @@ BPlusTree<3>& GQLModel::get_node_key_value() {
         }
         if (!ctx.projection_ctx->node_key_value_index) {
             // Property indexes are gated by includeProperties config at build
-            // time, not by IndexSet (Spec #3 §3.4). The diagnostic still cites
-            // the active preset for diagnostic completeness but the suggested
-            // fix is to rebuild with includeProperties, not to widen IndexSet.
+            // time, not by the index-set preset selection. The diagnostic still
+            // cites the active preset for diagnostic completeness but the
+            // suggested fix is to rebuild with includeProperties, not to widen
+            // the index-set preset.
             throw QueryException(make_missing_index_message(
                 ctx.active_projection,
                 GQL::ProjectionIndex::NODE_KEY_VALUE,

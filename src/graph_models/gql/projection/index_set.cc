@@ -38,7 +38,8 @@ ProjectionIndex project_index_mask_for(IndexSet preset) noexcept {
     // Unreachable for valid enum values; for out-of-range casts (e.g., corrupt
     // catalog reading static_cast<IndexSet>(99)), return NONE (visibly wrong)
     // rather than ALL (which would silently mask the bug and materialize all
-    // indexes, defeating the purpose of Spec #3).
+    // indexes, defeating the purpose of the indexSet selection feature that
+    // allows projections to build only the B+Tree subset they need).
     assert(false && "project_index_mask_for: unhandled IndexSet value");
     return ProjectionIndex::NONE;
 }

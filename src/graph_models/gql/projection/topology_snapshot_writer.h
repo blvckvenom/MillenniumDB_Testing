@@ -5,7 +5,7 @@
 // Writes `topology_fwd.csr` (FORWARD, hashes `from_to_edge.leaf`) or
 // `topology_rev.csr` (REVERSE, hashes `to_from_edge.leaf`) next to the
 // projection's existing B+Tree files. The file layout is the shared
-// contract defined in `topology_snapshot.h` (T4.3).
+// contract defined in `topology_snapshot.h`.
 //
 // Operating contract:
 //   1. Caller precomputes a degree histogram of size `num_nodes` (a single
@@ -101,7 +101,7 @@ public:
     /// enclosing B+Tree scan driving the writer.
     void append_edge(ObjectId src, ObjectId dst, ObjectId edge_id);
 
-    /// Spec #19 parallel-append entry point.
+    /// Parallel-append entry point.
     ///
     /// Append a contiguous block of edges that all belong to the half-open
     /// src range `[lo_src, hi_src)`. The provided vectors hold the dst
@@ -157,11 +157,13 @@ private:
     std::filesystem::path final_path_;        // `topology_{fwd,rev}.csr`
     std::filesystem::path tmp_path_;          // `.csr.tmp`
 
-    // COL_IDX / EDGE_IDS element width in bytes (Spec #6). 8 (default, full
-    // tagged ObjectId, byte-identical to the legacy layout) or 4 (tag-stripped
-    // uint32). Selected once in the ctor from eligibility (num_nodes / num_edges
-    // both < 2^32) AND the `MDB_GNN_TOPOLOGY_UINT32` env opt-in. ROW_PTR is
-    // always uint64 regardless of this. See `element_size_()`.
+    // COL_IDX / EDGE_IDS element width in bytes. 8 (default, full tagged
+    // ObjectId, byte-identical to the legacy layout) or 4 (the 8-bit ObjectId
+    // type tag is stripped losslessly and reconstructed on read, ~halving
+    // topology file size). Width 4 is selected at construction only when both
+    // num_nodes and num_edges fit in uint32 AND the `MDB_GNN_TOPOLOGY_UINT32`
+    // env opt-in is set. ROW_PTR is always uint64 regardless of this.
+    // See `element_size_()`.
     uint8_t id_width_ = kTopologySnapshotIdWidth;
 
     // Sentinel for "type tag not yet captured" (valid tags are 0..255).
@@ -194,7 +196,7 @@ private:
     bool          finalized_   = false;
     uint64_t      bytes_written_ = 0;
 
-    // Per-section coalescing write buffers (T4.18 perf fix).
+    // Per-section coalescing write buffers.
     // Without these, append_edge() would issue one pwrite per word — on
     // ogbn-arxiv (~1.2 M edges × 2 pwrites / edge × 2 directions) the
     // syscall cost alone was ~4.4 s, dominating the integrated path.

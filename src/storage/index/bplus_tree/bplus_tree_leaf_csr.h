@@ -4,12 +4,14 @@
 // subclass of BPTLeafBase<N>, alongside BPTLeafV1<N> (bitset) and
 // BPTLeafV2<N> (delta+varint).
 //
-// Spec #8: each v3 leaf page holds MULTIPLE source nodes' adjacency
-// lists, packed CSR-style. An in-page offset table (uint16 per source
-// node entry) enables O(log srcs) lookup within a page; each entry
-// contains (src_id varint, degree varint, col_idx[degree] list) where
-// col_idx is delta+varint encoded (first dst full, subsequent zigzag
-// deltas — composes with Spec #5 T5.4/T5.5 codec).
+// CSR-hybrid graph storage: each v3 leaf page holds MULTIPLE source
+// nodes' adjacency lists packed CSR-style, so the edge-index B+Tree
+// leaves themselves ARE the CSR layout (no separate sidecar needed).
+// An in-page offset table (uint16 per source node entry) enables
+// O(log srcs) lookup within a page; each entry contains (src_id varint,
+// degree varint, col_idx[degree] list) where col_idx is delta+varint
+// encoded (first dst full, subsequent zigzag deltas — uses the same
+// delta+LEB128-varint leaf compression as the v2 leaf format).
 //
 // Hub nodes whose adjacency exceeds 4 KB span multiple pages via the
 // continuation-header variant (see bpt_leaf_csr_format.h): the
@@ -45,14 +47,13 @@ template <std::size_t N> class BPlusTreeSplit;
 template <std::size_t N>
 class BPTLeafCSR : public BPTLeafBase<N> {
 public:
-    /// Reader-mode tag. Disambiguates from a future writer-mode ctor (T8.5).
+    /// Reader-mode tag. Disambiguates from a future writer-mode constructor.
     struct ReadTag {};
 
-    /// Continuation-mode tag (Spec #8-B T8-B.1). Enables BptIter to open a
-    /// hub continuation page as a BPTLeafBase<N> view during cross-page
-    /// transitions, so BptIter can iterate the hub's remaining dsts that
-    /// spilled onto continuations. The chain-head reader cannot do this —
-    /// its ctor rejects continuations per I6.
+    /// Continuation-mode tag. Enables BptIter to open a hub continuation page
+    /// as a BPTLeafBase<N> view during cross-page transitions, so BptIter can
+    /// iterate the hub's remaining dsts that spilled onto continuations. The
+    /// chain-head reader cannot do this — its ctor rejects continuations per I6.
     ///
     /// `owning_src_id` is the hub's src_id decoded from its chain-head entry;
     /// continuation pages do not store it.
@@ -60,10 +61,11 @@ public:
     /// chunk (chain-head's last dst, or the previous continuation's last dst).
     /// The first varint on this continuation decodes as a zigzag-delta
     /// against this carry per the writer's §5.4 convention.
-    /// `prev_eid_carry` (Spec #8-B task #1 hub completion) is the running
-    /// edge_id cursor at the end of the previous chunk's eid stream. Only
-    /// consulted when the continuation page advertises kHasEdgeIds. Defaults
-    /// to 0 to preserve back-compat with pre-hub-completion call sites.
+    /// `prev_eid_carry` is the running edge_id cursor at the end of the previous
+    /// chunk's eid stream, enabling the parallel edge_id varint stream to be
+    /// resumed across hub chain continuation pages. Only consulted when the
+    /// continuation page advertises kHasEdgeIds. Defaults to 0 to preserve
+    /// back-compat with pages that do not carry edge_ids.
     struct ContinuationTag {
         uint64_t owning_src_id;
         uint64_t prev_dst_carry;
@@ -71,7 +73,7 @@ public:
     };
 
     /// Read-mode construction. Validates the v3 header at the start of
-    /// `page_bytes` (design §5.5 + T8.3 checks) and caches metadata,
+    /// `page_bytes` (design §5.5 format invariants) and caches metadata,
     /// including a pointer to the in-page uint16 offset table that
     /// begins immediately after the 16-byte header.
     ///
@@ -87,12 +89,12 @@ public:
     ///   - offset table not monotonically increasing or out of page bounds
     BPTLeafCSR(const char* page_bytes, ReadTag);
 
-    /// Continuation-mode construction (Spec #8-B T8-B.1). Validates the
-    /// v3 continuation header (format_version=3, record_width=N,
-    /// flags & kIsContinuation != 0, reserved=0), pre-decodes the chunk's
-    /// zigzag-delta varint stream against `prev_dst_carry` into an internal
-    /// buffer, and exposes them via the BPTLeafBase<N> contract so BptIter
-    /// can iterate the hub's remaining dsts.
+    /// Continuation-mode construction. Validates the v3 continuation header
+    /// (format_version=3, record_width=N, flags & kIsContinuation != 0,
+    /// reserved=0), pre-decodes the chunk's zigzag-delta varint stream
+    /// against `prev_dst_carry` into an internal buffer, and exposes them
+    /// via the BPTLeafBase<N> contract so BptIter can iterate the hub's
+    /// remaining dsts across continuation pages.
     ///
     /// Raises BPT::BPTLeafCSRDecodeException on header / payload corruption.
     BPTLeafCSR(const char* page_bytes, ContinuationTag tag);
@@ -148,9 +150,10 @@ public:
     /// `start_offset` (the col_idx stream position returned by
     /// find_src_entry) with a known `degree`. `i` must be in [0, degree).
     ///
-    /// Uses a sequential-access cache (mirroring the Spec #5 T5.13b cursor
-    /// pattern) to amortize decoding cost. Non-sequential or cross-entry
-    /// access restarts the cursor from `start_offset`.
+    /// Uses a sequential-access cursor cache (the same pattern used in the
+    /// v2 delta+varint leaf reader to amortize decoding cost on sequential
+    /// scans). Non-sequential or cross-entry access restarts the cursor from
+    /// `start_offset`.
     ///
     /// Returns true on success with `out_dst` populated; false if `i >= degree`.
     bool get_dst_at(uint32_t start_offset,
@@ -158,15 +161,17 @@ public:
                     uint_fast32_t i,
                     uint64_t& out_dst) const noexcept;
 
-    /// Spec #8-B task #1 companion to get_dst_at(): decode the i-th
-    /// edge_id from an entry's parallel edge_id varint stream that
-    /// begins at `eid_start_offset`. Walks the stream from position 0
-    /// (first varint is a full-value varint; subsequent entries are
-    /// zigzag-delta varints against the running accumulator) — the
-    /// call is O(i) time with no persistent cache. Intended for
-    /// decode_tuple_'s "emit eid for this tuple" path, which is itself
-    /// wrapped in a sequential cursor by the tuple-level cache, so
-    /// the per-call cost stays amortised O(1) on forward scans.
+    /// Companion to get_dst_at(): decode the i-th edge_id from an entry's
+    /// parallel edge_id varint stream that begins at `eid_start_offset`.
+    /// Edge_ids are stored in a separate varint stream parallel to the
+    /// dst stream, enabling `count(e)` and edge-id lookups on CSR-hybrid
+    /// projections. Walks the stream from position 0 (first varint is a
+    /// full-value varint; subsequent entries are zigzag-delta varints
+    /// against the running accumulator) — the call is O(i) time with no
+    /// persistent cache. Intended for decode_tuple_'s "emit eid for this
+    /// tuple" path, which is itself wrapped in a sequential cursor by the
+    /// tuple-level cache, so the per-call cost stays amortised O(1) on
+    /// forward scans.
     ///
     /// Returns true on success with `out_eid` populated; false if
     /// `i >= degree` or a varint decode fault occurs.
@@ -178,12 +183,13 @@ public:
     /// Chain support: returns true if this is a chain-head page (always
     /// the case when the reader-mode ctor accepts the page, since
     /// continuation pages are rejected at construction per I6 —
-    /// kept as an explicit accessor for future-proofing T8.9's
-    /// TopologyAccessor shortcut).
+    /// kept as an explicit accessor for the TopologyAccessor hub-shortcut
+    /// path that needs to distinguish chain-head from continuation pages
+    /// without re-inspecting raw flags).
     bool is_chain_head() const noexcept;
 
-    /// Page id of the next leaf in the leaf chain, used by the reader of a
-    /// hub's multi-page adjacency (T8.9) to follow continuation pages. A
+    /// Page id of the next leaf in the leaf chain, used when iterating a
+    /// hub node's multi-page adjacency list across continuation pages. A
     /// value of 0 means "this is the last leaf in the B+Tree".
     uint32_t next_leaf() const noexcept;
 
@@ -197,8 +203,9 @@ private:
 
     // Two distinct decode modes share one class. ChainHead is the original
     // reader opened by ReadTag — has offset table, multiple src entries.
-    // Continuation (T8-B.1) is the hub-chunk reader opened by ContinuationTag
-    // — no offset table, dsts pre-decoded into cont_dsts_, single owning_src_id.
+    // Continuation is the hub-chunk reader opened by ContinuationTag for
+    // pages that hold a hub's spill-over adjacency — no offset table, dsts
+    // pre-decoded into cont_dsts_, single owning_src_id.
     enum class Mode : uint8_t { ChainHead, Continuation };
     Mode                    mode_         = Mode::ChainHead;
 
@@ -215,12 +222,12 @@ private:
     const uint8_t*          offset_table_ = nullptr;
 
     // Cached total tuple count: sum of PHYSICAL degrees across all src
-    // entries on this page (post T8-B.1 Bug-A fix). For a chain-head page
-    // carrying a hub whose on-disk `degree` header describes the TOTAL chain
-    // size (§3.9), physical_degrees_[i] holds only the dsts actually
-    // serialized on THIS page — varints past the entry boundary / page end
-    // are not counted. For a non-hub entry physical_degrees_[i] == stored
-    // degree.
+    // entries on this page — i.e. the count of varints actually serialized
+    // here. For a chain-head page carrying a hub, the on-disk `degree` field
+    // describes the TOTAL chain size (§3.9), so physical_degrees_[i] holds
+    // only the dsts serialized on THIS page — varints past the entry boundary /
+    // page end are not counted. For a non-hub entry physical_degrees_[i] ==
+    // stored degree.
     //
     // In Continuation mode, this equals chunk_count (the pre-decoded dst
     // count) and is used by get_value_count() uniformly.
@@ -238,36 +245,39 @@ private:
     // header on every decode_tuple_ / find_src_entry call.
     std::vector<uint32_t>   entry_col_idx_start_;
 
-    // Spec #8-B: byte offset where each entry's parallel edge_id varint
-    // stream begins. Populated only when the page-level flag kHasEdgeIds
-    // is set in header_.flags and we are in ChainHead mode. Same length
-    // as physical_degrees_; zero at every index otherwise.
+    // Byte offset where each entry's parallel edge_id varint stream begins.
+    // Edge_ids are stored in a separate parallel stream so that edge-id
+    // lookups (e.g. count(e) queries) work correctly on CSR-hybrid projections.
+    // Populated only when the page-level flag kHasEdgeIds is set in
+    // header_.flags and we are in ChainHead mode. Same length as
+    // physical_degrees_; zero at every index otherwise.
     std::vector<uint32_t>   entry_edge_id_start_;
 
     // Cached header-level flag: true iff this page carries a parallel
     // edge_id stream per entry (header_.flags & kHasEdgeIds != 0). Read
     // path branches on this to decide whether to decode the eid varint
-    // chain or return eid = 0 (the Spec #8 ADR 008 Known-limitation
-    // fallback for pre-Spec-#8-B projections).
+    // chain or return eid = 0 (the fallback for CSR-hybrid projections
+    // built before edge_id persistence was added to the v3 leaf format).
     bool                    page_has_edge_ids_ = false;
 
     // Cached header-level flag: true iff this is a HUB chain-head page
     // (header_.flags & kIsHubChainHead != 0). When set, the single entry
     // (value_count must be 1) carries an extra varint `k_on_head` between
     // (degree) and (dst stream) that the reader uses to bound the dst
-    // walk; without this signal the physical_degrees_ heuristic could not
-    // distinguish dst varints from the trailing eid varints when both
-    // streams are present on a hub chain-head. See Spec #8-B task #1.
+    // walk on the chain-head page. Without this signal the physical_degrees_
+    // heuristic cannot distinguish dst varints from trailing eid varints when
+    // both streams are present on a hub chain-head page.
     bool                    page_is_hub_chain_head_ = false;
 
     // Continuation mode state. Empty in ChainHead mode.
     uint64_t                cont_owning_src_id_ = 0;
     std::vector<uint64_t>   cont_dsts_;
-    // Spec #8-B task #1 (hub completion): when the continuation page
-    // advertises kHasEdgeIds, cont_eids_ holds chunk_count parallel eid
-    // values pre-decoded against ContinuationTag::prev_eid_carry. Empty
-    // when the flag is clear (legacy pages); decode_tuple_ then emits
-    // eid=0 to preserve the ADR 008 fallback.
+    // When the continuation page advertises kHasEdgeIds, cont_eids_ holds
+    // chunk_count parallel eid values pre-decoded against
+    // ContinuationTag::prev_eid_carry, so edge_ids are correctly resumed
+    // across hub chain continuation pages. Empty when the flag is clear
+    // (pages built before edge_id persistence was added); decode_tuple_ then
+    // emits eid=0 to preserve the fallback for older projections.
     std::vector<uint64_t>   cont_eids_;
 
     // Sequential-decode cache. When get_dst_at(start_offset, degree, i+1)
@@ -285,12 +295,12 @@ private:
     mutable uint64_t        cache_value_     = 0;      // its decoded dst value
     mutable const uint8_t*  cache_in_        = nullptr; // byte ptr just past the last varint
 
-    // Sequential tuple-cursor cache for decode_tuple_ / get_record (T8.12b).
-    // Pre-fix, decode_tuple_(pos) walked the offset table from src entry 0
-    // on every call, linearly accumulating degrees until it found the src
-    // entry containing tuple `pos`. BptIter<N>::next() drives pos=0,1,...,
-    // total_tuples_-1 sequentially, so without a cross-entry cursor the cost
-    // was O(total_tuples_ * value_count) per leaf scan.
+    // Sequential tuple-cursor cache for decode_tuple_ / get_record.
+    // Without this cache, decode_tuple_(pos) walks the offset table from
+    // src entry 0 on every call, linearly accumulating degrees until it
+    // finds the src entry containing tuple `pos`. BptIter<N>::next() drives
+    // pos=0,1,...,total_tuples_-1 sequentially, so without a cross-entry
+    // cursor the cost was O(total_tuples_ * value_count) per leaf scan.
     //
     // This cache captures the (src_entry, within-entry) position of the
     // most recently decoded tuple. Calls with pos == seq_tuple_pos_ + 1
@@ -327,7 +337,7 @@ private:
     /// (0 <= pos < total_tuples_). For the BPTLeafBase<N> contract.
     /// Used only when N == 3 for edge indexes; for N != 3 it returns
     /// a record with (src_id, dst, 0) (N==2) or (src_id,) (N==1) — but
-    /// Spec #8 scope limits CSR_HYBRID to edge indexes (N=3), so those
+    /// CSR-hybrid graph storage is scoped to edge indexes (N=3), so those
     /// paths are defensive only.
     Record<N> decode_tuple_(uint_fast32_t pos) const;
 

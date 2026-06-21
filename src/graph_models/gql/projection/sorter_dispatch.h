@@ -100,11 +100,14 @@ using BuildFromSorterFn =
  *                          forwarding to `ProjectionStorage::build_index_streaming`.
  * @param  sort_temp_dir    Directory for the sorter's temporary files.
  *                          Usually `<projection_dir>/sort_tmp`.
- * @param  leaf_format      Spec #5 T5.11b. Selects the on-disk leaf encoding.
- *                          BITSET (default) preserves pre-Spec-#5 byte-
- *                          identical behavior; DELTA_VARINT opts into the
- *                          zigzag-delta + LEB128 varint v2 encoding. The
- *                          RADIX backend propagates this into
+ * @param  leaf_format      Selects the on-disk B+Tree leaf encoding for this
+ *                          index build. BITSET (default) uses the legacy v1
+ *                          leaf format — byte-for-byte identical to builds
+ *                          before the delta + LEB128-varint leaf encoding was
+ *                          introduced. DELTA_VARINT opts into the v2 encoding
+ *                          (zigzag-delta LEB128 varints), which typically
+ *                          reduces leaf-file size by ~75-80% on sorted integer
+ *                          edge indexes. The RADIX backend propagates this into
  *                          RadixPartitionSort<N>::Config.leaf_format; the
  *                          CLASSIC backend relies on the caller-supplied
  *                          `build_from_sorter` callback picking up the same
@@ -113,11 +116,16 @@ using BuildFromSorterFn =
  *                          `requested_leaf_format` directly, so the value
  *                          does not need to be re-threaded through the
  *                          callback signature).
- * @param  graph_storage    Spec #8 T8.9. When CSR_HYBRID AND N == 3 (edge
- *                          index widths), the dispatch emits v3 CSR leaves
- *                          via BPTLeafCSRWriter instead of the BITSET/
- *                          DELTA_VARINT path. The caller is expected to
- *                          pass CSR_HYBRID only for FROM_TO_EDGE /
+ * @param  graph_storage    Controls whether edge-index B+Tree leaves are
+ *                          written in the standard B+Tree format or in the
+ *                          CSR-hybrid format where the leaf pages themselves
+ *                          encode a Compressed Sparse Row layout (v3 leaves).
+ *                          When CSR_HYBRID AND N == 3 (the arity of edge
+ *                          indexes), the dispatch emits v3 CSR leaves via
+ *                          BPTLeafCSRWriter — the edge-index B+Tree leaves
+ *                          become the CSR, enabling O(1) neighbor slices
+ *                          without a separate sidecar file. The caller is
+ *                          expected to pass CSR_HYBRID only for FROM_TO_EDGE /
  *                          TO_FROM_EDGE index builds; non-edge indexes
  *                          (N != 3 or other semantic positions) must keep
  *                          the default BTREE. The CLASSIC backend bypasses
@@ -126,7 +134,8 @@ using BuildFromSorterFn =
  *                          through BPTLeafCSRWriter, matching the RADIX
  *                          path's self-contained write_btree_from_sorted_
  *                          partitions_csr_ helper. Default BTREE preserves
- *                          pre-Spec-#8 byte-for-byte behavior.
+ *                          byte-for-byte behavior relative to builds that
+ *                          predate the CSR-hybrid graph storage mode.
  * @return Total unique records written to the B+Tree (return value of the
  *         caller's build callback).
  */

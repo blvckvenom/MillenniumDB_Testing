@@ -1,11 +1,13 @@
-// Standalone dumper for projection B+Tree .leaf files (Spec #5 T5.12).
+// Standalone dumper for projection B+Tree .leaf files.
 //
 // Reads a projection .leaf file page-by-page and prints each decoded record
 // to stdout as N space-separated decimal uint64 fields, one record per line.
 //
 // Auto-detects the leaf page format from byte 0:
-//   0x02  -> v2 (Spec #5 DELTA_VARINT); decoded via BPTLeafV2<N>(page, ReadTag{})
-//   else  -> v1 (pre-Spec-#5 BITSET);    decoded inline with a minimal reader
+//   0x02  -> v2 (delta + LEB128-varint compressed leaf, DELTA_VARINT encoding);
+//            decoded via BPTLeafV2<N>(page, ReadTag{})
+//   else  -> v1 (legacy BITSET leaf, redundant-byte-bitset encoding);
+//            decoded inline with a minimal reader
 //
 // The output is deterministic across formats and record-widths, which makes
 // it suitable as the canonical "record sequence" that
@@ -35,7 +37,8 @@ constexpr size_t PAGE_SIZE = Page::SIZE;  // 4096
 
 // Inline V1 (BITSET) reader: extracts records from one raw 4 KB page buffer,
 // mirroring the reconstruction logic in BPTLeafV1<N>::set_record() without
-// requiring a BufferManager-backed Page handle. Layout (pre-Spec-#5):
+// requiring a BufferManager-backed Page handle. Layout (legacy BITSET format,
+// before the delta + LEB128-varint leaf encoding was introduced):
 //   bytes 0..3   : value_count   (uint32 LE)
 //   bytes 4..7   : next_leaf     (uint32 LE)
 //   bytes 8..8+N : bitset[N] — bit pos_bitset=i*8+bit marks byte i

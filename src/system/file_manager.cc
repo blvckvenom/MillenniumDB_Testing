@@ -97,12 +97,12 @@ void FileManager::update_appends(const std::map<FileId, unsigned>& appended_page
 
 FileId FileManager::get_file_id(const string& filename)
 {
-    // Spec #18 — thread-safe lookup. The mutex protects the two maps;
+    // Thread-safe lookup. The mutex protects the two maps;
     // the open()/lseek() syscalls run outside the critical section so
     // concurrent callers (e.g. ProjectionStorage::open_all_bplustree_readers_
     // with MDB_PROJECTION_PARALLEL_READERS=1) can overlap their kernel
-    // metadata work. This is a strict improvement: pre-Spec-#18 callers
-    // were single-threaded so the added lock cost is negligible.
+    // metadata work. This is a strict improvement: callers were
+    // single-threaded before this lock was added, so its cost is negligible.
     {
         std::lock_guard<std::mutex> guard(maps_mutex);
         auto search = filename2file_id.find(filename);

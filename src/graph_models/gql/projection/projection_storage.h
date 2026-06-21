@@ -346,7 +346,7 @@ public:
      * of edge records can remain in the internal batches when build_one_index()
      * runs, causing those records to be omitted from the serialized B+Tree build
      * and later re-processed by the fallback flush() call — overwriting the
-     * correctly-built index with a partial dataset (Spec #2 §4 correctness fix).
+     * correctly-built index with a partial dataset.
      */
     void drain_pending_batches();
 
@@ -468,7 +468,7 @@ public:
     void resize_bloom_filter(size_t expected_edges, double fpr = BLOOM_FILTER_FPR);
     /// @}
 
-    /// @name Serialized Scan Pipeline (Spec #2)
+    /// @name Serialized Scan Pipeline (one-index-at-a-time edge scan)
     /// @{
 
     /**
@@ -522,8 +522,8 @@ public:
     /**
      * @brief Open all B+Tree index readers after the index files have been built.
      *
-     * Spec #2 Phase 4 — called by both build_all_indexes_bulk() (CLASSIC path)
-     * and NativeProjectionBuilder::finalize_serialized_() (SERIALIZED path).
+     * Called by both build_all_indexes_bulk() (CLASSIC path) and
+     * NativeProjectionBuilder::finalize_serialized_() (SERIALIZED path).
      *
      * Under CLASSIC, build_all_indexes_bulk() builds all 14 indexes and then
      * calls this method to open the resulting .leaf/.dir files.
@@ -564,14 +564,13 @@ public:
      *
      * After `finalize_node_scan()`, the returned vector is sorted by
      * value and contains each ObjectId.id at most once. Used by
-     * `EdgeKeepBitmapGpuBatcher` (Spec #27) to upload a single sorted
-     * array to the GPU for parallel binary-search membership testing,
-     * mirroring exactly the data structure that `has_node()` walks on
-     * the CPU path.
+     * `EdgeKeepBitmapGpuBatcher` to upload a single sorted array to the
+     * GPU for parallel binary-search membership testing, mirroring exactly
+     * the data structure that `has_node()` walks on the CPU path.
      *
      * Pre-`finalize_node_scan()` the vector is unsorted with possible
-     * duplicates — callers needing the sorted invariant must finalize
-     * first (Spec #2 invariant I1).
+     * duplicates — callers needing the sorted invariant must call
+     * finalize_node_scan() first.
      */
     const std::vector<uint64_t>& collected_nodes() const noexcept {
         return collected_nodes_;
@@ -620,36 +619,39 @@ public:
     ///
     /// Populated at build time by NativeProjectionBuilder and restored at
     /// read time from the catalog via ProjectionStorage::open(). Consumed
-    /// by the query-layer error diagnostic (Spec #3 T3.9) to report the
-    /// active preset when a missing index is accessed.
+    /// by the query-layer error diagnostic to report the active preset
+    /// when a missing index is accessed.
     IndexSet get_index_set() const { return requested_index_set; }
 
-    /// @brief Spec #5 T5.11 — leaf-encoding preset for every B+Tree index
-    /// this projection owns. Set by NativeProjectionBuilder from the GQL
+    /// @brief Leaf-encoding preset (BITSET or DELTA_VARINT) for every B+Tree
+    /// index this projection owns. Set by NativeProjectionBuilder from the GQL
     /// `leafFormat` config key before flush()/open(). Consumed by:
     ///   (1) every `std::make_unique<BPlusTree<N>>(...)` call in open() and
     ///       open_all_bplustree_readers_() (passes it as the second ctor
     ///       argument so BptIter dispatches on the right leaf layout).
     ///   (2) save_catalog() to populate ProjectionCatalog::leaf_formats with
     ///       one byte per materialized index (catalog v1.5). Default BITSET
-    ///       preserves pre-Spec-#5 byte-identical behavior.
+    ///       preserves byte-identical behavior for projections built without
+    ///       delta + LEB128-varint leaf compression.
     BPT::LeafFormat requested_leaf_format = BPT::LeafFormat::BITSET;
 
     /// @brief Returns the leaf-format preset this projection was built under.
     BPT::LeafFormat get_leaf_format() const noexcept { return requested_leaf_format; }
 
-    /// @brief Spec #8 T8.8 — per-projection graph-storage mode. Set by
+    /// @brief Per-projection graph-storage mode (BTREE or CSR_HYBRID). Set by
     /// NativeProjectionBuilder from the GQL `graphStorage` config key
     /// before flush(), restored on open() from ProjectionCatalog::
     /// graph_storage (v1.6 byte). Consumed by:
     ///   (1) save_catalog() which forwards it into catalog.graph_storage
     ///       for v1.6 persistence.
-    ///   (2) T8.9's edge-index dispatch in sorter_dispatch.cc, which will
-    ///       select BPTLeafCSRWriter under CSR_HYBRID. Under T8.8 alone
-    ///       the dispatch path still emits BTREE leaves regardless, so
-    ///       CSR_HYBRID projections currently round-trip the catalog byte
+    ///   (2) The edge-index dispatch in sorter_dispatch.cc, which selects
+    ///       BPTLeafCSRWriter under CSR_HYBRID (where edge-index B+Tree leaves
+    ///       store the CSR layout directly for O(1) neighbor access). Under
+    ///       BTREE the dispatch path emits standard B+Tree leaves regardless,
+    ///       so CSR_HYBRID projections currently round-trip the catalog byte
     ///       only.
-    /// Default BTREE preserves pre-Spec-#8 byte-identical behavior.
+    /// Default BTREE preserves byte-identical behavior for projections that
+    /// do not use the CSR-hybrid graph storage mode.
     BPT::GraphStorage requested_graph_storage = BPT::GraphStorage::BTREE;
 
     /// @brief Returns the graph-storage mode this projection was built under.
@@ -657,7 +659,7 @@ public:
         return requested_graph_storage;
     }
 
-    /// @name Spec #4-B T4.18: integrated topology snapshot emission
+    /// @name Integrated topology CSR sidecar emission
     /// @{
 
     /**
@@ -839,15 +841,16 @@ private:
     static constexpr double BLOOM_FILTER_FPR = 0.01;
     /// @}
 
-    /// @name Spec #4-B T4.18: integrated topology snapshot state
+    /// @name Integrated topology CSR sidecar state
     /// @{
     /// Opt-in flag set by NativeProjectionBuilder via
     /// set_build_topology_snapshot() before finalize. When true, the two
     /// edge index builders (build_from_to_edge_index_ / build_to_from_edge_index_)
     /// invoke GQL::Projection::build_topology_snapshot_from_leaf() right
-    /// after the `.leaf` is written to disk, emitting the matching CSR
-    /// sidecar via mmap over the fresh file. Default false preserves the
-    /// pre-T4.18 behavior for every existing caller.
+    /// after the `.leaf` is written to disk, emitting the matching mmap-backed
+    /// CSR sidecar file (topology_fwd.csr or topology_rev.csr) over the fresh
+    /// file. Default false preserves the original behavior for every existing
+    /// caller that does not request topology snapshots.
     bool build_topology_snapshot_ = false;
 
     /// Per-direction "already emitted" flags, set by the integrated path.
@@ -864,14 +867,14 @@ private:
     /// @{
     /**
      * @brief Bitmask controlling which edge streaming buffers flush_edge_batch()
-     * populates during the SERIAL scan pipeline (Spec #2).
+     * populates during the serialized one-index-at-a-time scan pipeline.
      *
      * 0 (default) = CLASSIC mode: write to all applicable buffers.
      * Non-zero    = SERIAL mode: only write to buffers whose ProjectionIndex
      *               bit is set in the mask. Used by
      *               ProjectionStorage::begin_serial_edge_pass_() to bound peak
      *               scratch disk to O(max single pass) on large datasets
-     *               (papers100M disk fix — see projection_storage.cc).
+     *               (see projection_storage.cc for the papers100M motivation).
      *
      * Also gates the edge bloom filter: when the mask is active the bloom check
      * is skipped so each fresh per-pass scan emits all edges independently.
@@ -938,13 +941,13 @@ private:
 
     // Per-index build methods (extracted from build_all_indexes_bulk).
     // Each builds exactly one B+Tree .leaf/.dir file from its backing
-    // StreamingRecordBuffer via GQL::sort_and_build_index (Spec #1 facade).
+    // StreamingRecordBuffer via GQL::sort_and_build_index.
     // Called by build_all_indexes_bulk() in CLASSIC mode and by
-    // build_one_index(ProjectionIndex) in SERIALIZED mode (Task 5).
+    // build_one_index(ProjectionIndex) in SERIALIZED mode.
 
     // Builds the nodes B+Tree. Side effect: updates the class-scope
     // node_count member (consumed by catalog finalization and by any
-    // future build_one_index(NODES) caller from Task 5's dispatcher).
+    // build_one_index(NODES) caller from the SERIALIZED dispatcher).
     // This is the only per-index method that mutates non-local state.
     void build_nodes_index_();
     void build_node_label_index_();

@@ -169,8 +169,8 @@ void ProjectionCatalog::load() {
 
     // v1.4 field: IndexSet preset byte. For v1.3 and earlier catalogs we
     // default to IndexSet::ALL (full materialization, the behavior shipped
-    // before Spec #3). Writing this AFTER the key mappings keeps the v1.4
-    // format a strict append to v1.3.
+    // before the IndexSet feature was introduced). Writing this AFTER the
+    // key mappings keeps the v1.4 format a strict append to v1.3.
     if (minor_ver >= 4) {
         uint8_t raw = read_uint8(file);
         // We intentionally do NOT validate the byte here — project_index_mask_for()
@@ -183,8 +183,9 @@ void ProjectionCatalog::load() {
 
     // v1.5 field: per-index leaf_format byte array. One byte per materialized
     // index, in canonical ProjectionIndex enum order. For v1.4 and earlier
-    // catalogs, populate with all BITSET (1) so pre-Spec-#5 projections read
-    // as redundant-bitset-encoded (preserving historical behavior).
+    // catalogs, populate with all BITSET (1) so projections built before the
+    // delta + LEB128-varint leaf encoding was introduced read as
+    // redundant-bitset-encoded (preserving historical behavior).
     leaf_formats.clear();
     if (minor_ver >= 5) {
         const uint8_t num_format_bytes = read_uint8(file);
@@ -219,9 +220,10 @@ void ProjectionCatalog::load() {
 
     // v1.6 field: per-projection graphStorage byte. For MINOR < 6 we leave
     // graph_storage at its default (1 = BTREE), preserving the byte-for-byte
-    // behavior of every pre-Spec-#8 projection. For MINOR >= 6 the byte must
-    // be 1 (BTREE) or 2 (CSR_HYBRID); any other value is an on-disk
-    // corruption signal and raises.
+    // behavior of every projection built before CSR-hybrid graph storage was
+    // introduced (where edge-index B+Tree leaves directly encode the CSR
+    // layout). For MINOR >= 6 the byte must be 1 (BTREE) or 2 (CSR_HYBRID);
+    // any other value is an on-disk corruption signal and raises.
     if (minor_ver >= 6) {
         graph_storage = read_uint8(file);
         if (graph_storage != 1 && graph_storage != 2) {
@@ -322,7 +324,7 @@ void ProjectionCatalog::save() {
     // and the basic metadata), default every slot to BITSET so on-disk and
     // on-read invariants hold. Same defaulting rule is applied by the
     // v1.4-catalog read path so both code paths yield the same in-memory
-    // state for pre-Spec-#5 workloads.
+    // state for projections built before delta + LEB128-varint leaf encoding.
     if (leaf_formats.empty()) {
         const size_t n = count_materialized_indexes(index_set);
         leaf_formats.assign(n, static_cast<uint8_t>(BPT::LeafFormat::BITSET));
@@ -346,8 +348,9 @@ void ProjectionCatalog::save() {
     // v1.5 leaf_formats array so v1.5 readers stop cleanly after the format
     // bytes. The MINOR_VERSION header (written above) is now 6, so any
     // future reader selecting on minor_ver >= 6 will consume this byte.
-    // Values are fixed to 1=BTREE (default) or 2=CSR_HYBRID — T8.8 will
-    // plumb the value from the graph_project config; T8.6 dispatches on it.
+    // Values are 1=BTREE (default) or 2=CSR_HYBRID; the graph_project
+    // procedure populates this field from the user's config, and the
+    // topology accessor dispatches on it at read time.
     write_uint8(file, graph_storage);
 
     // Ensure data is flushed to OS buffer before close

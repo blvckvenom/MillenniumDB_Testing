@@ -158,9 +158,12 @@ private:
 };
 
 
-// Preserves external compilation — every pre-Spec-#5 reference to
-// BPlusTreeLeaf<N> still resolves to the concrete V1 type. T5.9 will
-// migrate BptIter to hold std::unique_ptr<BPTLeafBase<N>> for polymorphic
-// dispatch; until then, external code is pinned to V1.
+// Backwards-compatible type alias: all existing code that names BPlusTreeLeaf<N>
+// continues to resolve to the concrete v1 redundant-bitset leaf format (BPTLeafV1).
+// The alias was introduced when the delta + LEB128-varint compressed leaf format
+// (BPTLeafV2) was added — callers that already used BPlusTreeLeaf<N> are unaffected.
+// A planned follow-up will migrate BptIter to hold std::unique_ptr<BPTLeafBase<N>>
+// for polymorphic dispatch over v1/v2/v3 leaf types; until then, external code is
+// pinned to V1 via this alias.
 template <std::size_t N>
 using BPlusTreeLeaf = BPTLeafV1<N>;

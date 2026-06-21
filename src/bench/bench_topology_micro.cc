@@ -1,7 +1,9 @@
 // bench_topology_micro.cc
 //
-// Spec #4-B T4.17 — isolated micro-benchmark for
-// `mdb::gnn::TopologyAccessor::sample_khop_neighbors`.
+// Isolated micro-benchmark for
+// `mdb::gnn::TopologyAccessor::sample_khop_neighbors`, comparing the
+// mmap-backed topology CSR sidecar path (topology_fwd.csr / topology_rev.csr,
+// O(1) neighbor slice) against the direct B+Tree fallback path.
 //
 // The end-to-end bench in `scripts/bench_topology_snapshot.sh` goes through
 // `gnn_offline_sample`, which spends ~96% of its wall-clock in non-topology
@@ -142,8 +144,9 @@ Options parse_args(int argc, char** argv) {
 }
 
 // -----------------------------------------------------------------------------
-// Singleton MDB bootstrap — same pattern as the T4.11 fixture (System +
-// QueryContext + ProjectionManager are process-lifetime singletons).
+// Singleton MDB bootstrap — same pattern as the topology-accessor integration
+// test fixture (System + QueryContext + ProjectionManager are process-lifetime
+// singletons).
 //
 // Buffer pool sized for large datasets: 1 GB shared, 256 MB private. This
 // must be small enough to leave RAM for the sampling workload and large

@@ -115,8 +115,10 @@ bool gpu_sort_preconditions_hold(const std::vector<Record<N>>& records) {
 // Inline dedup at write time preserves the "no duplicates" invariant that
 // ExternalRecordSort's single-pass writer delivers to the classic backend.
 // ---------------------------------------------------------------------------
-// BITSET-backed concatenation (V1 leaf format, pre-Spec-#5).
-// Preserves pre-Spec-#5 byte-identical output.
+// BITSET-backed concatenation (V1 leaf format, pre-delta-varint-compression era).
+// Preserves byte-identical output for indexes that do not use delta+LEB128-varint
+// leaf encoding (the B+Tree leaf compression scheme where record 0 is stored as
+// full LEB128 varints and records 1..k-1 are stored as zigzag-delta LEB128 varints).
 template<std::size_t N>
 static std::size_t write_btree_from_sorted_partitions_bitset_(
     const std::vector<std::string>& sorted_partition_paths,
@@ -225,8 +227,10 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
     // and radix partitioning ensures partition_i < partition_{i+1} key-wise,
     // so the concatenation is globally sorted.
     //
-    // Spec #25 fix #4: bulk-read partition records into a 4096-record batch
-    // to amortize per-record fread() overhead.
+    // Bulk-read partition records into a 4096-record batch to amortize
+    // per-record fread() overhead. Without batching, each record routes
+    // through a function-pointer chain into libc fread() for a 24-byte read;
+    // batching amortizes that cost ~4000× for large partitions.
     constexpr std::size_t kReadBatch = 4096;
     std::vector<Record<N>> batch(kReadBatch);
 
@@ -280,10 +284,10 @@ static std::size_t write_btree_from_sorted_partitions_bitset_(
     return unique_count;
 }
 
-// DELTA_VARINT-backed concatenation (V2 leaf format, Spec #5).
-// Streams records one at a time into BPTLeafV2Writer, which handles
-// page boundaries internally (variable per-record bytes via zigzag
-// deltas). Directory entries are emitted on page boundary crossings.
+// DELTA_VARINT-backed concatenation (V2 leaf format, delta+LEB128-varint
+// B+Tree leaf compression). Streams records one at a time into BPTLeafV2Writer,
+// which handles page boundaries internally (variable per-record bytes via
+// zigzag deltas). Directory entries are emitted on page boundary crossings.
 template<std::size_t N>
 static std::size_t write_btree_from_sorted_partitions_delta_varint_(
     const std::vector<std::string>& sorted_partition_paths,
@@ -310,8 +314,8 @@ static std::size_t write_btree_from_sorted_partitions_delta_varint_(
     std::size_t unique_count = 0;
     std::size_t page_count   = 0;   // number of completed page boundary crossings
 
-    // Spec #25 fix #4: bulk-read partition records into a 4096-record batch
-    // (~96 KB at N=3). Pre-fix called PartitionFile::Reader::next() per
+    // Bulk-read partition records into a 4096-record batch (~96 KB at N=3).
+    // The original per-record path called PartitionFile::Reader::next() per
     // record, which routes each call through a function-pointer chain into
     // libc fread() for a 24-byte read — significant overhead for billions
     // of records. Bulk-read amortizes the call cost ~4000×.
@@ -352,12 +356,12 @@ static std::size_t write_btree_from_sorted_partitions_delta_varint_(
     return unique_count;
 }
 
-// CSR_HYBRID concatenation (v3 leaf format, Spec #8). Streams records
-// from globally-ordered partition files into BPTLeafCSRWriter, which
-// groups by record[0] (src) and emits chain-head + optional continuation
-// pages. A trivial root .dir (key_count=0) is emitted; lookups route to
-// leaf 0 and walk the next_leaf chain. Correctness-first MVP: src-keyed
-// directory routing is deferred to T8.12's Gate D bench optimization.
+// CSR_HYBRID concatenation (v3 leaf format: edge-index B+Tree leaves ARE
+// the CSR layout). Streams records from globally-ordered partition files into
+// BPTLeafCSRWriter, which groups by record[0] (src) and emits chain-head +
+// optional continuation pages. A trivial root .dir (key_count=0) is emitted;
+// lookups route to leaf 0 and walk the next_leaf chain. Correctness-first MVP:
+// src-keyed directory routing is deferred to a later Gate D bench optimization.
 //
 // N == 3 is the only instantiation that produces sensible CSR output
 // (src, dst, edge_id). The writer drops edge_id (design §3.4 notes the
@@ -370,10 +374,11 @@ static std::size_t write_btree_from_sorted_partitions_csr_(
     const std::string& base_path)
 {
     if constexpr (N == 3) {
-        // Spec #8-B task #1: enable edge_id stream emission on edge
-        // indexes (N == 3 only; property indexes route through the
-        // non-CSR sibling). See sorter_dispatch.cc build_index_csr_from_sorter_
-        // for the full rationale.
+        // Enable edge_id stream emission on edge indexes (N == 3 only;
+        // property indexes route through the non-CSR sibling). The CSR-hybrid
+        // layout stores edge_ids in a stream parallel to the dst stream so that
+        // count(e) queries and edge-id lookups remain correct. See
+        // sorter_dispatch.cc build_index_csr_from_sorter_ for the full rationale.
         BPTLeafCSRWriter<N> leaf_writer(base_path + ".leaf",
                                         /*emit_edge_ids=*/true);
         // Dtor emits the root dir page.
@@ -395,7 +400,7 @@ static std::size_t write_btree_from_sorted_partitions_csr_(
         bool        has_prev     = false;
         std::size_t unique_count = 0;
 
-        // Spec #25 fix #4: bulk-read for amortized fread cost.
+        // Bulk-read into batches to amortize per-record fread() call overhead.
         constexpr std::size_t kReadBatch = 4096;
         std::vector<Record<N>> batch(kReadBatch);
 
@@ -420,19 +425,19 @@ static std::size_t write_btree_from_sorted_partitions_csr_(
         leaf_writer.flush_finalize();
         return unique_count;
     } else {
-        // Spec #8 scopes CSR_HYBRID to edge indexes (N==3). Reaching here
-        // is a caller-side invariant violation — radix config should have
-        // kept graph_storage at BTREE for N==2 indexes. Return 0 as a
-        // defensive fallback; the upstream ProjectionStorage dispatch
-        // enforces the scope at config time.
+        // CSR_HYBRID (edge-index B+Tree leaves as CSR) is scoped to edge indexes
+        // (N==3). Reaching here is a caller-side invariant violation — radix
+        // config should have kept graph_storage at BTREE for N==2 indexes.
+        // Return 0 as a defensive fallback; the upstream ProjectionStorage
+        // dispatch enforces the scope at config time.
         (void)sorted_partition_paths;
         (void)base_path;
         return 0;
     }
 }
 
-// Dispatch shim. Default leaf_format is BITSET to preserve pre-Spec-#5
-// behavior for any caller not yet plumbed through T5.11b.
+// Dispatch shim. Default leaf_format is BITSET to preserve the behavior of
+// callers that do not specify delta+LEB128-varint B+Tree leaf compression.
 template<std::size_t N>
 std::size_t write_btree_from_sorted_partitions(
     const std::vector<std::string>& sorted_partition_paths,
@@ -440,8 +445,8 @@ std::size_t write_btree_from_sorted_partitions(
     BPT::LeafFormat leaf_format,
     BPT::GraphStorage graph_storage)
 {
-    // Spec #8 T8.9 — CSR_HYBRID supersedes leaf_format for its scope
-    // (edge indexes, N==3). The helper itself gates on N via constexpr.
+    // CSR_HYBRID (edge-index B+Tree leaves as CSR layout) supersedes leaf_format
+    // for its scope (edge indexes, N==3). The helper itself gates on N via constexpr.
     if (graph_storage == BPT::GraphStorage::CSR_HYBRID) {
         return write_btree_from_sorted_partitions_csr_<N>(
             sorted_partition_paths, base_path);
@@ -568,10 +573,10 @@ std::size_t RadixPartitionSort<N>::scan_and_partition(
         num_partitions_, scan_threads, config_.scratch_dir,
         [this](const Record<N>& r) { return radix_bucket(r); });
 
-    // Spec #25 (Option C — CPU TBB): chunk-parallel partition fill.
+    // Chunk-parallel Phase 1 partition fill via TBB (CPU parallelism option).
     // Default ON; opt-out with MDB_PROJECTION_RADIX_PHASE1_PARALLEL=0 for
     // A/B benchmarking and bisecting regressions. The single-thread fallback
-    // preserves pre-Spec-#25 behavior bit-for-bit.
+    // preserves sequential-fill behavior bit-for-bit.
     bool parallel_phase1 = true;
     if (const char* env = std::getenv("MDB_PROJECTION_RADIX_PHASE1_PARALLEL")) {
         if (std::string(env) == "0") parallel_phase1 = false;
@@ -612,14 +617,13 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
 {
     std::size_t total_written = 0;
 
-    // Spec #25 fix: use adaptive memory budget instead of hardcoded 4 GB.
-    // Pre-fix bug: a hardcoded 4 GB budget capped Phase 2 worker count to
+    // Use adaptive memory budget instead of a hardcoded constant. An earlier
+    // hardcoded 4 GB budget capped Phase 2 worker count to
     // `min(cores - scan_threads, 4 GB / 512 MB) = min(20-10, 8) = 8`
-    // workers on celebi (20 cores). Adaptive sizes to whatever fraction of
-    // MemAvailable is free at sort-phase entry, after the scan phase has
-    // released its streaming buffers. compute_adaptive_sort_buffer respects
-    // the MDB_SORT_BUFFER_MB env override too, so operators can pin a value
-    // for benchmarking without code changes.
+    // workers on a 20-core host. Adaptive sizing reads MemAvailable at
+    // sort-phase entry, after the scan phase has released its streaming
+    // buffers. compute_adaptive_sort_buffer respects the MDB_SORT_BUFFER_MB
+    // env override too, so operators can pin a value for benchmarking.
     std::size_t adaptive_memory_budget = compute_adaptive_sort_buffer();
     std::size_t num_workers = compute_num_workers(
         std::thread::hardware_concurrency(),
@@ -634,7 +638,7 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
     // dispatching on the default arena (up to hardware_concurrency workers)
     // would multiply transient RSS far beyond the
     // O(num_workers × worker_memory_budget) bound that compute_num_workers
-    // derives (ADR 004 §peak-RSS).
+    // derives (peak-RSS design constraint for the radix partition sort backend).
     tbb::task_arena arena(static_cast<int>(num_workers));
 
     // Dispatch partitions across workers via tbb::parallel_for.
@@ -712,7 +716,7 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
     return total_written;
 }
 
-// Spec #24 — GPU path for RADIX Phase 2 per-partition sort.
+// GPU path for RADIX Phase 2 per-partition sort.
 //
 // When MillenniumDB is built with CUDA (MDB_GPU_ENABLED) and a CUDA device is
 // available at runtime, route each in-memory partition through
@@ -748,9 +752,9 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
 {
     std::vector<Record<N>> buffer;
     {
-        // Spec #25 fix #4: bulk-read into batches, then bulk-append. This
-        // amortizes fread overhead and uses vector::insert (memcpy under the
-        // hood) instead of per-element push_back checks.
+        // Bulk-read into batches, then bulk-append. This amortizes fread
+        // overhead and uses vector::insert (memcpy under the hood) instead
+        // of per-element push_back checks.
         constexpr std::size_t kReadBatch = 4096;
         std::vector<Record<N>> batch(kReadBatch);
         typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
@@ -890,10 +894,10 @@ void RadixPartitionSort<N>::sort_partition_external(
 
     std::vector<std::string> run_paths;
     {
-        // Spec #25 fix #4: bulk-read instead of per-record fread. Note this
-        // path is for partitions that exceed worker_memory_budget; with
-        // fix #1 (real estimated_count) most partitions hit the in-memory
-        // path instead, so this code is exercised only on degenerate inputs.
+        // Bulk-read instead of per-record fread to amortize call overhead.
+        // This path handles partitions that exceed worker_memory_budget; with
+        // an accurate estimated_count most partitions hit the in-memory
+        // sort path instead, so this code is exercised only on degenerate inputs.
         typename PartitionFile<N>::Reader reader(partition_paths_[partition_idx]);
         constexpr std::size_t kReadBatch = 4096;
         std::vector<Record<N>> batch(kReadBatch);

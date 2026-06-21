@@ -14,15 +14,17 @@
 #include "storage/index/record.h"
 #include "storage/page/page.h"
 
-// BPTLeafV2 — delta + LEB128 varint encoding (Spec #5 v2 leaf format).
+// BPTLeafV2 — delta + LEB128 varint leaf encoding (v2 leaf format).
 //
-// Write path (T5.7): append_record(r) encodes r[0] as N full varints on the
-// first call, and subsequent records as N zigzag(delta) varints against the
+// Write path: append_record(r) encodes r[0] as N full varints on the first
+// call, and subsequent records as N zigzag(delta) varints against the
 // previously-appended record. flush() commits the 16-byte header + encoded
 // bytes to the page and zero-pads to Page::SIZE = 4096. Overflow detection
 // is against Page::SIZE - sizeof(BPTLeafV2Header).
 //
-// Read path (T5.8): get_record / search_index via linear scan. Stubbed here.
+// Read path: get_record / search_index via linear scan. A sequential-decode
+// cache (cache_pos_ / cache_cursor_ / cache_in_) avoids O(k²) rescanning
+// when records are accessed in forward order.
 //
 // Page-boundary invariant: no record spans two pages — if the next record
 // would push bytes_used past Page::SIZE, the writer signals "page full" and
@@ -35,7 +37,9 @@
 //
 // Virtual destructor is inherited from BPTLeafBase<N>.
 //
-// Spec reference: design §5.2 (layout), §5.3 (worked example), §5.4 (padding).
+// Layout reference: 16-byte header (format_version=2, record_width, value_count,
+// next_leaf) + record 0 as N full LEB128 varints + records 1..k-1 as N
+// zigzag-delta LEB128 varints. Pages are zero-padded to 4096 bytes.
 
 template <std::size_t N>
 class BPTLeafV2 : public BPTLeafBase<N> {
@@ -60,10 +64,10 @@ public:
 
     /// Reader-mode construction. Parses and validates the 16-byte header at
     /// the start of `page_bytes`, raising BPT::BPTLeafV2DecodeException if
-    /// any of the page-open validation invariants fail (design §5.5):
+    /// any of the page-open validation invariants fail:
     ///   - byte 0 must equal 2 (format_version)
     ///   - byte 1 must equal N (record_width)
-    ///   - byte 2 (flags) must be 0 (reserved in Spec #5)
+    ///   - byte 2 (flags) must be 0 (reserved, currently unused)
     ///   - byte 3 (reserved) must be 0
     ///   - value_count must be <= leaf_max_records_v2() = (PAGE_SIZE-16)/N
     ///   - bytes 12..15 (reserved2) must be all zero
@@ -121,10 +125,11 @@ public:
 
     // ========== BPTLeafBase<N> contract =====================================
     //
-    // T5.7 implements only the write path. get_value_count() and has_next()
-    // are trivially answerable from writer state and are implemented inline.
-    // The remaining read-side methods throw std::logic_error until T5.8
-    // delivers the linear-scan reader.
+    // The write path (append_record / flush) is complete. get_value_count()
+    // and has_next() are trivially answerable from writer state and are
+    // implemented inline. The remaining read-side methods (get_record,
+    // search_index, etc.) use the sequential-decode cache for O(k) forward
+    // scans and restart from the beginning for backward seeks.
 
     uint32_t      get_value_count() const override { return value_count_; }
     bool          has_next() const override { return next_leaf_ != 0; }

@@ -184,7 +184,7 @@ uint64_t NativeScanner::scan_label_node(
 
     // Sequential path — used when the parallel feature is disabled, when TBB
     // is not built in, or when only one partition is requested. Mirrors the
-    // pre-Spec-#15 behavior exactly.
+    // original single-threaded label_node scan behavior exactly.
     bool parallel_enabled = resolve_parallel_node_scan_enabled();
     std::size_t num_partitions = resolve_node_scan_partitions();
 
@@ -499,8 +499,8 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
 
     // Sequential path — used when the parallel feature is disabled, when TBB
     // is not built in, or when only one partition is requested. Mirrors the
-    // pre-Spec-#16 behavior exactly: collect into a single stack-local
-    // vector and replay through the user callback.
+    // original single-threaded label_edge_with_endpoints scan behavior: each
+    // edge is emitted directly to the user callback as it is scanned.
     bool parallel_enabled = resolve_parallel_edge_scan_enabled();
     std::size_t num_partitions = resolve_edge_scan_partitions();
 
@@ -509,11 +509,11 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
 #endif
 
     if (!parallel_enabled || num_partitions < 2) {
-        // Inline callback path — never accumulates into a vector. This matches
-        // the pre-Spec-#16 behavior, where each edge was emitted to the
-        // callback as soon as it was scanned. Required for large datasets
-        // (papers100M: 1.6B edges × 24 B = 36 GB if accumulated) where the
-        // collect-then-replay sink would exceed RAM.
+        // Inline callback path — never accumulates into a vector. Each edge is
+        // emitted to the user callback as soon as its endpoints are resolved.
+        // Required for large datasets (papers100M: 1.6B edges × 24 B/triple =
+        // 36 GB if accumulated) where a collect-then-replay approach would
+        // exceed available RAM.
         Record<2> min_record;
         min_record[0] = search_type_id;
         min_record[1] = 0;
@@ -554,17 +554,18 @@ uint64_t NativeScanner::scan_label_edge_with_endpoints(
     // is idempotent and cheap.
     QueryContext* parent_ctx = QueryContext::_query_ctx;
 
-    // Range partition strategy: same uniform split as Spec #16 original.
+    // Range partition strategy: uniform split of the full 64-bit edge-id space
+    // into num_partitions disjoint sub-ranges (same approach as the node scan).
     auto ranges = build_uniform_subranges(num_partitions);
 
     // ---- Streaming producer-consumer with bounded per-partition queues.
     //
-    // Original Spec #16 design (collect-then-replay) accumulated all
-    // per-partition triples in std::vector<std::vector<EdgeEndpointTriple>>
-    // before invoking the user callback. For papers100M (1.6 B edges ×
-    // 24 B/triple = 36 GB) this exceeds the 32 GB host RAM and OOMs.
+    // A naive collect-then-replay design would accumulate all per-partition
+    // triples in std::vector<std::vector<EdgeEndpointTriple>> before invoking
+    // the user callback. For papers100M (1.6 B edges × 24 B/triple = 36 GB)
+    // this exceeds 32 GB host RAM and OOMs.
     //
-    // Streaming fix: each partition has a bounded queue (kQueueMax slots).
+    // Streaming design: each partition has a bounded queue (kQueueMax slots).
     // Workers push triples; if the queue is full they block on cv_not_full.
     // The main thread consumes queues in ascending partition order so the
     // callback sees the bit-identical sequence that the legacy single-

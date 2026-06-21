@@ -1,6 +1,6 @@
 // src/graph_models/gql/projection/batched_edge_aggregator.cc
 //
-// Spec #26 — implementation of BatchedEdgeAggregator (see header for design).
+// Implementation of BatchedEdgeAggregator (see header for design).
 //
 // CPU path: linear scan over a sorted EdgeAggregationRecord buffer, tracking
 // per-group state in 64 stack-resident bytes; emits one record per unique
@@ -12,7 +12,7 @@
 // GPU path: a CPU-equivalent stub today. The contract is intentional: the
 // stub returns the same output as the CPU path so any consumer that wires
 // `Backend::AUTO` (or `Backend::GPU` once enabled) sees no behavioural
-// change pre-v2. Spec #26 v2 swaps the stub body for `cub::DeviceRadixSort`
+// change pre-v2. A future GPU version swaps the stub body for `cub::DeviceRadixSort`
 // + `cub::DeviceReduce::ReduceByKey` (or `DeviceSegmentedReduce` once
 // segment offsets are computed) without touching consumers.
 
@@ -33,7 +33,7 @@ namespace GQL {
 //
 // Mirrors EdgeKeepBitmapGpuBatcher::gpu_path_available() for consistency,
 // with one polarity flip: this env var defaults OFF because the GPU body is
-// a stub today. Once Spec #26 v2 lands, the natural follow-up flips the
+// a stub today. Once the real GPU aggregation kernel lands, the natural follow-up flips the
 // default to ON (matching MDB_PROJECTION_BITMAP_GPU's "1" = on-by-default
 // convention).
 bool BatchedEdgeAggregator::gpu_path_available() {
@@ -45,8 +45,8 @@ bool BatchedEdgeAggregator::gpu_path_available() {
         if (env == nullptr || env[0] != '1' || env[1] != '\0') {
             // Default-off + any non-"1" value disables. We deliberately do
             // NOT treat unset == on (unlike MDB_PROJECTION_BITMAP_GPU) so
-            // the stub doesn't masquerade as a working GPU path during
-            // Spec #26 v1 rollout.
+            // the stub doesn't masquerade as a working GPU path while
+            // the GPU body is still a CPU-equivalent stub.
             return false;
         }
         const auto res = mdb::gpu::detect_resources();
@@ -212,11 +212,11 @@ bool BatchedEdgeAggregator::aggregate_cpu_(
 }
 
 // ---------------------------------------------------------------------------
-// aggregate_gpu_(): Spec #26 v1 stub. CPU-equivalent output.
+// aggregate_gpu_(): first-version stub. CPU-equivalent output.
 // ---------------------------------------------------------------------------
 //
 // The stub deliberately re-uses aggregate_cpu_() to guarantee bit-identical
-// output. Spec #26 v2 will replace this body with:
+// output. The future GPU-accelerated version will replace this body with:
 //
 //   1. cudaMalloc + cudaMemcpy of the SoA layout (5 parallel uint64
 //      arrays). EdgeAggregationRecord's static_assert (5 contiguous

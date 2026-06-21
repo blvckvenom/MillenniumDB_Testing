@@ -129,7 +129,7 @@ void ParallelScanPartitioner<N>::run(
 }
 
 // ---------------------------------------------------------------------------
-// Spec #25 (Option C — CPU TBB) — chunk-parallel partition fill.
+// Chunk-parallel partition fill via TBB (CPU-only, no GPU involvement).
 //
 // Design:
 //   - Producer (calling thread) repeatedly drains the input via scan_fn into

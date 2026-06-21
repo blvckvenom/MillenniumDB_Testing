@@ -5,7 +5,8 @@
 // through its iterator (the original post-hoc path at
 // native_projection_builder.cc:2453-2526).
 //
-// Motivation (Spec #4-B T4.18): the post-hoc path scanned each edge index
+// Motivation: the post-hoc path for building the topology CSR sidecars
+// (topology_fwd.csr / topology_rev.csr via mmap) scanned each edge index
 // twice (pass 1 = degree histogram, pass 2 = edge stream) through the
 // full BPT iterator. On ogbn-products this doubled the build time
 // (214 s -> 454 s, +112 %). Since the sorted records have already landed

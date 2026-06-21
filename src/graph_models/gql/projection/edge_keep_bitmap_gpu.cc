@@ -1,7 +1,7 @@
 // src/graph_models/gql/projection/edge_keep_bitmap_gpu.cc
 //
-// Spec #27 — implementation of EdgeKeepBitmapGpuBatcher (see header for
-// rationale + design).
+// GPU-batched edge keep-bitmap computation: implementation of
+// EdgeKeepBitmapGpuBatcher (see header for rationale + design).
 
 #include "graph_models/gql/projection/edge_keep_bitmap_gpu.h"
 
@@ -209,8 +209,9 @@ void EdgeKeepBitmapGpuBatcher::run_cpu_(std::size_t n) {
 // ---------------------------------------------------------------------------
 bool EdgeKeepBitmapGpuBatcher::run_gpu_(std::size_t n) {
     // Snapshot the sorted node array. has_node() requires
-    // collected_nodes_sorted_ at this point — Spec #2 invariant I1
-    // (Phase A's finalize_node_scan runs strictly before Phase B).
+    // collected_nodes_sorted_ at this point — relying on the node-scan
+    // ordering invariant (Phase A's finalize_node_scan runs strictly
+    // before Phase B).
     const std::vector<uint64_t>& nodes = storage_.collected_nodes();
     if (nodes.empty()) {
         // Empty projection: nothing keeps. Set all flags to 0 in-place

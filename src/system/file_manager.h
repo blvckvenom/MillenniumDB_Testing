@@ -55,9 +55,9 @@ private:
     // FileId -> PageCount (on disk)
     std::map<FileId, uint32_t> fid2pages;
 
-    // Spec #18 — get_file_id() is now safe to call from multiple threads
-    // concurrently (used by ProjectionStorage::open_all_bplustree_readers_
-    // when MDB_PROJECTION_PARALLEL_READERS is enabled). The mutex is taken
+    // get_file_id() is safe to call from multiple threads concurrently
+    // (used by ProjectionStorage::open_all_bplustree_readers_ when
+    // MDB_PROJECTION_PARALLEL_READERS is enabled). The mutex is taken
     // around the map mutations only; the open()/lseek() syscalls run
     // outside the critical section so they can overlap across threads.
     std::mutex maps_mutex;

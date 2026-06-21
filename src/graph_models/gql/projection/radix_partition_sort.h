@@ -10,7 +10,7 @@
  * src/tests/radix_partition_sort_test.cc, and golden-compare integration
  * against the CLASSIC backend in scripts/test_projection_radix.sh.
  *
- * Spec reference:
+ * Design notes:
  *   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2
  */
 
@@ -50,16 +50,21 @@ public:
         std::size_t num_workers            = 0;   // 0 = auto (cores/mem)
         std::size_t num_scan_threads       = 0;   // 0 = auto (nproc/2)
         std::string scratch_dir;                   // partition file directory
-        // Spec #5 T5.11b — leaf encoding for the B+Tree `.leaf` output.
-        // BITSET (default) preserves pre-Spec-#5 byte-identical behavior;
-        // DELTA_VARINT opts in to the delta+varint v2 encoding.
+        // Leaf encoding for the B+Tree `.leaf` output files produced in Phase 3.
+        // BITSET (default) uses the legacy v1 format (shared-prefix byte-bitset
+        // encoding), preserving byte-identical output with the CLASSIC backend.
+        // DELTA_VARINT opts in to the delta + LEB128-varint v2 encoding, which
+        // exploits sorted record order to achieve ~80% size reduction on typical
+        // edge indexes.
         BPT::LeafFormat leaf_format        = BPT::LeafFormat::BITSET;
 
-        // Spec #8 T8.9 — when CSR_HYBRID, Phase 3 emits v3 CSR leaves via
-        // BPTLeafCSRWriter<N> instead of the BITSET/DELTA_VARINT writers.
-        // Caller gates this to N==3 edge indexes (FROM_TO_EDGE /
-        // TO_FROM_EDGE) per design §3.6 D6. Default BTREE preserves
-        // pre-Spec-#8 byte-identical RADIX output.
+        // Graph storage mode for edge-index B+Tree leaf files produced in Phase 3.
+        // When CSR_HYBRID, Phase 3 emits v3 CSR leaves via BPTLeafCSRWriter<N>
+        // (the edge-index B+Tree leaves themselves become the CSR layout, enabling
+        // O(1) neighbor slices without a separate sidecar). Callers gate this to
+        // N==3 edge indexes (FROM_TO_EDGE / TO_FROM_EDGE) per design §3.6 D6.
+        // Default BTREE preserves byte-identical RADIX output with standard
+        // BITSET/DELTA_VARINT leaf encoding.
         BPT::GraphStorage graph_storage    = BPT::GraphStorage::BTREE;
 
         // Keep the intermediate `.sorted_part_*.bin` files after Phase 3
@@ -108,20 +113,19 @@ public:
         std::size_t worker_memory_budget,
         std::size_t override_value);
 
-    /// Task 4.2 telemetry: how many partitions Phase 2 sorted on the GPU vs
-    /// the CPU. Populated during sort_and_write(); a single summary line is
-    /// also emitted to stderr at the end of that call. On non-CUDA builds (or
-    /// when the GPU path is disabled / planner-downgraded) every partition is
-    /// counted as CPU.
+    /// Telemetry: how many partitions Phase 2 sorted on the GPU vs the CPU.
+    /// Populated during sort_and_write(); a single summary line is also emitted
+    /// to stderr at the end of that call. On non-CUDA builds (or when the GPU
+    /// path is disabled / planner-downgraded) every partition is counted as CPU.
     std::size_t gpu_partitions_sorted() const { return gpu_partitions_.load(); }
     std::size_t cpu_partitions_sorted() const { return cpu_partitions_.load(); }
 
-    /// Task 5.1 test seam: the running maximum number of Phase 2 workers that
-    /// were simultaneously inside the GPU-submission region. The GPU
-    /// concurrency semaphore (sized from MDB_PROJECTION_RADIX_GPU_CONCURRENCY,
-    /// default 1) bounds this to kGpuConcurrency; the unit test asserts the
-    /// observed peak never exceeds that bound. On a non-CUDA build (or when
-    /// no GPU is present and every partition routes to CPU) this stays 0.
+    /// Test seam: the running maximum number of Phase 2 workers that were
+    /// simultaneously inside the GPU-submission region. The GPU concurrency
+    /// semaphore (sized from MDB_PROJECTION_RADIX_GPU_CONCURRENCY, default 1)
+    /// bounds this to kGpuConcurrency; unit tests assert the observed peak never
+    /// exceeds that bound. On a non-CUDA build (or when no GPU is present and
+    /// every partition routes to CPU) this stays 0.
     int gpu_peak_in_flight() const { return gpu_peak_in_flight_.load(); }
 
 private:
@@ -129,17 +133,18 @@ private:
     std::size_t num_partitions_ = 0;
     std::vector<std::string> partition_paths_;  // per-partition merged files
 
-    // Task 4.2: per-partition GPU/CPU sort tallies. Atomic because Phase 2
+    // Per-partition GPU/CPU sort tallies. Atomic because Phase 2
     // dispatches partitions across a tbb::parallel_for worker pool.
     std::atomic<std::size_t> gpu_partitions_{0};
     std::atomic<std::size_t> cpu_partitions_{0};
 
-    // Task 5.1: bound how many Phase 2 workers submit to the single GPU at
-    // once. Sized once in the ctor from MDB_PROJECTION_RADIX_GPU_CONCURRENCY
-    // (default 1, clamped to [1, 8]); the remaining workers sort their
-    // partitions on the CPU concurrently — that overlap is the "CPU and GPU
-    // both busy" win. unique_ptr because CountingSemaphore is non-copyable
-    // and the permit count is only known at construction time.
+    // Semaphore bounding how many Phase 2 workers may submit to the single GPU
+    // simultaneously. Sized once in the ctor from
+    // MDB_PROJECTION_RADIX_GPU_CONCURRENCY (default 1, clamped to [1, 8]);
+    // the remaining workers sort their partitions on the CPU concurrently —
+    // that overlap keeps both CPU and GPU busy. unique_ptr because
+    // CountingSemaphore is non-copyable and the permit count is only known at
+    // construction time.
     int gpu_concurrency_ = 1;
     std::unique_ptr<CountingSemaphore> gpu_semaphore_;
 

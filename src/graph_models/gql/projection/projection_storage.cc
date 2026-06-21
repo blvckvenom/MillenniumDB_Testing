@@ -175,14 +175,15 @@ void ProjectionStorage::open() {
         directed_edge_count = catalog.directed_edge_count;
         undirected_edge_count = catalog.undirected_edge_count;
 
-        // Restore IndexSet preset so the query-layer diagnostic (T3.9) can
-        // name the preset this projection was built under when a missing
-        // index is accessed. Older catalogs (pre-v1.4) default to ALL via
+        // Restore IndexSet preset so the query layer can name the preset
+        // this projection was built under when a missing index is accessed.
+        // Older catalogs (pre-v1.4) default to ALL via
         // ProjectionCatalog::load(), so this is safe for all versions.
         requested_index_set = catalog.index_set;
 
-        // Spec #5 T5.11 — restore the leaf-format preset from v1.5 catalog.
-        // Pre-v1.5 catalogs default every slot to BITSET (handled by
+        // Restore the leaf-format preset from the v1.5 catalog byte array
+        // (delta + LEB128-varint leaf encoding configuration). Pre-v1.5
+        // catalogs default every slot to BITSET (handled by
         // ProjectionCatalog::load); we pick the first entry as the
         // projection-wide format since the current surface only supports a
         // single format per projection. Empty vector (no materialized
@@ -196,13 +197,15 @@ void ProjectionStorage::open() {
             }
         }
 
-        // Spec #8 T8.8 — restore the per-projection graph-storage mode from
-        // the v1.6 catalog byte. ProjectionCatalog::load() defaults this to
-        // BTREE (1) for pre-v1.6 catalogs and validates the byte is in
-        // {1, 2} on read, so we can trust the value here. T8.9 will consume
-        // requested_graph_storage from the edge-index sorter dispatch to
-        // select BPTLeafCSRWriter when CSR_HYBRID; under T8.8 alone the
-        // dispatch path still emits BTREE leaves regardless.
+        // Restore the per-projection graph-storage mode (BTREE or CSR_HYBRID)
+        // from the v1.6 catalog byte. CSR_HYBRID means the edge-index B+Tree
+        // leaves embed the CSR layout directly instead of using the standard
+        // BITSET/DELTA_VARINT formats. ProjectionCatalog::load() defaults
+        // this to BTREE (1) for pre-v1.6 catalogs and validates the byte is
+        // in {1, 2} on read, so we can trust the value here. The
+        // requested_graph_storage field is consumed by the edge-index sorter
+        // dispatch to select BPTLeafCSRWriter when CSR_HYBRID; under BTREE
+        // the dispatch emits standard leaves regardless.
         if (catalog.graph_storage
             == static_cast<uint8_t>(BPT::GraphStorage::CSR_HYBRID)) {
             requested_graph_storage = BPT::GraphStorage::CSR_HYBRID;
@@ -211,29 +214,31 @@ void ProjectionStorage::open() {
         }
     }
 
-    // Spec #5 T5.11 — thread the restored leaf_format into every BPlusTree
-    // reader so BptIter dispatches on the right leaf layout at read time.
+    // Thread the restored leaf encoding (BITSET or DELTA_VARINT) into every
+    // BPlusTree reader so BptIter dispatches on the right leaf layout at
+    // read time.
     const BPT::LeafFormat lf = requested_leaf_format;
 
-    // Spec #8 T8.9 — under CSR_HYBRID, edge indexes (from_to_edge /
-    // to_from_edge) carry v3 CSR leaves with a distinct header byte (0x03).
-    // BptIter's 3-way dispatch (T8.6) keys on the LeafFormat passed to the
-    // BPlusTree<N> ctor, so we must pass CSR_HYBRID for edge indexes in
-    // this mode while keeping the user-requested format for everything
-    // else. Non-edge indexes remain on lf (BITSET / DELTA_VARINT).
+    // Under CSR_HYBRID graph storage, the edge indexes (from_to_edge /
+    // to_from_edge) carry v3 CSR leaves — the B+Tree leaves embed the CSR
+    // layout directly — with a distinct header byte (0x03). BptIter's
+    // 3-way dispatch keys on the LeafFormat passed to the BPlusTree<N>
+    // ctor, so we must pass CSR_HYBRID for edge indexes in this mode while
+    // keeping the user-requested format for everything else. Non-edge
+    // indexes remain on lf (BITSET / DELTA_VARINT).
     const BPT::LeafFormat edge_lf =
         (requested_graph_storage == BPT::GraphStorage::CSR_HYBRID)
             ? BPT::LeafFormat::CSR_HYBRID
             : lf;
 
-    // Spec #3 T3.8 (mirrored from open_all_bplustree_readers_): open readers
-    // only for indexes whose bit is in the active IndexSet preset.
-    // FileManager::get_file_id() opens with O_CREAT, so unconditional
-    // construction of a BPlusTree for an index elided by GNN_MINIMAL /
-    // READONLY_TRAVERSAL would produce 0-byte .leaf/.dir files on disk —
-    // defeating the file-count / disk-footprint contract of the preset.
-    // Pre-v1.4 catalogs default to IndexSet::ALL (see above), so every
-    // legacy projection keeps the previous unconditional behavior.
+    // Open readers only for indexes whose bit is in the active IndexSet
+    // preset (mirrors open_all_bplustree_readers_). FileManager::get_file_id()
+    // opens with O_CREAT, so unconditional construction of a BPlusTree for
+    // an index elided by GNN_MINIMAL / READONLY_TRAVERSAL would produce
+    // 0-byte .leaf/.dir files on disk — defeating the file-count /
+    // disk-footprint contract of the preset. Pre-v1.4 catalogs default to
+    // IndexSet::ALL (see above), so every legacy projection keeps the
+    // previous unconditional behavior.
     const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
     if (has_flag(active_mask, ProjectionIndex::NODES)) {
@@ -890,11 +895,13 @@ void ProjectionStorage::save_catalog() {
     // Persist the v1.4 IndexSet preset. The default ordinal (0 = ALL) is set
     // both here and on the catalog field, so a builder that never sets the
     // preset still produces a well-formed v1.4 catalog equivalent to the
-    // pre-Spec #3 "everything materialized" behavior.
+    // legacy "everything materialized" behavior.
     catalog.index_set = requested_index_set;
 
-    // Spec #5 T5.11 — persist the per-index leaf_format byte array in
-    // catalog v1.5. Size == number of materialized indexes under the active
+    // Persist the per-index leaf-format byte array in catalog v1.5. This
+    // records whether each B+Tree index uses the standard BITSET leaf
+    // encoding (v1, legacy) or the delta + LEB128-varint encoding (v2,
+    // opt-in). Size == number of materialized indexes under the active
     // IndexSet preset (one byte per slot, in canonical ProjectionIndex enum
     // order; see projection_catalog.{h,cc}). The current graph_project
     // surface exposes a single projection-wide format, so every slot gets
@@ -902,14 +909,14 @@ void ProjectionStorage::save_catalog() {
     // all-BITSET, but we populate it explicitly here so DELTA_VARINT is
     // actually recorded when the user opts in.
     //
-    // Spec #8 T8.9: CSR_HYBRID is NOT recorded per-slot in leaf_formats —
-    // the v1.5 array validator only accepts BITSET/DELTA_VARINT, and the
-    // sealed catalog file cannot be extended. Instead, the per-projection
-    // `graph_storage` byte (v1.6) carries the CSR_HYBRID signal; the
-    // open-time reader in ProjectionStorage::open() derives the right
-    // LeafFormat for FROM_TO_EDGE / TO_FROM_EDGE from that byte and
-    // bypasses leaf_formats for those two slots. Non-edge indexes honor
-    // leaf_formats as before.
+    // CSR_HYBRID (edge-index B+Tree leaves that embed the CSR layout) is
+    // NOT recorded per-slot in leaf_formats — the v1.5 array validator
+    // only accepts BITSET/DELTA_VARINT, and the sealed catalog file cannot
+    // be extended. Instead, the per-projection `graph_storage` byte (v1.6)
+    // carries the CSR_HYBRID signal; the open-time reader in
+    // ProjectionStorage::open() derives the right LeafFormat for
+    // FROM_TO_EDGE / TO_FROM_EDGE from that byte and bypasses leaf_formats
+    // for those two slots. Non-edge indexes honor leaf_formats as before.
     {
         const auto mask =
             static_cast<uint32_t>(project_index_mask_for(requested_index_set));
@@ -920,12 +927,13 @@ void ProjectionStorage::save_catalog() {
             static_cast<uint8_t>(requested_leaf_format));
     }
 
-    // Spec #8 T8.8 — persist the per-projection graph-storage mode as the
-    // v1.6 catalog byte. Default BTREE (1) is byte-for-byte identical to
-    // pre-Spec-#8 catalogs (the v1.6 byte is absent there, and load()
-    // defaults to BTREE for those). Under T8.8 alone this is the only
-    // observable effect of CSR_HYBRID; the build pipeline still emits
-    // BTREE leaves regardless.
+    // Persist the per-projection graph-storage mode (BTREE or CSR_HYBRID)
+    // as the v1.6 catalog byte. Default BTREE (1) is byte-for-byte
+    // identical to pre-v1.6 catalogs (the v1.6 byte is absent there, and
+    // load() defaults to BTREE for those). CSR_HYBRID means the edge-index
+    // B+Tree leaves embed the CSR layout directly; this byte is the sole
+    // catalog signal for that mode, since leaf_formats (v1.5) does not
+    // encode it.
     catalog.graph_storage = static_cast<uint8_t>(requested_graph_storage);
 
     // Save to disk
@@ -1076,12 +1084,14 @@ size_t ProjectionStorage::build_index_bulk(std::vector<Record<N>>& records, cons
 
 template<std::size_t N>
 size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, const std::string& base_path) {
-    // Spec #5 T5.11b — dispatch on the projection-wide leaf-format preset.
-    // BITSET preserves pre-Spec-#5 byte-identical behavior; DELTA_VARINT
-    // produces v2 leaves with a 16-byte header + zigzag-delta varint
-    // payload. The format is populated from the config parameter on
-    // graph_project (project_procedure.cc) and threaded through
-    // NativeProjectionBuilder into requested_leaf_format during ctor.
+    // Dispatch on the projection-wide leaf-format preset. BITSET preserves
+    // legacy byte-identical behavior; DELTA_VARINT produces v2 leaves with
+    // a 16-byte header + zigzag-delta LEB128-varint payload, which
+    // compresses sorted B+Tree records by encoding successive deltas rather
+    // than full values. The format is populated from the `leafFormat` config
+    // parameter on graph_project (project_procedure.cc) and threaded
+    // through NativeProjectionBuilder into requested_leaf_format during
+    // construction.
     if (requested_leaf_format == BPT::LeafFormat::DELTA_VARINT) {
         BPTLeafV2Writer<N> leaf_writer(base_path + ".leaf");
         BPTDirWriter<N>    dir_writer(base_path + ".dir");
@@ -1119,7 +1129,7 @@ size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, c
         return unique_count;
     }
 
-    // BITSET path — unchanged from pre-Spec-#5 (byte-identical output).
+    // BITSET path — legacy leaf encoding, byte-identical to original output.
     BPTLeafWriter<N> leaf_writer(base_path + ".leaf");
     BPTDirWriter<N> dir_writer(base_path + ".dir");
 
@@ -1272,7 +1282,7 @@ template size_t ProjectionStorage::build_index_streaming<3>(ExternalRecordSort<3
 // their feature flag is false or the backing buffer is null.
 //
 // Callers: build_all_indexes_bulk() in CLASSIC mode, and
-// build_one_index(ProjectionIndex) in SERIALIZED mode (Task 5).
+// build_one_index(ProjectionIndex) in SERIALIZED mode.
 // =========================================================================
 
 void ProjectionStorage::build_nodes_index_() {
@@ -1282,7 +1292,7 @@ void ProjectionStorage::build_nodes_index_() {
     node_count = GQL::sort_and_build_index<1>(
         *node_records_buffer_,
         projection_dir + "/nodes",
-        /*estimated_count=*/node_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/node_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<1>& sorter, const std::string& path) {
             return build_index_streaming<1>(sorter, path);
         },
@@ -1298,25 +1308,27 @@ void ProjectionStorage::build_from_to_edge_index_() {
     GQL::sort_and_build_index<3>(
         *from_to_records_buffer_,
         projection_dir + "/from_to_edge",
-        /*estimated_count=*/from_to_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/from_to_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
         sort_temp_dir,
         requested_leaf_format,
-        // Spec #8 T8.9 — edge indexes pick up the per-projection
-        // graph_storage mode. Under CSR_HYBRID the dispatch bypasses
-        // the build_from_sorter callback and invokes BPTLeafCSRWriter
-        // directly, producing v3 leaf pages. BTREE (default) preserves
-        // pre-Spec-#8 byte-identical output.
+        // Edge indexes pick up the per-projection graph-storage mode.
+        // Under CSR_HYBRID the dispatch bypasses the build_from_sorter
+        // callback and invokes BPTLeafCSRWriter directly, producing v3
+        // leaf pages where the B+Tree leaf IS the CSR adjacency list.
+        // BTREE (default) preserves legacy byte-identical output.
         requested_graph_storage
     );
 
-    // Spec #4-B T4.18 integrated topology snapshot emission.
-    // Runs only when NativeProjectionBuilder pre-set the opt-in flag AND
-    // the projection is in BTREE mode. Under CSR_HYBRID the in-leaf CSR
-    // supersedes the sidecar (design §3.8 D8), so we skip emission here
-    // and build_topology_snapshots_() short-circuits below.
+    // Integrated topology CSR sidecar emission (topology_fwd.csr).
+    // The CSR sidecar is an mmap-backed file that provides O(1) neighbor
+    // slices, accelerating GNN k-hop sampling versus O(log N) B+Tree
+    // traversal. Runs only when NativeProjectionBuilder pre-set the opt-in
+    // flag AND the projection is in BTREE mode. Under CSR_HYBRID the
+    // B+Tree leaves already embed the CSR adjacency list and supersede the
+    // sidecar, so we skip emission here.
     if (build_topology_snapshot_
         && requested_graph_storage != BPT::GraphStorage::CSR_HYBRID) {
         try {
@@ -1343,19 +1355,21 @@ void ProjectionStorage::build_to_from_edge_index_() {
     GQL::sort_and_build_index<3>(
         *to_from_records_buffer_,
         projection_dir + "/to_from_edge",
-        /*estimated_count=*/to_from_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/to_from_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
         sort_temp_dir,
         requested_leaf_format,
-        // Spec #8 T8.9 — see build_from_to_edge_index_() above.
+        // Pass the per-projection graph-storage mode; see build_from_to_edge_index_() above.
         requested_graph_storage
     );
 
-    // Spec #4-B T4.18 integrated topology snapshot emission (reverse).
-    // Same gate + fallback logic as the FORWARD builder above, plus the
-    // Spec #8 T8.9 CSR_HYBRID supersession (design §3.8 D8).
+    // Integrated topology CSR sidecar emission (topology_rev.csr).
+    // Same gate and fallback logic as the FORWARD builder above: the
+    // mmap-backed reverse sidecar enables O(1) reverse-neighbor slices
+    // for k-hop sampling. Skipped under CSR_HYBRID because the reverse
+    // edge B+Tree leaves already embed the CSR adjacency list.
     if (build_topology_snapshot_
         && requested_graph_storage != BPT::GraphStorage::CSR_HYBRID) {
         try {
@@ -1380,7 +1394,7 @@ void ProjectionStorage::build_edge_direction_index_() {
     GQL::sort_and_build_index<2>(
         *direction_records_buffer_,
         projection_dir + "/edge_direction",
-        /*estimated_count=*/direction_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/direction_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1396,7 +1410,7 @@ void ProjectionStorage::build_edge_from_to_index_() {
     GQL::sort_and_build_index<3>(
         *edge_from_to_records_buffer_,
         projection_dir + "/edge_from_to",
-        /*estimated_count=*/edge_from_to_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/edge_from_to_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1412,7 +1426,7 @@ void ProjectionStorage::build_edge_n1_n2_index_() {
     GQL::sort_and_build_index<3>(
         *edge_n1_n2_records_buffer_,
         projection_dir + "/edge_n1_n2",
-        /*estimated_count=*/edge_n1_n2_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/edge_n1_n2_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1429,7 +1443,7 @@ void ProjectionStorage::build_node_label_index_() {
     GQL::sort_and_build_index<2>(
         *node_label_records_buffer_,
         projection_dir + "/node_label",
-        /*estimated_count=*/node_label_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/node_label_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1446,7 +1460,7 @@ void ProjectionStorage::build_label_node_index_() {
     GQL::sort_and_build_index<2>(
         *label_node_records_buffer_,
         projection_dir + "/label_node",
-        /*estimated_count=*/label_node_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/label_node_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1463,7 +1477,7 @@ void ProjectionStorage::build_edge_label_index_() {
     GQL::sort_and_build_index<2>(
         *edge_label_records_buffer_,
         projection_dir + "/edge_label",
-        /*estimated_count=*/edge_label_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/edge_label_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1480,7 +1494,7 @@ void ProjectionStorage::build_label_edge_index_() {
     GQL::sort_and_build_index<2>(
         *label_edge_records_buffer_,
         projection_dir + "/label_edge",
-        /*estimated_count=*/label_edge_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/label_edge_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<2>& sorter, const std::string& path) {
             return build_index_streaming<2>(sorter, path);
         },
@@ -1497,7 +1511,7 @@ void ProjectionStorage::build_node_key_value_index_() {
     GQL::sort_and_build_index<3>(
         *node_key_value_records_buffer_,
         projection_dir + "/node_key_value",
-        /*estimated_count=*/node_key_value_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/node_key_value_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1514,7 +1528,7 @@ void ProjectionStorage::build_key_value_node_index_() {
     GQL::sort_and_build_index<3>(
         *key_value_node_records_buffer_,
         projection_dir + "/key_value_node",
-        /*estimated_count=*/key_value_node_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/key_value_node_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1531,7 +1545,7 @@ void ProjectionStorage::build_edge_key_value_index_() {
     GQL::sort_and_build_index<3>(
         *edge_key_value_records_buffer_,
         projection_dir + "/edge_key_value",
-        /*estimated_count=*/edge_key_value_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/edge_key_value_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1548,7 +1562,7 @@ void ProjectionStorage::build_key_value_edge_index_() {
     GQL::sort_and_build_index<3>(
         *key_value_edge_records_buffer_,
         projection_dir + "/key_value_edge",
-        /*estimated_count=*/key_value_edge_records_buffer_->size(),  // Spec #25 fix: real count for RADIX partitioning
+        /*estimated_count=*/key_value_edge_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
         [this](ExternalRecordSort<3>& sorter, const std::string& path) {
             return build_index_streaming<3>(sorter, path);
         },
@@ -1562,8 +1576,8 @@ void ProjectionStorage::reset_sort_scratch_() {
     std::filesystem::remove_all(projection_dir + "/sort_tmp", ec);
     // Best-effort cleanup; recreate empty dir for the next pass.
     std::filesystem::create_directories(projection_dir + "/sort_tmp");
-    // NOTE: .radix_scratch (Spec #1) is managed by RadixPartitionSort's
-    // destructor; we don't need to touch it here.
+    // NOTE: .radix_scratch (used by RadixPartitionSort) is managed by that
+    // class's destructor; we don't need to touch it here.
 }
 
 void ProjectionStorage::begin_serial_edge_pass_(ProjectionIndex which) {
@@ -1640,15 +1654,15 @@ void ProjectionStorage::build_all_indexes_bulk() {
     std::string sort_temp_dir = projection_dir + "/sort_tmp";
     std::filesystem::create_directories(sort_temp_dir);
 
-    // Spec #3 T3.8: gate topology/label index materialization on the active
-    // IndexSet preset mask. The 10 gated bits are: NODES, NODE_LABEL,
-    // LABEL_NODE, FROM_TO_EDGE, TO_FROM_EDGE, EDGE_DIRECTION, EDGE_FROM_TO,
-    // EDGE_N1_N2, EDGE_LABEL, LABEL_EDGE. Property indexes (NODE_KEY_VALUE,
+    // Gate topology/label index materialization on the active IndexSet
+    // preset mask. The 10 gated bits are: NODES, NODE_LABEL, LABEL_NODE,
+    // FROM_TO_EDGE, TO_FROM_EDGE, EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2,
+    // EDGE_LABEL, LABEL_EDGE. Property indexes (NODE_KEY_VALUE,
     // KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE) are NOT gated here —
     // they remain conditional on features.include_*_properties inside their
-    // respective build_*_index_() helpers (Spec #3 §3.4). The mask is
-    // computed once per build since requested_index_set is immutable after
-    // the builder hands off to flush().
+    // respective build_*_index_() helpers. The mask is computed once per
+    // build since requested_index_set is immutable after the builder hands
+    // off to flush().
     const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
     // PHASE 1: Required topology indexes — now gated by IndexSet.
@@ -1693,8 +1707,8 @@ void ProjectionStorage::build_all_indexes_bulk() {
         build_label_edge_index_();
     }
 
-    // PHASE 3: Optional property indexes — NOT gated by IndexSet (Spec #3
-    // §3.4). Property-config gates via features.include_*_properties remain
+    // PHASE 3: Optional property indexes — NOT gated by IndexSet.
+    // Property-config gates via features.include_*_properties remain
     // the sole controller inside each helper.
     build_node_key_value_index_();
     build_key_value_node_index_();
@@ -1704,57 +1718,57 @@ void ProjectionStorage::build_all_indexes_bulk() {
     // PHASE 4: Cleanup + open indexes for reading.
     // Delegated to open_all_bplustree_readers_() so the SERIALIZED path
     // (finalize_serialized_) can call the same Phase 4 after its piecemeal
-    // build passes without duplicating the reader-open logic (Spec #2, Task 11).
+    // build passes without duplicating the reader-open logic.
     open_all_bplustree_readers_();
 }
 
-// Spec #2, Task 11 — Phase 4 extracted from build_all_indexes_bulk().
-//
-// Opens all B+Tree index readers after the .leaf/.dir files have been built.
-// Removes the sort_tmp scratch directory as a final cleanup step.
+// Phase 4 extracted from build_all_indexes_bulk(): opens all B+Tree index
+// readers after the .leaf/.dir files have been built, and removes the
+// sort_tmp scratch directory as a final cleanup step.
 //
 // Called by:
 //   - build_all_indexes_bulk() (CLASSIC path) after all 14 sort+build calls.
 //   - NativeProjectionBuilder::finalize_serialized_() (SERIALIZED path) after
-//     the last Phase C build_one_index() call, before save_catalog() runs.
+//     the last build_one_index() call, before save_catalog() runs.
 void ProjectionStorage::open_all_bplustree_readers_() {
     // Remove sort_tmp scratch directory (created by build_*_index_ helpers
     // and also by reset_sort_scratch_ between serialized passes).
     // best-effort: if already removed, remove_all is a no-op.
     std::filesystem::remove_all(projection_dir + "/sort_tmp");
 
-    // Spec #3 T3.8: open readers only for indexes whose bit is in the active
-    // IndexSet preset. FileManager::get_file_id() opens with O_CREAT, so
+    // Open readers only for indexes whose bit is in the active IndexSet
+    // preset. FileManager::get_file_id() opens with O_CREAT, so
     // unconditional construction of a BPlusTree for a skipped index would
     // produce a 0-byte .leaf/.dir on disk — defeating the file-count /
-    // disk-footprint contract of GNN_MINIMAL. The query layer (T3.9, out of
-    // scope here) will diagnose attempts to use an elided index.
+    // disk-footprint contract of GNN_MINIMAL. The query layer will diagnose
+    // attempts to use an elided index at runtime.
     const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
 
-    // Spec #5 T5.11 — projection-wide leaf encoding threaded into every
-    // BPlusTree reader so BptIter dispatches on the right leaf layout. Spec
-    // #5-B will later introduce per-index mixed formats; this call site
-    // consumes a single projection-wide value because that is what the
-    // current graph_project surface exposes.
+    // Thread the projection-wide leaf encoding (BITSET or DELTA_VARINT)
+    // into every BPlusTree reader so BptIter dispatches on the right leaf
+    // layout. A future extension may introduce per-index mixed formats;
+    // this call site consumes a single projection-wide value because that
+    // is what the current graph_project surface exposes.
     const BPT::LeafFormat lf = requested_leaf_format;
 
-    // Spec #8 T8.9 — mirrored from the open() path: under CSR_HYBRID the
-    // FROM_TO_EDGE / TO_FROM_EDGE B+Trees carry v3 CSR leaves; all other
-    // indexes keep the projection-wide lf.
+    // Mirrored from the open() path: under CSR_HYBRID graph storage, the
+    // FROM_TO_EDGE / TO_FROM_EDGE B+Trees carry v3 CSR leaves (the B+Tree
+    // leaf IS the CSR adjacency list); all other indexes keep the
+    // projection-wide leaf format.
     const BPT::LeafFormat edge_lf =
         (requested_graph_storage == BPT::GraphStorage::CSR_HYBRID)
             ? BPT::LeafFormat::CSR_HYBRID
             : lf;
 
-    // Spec #18 — Phase 4 reader opening was previously fully sequential
-    // (14 file-open syscalls back-to-back). Each B+Tree ctor only calls
-    // FileManager::get_file_id() twice (.dir + .leaf), so we collect the
-    // independent open tasks into a task vector and dispatch via TBB.
-    // Each task writes to a DIFFERENT std::unique_ptr member, so there is
-    // no shared-mutable-state contention between tasks. FileManager's
-    // internal mutex (added in this same change) makes the map mutations
-    // safe; the open()/lseek() syscalls run outside the critical section
-    // and overlap across threads.
+    // Phase 4 reader opening is parallelized via TBB. Previously the 14
+    // file-open syscalls ran back-to-back sequentially. Each B+Tree ctor
+    // only calls FileManager::get_file_id() twice (.dir + .leaf), so we
+    // collect the independent open tasks into a task vector and dispatch
+    // them in parallel. Each task writes to a DIFFERENT std::unique_ptr
+    // member, so there is no shared-mutable-state contention between tasks.
+    // FileManager's internal mutex makes map mutations safe; the
+    // open()/lseek() syscalls run outside the critical section and overlap
+    // across threads.
     //
     // Disable via env var: MDB_PROJECTION_PARALLEL_READERS=0
     // (intended for A/B benchmarking and bisecting any future regression).
@@ -1822,7 +1836,7 @@ void ProjectionStorage::open_all_bplustree_readers_() {
         }
     }
 
-    // Open optional property indexes — NOT gated by IndexSet (Spec #3 §3.4).
+    // Open optional property indexes — NOT gated by IndexSet.
     if (features.include_node_properties) {
         tasks.emplace_back([this, lf]() {
             node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
@@ -1873,12 +1887,12 @@ void ProjectionStorage::open_all_bplustree_readers_() {
 #endif
 }
 
-// Dispatcher for the serialized scan pipeline (Spec #2, Task 5).
-// Routes a single-bit ProjectionIndex value to the corresponding
-// private build_<name>_index_() helper. The default: clause catches
-// NONE, ALL_NODE, ALL_EDGE, ALL, and any unknown bit pattern, enforcing
-// single-bit-only semantics. Callers (Task 10's finalize_serialized_)
-// iterate over single-bit enumerators via enabled_indexes_().
+// Dispatcher for the serialized scan pipeline: routes a single-bit
+// ProjectionIndex value to the corresponding private build_<name>_index_()
+// helper. The default: clause catches NONE, ALL_NODE, ALL_EDGE, ALL, and
+// any unknown bit pattern, enforcing single-bit-only semantics. Callers
+// (finalize_serialized_) iterate over single-bit enumerators via
+// enabled_indexes_().
 void ProjectionStorage::build_one_index(ProjectionIndex which) {
     switch (which) {
         case ProjectionIndex::NODES:           build_nodes_index_();          break;

@@ -39,10 +39,10 @@ const char* source_basename_for(TopologySnapshotWriter::Direction d) {
     return "from_to_edge.leaf";
 }
 
-// Spec #19 — env var resolution for the parallel snapshot build.
+// Env var resolution for the parallel snapshot build.
 // Mirrors the resolve_bool_env / resolve_partition_count_env pattern from
-// native_scanner.cc so the operator surface is consistent across Specs
-// #15/#16/#19.
+// native_scanner.cc so the operator surface is consistent across the other
+// parallel projection-build stages.
 bool resolve_bool_env(const char* name, bool default_value) {
     const char* env = std::getenv(name);
     if (env == nullptr) {
@@ -311,7 +311,7 @@ void visit_leaf_records(const MappedFile& mm, Visitor&& visit) {
 
 // Read the first record's `key[0]` (i.e. the page-leading src ObjectId,
 // before tag-stripping) for every non-empty page, plus the last record's
-// `key[0]`. Used by the Spec #19 parallel build to assign each worker
+// `key[0]`. Used by the parallel snapshot build to assign each worker
 // its page range.
 //
 // Returns a vector of (first_src, last_src) pairs of length num_pages;
@@ -415,8 +415,9 @@ std::size_t find_first_page_for_src(
     return boundaries.size();
 }
 
-// Sequential implementation — pre-Spec-#19 code path. Used as the fallback
-// when MDB_PROJECTION_PARALLEL_SNAPSHOT=0, when partitions < 2, or when
+// Sequential implementation — the original single-threaded code path that
+// predates the parallel build. Used as the fallback when
+// MDB_PROJECTION_PARALLEL_SNAPSHOT=0, when partitions < 2, or when
 // HAS_TBB is not defined.
 void build_sequential(const std::filesystem::path& projection_dir,
                       TopologySnapshotWriter::Direction dir,
@@ -451,7 +452,7 @@ void build_sequential(const std::filesystem::path& projection_dir,
 }
 
 #ifdef HAS_TBB
-// Spec #19 parallel implementation.
+// Parallel (multi-worker) implementation.
 //
 // Strategy: assign each worker a disjoint half-open src range
 // [lo_src, hi_src) covering the dense node id space. Workers walk the
@@ -472,15 +473,15 @@ void build_sequential(const std::filesystem::path& projection_dir,
 // COL_IDX / EDGE_IDS region. pwrite is thread-safe and the regions don't
 // overlap, so byte-for-byte output equals the sequential path.
 //
-// QueryContext note: unlike Specs #15/#16 (which dispatched B+Tree
-// iterators that decode leaf pages and consult the thread_local
-// QueryContext::_query_ctx pointer), this builder reads raw mmap'd
-// bytes directly via std::memcpy. No BPT leaf decode happens on the
-// worker thread, so the QueryContext propagation pattern is not
+// QueryContext note: unlike the other parallel projection-build stages
+// (which dispatched B+Tree iterators that decode leaf pages and consult
+// the thread_local QueryContext::_query_ctx pointer), this builder reads
+// raw mmap'd bytes directly via std::memcpy. No BPT leaf decode happens
+// on the worker thread, so the QueryContext propagation pattern is not
 // required here. The post-hoc BPT-iterator path in
 // native_projection_builder.cc:build_one_topology_snapshot_ — used as
 // a fallback when the integrated emission failed — remains sequential
-// for that reason; parallelizing it would need the Spec #15/#16
+// for that reason; parallelizing it would need those other stages'
 // `parent_ctx` capture pattern.
 void build_parallel(const std::filesystem::path& projection_dir,
                     TopologySnapshotWriter::Direction dir,
@@ -662,8 +663,9 @@ void build_topology_snapshot_from_leaf(
 
     MappedFile mm = MappedFile::open_readonly(leaf_path);
 
-    // Spec #19 dispatch — opt-in via MDB_PROJECTION_PARALLEL_SNAPSHOT
-    // (default true). Falls back to the sequential path when:
+    // Parallel-vs-sequential snapshot-build dispatch — opt-in via
+    // MDB_PROJECTION_PARALLEL_SNAPSHOT (default true). Falls back to the
+    // sequential path when:
     //   - the env var is set to 0/false/off
     //   - HAS_TBB is not defined at compile time
     //   - num_partitions < 2

@@ -67,8 +67,11 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BPTLeafV2Writer — bulk-load sibling of BPTLeafWriter for Spec #5 v2
-// (delta + LEB128 varint) leaf pages.
+// BPTLeafV2Writer — bulk-load sibling of BPTLeafWriter for the delta +
+// LEB128-varint (v2) leaf encoding. v2 pages replace the v1 redundant-byte
+// bitset format with a compact representation: record 0 is stored as N full
+// LEB128 varints; records 1..k-1 are stored as N zigzag-delta LEB128
+// varints that exploit the sorted-record invariant to shrink high-bit values.
 //
 // Unlike BPTLeafWriter — which the caller drives page-at-a-time with a
 // pre-packed byte buffer + redundant-byte bitset — BPTLeafV2Writer exposes
@@ -240,7 +243,11 @@ private:
 
 // ---------------------------------------------------------------------------
 // BPTLeafCSRWriter — bulk-load sibling of BPTLeafWriter (v1 bitset) and
-// BPTLeafV2Writer (v2 delta+varint). Emits Spec #8 CSR_HYBRID leaf pages.
+// BPTLeafV2Writer (v2 delta+varint). Emits CSR-hybrid (v3) leaf pages in
+// which the edge-index B+Tree leaves ARE the CSR layout: each page stores
+// sorted (src, dst) adjacency data directly in a compressed CSR encoding
+// so GNN samplers can perform O(1) neighbor slice reads rather than
+// O(log N) B+Tree directory walks.
 //
 // Consumption contract: the caller streams sorted (src, dst, edge_id) tuples
 // one at a time via append(Record<N>). Records MUST arrive in non-decreasing
@@ -269,12 +276,15 @@ private:
 // portion spilled onto continuations). The chain-head's value_count remains
 // 1 (just the hub src entry on that page).
 //
-// Edge-id encoding: not emitted in this writer (flags bit 1 always 0). The
-// T8.4 reader's tuple-iteration path returns edge_id=0 for v3 pages — the
-// parallel-stream edge-id encoding described in design §3.4 is future work
-// tracked by T8.6+. This keeps the writer focused on the structural novelty
-// (CSR layout + hub chaining) without blocking on a codec the reader does
-// not yet consume.
+// Edge-id encoding: not emitted in this writer by default (flags bit 1
+// always 0 when emit_edge_ids is false). When the reader encounters a v3
+// page without the kHasEdgeIds flag, it returns edge_id=0 for every tuple.
+// The parallel-stream edge-id encoding (persisting a second zigzag-varint
+// stream alongside dsts) is opt-in via the emit_edge_ids constructor
+// argument; see the emit_edge_ids_ member comment for details. This keeps
+// the basic writer focused on the structural novelty (CSR layout + hub
+// chaining) without requiring callers that only need neighbor access to
+// also carry edge_ids.
 //
 // next_leaf chain: continuation pages chain via next_leaf just like regular
 // leaf pages. When a chain-head's hub run finishes, its LAST continuation's
@@ -286,15 +296,17 @@ class BPTLeafCSRWriter {
 public:
     static_assert(N >= 2, "BPTLeafCSRWriter requires Record<N>.src + dst at minimum");
 
-    // Spec #8-B task #1: `emit_edge_ids` controls whether the v3 leaf page
-    // writes a parallel edge_id varint stream alongside the dst stream. When
-    // true and N == 3, each entry body layout becomes:
+    // `emit_edge_ids` controls whether the v3 leaf page writes a parallel
+    // edge_id varint stream alongside the dst stream. When true and N == 3,
+    // each entry body layout becomes:
     //     varint(src_id) | varint(degree) | dst_varint_chain | eid_varint_chain
     // (dst_varint_chain and eid_varint_chain each hold `degree` varints in
     // the same DELTA-zigzag format used for dsts); the header flag
-    // `kHasEdgeIds` is set per page. When false (default) the writer
-    // preserves the pre-Spec-#8-B behavior — dst stream only, eid=0 at
-    // read time — which keeps every legacy projection byte-identical.
+    // `kHasEdgeIds` is set per page. Persisting edge_ids in the v3 pages
+    // allows count(e) queries over CSR-hybrid projections to match the B+Tree
+    // result instead of returning zero. When false (default) the writer
+    // preserves the dst-stream-only layout — eid=0 at read time — which
+    // keeps every legacy projection byte-identical.
     explicit BPTLeafCSRWriter(const std::string& filename,
                               bool emit_edge_ids = false)
         : file_(filename, std::ios::out | std::ios::in | std::ios::binary | std::ios::trunc)
@@ -474,7 +486,9 @@ private:
                 // Caller contract: dsts non-decreasing OR at least signed
                 // delta encodable via zigzag. Use unsigned subtraction to
                 // obtain the two's-complement int64 delta, matching the
-                // T8.4 reader's cache resume formula.
+                // reader's sequential cursor-cache resume formula (the reader
+                // accumulates deltas from the first dst of each page via the
+                // same zigzag-varint scheme).
                 const uint64_t delta_u = cur - prev;
                 const int64_t  delta_i = static_cast<int64_t>(delta_u);
                 total += BPT::varint_size(BPT::zigzag_encode_i64(delta_i));
@@ -556,12 +570,13 @@ private:
     }
 
     // Patch the last-emitted continuation's next_leaf to point at the page
-    // about to be written (T8-B.1 Bug-C fix). emit_hub_continuation_ writes
-    // the tail continuation with next_leaf=0 because it doesn't yet know
-    // whether a subsequent src will open a new chain-head page. This
-    // helper, called immediately before every new page write that follows
-    // a hub chain, resolves the forward pointer so the leaf chain stays
-    // walkable across the hub.
+    // about to be written. emit_hub_continuation_ writes the tail
+    // continuation with next_leaf=0 because it does not yet know whether a
+    // subsequent src will open a new chain-head page. This helper, called
+    // immediately before every new page write that follows a hub chain,
+    // resolves the forward pointer by seeking back to the continuation's
+    // next_leaf field (bytes 8..11) and overwriting it with the target page
+    // number, so the leaf chain stays walkable across hub boundaries.
     void patch_pending_continuation_next_leaf_(uint32_t target_page_num) noexcept
     {
         if (pending_cont_patch_page_ == UINT32_MAX) return;
@@ -655,13 +670,13 @@ private:
     // `prev_dst_carry` is the dst value at the end of the previous chunk
     // (so the first dst in this chunk encodes as zigzag-delta against it).
     //
-    // Spec #8-B task #1 (hub completion): when `eids_slice` is non-null,
-    // `eids_count` parallel eid varints are appended after the dst stream
-    // using the same zigzag-delta encoding (first eid as a full varint
-    // against `prev_eid_carry` semantics, but matching the v3 chain-head
-    // convention `zigzag(eids[0] - prev_eid_carry)` so cross-chunk decoding
-    // is uniform). The writer sets the kHasEdgeIds flag on the page when
-    // eids are present.
+    // When `eids_slice` is non-null and `eids_count` equals `dsts_count`,
+    // a parallel edge_id varint stream is appended after the dst stream.
+    // Each eid is encoded as zigzag-delta against the previous eid, with
+    // `prev_eid_carry` as the seed value so cross-chunk decoding is uniform
+    // with the chain-head convention. The writer sets the kHasEdgeIds flag
+    // on the page when eids are present, enabling count(e) correctness over
+    // hub-bearing CSR-hybrid projections.
     void emit_hub_continuation_(const uint64_t* dsts_slice,
                                 std::size_t     dsts_count,
                                 uint32_t        next_leaf,
@@ -714,8 +729,9 @@ private:
             prev = cur;
         }
 
-        // Spec #8-B: parallel eid stream, encoded analogously against
-        // prev_eid_carry. Counts match dsts_count so the reader can pair
+        // Parallel edge_id stream for CSR-hybrid pages that carry edge_ids:
+        // encoded analogously to the dst stream (zigzag-delta against
+        // prev_eid_carry). Counts match dsts_count so the reader can pair
         // them 1:1 in cont_dsts_ / cont_eids_.
         if (has_eids) {
             uint64_t prev_eid = prev_eid_carry;
@@ -744,16 +760,15 @@ private:
     // pages. Patches the chain-head's next_leaf AFTER chain emission so the
     // header reflects the true forward pointer.
     //
-    // Spec #8-B task #1 (hub completion): under emit_edge_ids_, the hub
-    // chain ALSO persists parallel edge_ids alongside dsts. The chain-head
+    // When emit_edge_ids_ is true, the hub chain ALSO persists parallel
+    // edge_ids alongside dsts so that count(e) queries over CSR-hybrid
+    // projections return the correct count instead of zero. The chain-head
     // carries an extra `k_on_head` varint after `(src_id, total_degree)` so
-    // the reader can recover where the dst stream ends and the eid stream
-    // begins; that varint is signalled by setting kIsHubChainHead in the
-    // page flags. Each continuation page also carries `chunk_count` eid
-    // varints after its dst chunk, with the running eid cursor crossing
-    // chunk boundaries the same way prev_dst_carry does. This converts
-    // count(e) over hub-bearing CSR_HYBRID projections from "under-counted"
-    // to "matches BTREE".
+    // the reader can determine where the dst stream ends and the eid stream
+    // begins on that page; that varint is signalled by setting
+    // kIsHubChainHead in the page flags. Each continuation page also carries
+    // `chunk_count` eid varints after its dst chunk, with the running eid
+    // cursor crossing chunk boundaries the same way prev_dst_carry does.
     void emit_hub_chain_(uint64_t src_id,
                          const std::vector<uint64_t>& dsts,
                          const std::vector<uint64_t>& eids) noexcept
@@ -779,11 +794,10 @@ private:
                                    /*min_src_or_head=*/min_src_low);
         }
 
-        // Spec #8-B contract: when emit_edge_ids_ is on, eids must be a
-        // length-matched parallel stream to dsts. Defensive only — the
-        // append() entry point enforces this invariant; if the caller
-        // somehow passes a mismatched eids vector we fall back to the
-        // pre-Spec-#8-B "dsts-only" path on this hub.
+        // When emit_edge_ids_ is on, eids must be a length-matched parallel
+        // stream to dsts. Defensive only — the append() entry point enforces
+        // this invariant; if the caller somehow passes a mismatched eids
+        // vector we fall back to the dst-stream-only path for this hub.
         const bool hub_emit_eids =
             emit_edge_ids_ && (eids.size() == dsts.size());
 
@@ -872,11 +886,12 @@ private:
         const uint32_t chain_head_page_num = pages_written_;
 
         // Pack the chain-head body: just one entry.
-        // Spec #8-B layout when hub_emit_eids:
+        // Chain-head body layout when hub_emit_eids is true (parallel edge_id
+        // stream persisted for count(e) correctness):
         //     varint(src_id) | varint(total_degree) | varint(k_on_head)
         //   | dst[0] full varint | dst[1..k-1] zigzag-deltas
         //   | eid[0] full varint | eid[1..k-1] zigzag-deltas
-        // Pre-Spec-#8-B layout when !hub_emit_eids:
+        // Chain-head body layout when hub_emit_eids is false (dst stream only):
         //     varint(src_id) | varint(total_degree)
         //   | dst[0] full varint | dst[1..k-1] zigzag-deltas
         std::vector<uint8_t> body;
@@ -945,9 +960,10 @@ private:
         // We need to decide, for each continuation, how many dsts fit in
         // one page (4080 byte payload budget). Greedy fill: starting from
         // the running cursor (previous dst), pack dsts via zigzag-varint
-        // until the next varint would exceed budget. Spec #8-B: when
-        // hub_emit_eids is true, each dst slot also costs an eid varint at
-        // the same K position, so the budget walk must account for both.
+        // until the next varint would exceed budget. When hub_emit_eids is
+        // true (parallel edge_ids are being persisted alongside dsts), each
+        // dst slot also costs an eid varint at the same K position, so the
+        // budget walk must account for both streams together.
         const std::size_t continuation_budget = Page::SIZE - 16;
         uint64_t prev_dst_carry = (k_on_head > 0) ? dsts[k_on_head - 1] : 0;
         uint64_t prev_eid_carry = (hub_emit_eids && k_on_head > 0)
@@ -968,9 +984,10 @@ private:
         // continuation chains terminate at chain end per design).
         //
         // Page-slicing walk: for each chunk, compute how many dsts fit.
-        // Spec #8-B: each chunk also carries an eid carry-in / carry-out
-        // so emit_hub_continuation_ knows how to delta-encode eid[0] of
-        // the chunk against the previous chunk's last eid.
+        // When edge_ids are being persisted, each chunk also carries an eid
+        // carry-in / carry-out so emit_hub_continuation_ knows how to
+        // delta-encode eid[0] of the chunk against the previous chunk's
+        // last eid.
         struct ChunkSlice {
             std::size_t start;
             std::size_t count;
@@ -1027,7 +1044,8 @@ private:
         // Emit continuations. The LAST continuation is emitted with
         // next_leaf=0 initially; if a subsequent chain-head page follows
         // (another src), patch_pending_continuation_next_leaf_ will rewrite
-        // it at the next page-write callsite (T8-B.1 Bug-C fix). If no src
+        // it at the next page-write callsite to point at the new chain-head,
+        // keeping the leaf chain walkable across hub boundaries. If no src
         // follows, the 0 correctly marks end-of-chain.
         const uint32_t first_continuation_page_num = pages_written_;
         uint32_t last_continuation_page_num = UINT32_MAX;
@@ -1177,16 +1195,21 @@ private:
     // and N >= 3. Always has the same length as staging_dsts_.
     std::vector<uint64_t> staging_eids_;
 
-    // Bug-C patch state (T8-B.1). When emit_hub_chain_ writes a continuation
-    // chain whose last page has next_leaf=0, we record its page number here;
-    // the next new-page write callsite patches its next_leaf to the new page
-    // before proceeding. UINT32_MAX == no pending patch.
+    // Deferred forward-pointer patch state. When emit_hub_chain_ writes a
+    // continuation chain whose last page has next_leaf=0 (because the
+    // next chain-head page number is not yet known), we record the
+    // continuation's page number here. The next new-page write callsite
+    // calls patch_pending_continuation_next_leaf_ to seek back and rewrite
+    // bytes 8..11 with the correct target page before appending the new page.
+    // UINT32_MAX == no pending patch.
     uint32_t pending_cont_patch_page_;
 
-    // Spec #8-B task #1: whether the page-level flag kHasEdgeIds must be
-    // set and a parallel eid varint chain must be appended after every dst
-    // varint chain. Set once at construction from the ctor argument and
-    // never mutated. Implies N >= 3 (guarded in the ctor initializer).
+    // Whether the page-level flag kHasEdgeIds must be set and a parallel
+    // eid varint chain must be appended after every dst varint chain.
+    // Enabling this persists edge_ids in v3 CSR-hybrid pages so that
+    // count(e) queries return the correct count rather than zero.
+    // Set once at construction from the ctor argument and never mutated.
+    // Implies N >= 3 (guarded in the ctor initializer).
     bool emit_edge_ids_;
 };
 

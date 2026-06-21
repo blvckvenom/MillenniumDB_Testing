@@ -3,8 +3,8 @@
 // TopologySnapshot — mmap-backed CSR sidecar for projection sampling.
 //
 // This header defines only the on-disk file format (the 64-byte fixed
-// header) and the serialize/parse primitives that the writer (T4.4) and
-// reader (T4.5) will share. No file I/O, no mmap, no SHA-256 state lives
+// header) and the serialize/parse primitives that the sidecar writer and
+// reader will share. No file I/O, no mmap, no SHA-256 state lives
 // here — those layers build on top of this format contract.
 //
 // Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
@@ -16,7 +16,11 @@
 //   ────────────────────────────────────────────────────────────────────
 //   0       8     magic              "TOPOCSR1" (8 ASCII bytes, no NUL)
 //   8       4     version            uint32 = 1
-//   12      1     id_width           uint8 = 8 (full ObjectId) or 4 (Spec #6, tag-stripped)
+//   12      1     id_width           uint8 = 8 (full 64-bit ObjectId) or 4 (narrow uint32:
+//                                    the 8-bit ObjectId type tag is stripped before writing
+//                                    and re-OR'd from the header's dst_type_tag/edge_type_tag
+//                                    on read; lossless when all values fit in 32 bits after
+//                                    masking and every entry in a section shares one type tag)
 //   13      1     flags              bit 0 = has_edge_ids; rest reserved=0
 //   14      1     dst_type_tag       uint8 — ObjectId type tag re-applied to COL_IDX
 //                                    values when id_width==4; 0 when id_width==8.
@@ -52,10 +56,12 @@ inline constexpr std::array<uint8_t, 8> kTopologySnapshotMagic = {
 inline constexpr uint32_t kTopologySnapshotVersion = 1;
 
 /// Default ObjectId width in bytes (full tagged ObjectId.id). Writers emit
-/// this unless the narrow uint32 variant is eligible (Spec #6).
+/// this unless the narrow uint32 variant is eligible (i.e., all node/edge ids
+/// in the section fit in 32 bits after stripping the 8-bit type tag, allowing
+/// the sidecar to store uint32 values instead of uint64, halving its size).
 inline constexpr uint8_t kTopologySnapshotIdWidth = 8;
 
-/// Narrow ObjectId width (Spec #6): COL_IDX / EDGE_IDS stored as uint32 of the
+/// Narrow ObjectId width: COL_IDX / EDGE_IDS stored as uint32 of the
 /// tag-stripped value (id & 0x00FFFFFFFFFFFFFF), with the constant per-section
 /// type tag carried in the header (dst_type_tag / edge_type_tag) and re-OR'd
 /// onto each value on read. Lossless iff every value < 2^32 after masking and
@@ -101,10 +107,10 @@ inline constexpr std::size_t kTopologySnapshotHeaderSize = 64;
 struct TopologySnapshotHeader {
     uint8_t  magic[8];            // "TOPOCSR1"
     uint32_t version;             // kTopologySnapshotVersion
-    uint8_t  id_width;            // 8 (full) or 4 (Spec #6 tag-stripped uint32)
+    uint8_t  id_width;            // 8 (full 64-bit ObjectId) or 4 (tag-stripped uint32)
     uint8_t  flags;               // TopologySnapshotFlags::*
-    uint8_t  dst_type_tag;        // Spec #6: tag re-applied to COL_IDX when id_width==4; else 0
-    uint8_t  edge_type_tag;       // Spec #6: tag re-applied to EDGE_IDS when id_width==4; else 0
+    uint8_t  dst_type_tag;        // ObjectId type tag re-applied to COL_IDX when id_width==4; else 0
+    uint8_t  edge_type_tag;       // ObjectId type tag re-applied to EDGE_IDS when id_width==4; else 0
     uint64_t num_nodes;           // N (number of source nodes)
     uint64_t num_edges;           // M (number of edges)
     uint8_t  source_sha256[32];   // SHA-256 of source .leaf file

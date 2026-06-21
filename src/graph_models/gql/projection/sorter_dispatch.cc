@@ -47,17 +47,20 @@ void init_cached_backend() {
 }
 
 /**
- * @brief Spec #8 T8.9 — CLASSIC-backend CSR_HYBRID write helper.
+ * @brief CLASSIC-backend write helper for CSR-hybrid graph storage on edge indexes.
  *
  * Invoked only when the caller requests CSR_HYBRID on an edge-index
- * (Record<3>). Drains the populated `sorter` in key order and streams each
+ * (Record<3>). In CSR-hybrid storage the B+Tree leaf pages themselves carry
+ * the CSR layout: each leaf groups all out-neighbors of a source node into a
+ * v3 chain-head page plus optional continuation pages, rather than storing
+ * individual (src, dst, edge_id) tuples in the standard BITSET/DELTA_VARINT
+ * format. Drains the populated `sorter` in key order and streams each
  * record through `BPTLeafCSRWriter<N>`, which groups by record[0] (src) and
- * emits v3 chain-head + optional continuation pages. A trivial (key_count=0)
+ * emits those v3 chain-head + continuation pages. A trivial (key_count=0)
  * root directory page is written alongside — lookups route unconditionally
  * to leaf 0 and walk the `next_leaf` chain to locate the target src. This
- * MVP dir layout is correctness-first; dir-keyed routing that narrows to
- * the specific chain-head page is a future optimization covered by the
- * T8.12 Gate D benchmark.
+ * layout is correctness-first; dir-keyed routing that narrows to the
+ * specific chain-head page is a future optimization.
  *
  * The writer's `append()` contract requires records sorted by record[0]
  * (src) — this matches the sorter's output. A return value of `unique_count`
@@ -72,13 +75,13 @@ std::size_t build_index_csr_from_sorter_(
     ExternalRecordSort<N>& sorter,
     const std::string&     index_base_path)
 {
-    // Spec #8-B task #1: turn on the parallel edge_id stream for N == 3
-    // edge indexes (FROM_TO_EDGE / TO_FROM_EDGE). For N < 3 there is no
-    // third field to emit, so the flag collapses to false inside the
-    // writer. Setting this unconditionally for edge indexes closes the
-    // ADR 008 Known-limitation #1 caveat — the count(e) query and other
-    // edge_id-dependent MATCH patterns now return BTREE-equivalent
-    // cardinality under graphStorage: CSR_HYBRID.
+    // Enable the parallel edge_id stream for N == 3 edge indexes
+    // (FROM_TO_EDGE / TO_FROM_EDGE). For N < 3 there is no third field to
+    // emit, so the flag collapses to false inside the writer. Storing
+    // edge_ids alongside the dst stream in the v3 CSR leaf ensures that
+    // count(e) queries and other edge_id-dependent MATCH patterns return
+    // the same cardinality under graphStorage: CSR_HYBRID as they do under
+    // the standard BTREE layout.
     constexpr bool emit_edge_ids = (N >= 3);
     BPTLeafCSRWriter<N> leaf_writer(index_base_path + ".leaf",
                                      emit_edge_ids);
@@ -86,8 +89,8 @@ std::size_t build_index_csr_from_sorter_(
     // With the CSR leaf chain walked via next_leaf from page 0, any
     // search_leaf(min) lands at leaf 0 and the forward chain covers the
     // rest — preserving correctness at the cost of an O(num_pages) scan
-    // per range lookup. Proper src-keyed dir entries are the subject of
-    // the Gate D performance sweep (T8.12).
+    // per range lookup. Proper src-keyed dir entries that narrow the search
+    // to the specific chain-head page are a future performance optimization.
     BPTDirWriter<N>  dir_writer(index_base_path + ".dir");
 
     if (sorter.total_records() == 0) {
@@ -120,8 +123,7 @@ std::size_t build_index_csr_from_sorter_(
  *
  * Mirrors the existing `build_index_with_streaming_sort` helper in
  * `projection_storage.cc`. Kept here so the dispatch facade can own the
- * full sort → build → trim lifecycle once callers migrate to it (wiring
- * happens in a later task; Task 1 only introduces the facade).
+ * full sort → build → trim lifecycle once callers migrate to it.
  */
 template<std::size_t N>
 std::size_t run_classic(
@@ -190,13 +192,14 @@ std::size_t sort_and_build_index(
     BPT::LeafFormat              leaf_format,
     BPT::GraphStorage            graph_storage
 ) {
-    // Spec #8 T8.9 — CSR_HYBRID gates only on Record<3> edge indexes. The
+    // CSR-hybrid graph storage applies only to Record<3> edge indexes. The
     // caller is responsible for passing CSR_HYBRID exclusively for the
-    // FROM_TO_EDGE / TO_FROM_EDGE builds (design §3.6 D6 scopes the hybrid
-    // format to those two topology indexes). Non-edge widths must keep
-    // BTREE; this constexpr check enforces the scope at compile time so a
-    // slip through to BPTLeafCSRWriter<1> (which would be instantiation-
-    // failing anyway) never silently drops to an incorrect write path.
+    // FROM_TO_EDGE / TO_FROM_EDGE builds — those are the only two topology
+    // indexes that hold (src, dst, edge_id) triples and benefit from the
+    // CSR leaf layout. Non-edge widths must keep BTREE; this constexpr
+    // check enforces the scope at compile time so a slip through to
+    // BPTLeafCSRWriter<1> (which would be instantiation-failing anyway)
+    // never silently drops to an incorrect write path.
     const bool csr_edge =
         (graph_storage == BPT::GraphStorage::CSR_HYBRID) && (N == 3);
 
@@ -208,8 +211,8 @@ std::size_t sort_and_build_index(
             // ProjectionStorage instance and reads `requested_leaf_format`
             // from there when it calls build_index_streaming. We accept the
             // parameter for signature symmetry and to satisfy the unit-
-            // level API contract (T5.11b unit tests pass BITSET explicitly
-            // to pin default behavior).
+            // level API contract (unit tests pass BITSET explicitly to pin
+            // default behavior).
             (void)leaf_format;
 
             if (csr_edge) {
@@ -246,7 +249,7 @@ std::size_t sort_and_build_index(
                 input_stream, index_base_path, build_from_sorter, sort_temp_dir);
         }
         case SorterBackend::RADIX: {
-            // RADIX backend pipeline (Tasks 5-11, Spec #5 T5.11b):
+            // RADIX backend pipeline for building B+Tree indexes:
             //   Phase 1: scan + partition by top-bits of record[0]
             //   Phase 2: parallel per-partition sort (in-memory or external fallback)
             //   Phase 3: concatenate sorted partitions into BPT{V1,V2}LeafWriter
@@ -256,19 +259,20 @@ std::size_t sort_and_build_index(
             // directly (mirroring the page-level process_block pattern used by
             // ProjectionStorage::build_index_streaming). Under BITSET, the
             // resulting .leaf / .dir files are bit-identical to the CLASSIC
-            // backend's output on the same input (validated by Task 13's
-            // golden-compare script). Under DELTA_VARINT, the .leaf file starts
-            // with the v2 header (byte 0 = 0x02).
+            // backend's output on the same input (validated by a golden-compare
+            // script). Under DELTA_VARINT (delta + LEB128-varint leaf encoding),
+            // the .leaf file starts with the v2 header (byte 0 = 0x02).
             (void)build_from_sorter;
 
             typename RadixPartitionSort<N>::Config cfg;
             cfg.scratch_dir =
                 (std::filesystem::path(sort_temp_dir) / ".radix_scratch").string();
             cfg.leaf_format = leaf_format;
-            // Spec #8 T8.9 — propagate the edge-index CSR gate so the
-            // RADIX backend's Phase 3 writer (write_btree_from_sorted_
-            // partitions_csr_) replaces the BITSET/DELTA_VARINT writers
-            // when the caller asks for CSR_HYBRID on an edge index.
+            // Propagate the edge-index CSR gate so the RADIX backend's
+            // Phase 3 writer (write_btree_from_sorted_partitions_csr_)
+            // replaces the BITSET/DELTA_VARINT writers when the caller
+            // requests CSR-hybrid storage on an edge index (i.e., the
+            // B+Tree leaf pages will carry the CSR layout directly).
             cfg.graph_storage = csr_edge
                 ? BPT::GraphStorage::CSR_HYBRID
                 : BPT::GraphStorage::BTREE;

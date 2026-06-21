@@ -11,7 +11,7 @@ namespace GQL {
 /**
  * @brief Write-once / read-many bit vector keyed by edge_id.
  *
- * Used by the serialized scan pipeline (Spec #2) as the output of Phase B
+ * Used by the serialized scan pipeline as the output of Phase B
  * (edge filter pre-computation). After `finalize()`, the bitmap is
  * immutable; `set_kept()` throws std::logic_error. Phase C's 9 edge-index
  * passes consume the bitmap via `is_kept()` without mutating it.

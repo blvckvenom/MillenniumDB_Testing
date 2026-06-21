@@ -47,9 +47,9 @@ public:
         /// Bulk read up to `max_records` records into `out`.
         /// @return number of records actually read (0 on EOF).
         /// @throws std::runtime_error on a read failure that is not EOF.
-        /// Used by the Phase 3 producer-consumer pipeline (Spec #25 fix #4)
-        /// to amortize per-record fread overhead and feed the bounded
-        /// queue between disk and the B+Tree writer.
+        /// Used by the Phase 3 producer-consumer pipeline that reads sorted
+        /// partition files and feeds the B+Tree leaf writer through a bounded
+        /// queue; bulk reads amortize per-record fread overhead.
         std::size_t read_batch(Record<N>* out, std::size_t max_records);
 
         bool eof() const { return eof_; }

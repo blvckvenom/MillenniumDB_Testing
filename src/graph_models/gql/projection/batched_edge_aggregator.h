@@ -1,6 +1,6 @@
 // src/graph_models/gql/projection/batched_edge_aggregator.h
 //
-// Spec #26 — batch-shaped edge aggregator (CPU + future GPU).
+// Batch-shaped edge aggregator (CPU + future GPU).
 //
 // The legacy `StreamingEdgeAggregator` (streaming_aggregator.h) consumes one
 // record at a time via an inner-loop callback, threading per-group state
@@ -24,14 +24,14 @@
 //      `MDB_PROJECTION_AGGREGATION_GPU` (default off) and the runtime
 //      `mdb::gpu::detect_resources()` probe, mirroring the resolution order
 //      of `EdgeKeepBitmapGpuBatcher::gpu_path_available()`.
-//   4. The GPU path is currently a CPU-equivalent stub — Phase 1 of the
-//      Spec #26 work establishes the data-flow contract; Spec #26 v2 will
-//      replace the stub body with a `cub::DeviceRadixSort` (in case the
+//   4. The GPU path is currently a CPU-equivalent stub — this first stage
+//      establishes the data-flow contract; a later GPU-acceleration stage
+//      will replace the stub body with a `cub::DeviceRadixSort` (in case the
 //      caller-supplied span is not strictly sorted by the 3-field key) +
 //      `cub::DeviceReduce::ReduceByKey` pair. The stub returns
 //      bit-identical output to the CPU path so call-sites can wire the
-//      GPU dispatch today and pick up acceleration when v2 lands without
-//      any consumer changes.
+//      GPU dispatch today and pick up acceleration when that later stage
+//      lands without any consumer changes.
 //
 // The class supports the same five aggregation strategies as the streaming
 // path (SINGLE/MIN/MAX/SUM/COUNT). SINGLE preserves the existing
@@ -48,8 +48,11 @@
 //   stays on the streaming path because the records arrive lazily through a
 //   k-way merge and never form a contiguous span. That asymmetry is fine:
 //   the in-memory branch is the one that hits multi-billion-record graphs
-//   with VRAM-resident data (papers100M scale post-Spec #13 four-level
-//   topology store), which is exactly the wave 2 acceleration target.
+//   with VRAM-resident data (papers100M scale when using the Four-Level
+//   Topology Store, which keeps hot hubs in L1 RAM hash / L2 compact uint32
+//   CSR / L3 mmap sidecar / L4 direct B+Tree and returns neighbor slices
+//   in O(1) for the frequently-accessed nodes), which is exactly the
+//   wave 2 acceleration target.
 
 #pragma once
 
@@ -140,9 +143,9 @@ public:
      *   1. MDB_GPU_ENABLED build flag — undefined => false.
      *   2. MDB_PROJECTION_AGGREGATION_GPU env var — "1" enables, anything
      *      else (including unset, "0", empty) disables. Mirrors
-     *      MDB_PROJECTION_BITMAP_GPU's polarity but defaults OFF — Spec
-     *      #26's GPU body is a stub today, so the AUTO default stays on
-     *      CPU until v2 lands.
+     *      MDB_PROJECTION_BITMAP_GPU's polarity but defaults OFF — the
+     *      GPU aggregation body is a stub today, so the AUTO default stays
+     *      on CPU until the real GPU reduce-by-key path lands.
      *   3. Runtime CUDA device probe (`mdb::gpu::detect_resources()`).
      *
      * Result is cached on first call.

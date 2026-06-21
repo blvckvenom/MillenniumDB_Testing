@@ -40,8 +40,9 @@ std::unique_ptr<BPTLeafBase<N>> BPlusTree<N>::open_leaf_page(Page& page,
             // DELTA_VARINT is only supported for the record widths that have
             // BPTLeafV2<N> explicit template instantiations (N = 1, 2, 3).
             // BPlusTree<4> — the quad-model edge table — never carries
-            // DELTA_VARINT in Spec #5 and hitting this branch for N=4 would
-            // be a catalog bit-flip; fail loudly instead of link-failing.
+            // DELTA_VARINT (the delta + LEB128-varint leaf encoding) and
+            // hitting this branch for N=4 would be a catalog bit-flip;
+            // fail loudly instead of link-failing.
             if constexpr (N >= 1 && N <= 3) {
                 // Defense-in-depth: catalog says DELTA_VARINT so the page
                 // must carry format_version=2 in byte 0. Anything else
@@ -64,12 +65,14 @@ std::unique_ptr<BPTLeafBase<N>> BPlusTree<N>::open_leaf_page(Page& page,
         }
 
         case BPT::LeafFormat::CSR_HYBRID: {
-            // CSR_HYBRID (Spec #8) is an edge-index-only encoding
-            // instantiated for N in {2, 3}. Per design §3.6 D6 the hybrid
-            // format is selected only for FROM_TO_EDGE / TO_FROM_EDGE
-            // topology indexes; BPlusTree<1> / BPlusTree<4> never carries
-            // it, so hitting this branch outside [2..3] is a catalog
-            // bit-flip and we fail loudly rather than link-failing.
+            // CSR_HYBRID is the encoding where the edge-index B+Tree leaves
+            // ARE the CSR layout (src adjacency list packed directly into
+            // the leaf page, with an offset table + delta-varint dst stream).
+            // It is instantiated only for N in {2, 3} because it applies
+            // only to FROM_TO_EDGE / TO_FROM_EDGE topology indexes;
+            // BPlusTree<1> / BPlusTree<4> never carry it, so hitting this
+            // branch outside [2..3] is a catalog bit-flip and we fail
+            // loudly rather than link-failing.
             if constexpr (N >= 2 && N <= 3) {
                 const auto* bytes = reinterpret_cast<const uint8_t*>(page.get_bytes());
                 // Cross-check 1: catalog says CSR_HYBRID so byte 0 must be 3.
@@ -223,10 +226,11 @@ double BPlusTree<N>::estimate_records(const BPlusTreeDir<N>& root,
 // every `update_to_next_leaf` transition when leaf_format_ == DELTA_VARINT.
 // The V1 instance's `get_page()` accessor is public and non-mutating; we
 // view the same buffer under BPTLeafV2<N>'s ReadTag decoder so the
-// on-disk bytes are interpreted per Spec #5 §5.2 (16-byte header +
-// zigzag-delta varint payload). The V2 reader owns nothing about the
-// page pin — it holds a raw `const char*` into the pinned page bytes,
-// valid only as long as `current_leaf_` stays alive.
+// on-disk bytes are interpreted as the delta + LEB128-varint leaf format
+// (16-byte header + record 0 as full varints + records 1..k-1 as
+// zigzag-delta varints). The V2 reader owns nothing about the page pin —
+// it holds a raw `const char*` into the pinned page bytes, valid only as
+// long as `current_leaf_` stays alive.
 template <std::size_t N>
 static std::unique_ptr<BPTLeafBase<N>> open_v2_reader_over_pinned_page_(
     BPTLeafBase<N>* current_leaf_v1)
@@ -253,11 +257,13 @@ static std::unique_ptr<BPTLeafBase<N>> open_v2_reader_over_pinned_page_(
 // Rebuild `v3_reader_` over the page currently pinned by `current_leaf_`
 // (a BPTLeafV1<N> held only for its Page* pin). Used at ctor time and on
 // every cross-page transition when leaf_format_ == CSR_HYBRID. The V3
-// reader validates the 16-byte v3 header at construction per Spec #8
-// §5.5; any failure here raises BPTLeafCSRDecodeException (propagated
-// to the caller). The v3 reader owns nothing about the page pin — it
-// holds a raw `const char*` into the pinned page bytes, valid only as
-// long as `current_leaf_` stays alive.
+// reader validates the 16-byte v3 header at construction (checking the
+// CSR_HYBRID magic, format version byte = 3, and that the page is a
+// chain-head, not a continuation); any failure raises
+// BPTLeafCSRDecodeException (propagated to the caller). The v3 reader
+// owns nothing about the page pin — it holds a raw `const char*` into
+// the pinned page bytes, valid only as long as `current_leaf_` stays
+// alive.
 template <std::size_t N>
 static std::unique_ptr<BPTLeafBase<N>> open_v3_reader_over_pinned_page_(
     BPTLeafBase<N>* current_leaf_v1)
@@ -324,7 +330,8 @@ BptIter<N>::BptIter(bool* interruption_requested,
         // Re-interpret the pinned page under a v3 decoder. The V1 held
         // in `current_leaf_` stays alive purely as a pin; all reads
         // dispatch to v3_reader_ below. Construction validates the v3
-        // header per Spec #8 §5.5 and rejects continuation pages
+        // header (16-byte CSR-hybrid header: magic, format_version=3,
+        // flags, next_leaf, value_count) and rejects continuation pages
         // (flags bit 0 set) — a directory that routed us to a
         // continuation page is a catalog inconsistency, surfaced here
         // via BPTLeafCSRDecodeException.
@@ -412,7 +419,7 @@ const Record<N>* BptIter<N>::next() {
         else if (reader->has_next()) {
             // Cross-page transition. For BITSET (V1) we reuse the existing
             // in-place update_to_next_leaf() pathway on current_leaf_,
-            // which preserves the pre-Spec-#5 page-walking behavior
+            // which preserves the original v1 page-walking behavior
             // byte-for-byte. For DELTA_VARINT we advance current_leaf_
             // (the V1 pin-holder) to the next page — V1 reads the v2
             // header's `next_leaf` field from offset 8..11, which happens
@@ -455,7 +462,7 @@ const Record<N>* BptIter<N>::next() {
                 }
             }
             if (leaf_format_ == BPT::LeafFormat::CSR_HYBRID) {
-                // Cross-page transition for v3 pages (Spec #8 / T8-B.1).
+                // Cross-page transition for v3 (CSR-hybrid) pages.
                 //
                 // Two sub-cases depending on the new page's flags byte:
                 //   (a) Chain-head page (flags bit 0 clear): open via
@@ -465,9 +472,10 @@ const Record<N>* BptIter<N>::next() {
                 //       owning src_id and last dst of the CURRENT page so
                 //       the hub's spilled adjacency is iterable end-to-end.
                 //
-                // Before T8-B.1 this branch unconditionally used ReadTag
-                // which rejected continuation pages, causing hub sampling
-                // on arxiv-scale projections to fail mid-iteration.
+                // The ReadTag constructor rejects continuation pages via
+                // BPTLeafCSRDecodeException; using ContinuationTag instead
+                // for those pages allows hub adjacency lists that spill
+                // across multiple leaf pages to be iterated correctly.
                 if constexpr (N >= 2 && N <= 3) {
                     auto* v1 = dynamic_cast<BPTLeafV1<N>*>(current_leaf_.get());
                     if (v1 == nullptr) return nullptr;  // defensive
@@ -481,13 +489,13 @@ const Record<N>* BptIter<N>::next() {
                     // follow; fall back to (0, 0) — writer invariant
                     // guarantees an empty chain-head has no continuations.
                     //
-                    // Spec #8-B task #1: also carry the previous eid so a
-                    // continuation page that advertises kHasEdgeIds can
-                    // delta-decode its eid stream. current_record[2]
-                    // already holds the last emitted eid (real value when
-                    // the page advertised eids, 0 otherwise — the carry
-                    // is consulted by the continuation reader only when
-                    // its own header bit is set).
+                    // Also carry the previous edge id so a continuation
+                    // page that advertises kHasEdgeIds can delta-decode
+                    // its eid stream. current_record[2] already holds the
+                    // last emitted eid (real value when the page advertised
+                    // eids, 0 otherwise — the carry is consulted by the
+                    // continuation reader only when its own header bit is
+                    // set).
                     uint64_t carry_src_id   = 0;
                     uint64_t carry_prev_dst = 0;
                     uint64_t carry_prev_eid = 0;

@@ -16,7 +16,7 @@ namespace GQL {
  *        (directed / undirected) because GQL edge counters are per-orientation
  *        dense starting from 0 — so a single combined bitmap would collide.
  *
- * Used by Spec #2's serialized scan pipeline (Phase B producer,
+ * Used by the projection's serialized edge-scan pipeline (Phase B producer,
  * Phase C consumers). The caller passes raw ObjectIds; EdgeFilter strips
  * the top 8 type bits (via ObjectId::VALUE_MASK) and routes by the top-byte
  * type tag (MASK_UNDIRECTED_EDGE vs MASK_DIRECTED_EDGE from object_id.h).
