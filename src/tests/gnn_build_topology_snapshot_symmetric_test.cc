@@ -78,7 +78,11 @@ TEST(SymmetricBake, BakedRowsMatchLiveUndirected) {
     }
 }
 
-TEST(SymmetricBake, MultigraphRefuses) {
+// A parallel-edge multigraph is NOT refused: the bake preserves the duplicate
+// neighbors (keyed on the real, distinct edge_ids, exactly like the accessor)
+// and only zeroes the edge_id values. The baked rows must still equal the live
+// accessor UNDIRECTED list byte-for-byte.
+TEST(SymmetricBake, MultigraphBuildsAndPreservesParallelEdges) {
     (void)MdbFixture::instance();
     auto& mgr = GQL::ProjectionManager::get_instance();
     std::string dir = mgr.create_projection("sym_bake_multi");
@@ -98,15 +102,39 @@ TEST(SymmetricBake, MultigraphRefuses) {
         return x;
     };
     s.add_edge(e(0, 1, 100));
-    s.add_edge(e(0, 1, 101));  // PARALLEL
+    s.add_edge(e(0, 1, 101));  // PARALLEL: same (0,1), distinct edge_id
     s.flush();
 
     auto storage = open_projection(dir);
     auto [bytes, ms, refused] = Proc::run_symmetric_for_test(*storage);
     (void)ms;
-    EXPECT_TRUE(refused);
-    EXPECT_EQ(bytes, 0u);
-    EXPECT_FALSE(fs::exists(fs::path(dir) / "topology_sym.csr"));
+    EXPECT_FALSE(refused);
+    EXPECT_GT(bytes, 64u);
+    ASSERT_TRUE(fs::exists(fs::path(dir) / "topology_sym.csr"));
+
+    // Row 0 undirected = out{1,1} (two parallel edges) + in{} = {1,1};
+    // row 1 = out{} + in{0,0} = {0,0}. Compare to the live accessor.
+    auto storage2 = open_projection(dir);
+    mdb::gnn::TopologyAccessor acc(*storage2);
+    std::ifstream f(fs::path(dir) / "topology_sym.csr", std::ios::binary);
+    uint8_t hdr[GQL::Projection::kTopologySnapshotHeaderSize];
+    f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+    uint64_t N = 0;
+    std::memcpy(&N, hdr + 16, 8);
+    ASSERT_EQ(N, 2u);
+    std::vector<uint64_t> row_ptr(N + 1);
+    f.read(reinterpret_cast<char*>(row_ptr.data()), (N + 1) * sizeof(uint64_t));
+    std::vector<uint64_t> col(row_ptr[N]);
+    f.read(reinterpret_cast<char*>(col.data()), row_ptr[N] * sizeof(uint64_t));
+    EXPECT_EQ(row_ptr[N], 4u) << "parallel edges must be preserved (no collapse)";
+    for (uint64_t u = 0; u < N; ++u) {
+        mdb::gnn::Neighbors live;
+        acc.get_neighbors_into(ObjectId{u}, mdb::gnn::EdgeOrientation::UNDIRECTED, live);
+        std::vector<uint64_t> baked(col.begin() + row_ptr[u], col.begin() + row_ptr[u + 1]);
+        std::vector<uint64_t> live_ids;
+        for (auto& n : live.node_ids) live_ids.push_back(n.id & ObjectId::VALUE_MASK);
+        EXPECT_EQ(baked, live_ids) << "row " << u;
+    }
 }
 
 // mode='symmetric' builds the sym sidecar.

@@ -130,10 +130,18 @@ uint64_t build_one_snapshot_post_hoc(
 // merging each node's out+in neighbor lists via the canonical UNDIRECTED dedup
 // (Projection::merge_symmetric_row). edge_ids are dropped (the symmetric sample
 // CSR never carries them); the dst node receptive field stays byte-identical to
-// the runtime out+in+merge. Returns bytes written; returns 0 and sets *refused
-// when a meaningful parallel-edge multigraph is detected (the bake abstains
-// rather than silently collapse parallel edges). Throws std::runtime_error on a
-// self-verify mismatch (verify=true) so a corrupt bake never finalizes.
+// the runtime out+in+merge. Returns bytes written. Throws std::runtime_error on
+// a self-verify mismatch (verify=true) so a corrupt bake never finalizes.
+//
+// This bake NEVER refuses: it keys the dedup on the SOURCE `has_edge_ids` flag,
+// exactly like the accessor, so a graph with parallel / mutual edges (e.g. cora
+// UNDIRECTED, where 151 mutual citations become duplicated (src,dst) records)
+// keeps every duplicate neighbor — the node sequence is reproduced byte-for-byte
+// and only the edge_id VALUES are zeroed (model-irrelevant for node
+// classification). The parallel-edge guard (detect_parallel_edges) belongs to
+// the four-level edge_id-DROP path, where the dedup key is forced to node-id and
+// duplicates WOULD collapse, changing the receptive field. `*refused` is always
+// set false here and kept only for yield/API stability.
 //
 // `verify_sample`: when N is large only ~verify_sample randomly-chosen rows are
 // cross-checked against the live accessor; all rows are checked when N is small.
@@ -143,18 +151,11 @@ uint64_t build_symmetric_snapshot_post_hoc(GQL::ProjectionStorage& storage,
     using Projection::TopologySnapshotWriter;
     *refused = false;
 
-    BPlusTree<3>* fwd_bpt = storage.get_from_to_edge_index();
-    BPlusTree<3>* rev_bpt = storage.get_to_from_edge_index();
-    if (fwd_bpt == nullptr || rev_bpt == nullptr) {
+    if (storage.get_from_to_edge_index() == nullptr
+        || storage.get_to_from_edge_index() == nullptr) {
         throw std::runtime_error(
             "gnn_build_topology_snapshot(symmetric): both FROM_TO_EDGE and "
             "TO_FROM_EDGE indexes must be open to build topology_sym.csr");
-    }
-
-    // Parallel-edge guard: refuse rather than node-id-dedup a real multigraph.
-    if (Projection::detect_parallel_edges(fwd_bpt, storage.get_node_count())) {
-        *refused = true;
-        return 0;
     }
 
     const uint64_t N = storage.get_node_count();
