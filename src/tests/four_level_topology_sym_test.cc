@@ -36,3 +36,47 @@ TEST(FourLevelTopologySym, SymTierDefaultsOff) {
         tiers, [](ObjectId v) { return v.id; }, cfg);
     EXPECT_FALSE(store.is_symmetric_built());
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 — the per-row merge that the symmetric populate uses. Replicates the
+// accessor's dedup: edge_id key when has_edge_ids (distinct -> nothing removed),
+// node-id key otherwise; out(u) first, then in(u) survivors.
+// ---------------------------------------------------------------------------
+using mdb::gnn::detail::symmetric_merge_row;
+
+// Distinct edge_ids -> out ++ in with NO node-id dedup (parallel/mutual edges
+// are PRESERVED, byte-identical to the accessor + the design correction).
+TEST(FourLevelTopologySym, MergeRule_RealEdgeIds_NoDedup) {
+    std::vector<uint64_t> df = {2, 3}, ef = {10, 11};
+    std::vector<uint64_t> dr = {2, 4}, er = {20, 21};  // dst 2 repeats, eids distinct
+    std::vector<AdjEntry> out;
+    symmetric_merge_row(df, ef, dr, er, /*has_edge_ids=*/true, out);
+    ASSERT_EQ(4u, out.size());  // 2,3,2,4 — no node-id dedup
+    EXPECT_EQ(2u, out[0].node_id);
+    EXPECT_EQ(2u, out[2].node_id);
+    EXPECT_EQ(10u, out[0].edge_id);
+    EXPECT_EQ(20u, out[2].edge_id);
+}
+
+// edge_id==0 -> node-id dedup; the in-side duplicate of an out node is dropped.
+TEST(FourLevelTopologySym, MergeRule_ZeroEdgeIds_NodeDedup) {
+    std::vector<uint64_t> df = {2, 3}, ef = {0, 0};
+    std::vector<uint64_t> dr = {2, 4}, er = {0, 0};
+    std::vector<AdjEntry> out;
+    symmetric_merge_row(df, ef, dr, er, /*has_edge_ids=*/false, out);
+    ASSERT_EQ(3u, out.size());  // 2,3,4 — dst 2 from rev dropped
+    EXPECT_EQ(2u, out[0].node_id);
+    EXPECT_EQ(3u, out[1].node_id);
+    EXPECT_EQ(4u, out[2].node_id);
+}
+
+// Order contract: out(u) first, then in(u) survivors.
+TEST(FourLevelTopologySym, MergeRule_OrderOutThenIn) {
+    std::vector<uint64_t> df = {5}, ef = {0};
+    std::vector<uint64_t> dr = {4, 5}, er = {0, 0};
+    std::vector<AdjEntry> out;
+    symmetric_merge_row(df, ef, dr, er, /*has_edge_ids=*/false, out);
+    ASSERT_EQ(2u, out.size());
+    EXPECT_EQ(5u, out[0].node_id);  // from out
+    EXPECT_EQ(4u, out[1].node_id);  // from in, 5-dup dropped
+}

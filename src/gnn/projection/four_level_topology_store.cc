@@ -500,6 +500,105 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     l2_out->freeze();
 }
 
+namespace detail {
+void symmetric_merge_row(const std::vector<uint64_t>& dst_fwd,
+                         const std::vector<uint64_t>& eid_fwd,
+                         const std::vector<uint64_t>& dst_rev,
+                         const std::vector<uint64_t>& eid_rev,
+                         bool has_edge_ids,
+                         std::vector<AdjEntry>& out) {
+    out.clear();
+    out.reserve(dst_fwd.size() + dst_rev.size());
+    const bool ef_ok = (eid_fwd.size() == dst_fwd.size());
+    const bool er_ok = (eid_rev.size() == dst_rev.size());
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(dst_fwd.size() + dst_rev.size());
+    for (std::size_t i = 0; i < dst_fwd.size(); ++i) {
+        const uint64_t eid = ef_ok ? eid_fwd[i] : 0ULL;
+        const uint64_t key = has_edge_ids ? eid : dst_fwd[i];
+        if (seen.insert(key).second) out.push_back(AdjEntry{ dst_fwd[i], eid });
+    }
+    for (std::size_t i = 0; i < dst_rev.size(); ++i) {
+        const uint64_t eid = er_ok ? eid_rev[i] : 0ULL;
+        const uint64_t key = has_edge_ids ? eid : dst_rev[i];
+        if (seen.insert(key).second) out.push_back(AdjEntry{ dst_rev[i], eid });
+    }
+}
+}  // namespace detail
+
+void FourLevelTopologyStore::populate_direction_symmetric_(
+    const GQL::Projection::TopologySnapshotReader& l3_fwd,
+    const GQL::Projection::TopologySnapshotReader& l3_rev,
+    const std::vector<uint8_t>&                    tiers,
+    const std::vector<uint64_t>&                   /*frequency*/,
+    std::unique_ptr<L1HashCache>&                  l1_out,
+    std::unique_ptr<L2CompactCsr>&                 l2_out) const
+{
+    l1_out = std::make_unique<L1HashCache>(tiers);
+    l2_out = std::make_unique<L2CompactCsr>(/*hint=*/0);
+
+    // Sequential advice over BOTH sidecars for the duration of the ascending
+    // row scan (same rationale as populate_direction_via_sidecar_), restored on
+    // any exit.
+    struct SeqAdviseGuard {
+        const GQL::Projection::TopologySnapshotReader* a;
+        const GQL::Projection::TopologySnapshotReader* b;
+        bool active = false;
+        SeqAdviseGuard(const GQL::Projection::TopologySnapshotReader& aa,
+                       const GQL::Projection::TopologySnapshotReader& bb)
+            : a(&aa), b(&bb) {
+            const char* off = std::getenv("MDB_GNN_NO_POPULATE_SEQUENTIAL");
+            if (!(off && (off[0] == '1' || off[0] == 't' || off[0] == 'T'))) {
+                a->advise_access(/*sequential=*/true);
+                b->advise_access(/*sequential=*/true);
+                active = true;
+            }
+        }
+        ~SeqAdviseGuard() {
+            if (active) {
+                a->advise_access(/*sequential=*/false);
+                b->advise_access(/*sequential=*/false);
+            }
+        }
+    } seq_guard_(l3_fwd, l3_rev);
+
+    const uint64_t num_nodes = std::max(l3_fwd.num_nodes(), l3_rev.num_nodes());
+    // Matches the accessor's per-node rule: has_edge_ids when EITHER direction
+    // carries real edge_ids (the directional sidecars are built together, so in
+    // practice both have or both lack them).
+    const bool has_eids = l3_fwd.has_edge_ids() || l3_rev.has_edge_ids();
+
+    std::vector<uint64_t> df, ef, dr, er;
+    std::vector<AdjEntry> merged;
+    for (uint64_t row = 0; row < num_nodes; ++row) {
+        if (row >= tiers.size()) break;
+        const uint8_t tier = tiers[row];
+        if (tier != 1 && tier != 2) continue;  // L3/L4 handled at runtime
+
+        df.clear(); ef.clear(); dr.clear(); er.clear();
+        if (row < l3_fwd.num_nodes()) {
+            l3_fwd.copy_neighbors(row, df);
+            if (l3_fwd.has_edge_ids()) l3_fwd.copy_edge_ids(row, ef);
+        }
+        if (row < l3_rev.num_nodes()) {
+            l3_rev.copy_neighbors(row, dr);
+            if (l3_rev.has_edge_ids()) l3_rev.copy_edge_ids(row, er);
+        }
+        detail::symmetric_merge_row(df, ef, dr, er, has_eids, merged);
+
+        if (tier == 1) {
+            std::vector<AdjEntry> tight(merged);
+            tight.shrink_to_fit();
+            l1_out->insert(/*src_node_id=*/row, std::move(tight),
+                           /*row_idx=*/static_cast<std::size_t>(row));
+        } else {
+            l2_out->add_node(/*src_node_id=*/row, merged);
+        }
+    }
+
+    l2_out->freeze();
+}
+
 void FourLevelTopologyStore::open_l3_sidecars_() {
     if (!config_.use_l3_mmap_sidecar) return;
     if (projection_dir_.empty())     return;

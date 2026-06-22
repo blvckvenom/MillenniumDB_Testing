@@ -32,6 +32,20 @@ class TopologyFrequencyProfiler;
 class PinnedTopologyView;
 struct SamplingBackendPlan;
 
+namespace detail {
+// Merge a node's directional out+in lists into the canonical UNDIRECTED order
+// (out(u) first, then in(u) survivors). The dedup key is the edge_id when
+// has_edge_ids (distinct edge_ids -> nothing removed, so parallel/mutual edges
+// are PRESERVED), else the neighbor node id. Replicates
+// TopologyAccessor::get_neighbors_into(UNDIRECTED). `out` is cleared and filled.
+void symmetric_merge_row(const std::vector<uint64_t>& dst_fwd,
+                         const std::vector<uint64_t>& eid_fwd,
+                         const std::vector<uint64_t>& dst_rev,
+                         const std::vector<uint64_t>& eid_rev,
+                         bool has_edge_ids,
+                         std::vector<AdjEntry>& out);
+}  // namespace detail
+
 /**
  * @brief Coordinator for the frequency-tiered Four-Level Topology Store.
  *
@@ -521,6 +535,18 @@ private:
      */
     void populate_direction_via_sidecar_(
         const GQL::Projection::TopologySnapshotReader& sidecar,
+        const std::vector<uint8_t>&                    tiers,
+        const std::vector<uint64_t>&                   frequency,
+        std::unique_ptr<L1HashCache>&                  l1_out,
+        std::unique_ptr<L2CompactCsr>&                 l2_out) const;
+    // Populate the symmetric (pre-merged undirected) L1/L2 tier by merging the
+    // two directional L3 sidecars row-by-row via detail::symmetric_merge_row.
+    // Reuses the same per-node tier assignment; tier-3/4 rows are skipped (the
+    // L4 symmetric merge covers them at runtime). Used when no on-disk
+    // topology_sym.csr is present (the merge-fallback path).
+    void populate_direction_symmetric_(
+        const GQL::Projection::TopologySnapshotReader& l3_fwd,
+        const GQL::Projection::TopologySnapshotReader& l3_rev,
         const std::vector<uint8_t>&                    tiers,
         const std::vector<uint64_t>&                   frequency,
         std::unique_ptr<L1HashCache>&                  l1_out,
