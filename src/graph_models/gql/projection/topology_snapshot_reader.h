@@ -86,6 +86,16 @@ public:
     static TopologySnapshotReader open(const std::filesystem::path& projection_dir,
                                        Direction                    dir);
 
+    /// Symmetric-sidecar factory: opens `<projection_dir>/topology_sym.csr`,
+    /// parses the "TOPOSYM1" header, runs the SAME structural validation as
+    /// open(), then a TWO-source staleness gate over {from_to_edge.leaf,
+    /// to_from_edge.leaf} (a combined digest chaining both .leaf streams in
+    /// fixed order). Same fallback-first contract as open(): absent / malformed
+    /// / stale → has_data()==false, never throws. A directional sidecar placed
+    /// under this name is rejected because its magic is not "TOPOSYM1".
+    static TopologySnapshotReader open_symmetric(
+        const std::filesystem::path& projection_dir);
+
     /// Move-only — the reader owns an mmap region + file descriptor.
     TopologySnapshotReader(TopologySnapshotReader&&) noexcept;
     TopologySnapshotReader& operator=(TopologySnapshotReader&&) noexcept;
@@ -219,6 +229,16 @@ public:
     /// this automatically and falls back on mismatch; callers only need
     /// to use it directly for after-the-fact rehashing (e.g. tests).
     bool verify_source_sha256(const std::filesystem::path& source_leaf_path) const;
+
+    /// Two-source staleness check for the symmetric sidecar. Chains SHA-256 over
+    /// `source_leaf_paths` in list order (matching the writer's combined digest)
+    /// and compares the result to `header().source_sha256`. Returns false when
+    /// the reader has no data, any source is unreadable, or the order/content
+    /// differs — conservative: unverifiable → untrusted. `open_symmetric()`
+    /// invokes this automatically and falls back on mismatch; callers use it
+    /// directly only for after-the-fact rehashing (e.g. tests).
+    bool verify_combined_sha256(
+        const std::vector<std::filesystem::path>& source_leaf_paths) const;
 
 private:
     // Constructed only via `open()`. Private to prevent direct instantiation

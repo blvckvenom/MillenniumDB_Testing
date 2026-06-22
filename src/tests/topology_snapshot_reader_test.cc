@@ -917,3 +917,119 @@ TEST_F(TopologySnapshotReaderTest, DefaultLayoutStaysWideWithoutOptIn) {
     ASSERT_EQ(n0.size(), 1u);
     EXPECT_EQ(n0[0], kDstTag | 1);
 }
+
+// ===========================================================================
+// Symmetric reader: open_symmetric() + two-source staleness gate (TOPOSYM1)
+// ===========================================================================
+//
+// The symmetric sidecar topology_sym.csr carries a distinct magic ("TOPOSYM1")
+// and a COMBINED digest chaining BOTH source .leaf streams (from_to_edge then
+// to_from_edge, fixed order). open_symmetric() runs the SAME structural
+// validation as open() but parses with the sym parser and verifies against the
+// two-source chained digest. Same fallback-first contract: absent / malformed /
+// stale → has_data()==false, never throws.
+
+// Build a valid topology_sym.csr in `dir` from an undirected adjacency, hashing
+// from_to_edge.leaf then to_from_edge.leaf (fixed chaining order).
+// N=3 undirected: 0-{1,2}, 1-{0}, 2-{0}.
+static void build_sym_fixture(const std::filesystem::path& dir,
+                              const std::string& fwd_leaf,
+                              const std::string& rev_leaf) {
+    { std::ofstream f(dir / "from_to_edge.leaf",
+                      std::ios::binary | std::ios::trunc);
+      f.write(fwd_leaf.data(), static_cast<std::streamsize>(fwd_leaf.size())); }
+    { std::ofstream f(dir / "to_from_edge.leaf",
+                      std::ios::binary | std::ios::trunc);
+      f.write(rev_leaf.data(), static_cast<std::streamsize>(rev_leaf.size())); }
+    TopologySnapshotWriter w(
+        dir,
+        std::string("topology_sym.csr"),
+        std::vector<std::filesystem::path>{dir / "from_to_edge.leaf",
+                                           dir / "to_from_edge.leaf"},
+        /*num_nodes=*/3,
+        /*degrees=*/{2, 1, 1},
+        /*include_edge_ids=*/false,
+        /*symmetric_format=*/true);
+    w.append_edge(oid(0), oid(1), ObjectId());
+    w.append_edge(oid(0), oid(2), ObjectId());
+    w.append_edge(oid(1), oid(0), ObjectId());
+    w.append_edge(oid(2), oid(0), ObjectId());
+    w.finalize();
+}
+
+TEST_F(TopologySnapshotReaderTest, SymOpenSucceedsAndSlicesNeighbors) {
+    build_sym_fixture(dir_, "fwd-bytes", "rev-bytes");
+    auto r = TopologySnapshotReader::open_symmetric(dir_);
+    ASSERT_TRUE(r.has_data());
+    EXPECT_EQ(r.num_nodes(), 3u);
+    EXPECT_EQ(r.num_edges(), 4u);
+    EXPECT_FALSE(r.has_edge_ids());
+
+    auto n0 = r.neighbors(0);
+    ASSERT_EQ(n0.size(), 2u);
+    EXPECT_EQ(n0[0], 1u);
+    EXPECT_EQ(n0[1], 2u);
+    auto n1 = r.neighbors(1);
+    ASSERT_EQ(n1.size(), 1u);
+    EXPECT_EQ(n1[0], 0u);
+}
+
+TEST_F(TopologySnapshotReaderTest, SymOpenAbsentFileHasNoData) {
+    // No topology_sym.csr written at all.
+    auto r = TopologySnapshotReader::open_symmetric(dir_);
+    EXPECT_FALSE(r.has_data());
+}
+
+TEST_F(TopologySnapshotReaderTest, SymOpenRejectsDirectionalMagic) {
+    // A directional fwd writer produces "TOPOCSR1"; place it under the sym name
+    // by writing a directional file and renaming it.
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "x");
+    TopologySnapshotWriter w(
+        dir_, TopologySnapshotWriter::Direction::FORWARD,
+        /*num_nodes=*/1, /*degrees=*/{1}, /*include_edge_ids=*/false);
+    w.append_edge(oid(0), oid(0), ObjectId());
+    w.finalize();
+    std::filesystem::rename(dir_ / "topology_fwd.csr", dir_ / "topology_sym.csr");
+
+    auto r = TopologySnapshotReader::open_symmetric(dir_);
+    EXPECT_FALSE(r.has_data())
+        << "directional magic must be rejected by the symmetric opener";
+}
+
+TEST_F(TopologySnapshotReaderTest, SymStalenessFallsBackWhenLeafChanges) {
+    build_sym_fixture(dir_, "fwd-original", "rev-original");
+    // Mutate one source .leaf AFTER the sidecar was written → combined digest
+    // no longer matches → open_symmetric must fall back to has_data()==false.
+    { std::ofstream f(dir_ / "to_from_edge.leaf",
+                      std::ios::binary | std::ios::trunc);
+      const std::string m = "rev-MUTATED";
+      f.write(m.data(), static_cast<std::streamsize>(m.size())); }
+
+    auto r = TopologySnapshotReader::open_symmetric(dir_);
+    EXPECT_FALSE(r.has_data())
+        << "a post-write edit to either source .leaf must stale the sym sidecar";
+}
+
+TEST_F(TopologySnapshotReaderTest, SymVerifyCombinedSha256MatchesFreshLeaves) {
+    build_sym_fixture(dir_, "fwd-bytes", "rev-bytes");
+    auto r = TopologySnapshotReader::open_symmetric(dir_);
+    ASSERT_TRUE(r.has_data());
+    EXPECT_TRUE(r.verify_combined_sha256(
+        {dir_ / "from_to_edge.leaf", dir_ / "to_from_edge.leaf"}));
+    // Reversed order must NOT verify (chaining order is load-bearing).
+    EXPECT_FALSE(r.verify_combined_sha256(
+        {dir_ / "to_from_edge.leaf", dir_ / "from_to_edge.leaf"}));
+}
+
+TEST_F(TopologySnapshotReaderTest, SymTrustSidecarBypassesStaleness) {
+    build_sym_fixture(dir_, "fwd-x", "rev-x");
+    { std::ofstream f(dir_ / "from_to_edge.leaf",
+                      std::ios::binary | std::ios::trunc);
+      const std::string m = "fwd-CHANGED";
+      f.write(m.data(), static_cast<std::streamsize>(m.size())); }
+    ::setenv("MDB_GNN_TRUST_SIDECAR", "1", /*overwrite=*/1);
+    auto r = TopologySnapshotReader::open_symmetric(dir_);
+    ::unsetenv("MDB_GNN_TRUST_SIDECAR");
+    EXPECT_TRUE(r.has_data())
+        << "MDB_GNN_TRUST_SIDECAR must skip the combined staleness gate";
+}

@@ -44,6 +44,10 @@ const char* source_basename_for(TopologySnapshotReader::Direction d) {
     return "from_to_edge.leaf";  // unreachable
 }
 
+// Symmetric sidecar filename. Unlike the directional files it has no single
+// source — its combined digest chains the fixed-order pair below.
+const char* sym_output_basename() { return "topology_sym.csr"; }
+
 // Process-level memoization of the source-.leaf SHA-256, keyed by
 // (path, mtime_ns, size). The four-level sample path hashes the SAME .leaf
 // TWICE per run — once in the TopologyAccessor ctor (opening fwd_csr_/rev_csr_)
@@ -415,6 +419,213 @@ TopologySnapshotReader TopologySnapshotReader::open(
 }
 
 // ---------------------------------------------------------------------------
+// open_symmetric() — same validation pipeline as open(), three differences:
+//   (1) reads topology_sym.csr,
+//   (2) parses with parse_topology_snapshot_sym_header (magic "TOPOSYM1"),
+//   (3) staleness gate is the COMBINED two-source digest over
+//       {from_to_edge.leaf, to_from_edge.leaf} (verify_combined_sha256).
+// The body is intentionally a faithful copy of open() rather than a shared
+// helper: open() is the validated directional path (papers100M-proven) and
+// keeping the symmetric opener structurally identical-but-separate avoids any
+// risk of regressing it. Every failure path emits warn() + has_data_==false.
+// ---------------------------------------------------------------------------
+
+TopologySnapshotReader TopologySnapshotReader::open_symmetric(
+    const std::filesystem::path& projection_dir) {
+    TopologySnapshotReader reader;
+    const std::filesystem::path path = projection_dir / sym_output_basename();
+
+    // Step 1 — absent is the normal "sidecar not built" path. No log.
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return reader;
+    }
+
+    // Step 2 — open RDONLY.
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        warn(path, "open(O_RDONLY) failed (errno=" + std::to_string(errno) + ")");
+        return reader;
+    }
+
+    // Step 3 — fstat → file size ≥ 64.
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) {
+        warn(path, "fstat failed (errno=" + std::to_string(errno) + ")");
+        ::close(fd);
+        return reader;
+    }
+    if (st.st_size < static_cast<off_t>(kTopologySnapshotHeaderSize)) {
+        warn(path, "file too small to hold a 64-byte header (size="
+                   + std::to_string(st.st_size) + ")");
+        ::close(fd);
+        return reader;
+    }
+    const std::size_t file_size = static_cast<std::size_t>(st.st_size);
+
+    // Step 4 — read + parse the SYMMETRIC header (validates magic "TOPOSYM1",
+    // version, id_width).
+    uint8_t hdr_buf[kTopologySnapshotHeaderSize];
+    {
+        std::size_t off = 0;
+        while (off < kTopologySnapshotHeaderSize) {
+            ssize_t got = ::pread(fd, hdr_buf + off,
+                                  kTopologySnapshotHeaderSize - off,
+                                  static_cast<off_t>(off));
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                warn(path, "pread(header) failed (errno="
+                           + std::to_string(errno) + ")");
+                ::close(fd);
+                return reader;
+            }
+            if (got == 0) {
+                warn(path, "short read on header");
+                ::close(fd);
+                return reader;
+            }
+            off += static_cast<std::size_t>(got);
+        }
+    }
+
+    TopologySnapshotHeader header;
+    try {
+        header = parse_topology_snapshot_sym_header(hdr_buf);
+    } catch (const TopologySnapshotFormatError& e) {
+        warn(path, std::string("sym header validation rejected: ") + e.what());
+        ::close(fd);
+        return reader;
+    }
+
+    // Step 5 — file-size invariant.
+    const bool has_edge_ids_flag =
+        (header.flags & TopologySnapshotFlags::kHasEdgeIds) != 0;
+    const uint64_t N = header.num_nodes;
+    const uint64_t M = header.num_edges;
+    const uint64_t W = static_cast<uint64_t>(header.id_width);
+    const uint64_t expected =
+        static_cast<uint64_t>(kTopologySnapshotHeaderSize)
+        + sizeof(uint64_t) * (N + 1)
+        + W * M * (has_edge_ids_flag ? 2 : 1);
+    if (expected != static_cast<uint64_t>(file_size)) {
+        warn(path, "file size mismatch: expected=" + std::to_string(expected)
+                   + ", actual=" + std::to_string(file_size)
+                   + " (N=" + std::to_string(N) + ", M=" + std::to_string(M)
+                   + ", has_edge_ids=" + (has_edge_ids_flag ? "1" : "0") + ")");
+        ::close(fd);
+        return reader;
+    }
+
+    // Step 6 — mmap MAP_PRIVATE.
+    void* map_base = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_base == MAP_FAILED) {
+        warn(path, "mmap failed (errno=" + std::to_string(errno) + ")");
+        ::close(fd);
+        return reader;
+    }
+
+    // Step 7 — MADV_RANDOM (best-effort).
+    if (::madvise(map_base, file_size, MADV_RANDOM) != 0) {
+        // Not fatal; some mount options reject it — don't log spuriously.
+    }
+
+    // Step 8 — ROW_PTR structural invariants.
+    auto* map_bytes = static_cast<const uint8_t*>(map_base);
+    const uint64_t* row_ptr = reinterpret_cast<const uint64_t*>(
+        map_bytes + kTopologySnapshotHeaderSize);
+
+    if (N > 0) {
+        if (row_ptr[0] != 0) {
+            warn(path, "ROW_PTR[0] != 0 (got "
+                       + std::to_string(row_ptr[0]) + ")");
+            ::munmap(map_base, file_size);
+            ::close(fd);
+            return reader;
+        }
+        if (row_ptr[N] != M) {
+            warn(path, "ROW_PTR[N] != M (ROW_PTR[" + std::to_string(N) + "]="
+                       + std::to_string(row_ptr[N])
+                       + ", M=" + std::to_string(M) + ")");
+            ::munmap(map_base, file_size);
+            ::close(fd);
+            return reader;
+        }
+        if (N <= kMonotonicityScanNodeLimit) {
+            for (uint64_t i = 0; i < N; ++i) {
+                if (row_ptr[i] > row_ptr[i + 1]) {
+                    warn(path, "ROW_PTR not monotonic at i="
+                               + std::to_string(i)
+                               + " (row_ptr[i]="
+                               + std::to_string(row_ptr[i])
+                               + ", row_ptr[i+1]="
+                               + std::to_string(row_ptr[i + 1]) + ")");
+                    ::munmap(map_base, file_size);
+                    ::close(fd);
+                    return reader;
+                }
+            }
+        } else {
+            std::cerr << "TopologySnapshotReader: " << path.string()
+                      << ": monotonicity check skipped for N=" << N
+                      << " (> " << kMonotonicityScanNodeLimit
+                      << "), trusting writer invariant" << std::endl;
+        }
+    } else {
+        if (row_ptr[0] != 0) {
+            warn(path, "ROW_PTR[0] != 0 for N=0 graph");
+            ::munmap(map_base, file_size);
+            ::close(fd);
+            return reader;
+        }
+    }
+
+    // Provisionally commit so verify_combined_sha256() sees header_/has_data_.
+    reader.header_    = header;
+    reader.map_base_  = map_base;
+    reader.file_size_ = file_size;
+    reader.fd_        = fd;
+
+    reader.row_ptr_ = row_ptr;
+    const uint8_t* col_base = map_bytes + kTopologySnapshotHeaderSize
+                                        + sizeof(uint64_t) * (N + 1);
+    const uint8_t* eid_base = col_base + W * M;
+    if (header.id_width == kTopologySnapshotIdWidthNarrow) {
+        reader.col_idx32_  = reinterpret_cast<const uint32_t*>(col_base);
+        reader.edge_ids32_ = has_edge_ids_flag
+            ? reinterpret_cast<const uint32_t*>(eid_base)
+            : nullptr;
+    } else {
+        reader.col_idx_  = reinterpret_cast<const uint64_t*>(col_base);
+        reader.edge_ids_ = has_edge_ids_flag
+            ? reinterpret_cast<const uint64_t*>(eid_base)
+            : nullptr;
+    }
+    reader.has_data_ = true;
+
+    // Step 9 — two-source staleness gate (combined chained digest over BOTH
+    // .leaf streams). MDB_GNN_TRUST_SIDECAR opts out, same as open().
+    {
+        const char* trust = std::getenv("MDB_GNN_TRUST_SIDECAR");
+        if (trust && (trust[0] == '1' || trust[0] == 't' || trust[0] == 'T')) {
+            std::cerr << "TopologySnapshotReader: " << path.string()
+                      << ": MDB_GNN_TRUST_SIDECAR set — skipping combined "
+                         "two-source SHA-256 staleness check\n";
+            return reader;
+        }
+    }
+    const std::vector<std::filesystem::path> sources = {
+        projection_dir / "from_to_edge.leaf",
+        projection_dir / "to_from_edge.leaf"
+    };
+    if (!reader.verify_combined_sha256(sources)) {
+        warn(path, "combined two-source SHA-256 mismatch, falling back to B+Tree");
+        reader.release_resources_();
+        return reader;
+    }
+    return reader;
+}
+
+// ---------------------------------------------------------------------------
 // Destructor + move
 // ---------------------------------------------------------------------------
 
@@ -724,6 +935,63 @@ bool TopologySnapshotReader::verify_source_sha256(
     if (!compute_sha256_64k(source_leaf_path, actual)) {
         return false;
     }
+    return std::memcmp(actual.data(), header_.source_sha256, 32) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// verify_combined_sha256 — chained two-source staleness gate (symmetric).
+// ---------------------------------------------------------------------------
+//
+// Streams the source .leaf files through ONE SHA-256 context in list order
+// (matching the writer's sha256_of_files_chained) and compares to the combined
+// digest the symmetric writer embedded in header_.source_sha256. The per-file
+// compute_sha256_64k cache cannot express a chained multi-file digest, so this
+// re-streams both files; the staleness-gate cost is paid only at open time.
+// Conservative: reader-has-no-data / unreadable source / order or content
+// mismatch all return false (untrusted).
+
+bool TopologySnapshotReader::verify_combined_sha256(
+    const std::vector<std::filesystem::path>& source_leaf_paths) const {
+    if (!has_data_) {
+        return false;
+    }
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        return false;
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+    constexpr std::size_t BUF = 256 * 1024;
+    std::array<char, BUF> buf{};
+    for (const auto& path : source_leaf_paths) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            EVP_MD_CTX_free(ctx);
+            return false;  // unreadable source → untrusted
+        }
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        bool ok = true;
+        while (true) {
+            ssize_t n = ::read(fd, buf.data(), BUF);
+            if (n < 0) { if (errno == EINTR) continue; ok = false; break; }
+            if (n == 0) break;
+            if (EVP_DigestUpdate(ctx, buf.data(),
+                                 static_cast<std::size_t>(n)) != 1) {
+                ok = false; break;
+            }
+        }
+        ::close(fd);
+        if (!ok) { EVP_MD_CTX_free(ctx); return false; }
+    }
+    std::array<uint8_t, 32> actual{};
+    unsigned int len = 0;
+    if (EVP_DigestFinal_ex(ctx, actual.data(), &len) != 1 || len != 32) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+    EVP_MD_CTX_free(ctx);
     return std::memcmp(actual.data(), header_.source_sha256, 32) == 0;
 }
 
