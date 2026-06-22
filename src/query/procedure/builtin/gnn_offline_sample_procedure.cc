@@ -122,6 +122,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     uint64_t num_workers = std::numeric_limits<uint64_t>::max();  // sentinel: max = unset (auto-detect below)
     bool force = false;
     std::string sampling_backend_str = "auto";  // dynamic GPU/CPU backend choice
+    std::string symmetric_topology_str = "auto";  // auto|on|off single merged slice
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -135,7 +136,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                           use_l3_mmap_sidecar,
                           auto_profile_on_cold_start,
                           profile_num_walks, profile_walk_length,
-                          num_workers, force, sampling_backend_str);
+                          num_workers, force, sampling_backend_str,
+                          symmetric_topology_str);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -152,6 +154,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
                 "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
                 "  - useL3MmapSidecar (BOOL): mmap'd topology CSR sidecar as L3 (default: true)\n"
+                "  - useSymmetricTopology (STRING): 'auto'|'on'|'off' single pre-merged undirected slice (default: 'auto')\n"
                 "  - force (BOOL): Drop + re-create an existing sample set (default: false)\n\n"
                 "Example:\n"
                 "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
@@ -279,6 +282,17 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             config.sampling_backend = SamplingBackendChoice::AUTO;  // "auto" or unknown
         }
     }
+    {
+        std::string st = symmetric_topology_str;
+        std::transform(st.begin(), st.end(), st.begin(), ::tolower);
+        if (st == "on") {
+            config.use_symmetric_topology = SamplingConfig::SymmetricTopologyMode::ON;
+        } else if (st == "off") {
+            config.use_symmetric_topology = SamplingConfig::SymmetricTopologyMode::OFF;
+        } else {
+            config.use_symmetric_topology = SamplingConfig::SymmetricTopologyMode::AUTO;
+        }
+    }
     config.use_predefined_splits = use_predefined_splits;
     config.use_adjacency_cache = use_adjacency_cache;
     config.use_four_level_topology_store = use_four_level_topology_store;
@@ -386,6 +400,17 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("samplingDirections", ctx.create_string(result.sampling_directions));
     ctx.yield("samplingPlanReason", ctx.create_string(result.sampling_plan_reason));
 
+    // Symmetric single-slice topology telemetry. symmetricUsed reflects the
+    // resolved decision (AUTO => UNDIRECTED); symmetricBuiltOk + symmetricMs +
+    // symmetricRamBytes report the in-RAM merge of the two directional CSRs into
+    // one pre-merged undirected slice consumed by the GPU-UVA pin / sym tier.
+    ctx.yield("symmetricUsed",     ctx.create_bool(result.symmetric_used));
+    ctx.yield("symmetricBuiltOk",  ctx.create_bool(result.symmetric_built_ok));
+    ctx.yield("symmetricMs",       ctx.create_int(
+        static_cast<int64_t>(result.symmetric_ms)));
+    ctx.yield("symmetricRamBytes", ctx.create_int(
+        static_cast<int64_t>(result.symmetric_ram_bytes)));
+
     ctx.yield_row();
 }
 
@@ -464,7 +489,8 @@ void GnnOfflineSampleProcedure::parse_options(
     uint64_t& profile_walk_length,
     uint64_t& num_workers,
     bool& force,
-    std::string& sampling_backend
+    std::string& sampling_backend,
+    std::string& symmetric_topology
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -534,6 +560,12 @@ void GnnOfflineSampleProcedure::parse_options(
     // 'gpu' (force the GPU path; requires the Four-Level Topology Store).
     if (auto v = opts.get_string("samplingBackend")) {
         sampling_backend = *v;
+    }
+
+    // Symmetric topology: 'auto' (on for UNDIRECTED), 'on' (force the merged
+    // undirected slice), or 'off' (keep the runtime out+in+merge path).
+    if (auto v = opts.get_string("useSymmetricTopology")) {
+        symmetric_topology = *v;
     }
 
     // Parse useAdjacencyCache: when true, a single full B+Tree scan over

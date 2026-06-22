@@ -155,7 +155,18 @@ public:
                 "backend: NONE, FORWARD_ONLY, REVERSE_ONLY, or BOTH."},
             YieldField{"samplingPlanReason", YieldType::STRING,
                 "Human-readable reason for the sampling-backend decision "
-                "(which gate passed or failed)."}
+                "(which gate passed or failed)."},
+            YieldField{"symmetricUsed", YieldType::BOOL,
+                "True iff the pre-merged undirected slice was resolved-on "
+                "(useSymmetricTopology AUTO => UNDIRECTED, or ON)."},
+            YieldField{"symmetricBuiltOk", YieldType::BOOL,
+                "True once the symmetric slice (GPU pin) or symmetric tier (CPU) "
+                "is actually active for this sample."},
+            YieldField{"symmetricMs", YieldType::INT,
+                "Wall-clock milliseconds spent building the in-RAM merged "
+                "undirected slice (0 when not materialized)."},
+            YieldField{"symmetricRamBytes", YieldType::INT,
+                "Resident bytes of the merged undirected slice (0 when absent)."}
         };
     }
 
@@ -206,7 +217,8 @@ private:
         uint64_t& profile_walk_length,
         uint64_t& num_workers,
         bool& force,
-        std::string& sampling_backend
+        std::string& sampling_backend,
+        std::string& symmetric_topology
     );
 };
 
