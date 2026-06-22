@@ -6,6 +6,7 @@
 // materialization. CI-friendly: passes with OR without a GPU (the pin is a
 // documented no-op without a runtime GPU, exactly like PinnedTopologyView).
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -110,6 +111,34 @@ TEST(SymmetricLazy, MergeHelpersAreDeterministic_Idempotent) {
     merge_symmetric_csr_node_dedup(f_rp, f_ci, r_rp, r_ci, rp2, ci2);
     EXPECT_EQ(rp1, rp2);
     EXPECT_EQ(ci1, ci2);
+}
+
+// The merged undirected list per node equals the runtime out++in merge
+// (node-id dedup) — the §6 build-time self-verify at unit scale.
+TEST(SymmetricInvariant, MergedEqualsRuntimeUndirectedMerge) {
+    // Reference "runtime merge": out(u) then in(u)-not-already-present.
+    auto runtime_merge = [](const std::vector<uint32_t>& out,
+                            const std::vector<uint32_t>& in) {
+        std::vector<uint32_t> r = out;
+        std::unordered_set<uint32_t> seen(out.begin(), out.end());
+        for (uint32_t v : in)
+            if (seen.insert(v).second) r.push_back(v);
+        return r;
+    };
+    // 3 nodes. out: 0->{1,2} 1->{} 2->{0}; in: 0->{2} 1->{0} 2->{0,1}
+    std::vector<uint64_t> f_rp{0, 2, 2, 3}, r_rp{0, 1, 2, 4};
+    std::vector<uint32_t> f_ci{1, 2, 0}, r_ci{2, 0, 0, 1};
+    std::vector<uint64_t> s_rp;
+    std::vector<uint32_t> s_ci;
+    merge_symmetric_csr_node_dedup(f_rp, f_ci, r_rp, r_ci, s_rp, s_ci);
+
+    for (uint32_t u = 0; u < 3; ++u) {
+        std::vector<uint32_t> out(f_ci.begin() + f_rp[u], f_ci.begin() + f_rp[u + 1]);
+        std::vector<uint32_t> in(r_ci.begin() + r_rp[u], r_ci.begin() + r_rp[u + 1]);
+        std::vector<uint32_t> expect = runtime_merge(out, in);
+        std::vector<uint32_t> got(s_ci.begin() + s_rp[u], s_ci.begin() + s_rp[u + 1]);
+        EXPECT_EQ(got, expect) << "node " << u;
+    }
 }
 
 }  // namespace
