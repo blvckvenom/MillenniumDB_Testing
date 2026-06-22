@@ -2139,6 +2139,43 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# Symmetric topology parallel-edge guard unit tests
+# ============================================================================
+# Constructs ProjectionStorage + scans a BPlusTree<3>, so it needs the full
+# millenniumdb link (same recipe as gnn_build_topology_snapshot_procedure_test).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_symmetric_parallel_edge_test.cc")
+    add_executable(topology_symmetric_parallel_edge_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_symmetric_parallel_edge_test.cc
+    )
+    set_target_properties(topology_symmetric_parallel_edge_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_symmetric_parallel_edge_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologySymmetricParallelEdgeTests
+        COMMAND $<TARGET_FILE:topology_symmetric_parallel_edge_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # GNN procedure metadata consistency tests (yield_fields vs runtime yields)
 # ============================================================================
 if(GTest_FOUND AND ENABLE_GNN AND

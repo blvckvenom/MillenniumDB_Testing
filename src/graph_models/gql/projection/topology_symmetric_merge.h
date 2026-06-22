@@ -4,6 +4,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "graph_models/object_id.h"
+#include "storage/index/bplus_tree/bplus_tree.h"
+#include "storage/index/record.h"
+
 namespace GQL::Projection {
 
 // Replicates TopologyAccessor::get_neighbors_into(UNDIRECTED) node-list dedup
@@ -44,6 +48,38 @@ inline uint64_t merge_symmetric_row(const std::vector<uint64_t>& out_dst,
         }
     }
     return merged_dst.size();
+}
+
+// True iff the from_to_edge BPT holds >=2 distinct edges on the same (src,dst)
+// (a meaningful parallel edge). The key layout (src,dst,edge_id) ascending makes
+// such edges adjacent: equal [0]&[1], differing [2]. Tags are stripped before
+// compare. A null BPT returns false (nothing to refuse). Used by the symmetric
+// edge_id-drop bake to ABSTAIN on a true multigraph rather than silently
+// node-id-dedup parallel edges away.
+inline bool detect_parallel_edges(BPlusTree<3>* fwd_bpt, uint64_t /*num_nodes*/) {
+    if (fwd_bpt == nullptr) {
+        return false;
+    }
+    bool interrupt = false;
+    Record<3> min_rec = {0, 0, 0};
+    Record<3> max_rec = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    auto iter = fwd_bpt->get_range(&interrupt, min_rec, max_rec);
+    const Record<3>* rec = nullptr;
+    bool have_prev = false;
+    uint64_t p_src = 0, p_dst = 0, p_eid = 0;
+    while ((rec = iter.next()) != nullptr) {
+        const uint64_t src = (*rec)[0] & ObjectId::VALUE_MASK;
+        const uint64_t dst = (*rec)[1] & ObjectId::VALUE_MASK;
+        const uint64_t eid = (*rec)[2] & ObjectId::VALUE_MASK;
+        if (have_prev && src == p_src && dst == p_dst && eid != p_eid) {
+            return true;  // two distinct edges on the same (src,dst)
+        }
+        p_src = src;
+        p_dst = dst;
+        p_eid = eid;
+        have_prev = true;
+    }
+    return false;
 }
 
 }  // namespace GQL::Projection
