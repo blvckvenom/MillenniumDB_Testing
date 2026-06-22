@@ -549,6 +549,18 @@ void TopologyAccessor::get_neighbors_into(ObjectId node_id,
             return;
 
         case EdgeOrientation::UNDIRECTED: {
+            // Four-level store path: ONE pre-merged undirected fetch. The store
+            // collapses out+in+dedup onto its symmetric tier when built, and
+            // onto the same-rule merge otherwise — either way one call, one
+            // result, byte-identical to the dual-fetch + merge below. This drops
+            // the per-node out+in fetch + dedup that was the dominant expand
+            // sub-cost.
+            if (impl_->four_level_store_) {
+                materialise_from_four_level_into_(
+                    impl_->four_level_store_->get_neighbors(node_id), out);
+                return;
+            }
+
             // Per-worker reusable scratch for the two directions (each parallel
             // sampler thread gets its own via thread_local). Filled in place so
             // the UNDIRECTED fetch allocates no fresh Neighbors per node.
@@ -1095,6 +1107,11 @@ void TopologyAccessor::enable_four_level_store(
 
 bool TopologyAccessor::is_four_level_store_enabled() const {
     return static_cast<bool>(impl_->four_level_store_);
+}
+
+bool TopologyAccessor::is_symmetric_topology_built() const {
+    return impl_->four_level_store_
+        && impl_->four_level_store_->is_symmetric_built();
 }
 
 const L2CompactCsr* TopologyAccessor::l2_fwd() const {

@@ -219,6 +219,20 @@ TEST(TopologyAccessorFourLevel, EnableDisable_Roundtrip) {
             << "in node " << nid;
     }
 
+    // UNDIRECTED routes through the single store->get_neighbors call (Task 14).
+    // No sidecar here, so the sym tier is NOT built — the store's same-rule
+    // fallback must still match the BPT-oracle merge for every node.
+    EXPECT_FALSE(acc_four_level.is_symmetric_topology_built());
+    for (uint64_t nid = 0; nid < FixtureGraph::kNumNodes; ++nid) {
+        mdb::gnn::Neighbors got;
+        acc_four_level.get_neighbors_into(
+            ObjectId(nid), mdb::gnn::EdgeOrientation::UNDIRECTED, got);
+        EXPECT_EQ(sorted_node_ids(acc_bpt.get_neighbors(
+                      ObjectId(nid), mdb::gnn::EdgeOrientation::UNDIRECTED)),
+                  sorted_node_ids(got))
+            << "undirected (fallback) node " << nid;
+    }
+
     // Calling enable twice throws (idempotent fail-loud contract).
     EXPECT_THROW(acc_four_level.enable_four_level_store(cfg), std::logic_error);
 }
@@ -549,6 +563,21 @@ TEST(TopologyAccessorFourLevel, Build_SymmetricTierFromDirectionalSidecars) {
                           ObjectId(nid), mdb::gnn::EdgeOrientation::UNDIRECTED)),
                       got)
                 << "sym dispatch node " << nid;
+        }
+
+        // Accessor-level Task 14: get_neighbors_into(UNDIRECTED) through a
+        // four-level accessor with the sym tier built must match the BPT oracle.
+        mdb::gnn::TopologyAccessor acc(*storage);
+        acc.enable_four_level_store(cfg);
+        EXPECT_TRUE(acc.is_symmetric_topology_built());
+        for (uint64_t nid = 0; nid < FixtureGraph::kNumNodes; ++nid) {
+            mdb::gnn::Neighbors got;
+            acc.get_neighbors_into(
+                ObjectId(nid), mdb::gnn::EdgeOrientation::UNDIRECTED, got);
+            EXPECT_EQ(sorted_node_ids(oracle.get_neighbors(
+                          ObjectId(nid), mdb::gnn::EdgeOrientation::UNDIRECTED)),
+                      sorted_node_ids(got))
+                << "accessor sym dispatch node " << nid;
         }
     }
     {

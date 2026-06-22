@@ -557,6 +557,12 @@ public:
     /// Returns true iff `enable_four_level_store()` has run successfully.
     bool is_four_level_store_enabled() const;
 
+    /// Returns true iff the four-level store is enabled AND its symmetric
+    /// (pre-merged undirected) tier was populated — i.e. UNDIRECTED neighbor
+    /// fetches resolve via a single pre-merged dispatch rather than the runtime
+    /// out+in+merge.
+    bool is_symmetric_topology_built() const;
+
     /**
      * @brief Tier-2 compact CSR per direction, for SIZING the dynamic GPU/CPU
      *        sampling backend decision (`plan_sampling_backend`).
