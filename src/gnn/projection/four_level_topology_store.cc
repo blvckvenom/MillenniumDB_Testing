@@ -214,6 +214,104 @@ void FourLevelTopologyStore::enable_pinned_gpu_view(
 }
 
 // ---------------------------------------------------------------------------
+// In-RAM symmetric CSR merge (Part D — GPU-UVA single slice).
+// ---------------------------------------------------------------------------
+
+void merge_symmetric_csr_concat(
+    const std::vector<uint64_t>& f_rp, const std::vector<uint32_t>& f_ci,
+    const std::vector<uint64_t>& r_rp, const std::vector<uint32_t>& r_ci,
+    std::vector<uint64_t>& o_rp, std::vector<uint32_t>& o_ci) {
+    const std::size_t n = f_rp.size() ? f_rp.size() - 1 : 0;
+    o_rp.assign(n + 1, 0);
+    o_ci.clear();
+    o_ci.reserve(f_ci.size() + r_ci.size());
+    for (std::size_t u = 0; u < n; ++u) {
+        for (uint64_t i = f_rp[u]; i < f_rp[u + 1]; ++i) o_ci.push_back(f_ci[i]);
+        for (uint64_t i = r_rp[u]; i < r_rp[u + 1]; ++i) o_ci.push_back(r_ci[i]);
+        o_rp[u + 1] = o_ci.size();
+    }
+}
+
+void merge_symmetric_csr_node_dedup(
+    const std::vector<uint64_t>& f_rp, const std::vector<uint32_t>& f_ci,
+    const std::vector<uint64_t>& r_rp, const std::vector<uint32_t>& r_ci,
+    std::vector<uint64_t>& o_rp, std::vector<uint32_t>& o_ci) {
+    const std::size_t n = f_rp.size() ? f_rp.size() - 1 : 0;
+    o_rp.assign(n + 1, 0);
+    o_ci.clear();
+    o_ci.reserve(f_ci.size() + r_ci.size());
+    std::unordered_set<uint32_t> seen;  // reused per row; small (O(degree))
+    for (std::size_t u = 0; u < n; ++u) {
+        seen.clear();
+        for (uint64_t i = f_rp[u]; i < f_rp[u + 1]; ++i) {
+            uint32_t v = f_ci[i];
+            if (seen.insert(v).second) o_ci.push_back(v);   // out first, dedup
+        }
+        for (uint64_t i = r_rp[u]; i < r_rp[u + 1]; ++i) {
+            uint32_t v = r_ci[i];
+            if (seen.insert(v).second) o_ci.push_back(v);   // in not already present
+        }
+        o_rp[u + 1] = o_ci.size();
+    }
+}
+
+const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
+    if (sym_arrays_built_) return &sym_arrays_;
+
+    auto narrow = [](const GQL::Projection::TopologySnapshotReader* r) {
+        return r != nullptr && r->has_data() && r->id_width() == 4;
+    };
+    const bool have_f = narrow(l3_fwd_);
+    const bool have_r = narrow(l3_rev_);
+    if (!have_f && !have_r) return nullptr;  // nothing pinnable to merge
+
+    const uint64_t n = have_f ? l3_fwd_->num_nodes() : l3_rev_->num_nodes();
+    auto lift = [n](const GQL::Projection::TopologySnapshotReader* r, bool present,
+                    std::vector<uint64_t>& rp, std::vector<uint32_t>& ci) {
+        rp.assign(static_cast<std::size_t>(n) + 1, 0);
+        ci.clear();
+        if (!present) return;
+        for (uint64_t u = 0; u < n; ++u) {
+            const uint64_t d = r->degree(u);
+            const uint32_t* row = r->col_idx32_row(u);
+            for (uint64_t i = 0; i < d; ++i) ci.push_back(row[i]);
+            rp[u + 1] = ci.size();
+        }
+    };
+    std::vector<uint64_t> f_rp, r_rp;
+    std::vector<uint32_t> f_ci, r_ci;
+    lift(l3_fwd_, have_f, f_rp, f_ci);
+    lift(l3_rev_, have_r, r_rp, r_ci);
+
+    // §4 contract: distinct real edge_ids => concat (no dedup, matching the
+    // edge_id-keyed merge that removes nothing); edge_id==0 => node-id dedup.
+    const bool distinct_eids =
+        (have_f && l3_fwd_->has_edge_ids()) || (have_r && l3_rev_->has_edge_ids());
+    if (distinct_eids) {
+        merge_symmetric_csr_concat(f_rp, f_ci, r_rp, r_ci,
+                                   sym_row_ptr_, sym_col_idx_);
+    } else {
+        merge_symmetric_csr_node_dedup(f_rp, f_ci, r_rp, r_ci,
+                                       sym_row_ptr_, sym_col_idx_);
+    }
+
+    sym_arrays_.row_ptr      = sym_row_ptr_.data();
+    sym_arrays_.col_idx      = sym_col_idx_.data();
+    sym_arrays_.n_rows       = n;
+    sym_arrays_.n_edges      = sym_col_idx_.size();
+    sym_arrays_.dst_type_tag =
+        static_cast<uint64_t>((have_f ? l3_fwd_ : l3_rev_)->dst_type_tag()) << 56;
+    sym_arrays_built_ = true;
+    return &sym_arrays_;
+}
+
+std::size_t FourLevelTopologyStore::symmetric_ram_bytes() const noexcept {
+    if (!sym_arrays_built_) return 0;
+    return sym_row_ptr_.size() * sizeof(uint64_t)
+         + sym_col_idx_.size() * sizeof(uint32_t);
+}
+
+// ---------------------------------------------------------------------------
 //  build()
 // ---------------------------------------------------------------------------
 

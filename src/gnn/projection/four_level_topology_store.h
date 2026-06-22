@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "gnn/projection/adj_entry.h"
+#include "gnn/projection/pinned_topology_view.h"  // HostCsrArrays (complete type)
 #include "gnn/projection/edge_orientation.h"
 #include "gnn/projection/l1_hash_cache.h"
 #include "gnn/projection/l2_compact_csr.h"
@@ -45,6 +46,21 @@ void symmetric_merge_row(const std::vector<uint64_t>& dst_fwd,
                          bool has_edge_ids,
                          std::vector<AdjEntry>& out);
 }  // namespace detail
+
+// Merge two narrow uint32 directional CSRs into one undirected CSR (the in-RAM
+// substrate the GPU-UVA single slice pins).
+//   _concat:     out(u) ++ in(u) with NO dedup (the has_edge_ids / distinct-edge
+//                case — parallel/mutual edges preserved).
+//   _node_dedup: out(u) ++ (in(u) not already present) (the edge_id==0 case).
+// Per-row peak O(degree); out_row_ptr is sized from the realized per-row counts.
+void merge_symmetric_csr_concat(
+    const std::vector<uint64_t>& fwd_row_ptr, const std::vector<uint32_t>& fwd_col_idx,
+    const std::vector<uint64_t>& rev_row_ptr, const std::vector<uint32_t>& rev_col_idx,
+    std::vector<uint64_t>& out_row_ptr, std::vector<uint32_t>& out_col_idx);
+void merge_symmetric_csr_node_dedup(
+    const std::vector<uint64_t>& fwd_row_ptr, const std::vector<uint32_t>& fwd_col_idx,
+    const std::vector<uint64_t>& rev_row_ptr, const std::vector<uint32_t>& rev_col_idx,
+    std::vector<uint64_t>& out_row_ptr, std::vector<uint32_t>& out_col_idx);
 
 /**
  * @brief Coordinator for the frequency-tiered Four-Level Topology Store.
@@ -439,6 +455,24 @@ public:
     }
 
     /**
+     * @brief Build (once, idempotent) an in-RAM merged undirected CSR from the
+     *        active L3 fwd+rev narrow readers and cache it.
+     *
+     * Replicates the accessor's undirected emission (out ++ in, dedup keyed on
+     * node-id when edge_ids are absent/zero, concat when edge_ids are distinct)
+     * so the merged slice is the byte-identical receptive field the runtime
+     * out+in+merge produces. Returns a stable pointer to the cached HostCsrArrays,
+     * or nullptr when neither L3 narrow (id_width==4) reader is present (the GPU
+     * path then stays off and the CPU merge runs unchanged). NOT a second build():
+     * pure additive RAM allocation, safe to call after build(). Idempotent.
+     */
+    const HostCsrArrays* materialize_symmetric_arrays();
+
+    /// Resident bytes of the materialized symmetric arrays ((N+1)*8 + M*4),
+    /// 0 when not built. For RAM diagnostics + telemetry.
+    std::size_t symmetric_ram_bytes() const noexcept;
+
+    /**
      * @brief Get outgoing neighbors (NATURAL).
      *
      * @throws std::logic_error when the store was constructed via the
@@ -661,6 +695,16 @@ private:
     // must run before the L3 sidecar readers / L2 caches it pins are freed.
     // nullptr unless enable_pinned_gpu_view() registered one.
     std::unique_ptr<PinnedTopologyView>                pinned_view_;
+
+    // In-RAM merged undirected CSR for the GPU-UVA single slice (Part D). Owns
+    // its backing vectors so the pinned pages stay valid; sym_arrays_ points into
+    // them. Built lazily by materialize_symmetric_arrays(). NOTE: distinct from
+    // the Part C sym_built_ tier-dispatch flag — this is the flat uint32 CSR for
+    // pinning, gated by its own sym_arrays_built_.
+    std::vector<uint64_t>                              sym_row_ptr_;
+    std::vector<uint32_t>                              sym_col_idx_;
+    HostCsrArrays                                      sym_arrays_{};
+    bool                                               sym_arrays_built_ = false;
 };
 
 }  // namespace mdb::gnn
