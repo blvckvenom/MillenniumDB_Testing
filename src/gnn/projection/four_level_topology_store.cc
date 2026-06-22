@@ -173,6 +173,22 @@ void FourLevelTopologyStore::enable_pinned_gpu_view(
         return;  // CPU path: nothing to pin.
     }
 
+    // Symmetric single-slice path: serve ONE pre-merged undirected CSR as fwd,
+    // rev null. plan.directions is FORWARD_ONLY here (the engine forces it); BOTH
+    // would double-count an already-merged list and is never used.
+    if (plan.use_symmetric) {
+        const HostCsrArrays* sym = materialize_symmetric_arrays();
+        if (sym == nullptr || sym->row_ptr == nullptr) {
+            return;  // nothing pinnable -> stay on CPU path
+        }
+        auto view = std::make_unique<PinnedTopologyView>();
+        view->build_and_register(*sym, HostCsrArrays{});
+        if (view->is_registered()) {
+            pinned_view_ = std::move(view);
+        }
+        return;
+    }
+
     // Substrate A: the global L3 sidecar (full ROW_PTR + narrow uint32 COL_IDX)
     // covers every node by dense row, so it is the correctness-complete pinnable
     // CSR. Only the narrow (id_width==4) layout is pinnable as uint32.

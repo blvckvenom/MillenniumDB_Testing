@@ -12,6 +12,7 @@
 
 #include "gnn/projection/edge_orientation.h"
 #include "gnn/projection/four_level_topology_store.h"
+#include "gnn/projection/pinned_topology_view.h"
 #include "gnn/sampling/sampling_backend_plan.h"
 #include "gnn/sampling/sampling_config.h"
 
@@ -71,6 +72,31 @@ TEST(SymmetricMerge, EdgeIdDistinct_NoDedup) {
     merge_symmetric_csr_concat(fwd_rp, fwd_ci, rev_rp, rev_ci, sym_rp, sym_ci);
     EXPECT_EQ(sym_rp, (std::vector<uint64_t>{0, 1, 2}));
     EXPECT_EQ(sym_ci, (std::vector<uint32_t>{1, 0}));
+}
+
+// The merged undirected slice is served as fwd ONLY (rev null), never BOTH.
+// CI-friendly: without a runtime GPU the pin is a documented no-op.
+TEST(SymmetricPin, SingleSliceForwardOnly_RevNull) {
+    std::vector<uint64_t> rp = {0, 2, 3, 5};
+    std::vector<uint32_t> ci = {1, 2, 0, 0, 1};
+    HostCsrArrays sym;
+    sym.row_ptr = rp.data();
+    sym.col_idx = ci.data();
+    sym.n_rows = 3;
+    sym.n_edges = 5;
+    sym.dst_type_tag = static_cast<uint64_t>(0xD4) << 56;
+
+    PinnedTopologyView view;
+    view.build_and_register(sym, HostCsrArrays{});  // rev null == symmetric pin
+    if (!view.is_registered()) {                    // no GPU: documented no-op
+        EXPECT_EQ(view.fwd(), nullptr);
+        EXPECT_EQ(view.rev(), nullptr);
+        return;
+    }
+    ASSERT_NE(view.fwd(), nullptr);
+    EXPECT_EQ(view.rev(), nullptr);                 // NEVER BOTH for symmetric
+    EXPECT_EQ(view.fwd()->n_rows, 3u);
+    EXPECT_EQ(view.fwd()->n_edges, 5u);
 }
 
 }  // namespace
