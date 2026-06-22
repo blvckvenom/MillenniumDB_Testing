@@ -167,6 +167,11 @@ struct BasicKHopSampler::Impl {
             tcfg.l2_budget_mb        = config_.l2_cache_mb;
             tcfg.use_l3_mmap_sidecar = config_.use_l3_mmap_sidecar;
             tcfg.orientation         = config_.orientation;
+            // useSymmetricTopology AUTO/ON -> build the pre-merged undirected
+            // tier; OFF -> keep the runtime out+in+merge fallback (the
+            // bit-reproducible reference, byte-identical via the same dedup).
+            tcfg.build_symmetric_tier =
+                config_.symmetric_resolved_on(config_.orientation);
             topology->enable_four_level_store(tcfg);
             // Force PER_NODE: the four-level store dispatch is O(1) per
             // node (L1 hash lookup or L2 CSR slice), which beats the

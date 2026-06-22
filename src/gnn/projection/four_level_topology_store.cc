@@ -1152,7 +1152,8 @@ void FourLevelTopologyStore::build() {
         // topology_sym.csr; else merge the two directional sidecars row-by-row.
         // Skipped (sym_built_ stays false) when neither source is available, so
         // get_neighbors(UNDIRECTED) keeps the runtime out+in+merge fallback.
-        if (config_.orientation == EdgeOrientation::UNDIRECTED) {
+        if (config_.orientation == EdgeOrientation::UNDIRECTED
+            && config_.build_symmetric_tier) {
             // Edge_id-drop guard: dropping forces node-id dedup, which would
             // collapse parallel edges and change the receptive field. Refuse on
             // a parallel-edge multigraph and leave the sym tier unbuilt so the

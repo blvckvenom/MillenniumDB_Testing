@@ -290,6 +290,12 @@ public:
         /// build REFUSES the drop (sym_refused_edge_id_drop()), leaving the
         /// symmetric tier unbuilt so the runtime out+in+merge fallback engages.
         bool drop_edge_ids = false;
+
+        /// Build the symmetric (pre-merged undirected) tier for UNDIRECTED
+        /// orientation. Default true. When false, get_neighbors(UNDIRECTED) uses
+        /// the runtime out+in+merge fallback (same dedup rule, so byte-identical)
+        /// — the bit-reproducible reference for the symmetric ON/OFF gate.
+        bool build_symmetric_tier = true;
     };
 
     // ------------------------------------------------------------------
