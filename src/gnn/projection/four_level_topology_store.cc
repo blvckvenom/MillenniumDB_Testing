@@ -623,6 +623,18 @@ void FourLevelTopologyStore::open_l3_sidecars_() {
                     GQL::Projection::TopologySnapshotReader::Direction::REVERSE));
         l3_rev_ = owned_l3_rev_.get();
     }
+    // Optional on-disk pre-merged undirected sidecar (topology_sym.csr). When
+    // present it is the fast path for the symmetric tier; when absent the
+    // symmetric tier is built by merging l3_fwd_ + l3_rev_ at build() time.
+    if (config_.orientation == EdgeOrientation::UNDIRECTED) {
+        owned_l3_sym_ = std::make_unique<
+            GQL::Projection::TopologySnapshotReader>(
+                GQL::Projection::TopologySnapshotReader::open_symmetric(
+                    projection_dir_));
+        l3_sym_ = (owned_l3_sym_ && owned_l3_sym_->has_data())
+                      ? owned_l3_sym_.get() : nullptr;
+        if (l3_sym_ == nullptr) owned_l3_sym_.reset();
+    }
 }
 
 void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
@@ -1010,6 +1022,29 @@ void FourLevelTopologyStore::build() {
 
         populate_ms = elapsed_ms_(t_pop, clk_::now());
         io_read_after = read_proc_io_read_bytes_();
+
+        // Symmetric (pre-merged undirected) tier. Reuses the SAME per-node tier
+        // assignment + freq (direction-agnostic). Prefer the on-disk
+        // topology_sym.csr; else merge the two directional sidecars row-by-row.
+        // Skipped (sym_built_ stays false) when neither source is available, so
+        // get_neighbors(UNDIRECTED) keeps the runtime out+in+merge fallback.
+        if (config_.orientation == EdgeOrientation::UNDIRECTED) {
+            if (l3_sym_ != nullptr && l3_sym_->has_data()) {
+                populate_direction_via_sidecar_(*l3_sym_, owned_tier_assignment_,
+                                                freq, owned_l1_sym_, owned_l2_sym_);
+                sym_built_ = true;
+            } else if (l3_fwd_ != nullptr && l3_fwd_->has_data()
+                       && l3_rev_ != nullptr && l3_rev_->has_data()) {
+                populate_direction_symmetric_(*l3_fwd_, *l3_rev_,
+                                              owned_tier_assignment_, freq,
+                                              owned_l1_sym_, owned_l2_sym_);
+                sym_built_ = true;
+            }
+            if (sym_built_) {
+                l1_sym_ = owned_l1_sym_.get();
+                l2_sym_ = owned_l2_sym_.get();
+            }
+        }
     }
 
     // Wire the active references to the owned tier sources.
@@ -1052,6 +1087,27 @@ void FourLevelTopologyStore::build() {
                 if (std::get<0>(*rec) != v.id) continue;
                 out.push_back(AdjEntry{ std::get<1>(*rec), std::get<2>(*rec) });
             }
+            return out;
+        };
+    }
+
+    // L4 symmetric fallback: merge the two directional L4 closures so a tier-3/4
+    // sym node (no L1/L2 entry) still resolves to the canonical UNDIRECTED list.
+    if (sym_built_ && fwd_bpt_ != nullptr && rev_bpt_ != nullptr) {
+        L4Lookup lf = l4_fwd_;
+        L4Lookup lr = l4_rev_;
+        l4_sym_ = [lf, lr](ObjectId v) -> std::vector<AdjEntry> {
+            std::vector<AdjEntry> a = lf ? lf(v) : std::vector<AdjEntry>{};
+            std::vector<AdjEntry> b = lr ? lr(v) : std::vector<AdjEntry>{};
+            std::vector<uint64_t> df, ef, dr, er;
+            df.reserve(a.size()); ef.reserve(a.size());
+            dr.reserve(b.size()); er.reserve(b.size());
+            for (auto& e : a) { df.push_back(e.node_id); ef.push_back(e.edge_id); }
+            for (auto& e : b) { dr.push_back(e.node_id); er.push_back(e.edge_id); }
+            const bool has_eids = (!a.empty() && a.front().edge_id != 0)
+                               || (!b.empty() && b.front().edge_id != 0);
+            std::vector<AdjEntry> out;
+            detail::symmetric_merge_row(df, ef, dr, er, has_eids, out);
             return out;
         };
     }
@@ -1318,6 +1374,14 @@ std::size_t FourLevelTopologyStore::l3_node_count() const noexcept {
     return n;
 }
 
+std::size_t FourLevelTopologyStore::l1_sym_node_count() const noexcept {
+    return l1_sym_ != nullptr ? l1_sym_->node_count() : 0;
+}
+
+std::size_t FourLevelTopologyStore::l2_sym_node_count() const noexcept {
+    return l2_sym_ != nullptr ? l2_sym_->node_count() : 0;
+}
+
 std::size_t FourLevelTopologyStore::l4_node_count() const noexcept {
     if (tier_lookup_ref_ == nullptr) return 0;
     std::size_t n = 0;
@@ -1340,6 +1404,8 @@ std::size_t FourLevelTopologyStore::total_ram_used() const noexcept {
     if (l1_rev_ != nullptr) bytes += l1_rev_->total_bytes();
     if (l2_fwd_ != nullptr) bytes += l2_fwd_->total_bytes();
     if (l2_rev_ != nullptr) bytes += l2_rev_->total_bytes();
+    if (l1_sym_ != nullptr) bytes += l1_sym_->total_bytes();
+    if (l2_sym_ != nullptr) bytes += l2_sym_->total_bytes();
     return bytes;
 }
 

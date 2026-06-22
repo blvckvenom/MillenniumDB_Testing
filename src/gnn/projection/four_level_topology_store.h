@@ -456,6 +456,10 @@ public:
     std::size_t l2_node_count() const noexcept;
     std::size_t l3_node_count() const noexcept;
     std::size_t l4_node_count() const noexcept;
+    /// Node counts held by the symmetric (pre-merged undirected) L1/L2 tiers;
+    /// 0 when the symmetric tier is not built.
+    std::size_t l1_sym_node_count() const noexcept;
+    std::size_t l2_sym_node_count() const noexcept;
 
     /// Sum of L1 + L2 resident bytes (using the `kL1*` / `kL2*` Phase
     /// 1 contracts) across both directions. L3 / L4 are mmap / disk

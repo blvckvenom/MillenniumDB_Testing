@@ -481,3 +481,75 @@ TEST(TopologyAccessorFourLevel, Build_ColdStartSkipsMinHashReorder) {
 
     EXPECT_TRUE(store.l3_reorder_permutation().empty());
 }
+
+// ---------------------------------------------------------------------------
+// Build_SymmetricTierFromDirectionalSidecars.
+//
+// An UNDIRECTED build with both directional sidecars present (and no on-disk
+// topology_sym.csr) populates the symmetric tier by merging fwd+rev row-by-row,
+// so is_symmetric_built() is true and the symmetric L1 holds every node. A
+// NATURAL-orientation build leaves the symmetric tier off.
+// ---------------------------------------------------------------------------
+TEST(TopologyAccessorFourLevel, Build_SymmetricTierFromDirectionalSidecars) {
+    (void)MdbFixture::instance();
+    auto storage = build_fixture_storage("four_level_symmetric_tier");
+
+    auto build_sidecar = [&](GQL::Projection::TopologySnapshotWriter::Direction dir) {
+        std::vector<uint64_t> degrees(FixtureGraph::kNumNodes, 0);
+        std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sorted_edges;
+        for (const auto& e : FixtureGraph::edges()) {
+            const uint64_t from = std::get<0>(e), to = std::get<1>(e),
+                           eid = std::get<2>(e);
+            if (dir == GQL::Projection::TopologySnapshotWriter::Direction::FORWARD) {
+                sorted_edges.emplace_back(from, to, eid);
+                degrees[from]++;
+            } else {
+                sorted_edges.emplace_back(to, from, eid);
+                degrees[to]++;
+            }
+        }
+        std::sort(sorted_edges.begin(), sorted_edges.end());
+        GQL::Projection::TopologySnapshotWriter w(
+            std::filesystem::path(storage->get_projection_dir()), dir,
+            FixtureGraph::kNumNodes, std::move(degrees), /*include_edge_ids=*/true);
+        for (const auto& [src, dst, eid] : sorted_edges) {
+            w.append_edge(ObjectId(src), ObjectId(dst), ObjectId(eid));
+        }
+        w.finalize();
+    };
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::FORWARD);
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::REVERSE);
+
+    {
+        mdb::gnn::FourLevelTopologyStore::Config cfg;
+        cfg.l1_budget_mb        = 256;  // all nodes -> L1
+        cfg.l2_budget_mb        = 256;
+        cfg.use_l3_mmap_sidecar = true;
+        cfg.orientation         = mdb::gnn::EdgeOrientation::UNDIRECTED;
+        mdb::gnn::FourLevelTopologyStore store(
+            storage->get_from_to_edge_index(),
+            storage->get_to_from_edge_index(),
+            storage.get(),
+            std::filesystem::path(storage->get_projection_dir()), cfg);
+        store.build();
+        EXPECT_TRUE(store.is_symmetric_built());
+        // All 6 nodes (incl. the isolated one) land in the symmetric L1.
+        EXPECT_EQ(FixtureGraph::kNumNodes, store.l1_sym_node_count());
+        EXPECT_EQ(0u, store.l2_sym_node_count());
+    }
+    {
+        mdb::gnn::FourLevelTopologyStore::Config cfg;
+        cfg.l1_budget_mb        = 256;
+        cfg.l2_budget_mb        = 256;
+        cfg.use_l3_mmap_sidecar = true;
+        cfg.orientation         = mdb::gnn::EdgeOrientation::NATURAL;
+        mdb::gnn::FourLevelTopologyStore store(
+            storage->get_from_to_edge_index(),
+            storage->get_to_from_edge_index(),
+            storage.get(),
+            std::filesystem::path(storage->get_projection_dir()), cfg);
+        store.build();
+        EXPECT_FALSE(store.is_symmetric_built());
+        EXPECT_EQ(0u, store.l1_sym_node_count());
+    }
+}
