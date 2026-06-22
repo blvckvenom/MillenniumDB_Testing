@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <random>
@@ -464,6 +465,67 @@ TEST(TopologyAccessorFourLevel, Build_UsesSidecarWhenAvailable) {
     // node_counts.bin exists (every build today). Phase 5 will flip
     // the warm-start branch and populate this vector.
     EXPECT_TRUE(store.l3_reorder_permutation().empty());
+}
+
+// ---------------------------------------------------------------------------
+// MaterializeSymmetricArrays_Idempotent.
+//
+// materialize_symmetric_arrays() merges the two narrow (uint32) directional L3
+// readers into one in-RAM undirected slice exactly once and caches it: a second
+// call returns the same pointer (the lazy/idempotent contract) without re-merging,
+// and never touches the on-disk topology_sym.csr.
+// ---------------------------------------------------------------------------
+TEST(TopologyAccessorFourLevel, MaterializeSymmetricArrays_Idempotent) {
+    (void)MdbFixture::instance();
+    auto storage = build_fixture_storage("four_level_sym_materialize");
+
+    // Narrow (uint32) sidecars so materialize_symmetric_arrays() (id_width==4)
+    // produces real arrays. Scope the env to this test's writes only.
+    ::setenv("MDB_GNN_TOPOLOGY_UINT32", "1", /*overwrite=*/1);
+    auto build_sidecar = [&](GQL::Projection::TopologySnapshotWriter::Direction dir) {
+        std::vector<uint64_t> degrees(FixtureGraph::kNumNodes, 0);
+        std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sorted_edges;
+        for (const auto& e : FixtureGraph::edges()) {
+            const uint64_t from = std::get<0>(e), to = std::get<1>(e),
+                           eid = std::get<2>(e);
+            if (dir == GQL::Projection::TopologySnapshotWriter::Direction::FORWARD) {
+                sorted_edges.emplace_back(from, to, eid); degrees[from]++;
+            } else {
+                sorted_edges.emplace_back(to, from, eid); degrees[to]++;
+            }
+        }
+        std::sort(sorted_edges.begin(), sorted_edges.end());
+        GQL::Projection::TopologySnapshotWriter w(
+            std::filesystem::path(storage->get_projection_dir()), dir,
+            FixtureGraph::kNumNodes, std::move(degrees), /*include_edge_ids=*/true);
+        for (const auto& [src, dst, eid] : sorted_edges) {
+            w.append_edge(ObjectId(src), ObjectId(dst), ObjectId(eid));
+        }
+        w.finalize();
+    };
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::FORWARD);
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::REVERSE);
+    ::unsetenv("MDB_GNN_TOPOLOGY_UINT32");
+
+    mdb::gnn::FourLevelTopologyStore::Config cfg;
+    cfg.l1_budget_mb        = 256;
+    cfg.l2_budget_mb        = 256;
+    cfg.use_l3_mmap_sidecar = true;
+    cfg.orientation         = mdb::gnn::EdgeOrientation::UNDIRECTED;
+    mdb::gnn::FourLevelTopologyStore store(
+        storage->get_from_to_edge_index(),
+        storage->get_to_from_edge_index(),
+        storage.get(),
+        std::filesystem::path(storage->get_projection_dir()), cfg);
+    store.build();
+
+    const mdb::gnn::HostCsrArrays* a = store.materialize_symmetric_arrays();
+    ASSERT_NE(a, nullptr) << "narrow L3 readers should yield merged arrays";
+    EXPECT_GT(store.symmetric_ram_bytes(), 0u);
+    const std::size_t edges1 = a->n_edges;
+    const mdb::gnn::HostCsrArrays* b = store.materialize_symmetric_arrays();
+    EXPECT_EQ(a, b) << "second materialize must return the cached pointer";
+    EXPECT_EQ(edges1, b->n_edges);
 }
 
 // ---------------------------------------------------------------------------

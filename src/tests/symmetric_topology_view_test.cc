@@ -99,5 +99,18 @@ TEST(SymmetricPin, SingleSliceForwardOnly_RevNull) {
     EXPECT_EQ(view.fwd()->n_edges, 5u);
 }
 
+// The merge is deterministic, so the cached materialize (materialize once, reuse
+// the same pointer) is a no-op the second time — same inputs => same outputs.
+TEST(SymmetricLazy, MergeHelpersAreDeterministic_Idempotent) {
+    std::vector<uint64_t> f_rp{0, 2, 2, 3}, r_rp{0, 1, 2, 4};
+    std::vector<uint32_t> f_ci{1, 2, 0}, r_ci{2, 0, 0, 1};
+    std::vector<uint64_t> rp1, rp2;
+    std::vector<uint32_t> ci1, ci2;
+    merge_symmetric_csr_node_dedup(f_rp, f_ci, r_rp, r_ci, rp1, ci1);
+    merge_symmetric_csr_node_dedup(f_rp, f_ci, r_rp, r_ci, rp2, ci2);
+    EXPECT_EQ(rp1, rp2);
+    EXPECT_EQ(ci1, ci2);
+}
+
 }  // namespace
 }  // namespace mdb::gnn
