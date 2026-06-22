@@ -109,6 +109,50 @@ std::array<uint8_t, 32> sha256_of_file(const std::filesystem::path& path) {
     return digest;
 }
 
+// Stream SHA-256 over a fixed-order list of files, chaining all bytes through
+// one EVP context. The result is the symmetric sidecar's combined two-source
+// digest. Empty/absent paths in the list are skipped by the caller's guard.
+std::array<uint8_t, 32> sha256_of_files_chained(
+    const std::vector<std::filesystem::path>& paths) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        throw std::runtime_error("TopologySnapshotWriter: EVP_MD_CTX_new failed");
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error(
+            "TopologySnapshotWriter: EVP_DigestInit_ex(SHA-256) failed");
+    }
+    constexpr std::size_t BUF = 64 * 1024;
+    std::array<char, BUF> buf;
+    for (const auto& path : paths) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            EVP_MD_CTX_free(ctx);
+            throw std::runtime_error(
+                "TopologySnapshotWriter: cannot open source .leaf for combined "
+                "SHA-256: " + path.string());
+        }
+        while (f.read(buf.data(), BUF) || f.gcount() > 0) {
+            if (EVP_DigestUpdate(ctx, buf.data(),
+                                 static_cast<std::size_t>(f.gcount())) != 1) {
+                EVP_MD_CTX_free(ctx);
+                throw std::runtime_error(
+                    "TopologySnapshotWriter: EVP_DigestUpdate failed (chained)");
+            }
+        }
+    }
+    std::array<uint8_t, 32> digest{};
+    unsigned int len = 0;
+    if (EVP_DigestFinal_ex(ctx, digest.data(), &len) != 1 || len != 32) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error(
+            "TopologySnapshotWriter: EVP_DigestFinal_ex failed (chained)");
+    }
+    EVP_MD_CTX_free(ctx);
+    return digest;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -235,6 +279,128 @@ TopologySnapshotWriter::TopologySnapshotWriter(
         // is fixed — ROW_PTR is right after the header — so we can commit it
         // now. COL_IDX and (optionally) EDGE_IDS are filled in by
         // append_edge() via pwrite at the per-edge offsets implied by row_ptr_.
+        pwrite_all(row_ptr_.data(),
+                   row_ptr_.size() * sizeof(uint64_t),
+                   kTopologySnapshotHeaderSize);
+    } catch (...) {
+        ::close(out_fd_);
+        out_fd_ = -1;
+        std::error_code ec;
+        std::filesystem::remove(tmp_path_, ec);
+        throw;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor — explicit basename + chained multi-source hash (symmetric CSR)
+// ---------------------------------------------------------------------------
+//
+// Body is byte-identical to the Direction ctor above (degrees check, row_ptr
+// prefix sum, uint32 eligibility, coalescing-buffer reserves, section offsets,
+// O_EXCL open / ftruncate / placeholder-header / ROW_PTR prewrite). Only the
+// init-list differs: final_path_ is the explicit basename, the source set is
+// the chained `source_leaf_paths_` list, and the two symmetric-mode members
+// are set. The source hashing itself happens in finalize().
+
+TopologySnapshotWriter::TopologySnapshotWriter(
+    const std::filesystem::path&             projection_dir,
+    std::string                              output_basename,
+    std::vector<std::filesystem::path>       source_leaf_paths,
+    uint64_t                                 num_nodes,
+    std::vector<uint64_t>                    degrees,
+    bool                                     include_edge_ids,
+    bool                                     symmetric_format)
+    : projection_dir_    (projection_dir)
+    , direction_         (Direction::FORWARD)   // unused in this mode
+    , num_nodes_         (num_nodes)
+    , num_edges_         (0)
+    , include_edge_ids_  (include_edge_ids)
+    , source_leaf_path_  ()                      // unused; combined hash uses the list
+    , final_path_        (projection_dir / output_basename)
+    , tmp_path_          (final_path_.string() + ".tmp")
+    , source_leaf_paths_ (std::move(source_leaf_paths))
+    , symmetric_format_  (symmetric_format)
+{
+    if (degrees.size() != num_nodes_) {
+        throw std::invalid_argument(
+            "TopologySnapshotWriter: degrees.size() ("
+            + std::to_string(degrees.size())
+            + ") != num_nodes (" + std::to_string(num_nodes_) + ")");
+    }
+
+    // Build row_ptr as prefix sum of degrees. row_ptr has length N+1 and
+    // encodes invariant row_ptr[0]=0, row_ptr[N]=M (§5.1).
+    row_ptr_.resize(static_cast<std::size_t>(num_nodes_) + 1);
+    row_ptr_[0] = 0;
+    uint64_t running = 0;
+    for (uint64_t i = 0; i < num_nodes_; ++i) {
+        running += degrees[i];
+        row_ptr_[i + 1] = running;
+    }
+    num_edges_ = running;
+
+    // uint32 topology sidecar eligibility — identical opt-in rules as the
+    // Direction ctor (MDB_GNN_TOPOLOGY_UINT32 + node/edge ids fit uint32).
+    {
+        bool want_narrow = false;
+        if (const char* e = std::getenv("MDB_GNN_TOPOLOGY_UINT32")) {
+            want_narrow = (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+        }
+        const uint64_t kU32 = uint64_t{1} << 32;
+        const bool node_fits = num_nodes_ < kU32;
+        const bool edge_fits = !include_edge_ids_ || num_edges_ < kU32;
+        id_width_ = (want_narrow && node_fits && edge_fits)
+                        ? kTopologySnapshotIdWidthNarrow
+                        : kTopologySnapshotIdWidth;
+    }
+
+    write_cursor_.assign(static_cast<std::size_t>(num_nodes_), 0);
+
+    col_idx_buf_.reserve(kCoalesceBytes / sizeof(uint64_t));
+    if (include_edge_ids_) {
+        edge_ids_buf_.reserve(kCoalesceBytes / sizeof(uint64_t));
+    }
+    if (id_width_ == kTopologySnapshotIdWidthNarrow) {
+        col_idx_buf32_.reserve(kCoalesceBytes / sizeof(uint64_t));
+        if (include_edge_ids_) {
+            edge_ids_buf32_.reserve(kCoalesceBytes / sizeof(uint64_t));
+        }
+    }
+
+    // Section offsets. Fixed once N, M, and id_width_ are known. ROW_PTR is
+    // uint64; COL_IDX / EDGE_IDS use element_size_() (4 or 8).
+    col_idx_offset_  = static_cast<uint64_t>(kTopologySnapshotHeaderSize)
+                     + sizeof(uint64_t) * (num_nodes_ + 1);
+    edge_ids_offset_ = col_idx_offset_
+                     + element_size_() * num_edges_;
+    const uint64_t file_size =
+        col_idx_offset_
+        + element_size_() * num_edges_ * (include_edge_ids_ ? 2 : 1);
+
+    out_fd_ = ::open(tmp_path_.c_str(),
+                     O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                     S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (out_fd_ < 0) {
+        int e = errno;
+        throw std::runtime_error(
+            "TopologySnapshotWriter: cannot create " + tmp_path_.string()
+            + " (errno=" + std::to_string(e)
+            + (e == EEXIST ? " / another writer already holds this file" : "")
+            + ")");
+    }
+
+    try {
+        if (::ftruncate(out_fd_, static_cast<off_t>(file_size)) != 0) {
+            int e = errno;
+            throw std::runtime_error(
+                "TopologySnapshotWriter: ftruncate failed on " + tmp_path_.string()
+                + " to " + std::to_string(file_size) + " bytes"
+                + " (errno=" + std::to_string(e) + ")");
+        }
+
+        std::array<uint8_t, kTopologySnapshotHeaderSize> zero_header{};
+        pwrite_all(zero_header.data(), zero_header.size(), 0);
+
         pwrite_all(row_ptr_.data(),
                    row_ptr_.size() * sizeof(uint64_t),
                    kTopologySnapshotHeaderSize);
@@ -534,9 +700,32 @@ void TopologySnapshotWriter::finalize() {
     flush_col_idx_buffer_();
     flush_edge_ids_buffer_();
 
-    // Hash the source .leaf end-to-end (separate pass over the file).
+    // Hash the source(s). Symmetric mode chains the explicit source list into
+    // one combined digest; directional mode hashes the single direction-derived
+    // .leaf (legacy path).
     std::array<uint8_t, 32> source_hash{};
-    if (std::filesystem::exists(source_leaf_path_)) {
+    if (symmetric_format_ || !source_leaf_paths_.empty()) {
+        if (num_edges_ != 0) {
+            for (const auto& p : source_leaf_paths_) {
+                if (!std::filesystem::exists(p)) {
+                    throw std::runtime_error(
+                        "TopologySnapshotWriter: source .leaf missing: " + p.string());
+                }
+                if (std::filesystem::file_size(p) == 0) {
+                    throw std::runtime_error(
+                        "TopologySnapshotWriter: source .leaf is empty but graph "
+                        "has " + std::to_string(num_edges_) + " edges: " + p.string());
+                }
+            }
+        }
+        bool any_present = false;
+        for (const auto& p : source_leaf_paths_) {
+            if (std::filesystem::exists(p)) { any_present = true; break; }
+        }
+        if (any_present) {
+            source_hash = sha256_of_files_chained(source_leaf_paths_);
+        }
+    } else if (std::filesystem::exists(source_leaf_path_)) {
         // Guard against an empty source file paired with a non-empty graph:
         // hashing an empty file yields a well-defined digest, but that
         // silently accepts an obviously corrupt projection layout. Fail
@@ -560,8 +749,11 @@ void TopologySnapshotWriter::finalize() {
         }
     }
 
-    // Rewrite header at offset 0 with real values (§5.3 step 5).
-    TopologySnapshotHeader header = make_default_topology_snapshot_header();
+    // Rewrite header at offset 0 with real values (§5.3 step 5). Symmetric mode
+    // uses the "TOPOSYM1" magic/version so directional readers never mis-parse it.
+    TopologySnapshotHeader header = symmetric_format_
+        ? make_default_topology_snapshot_sym_header()
+        : make_default_topology_snapshot_header();
     header.id_width = id_width_;
     if (include_edge_ids_) {
         header.flags |= TopologySnapshotFlags::kHasEdgeIds;

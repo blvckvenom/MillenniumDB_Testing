@@ -490,3 +490,120 @@ TEST_F(TopologySnapshotWriterTest, AppendEdgeRejectsDegreeOverflow) {
         writer.append_edge(ObjectId{0}, ObjectId{1}, ObjectId{0}),
         std::runtime_error);
 }
+
+// ---------------------------------------------------------------------------
+// Symmetric / explicit-basename writer ctor
+// ---------------------------------------------------------------------------
+
+// Hand-compute SHA-256 of two concatenated payloads, matching the writer's
+// fixed-order chaining (from_to_edge.leaf first, to_from_edge.leaf second).
+static std::array<uint8_t, 32> sha256_concat(const std::string& a,
+                                             const std::string& b) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
+    EVP_DigestUpdate(ctx, a.data(), a.size());
+    EVP_DigestUpdate(ctx, b.data(), b.size());
+    std::array<uint8_t, 32> d{};
+    unsigned int len = 0;
+    EVP_DigestFinal_ex(ctx, d.data(), &len);
+    EVP_MD_CTX_free(ctx);
+    return d;
+}
+
+TEST_F(TopologySnapshotWriterTest, SymmetricWriterEmitsSymMagicAndExplicitBasename) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "fwd-leaf");
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::REVERSE, "rev-leaf");
+
+    TopologySnapshotWriter writer(
+        dir_,
+        std::string("topology_sym.csr"),
+        std::vector<std::filesystem::path>{dir_ / "from_to_edge.leaf",
+                                           dir_ / "to_from_edge.leaf"},
+        /*num_nodes=*/2,
+        /*degrees=*/{1, 1},
+        /*include_edge_ids=*/false,
+        /*symmetric_format=*/true);
+    writer.append_edge(oid(0), oid(1), ObjectId());
+    writer.append_edge(oid(1), oid(0), ObjectId());
+    writer.finalize();
+
+    const auto path = dir_ / "topology_sym.csr";
+    ASSERT_TRUE(std::filesystem::exists(path));
+    EXPECT_EQ(writer.output_path(), path);
+
+    std::ifstream f(path, std::ios::binary);
+    uint8_t buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    f.read(reinterpret_cast<char*>(buf),
+           GQL::Projection::kTopologySnapshotHeaderSize);
+    auto h = GQL::Projection::parse_topology_snapshot_sym_header(buf);
+    EXPECT_EQ(h.num_nodes, 2u);
+    EXPECT_EQ(h.num_edges, 2u);
+    EXPECT_EQ(h.flags & kHasEdgeIds, 0u);
+}
+
+TEST_F(TopologySnapshotWriterTest, SymmetricWriterCombinedHashChainsBothLeavesInOrder) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "AAA-fwd");
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::REVERSE, "BBB-rev");
+
+    TopologySnapshotWriter writer(
+        dir_,
+        std::string("topology_sym.csr"),
+        std::vector<std::filesystem::path>{dir_ / "from_to_edge.leaf",
+                                           dir_ / "to_from_edge.leaf"},
+        /*num_nodes=*/1,
+        /*degrees=*/{1},
+        /*include_edge_ids=*/false,
+        /*symmetric_format=*/true);
+    writer.append_edge(oid(0), oid(0), ObjectId());
+    writer.finalize();
+
+    std::ifstream f(dir_ / "topology_sym.csr", std::ios::binary);
+    uint8_t buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    f.read(reinterpret_cast<char*>(buf),
+           GQL::Projection::kTopologySnapshotHeaderSize);
+    auto h = GQL::Projection::parse_topology_snapshot_sym_header(buf);
+
+    auto expected = sha256_concat("AAA-fwd", "BBB-rev");
+    EXPECT_EQ(std::memcmp(h.source_sha256, expected.data(), 32), 0)
+        << "combined digest must chain from_to_edge.leaf then to_from_edge.leaf";
+    auto wrong = sha256_concat("BBB-rev", "AAA-fwd");
+    EXPECT_NE(std::memcmp(h.source_sha256, wrong.data(), 32), 0);
+}
+
+TEST_F(TopologySnapshotWriterTest, SymmetricWriterBodyIsPlainCsrNoEdgeIds) {
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "f");
+    write_fake_source_leaf(TopologySnapshotWriter::Direction::REVERSE, "r");
+    // N=3, undirected row of node 0 = {1,2}; node1={0}; node2={0}.
+    TopologySnapshotWriter writer(
+        dir_,
+        std::string("topology_sym.csr"),
+        std::vector<std::filesystem::path>{dir_ / "from_to_edge.leaf",
+                                           dir_ / "to_from_edge.leaf"},
+        /*num_nodes=*/3,
+        /*degrees=*/{2, 1, 1},
+        /*include_edge_ids=*/false,
+        /*symmetric_format=*/true);
+    writer.append_edge(oid(0), oid(1), ObjectId());
+    writer.append_edge(oid(0), oid(2), ObjectId());
+    writer.append_edge(oid(1), oid(0), ObjectId());
+    writer.append_edge(oid(2), oid(0), ObjectId());
+    writer.finalize();
+
+    const auto path = dir_ / "topology_sym.csr";
+    // No EDGE_IDS section: 64 + 8*(3+1) + 8*4 = 64+32+32 = 128.
+    EXPECT_EQ(std::filesystem::file_size(path), 128u);
+
+    auto bytes = read_all(path);
+    uint64_t row_ptr[4];
+    std::memcpy(row_ptr, bytes.data() + 64, 32);
+    EXPECT_EQ(row_ptr[0], 0u);
+    EXPECT_EQ(row_ptr[1], 2u);
+    EXPECT_EQ(row_ptr[2], 3u);
+    EXPECT_EQ(row_ptr[3], 4u);
+    uint64_t col[4];
+    std::memcpy(col, bytes.data() + 64 + 32, 32);
+    EXPECT_EQ(col[0], 1u);
+    EXPECT_EQ(col[1], 2u);
+    EXPECT_EQ(col[2], 0u);
+    EXPECT_EQ(col[3], 0u);
+}

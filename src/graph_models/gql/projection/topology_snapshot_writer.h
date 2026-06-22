@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 #include "graph_models/object_id.h"
@@ -75,6 +76,24 @@ public:
                            uint64_t                     num_nodes,
                            std::vector<uint64_t>        degrees,
                            bool                         include_edge_ids);
+
+    /// Explicit-basename / multi-source ctor (symmetric CSR). Unlike the
+    /// Direction ctor, the output filename and the SHA-256 source set are NOT
+    /// derived from a 2-valued Direction — the symmetric file has no single
+    /// source. `output_basename` is the final filename (e.g. "topology_sym.csr");
+    /// `source_leaf_paths` are hashed in list order into one combined digest
+    /// stored in the header's source_sha256. `symmetric_format` selects the
+    /// "TOPOSYM1" magic/version; pass false to write a directional layout under
+    /// an explicit basename (kept general, currently unused).
+    /// Same O_EXCL / placeholder-header / ROW_PTR-prewrite contract as the
+    /// Direction ctor.
+    TopologySnapshotWriter(const std::filesystem::path&             projection_dir,
+                           std::string                              output_basename,
+                           std::vector<std::filesystem::path>       source_leaf_paths,
+                           uint64_t                                 num_nodes,
+                           std::vector<uint64_t>                    degrees,
+                           bool                                     include_edge_ids,
+                           bool                                     symmetric_format);
 
     /// Non-copyable, non-movable: owns a POSIX file descriptor and the
     /// `.tmp` on disk.
@@ -156,6 +175,12 @@ private:
     std::filesystem::path source_leaf_path_;  // for SHA-256
     std::filesystem::path final_path_;        // `topology_{fwd,rev}.csr`
     std::filesystem::path tmp_path_;          // `.csr.tmp`
+
+    // Symmetric-mode state. Empty source_leaf_paths_ / symmetric_format_==false
+    // means the Direction ctor was used and source_leaf_path_ + direction_
+    // drive the legacy single-source hash + basename.
+    std::vector<std::filesystem::path> source_leaf_paths_;  // chained for combined hash
+    bool                               symmetric_format_ = false;
 
     // COL_IDX / EDGE_IDS element width in bytes. 8 (default, full tagged
     // ObjectId, byte-identical to the legacy layout) or 4 (the 8-bit ObjectId
