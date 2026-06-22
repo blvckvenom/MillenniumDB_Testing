@@ -26,6 +26,7 @@
 #include "gnn/sampling/sampling_backend_plan.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
+#include "graph_models/gql/projection/topology_symmetric_merge.h"  // detect_parallel_edges
 #include "misc/available_ram.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -584,7 +585,16 @@ void FourLevelTopologyStore::populate_direction_symmetric_(
             l3_rev.copy_neighbors(row, dr);
             if (l3_rev.has_edge_ids()) l3_rev.copy_edge_ids(row, er);
         }
-        detail::symmetric_merge_row(df, ef, dr, er, has_eids, merged);
+        // Edge_id-drop gate: when dropping, the dedup key switches to node-id
+        // (parallel/mutual edges collapse) and the emitted edge_ids are zeroed.
+        // The build() guard refuses this on a parallel-edge multigraph, so by
+        // the time we get here either the graph has no parallel edges or the
+        // caller accepts the collapse.
+        const bool effective_has_eids = has_eids && !config_.drop_edge_ids;
+        detail::symmetric_merge_row(df, ef, dr, er, effective_has_eids, merged);
+        if (config_.drop_edge_ids) {
+            for (auto& e : merged) e.edge_id = 0;
+        }
 
         if (tier == 1) {
             std::vector<AdjEntry> tight(merged);
@@ -1029,7 +1039,18 @@ void FourLevelTopologyStore::build() {
         // Skipped (sym_built_ stays false) when neither source is available, so
         // get_neighbors(UNDIRECTED) keeps the runtime out+in+merge fallback.
         if (config_.orientation == EdgeOrientation::UNDIRECTED) {
-            if (l3_sym_ != nullptr && l3_sym_->has_data()) {
+            // Edge_id-drop guard: dropping forces node-id dedup, which would
+            // collapse parallel edges and change the receptive field. Refuse on
+            // a parallel-edge multigraph and leave the sym tier unbuilt so the
+            // runtime out+in+merge fallback (which preserves edge_ids) engages.
+            bool refuse_drop = false;
+            if (config_.drop_edge_ids && fwd_bpt_ != nullptr) {
+                refuse_drop = GQL::Projection::detect_parallel_edges(
+                    fwd_bpt_, owned_tier_assignment_.size());
+            }
+            if (refuse_drop) {
+                sym_refused_edge_id_drop_ = true;
+            } else if (l3_sym_ != nullptr && l3_sym_->has_data()) {
                 populate_direction_via_sidecar_(*l3_sym_, owned_tier_assignment_,
                                                 freq, owned_l1_sym_, owned_l2_sym_);
                 sym_built_ = true;

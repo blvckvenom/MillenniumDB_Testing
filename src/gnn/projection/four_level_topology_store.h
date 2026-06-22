@@ -265,6 +265,15 @@ public:
         ///   - REVERSE    -> reverse L1+L2 only.
         ///   - UNDIRECTED -> both forward + reverse.
         EdgeOrientation orientation = EdgeOrientation::UNDIRECTED;
+
+        /// Drop edge_ids from the symmetric (pre-merged undirected) tier: the
+        /// merge keys dedup on node-id (so the emitted edge_ids are zeroed) and
+        /// the receptive field collapses parallel/mutual edges. Default false
+        /// (keep the edge_id-keyed merge that preserves duplicates byte-for-byte
+        /// with the accessor). When true AND the graph has parallel edges the
+        /// build REFUSES the drop (sym_refused_edge_id_drop()), leaving the
+        /// symmetric tier unbuilt so the runtime out+in+merge fallback engages.
+        bool drop_edge_ids = false;
     };
 
     // ------------------------------------------------------------------
@@ -370,6 +379,14 @@ public:
      * direction-agnostic.
      */
     bool is_symmetric_built() const noexcept { return sym_built_; }
+
+    /// True iff a requested edge_id-drop (Config::drop_edge_ids) was REFUSED
+    /// because the graph has parallel edges, which node-id dedup would collapse.
+    /// When this is true the symmetric tier is left unbuilt and undirected
+    /// fetches use the runtime out+in+merge fallback (preserving edge_ids).
+    bool sym_refused_edge_id_drop() const noexcept {
+        return sym_refused_edge_id_drop_;
+    }
 
     /**
      * @brief Read-only access to the tier-2 compact CSR for each direction.
@@ -633,6 +650,9 @@ private:
     bool                                               built_         = false;
     // Set true once the symmetric tier is populated (UNDIRECTED build only).
     bool                                               sym_built_     = false;
+    // Set true when Config::drop_edge_ids was requested but refused due to a
+    // parallel-edge multigraph (sym tier left unbuilt -> runtime merge fallback).
+    bool                                               sym_refused_edge_id_drop_ = false;
 
     Config                                             config_;
 

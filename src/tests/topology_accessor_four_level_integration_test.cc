@@ -467,6 +467,84 @@ TEST(TopologyAccessorFourLevel, Build_UsesSidecarWhenAvailable) {
 }
 
 // ---------------------------------------------------------------------------
+// DropEdgeIds_RefusesOnParallelEdges.
+//
+// With Config::drop_edge_ids set, an UNDIRECTED build over a parallel-edge
+// multigraph (two distinct edges on the same (src,dst)) REFUSES the drop —
+// node-id dedup would collapse the parallel edges and change the receptive
+// field. The symmetric tier is left unbuilt and get_neighbors(UNDIRECTED) falls
+// back to the runtime merge, which preserves the duplicates via the edge-id key.
+// ---------------------------------------------------------------------------
+TEST(TopologyAccessorFourLevel, DropEdgeIds_RefusesOnParallelEdges) {
+    (void)MdbFixture::instance();
+    auto& manager = GQL::ProjectionManager::get_instance();
+    const std::string proj_dir = manager.create_projection("four_level_drop_refuse");
+    auto storage = std::make_unique<GQL::ProjectionStorage>(
+        proj_dir, MdbFixture::instance().db_folder(), "four_level_drop_refuse");
+    storage->init();
+    for (uint64_t i = 0; i < 2; ++i) {
+        GQL::ProjectedNode n;
+        n.node_id = ObjectId(i);
+        storage->add_node(n);
+    }
+    auto mk = [&](uint64_t f, uint64_t t, uint64_t id) {
+        GQL::ProjectedEdge e;
+        e.from_node = ObjectId(f);
+        e.to_node = ObjectId(t);
+        e.edge_id = ObjectId(id);
+        e.is_directed = true;
+        return e;
+    };
+    storage->add_edge(mk(0, 1, 100));
+    storage->add_edge(mk(0, 1, 101));  // PARALLEL
+    storage->flush();
+
+    auto build_sidecar = [&](GQL::Projection::TopologySnapshotWriter::Direction dir) {
+        std::vector<uint64_t> degrees(2, 0);
+        std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> edges;
+        for (auto t : {std::make_tuple<uint64_t, uint64_t, uint64_t>(0, 1, 100),
+                       std::make_tuple<uint64_t, uint64_t, uint64_t>(0, 1, 101)}) {
+            const uint64_t f = std::get<0>(t), to = std::get<1>(t), e = std::get<2>(t);
+            if (dir == GQL::Projection::TopologySnapshotWriter::Direction::FORWARD) {
+                edges.emplace_back(f, to, e); degrees[f]++;
+            } else {
+                edges.emplace_back(to, f, e); degrees[to]++;
+            }
+        }
+        std::sort(edges.begin(), edges.end());
+        GQL::Projection::TopologySnapshotWriter w(
+            std::filesystem::path(proj_dir), dir, 2, std::move(degrees),
+            /*include_edge_ids=*/true);
+        for (const auto& [s, d, e] : edges) w.append_edge(ObjectId(s), ObjectId(d), ObjectId(e));
+        w.finalize();
+    };
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::FORWARD);
+    build_sidecar(GQL::Projection::TopologySnapshotWriter::Direction::REVERSE);
+
+    mdb::gnn::FourLevelTopologyStore::Config cfg;
+    cfg.l1_budget_mb        = 256;
+    cfg.l2_budget_mb        = 256;
+    cfg.use_l3_mmap_sidecar = true;
+    cfg.orientation         = mdb::gnn::EdgeOrientation::UNDIRECTED;
+    cfg.drop_edge_ids       = true;
+    mdb::gnn::FourLevelTopologyStore store(
+        storage->get_from_to_edge_index(),
+        storage->get_to_from_edge_index(),
+        storage.get(),
+        std::filesystem::path(proj_dir), cfg);
+    store.build();
+
+    EXPECT_TRUE(store.sym_refused_edge_id_drop());
+    EXPECT_FALSE(store.is_symmetric_built());
+
+    // Fallback merge preserves both parallel edges (edge-id key, real eids).
+    auto n0 = store.get_neighbors(ObjectId(0));
+    std::vector<uint64_t> got;
+    n0.for_each_dst([&](uint64_t dst) { got.push_back(dst); });
+    EXPECT_EQ(2u, got.size()) << "parallel edges must be preserved in the fallback";
+}
+
+// ---------------------------------------------------------------------------
 // Build_ColdStartSkipsMinHashReorder.
 //
 // Confirms the cold-start branch of `compute_l3_minhash_reorder_` leaves

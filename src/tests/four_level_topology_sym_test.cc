@@ -110,3 +110,27 @@ TEST(FourLevelTopologySym, Undirected_FallbackMerge_NodeDedup) {
     EXPECT_EQ(dst, (std::vector<uint64_t>{1, 2, 3}));  // out{1,2} ++ in{3}
     EXPECT_EQ(eid, (std::vector<uint64_t>{0, 0, 0}));
 }
+
+// ---------------------------------------------------------------------------
+// Task 15 — the edge_id-drop gate: dropping switches the dedup key to node-id
+// (parallel/mutual edges collapse) and zeroes every edge_id; NOT dropping keeps
+// the edge-id key (duplicates preserved).
+// ---------------------------------------------------------------------------
+TEST(FourLevelTopologySym, DropEdgeIds_ZerosEdgeIds_KeepsDstSet) {
+    std::vector<uint64_t> df = {1, 2}, ef = {10, 11};
+    std::vector<uint64_t> dr = {2, 3}, er = {12, 13};  // dst 2 repeats
+    std::vector<AdjEntry> kept, dropped;
+    symmetric_merge_row(df, ef, dr, er, /*has_edge_ids=*/true, kept);
+    symmetric_merge_row(df, ef, dr, er, /*has_edge_ids=*/false, dropped);
+    for (auto& e : dropped) e.edge_id = 0;
+
+    // drop: node-id dedup -> {1,2,3}, eids zeroed.
+    ASSERT_EQ(3u, dropped.size());
+    EXPECT_EQ(1u, dropped[0].node_id);
+    EXPECT_EQ(2u, dropped[1].node_id);
+    EXPECT_EQ(3u, dropped[2].node_id);
+    for (auto& e : dropped) EXPECT_EQ(0u, e.edge_id);
+
+    // keep: edge-id key -> no node dedup (1,2,2,3).
+    ASSERT_EQ(4u, kept.size());
+}
