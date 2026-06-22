@@ -676,6 +676,45 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
+# Symmetric topology per-node merge unit tests
+# ============================================================================
+# Registers topology_symmetric_merge_test when GTest is available and the
+# header-only merge helper exists. Same EXISTS-gated precedent as
+# topology_snapshot_format_test above.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_symmetric_merge.h")
+    add_executable(topology_symmetric_merge_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_symmetric_merge_test.cc
+    )
+    set_target_properties(topology_symmetric_merge_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main before millenniumdb so its main() wins over the serdi.cc
+    # main() pulled into libmillenniumdb.a by the recursive src/*.cc glob.
+    target_link_libraries(topology_symmetric_merge_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_symmetric_merge_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySymmetricMergeTests
+        COMMAND $<TARGET_FILE:topology_symmetric_merge_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # B+Tree v2 leaf header format unit tests (Spec #5 T5.3)
 # ============================================================================
 # Registers bpt_leaf_v2_format_test when GTest is available and the source
