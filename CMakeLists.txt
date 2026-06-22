@@ -1833,6 +1833,45 @@ if(GTest_FOUND AND ENABLE_GNN AND
     endif()
 endif()
 
+# symmetric_topology_view tests — useSymmetricTopology resolution + in-RAM merge
+# + single-slice FORWARD_ONLY pin (GPU-UVA). CI-friendly (no-GPU = documented no-op).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/symmetric_topology_view_test.cc")
+    add_executable(symmetric_topology_view_test
+        ${CMAKE_SOURCE_DIR}/src/tests/symmetric_topology_view_test.cc
+    )
+    set_target_properties(symmetric_topology_view_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(symmetric_topology_view_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SymmetricTopologyViewTests
+        COMMAND $<TARGET_FILE:symmetric_topology_view_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST SymmetricTopologyViewTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
 # gpu_khop_sampler tests — statistical validation of the GPU reservoir+Philox
 # sampling kernel (short-circuit, no-replacement, uniformity, determinism).
 if(GTest_FOUND AND ENABLE_GNN AND

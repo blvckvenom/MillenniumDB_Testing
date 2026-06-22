@@ -394,6 +394,33 @@ struct SamplingConfig {
     SamplingBackendChoice sampling_backend = SamplingBackendChoice::AUTO;
 
     // =========================================================================
+    // Symmetric topology (single pre-merged undirected slice)
+    // =========================================================================
+
+    /**
+     * @brief Tri-state control of the symmetric (pre-merged undirected) CSR.
+     *
+     * AUTO (default): enabled only for UNDIRECTED orientation — the only case
+     *   where a single pre-merged out+in slice replaces the per-node runtime
+     *   merge. ON: force the merged slice even for NATURAL/REVERSE (the slice
+     *   then equals the single-direction list). OFF: never build it (keeps the
+     *   runtime out+in+merge path; the bit-reproducible reference).
+     */
+    enum class SymmetricTopologyMode { AUTO, ON, OFF };
+    SymmetricTopologyMode use_symmetric_topology = SymmetricTopologyMode::AUTO;
+
+    /// Resolve AUTO/ON/OFF against the sampling orientation.
+    bool symmetric_resolved_on(EdgeOrientation orientation) const noexcept {
+        switch (use_symmetric_topology) {
+            case SymmetricTopologyMode::ON:  return true;
+            case SymmetricTopologyMode::OFF: return false;
+            case SymmetricTopologyMode::AUTO:
+            default:
+                return orientation == EdgeOrientation::UNDIRECTED;
+        }
+    }
+
+    // =========================================================================
     // Output
     // =========================================================================
 

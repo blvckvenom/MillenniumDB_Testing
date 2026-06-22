@@ -83,6 +83,11 @@ struct SamplingBackendConfig {
 struct SamplingBackendPlan {
     SamplingBackend backend              = SamplingBackend::CPU_OUT_OF_CORE;
     GpuDirections   directions           = GpuDirections::NONE;
+    // Set by the ENGINE (not the pure planner) when the symmetric pre-merged
+    // undirected slice is served: the plan then carries directions==FORWARD_ONLY
+    // and the pinned view is the single undirected CSR (never BOTH — that would
+    // double-count an already-merged list). plan_sampling_backend leaves false.
+    bool            use_symmetric        = false;
     std::string     reason;
     std::size_t     fwd_csr_bytes        = 0;  // (n_rows+1)*8 + n_edges*4, dir fwd
     std::size_t     rev_csr_bytes        = 0;  // (n_rows+1)*8 + n_edges*4, dir rev
