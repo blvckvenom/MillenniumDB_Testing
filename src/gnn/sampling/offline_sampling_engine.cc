@@ -236,9 +236,23 @@ struct OfflineSamplingEngine::Impl {
                     }
                     return DirCsrDims{};
                 };
-                const SamplingBackendPlan plan = plan_sampling_backend(
+                SamplingBackendPlan plan = plan_sampling_backend(
                     res, config.orientation, l3_dims(topo.l3_fwd()),
                     l3_dims(topo.l3_rev()), backend_choice);
+
+                // Symmetric single-slice override: when resolved-on (AUTO =>
+                // UNDIRECTED) and a pinnable substrate exists, serve ONE
+                // pre-merged undirected slice. The planner sized on the
+                // directional sidecars; collapse to a single FORWARD_ONLY slice
+                // and flag use_symmetric so the pin path takes the merged arrays
+                // (never BOTH).
+                const bool sym_on = config.symmetric_resolved_on(config.orientation);
+                if (sym_on && plan.backend != SamplingBackend::CPU_OUT_OF_CORE) {
+                    plan.use_symmetric = true;
+                    plan.directions    = GpuDirections::FORWARD_ONLY;
+                }
+                result.symmetric_used = sym_on;
+
                 result.sampling_backend     = to_string(plan.backend);
                 result.sampling_directions  = to_string(plan.directions);
                 result.sampling_plan_reason = plan.reason;
@@ -252,16 +266,36 @@ struct OfflineSamplingEngine::Impl {
                 }
 #ifdef GNN_CUDA_ENABLED
                 if (plan.backend != SamplingBackend::CPU_OUT_OF_CORE) {
-                    // Pin the global topology CSR (no-op without a GPU at runtime).
-                    khop_sampler->get_topology().enable_pinned_gpu_view(plan);
-                    const PinnedTopologyView* pv =
-                        khop_sampler->get_topology().pinned_view();
+                    auto& topo_store = khop_sampler->get_topology();
+                    if (plan.use_symmetric) {
+                        // enable_pinned_gpu_view materializes the merged
+                        // undirected slice (once, cached) AND pins it.
+                        const auto t0 = std::chrono::steady_clock::now();
+                        topo_store.enable_pinned_gpu_view(plan);
+                        result.symmetric_ms = phase_ms_(
+                            t0, std::chrono::steady_clock::now());
+                        result.symmetric_ram_bytes = topo_store.symmetric_ram_bytes();
+                        result.symmetric_built_ok =
+                            result.symmetric_ram_bytes > 0;
+                    } else {
+                        topo_store.enable_pinned_gpu_view(plan);
+                    }
+                    const PinnedTopologyView* pv = topo_store.pinned_view();
                     if (pv != nullptr && pv->is_registered()) {
                         use_gpu_sampling = true;
                         active_gpu_plan  = plan;
                     }
                 }
 #endif
+                // CPU / no-pin path: the Part C symmetric tier (single dispatch)
+                // delivers the benefit, not the flat GPU arrays. Report whether
+                // that tier is active; do NOT materialize the flat merge (only
+                // the GPU pin consumes it) just for telemetry — on a large graph
+                // it would be a multi-GB merge with no consumer here.
+                if (result.symmetric_used && !use_gpu_sampling) {
+                    result.symmetric_built_ok =
+                        khop_sampler->get_topology().is_symmetric_topology_built();
+                }
                 std::cerr << "[OfflineSamplingEngine] sampling backend = "
                           << result.sampling_backend << " (" << plan.reason << ") "
                           << (use_gpu_sampling ? "[GPU kernel active]"

@@ -563,6 +563,10 @@ public:
     /// out+in+merge.
     bool is_symmetric_topology_built() const;
 
+    /// Resident bytes of the four-level store's in-RAM merged undirected slice
+    /// (the GPU-UVA single-slice substrate); 0 when absent. For telemetry.
+    std::size_t symmetric_ram_bytes() const;
+
     /**
      * @brief Tier-2 compact CSR per direction, for SIZING the dynamic GPU/CPU
      *        sampling backend decision (`plan_sampling_backend`).

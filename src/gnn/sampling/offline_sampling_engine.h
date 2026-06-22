@@ -94,6 +94,16 @@ struct SamplingResult {
     std::string sampling_backend     = "CPU_OUT_OF_CORE";
     std::string sampling_directions  = "NONE";
     std::string sampling_plan_reason;
+
+    // Symmetric single-slice topology telemetry. symmetric_used is the resolved
+    // decision (AUTO => UNDIRECTED); symmetric_built_ok is true once the merged
+    // undirected slice (GPU pin) or the symmetric tier (CPU) is active;
+    // symmetric_ms is the in-RAM merge wall-clock; symmetric_ram_bytes is the
+    // merged slice's RAM footprint.
+    bool        symmetric_used       = false;
+    bool        symmetric_built_ok   = false;
+    double      symmetric_ms         = 0.0;
+    std::size_t symmetric_ram_bytes  = 0;
 };
 
 /**

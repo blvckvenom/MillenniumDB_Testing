@@ -1114,6 +1114,11 @@ bool TopologyAccessor::is_symmetric_topology_built() const {
         && impl_->four_level_store_->is_symmetric_built();
 }
 
+std::size_t TopologyAccessor::symmetric_ram_bytes() const {
+    return impl_->four_level_store_
+        ? impl_->four_level_store_->symmetric_ram_bytes() : 0;
+}
+
 const L2CompactCsr* TopologyAccessor::l2_fwd() const {
     return impl_->four_level_store_ ? impl_->four_level_store_->l2_fwd() : nullptr;
 }
