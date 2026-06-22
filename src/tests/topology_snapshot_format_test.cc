@@ -268,3 +268,71 @@ TEST(TopologySnapshotFormat, DefaultHeaderIsParseable) {
         EXPECT_EQ(dst.source_sha256[i], 0u);
     }
 }
+
+// ---- Symmetric CSR header variant (magic "TOPOSYM1") ----------------------
+#include <array>  // already included transitively; harmless if duplicated
+
+using GQL::Projection::kTopologySnapshotSymMagic;
+using GQL::Projection::kTopologySnapshotSymVersion;
+using GQL::Projection::make_default_topology_snapshot_sym_header;
+using GQL::Projection::parse_topology_snapshot_sym_header;
+using GQL::Projection::topology_snapshot_header_is_symmetric;
+
+TEST(TopologySnapshotSymFormat, DefaultHeaderCarriesSymMagicAndVersion) {
+    auto h = make_default_topology_snapshot_sym_header();
+    EXPECT_EQ(std::memcmp(h.magic, kTopologySnapshotSymMagic.data(), 8), 0);
+    EXPECT_EQ(h.version, kTopologySnapshotSymVersion);
+    EXPECT_EQ(h.id_width, GQL::Projection::kTopologySnapshotIdWidth);
+    EXPECT_EQ(h.flags, 0u);
+}
+
+TEST(TopologySnapshotSymFormat, SerializeRoundTripThroughSymParser) {
+    auto h = make_default_topology_snapshot_sym_header();
+    h.num_nodes = 7;
+    h.num_edges = 13;
+    for (int i = 0; i < 32; ++i) h.source_sha256[i] = static_cast<uint8_t>(i + 1);
+    uint8_t buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    GQL::Projection::serialize_topology_snapshot_header(h, buf);
+
+    auto parsed = parse_topology_snapshot_sym_header(buf);
+    EXPECT_EQ(parsed.num_nodes, 7u);
+    EXPECT_EQ(parsed.num_edges, 13u);
+    EXPECT_EQ(std::memcmp(parsed.source_sha256, h.source_sha256, 32), 0);
+}
+
+TEST(TopologySnapshotSymFormat, IsSymmetricDiscriminatesByMagic) {
+    uint8_t sym_buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    GQL::Projection::serialize_topology_snapshot_header(
+        make_default_topology_snapshot_sym_header(), sym_buf);
+    EXPECT_TRUE(topology_snapshot_header_is_symmetric(sym_buf));
+
+    uint8_t dir_buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    GQL::Projection::serialize_topology_snapshot_header(
+        GQL::Projection::make_default_topology_snapshot_header(), dir_buf);
+    EXPECT_FALSE(topology_snapshot_header_is_symmetric(dir_buf));
+}
+
+TEST(TopologySnapshotSymFormat, SymParserRejectsDirectionalMagic) {
+    uint8_t dir_buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    GQL::Projection::serialize_topology_snapshot_header(
+        GQL::Projection::make_default_topology_snapshot_header(), dir_buf);
+    EXPECT_THROW(parse_topology_snapshot_sym_header(dir_buf),
+                 GQL::Projection::TopologySnapshotFormatError);
+}
+
+TEST(TopologySnapshotSymFormat, DirectionalParserRejectsSymMagic) {
+    uint8_t sym_buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    GQL::Projection::serialize_topology_snapshot_header(
+        make_default_topology_snapshot_sym_header(), sym_buf);
+    EXPECT_THROW(GQL::Projection::parse_topology_snapshot_header(sym_buf),
+                 GQL::Projection::TopologySnapshotFormatError);
+}
+
+TEST(TopologySnapshotSymFormat, SymParserRejectsBadVersion) {
+    auto h = make_default_topology_snapshot_sym_header();
+    h.version = kTopologySnapshotSymVersion + 99;
+    uint8_t buf[GQL::Projection::kTopologySnapshotHeaderSize];
+    GQL::Projection::serialize_topology_snapshot_header(h, buf);
+    EXPECT_THROW(parse_topology_snapshot_sym_header(buf),
+                 GQL::Projection::TopologySnapshotFormatError);
+}

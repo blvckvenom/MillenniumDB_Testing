@@ -196,4 +196,77 @@ inline TopologySnapshotHeader make_default_topology_snapshot_header() noexcept {
     return header;
 }
 
+// ---------------------------------------------------------------------------
+// Symmetric CSR variant (pre-merged undirected topology)
+// ---------------------------------------------------------------------------
+//
+// `topology_sym.csr` is a pre-merged undirected CSR: byte-for-byte the SAME
+// 64-byte header struct + ROW_PTR[N+1] + COL_IDX[M] body as a directional
+// snapshot, with TWO differences: (1) a distinct magic ("TOPOSYM1") + version
+// so a directional reader/parser never accepts it; (2) `source_sha256[32]`
+// holds a COMBINED digest chaining BOTH source `.leaf` streams (from_to_edge
+// then to_from_edge, in a fixed order) — the symmetric body depends on both
+// directions, so a single-source digest cannot express staleness.
+
+/// Magic bytes for the symmetric pre-merged CSR sidecar (8 bytes, no NUL).
+inline constexpr std::array<uint8_t, 8> kTopologySnapshotSymMagic = {
+    'T', 'O', 'P', 'O', 'S', 'Y', 'M', '1'
+};
+
+/// On-disk version of the symmetric variant.
+inline constexpr uint32_t kTopologySnapshotSymVersion = 1;
+
+/// Non-throwing magic peek: true iff `in` carries the symmetric magic. Lets a
+/// caller (e.g. a unified opener) discriminate sym vs directional before
+/// committing to a parser. Does NOT validate version or id_width.
+inline bool topology_snapshot_header_is_symmetric(
+    const uint8_t (&in)[kTopologySnapshotHeaderSize]) noexcept {
+    return std::memcmp(in, kTopologySnapshotSymMagic.data(),
+                       kTopologySnapshotSymMagic.size()) == 0;
+}
+
+/// Parses a 64-byte SYMMETRIC header, validating magic=="TOPOSYM1",
+/// version==kTopologySnapshotSymVersion, and id_width in {4,8}. Throws
+/// TopologySnapshotFormatError on any mismatch. The struct, body layout, and
+/// every numeric field are identical to the directional header — only the
+/// magic/version gate differs. `source_sha256` carries the combined digest.
+inline TopologySnapshotHeader parse_topology_snapshot_sym_header(
+    const uint8_t (&in)[kTopologySnapshotHeaderSize]) {
+    TopologySnapshotHeader header{};
+    std::memcpy(&header, in, kTopologySnapshotHeaderSize);
+
+    if (std::memcmp(header.magic,
+                    kTopologySnapshotSymMagic.data(),
+                    kTopologySnapshotSymMagic.size()) != 0) {
+        throw TopologySnapshotFormatError(
+            "TopologySnapshot(sym): invalid magic (expected \"TOPOSYM1\")");
+    }
+    if (header.version != kTopologySnapshotSymVersion) {
+        throw TopologySnapshotFormatError(
+            "TopologySnapshot(sym): unsupported version " +
+            std::to_string(header.version) + " (expected " +
+            std::to_string(kTopologySnapshotSymVersion) + ")");
+    }
+    if (!topology_snapshot_id_width_valid(header.id_width)) {
+        throw TopologySnapshotFormatError(
+            "TopologySnapshot(sym): unsupported id_width " +
+            std::to_string(header.id_width) + " (expected 4 or 8)");
+    }
+    return header;
+}
+
+/// Symmetric counterpart of make_default_topology_snapshot_header(): fills
+/// magic/version/id_width and zeroes the rest. The caller sets flags,
+/// num_nodes, num_edges, dst_type_tag, and the combined source_sha256.
+inline TopologySnapshotHeader make_default_topology_snapshot_sym_header() noexcept {
+    TopologySnapshotHeader header{};
+    std::memcpy(header.magic,
+                kTopologySnapshotSymMagic.data(),
+                kTopologySnapshotSymMagic.size());
+    header.version  = kTopologySnapshotSymVersion;
+    header.id_width = kTopologySnapshotIdWidth;
+    header.flags    = 0;
+    return header;
+}
+
 }  // namespace GQL::Projection
