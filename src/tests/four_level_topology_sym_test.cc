@@ -80,3 +80,33 @@ TEST(FourLevelTopologySym, MergeRule_OrderOutThenIn) {
     EXPECT_EQ(5u, out[0].node_id);  // from out
     EXPECT_EQ(4u, out[1].node_id);  // from in, 5-dup dropped
 }
+
+// ---------------------------------------------------------------------------
+// Task 13 — get_neighbors(UNDIRECTED) with the sym tier NOT built falls back to
+// the out+in merge keyed by the same rule. zero edge_ids -> node-id dedup.
+// ---------------------------------------------------------------------------
+TEST(FourLevelTopologySym, Undirected_FallbackMerge_NodeDedup) {
+    const std::vector<uint8_t> tiers = {1, 1, 1, 1};
+    L1HashCache l1f(tiers), l1r(tiers);
+    L2CompactCsr l2f, l2r;
+    l2f.freeze();
+    l2r.freeze();
+    l1f.insert(0, std::vector<AdjEntry>{ {1, 0}, {2, 0} }, 0);  // out(0) = {1,2}
+    l1r.insert(0, std::vector<AdjEntry>{ {2, 0}, {3, 0} }, 0);  // in(0)  = {2,3}
+    FourLevelTopologyStore::Config cfg;  // UNDIRECTED
+    FourLevelTopologyStore store(
+        l1f, l1r, l2f, l2r,
+        /*l3_fwd=*/nullptr, /*l3_rev=*/nullptr,
+        /*l4_fwd=*/{}, /*l4_rev=*/{},
+        tiers, [](ObjectId v) { return v.id; }, cfg);
+    ASSERT_FALSE(store.is_symmetric_built());  // dispatcher ctor: no sym tier
+
+    auto merged = store.get_neighbors(ObjectId(0));
+    std::vector<uint64_t> dst, eid;
+    merged.for_each_with_edge_id([&](uint64_t d, uint64_t e) {
+        dst.push_back(d);
+        eid.push_back(e);
+    });
+    EXPECT_EQ(dst, (std::vector<uint64_t>{1, 2, 3}));  // out{1,2} ++ in{3}
+    EXPECT_EQ(eid, (std::vector<uint64_t>{0, 0, 0}));
+}

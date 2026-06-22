@@ -1198,23 +1198,38 @@ FourLevelTopologyStore::get_neighbors(ObjectId v) const
             break;
     }
 
-    // UNDIRECTED merge: collect dst ids from both directions, dedupe.
+    // Symmetric single-dispatch: when the pre-merged undirected tier is built,
+    // one dispatch over it replaces the per-node out+in fetch + merge. It reuses
+    // the SAME tier_lookup_ref_ + row_lookup_ (per-node, direction-agnostic).
+    if (sym_built_) {
+        return dispatch_(v, *l1_sym_, *l2_sym_, l3_sym_, l4_sym_);
+    }
+
+    // Fallback (sym tier not built): out + in merged with the SAME rule as the
+    // bake and the accessor (detail::symmetric_merge_row) — key = edge_id when
+    // edge_ids are real (mutual/parallel edges preserved), else node-id. This
+    // makes get_neighbors(UNDIRECTED) byte-identical to
+    // TopologyAccessor::get_neighbors_into(UNDIRECTED) regardless of the sym
+    // tier, so routing the accessor through this one call never changes the
+    // sampled receptive field.
     Neighbors out;
     out.tier = 4;  // materialise into l4_owned for the merge result.
 
     auto fwd = get_out_neighbors(v);
     auto rev = get_in_neighbors(v);
 
-    std::unordered_set<uint64_t> seen;
-    seen.reserve(fwd.size() + rev.size());
-
-    auto append = [&](uint64_t dst, uint64_t eid) {
-        if (seen.insert(dst).second) {
-            out.l4_owned.push_back(AdjEntry{ dst, eid });
-        }
-    };
-    fwd.for_each_with_edge_id(append);
-    rev.for_each_with_edge_id(append);
+    std::vector<uint64_t> df, ef, dr, er;
+    df.reserve(fwd.size()); ef.reserve(fwd.size());
+    dr.reserve(rev.size()); er.reserve(rev.size());
+    fwd.for_each_with_edge_id([&](uint64_t d, uint64_t e) {
+        df.push_back(d); ef.push_back(e);
+    });
+    rev.for_each_with_edge_id([&](uint64_t d, uint64_t e) {
+        dr.push_back(d); er.push_back(e);
+    });
+    const bool has_eids = (!ef.empty() && ef.front() != 0)
+                       || (!er.empty() && er.front() != 0);
+    detail::symmetric_merge_row(df, ef, dr, er, has_eids, out.l4_owned);
 
     return out;
 }

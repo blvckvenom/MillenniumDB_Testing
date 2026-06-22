@@ -536,6 +536,20 @@ TEST(TopologyAccessorFourLevel, Build_SymmetricTierFromDirectionalSidecars) {
         // All 6 nodes (incl. the isolated one) land in the symmetric L1.
         EXPECT_EQ(FixtureGraph::kNumNodes, store.l1_sym_node_count());
         EXPECT_EQ(0u, store.l2_sym_node_count());
+
+        // The single sym dispatch must return the same undirected node set as a
+        // BPT-oracle accessor for every node (Task 13 collapse).
+        mdb::gnn::TopologyAccessor oracle(*storage);
+        for (uint64_t nid = 0; nid < FixtureGraph::kNumNodes; ++nid) {
+            auto sym_n = store.get_neighbors(ObjectId(nid));
+            std::vector<uint64_t> got;
+            sym_n.for_each_dst([&](uint64_t dst) { got.push_back(dst); });
+            std::sort(got.begin(), got.end());
+            EXPECT_EQ(sorted_node_ids(oracle.get_neighbors(
+                          ObjectId(nid), mdb::gnn::EdgeOrientation::UNDIRECTED)),
+                      got)
+                << "sym dispatch node " << nid;
+        }
     }
     {
         mdb::gnn::FourLevelTopologyStore::Config cfg;
