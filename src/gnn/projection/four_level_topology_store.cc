@@ -282,33 +282,54 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
     if (!have_f && !have_r) return nullptr;  // nothing pinnable to merge
 
     const uint64_t n = have_f ? l3_fwd_->num_nodes() : l3_rev_->num_nodes();
-    auto lift = [n](const GQL::Projection::TopologySnapshotReader* r, bool present,
-                    std::vector<uint64_t>& rp, std::vector<uint32_t>& ci) {
-        rp.assign(static_cast<std::size_t>(n) + 1, 0);
-        ci.clear();
-        if (!present) return;
-        for (uint64_t u = 0; u < n; ++u) {
-            const uint64_t d = r->degree(u);
-            const uint32_t* row = r->col_idx32_row(u);
-            for (uint64_t i = 0; i < d; ++i) ci.push_back(row[i]);
-            rp[u + 1] = ci.size();
-        }
-    };
-    std::vector<uint64_t> f_rp, r_rp;
-    std::vector<uint32_t> f_ci, r_ci;
-    lift(l3_fwd_, have_f, f_rp, f_ci);
-    lift(l3_rev_, have_r, r_rp, r_ci);
-
     // §4 contract: distinct real edge_ids => concat (no dedup, matching the
     // edge_id-keyed merge that removes nothing); edge_id==0 => node-id dedup.
     const bool distinct_eids =
         (have_f && l3_fwd_->has_edge_ids()) || (have_r && l3_rev_->has_edge_ids());
-    if (distinct_eids) {
-        merge_symmetric_csr_concat(f_rp, f_ci, r_rp, r_ci,
-                                   sym_row_ptr_, sym_col_idx_);
-    } else {
-        merge_symmetric_csr_node_dedup(f_rp, f_ci, r_rp, r_ci,
-                                       sym_row_ptr_, sym_col_idx_);
+
+    // STREAMING merge straight from the two mmap'd narrow readers — do NOT lift
+    // each COL_IDX into a full RAM vector first. The lift-then-merge form peaked
+    // at ~2x the output (fwd COL_IDX + rev COL_IDX + merged) which OOMs on a
+    // commodity host at papers100M scale (~26 GB transient on a 30 GB box). Here
+    // the only large resident allocation is the output (sym_col_idx_, ≈ the size
+    // of ONE directional COL_IDX since fwd/in are ~disjoint), reserved once up
+    // front so the per-row appends never reallocate; the source pages are read
+    // sequentially through the mmap and stay evictable.
+    sym_row_ptr_.assign(static_cast<std::size_t>(n) + 1, 0);
+    sym_col_idx_.clear();
+    const std::size_t upper = (have_f ? l3_fwd_->num_edges() : 0)
+                            + (have_r ? l3_rev_->num_edges() : 0);
+    sym_col_idx_.reserve(upper);  // exact for concat, upper bound for node-dedup
+
+    std::unordered_set<uint32_t> seen;  // reused per row (node-dedup only)
+    for (uint64_t u = 0; u < n; ++u) {
+        const uint32_t* frow = nullptr;
+        uint64_t fdeg = 0;
+        if (have_f && u < l3_fwd_->num_nodes()) {
+            fdeg = l3_fwd_->degree(u);
+            frow = l3_fwd_->col_idx32_row(u);
+        }
+        const uint32_t* rrow = nullptr;
+        uint64_t rdeg = 0;
+        if (have_r && u < l3_rev_->num_nodes()) {
+            rdeg = l3_rev_->degree(u);
+            rrow = l3_rev_->col_idx32_row(u);
+        }
+        if (distinct_eids) {
+            for (uint64_t i = 0; i < fdeg; ++i) sym_col_idx_.push_back(frow[i]);
+            for (uint64_t i = 0; i < rdeg; ++i) sym_col_idx_.push_back(rrow[i]);
+        } else {
+            seen.clear();
+            for (uint64_t i = 0; i < fdeg; ++i) {
+                uint32_t v = frow[i];
+                if (seen.insert(v).second) sym_col_idx_.push_back(v);
+            }
+            for (uint64_t i = 0; i < rdeg; ++i) {
+                uint32_t v = rrow[i];
+                if (seen.insert(v).second) sym_col_idx_.push_back(v);
+            }
+        }
+        sym_row_ptr_[u + 1] = sym_col_idx_.size();
     }
 
     sym_arrays_.row_ptr      = sym_row_ptr_.data();
