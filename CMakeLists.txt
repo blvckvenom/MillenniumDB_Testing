@@ -2010,6 +2010,46 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# FourLevelTopologyStore symmetric (pre-merged undirected) tier unit tests
+# ============================================================================
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_sym_test.cc")
+    add_executable(four_level_topology_sym_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_sym_test.cc
+    )
+    set_target_properties(four_level_topology_sym_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_sym_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologySymTests
+        COMMAND $<TARGET_FILE:four_level_topology_sym_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologySymTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
+# ============================================================================
 # FourLevelTopologyStore warm-start activation tests (Spec #13 Phase 5)
 # ============================================================================
 # Exercises the round-trip between gnn_offline_sample's `node_counts.bin`

@@ -346,6 +346,18 @@ public:
     bool is_built() const noexcept;
 
     /**
+     * @brief Whether the pre-merged symmetric (undirected) tier is populated.
+     *
+     * When true, get_neighbors(UNDIRECTED) collapses to a single dispatch over
+     * the symmetric tier (l1_sym_ / l2_sym_ / l3_sym_ / l4_sym_) instead of the
+     * runtime out+in+merge. Built only for UNDIRECTED orientation; false
+     * otherwise. The symmetric tier reuses the SAME per-node tier assignment
+     * (tier_lookup_ref_ / row_lookup_) as the directional tiers — it is
+     * direction-agnostic.
+     */
+    bool is_symmetric_built() const noexcept { return sym_built_; }
+
+    /**
      * @brief Read-only access to the tier-2 compact CSR for each direction.
      *
      * Used only to SIZE the dynamic GPU/CPU sampling backend decision
@@ -545,6 +557,13 @@ private:
                                                        owned_l3_fwd_;
     std::unique_ptr<GQL::Projection::TopologySnapshotReader>
                                                        owned_l3_rev_;
+    // Symmetric (pre-merged undirected) tier — owned when the UNDIRECTED build
+    // populates it (from topology_sym.csr or by merging the two directional
+    // sidecars). Reuses owned_tier_assignment_ (per-node, direction-agnostic).
+    std::unique_ptr<L1HashCache>                       owned_l1_sym_;
+    std::unique_ptr<L2CompactCsr>                      owned_l2_sym_;
+    std::unique_ptr<GQL::Projection::TopologySnapshotReader>
+                                                       owned_l3_sym_;
     std::vector<uint8_t>                               owned_tier_assignment_;
 
     // MinHash permutation over L3-tier nodes for disk-read locality.
@@ -563,6 +582,12 @@ private:
     const GQL::Projection::TopologySnapshotReader*     l3_rev_ = nullptr;
     L4Lookup                                           l4_fwd_;
     L4Lookup                                           l4_rev_;
+    // Active symmetric tier references (owned-or-borrowed). Null until an
+    // UNDIRECTED build populates them; gated by sym_built_.
+    const L1HashCache*                                 l1_sym_ = nullptr;
+    const L2CompactCsr*                                l2_sym_ = nullptr;
+    const GQL::Projection::TopologySnapshotReader*     l3_sym_ = nullptr;
+    L4Lookup                                           l4_sym_;
 
     // tier_lookup_ref_ points either into owned_tier_assignment_ (Phase
     // 3 ctor) or into a caller-provided const vector (Phase 2 ctor).
@@ -576,6 +601,8 @@ private:
     std::filesystem::path                              projection_dir_;
     bool                                               phase3_ctor_   = false;
     bool                                               built_         = false;
+    // Set true once the symmetric tier is populated (UNDIRECTED build only).
+    bool                                               sym_built_     = false;
 
     Config                                             config_;
 
