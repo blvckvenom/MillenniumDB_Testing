@@ -712,6 +712,11 @@ if(GTest_FOUND AND
         COMMAND $<TARGET_FILE:topology_symmetric_merge_test>
         WORKING_DIRECTORY tests
     )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologySymmetricMergeTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
 endif()
 
 # ============================================================================
@@ -2252,6 +2257,11 @@ if(GTest_FOUND AND ENABLE_GNN AND
         COMMAND $<TARGET_FILE:topology_symmetric_parallel_edge_test>
         WORKING_DIRECTORY tests
     )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologySymmetricParallelEdgeTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
 endif()
 
 # ============================================================================
@@ -2289,6 +2299,11 @@ if(GTest_FOUND AND ENABLE_GNN AND
         COMMAND $<TARGET_FILE:gnn_build_topology_snapshot_symmetric_test>
         WORKING_DIRECTORY tests
     )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST GnnBuildTopologySnapshotSymmetricTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
 endif()
 
 # ============================================================================
