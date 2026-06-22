@@ -2176,6 +2176,43 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
+# Post-hoc symmetric topology bake unit tests
+# ============================================================================
+# Builds a TopologyAccessor (needs torch + mdb_gnn_core) and a ProjectionStorage,
+# so it uses the same full link recipe as gnn_build_topology_snapshot_procedure_test.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gnn_build_topology_snapshot_symmetric_test.cc")
+    add_executable(gnn_build_topology_snapshot_symmetric_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_build_topology_snapshot_symmetric_test.cc
+    )
+    set_target_properties(gnn_build_topology_snapshot_symmetric_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(gnn_build_topology_snapshot_symmetric_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnBuildTopologySnapshotSymmetricTests
+        COMMAND $<TARGET_FILE:gnn_build_topology_snapshot_symmetric_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
+
+# ============================================================================
 # GNN procedure metadata consistency tests (yield_fields vs runtime yields)
 # ============================================================================
 if(GTest_FOUND AND ENABLE_GNN AND

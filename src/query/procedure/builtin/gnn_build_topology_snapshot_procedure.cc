@@ -4,16 +4,21 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include "gnn/projection/edge_orientation.h"
+#include "gnn/projection/topology_accessor.h"
 #include "graph_models/gql/projection/index_set.h"
 #include "graph_models/gql/projection/native_projection_builder.h"
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot.h"
 #include "graph_models/gql/projection/topology_snapshot_writer.h"
+#include "graph_models/gql/projection/topology_symmetric_merge.h"
 #include "graph_models/object_id.h"
 #include "query/exceptions.h"
 #include "query/procedure/builtin/gnn_procedure_utils.h"
@@ -119,6 +124,113 @@ uint64_t build_one_snapshot_post_hoc(
     return writer.bytes_written();
 }
 
+// Build the pre-merged undirected CSR sidecar (topology_sym.csr) post-hoc by
+// merging each node's out+in neighbor lists via the canonical UNDIRECTED dedup
+// (Projection::merge_symmetric_row). edge_ids are dropped (the symmetric sample
+// CSR never carries them); the dst node receptive field stays byte-identical to
+// the runtime out+in+merge. Returns bytes written; returns 0 and sets *refused
+// when a meaningful parallel-edge multigraph is detected (the bake abstains
+// rather than silently collapse parallel edges). Throws std::runtime_error on a
+// self-verify mismatch (verify=true) so a corrupt bake never finalizes.
+//
+// `verify_sample`: when N is large only ~verify_sample randomly-chosen rows are
+// cross-checked against the live accessor; all rows are checked when N is small.
+uint64_t build_symmetric_snapshot_post_hoc(GQL::ProjectionStorage& storage,
+                                           bool verify, uint64_t verify_sample,
+                                           bool* refused) {
+    using Projection::TopologySnapshotWriter;
+    *refused = false;
+
+    BPlusTree<3>* fwd_bpt = storage.get_from_to_edge_index();
+    BPlusTree<3>* rev_bpt = storage.get_to_from_edge_index();
+    if (fwd_bpt == nullptr || rev_bpt == nullptr) {
+        throw std::runtime_error(
+            "gnn_build_topology_snapshot(symmetric): both FROM_TO_EDGE and "
+            "TO_FROM_EDGE indexes must be open to build topology_sym.csr");
+    }
+
+    // Parallel-edge guard: refuse rather than node-id-dedup a real multigraph.
+    if (Projection::detect_parallel_edges(fwd_bpt, storage.get_node_count())) {
+        *refused = true;
+        return 0;
+    }
+
+    const uint64_t N = storage.get_node_count();
+    const fs::path proj_dir = storage.get_projection_dir();
+
+    mdb::gnn::TopologyAccessor acc(storage);
+    mdb::gnn::Neighbors out_n, in_n;
+    std::vector<uint64_t> out_dst, out_eid, in_dst, in_eid, m_dst, m_eid;
+
+    auto fetch = [&](uint64_t u) {
+        acc.get_out_neighbors_into(ObjectId{u}, out_n);
+        acc.get_in_neighbors_into(ObjectId{u}, in_n);
+        out_dst.clear(); out_eid.clear(); in_dst.clear(); in_eid.clear();
+        for (auto& x : out_n.node_ids) out_dst.push_back(x.id);
+        for (auto& x : out_n.edge_ids) out_eid.push_back(x.id);
+        for (auto& x : in_n.node_ids)  in_dst.push_back(x.id);
+        for (auto& x : in_n.edge_ids)  in_eid.push_back(x.id);
+    };
+    // edge_ids are "real" (matching the accessor's per-node rule) when the
+    // first out OR in edge_id is non-zero.
+    auto has_eids = [&]() {
+        return (!out_eid.empty() && out_eid.front() != 0)
+            || (!in_eid.empty()  && in_eid.front()  != 0);
+    };
+
+    // Pass 1: merged-degree histogram (post-dedup, so ROW_PTR is sized right).
+    std::vector<uint64_t> degrees(N, 0);
+    for (uint64_t u = 0; u < N; ++u) {
+        fetch(u);
+        degrees[u] = Projection::merge_symmetric_row(
+            out_dst, out_eid, in_dst, in_eid, has_eids(), m_dst, m_eid);
+    }
+
+    // Pass 2: emit the merged node list per row; edge_id dropped (always 0).
+    TopologySnapshotWriter writer(
+        proj_dir,
+        std::string("topology_sym.csr"),
+        std::vector<fs::path>{proj_dir / "from_to_edge.leaf",
+                              proj_dir / "to_from_edge.leaf"},
+        N, std::move(degrees), /*include_edge_ids=*/false,
+        /*symmetric_format=*/true);
+
+    std::mt19937_64 vrng(0xC0FFEE);
+    for (uint64_t u = 0; u < N; ++u) {
+        fetch(u);
+        Projection::merge_symmetric_row(
+            out_dst, out_eid, in_dst, in_eid, has_eids(), m_dst, m_eid);
+        for (uint64_t d : m_dst) {
+            writer.append_edge(ObjectId{u},
+                               ObjectId{d & ObjectId::VALUE_MASK}, ObjectId{});
+        }
+        // Self-verify against the live accessor UNDIRECTED list: all rows when
+        // small, a random sample when huge.
+        const bool check = verify
+            && (N <= 10'000'000ULL || (vrng() % N) < verify_sample);
+        if (check) {
+            mdb::gnn::Neighbors live;
+            acc.get_neighbors_into(ObjectId{u},
+                                   mdb::gnn::EdgeOrientation::UNDIRECTED, live);
+            if (live.node_ids.size() != m_dst.size()) {
+                throw std::runtime_error(
+                    "gnn_build_topology_snapshot(symmetric): self-verify degree "
+                    "mismatch at node " + std::to_string(u));
+            }
+            for (std::size_t i = 0; i < m_dst.size(); ++i) {
+                if ((live.node_ids[i].id & ObjectId::VALUE_MASK)
+                    != (m_dst[i] & ObjectId::VALUE_MASK)) {
+                    throw std::runtime_error(
+                        "gnn_build_topology_snapshot(symmetric): self-verify node "
+                        "mismatch at node " + std::to_string(u));
+                }
+            }
+        }
+    }
+    writer.finalize();
+    return writer.bytes_written();
+}
+
 } // namespace
 
 std::tuple<uint64_t, uint64_t, int64_t>
@@ -148,6 +260,20 @@ GnnBuildTopologySnapshotProcedure::run_for_test(
         t_end - t_start).count();
 
     return {fwd_bytes, rev_bytes, duration_ms};
+}
+
+std::tuple<uint64_t, int64_t, bool>
+GnnBuildTopologySnapshotProcedure::run_symmetric_for_test(
+    GQL::ProjectionStorage& storage)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    bool refused = false;
+    uint64_t bytes = build_symmetric_snapshot_post_hoc(
+        storage, /*verify=*/true, /*verify_sample=*/UINT64_MAX, &refused);
+    const auto t1 = std::chrono::steady_clock::now();
+    const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t1 - t0).count();
+    return {bytes, ms, refused};
 }
 
 void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {

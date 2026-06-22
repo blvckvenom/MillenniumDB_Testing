@@ -107,6 +107,14 @@ public:
     run_for_test(GQL::ProjectionStorage& storage,
                  bool build_forward,
                  bool build_reverse);
+
+    // Test-only hook for the post-hoc symmetric (pre-merged undirected) bake.
+    // Builds topology_sym.csr with build-time self-verification enabled and
+    // returns (sym_bytes, duration_millis, parallel_edge_refused). bytes==0 with
+    // refused==true means a parallel-edge multigraph was detected and the bake
+    // abstained (no file written).
+    static std::tuple<uint64_t, int64_t, bool>
+    run_symmetric_for_test(GQL::ProjectionStorage& storage);
 };
 
 } // namespace GQL::Procedures
