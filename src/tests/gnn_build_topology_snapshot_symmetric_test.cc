@@ -108,3 +108,27 @@ TEST(SymmetricBake, MultigraphRefuses) {
     EXPECT_EQ(bytes, 0u);
     EXPECT_FALSE(fs::exists(fs::path(dir) / "topology_sym.csr"));
 }
+
+// mode='symmetric' builds the sym sidecar.
+TEST(SymmetricMode, SymmetricModeBuildsSym) {
+    (void)MdbFixture::instance();
+    const std::string dir = build_small_projection("sym_mode_sym");
+    auto storage = open_projection(dir);
+    auto [bytes, status, refused] = Proc::run_mode_for_test(*storage, "symmetric");
+    EXPECT_EQ(status, "built");
+    EXPECT_GT(bytes, 64u);
+    EXPECT_FALSE(refused);
+    EXPECT_TRUE(fs::exists(fs::path(dir) / "topology_sym.csr"));
+}
+
+// mode='directional' leaves the sym sidecar untouched.
+TEST(SymmetricMode, DirectionalModeSkipsSym) {
+    (void)MdbFixture::instance();
+    const std::string dir = build_small_projection("sym_mode_dir");
+    auto storage = open_projection(dir);
+    auto [bytes, status, refused] = Proc::run_mode_for_test(*storage, "directional");
+    EXPECT_EQ(status, "skipped");
+    EXPECT_EQ(bytes, 0u);
+    EXPECT_FALSE(refused);
+    EXPECT_FALSE(fs::exists(fs::path(dir) / "topology_sym.csr"));
+}

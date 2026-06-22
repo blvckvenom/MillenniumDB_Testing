@@ -70,6 +70,8 @@ public:
         return {
             Parameter("projection", ParamType::STRING, true,
                       "Name of the projection to augment with a CSR sidecar"),
+            Parameter("mode", ParamType::STRING, false,
+                      "Build mode: 'directional' (default), 'symmetric', or 'both'"),
         };
     }
 
@@ -86,6 +88,14 @@ public:
             YieldField{"revStatus",      YieldType::STRING,
                        "Reverse direction outcome: 'built', 'skipped' "
                        "(IndexSet-ineligible), or 'failed: <error>'"},
+            YieldField{"symBytes",       YieldType::INT,
+                       "Bytes written to topology_sym.csr (0 when not emitted)"},
+            YieldField{"symStatus",      YieldType::STRING,
+                       "Symmetric outcome: 'built', 'skipped[: reason]', "
+                       "'refused: parallel-edge multigraph', or 'failed: <error>'"},
+            YieldField{"parallelEdgeRefused", YieldType::BOOL,
+                       "True when the symmetric bake abstained on a parallel-edge "
+                       "multigraph"},
             YieldField{"durationMillis", YieldType::INT,
                        "Total wall-clock time in milliseconds"},
         };
@@ -115,6 +125,14 @@ public:
     // abstained (no file written).
     static std::tuple<uint64_t, int64_t, bool>
     run_symmetric_for_test(GQL::ProjectionStorage& storage);
+
+    // Test-only hook mirroring execute()'s symmetric block for a given mode
+    // ('directional' | 'symmetric' | 'both'). Returns (sym_bytes, sym_status,
+    // parallel_edge_refused); it never builds the directional sidecars (those
+    // are covered by run_for_test). For 'directional' it is a no-op returning
+    // (0, "skipped", false).
+    static std::tuple<uint64_t, std::string, bool>
+    run_mode_for_test(GQL::ProjectionStorage& storage, const std::string& mode);
 };
 
 } // namespace GQL::Procedures

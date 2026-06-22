@@ -1,5 +1,7 @@
 #include "query/procedure/builtin/gnn_build_topology_snapshot_procedure.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -276,17 +278,49 @@ GnnBuildTopologySnapshotProcedure::run_symmetric_for_test(
     return {bytes, ms, refused};
 }
 
+std::tuple<uint64_t, std::string, bool>
+GnnBuildTopologySnapshotProcedure::run_mode_for_test(
+    GQL::ProjectionStorage& storage, const std::string& mode)
+{
+    uint64_t    sym_bytes = 0;
+    std::string sym_status = "skipped";
+    bool        refused = false;
+    if (mode == "symmetric" || mode == "both") {
+        if (storage.get_from_to_edge_index() == nullptr
+            || storage.get_to_from_edge_index() == nullptr) {
+            sym_status =
+                "skipped: symmetric requires both FROM_TO_EDGE and TO_FROM_EDGE";
+        } else if (storage.get_graph_storage() == BPT::GraphStorage::CSR_HYBRID) {
+            sym_status = "skipped: CSR_HYBRID";
+        } else {
+            try {
+                sym_bytes = build_symmetric_snapshot_post_hoc(
+                    storage, /*verify=*/true,
+                    /*verify_sample=*/storage.get_node_count() <= 10'000'000ULL
+                                      ? UINT64_MAX : 100'000ULL,
+                    &refused);
+                sym_status = refused ? "refused: parallel-edge multigraph"
+                                     : "built";
+            } catch (const std::exception& e) {
+                sym_status = std::string("failed: ") + e.what();
+            }
+        }
+    }
+    return {sym_bytes, sym_status, refused};
+}
+
 void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
     using Projection::TopologySnapshotWriter;
 
     // -------------------------------------------------------------------
     // Step 1: parse arguments
     // -------------------------------------------------------------------
-    if (ctx.arguments.size() != 1) {
+    if (ctx.arguments.size() < 1 || ctx.arguments.size() > 2) {
         throw QueryException(
-            "gnn_build_topology_snapshot requires exactly 1 argument.\n\n"
-            "Usage: CALL gnn_build_topology_snapshot(projection)\n"
-            "Example: CALL gnn_build_topology_snapshot('my_proj')");
+            "gnn_build_topology_snapshot requires 1 or 2 arguments.\n\n"
+            "Usage: CALL gnn_build_topology_snapshot(projection [, mode])\n"
+            "  mode: 'directional' (default), 'symmetric', or 'both'\n"
+            "Example: CALL gnn_build_topology_snapshot('my_proj', 'both')");
     }
 
     std::string projection_name;
@@ -302,6 +336,27 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
             "gnn_build_topology_snapshot: projection name cannot be empty");
     }
     validate_safe_name(projection_name, "projection");
+
+    // Optional build mode: 'directional' (default), 'symmetric', or 'both'.
+    std::string mode = "directional";
+    if (ctx.arguments.size() == 2) {
+        try {
+            mode = ctx.get_string_argument(1);
+        } catch (const std::exception& e) {
+            throw QueryException(
+                std::string("gnn_build_topology_snapshot: mode argument must be "
+                            "a STRING (") + e.what() + ")");
+        }
+        std::transform(mode.begin(), mode.end(), mode.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (mode != "directional" && mode != "symmetric" && mode != "both") {
+            throw QueryException(
+                "gnn_build_topology_snapshot: mode must be 'directional', "
+                "'symmetric', or 'both' (got '" + mode + "')");
+        }
+    }
+    const bool want_directional = (mode == "directional" || mode == "both");
+    const bool want_symmetric   = (mode == "symmetric"   || mode == "both");
 
     // -------------------------------------------------------------------
     // Step 2: resolve projection directory + open storage read-only
@@ -351,7 +406,7 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
     std::string fwd_status = "skipped";
     std::string rev_status = "skipped";
 
-    if (fwd_eligible) {
+    if (want_directional && fwd_eligible) {
         try {
             fwd_bytes = build_one_snapshot_post_hoc(
                 storage, TopologySnapshotWriter::Direction::FORWARD);
@@ -363,7 +418,7 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
                       << projection_name << "': " << e.what() << std::endl;
         }
     }
-    if (rev_eligible) {
+    if (want_directional && rev_eligible) {
         try {
             rev_bytes = build_one_snapshot_post_hoc(
                 storage, TopologySnapshotWriter::Direction::REVERSE);
@@ -376,15 +431,48 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
         }
     }
 
-    // When every eligible direction failed nothing was materialized — raise
+    // Symmetric (pre-merged undirected) sidecar — built only when requested and
+    // both directions are eligible. CSR_HYBRID projections already provide O(1)
+    // neighbor access via their v3 leaves, so the symmetric sidecar is skipped.
+    uint64_t    sym_bytes = 0;
+    std::string sym_status = "skipped";
+    bool        parallel_edge_refused = false;
+    if (want_symmetric) {
+        if (!(fwd_eligible && rev_eligible)) {
+            sym_status =
+                "skipped: symmetric requires both FROM_TO_EDGE and TO_FROM_EDGE";
+        } else if (storage.get_graph_storage()
+                   == BPT::GraphStorage::CSR_HYBRID) {
+            sym_status = "skipped: CSR_HYBRID";
+        } else {
+            try {
+                sym_bytes = build_symmetric_snapshot_post_hoc(
+                    storage, /*verify=*/true,
+                    /*verify_sample=*/storage.get_node_count() <= 10'000'000ULL
+                                      ? UINT64_MAX : 100'000ULL,
+                    &parallel_edge_refused);
+                sym_status = parallel_edge_refused
+                    ? "refused: parallel-edge multigraph"
+                    : "built";
+            } catch (const std::exception& e) {
+                sym_status = std::string("failed: ") + e.what();
+                std::cerr << "gnn_build_topology_snapshot: symmetric build "
+                             "failed for projection '"
+                          << projection_name << "': " << e.what() << std::endl;
+            }
+        }
+    }
+
+    // When every requested build failed/skipped nothing was materialized — raise
     // instead of yielding a row a remote client would read as success.
-    const bool any_built = (fwd_eligible && fwd_status == "built")
-                        || (rev_eligible && rev_status == "built");
+    const bool any_built = (want_directional && fwd_eligible && fwd_status == "built")
+                        || (want_directional && rev_eligible && rev_status == "built")
+                        || (want_symmetric && sym_status == "built");
     if (!any_built) {
         throw QueryException(
             "gnn_build_topology_snapshot: no sidecar could be built for "
             "projection '" + projection_name + "'. fwd: " + fwd_status
-            + "; rev: " + rev_status);
+            + "; rev: " + rev_status + "; sym: " + sym_status);
     }
 
     const auto t_end = std::chrono::steady_clock::now();
@@ -394,12 +482,15 @@ void GnnBuildTopologySnapshotProcedure::execute(ProcedureContext& ctx) {
     // -------------------------------------------------------------------
     // Step 5: yield results
     // -------------------------------------------------------------------
-    ctx.yield("projectionName", ctx.create_string(projection_name));
-    ctx.yield("fwdBytes",       ctx.create_int(static_cast<int64_t>(fwd_bytes)));
-    ctx.yield("revBytes",       ctx.create_int(static_cast<int64_t>(rev_bytes)));
-    ctx.yield("fwdStatus",      ctx.create_string(fwd_status));
-    ctx.yield("revStatus",      ctx.create_string(rev_status));
-    ctx.yield("durationMillis", ctx.create_int(duration_ms));
+    ctx.yield("projectionName",      ctx.create_string(projection_name));
+    ctx.yield("fwdBytes",            ctx.create_int(static_cast<int64_t>(fwd_bytes)));
+    ctx.yield("revBytes",            ctx.create_int(static_cast<int64_t>(rev_bytes)));
+    ctx.yield("fwdStatus",           ctx.create_string(fwd_status));
+    ctx.yield("revStatus",           ctx.create_string(rev_status));
+    ctx.yield("symBytes",            ctx.create_int(static_cast<int64_t>(sym_bytes)));
+    ctx.yield("symStatus",           ctx.create_string(sym_status));
+    ctx.yield("parallelEdgeRefused", ctx.create_bool(parallel_edge_refused));
+    ctx.yield("durationMillis",      ctx.create_int(duration_ms));
     ctx.yield_row();
 }
 
