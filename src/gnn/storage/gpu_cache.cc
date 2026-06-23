@@ -290,19 +290,22 @@ GpuCache::GpuCache(const fs::path& cache_file) {
     // Convert to torch::Tensor
     auto torch_dtype = to_torch_dtype(header.get_dtype());
 
-    // from_blob does NOT own the data — clone() to make the tensor own its storage
-    auto cpu_tensor = torch::from_blob(
+    // from_blob does NOT own cpu_buffer. On the CUDA path we skip the clone():
+    // .to(kCUDA) copies the data into GPU storage (owned by the result) while
+    // cpu_buffer is still alive, so the extra full-size host clone() (a second
+    // data_bytes heap copy at cache load) is pure waste. Only the CPU-only path
+    // needs an owning clone() to outlive cpu_buffer's scope.
+    auto cpu_view = torch::from_blob(
         cpu_buffer.data(),
         {static_cast<int64_t>(num_nodes_), static_cast<int64_t>(feature_dim_)},
         torch_dtype
-    ).clone();
+    );
 
-    // Move to GPU if CUDA is available
     if (torch::cuda::is_available()) {
-        features_ = cpu_tensor.to(torch::kCUDA);
+        features_ = cpu_view.to(torch::kCUDA);
         on_gpu_ = true;
     } else {
-        features_ = cpu_tensor;
+        features_ = cpu_view.clone();
         on_gpu_ = false;
     }
 }
