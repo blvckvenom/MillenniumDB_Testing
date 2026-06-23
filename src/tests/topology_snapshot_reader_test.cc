@@ -965,11 +965,15 @@ TEST_F(TopologySnapshotReaderTest, SymOpenSucceedsAndSlicesNeighbors) {
     EXPECT_EQ(r.num_edges(), 4u);
     EXPECT_FALSE(r.has_edge_ids());
 
-    auto n0 = r.neighbors(0);
+    // Narrow uint32 sym body: neighbors() (uint64-only span) throws; use the
+    // width-agnostic copy_neighbors() accessor.
+    std::vector<uint64_t> n0;
+    r.copy_neighbors(0, n0);
     ASSERT_EQ(n0.size(), 2u);
     EXPECT_EQ(n0[0], 1u);
     EXPECT_EQ(n0[1], 2u);
-    auto n1 = r.neighbors(1);
+    std::vector<uint64_t> n1;
+    r.copy_neighbors(1, n1);
     ASSERT_EQ(n1.size(), 1u);
     EXPECT_EQ(n1[0], 0u);
 }

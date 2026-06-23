@@ -590,8 +590,9 @@ TEST_F(TopologySnapshotWriterTest, SymmetricWriterBodyIsPlainCsrNoEdgeIds) {
     writer.finalize();
 
     const auto path = dir_ / "topology_sym.csr";
-    // No EDGE_IDS section: 64 + 8*(3+1) + 8*4 = 64+32+32 = 128.
-    EXPECT_EQ(std::filesystem::file_size(path), 128u);
+    // No EDGE_IDS section; symmetric body is NARROW uint32 col_idx (ROW_PTR stays
+    // uint64): 64 + 8*(3+1) + 4*4 = 64+32+16 = 112.
+    EXPECT_EQ(std::filesystem::file_size(path), 112u);
 
     auto bytes = read_all(path);
     uint64_t row_ptr[4];
@@ -600,8 +601,8 @@ TEST_F(TopologySnapshotWriterTest, SymmetricWriterBodyIsPlainCsrNoEdgeIds) {
     EXPECT_EQ(row_ptr[1], 2u);
     EXPECT_EQ(row_ptr[2], 3u);
     EXPECT_EQ(row_ptr[3], 4u);
-    uint64_t col[4];
-    std::memcpy(col, bytes.data() + 64 + 32, 32);
+    uint32_t col[4];
+    std::memcpy(col, bytes.data() + 64 + 32, 16);
     EXPECT_EQ(col[0], 1u);
     EXPECT_EQ(col[1], 2u);
     EXPECT_EQ(col[2], 0u);

@@ -56,6 +56,8 @@ int main() {
         "effectivePrefetchWorkers",
         "useAddrTablesEffective",
         "addrTableLoadUs",
+        "testAccuracyAtBestVal",
+        "bestValEpoch",
     };
 
     // Test 1: every yielded field is declared in yield_fields().
