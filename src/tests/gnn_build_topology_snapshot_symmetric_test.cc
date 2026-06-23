@@ -65,8 +65,19 @@ TEST(SymmetricBake, BakedRowsMatchLiveUndirected) {
     ASSERT_EQ(N, 4u);
     std::vector<uint64_t> row_ptr(N + 1);
     f.read(reinterpret_cast<char*>(row_ptr.data()), (N + 1) * sizeof(uint64_t));
+    // COL_IDX width follows the header id_width (offset 12): the symmetric
+    // sidecar is now narrow (uint32) when node ids fit. The bake stores untagged
+    // values (d & VALUE_MASK) in either width, so a narrow read widens directly.
     std::vector<uint64_t> col(row_ptr[N]);
-    f.read(reinterpret_cast<char*>(col.data()), row_ptr[N] * sizeof(uint64_t));
+    if (hdr[12] == 4) {
+        std::vector<uint32_t> col32(row_ptr[N]);
+        f.read(reinterpret_cast<char*>(col32.data()),
+               row_ptr[N] * sizeof(uint32_t));
+        for (std::size_t i = 0; i < col32.size(); ++i) col[i] = col32[i];
+    } else {
+        f.read(reinterpret_cast<char*>(col.data()),
+               row_ptr[N] * sizeof(uint64_t));
+    }
 
     for (uint64_t u = 0; u < N; ++u) {
         mdb::gnn::Neighbors live;
@@ -124,8 +135,19 @@ TEST(SymmetricBake, MultigraphBuildsAndPreservesParallelEdges) {
     ASSERT_EQ(N, 2u);
     std::vector<uint64_t> row_ptr(N + 1);
     f.read(reinterpret_cast<char*>(row_ptr.data()), (N + 1) * sizeof(uint64_t));
+    // COL_IDX width follows the header id_width (offset 12): the symmetric
+    // sidecar is now narrow (uint32) when node ids fit. The bake stores untagged
+    // values (d & VALUE_MASK) in either width, so a narrow read widens directly.
     std::vector<uint64_t> col(row_ptr[N]);
-    f.read(reinterpret_cast<char*>(col.data()), row_ptr[N] * sizeof(uint64_t));
+    if (hdr[12] == 4) {
+        std::vector<uint32_t> col32(row_ptr[N]);
+        f.read(reinterpret_cast<char*>(col32.data()),
+               row_ptr[N] * sizeof(uint32_t));
+        for (std::size_t i = 0; i < col32.size(); ++i) col[i] = col32[i];
+    } else {
+        f.read(reinterpret_cast<char*>(col.data()),
+               row_ptr[N] * sizeof(uint64_t));
+    }
     EXPECT_EQ(row_ptr[N], 4u) << "parallel edges must be preserved (no collapse)";
     for (uint64_t u = 0; u < N; ++u) {
         mdb::gnn::Neighbors live;

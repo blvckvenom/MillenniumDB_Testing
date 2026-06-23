@@ -339,12 +339,17 @@ TopologySnapshotWriter::TopologySnapshotWriter(
     }
     num_edges_ = running;
 
-    // uint32 topology sidecar eligibility — identical opt-in rules as the
-    // Direction ctor (MDB_GNN_TOPOLOGY_UINT32 + node/edge ids fit uint32).
+    // uint32 topology sidecar eligibility — opt-in via MDB_GNN_TOPOLOGY_UINT32
+    // for directional sidecars. The SYMMETRIC sidecar is a derived, edge-id-less,
+    // GPU-pin-only artifact: it should ALWAYS be as narrow as the ids allow,
+    // regardless of the env, so the offline sampling GPU-UVA path can pin it
+    // zero-copy (a wide symmetric slice is not pinnable as uint32 and would force
+    // the in-RAM merge fallback, defeating the bake). So force narrow for
+    // symmetric_format when the node ids fit uint32.
     {
-        bool want_narrow = false;
+        bool want_narrow = symmetric_format_;
         if (const char* e = std::getenv("MDB_GNN_TOPOLOGY_UINT32")) {
-            want_narrow = (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+            want_narrow = want_narrow || (e[0] == '1' || e[0] == 't' || e[0] == 'T');
         }
         const uint64_t kU32 = uint64_t{1} << 32;
         const bool node_fits = num_nodes_ < kU32;
