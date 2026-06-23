@@ -69,22 +69,32 @@ uint64_t build_symmetric_concat_parallel_(
     std::mutex err_mu;
     auto worker = [&](uint64_t lo, uint64_t hi) {
         try {
-            // One contiguous dst buffer for the whole range (length =
-            // row_ptr[hi]-row_ptr[lo]); reserve up front so appends never grow.
-            std::size_t cap = 0;
-            for (uint64_t u = lo; u < hi; ++u) cap += rf.degree(u) + rr.degree(u);
-            std::vector<uint64_t> dst;
-            dst.reserve(cap);
-            for (uint64_t u = lo; u < hi; ++u) {
-                const uint32_t* f = rf.col_idx32_row(u);
-                const uint64_t  fd = rf.degree(u);
-                for (uint64_t i = 0; i < fd; ++i) dst.push_back(f[i]);
-                const uint32_t* r = rr.col_idx32_row(u);
-                const uint64_t  rd = rr.degree(u);
-                for (uint64_t i = 0; i < rd; ++i) dst.push_back(r[i]);
-            }
+            // Out-of-core bake: flush per row-chunk so resident RAM is
+            // O(chunk edges) instead of O(range edges). On huge undirected
+            // graphs the previous whole-range dst materialized the entire
+            // undirected COL_IDX in heap (~M_undir * 8 B, ~26 GB on papers100M)
+            // across W workers and OOMed the auto-bake before sampling even
+            // started. append_subrange pwrites each sub-range at row_ptr[cs],
+            // so the chunked output is byte-identical to the whole-range write.
             static const std::vector<uint64_t> kNoEids;
-            writer.append_subrange(lo, hi, dst, kNoEids);
+            constexpr uint64_t kChunkRows = 1ULL << 20;  // 1M rows per flush
+            std::vector<uint64_t> dst;
+            for (uint64_t cs = lo; cs < hi; cs += kChunkRows) {
+                const uint64_t ce = std::min<uint64_t>(hi, cs + kChunkRows);
+                std::size_t cap = 0;
+                for (uint64_t u = cs; u < ce; ++u) cap += rf.degree(u) + rr.degree(u);
+                dst.clear();
+                dst.reserve(cap);
+                for (uint64_t u = cs; u < ce; ++u) {
+                    const uint32_t* f = rf.col_idx32_row(u);
+                    const uint64_t  fd = rf.degree(u);
+                    for (uint64_t i = 0; i < fd; ++i) dst.push_back(f[i]);
+                    const uint32_t* r = rr.col_idx32_row(u);
+                    const uint64_t  rd = rr.degree(u);
+                    for (uint64_t i = 0; i < rd; ++i) dst.push_back(r[i]);
+                }
+                writer.append_subrange(cs, ce, dst, kNoEids);
+            }
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(err_mu);
             if (err.empty()) err = e.what();
