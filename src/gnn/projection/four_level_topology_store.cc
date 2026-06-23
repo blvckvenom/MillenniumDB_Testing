@@ -8,6 +8,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cstdint>
+#include <unistd.h>
+
+#include "gnn/common/page_cache_hint.h"
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -317,8 +322,27 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
         sym_col_idx_.resize(static_cast<std::size_t>(m));
         std::memcpy(sym_row_ptr_.data(), l3_sym_->row_ptr_base(),
                     (static_cast<std::size_t>(n) + 1) * sizeof(uint64_t));
-        std::memcpy(sym_col_idx_.data(), l3_sym_->col_idx32_base(),
-                    static_cast<std::size_t>(m) * sizeof(uint32_t));
+        // Copy COL_IDX in chunks, dropping consumed mmap pages with
+        // madvise(DONTNEED) so the source's resident set stays ~one chunk instead
+        // of faulting in all M*4 B (~12.9 GB on papers100M) ON TOP of the heap
+        // target during the copy. Halves the transient host peak (~25.7->~13 GB);
+        // the heap copy is byte-identical (madvise only drops SOURCE pages).
+        {
+            const auto* src = reinterpret_cast<const uint8_t*>(l3_sym_->col_idx32_base());
+            auto* dst = reinterpret_cast<uint8_t*>(sym_col_idx_.data());
+            const std::size_t total = static_cast<std::size_t>(m) * sizeof(uint32_t);
+            const std::size_t pg = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+            const std::size_t CHUNK = std::size_t(256) << 20;  // 256 MB
+            for (std::size_t off = 0; off < total; off += CHUNK) {
+                const std::size_t len = std::min(CHUNK, total - off);
+                std::memcpy(dst + off, src + off, len);
+                // Drop the page-aligned interior of [src, src+off+len) already read.
+                const uintptr_t s  = reinterpret_cast<uintptr_t>(src);
+                const uintptr_t a0 = (s + pg - 1) & ~(static_cast<uintptr_t>(pg) - 1);
+                const uintptr_t a1 = (s + off + len) & ~(static_cast<uintptr_t>(pg) - 1);
+                if (a1 > a0) mdb::gnn::madvise_dontneed(reinterpret_cast<void*>(a0), a1 - a0);
+            }
+        }
         sym_arrays_.row_ptr      = sym_row_ptr_.data();
         sym_arrays_.col_idx      = sym_col_idx_.data();
         sym_arrays_.n_rows       = n;
