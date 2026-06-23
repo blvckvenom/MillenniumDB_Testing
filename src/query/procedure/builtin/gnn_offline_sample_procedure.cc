@@ -411,6 +411,21 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("symmetricRamBytes", ctx.create_int(
         static_cast<int64_t>(result.symmetric_ram_bytes)));
 
+    // RAM relief telemetry. directionalRamFreedBytes is what releasing the
+    // directional fwd/rev tiers reclaimed once the merged slice was pinned (the
+    // symmetric GPU path); rssPeakBeforeFreeBytes is the process high-water mark
+    // at the tightest moment (merged slice + directional tiers both resident),
+    // rssPeakAfterFreeBytes the post-free sampling-phase high-water mark, and
+    // rssCurrentEndBytes the resident size at end. 0 when unavailable / no free.
+    ctx.yield("directionalRamFreedBytes", ctx.create_int(
+        static_cast<int64_t>(result.directional_ram_freed_bytes)));
+    ctx.yield("rssPeakBeforeFreeBytes", ctx.create_int(
+        static_cast<int64_t>(result.rss_peak_before_free_bytes)));
+    ctx.yield("rssPeakAfterFreeBytes", ctx.create_int(
+        static_cast<int64_t>(result.rss_peak_after_free_bytes)));
+    ctx.yield("rssCurrentEndBytes", ctx.create_int(
+        static_cast<int64_t>(result.rss_current_end_bytes)));
+
     ctx.yield_row();
 }
 

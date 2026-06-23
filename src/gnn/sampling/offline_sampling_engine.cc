@@ -14,6 +14,7 @@
 #include <system_error>
 #include <thread>
 
+#include "gnn/common/process_memory.h"
 #include "gnn/projection/gnn_meta.h"
 #include "gnn/projection/pinned_topology_view.h"
 #include "gnn/projection/topology_accessor.h"
@@ -298,6 +299,23 @@ struct OfflineSamplingEngine::Impl {
                     if (pv != nullptr && pv->is_registered()) {
                         use_gpu_sampling = true;
                         active_gpu_plan  = plan;
+                        // The merged undirected slice is now materialized AND
+                        // pinned; the GPU kernel serves every node from it, so
+                        // the directional fwd/rev tiers (L1/L2 heap + the two L3
+                        // mmap sidecars) are dead weight. Capture the high-water
+                        // RSS at this tightest point (merged slice + directional
+                        // tiers both resident), release the directional tiers,
+                        // then reset the kernel peak so the sampling phase that
+                        // follows reports its own (much lower) high-water mark.
+                        // Symmetric-only: the non-symmetric pin registers the L3
+                        // sidecars directly, so those must outlive the kernel.
+                        if (plan.use_symmetric) {
+                            result.rss_peak_before_free_bytes = peak_rss_bytes();
+                            result.directional_ram_freed_bytes =
+                                topo_store
+                                    .release_directional_after_symmetric_pin();
+                            reset_peak_rss();
+                        }
                     }
                 }
 #endif
@@ -846,6 +864,14 @@ struct OfflineSamplingEngine::Impl {
             if (!result.cancelled) {
                 result.success = true;
             }
+
+            // RAM telemetry: the sampling-phase high-water mark (the peak was
+            // reset right after the directional free on the symmetric GPU path,
+            // so this reflects the post-free working set) + the current resident
+            // size at end. Compared against rss_peak_before_free_bytes these show
+            // the peak-RAM relief from releasing the directional tiers.
+            result.rss_peak_after_free_bytes = peak_rss_bytes();
+            result.rss_current_end_bytes     = current_rss_bytes();
 
         } catch (const std::exception& e) {
             result.error_message = e.what();

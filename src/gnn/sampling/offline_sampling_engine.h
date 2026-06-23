@@ -104,6 +104,20 @@ struct SamplingResult {
     bool        symmetric_built_ok   = false;
     double      symmetric_ms         = 0.0;
     std::size_t symmetric_ram_bytes  = 0;
+
+    // RAM telemetry (Linux VmRSS/VmHWM via process_memory.h; 0 if unavailable).
+    // directional_ram_freed_bytes is what release_directional_after_symmetric_pin
+    // reclaimed on the symmetric GPU path (0 otherwise). rss_peak_before_free is
+    // the process high-water mark captured right AFTER the merge+pin but BEFORE
+    // the directional free (the tight transient: merged slice + directional tiers
+    // both resident). rss_peak_after_free is the high-water mark of the sampling
+    // phase that follows (peak reset after the free). rss_current_end is VmRSS at
+    // the end of the run. All four let a caller see the peak-RAM relief without
+    // an external monitor.
+    std::size_t directional_ram_freed_bytes = 0;
+    std::size_t rss_peak_before_free_bytes  = 0;
+    std::size_t rss_peak_after_free_bytes    = 0;
+    std::size_t rss_current_end_bytes        = 0;
 };
 
 /**

@@ -166,7 +166,22 @@ public:
                 "Wall-clock milliseconds spent building the in-RAM merged "
                 "undirected slice (0 when not materialized)."},
             YieldField{"symmetricRamBytes", YieldType::INT,
-                "Resident bytes of the merged undirected slice (0 when absent)."}
+                "Resident bytes of the merged undirected slice (0 when absent)."},
+            YieldField{"directionalRamFreedBytes", YieldType::INT,
+                "Bytes reclaimed by releasing the directional fwd/rev tiers "
+                "(L1/L2 heap + the two munmapped L3 sidecars) once the merged "
+                "slice was pinned on the symmetric GPU path. 0 on the CPU path."},
+            YieldField{"rssPeakBeforeFreeBytes", YieldType::INT,
+                "Process peak RSS (VmHWM) captured right after the merge+pin but "
+                "before the directional free — the tightest moment, with the "
+                "merged slice and the directional tiers both resident. 0 if "
+                "unavailable / no free happened."},
+            YieldField{"rssPeakAfterFreeBytes", YieldType::INT,
+                "Process peak RSS (VmHWM) of the sampling phase after the "
+                "directional free (the kernel peak counter was reset post-free). "
+                "Compare with rssPeakBeforeFreeBytes to see the RAM relief."},
+            YieldField{"rssCurrentEndBytes", YieldType::INT,
+                "Current resident set size (VmRSS) at the end of the run."}
         };
     }
 
