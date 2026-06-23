@@ -252,9 +252,28 @@ struct OfflineSamplingEngine::Impl {
                     }
                     return DirCsrDims{};
                 };
-                SamplingBackendPlan plan = plan_sampling_backend(
-                    res, config.orientation, l3_dims(topo.l3_fwd()),
-                    l3_dims(topo.l3_rev()), backend_choice);
+                // UNDIRECTED/symmetric: enable_pinned_gpu_view pins the pre-merged
+                // narrow sym slice (topology_sym.csr), NOT the two directional
+                // sidecars. Those are narrow only when MDB_GNN_TOPOLOGY_UINT32 was
+                // set at build time; on a default (wide uint64) projection they read
+                // as absent here, which would wrongly force CPU even though the
+                // narrow merged slice exists and is pinnable. So when the sym slice
+                // is present, size the gate on IT (one NATURAL direction == the
+                // single slice that gets pinned) instead of the directional pair.
+                DirCsrDims sym_dims;
+                if (config.symmetric_resolved_on(config.orientation)) {
+                    auto sym = GQL::Projection::TopologySnapshotReader::open_symmetric(
+                        storage.get_projection_dir());
+                    if (sym.has_data() && sym.id_width() == 4) {
+                        sym_dims = DirCsrDims{sym.num_nodes(), sym.num_edges(), true};
+                    }
+                }
+                SamplingBackendPlan plan = sym_dims.present
+                    ? plan_sampling_backend(res, EdgeOrientation::NATURAL, sym_dims,
+                                            DirCsrDims{}, backend_choice)
+                    : plan_sampling_backend(res, config.orientation,
+                                            l3_dims(topo.l3_fwd()),
+                                            l3_dims(topo.l3_rev()), backend_choice);
 
                 // Symmetric single-slice override: when resolved-on (AUTO =>
                 // UNDIRECTED) and a pinnable substrate exists, serve ONE
