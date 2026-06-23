@@ -1157,6 +1157,12 @@ std::size_t TopologyAccessor::release_directional_after_symmetric_pin() {
         : 0;
 }
 
+std::size_t TopologyAccessor::release_directional_for_baked_symmetric() {
+    return impl_->four_level_store_
+        ? impl_->four_level_store_->release_directional_for_baked_symmetric()
+        : 0;
+}
+
 // ============================================================================
 // NodeIterator Implementation
 // ============================================================================

@@ -283,6 +283,7 @@ struct OfflineSamplingEngine::Impl {
 #ifdef GNN_CUDA_ENABLED
                 if (plan.backend != SamplingBackend::CPU_OUT_OF_CORE) {
                     auto& topo_store = khop_sampler->get_topology();
+                    bool sym_freed_before_pin = false;
                     if (plan.use_symmetric) {
                         // Ensure the pre-merged symmetric slice is baked on disk
                         // (topology_sym.csr) so enable_pinned_gpu_view OPENS +
@@ -296,7 +297,7 @@ struct OfflineSamplingEngine::Impl {
                         // does the in-RAM merge (correct, just not amortized).
                         const std::filesystem::path proj_dir =
                             storage.get_projection_dir();
-                        const bool sym_present =
+                        bool sym_present =
                             GQL::Projection::TopologySnapshotReader::open_symmetric(
                                 proj_dir).has_data();
                         if (!sym_present) {
@@ -310,11 +311,33 @@ struct OfflineSamplingEngine::Impl {
                                           << "topology_sym.csr in "
                                           << phase_ms_(tb, std::chrono::steady_clock::now())
                                           << " ms\n";
+                                // The slice is now servable from disk; re-check so
+                                // the free-before-pin path below can take effect.
+                                sym_present =
+                                    GQL::Projection::TopologySnapshotReader::
+                                        open_symmetric(proj_dir).has_data();
                             } catch (const std::exception& e) {
                                 std::cerr << "[OfflineSamplingEngine] auto-bake of "
                                           << "topology_sym.csr failed (" << e.what()
                                           << "); falling back to in-RAM merge\n";
                             }
+                        }
+                        // Free-before-pin: when the slice is servable from the
+                        // baked sidecar, materialize_symmetric_arrays() copies it
+                        // from that disk mmap and never reads the directional
+                        // tiers, so they (~15 GB on papers100M) are dead weight.
+                        // Release them BEFORE the copy+pin so the ~13 GB heap
+                        // slice never coexists with them (transient host peak
+                        // ~28 -> ~13 GB). Only safe when baked: the in-RAM
+                        // fallback merge (taken when !sym_present) consumes the
+                        // tiers and frees them after the pin instead.
+                        if (sym_present) {
+                            result.rss_peak_before_free_bytes = peak_rss_bytes();
+                            result.directional_ram_freed_bytes =
+                                topo_store
+                                    .release_directional_for_baked_symmetric();
+                            reset_peak_rss();
+                            sym_freed_before_pin = true;
                         }
                         // enable_pinned_gpu_view materializes the merged
                         // undirected slice (opens the baked sidecar, or merges as
@@ -343,7 +366,11 @@ struct OfflineSamplingEngine::Impl {
                         // follows reports its own (much lower) high-water mark.
                         // Symmetric-only: the non-symmetric pin registers the L3
                         // sidecars directly, so those must outlive the kernel.
-                        if (plan.use_symmetric) {
+                        if (plan.use_symmetric && !sym_freed_before_pin) {
+                            // Fallback path only: the in-RAM merge consumed the
+                            // directional tiers, so they can only be freed now,
+                            // after the pin. (The baked path freed them before
+                            // the copy+pin above, setting sym_freed_before_pin.)
                             result.rss_peak_before_free_bytes = peak_rss_bytes();
                             result.directional_ram_freed_bytes =
                                 topo_store

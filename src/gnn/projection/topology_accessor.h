@@ -620,6 +620,19 @@ public:
      */
     std::size_t release_directional_after_symmetric_pin();
 
+    /**
+     * @brief Free the directional tiers BEFORE the symmetric slice is pinned
+     *        (baked path only).
+     *
+     * Delegates to the Four-Level Topology Store's
+     * `release_directional_for_baked_symmetric()`: on the baked path the merged
+     * slice is copied from the topology_sym.csr mmap and never reads the
+     * directional tiers, so they can be freed up front to keep the ~13 GB heap
+     * slice from coexisting with the ~15 GB tiers during the copy+pin. No-op
+     * when the store is absent. Returns the bytes freed.
+     */
+    std::size_t release_directional_for_baked_symmetric();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

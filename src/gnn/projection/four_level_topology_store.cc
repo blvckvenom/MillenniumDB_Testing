@@ -440,7 +440,25 @@ std::size_t FourLevelTopologyStore::release_directional_after_symmetric_pin() {
     // self-owned, full-coverage RAM copy the GPU kernel walks, so only then are
     // the directional tiers provably dead (see the header contract). Idempotent.
     if (!sym_arrays_built_ || directional_released_) return 0;
+    return release_directional_tiers_();
+}
 
+std::size_t FourLevelTopologyStore::release_directional_for_baked_symmetric() {
+    // Pre-pin variant. The caller (offline sampling engine) has CONFIRMED a
+    // baked topology_sym.csr is present, so materialize_symmetric_arrays() will
+    // copy the merged slice from that disk mmap and never read the directional
+    // l3_fwd_/l3_rev_ tiers. They are therefore dead BEFORE the slice is built,
+    // so freeing them here (rather than after the pin) stops the ~13 GB heap
+    // slice from coexisting with the ~15 GB tiers during the copy+pin (transient
+    // host peak ~28 -> ~13 GB on papers100M). Unlike the post-pin variant this
+    // does NOT require sym_arrays_built_ (the slice is not materialized yet).
+    // Never frees l3_sym_ -- the baked slice is read from it. Idempotent; do NOT
+    // call on the in-RAM fallback merge path (it consumes the tiers).
+    if (directional_released_) return 0;
+    return release_directional_tiers_();
+}
+
+std::size_t FourLevelTopologyStore::release_directional_tiers_() {
     // Footprint of an L3 sidecar reader's faulted-in page-cache: ROW_PTR is
     // uint64 regardless of id_width; COL_IDX is the narrow (4 B) or wide (8 B)
     // width. Edge-id streams (when present) add to the file but are not counted

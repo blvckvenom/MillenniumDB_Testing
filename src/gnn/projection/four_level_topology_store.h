@@ -506,6 +506,25 @@ public:
      */
     std::size_t release_directional_after_symmetric_pin();
 
+    /**
+     * @brief Free the directional fwd/rev tiers BEFORE the symmetric slice is
+     *        pinned. Valid only when a baked topology_sym.csr is confirmed
+     *        present.
+     *
+     * Same effect as release_directional_after_symmetric_pin(), but intended to
+     * run *before* enable_pinned_gpu_view() on the baked path: there
+     * materialize_symmetric_arrays() copies the merged slice from the
+     * topology_sym.csr mmap and never reads l3_fwd_/l3_rev_, so the tiers are
+     * already dead and freeing them up front keeps the ~13 GB heap slice from
+     * coexisting with the ~15 GB tiers during the copy+pin (transient host peak
+     * ~28 -> ~13 GB on papers100M). Does NOT require the slice to be
+     * materialized (no sym_arrays_built_ gate); idempotent. MUST NOT be used on
+     * the in-RAM fallback merge path, which still consumes the tiers.
+     *
+     * @return Best-effort estimate of the bytes released; 0 on no-op.
+     */
+    std::size_t release_directional_for_baked_symmetric();
+
     /// True once release_directional_after_symmetric_pin() has run.
     bool directional_released() const noexcept { return directional_released_; }
 
@@ -573,6 +592,13 @@ private:
         const L2CompactCsr&                             l2,
         const GQL::Projection::TopologySnapshotReader*  l3,
         const L4Lookup&                                 l4) const;
+
+    // Shared implementation behind release_directional_after_symmetric_pin() and
+    // release_directional_for_baked_symmetric(): frees the owned directional
+    // L1/L2 heap caches, munmaps the two L3 directional sidecars, nulls the
+    // borrowed aliases, and sets directional_released_. Assumes the caller has
+    // already checked the appropriate precondition.
+    std::size_t release_directional_tiers_();
 
     // -------------------------------------------------
     //  Build helpers (only used by the Phase 3 ctor)
