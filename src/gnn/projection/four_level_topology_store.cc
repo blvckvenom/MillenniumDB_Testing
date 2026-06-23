@@ -725,6 +725,21 @@ void FourLevelTopologyStore::populate_direction_symmetric_(
         // The build() guard refuses this on a parallel-edge multigraph, so by
         // the time we get here either the graph has no parallel edges or the
         // caller accepts the collapse.
+        //
+        // UNIFORM concat (principled undirected receptive field): the symmetric
+        // tier keeps every undirected neighbor consistently (edge-id-keyed dedup
+        // removes nothing when edge_ids are real). This matches the GPU flat
+        // slice (materialize_symmetric_arrays) so CPU and GPU agree. NOTE: the
+        // legacy runtime out+in+merge is NOT uniform — L2CompactCsr drops
+        // edge_ids, so its tier-2 nodes fall back to node-id dedup (collapsing
+        // mutual-edge duplicates). That tier-dependent behavior is a
+        // budget-dependent artifact, not a clean invariant; the symmetric path
+        // deliberately does NOT replicate it. Measured cost on papers100M: the
+        // symmetric receptive field is ~0.05% richer than the legacy reference
+        // for the ~0.13% fwd/rev-overlap nodes that land in tier-2 — far below
+        // the irreducible papers100M variance, and accuracy-neutral. cora is
+        // all-L1 so ON==OFF stays bit-identical (0.8574939) there.
+        // useSymmetricTopology:'off' gives the exact legacy behavior.
         const bool effective_has_eids = has_eids && !config_.drop_edge_ids;
         detail::symmetric_merge_row(df, ef, dr, er, effective_has_eids, merged);
         if (config_.drop_edge_ids) {
