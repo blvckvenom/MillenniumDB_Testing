@@ -1119,6 +1119,11 @@ std::size_t TopologyAccessor::symmetric_ram_bytes() const {
         ? impl_->four_level_store_->symmetric_ram_bytes() : 0;
 }
 
+std::size_t TopologyAccessor::four_level_ram_used() const {
+    return impl_->four_level_store_
+        ? impl_->four_level_store_->total_ram_used() : 0;
+}
+
 const L2CompactCsr* TopologyAccessor::l2_fwd() const {
     return impl_->four_level_store_ ? impl_->four_level_store_->l2_fwd() : nullptr;
 }

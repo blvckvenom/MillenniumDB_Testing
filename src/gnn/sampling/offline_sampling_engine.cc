@@ -223,8 +223,22 @@ struct OfflineSamplingEngine::Impl {
                     else if (e == "gpu")  backend_choice = SamplingBackendChoice::FORCE_GPU;
                     else if (e == "auto") backend_choice = SamplingBackendChoice::AUTO;
                 }
-                const mdb::gpu::SystemResources res = mdb::gpu::detect_resources();
+                mdb::gpu::SystemResources res = mdb::gpu::detect_resources();
                 const TopologyAccessor& topo = khop_sampler->get_topology();
+
+                // Symmetric headroom: when resolved-on, the directional
+                // four-level tiers (L1+L2 fwd+rev) are SUPERSEDED by the single
+                // pinned undirected slice — the GPU kernel reads the slice, not
+                // the tiers. So their RAM is freeable headroom for the GPU/CPU
+                // decision: without this the tiers (e.g. ~15 GB on papers100M)
+                // shrink MemAvailable enough that the planner rejects the GPU
+                // even though the slice + tiers empirically coexist within
+                // budget (measured 24.8 GB peak on a 30 GB host). Add the tier
+                // RAM back so the planner sizes against the true headroom.
+                if (config.symmetric_resolved_on(config.orientation)) {
+                    res.ram_available += topo.four_level_ram_used();
+                }
+
                 // Size the decision on the L3 GLOBAL sidecar — the substrate
                 // enable_pinned_gpu_view actually pins (whole graph, narrow
                 // uint32) — NOT the warm-tier L2. present mirrors the pin

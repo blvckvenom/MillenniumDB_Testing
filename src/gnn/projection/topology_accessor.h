@@ -567,6 +567,12 @@ public:
     /// (the GPU-UVA single-slice substrate); 0 when absent. For telemetry.
     std::size_t symmetric_ram_bytes() const;
 
+    /// Resident bytes of the four-level store's in-RAM tiers (L1+L2, both
+    /// directions + symmetric); 0 when no store. On the symmetric GPU path these
+    /// directional tiers are superseded by the single pinned slice, so the
+    /// engine treats this as freeable headroom for the GPU/CPU decision.
+    std::size_t four_level_ram_used() const;
+
     /**
      * @brief Tier-2 compact CSR per direction, for SIZING the dynamic GPU/CPU
      *        sampling backend decision (`plan_sampling_backend`).
