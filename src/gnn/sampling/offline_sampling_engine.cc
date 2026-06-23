@@ -16,6 +16,7 @@
 
 #include "gnn/common/process_memory.h"
 #include "gnn/projection/gnn_meta.h"
+#include "gnn/projection/symmetric_snapshot_builder.h"
 #include "gnn/projection/pinned_topology_view.h"
 #include "gnn/projection/topology_accessor.h"
 #include "gnn/sampling/basic_khop_sampler.h"
@@ -283,8 +284,41 @@ struct OfflineSamplingEngine::Impl {
                 if (plan.backend != SamplingBackend::CPU_OUT_OF_CORE) {
                     auto& topo_store = khop_sampler->get_topology();
                     if (plan.use_symmetric) {
+                        // Ensure the pre-merged symmetric slice is baked on disk
+                        // (topology_sym.csr) so enable_pinned_gpu_view OPENS +
+                        // pins it (mmap, zero-copy) instead of merging the two
+                        // directional sidecars in RAM on every sample. Auto-bake
+                        // once when absent/stale (open_symmetric runs the
+                        // two-source staleness gate); the bake is the single
+                        // owner of the merge, shared with gnn_build_topology_
+                        // snapshot, so the auto and explicit bakes are identical.
+                        // On failure we log and fall through — materialize then
+                        // does the in-RAM merge (correct, just not amortized).
+                        const std::filesystem::path proj_dir =
+                            storage.get_projection_dir();
+                        const bool sym_present =
+                            GQL::Projection::TopologySnapshotReader::open_symmetric(
+                                proj_dir).has_data();
+                        if (!sym_present) {
+                            const auto tb = std::chrono::steady_clock::now();
+                            try {
+                                bool refused = false;
+                                mdb::gnn::build_symmetric_snapshot(
+                                    storage, /*verify=*/false,
+                                    /*verify_sample=*/0, &refused);
+                                std::cerr << "[OfflineSamplingEngine] auto-baked "
+                                          << "topology_sym.csr in "
+                                          << phase_ms_(tb, std::chrono::steady_clock::now())
+                                          << " ms\n";
+                            } catch (const std::exception& e) {
+                                std::cerr << "[OfflineSamplingEngine] auto-bake of "
+                                          << "topology_sym.csr failed (" << e.what()
+                                          << "); falling back to in-RAM merge\n";
+                            }
+                        }
                         // enable_pinned_gpu_view materializes the merged
-                        // undirected slice (once, cached) AND pins it.
+                        // undirected slice (opens the baked sidecar, or merges as
+                        // a fallback) AND pins it.
                         const auto t0 = std::chrono::steady_clock::now();
                         topo_store.enable_pinned_gpu_view(plan);
                         result.symmetric_ms = phase_ms_(

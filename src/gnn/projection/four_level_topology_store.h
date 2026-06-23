@@ -746,6 +746,11 @@ private:
     std::vector<uint32_t>                              sym_col_idx_;
     HostCsrArrays                                      sym_arrays_{};
     bool                                               sym_arrays_built_ = false;
+    // True when sym_arrays_ points at the l3_sym_ mmap (a baked topology_sym.csr
+    // opened zero-copy) rather than the owned sym_row_ptr_/sym_col_idx_ heap
+    // vectors. When true, owned_l3_sym_ backs the pin and must outlive it (and
+    // the heap vectors are empty). When false, the slice was merged in RAM.
+    bool                                               sym_slice_is_mmap_ = false;
 };
 
 }  // namespace mdb::gnn

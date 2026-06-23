@@ -288,6 +288,51 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
     auto narrow = [](const GQL::Projection::TopologySnapshotReader* r) {
         return r != nullptr && r->has_data() && r->id_width() == 4;
     };
+
+    // PREFERRED: a pre-merged symmetric sidecar (topology_sym.csr) already on
+    // disk — point the slice at its mmap pages ZERO-COPY (no in-RAM merge, no
+    // heap blowup). cudaHostRegister then makes those file pages resident +
+    // pinned for the GPU-UVA kernel. The single owner of the merge is the bake
+    // (mdb::gnn::build_symmetric_snapshot, shared with gnn_build_topology_snapshot
+    // and the engine's auto-bake), so the per-sample path here only OPENS it.
+    // l3_sym_ is wired at build() time; if the sidecar was baked AFTER build()
+    // (the engine auto-bakes when missing) open it on demand from projection_dir_.
+    if (!narrow(l3_sym_) && !projection_dir_.empty()) {
+        owned_l3_sym_ = std::make_unique<GQL::Projection::TopologySnapshotReader>(
+            GQL::Projection::TopologySnapshotReader::open_symmetric(
+                projection_dir_));
+        l3_sym_ = owned_l3_sym_->has_data() ? owned_l3_sym_.get() : nullptr;
+    }
+    if (narrow(l3_sym_)) {
+        // cudaHostRegister REJECTS file-backed mmap pages (MAP_PRIVATE read-only)
+        // with "invalid argument", so we cannot pin the l3_sym_ mmap directly.
+        // Copy the already-merged slice into OWNED heap vectors (which DO pin) —
+        // this still REPLACES the per-call fwd+rev merge with a plain sequential
+        // copy of the baked slice (no re-merge, ~seconds vs ~minutes). The mmap
+        // source is read sequentially so the kernel can reclaim consumed pages,
+        // keeping the transient bounded.
+        const uint64_t n = l3_sym_->num_nodes();
+        const uint64_t m = l3_sym_->num_edges();
+        sym_row_ptr_.resize(static_cast<std::size_t>(n) + 1);
+        sym_col_idx_.resize(static_cast<std::size_t>(m));
+        std::memcpy(sym_row_ptr_.data(), l3_sym_->row_ptr_base(),
+                    (static_cast<std::size_t>(n) + 1) * sizeof(uint64_t));
+        std::memcpy(sym_col_idx_.data(), l3_sym_->col_idx32_base(),
+                    static_cast<std::size_t>(m) * sizeof(uint32_t));
+        sym_arrays_.row_ptr      = sym_row_ptr_.data();
+        sym_arrays_.col_idx      = sym_col_idx_.data();
+        sym_arrays_.n_rows       = n;
+        sym_arrays_.n_edges      = m;
+        sym_arrays_.dst_type_tag =
+            static_cast<uint64_t>(l3_sym_->dst_type_tag()) << 56;
+        sym_slice_is_mmap_ = false;  // heap-backed copy (mmap is not pinnable)
+        sym_arrays_built_  = true;
+        return &sym_arrays_;
+    }
+
+    // FALLBACK: no baked sidecar (dispatcher-ctor tests, or a bake that did not
+    // run / failed) — merge the two directional narrow readers in RAM. In
+    // production the engine auto-bakes first, so this branch is not hit.
     const bool have_f = narrow(l3_fwd_);
     const bool have_r = narrow(l3_rev_);
     if (!have_f && !have_r) return nullptr;  // nothing pinnable to merge
@@ -355,6 +400,13 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
 
 std::size_t FourLevelTopologyStore::symmetric_ram_bytes() const noexcept {
     if (!sym_arrays_built_) return 0;
+    if (sym_slice_is_mmap_) {
+        // Baked sidecar opened zero-copy: the heap vectors are empty, but the
+        // mmap pages are resident (faulted + locked once pinned). Report the
+        // section sizes so the slice's RAM footprint is still visible.
+        return (sym_arrays_.n_rows + 1) * sizeof(uint64_t)
+             + sym_arrays_.n_edges * sizeof(uint32_t);
+    }
     return sym_row_ptr_.size() * sizeof(uint64_t)
          + sym_col_idx_.size() * sizeof(uint32_t);
 }
