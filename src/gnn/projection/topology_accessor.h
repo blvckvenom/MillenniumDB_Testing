@@ -608,6 +608,18 @@ public:
     /// The registered GPU view, or nullptr when none was enabled / no store.
     const PinnedTopologyView* pinned_view() const;
 
+    /**
+     * @brief Release the directional fwd/rev tiers after a symmetric GPU pin.
+     *
+     * Delegates to the Four-Level Topology Store's
+     * `release_directional_after_symmetric_pin()`. Reclaims the directional
+     * L1/L2 heap caches + munmaps the two L3 sidecars once the merged undirected
+     * slice is materialized + pinned (the GPU kernel serves every node from that
+     * slice). No-op when the store is absent or the symmetric slice was never
+     * built (the CPU path keeps its directional tiers). Returns the bytes freed.
+     */
+    std::size_t release_directional_after_symmetric_pin();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -1151,6 +1151,12 @@ const PinnedTopologyView* TopologyAccessor::pinned_view() const {
                                     : nullptr;
 }
 
+std::size_t TopologyAccessor::release_directional_after_symmetric_pin() {
+    return impl_->four_level_store_
+        ? impl_->four_level_store_->release_directional_after_symmetric_pin()
+        : 0;
+}
+
 // ============================================================================
 // NodeIterator Implementation
 // ============================================================================

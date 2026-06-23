@@ -479,6 +479,37 @@ public:
     std::size_t symmetric_ram_bytes() const noexcept;
 
     /**
+     * @brief Release the directional fwd/rev tiers once the symmetric slice is
+     *        materialized + pinned, reclaiming their RAM.
+     *
+     * Once materialize_symmetric_arrays() has built the merged undirected slice
+     * (sym_arrays_, the GPU-pinned full-coverage CSR), the directional tiers are
+     * dead weight on the symmetric GPU path: the GPU kernel walks ONLY the
+     * pinned slice (never l3_fwd_/l3_rev_), and the CPU UNDIRECTED dispatch uses
+     * the symmetric tier (l*_sym_) whose L4 fallback closes over the BPTs, not
+     * the directional L3 readers. This frees the owned directional L1/L2 heap
+     * caches and munmaps the two L3 sidecars (the only way to drop their
+     * faulted-in page-cache — there is no madvise(DONTNEED) path), then nulls
+     * the borrowed aliases so any stray directional dispatch faults loudly.
+     *
+     * Intended caller: the offline sampling engine, AFTER enable_pinned_gpu_view
+     * registered a symmetric pin and AFTER the one-time backend-sizing block
+     * (which reads l3_fwd()/l3_rev()/total_ram_used()) has run. No-op (returns 0)
+     * when the slice was never materialized — i.e. the CPU path, which still
+     * reads the directional tiers — or when already released (idempotent).
+     *
+     * @return Best-effort estimate of the bytes released (owned L1/L2 heap +
+     *         the munmapped L3 sidecar footprints); 0 on no-op.
+     * @post   get_out_neighbors()/get_in_neighbors() throw std::logic_error
+     *         (NATURAL/REVERSE directional fetches are no longer serviceable);
+     *         get_neighbors(UNDIRECTED) over the symmetric tier is unaffected.
+     */
+    std::size_t release_directional_after_symmetric_pin();
+
+    /// True once release_directional_after_symmetric_pin() has run.
+    bool directional_released() const noexcept { return directional_released_; }
+
+    /**
      * @brief Get outgoing neighbors (NATURAL).
      *
      * @throws std::logic_error when the store was constructed via the
@@ -693,6 +724,10 @@ private:
     // Set true when Config::drop_edge_ids was requested but refused due to a
     // parallel-edge multigraph (sym tier left unbuilt -> runtime merge fallback).
     bool                                               sym_refused_edge_id_drop_ = false;
+    // Set true once release_directional_after_symmetric_pin() freed the
+    // directional fwd/rev tiers. After this the directional l1/l2/l3 pointers
+    // are null and get_out_neighbors/get_in_neighbors throw.
+    bool                                               directional_released_ = false;
 
     Config                                             config_;
 

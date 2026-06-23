@@ -348,6 +348,61 @@ std::size_t FourLevelTopologyStore::symmetric_ram_bytes() const noexcept {
          + sym_col_idx_.size() * sizeof(uint32_t);
 }
 
+std::size_t FourLevelTopologyStore::release_directional_after_symmetric_pin() {
+    // No-op unless the merged undirected slice exists: that slice is the
+    // self-owned, full-coverage RAM copy the GPU kernel walks, so only then are
+    // the directional tiers provably dead (see the header contract). Idempotent.
+    if (!sym_arrays_built_ || directional_released_) return 0;
+
+    // Footprint of an L3 sidecar reader's faulted-in page-cache: ROW_PTR is
+    // uint64 regardless of id_width; COL_IDX is the narrow (4 B) or wide (8 B)
+    // width. Edge-id streams (when present) add to the file but are not counted
+    // here — this is a lower-bound estimate of the resident pages reclaimed.
+    auto l3_resident_bytes =
+        [](const GQL::Projection::TopologySnapshotReader* r) -> std::size_t {
+        if (r == nullptr || !r->has_data()) return 0;
+        const std::size_t w = (r->id_width() == 4) ? 4u : 8u;
+        return (static_cast<std::size_t>(r->num_nodes()) + 1) * sizeof(uint64_t)
+             + static_cast<std::size_t>(r->num_edges()) * w;
+    };
+
+    std::size_t freed = 0;
+    if (owned_l1_fwd_) freed += owned_l1_fwd_->total_bytes();
+    if (owned_l1_rev_) freed += owned_l1_rev_->total_bytes();
+    if (owned_l2_fwd_) freed += owned_l2_fwd_->total_bytes();
+    if (owned_l2_rev_) freed += owned_l2_rev_->total_bytes();
+    if (owned_l3_fwd_) freed += l3_resident_bytes(l3_fwd_);
+    if (owned_l3_rev_) freed += l3_resident_bytes(l3_rev_);
+
+    // L1HashCache / L2CompactCsr free their heap on destruction; the
+    // TopologySnapshotReader destructor munmaps its sidecar (the sole way to
+    // drop the resident page-cache — there is no DONTNEED API). Reset only the
+    // OWNED holders; in the dispatcher (Phase 2) ctor the L3 readers are
+    // borrowed (owned_l3_* are null) so reset is a no-op and the caller keeps
+    // ownership. Always null the borrowed aliases so a stray directional
+    // dispatch faults loudly instead of dereferencing freed memory.
+    owned_l1_fwd_.reset();
+    owned_l1_rev_.reset();
+    owned_l2_fwd_.reset();
+    owned_l2_rev_.reset();
+    owned_l3_fwd_.reset();
+    owned_l3_rev_.reset();
+    l1_fwd_ = nullptr;
+    l1_rev_ = nullptr;
+    l2_fwd_ = nullptr;
+    l2_rev_ = nullptr;
+    l3_fwd_ = nullptr;
+    l3_rev_ = nullptr;
+    // l4_sym_ captured its OWN copies of these closures (build() line wiring),
+    // so clearing the directional originals does not disturb the symmetric L4
+    // fallback; it only drops the directional BPT-capturing closures here.
+    l4_fwd_ = {};
+    l4_rev_ = {};
+
+    directional_released_ = true;
+    return freed;
+}
+
 // ---------------------------------------------------------------------------
 //  build()
 // ---------------------------------------------------------------------------
@@ -1345,6 +1400,12 @@ FourLevelTopologyStore::get_out_neighbors(ObjectId v) const
         throw std::logic_error(
             "FourLevelTopologyStore::get_out_neighbors before build()");
     }
+    if (directional_released_) {
+        throw std::logic_error(
+            "FourLevelTopologyStore::get_out_neighbors after the directional "
+            "tiers were released post symmetric GPU pin — only "
+            "get_neighbors(UNDIRECTED) over the pinned slice is valid");
+    }
     return dispatch_(v, *l1_fwd_, *l2_fwd_, l3_fwd_, l4_fwd_);
 }
 
@@ -1354,6 +1415,12 @@ FourLevelTopologyStore::get_in_neighbors(ObjectId v) const
     if (!built_) {
         throw std::logic_error(
             "FourLevelTopologyStore::get_in_neighbors before build()");
+    }
+    if (directional_released_) {
+        throw std::logic_error(
+            "FourLevelTopologyStore::get_in_neighbors after the directional "
+            "tiers were released post symmetric GPU pin — only "
+            "get_neighbors(UNDIRECTED) over the pinned slice is valid");
     }
     return dispatch_(v, *l1_rev_, *l2_rev_, l3_rev_, l4_rev_);
 }

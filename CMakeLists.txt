@@ -1877,6 +1877,46 @@ if(GTest_FOUND AND ENABLE_GNN AND
     endif()
 endif()
 
+# release-directional-tiers + in-process RSS probe tests — the symmetric GPU pin
+# frees the directional tiers once the merged slice is pinned; process_memory.h
+# surfaces the peak/current RSS so the relief is observable.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_release_directional_test.cc")
+    add_executable(four_level_topology_release_directional_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_release_directional_test.cc
+    )
+    set_target_properties(four_level_topology_release_directional_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_release_directional_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyReleaseDirectionalTests
+        COMMAND $<TARGET_FILE:four_level_topology_release_directional_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyReleaseDirectionalTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
+
 # gpu_khop_sampler tests — statistical validation of the GPU reservoir+Philox
 # sampling kernel (short-circuit, no-replacement, uniformity, determinism).
 if(GTest_FOUND AND ENABLE_GNN AND
