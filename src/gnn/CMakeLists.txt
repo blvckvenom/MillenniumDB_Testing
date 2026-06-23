@@ -102,6 +102,7 @@ add_library(mdb_gnn_core STATIC
     projection/l1_hash_cache.cc
     projection/l2_compact_csr.cc
     projection/four_level_topology_store.cc
+    projection/symmetric_snapshot_builder.cc
 
     # Dynamic GPU-UVA sampling: pin the global topology CSR as a device-visible
     # substrate (cudaHostRegister). No-op without CUDA / without a GPU.
