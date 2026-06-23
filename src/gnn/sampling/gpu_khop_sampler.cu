@@ -85,6 +85,14 @@ struct CsrRange {
     const uint64_t* row_ptr;
     const uint32_t* col_idx;
     uint32_t        n_rows;
+    // Global edge offset of the first edge present in `col_idx`. 0 when col_idx
+    // spans the whole CSR (non-tiled). In tiled mode col_idx points at a
+    // node-aligned window holding col_idx[row_ptr[u_lo] .. row_ptr[u_hi]); then
+    // col_base_offset = row_ptr[u_lo] and the kernel subtracts it from row_ptr[v]
+    // to land at the local index. The host only feeds this kernel frontier nodes
+    // whose row lies in [u_lo, u_hi), so a node's whole neighbor list is in-window
+    // (no straddling).
+    uint64_t        col_base_offset = 0;
 };
 
 __device__ __forceinline__ uint64_t deg_of_(const CsrRange& c, uint32_t v) {
@@ -114,8 +122,10 @@ __global__ void sample_layer_kernel(CsrRange a, CsrRange b,
             continue;
         }
 
-        const uint64_t base_a = (deg_a > 0) ? a.row_ptr[v] : 0;
-        const uint64_t base_b = (deg_b > 0) ? b.row_ptr[v] : 0;
+        // LOCAL col_idx offsets: subtract the window base (0 in the non-tiled
+        // case) so the three reads below index a windowed col_idx buffer.
+        const uint64_t base_a = (deg_a > 0) ? a.row_ptr[v] - a.col_base_offset : 0;
+        const uint64_t base_b = (deg_b > 0) ? b.row_ptr[v] - b.col_base_offset : 0;
         const uint32_t fo = static_cast<uint32_t>(fanout);
 
         // k == deg short-circuit: emit every neighbor in CSR order, no draws.
