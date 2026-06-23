@@ -149,26 +149,21 @@ void GnnMaterializeBatchesProcedure::execute(ProcedureContext& ctx) {
     }
 
     // =========================================================================
-    // Step 4: Open inputs and run materializer
+    // Step 4 (DEPRECATED no-op): gnn_build_feature_store packs directly from the
+    // sample; this procedure's packed/ output was never read downstream and is
+    // deleted by the next stage (four_level_store.cc Step 6). We keep the call
+    // invocable and the YIELD contract intact, but skip the redundant materialize.
     // =========================================================================
-    auto fm = FeatureMatrix::open(fmat_path);
-    auto rm = RowMapping::open(rmap_path);
-    auto samples = SampleStorage::open(storage_path);
+    (void) config;  // parsed for the legacy materialize path; now unused.
 
-    auto result = BatchMaterializer::materialize(
-        fm, rm, samples, config, db_folder, feature_name);
-
-    // =========================================================================
-    // Step 5: Yield results
-    // =========================================================================
     ctx.yield("sampleName",    ctx.create_string(sample_name));
     ctx.yield("featureName",   ctx.create_string(feature_name));
-    ctx.yield("totalBatches",  ctx.create_int(static_cast<int64_t>(result.total_batches)));
-    ctx.yield("reordered",     ctx.create_bool(result.reordered));
-    ctx.yield("reorderTimeMs", ctx.create_int(result.reorder_time_ms));
-    ctx.yield("packTimeMs",    ctx.create_int(result.pack_time_ms));
-    ctx.yield("totalTimeMs",   ctx.create_int(result.total_time_ms));
-    ctx.yield("packedDir",     ctx.create_string(result.packed_dir));
+    ctx.yield("totalBatches",  ctx.create_int(0));
+    ctx.yield("reordered",     ctx.create_bool(false));
+    ctx.yield("reorderTimeMs", ctx.create_int(0));
+    ctx.yield("packTimeMs",    ctx.create_int(0));
+    ctx.yield("totalTimeMs",   ctx.create_int(0));
+    ctx.yield("packedDir",     ctx.create_string(""));
     ctx.yield_row();
 }
 
