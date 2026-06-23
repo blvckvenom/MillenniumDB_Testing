@@ -157,7 +157,18 @@ FourLevelTopologyStore::FourLevelTopologyStore(
       config_(config)
 {}
 
-FourLevelTopologyStore::~FourLevelTopologyStore() = default;
+FourLevelTopologyStore::~FourLevelTopologyStore() {
+    // Unregister the GPU pin (cudaHostUnregister) BEFORE any member is
+    // destroyed, so it never runs on host pages a member destructor already
+    // freed. The symmetric single-slice pin is backed by sym_row_ptr_ /
+    // sym_col_idx_, which are declared AFTER pinned_view_ and would otherwise be
+    // destroyed first (members destruct in reverse declaration order). Resetting
+    // the view here in the destructor body — which runs before member
+    // destruction — makes teardown order-independent for both the symmetric
+    // (sym vectors) and directional (L3 readers) pin substrates. No-op when no
+    // view was registered (CPU path / no GPU).
+    pinned_view_.reset();
+}
 
 bool FourLevelTopologyStore::is_built() const noexcept {
     return built_;
