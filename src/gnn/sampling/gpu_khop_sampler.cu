@@ -15,6 +15,7 @@
 #include "gnn/sampling/gpu_khop_sampler.h"
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -246,6 +247,41 @@ void build_edges_(
     }
 }
 
+// One node-aligned COL_IDX window: nodes [u_lo, u_hi), edges col_idx[edge_lo,
+// edge_hi) == col_idx[row_ptr[u_lo], row_ptr[u_hi]). Node-aligned => a node's
+// whole neighbour list is wholly inside one window (never straddles a boundary).
+struct Window {
+    uint32_t u_lo, u_hi;
+    uint64_t edge_lo, edge_hi;
+};
+
+// Partition [0, n_rows) into node-aligned windows whose edge span stays <=
+// soft_cap, EXCEPT a single node whose degree alone exceeds soft_cap forms its
+// own window. buffer_cap (out) = max edge span over all windows = max(soft_cap,
+// max single-node degree), so one staging buffer of buffer_cap edges fits every
+// window's map. row_ptr has n_rows+1 entries (row_ptr[n_rows] == total edges).
+void compute_node_aligned_windows(const uint64_t* row_ptr, uint32_t n_rows,
+                                  std::size_t soft_cap,
+                                  std::vector<Window>& out,
+                                  std::size_t& buffer_cap) {
+    out.clear();
+    const std::size_t cap = soft_cap > 0 ? soft_cap : 1;
+    buffer_cap = cap;
+    uint32_t u_lo = 0;
+    while (u_lo < n_rows) {
+        const uint64_t edge_lo = row_ptr[u_lo];
+        uint32_t u_hi = u_lo + 1;  // always at least one node (super-hub allowed)
+        while (u_hi < n_rows && (row_ptr[u_hi + 1] - edge_lo) <= cap) {
+            ++u_hi;
+        }
+        const uint64_t edge_hi = row_ptr[u_hi];
+        out.push_back(Window{u_lo, u_hi, edge_lo, edge_hi});
+        const std::size_t span = static_cast<std::size_t>(edge_hi - edge_lo);
+        if (span > buffer_cap) buffer_cap = span;
+        u_lo = u_hi;
+    }
+}
+
 }  // namespace
 
 std::vector<std::vector<uint32_t>> gpu_sample_neighbors_for_test(
@@ -273,6 +309,71 @@ std::vector<std::vector<uint32_t>> gpu_sample_neighbors_for_test(
 
     cudaFree(d_row_ptr);
     cudaFree(d_col_idx);
+    return result;
+}
+
+std::vector<std::vector<uint32_t>> gpu_sample_neighbors_tiled_for_test(
+    const std::vector<uint64_t>& row_ptr, const std::vector<uint32_t>& col_idx,
+    const std::vector<uint32_t>& nodes, int fanout, uint64_t batch_seed,
+    int layer, std::size_t window_cap_edges) {
+    const std::size_t F = nodes.size();
+    std::vector<std::vector<uint32_t>> result(F);
+    if (nodes.empty() || fanout <= 0 || row_ptr.size() < 2) return result;
+
+    const uint32_t n_rows = static_cast<uint32_t>(row_ptr.size() - 1);
+
+    // Pin ROW_PTR whole on the device (mirrors the tiled view: ROW_PTR resident,
+    // COL_IDX streamed). deg_of_/base reads only need the full ROW_PTR.
+    uint64_t* d_row_ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_row_ptr, row_ptr.size() * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpy(d_row_ptr, row_ptr.data(),
+                          row_ptr.size() * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice));
+
+    std::vector<Window> windows;
+    std::size_t buffer_cap = 0;
+    compute_node_aligned_windows(row_ptr.data(), n_rows, window_cap_edges,
+                                 windows, buffer_cap);
+
+    // One reusable pinned, device-mapped staging buffer sized to the largest
+    // window span (so a super-hub window also fits).
+    uint32_t* h_win = nullptr;
+    uint32_t* d_win = nullptr;
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&h_win),
+                             buffer_cap * sizeof(uint32_t), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_win),
+                                        h_win, 0));
+
+    // Per window: gather the sub-frontier of nodes whose row lies in [u_lo,u_hi),
+    // stage that window's COL_IDX into the pinned buffer, sample, scatter back to
+    // the original frontier index. Sequential windows are safe because
+    // sample_layer_on_device_ synchronises before returning.
+    for (const auto& w : windows) {
+        std::vector<uint32_t> sub_frontier;
+        std::vector<std::size_t> orig_idx;
+        for (std::size_t i = 0; i < F; ++i) {
+            const uint32_t v = nodes[i];
+            if (v >= w.u_lo && v < w.u_hi) {
+                sub_frontier.push_back(v);
+                orig_idx.push_back(i);
+            }
+        }
+        if (sub_frontier.empty()) continue;
+
+        const std::size_t span = static_cast<std::size_t>(w.edge_hi - w.edge_lo);
+        std::memcpy(h_win, col_idx.data() + w.edge_lo, span * sizeof(uint32_t));
+
+        CsrRange a{d_row_ptr, d_win, n_rows, w.edge_lo};
+        CsrRange b{nullptr, nullptr, 0, 0};
+        auto sub = sample_layer_on_device_(a, b, sub_frontier, fanout,
+                                           batch_seed, layer);
+        for (std::size_t j = 0; j < sub.size(); ++j) {
+            result[orig_idx[j]] = std::move(sub[j]);
+        }
+    }
+
+    cudaFreeHost(h_win);
+    cudaFree(d_row_ptr);
     return result;
 }
 

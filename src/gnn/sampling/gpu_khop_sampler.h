@@ -22,6 +22,7 @@
 // dedup por primera aparicion) para construir el `GraphSample`, garantizando que la
 // FORMA de la salida sea identica — solo difieren los vecinos sorteados.
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -75,5 +76,28 @@ std::vector<std::vector<uint32_t>> gpu_sample_neighbors_for_test(
     int                          fanout,
     uint64_t                     batch_seed,
     int                          layer);
+
+/**
+ * @brief Variante TILED del seam de test: mismo contrato que
+ *        gpu_sample_neighbors_for_test, pero stagea COL_IDX en ventanas alineadas
+ *        a nodos de cota blanda `window_cap_edges` (un buffer pinned reusable).
+ *
+ * Prueba que el camino tiled (ROW_PTR entero + COL_IDX por ventanas) produce un
+ * resultado BIT-IDENTICO al de whole-CSR para cualquier window cap, demostrando
+ * la correctitud del windowing/particion/reensamblado sin tocar produccion ni
+ * requerir un topology_sym.csr en disco.
+ *
+ * @param window_cap_edges cota blanda de aristas por ventana (un nodo de grado
+ *        mayor a la cota forma su propia ventana; el buffer real se dimensiona a
+ *        max(cap, grado maximo)).
+ */
+std::vector<std::vector<uint32_t>> gpu_sample_neighbors_tiled_for_test(
+    const std::vector<uint64_t>& row_ptr,
+    const std::vector<uint32_t>& col_idx,
+    const std::vector<uint32_t>& nodes,
+    int                          fanout,
+    uint64_t                     batch_seed,
+    int                          layer,
+    std::size_t                  window_cap_edges);
 
 }  // namespace mdb::gnn
