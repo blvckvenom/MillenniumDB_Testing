@@ -86,6 +86,31 @@ void PinnedTopologyView::build_and_register_tiled(const HostCsrArrays& fwd,
 #endif
 }
 
+void PinnedTopologyView::build_and_register_resident(const HostCsrArrays& fwd,
+                                                     const HostCsrArrays& rev) {
+    if (registered_) {
+        throw std::logic_error(
+            "PinnedTopologyView::build_and_register_resident called while already "
+            "registered; call release() first");
+    }
+#ifdef GNN_CUDA_ENABLED
+    if (!gpu_present_()) {
+        return;  // no-op: no capable GPU at runtime
+    }
+    try {
+        register_dir_resident_(fwd, fwd_, fwd_active_, fwd_reg_);
+        register_dir_resident_(rev, rev_, rev_active_, rev_reg_);
+    } catch (...) {
+        release();  // free any partial device buffers before propagating
+        throw;
+    }
+    registered_ = fwd_active_ || rev_active_;
+#else
+    (void)fwd;
+    (void)rev;  // no-op: compiled without CUDA
+#endif
+}
+
 const uint32_t* PinnedTopologyView::map_col_window(const PinnedDirView& dir,
                                                    std::uint64_t edge_lo,
                                                    std::uint64_t edge_hi) const {
@@ -183,6 +208,56 @@ void PinnedTopologyView::register_dir_tiled_(const HostCsrArrays& src,
     out.tiled            = true;
     active_flag          = true;
 }
+
+void PinnedTopologyView::register_dir_resident_(const HostCsrArrays& src,
+                                                PinnedDirView&       out,
+                                                bool&                active_flag,
+                                                HostRegistration&    reg) {
+    active_flag = false;
+    if (src.row_ptr == nullptr || src.col_idx == nullptr) {
+        return;  // direction not present
+    }
+
+    const std::size_t row_bytes = (src.n_rows + 1) * sizeof(uint64_t);
+    const std::size_t col_bytes = src.n_edges * sizeof(uint32_t);
+
+    // Allocate the CSR in DEVICE memory and stream it up from the (mmap/heap)
+    // source ONCE, so the kernel reads adjacency from HBM instead of host pages
+    // over PCIe. Stash each device buffer in `reg` right after cudaMalloc so a
+    // throw on a later call still lets release() cudaFree the partial allocation.
+    void* d_row = nullptr;
+    void* d_col = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_row, row_bytes));
+    reg.d_row_owned = d_row;
+    CUDA_CHECK(cudaMalloc(&d_col, col_bytes));
+    reg.d_col_owned = d_col;
+
+    // ROW_PTR whole; COL_IDX in bounded chunks so the driver's bounce buffer for
+    // the pageable (mmap) source stays small. No madvise on the source: it may be
+    // a heap buffer (MADV_DONTNEED zero-fills anonymous pages), and the faulted
+    // mmap pages are reclaimable + this upload is one-time.
+    CUDA_CHECK(cudaMemcpy(d_row, src.row_ptr, row_bytes, cudaMemcpyHostToDevice));
+    {
+        auto* cdst = reinterpret_cast<uint8_t*>(d_col);
+        const auto* csrc = reinterpret_cast<const uint8_t*>(src.col_idx);
+        const std::size_t CHUNK = std::size_t(256) << 20;  // 256 MB
+        for (std::size_t off = 0; off < col_bytes; off += CHUNK) {
+            const std::size_t len = (col_bytes - off < CHUNK) ? (col_bytes - off)
+                                                              : CHUNK;
+            CUDA_CHECK(cudaMemcpy(cdst + off, csrc + off, len,
+                                  cudaMemcpyHostToDevice));
+        }
+    }
+
+    out.d_row_ptr    = static_cast<const uint64_t*>(d_row);
+    out.d_col_idx    = static_cast<const uint32_t*>(d_col);
+    out.dst_type_tag = src.dst_type_tag;
+    out.n_rows       = src.n_rows;
+    out.n_edges      = src.n_edges;
+    out.resident     = true;
+    out.tiled        = false;
+    active_flag      = true;
+}
 #else
 void PinnedTopologyView::register_dir_(const HostCsrArrays&,
                                        PinnedDirView&,
@@ -193,6 +268,10 @@ void PinnedTopologyView::register_dir_tiled_(const HostCsrArrays&,
                                              bool&,
                                              HostRegistration&,
                                              std::size_t) {}
+void PinnedTopologyView::register_dir_resident_(const HostCsrArrays&,
+                                                PinnedDirView&,
+                                                bool&,
+                                                HostRegistration&) {}
 #endif
 
 void PinnedTopologyView::release() noexcept {
@@ -217,6 +296,17 @@ void PinnedTopologyView::release() noexcept {
     };
     free_window(fwd_reg_.col_window);
     free_window(rev_reg_.col_window);
+    auto free_device = [](void* dev_ptr) noexcept {
+        if (dev_ptr != nullptr) {
+            cudaError_t e = cudaFree(dev_ptr);
+            (void)e;
+            cudaGetLastError();  // swallow — release() is noexcept / best-effort
+        }
+    };
+    free_device(fwd_reg_.d_row_owned);
+    free_device(fwd_reg_.d_col_owned);
+    free_device(rev_reg_.d_row_owned);
+    free_device(rev_reg_.d_col_owned);
 #endif
     fwd_reg_    = {};
     rev_reg_    = {};

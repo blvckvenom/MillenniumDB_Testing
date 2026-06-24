@@ -343,5 +343,60 @@ TEST(GpuKhopSampler, Tiled_Determinism) {
     EXPECT_NE(a, other_layer);  // layer enters the Philox counter
 }
 
+// Device-resident CSR == whole-UVA CSR: build the SAME small graph as a
+// device-resident view (cudaMalloc'd VRAM) and as a host-registered (UVA) view,
+// and assert sample_khop_gpu produces an identical GraphSample. Also assert the
+// resident view's col_idx is REAL device memory (not a host-mapped pointer),
+// which is what distinguishes the resident path from build_and_register.
+TEST(GpuKhopSampler, Resident_EqualsWholeCsr) {
+    SKIP_IF_NO_GPU();
+    std::vector<uint64_t> row_ptr;
+    std::vector<uint32_t> col_idx;
+    row_ptr.reserve(64 * 1024);
+    col_idx.reserve(64 * 1024);
+    Csr built = make_csr({{2, 3}, {3, 4}, {5}, {5}, {}, {}});
+    row_ptr.assign(built.row_ptr.begin(), built.row_ptr.end());
+    col_idx.assign(built.col_idx.begin(), built.col_idx.end());
+
+    HostCsrArrays fwd;
+    fwd.row_ptr      = row_ptr.data();
+    fwd.col_idx      = col_idx.data();
+    fwd.n_rows       = row_ptr.size() - 1;
+    fwd.n_edges      = col_idx.size();
+    fwd.dst_type_tag = 0;
+
+    SamplingBackendPlan plan;
+    plan.backend    = SamplingBackend::GPU_VRAM_COPY;
+    plan.directions = GpuDirections::FORWARD_ONLY;
+    std::vector<ObjectId> seeds{ObjectId(0), ObjectId(1)};
+
+    PinnedTopologyView resident;
+    resident.build_and_register_resident(fwd, HostCsrArrays{});
+    ASSERT_TRUE(resident.is_registered());
+#ifdef GNN_CUDA_ENABLED
+    cudaPointerAttributes attr{};
+    ASSERT_EQ(cudaPointerGetAttributes(&attr, resident.fwd()->d_col_idx),
+              cudaSuccess);
+    EXPECT_EQ(attr.type, cudaMemoryTypeDevice);  // real VRAM, not host-mapped
+#endif
+    GraphSample rs = sample_khop_gpu(seeds, /*batch_id=*/7, SplitType::TRAIN,
+                                     /*fanouts=*/{2, 2}, resident, plan,
+                                     /*random_seed=*/42);
+    EXPECT_NO_THROW(rs.validate());
+
+    PinnedTopologyView uva;
+    uva.build_and_register(fwd, HostCsrArrays{});
+    ASSERT_TRUE(uva.is_registered());
+    GraphSample us = sample_khop_gpu(seeds, 7, SplitType::TRAIN, {2, 2}, uva, plan,
+                                     42);
+
+    // Bit-identical: same kernel, same data, only the memory tier differs.
+    ASSERT_EQ(rs.all_unique_nodes.size(), us.all_unique_nodes.size());
+    for (size_t i = 0; i < us.all_unique_nodes.size(); ++i) {
+        EXPECT_EQ(rs.all_unique_nodes[i].id, us.all_unique_nodes[i].id) << "i=" << i;
+    }
+    EXPECT_EQ(rs.total_edges(), us.total_edges());
+}
+
 }  // namespace
 }  // namespace mdb::gnn

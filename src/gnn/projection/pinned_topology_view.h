@@ -54,6 +54,13 @@ struct PinnedDirView {
     uint32_t*       d_col_window   = nullptr;  // su puntero device
     std::size_t     window_cap_edges = 0;      // capacidad del buffer (en aristas)
     bool            tiled          = false;
+
+    // --- Modo resident (CSR entero en VRAM) ---------------------------------
+    // Cuando el grafo cabe en VRAM, ROW_PTR y COL_IDX se copian a memoria DEVICE
+    // propia (cudaMalloc) y d_row_ptr/d_col_idx apuntan ahí: el kernel lee de HBM
+    // (~cientos de GB/s) en vez de páginas host por PCIe (UVA). resident y tiled
+    // son mutuamente excluyentes (resident => tiled=false, d_col_idx no-null).
+    bool            resident       = false;
 };
 
 /**
@@ -148,6 +155,23 @@ public:
                                    std::uint64_t        edge_hi) const;
 
     /**
+     * @brief Variante resident: copia el CSR ENTERO a memoria device (cudaMalloc
+     *        + cudaMemcpy) y deja al kernel leerlo de HBM.
+     *
+     * Para grafos que caben en VRAM: el camino más rápido (lee de HBM, no por
+     * PCIe vía UVA, ni stagea ventanas). Una sola subida amortizada al inicio.
+     * Deja `resident=true, tiled=false` y d_row_ptr/d_col_idx apuntando a los
+     * buffers device propios. No-op silencioso sin GPU/CUDA. La salida del kernel
+     * es byte-idéntica a la de build_and_register (el RNG no depende de dónde vive
+     * col_idx).
+     *
+     * @throws std::logic_error si ya hay un registro activo.
+     * @throws CudaException si una llamada CUDA falla (buffers parciales liberados).
+     */
+    void build_and_register_resident(const HostCsrArrays& fwd,
+                                     const HostCsrArrays& rev);
+
+    /**
      * @brief Desregistra todas las regiones. Idempotente y noexcept.
      */
     void release() noexcept;
@@ -162,9 +186,11 @@ private:
     // Punteros HOST originales por direccion, retenidos para `cudaHostUnregister`
     // (que toma el puntero host, no el device).
     struct HostRegistration {
-        void* row_ptr    = nullptr;
-        void* col_idx    = nullptr;
-        void* col_window = nullptr;  // buffer cudaHostAlloc (tiled); cudaFreeHost en release()
+        void* row_ptr     = nullptr;
+        void* col_idx     = nullptr;
+        void* col_window  = nullptr;  // buffer cudaHostAlloc (tiled); cudaFreeHost en release()
+        void* d_row_owned = nullptr;  // cudaMalloc ROW_PTR (resident); cudaFree en release()
+        void* d_col_owned = nullptr;  // cudaMalloc COL_IDX (resident); cudaFree en release()
     };
 
     // Registra una direccion. Rellena `reg` incrementalmente (tras cada
@@ -182,6 +208,13 @@ private:
                              bool&                active_flag,
                              HostRegistration&    reg,
                              std::size_t          window_cap_edges);
+
+    // Variante resident de register_dir_: cudaMalloc ROW_PTR+COL_IDX en device y
+    // cudaMemcpy desde el mmap/heap fuente; setea resident y los d_*_owned de reg.
+    void register_dir_resident_(const HostCsrArrays& src,
+                                PinnedDirView&       out,
+                                bool&                active_flag,
+                                HostRegistration&    reg);
 
     bool             registered_ = false;
     bool             fwd_active_ = false;
