@@ -7,7 +7,11 @@ namespace mdb::gpu {
 struct GpuInfo {
     int    device_id          = -1;
     size_t total_vram         = 0;
-    size_t free_vram          = 0;
+    size_t free_vram          = 0;  // safety-derated free (sort/resource planner)
+    // Raw cudaMemGetInfo free, NO safety derate. For consumers (e.g. the GNN
+    // sampling backend) that compute their own phase-specific absolute headroom
+    // and must reason about the true free VRAM, not the blanket-derated value.
+    size_t raw_free_vram      = 0;
     int    compute_capability = 0;  // major*10 + minor
 };
 

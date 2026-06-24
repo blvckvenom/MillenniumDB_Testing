@@ -61,6 +61,7 @@ SystemResources detect_resources() {
             cudaGetDevice(&prev_device);
             cudaSetDevice(0);
             if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+                res.gpu.raw_free_vram = free_bytes;
                 res.gpu.free_vram = static_cast<size_t>(
                     static_cast<double>(free_bytes) * VRAM_SAFETY_FACTOR);
             }
