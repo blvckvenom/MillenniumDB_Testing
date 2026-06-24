@@ -254,5 +254,94 @@ TEST(GpuKhopSampler, Orchestrator_ProducesValidGraphSample) {
     EXPECT_EQ(s2.all_unique_nodes.size(), s.all_unique_nodes.size());
 }
 
+// ---------------------------------------------------------------------------
+// Tiled COL_IDX windowing == whole-CSR sampling, bit-for-bit.
+//
+// The tiled seam pins ROW_PTR whole and streams COL_IDX in node-aligned windows.
+// Because every node is sampled wholly within one window and the kernel's Philox
+// draws key on (batch_seed, node, layer, j) over the node's own degree, the
+// windowed picks must equal the whole-CSR picks element-for-element AND in order,
+// for ANY window cap. We assert that across caps (incl cap=1 forcing the deg-50
+// hub into its own window) x fanouts (reservoir, k==deg short-circuit, k>deg).
+// ---------------------------------------------------------------------------
+
+// deg = [2,1,50,0,3,4,1,7]; node 2 is a 50-edge super-hub, node 3 is isolated.
+// Distinct neighbour ids per node so equality is meaningful (no coincidences).
+// (Already inside the file's anonymous namespace -> internal linkage.)
+inline Csr make_tiled_fixture_csr() {
+    std::vector<std::vector<uint32_t>> adj(8);
+    auto fill = [&](uint32_t u, uint32_t base, uint32_t deg) {
+        for (uint32_t i = 0; i < deg; ++i) adj[u].push_back(base + i);
+    };
+    fill(0, 100, 2);
+    fill(1, 200, 1);
+    fill(2, 1000, 50);
+    // node 3: isolated (deg 0)
+    fill(4, 300, 3);
+    fill(5, 400, 4);
+    fill(6, 500, 1);
+    fill(7, 700, 7);
+    return make_csr(adj);
+}
+
+TEST(GpuKhopSampler, Tiled_EqualsWholeCsr) {
+    SKIP_IF_NO_GPU();
+    Csr csr = make_tiled_fixture_csr();
+    // Shuffled full frontier — proves window partition + scatter-back preserves
+    // per-frontier-index order regardless of input order.
+    const std::vector<uint32_t> frontier{5, 2, 0, 7, 3, 1, 6, 4};
+    const std::size_t caps[] = {1, 2, 3, 8, 1000};
+    const int fanouts[] = {1, 2, 10, 60};
+    for (int fanout : fanouts) {
+        auto whole = gpu_sample_neighbors_for_test(
+            csr.row_ptr, csr.col_idx, frontier, fanout,
+            /*batch_seed=*/0xC0FFEEu, /*layer=*/1);
+        for (std::size_t cap : caps) {
+            auto tiled = gpu_sample_neighbors_tiled_for_test(
+                csr.row_ptr, csr.col_idx, frontier, fanout,
+                /*batch_seed=*/0xC0FFEEu, /*layer=*/1, cap);
+            ASSERT_EQ(tiled.size(), whole.size())
+                << "fanout=" << fanout << " cap=" << cap;
+            for (std::size_t i = 0; i < whole.size(); ++i) {
+                EXPECT_EQ(tiled[i], whole[i])
+                    << "fanout=" << fanout << " cap=" << cap
+                    << " frontier_idx=" << i << " node=" << frontier[i];
+            }
+        }
+    }
+}
+
+// A frontier subset whose nodes land in DIFFERENT windows (the hub node 2 in its
+// own window under a small cap, node 7 in another) still equals the whole-CSR
+// result for that subset.
+TEST(GpuKhopSampler, Tiled_FrontierSpanningWindows) {
+    SKIP_IF_NO_GPU();
+    Csr csr = make_tiled_fixture_csr();
+    const std::vector<uint32_t> frontier{2, 7};
+    for (int fanout : {3, 40}) {
+        auto whole = gpu_sample_neighbors_for_test(
+            csr.row_ptr, csr.col_idx, frontier, fanout, 0x5151u, 0);
+        auto tiled = gpu_sample_neighbors_tiled_for_test(
+            csr.row_ptr, csr.col_idx, frontier, fanout, 0x5151u, 0,
+            /*window_cap_edges=*/3);
+        ASSERT_EQ(tiled, whole) << "fanout=" << fanout;
+    }
+}
+
+// Determinism + layer sensitivity through the tiled seam.
+TEST(GpuKhopSampler, Tiled_Determinism) {
+    SKIP_IF_NO_GPU();
+    Csr csr = make_tiled_fixture_csr();
+    const std::vector<uint32_t> frontier{2};  // the deg-50 hub draws randoms
+    auto a = gpu_sample_neighbors_tiled_for_test(csr.row_ptr, csr.col_idx,
+                                                 frontier, 10, 0xABCDEFu, 1, 8);
+    auto b = gpu_sample_neighbors_tiled_for_test(csr.row_ptr, csr.col_idx,
+                                                 frontier, 10, 0xABCDEFu, 1, 8);
+    EXPECT_EQ(a, b);  // same (seed,node,layer) -> identical
+    auto other_layer = gpu_sample_neighbors_tiled_for_test(
+        csr.row_ptr, csr.col_idx, frontier, 10, 0xABCDEFu, 2, 8);
+    EXPECT_NE(a, other_layer);  // layer enters the Philox counter
+}
+
 }  // namespace
 }  // namespace mdb::gnn
