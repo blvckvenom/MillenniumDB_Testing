@@ -41,6 +41,19 @@ struct PinnedDirView {
     uint64_t        dst_type_tag = 0;        // tag << 56
     std::size_t     n_rows       = 0;        // N (sidecar global) o N_L2 (compacto)
     std::size_t     n_edges      = 0;
+
+    // --- Modo tiled (path lean simetrico) -----------------------------------
+    // En modo tiled COL_IDX NO se registra entero: ROW_PTR se pinea completo y
+    // COL_IDX se transmite en ventanas alineadas a nodos a traves de un unico
+    // buffer pinned reutilizable. `tiled==false` => los campos de arriba se
+    // comportan EXACTAMENTE como el path no-tiled (d_col_idx es el COL_IDX
+    // entero device-visible) y los de abajo quedan sin usar.
+    const uint64_t* h_row_ptr      = nullptr;  // ROW_PTR host (scan de grados por ventana)
+    const uint32_t* h_col_src      = nullptr;  // COL_IDX host fuente (mmap/heap base); NUNCA se registra
+    uint32_t*       h_col_window   = nullptr;  // buffer pinned mapped de staging (host ptr)
+    uint32_t*       d_col_window   = nullptr;  // su puntero device
+    std::size_t     window_cap_edges = 0;      // capacidad del buffer (en aristas)
+    bool            tiled          = false;
 };
 
 /**
@@ -93,6 +106,48 @@ public:
     void build_and_register(const HostCsrArrays& fwd, const HostCsrArrays& rev);
 
     /**
+     * @brief Variante tiled: pinea ROW_PTR entero pero NO COL_IDX; transmite
+     *        COL_IDX en ventanas alineadas a nodos via un buffer pinned reusable.
+     *
+     * Pensada para el path lean simetrico en grafos enormes (papers100M): pinear
+     * el COL_IDX entero (~12.9 GB) como copia host pineada es justo lo que dispara
+     * el OOM. Aqui ROW_PTR (~0.9 GB) se pinea entero (cudaHostRegisterMapped) y por
+     * cada direccion activa se aloca UN buffer pinned mapped de `window_cap_edges`
+     * aristas (cudaHostAllocMapped); el COL_IDX se copia ventana a ventana con
+     * `map_col_window`. Deja `fwd()->d_col_idx == nullptr`: el llamador alimenta el
+     * COL_IDX por lanzamiento via `map_col_window`. No-op silencioso sin GPU/CUDA
+     * (igual que build_and_register).
+     *
+     * @param window_cap_edges capacidad del buffer de ventana en aristas (debe ser
+     *        >= el grado del nodo de mayor grado, para que ninguna ventana de un
+     *        solo nodo exceda el buffer).
+     * @throws std::logic_error si ya hay un registro activo.
+     * @throws CudaException si una llamada CUDA falla (registro parcial deshecho).
+     */
+    void build_and_register_tiled(const HostCsrArrays& fwd,
+                                  const HostCsrArrays& rev,
+                                  std::size_t          window_cap_edges);
+
+    /**
+     * @brief Stagea col_idx[edge_lo, edge_hi) de `dir` en su buffer pinned y
+     *        devuelve el device-ptr desde donde leer.
+     *
+     * Para una direccion no-tiled devuelve `dir.d_col_idx` sin tocar (edge_lo/
+     * edge_hi se ignoran): el COL_IDX entero ya es device-visible. Para una tiled
+     * copia la ventana al buffer pinned (memcpy host->host pinned, visible por el
+     * device via el mapeo) y devuelve `dir.d_col_window`. El buffer es UNICO y
+     * reusable: cada llamada lo sobreescribe, asi que el kernel de la ventana
+     * anterior debe haber sincronizado antes de re-mapear (lo hace
+     * sample_layer_on_device_ con cudaDeviceSynchronize).
+     *
+     * @throws std::logic_error si la ventana excede la capacidad del buffer o los
+     *         punteros tiled estan sin setear.
+     */
+    const uint32_t* map_col_window(const PinnedDirView& dir,
+                                   std::uint64_t        edge_lo,
+                                   std::uint64_t        edge_hi) const;
+
+    /**
      * @brief Desregistra todas las regiones. Idempotente y noexcept.
      */
     void release() noexcept;
@@ -107,8 +162,9 @@ private:
     // Punteros HOST originales por direccion, retenidos para `cudaHostUnregister`
     // (que toma el puntero host, no el device).
     struct HostRegistration {
-        void* row_ptr = nullptr;
-        void* col_idx = nullptr;
+        void* row_ptr    = nullptr;
+        void* col_idx    = nullptr;
+        void* col_window = nullptr;  // buffer cudaHostAlloc (tiled); cudaFreeHost en release()
     };
 
     // Registra una direccion. Rellena `reg` incrementalmente (tras cada
@@ -118,6 +174,14 @@ private:
                        PinnedDirView&       out,
                        bool&                active_flag,
                        HostRegistration&    reg);
+
+    // Variante tiled de register_dir_: pinea ROW_PTR entero, aloca el buffer de
+    // ventana pinned mapped, deja d_col_idx null y setea los campos tiled de out.
+    void register_dir_tiled_(const HostCsrArrays& src,
+                             PinnedDirView&       out,
+                             bool&                active_flag,
+                             HostRegistration&    reg,
+                             std::size_t          window_cap_edges);
 
     bool             registered_ = false;
     bool             fwd_active_ = false;
