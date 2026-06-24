@@ -478,11 +478,27 @@ struct OfflineSamplingEngine::Impl {
                     effective_workers = static_cast<uint32_t>(hw);
                 }
             }
-            // The GPU sampling path runs the sequential (legacy) loop on the main
-            // thread: the GPU parallelizes WITHIN each batch (across the frontier),
-            // so a CPU worker pool would only contend for the single CUDA context.
+            // The GPU sampling path can run the PARALLEL worker pool: the per-batch
+            // GPU work is microseconds (the device-resident CSR is read-only and
+            // shared across threads), so the bottleneck is the single-threaded HOST
+            // post-processing (edge assembly, dedup, serialize, write). Let the pool
+            // overlap that tail across batches instead of forcing one thread. Only
+            // safe on the RESIDENT backend (whole CSR in VRAM): the tiled fallback
+            // streams COL_IDX through a single shared pinned window buffer that is
+            // NOT reentrant, so it stays on the legacy serial loop. MDB_GNN_GPU_SERIAL=1
+            // forces the legacy serial GPU path regardless.
             if (use_gpu_sampling) {
-                effective_workers = 0;
+                const PinnedTopologyView* pv =
+                    khop_sampler->get_topology().pinned_view();
+                const bool resident_ok =
+                    pv != nullptr && pv->is_registered()
+                    && pv->fwd() != nullptr && pv->fwd()->resident;
+                const char* serial_env = std::getenv("MDB_GNN_GPU_SERIAL");
+                const bool want_serial =
+                    serial_env != nullptr && std::string(serial_env) == "1";
+                if (!resident_ok || want_serial) {
+                    effective_workers = 0;  // legacy GPU-serial loop
+                }
             }
             result.num_workers_used = effective_workers == 0
                 ? 1
@@ -715,10 +731,34 @@ struct OfflineSamplingEngine::Impl {
                         if (idx >= total_work) return;
 
                         const WorkItem& item = work[idx];
-                        sampler->reseed_for_batch(item.batch_id);
                         const auto t_exp0 = std::chrono::steady_clock::now();
-                        GraphSample sample = sampler->sample(
-                            *item.seeds, item.batch_id, item.split);
+                        GraphSample sample;
+#ifdef GNN_CUDA_ENABLED
+                        if (use_gpu_sampling) {
+                            // GPU sample is a pure function of (random_seed,
+                            // batch_id): batch_seed = random_seed ^ batch_id inside
+                            // sample_khop_gpu, so NO reseed is needed and the result
+                            // is invariant to worker count/order. The kernel reads
+                            // the shared device-resident CSR read-only; only per-call
+                            // device scratch is mutable, so concurrent workers do not
+                            // race on the graph. tally_nodes routes through the shared
+                            // atomic counts installed on every worker above.
+                            const PinnedTopologyView* pv =
+                                sampler->get_topology().pinned_view();
+                            std::vector<int> fanouts_i(config.fanouts.begin(),
+                                                       config.fanouts.end());
+                            sample = sample_khop_gpu(
+                                *item.seeds, item.batch_id, item.split,
+                                fanouts_i, *pv, active_gpu_plan,
+                                config.random_seed);
+                            sampler->tally_nodes(sample.all_unique_nodes);
+                        } else
+#endif
+                        {
+                            sampler->reseed_for_batch(item.batch_id);
+                            sample = sampler->sample(
+                                *item.seeds, item.batch_id, item.split);
+                        }
                         // Off-lock prep: serialize() + content-hash on the worker
                         // (concurrent, counted as expand). Pure functions of sample.
                         // Always done in the sharded path (the write is lock-free).
