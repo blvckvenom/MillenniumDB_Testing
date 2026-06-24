@@ -198,7 +198,14 @@ void FourLevelTopologyStore::enable_pinned_gpu_view(
             return;  // nothing pinnable -> stay on CPU path
         }
         auto view = std::make_unique<PinnedTopologyView>();
-        view->build_and_register(*sym, HostCsrArrays{});
+        if (config_.lean_symmetric_gpu) {
+            // Lean: pin ROW_PTR whole + stream COL_IDX windows (no ~13 GB pinned
+            // copy). sym->col_idx is the mmap base used as the window source.
+            view->build_and_register_tiled(*sym, HostCsrArrays{},
+                                           lean_window_cap_edges_);
+        } else {
+            view->build_and_register(*sym, HostCsrArrays{});
+        }
         if (view->is_registered()) {
             pinned_view_ = std::move(view);
         }
@@ -309,6 +316,41 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
         l3_sym_ = owned_l3_sym_->has_data() ? owned_l3_sym_.get() : nullptr;
     }
     if (narrow(l3_sym_)) {
+        if (config_.lean_symmetric_gpu) {
+            // Lean tiled path: do NOT copy the ~12.9 GB COL_IDX. Pin only ROW_PTR
+            // (copied to an owned heap vector so cudaHostRegister accepts it) and
+            // point col_idx at the mmap base — build_and_register_tiled uses it as
+            // the per-window COPY SOURCE (it is never registered whole). Compute
+            // the window cap = max(env/default, max node degree) so a super-hub
+            // window still fits one staging buffer.
+            const uint64_t nn = l3_sym_->num_nodes();
+            const uint64_t mm = l3_sym_->num_edges();
+            sym_row_ptr_.resize(static_cast<std::size_t>(nn) + 1);
+            std::memcpy(sym_row_ptr_.data(), l3_sym_->row_ptr_base(),
+                        (static_cast<std::size_t>(nn) + 1) * sizeof(uint64_t));
+            sym_arrays_.row_ptr      = sym_row_ptr_.data();
+            sym_arrays_.col_idx      = l3_sym_->col_idx32_base();  // mmap window src
+            sym_arrays_.n_rows       = nn;
+            sym_arrays_.n_edges      = mm;
+            sym_arrays_.dst_type_tag =
+                static_cast<uint64_t>(l3_sym_->dst_type_tag()) << 56;
+            sym_slice_is_mmap_ = false;  // ROW_PTR is heap; COL_IDX stays mmap
+            sym_arrays_built_  = true;
+
+            std::size_t env_cap = std::size_t(64) << 20;  // 64 Mi edges (~256 MB)
+            if (const char* e = std::getenv("MDB_GNN_TILE_WINDOW_EDGES")) {
+                const long long v = std::atoll(e);
+                if (v > 0) env_cap = static_cast<std::size_t>(v);
+            }
+            uint64_t max_deg = 0;
+            for (uint64_t u = 0; u < nn; ++u) {
+                const uint64_t d = sym_row_ptr_[u + 1] - sym_row_ptr_[u];
+                if (d > max_deg) max_deg = d;
+            }
+            lean_window_cap_edges_ =
+                std::max<std::size_t>(env_cap, static_cast<std::size_t>(max_deg));
+            return &sym_arrays_;
+        }
         // cudaHostRegister REJECTS file-backed mmap pages (MAP_PRIVATE read-only)
         // with "invalid argument", so we cannot pin the l3_sym_ mmap directly.
         // Copy the already-merged slice into OWNED heap vectors (which DO pin) —
@@ -1112,6 +1154,81 @@ void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
               << "future pass).\n";
 }
 
+void FourLevelTopologyStore::build_lean_symmetric_() {
+    // Open the mmap sidecars: l3_sym_ (the slice the GPU pins, tiled) plus
+    // l3_fwd_/l3_rev_ (the directional tiers the CPU fallback reads). All mmap,
+    // so this is cheap — none of the ~25 GB L1/L2 RAM build runs.
+    open_l3_sidecars_();
+
+    uint64_t n = 0;
+    if (l3_sym_ != nullptr && l3_sym_->has_data())      n = l3_sym_->num_nodes();
+    else if (l3_fwd_ != nullptr && l3_fwd_->has_data()) n = l3_fwd_->num_nodes();
+    else if (l3_rev_ != nullptr && l3_rev_->has_data()) n = l3_rev_->num_nodes();
+
+    // Every node served from the mmap L3 tier (tier 3): no L1/L2 residency. The
+    // all-3 tier vector (~N bytes; ~111 MB on papers100M) is the only heap cost,
+    // replacing the ~25 GB of populated L1/L2 it stands in for.
+    owned_tier_assignment_.assign(static_cast<std::size_t>(n), uint8_t{3});
+    tier_lookup_ref_ = &owned_tier_assignment_;
+
+    // Empty (non-null) L1/L2 so get_out/in_neighbors can bind their references;
+    // tier-3 dispatch reads the mmap directly and never queries them.
+    owned_l1_fwd_ = std::make_unique<L1HashCache>(owned_tier_assignment_);
+    owned_l2_fwd_ = std::make_unique<L2CompactCsr>(/*hint=*/0);
+    owned_l1_rev_ = std::make_unique<L1HashCache>(owned_tier_assignment_);
+    owned_l2_rev_ = std::make_unique<L2CompactCsr>(/*hint=*/0);
+    l1_fwd_ = owned_l1_fwd_.get();
+    l1_rev_ = owned_l1_rev_.get();
+    l2_fwd_ = owned_l2_fwd_.get();
+    l2_rev_ = owned_l2_rev_.get();
+
+    // L4 fallback closures to the live BPTs (cheap: capture the index pointer),
+    // so a tier-3 node whose sidecar row is out of range still resolves.
+    if (fwd_bpt_ != nullptr) {
+        BPlusTree<3>* idx = fwd_bpt_;
+        l4_fwd_ = [idx](ObjectId v) -> std::vector<AdjEntry> {
+            std::vector<AdjEntry> out;
+            Record<3> mn = {v.id, 0, 0};
+            Record<3> mx = {v.id, UINT64_MAX, UINT64_MAX};
+            bool interruption = false;
+            auto it = idx->get_range(&interruption, mn, mx);
+            const Record<3>* rec;
+            while ((rec = it.next()) != nullptr) {
+                if (std::get<0>(*rec) != v.id) continue;
+                out.push_back(AdjEntry{ std::get<1>(*rec), std::get<2>(*rec) });
+            }
+            return out;
+        };
+    }
+    if (rev_bpt_ != nullptr) {
+        BPlusTree<3>* idx = rev_bpt_;
+        l4_rev_ = [idx](ObjectId v) -> std::vector<AdjEntry> {
+            std::vector<AdjEntry> out;
+            Record<3> mn = {v.id, 0, 0};
+            Record<3> mx = {v.id, UINT64_MAX, UINT64_MAX};
+            bool interruption = false;
+            auto it = idx->get_range(&interruption, mn, mx);
+            const Record<3>* rec;
+            while ((rec = it.next()) != nullptr) {
+                if (std::get<0>(*rec) != v.id) continue;
+                out.push_back(AdjEntry{ std::get<1>(*rec), std::get<2>(*rec) });
+            }
+            return out;
+        };
+    }
+
+    // sym_built_ stays FALSE: get_neighbors(UNDIRECTED) takes the out+in merge
+    // over the mmap L3 tier (byte-identical to the non-lean fallback). The GPU
+    // kernel serves the merged neighbourhood from the pinned tiled slice instead.
+    row_lookup_ = [](ObjectId v) -> uint64_t { return v.get_value(); };
+    built_ = true;
+
+    std::cerr << "[FourLevelTopologyStore] lean symmetric GPU build — skipped "
+                 "L1/L2 tiers (n=" << n << " nodes, all tier-3 mmap); GPU pins "
+                 "the tiled symmetric slice, CPU fallback reads the mmap "
+                 "sidecars\n";
+}
+
 void FourLevelTopologyStore::build() {
     if (!phase3_ctor_) {
         throw std::logic_error(
@@ -1122,6 +1239,15 @@ void FourLevelTopologyStore::build() {
         throw std::logic_error(
             "FourLevelTopologyStore::build() called twice — recreate the "
             "store to rebuild");
+    }
+
+    // Lean tiled-symmetric path: skip the entire L1/L2/profiler/merge build (the
+    // ~25 GB that OOMs papers100M) — open only the mmap sidecars + a minimal
+    // all-tier-3 dispatch, and let enable_pinned_gpu_view pin the TILED symmetric
+    // slice. See build_lean_symmetric_().
+    if (config_.lean_symmetric_gpu) {
+        build_lean_symmetric_();
+        return;
     }
 
     // Build-phase per-span instrumentation: split the otherwise-opaque

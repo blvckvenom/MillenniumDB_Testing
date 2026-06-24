@@ -296,6 +296,16 @@ public:
         /// the runtime out+in+merge fallback (same dedup rule, so byte-identical)
         /// — the bit-reproducible reference for the symmetric ON/OFF gate.
         bool build_symmetric_tier = true;
+
+        /// Lean tiled-symmetric GPU path. When true, build() SKIPS the L1/L2 tier
+        /// population (the ~25 GB that OOMs papers100M) and the whole-COL_IDX copy:
+        /// it opens only the mmap sidecars, marks every node tier-3 (served from
+        /// the mmap), and enable_pinned_gpu_view pins the symmetric slice as a
+        /// TILED view (ROW_PTR pinned whole + COL_IDX streamed in node-aligned
+        /// windows). Only meaningful for UNDIRECTED with a baked narrow
+        /// topology_sym.csr + a capable GPU; the engine sets it via the AUTO
+        /// eligibility check. Default false keeps the full four-level build.
+        bool lean_symmetric_gpu = false;
     };
 
     // ------------------------------------------------------------------
@@ -670,6 +680,12 @@ private:
         std::unique_ptr<L1HashCache>&                  l1_out,
         std::unique_ptr<L2CompactCsr>&                 l2_out) const;
     void open_l3_sidecars_();
+
+    // Lean tiled-symmetric build (config_.lean_symmetric_gpu): opens the mmap
+    // sidecars and wires a minimal all-tier-3 dispatch (no L1/L2 population), so
+    // the GPU pins the tiled symmetric slice while a stray CPU fallback still
+    // resolves from the mmap. Called by build() in place of the full build.
+    void build_lean_symmetric_();
     /**
      * @brief Compute a MinHash permutation that clusters L3-tier nodes by
      *        sample-set similarity so that nearby seeds in the random-walk
@@ -777,6 +793,10 @@ private:
     // vectors. When true, owned_l3_sym_ backs the pin and must outlive it (and
     // the heap vectors are empty). When false, the slice was merged in RAM.
     bool                                               sym_slice_is_mmap_ = false;
+    // Window edge capacity for the lean tiled-symmetric pin (build_and_register_
+    // tiled): max(env MDB_GNN_TILE_WINDOW_EDGES or default, max node degree).
+    // Set by materialize_symmetric_arrays() on the lean path; 0 otherwise.
+    std::size_t                                        lean_window_cap_edges_ = 0;
 };
 
 }  // namespace mdb::gnn
