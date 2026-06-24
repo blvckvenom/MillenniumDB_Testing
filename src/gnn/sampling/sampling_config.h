@@ -230,6 +230,16 @@ struct SamplingConfig {
     bool use_four_level_topology_store = true;
 
     /**
+     * @brief Lean tiled-symmetric GPU sampling path. Set by the engine (NOT a
+     * user knob) when the AUTO eligibility check passes: UNDIRECTED + symmetric
+     * resolved-on + a baked narrow topology_sym.csr + a capable GPU. Threaded
+     * into FourLevelTopologyStore::Config so build() skips the ~25 GB L1/L2
+     * tiers and the ~13 GB whole-COL_IDX copy, pinning the symmetric slice as a
+     * tiled view instead. Default false.
+     */
+    bool lean_symmetric_gpu = false;
+
+    /**
      * @brief L1 cache budget in MiB. 0 means auto-detect from
      *        /proc/meminfo (25% of 70% of MemAvailable).
      */

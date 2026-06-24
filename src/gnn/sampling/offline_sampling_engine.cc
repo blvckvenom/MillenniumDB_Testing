@@ -38,6 +38,31 @@ namespace mdb::gnn {
 // Implementation
 // =============================================================================
 
+#ifdef GNN_CUDA_ENABLED
+// AUTO eligibility for the lean tiled-symmetric GPU path. True when the user did
+// not force CPU, the four-level store is in play, the orientation resolves to a
+// symmetric (UNDIRECTED) sample, a baked NARROW topology_sym.csr exists, and a
+// GPU is present. When true the engine builds the sampler with
+// lean_symmetric_gpu set, so the four-level L1/L2 build (the papers100M OOM) is
+// skipped and the symmetric slice is pinned tiled. Pure read-only probe (opens
+// the sidecar header + queries the device); no ordering dependency on storage
+// state established later in do_run.
+bool lean_symmetric_gpu_eligible(GQL::ProjectionStorage& storage,
+                                 const SamplingConfig& config) {
+    if (config.sampling_backend == SamplingBackendChoice::FORCE_CPU) return false;
+    if (const char* e = std::getenv("MDB_GNN_SAMPLING_BACKEND")) {
+        if (std::string(e) == "cpu") return false;
+    }
+    if (!config.use_four_level_topology_store) return false;
+    if (!config.symmetric_resolved_on(config.orientation)) return false;
+    auto sym = GQL::Projection::TopologySnapshotReader::open_symmetric(
+        storage.get_projection_dir());
+    if (!sym.has_data() || sym.id_width() != 4) return false;
+    const mdb::gpu::SystemResources res = mdb::gpu::detect_resources();
+    return res.has_gpu;
+}
+#endif
+
 struct OfflineSamplingEngine::Impl {
     GQL::ProjectionStorage& storage;
     SamplingConfig config;
@@ -105,7 +130,16 @@ struct OfflineSamplingEngine::Impl {
             seed_selector = std::make_unique<SeedSelector>(storage, config, row_mapping.get());
         }
         if (!khop_sampler) {
-            khop_sampler = std::make_unique<BasicKHopSampler>(storage, config);
+            SamplingConfig cfg = config;
+#ifdef GNN_CUDA_ENABLED
+            if (lean_symmetric_gpu_eligible(storage, config)) {
+                cfg.lean_symmetric_gpu = true;
+                std::cerr << "[OfflineSamplingEngine] lean tiled-symmetric GPU "
+                             "path eligible: skipping the four-level L1/L2 build "
+                             "(pinning the symmetric slice tiled)\n";
+            }
+#endif
+            khop_sampler = std::make_unique<BasicKHopSampler>(storage, cfg);
         }
     }
 

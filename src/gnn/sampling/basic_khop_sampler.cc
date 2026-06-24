@@ -172,6 +172,11 @@ struct BasicKHopSampler::Impl {
             // bit-reproducible reference, byte-identical via the same dedup).
             tcfg.build_symmetric_tier =
                 config_.symmetric_resolved_on(config_.orientation);
+            // Lean tiled-symmetric GPU path (set by the engine's AUTO check):
+            // build() skips the L1/L2 tiers + whole-COL_IDX copy and pins the
+            // symmetric slice tiled. use_four_level_topology_store stays true so
+            // node_counts.bin persistence + the store-backed plumbing are intact.
+            tcfg.lean_symmetric_gpu = config_.lean_symmetric_gpu;
             topology->enable_four_level_store(tcfg);
             // Force PER_NODE: the four-level store dispatch is O(1) per
             // node (L1 hash lookup or L2 CSR slice), which beats the
