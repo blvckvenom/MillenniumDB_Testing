@@ -30,6 +30,7 @@ mdb::gpu::SystemResources make_res(bool has_gpu, int cc,
     r.has_gpu                  = has_gpu;
     r.gpu.compute_capability   = cc;
     r.gpu.free_vram            = free_vram;
+    r.gpu.raw_free_vram        = free_vram;  // tests: raw == derated (sin derate)
     r.gpu.total_vram           = free_vram;
     r.ram_available            = ram;
     return r;
@@ -82,14 +83,45 @@ TEST(SamplingBackendPlan, CsrExceedsRamHeadroomFallsToCpu) {
 }
 
 TEST(SamplingBackendPlan, FitsRamAndVramPicksVramCopy) {
-    // needed = 20808 <= headroom (60M) y <= free_vram (100M) => VRAM_COPY.
-    auto res  = make_res(true, 80, /*vram=*/100'000'000, /*ram=*/100'000'000);
+    // needed = 20808 + abs headroom (~0.75 GiB) <= raw_free_vram (2 GB) => VRAM_COPY.
+    auto res  = make_res(true, 80, /*vram=*/2'000'000'000, /*ram=*/100'000'000);
     auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, dims(100, 5000),
                                       DirCsrDims{}, SamplingBackendChoice::AUTO,
                                       cfg_min_edges(1000));
     EXPECT_EQ(plan.backend, SamplingBackend::GPU_VRAM_COPY);
     EXPECT_EQ(plan.directions, GpuDirections::FORWARD_ONLY);
     EXPECT_GT(plan.estimated_vram_bytes, 0u);
+}
+
+TEST(SamplingBackendPlan, FitsRawVramEvenIfDeratedRejects) {
+    // The CSR + headroom fit the RAW free VRAM (2 GB) even though the derated
+    // free_vram (1 MB) would reject it: Gate D must key on raw free, not derated.
+    mdb::gpu::SystemResources r;
+    r.has_gpu                = true;
+    r.gpu.compute_capability = 80;
+    r.gpu.free_vram          = 1'000'000;       // derated (would reject)
+    r.gpu.raw_free_vram      = 2'000'000'000;   // raw (admits CSR + headroom)
+    r.gpu.total_vram         = 2'000'000'000;
+    r.ram_available          = 100'000'000;
+    auto plan = plan_sampling_backend(r, EdgeOrientation::NATURAL, dims(100, 5000),
+                                      DirCsrDims{}, SamplingBackendChoice::AUTO,
+                                      cfg_min_edges(1000));
+    EXPECT_EQ(plan.backend, SamplingBackend::GPU_VRAM_COPY);
+}
+
+TEST(SamplingBackendPlan, RawVramTooTightForHeadroomPicksUva) {
+    // raw free is above the CSR (20808) but below CSR + abs headroom => UVA.
+    mdb::gpu::SystemResources r;
+    r.has_gpu                = true;
+    r.gpu.compute_capability = 80;
+    r.gpu.free_vram          = 30'000;
+    r.gpu.raw_free_vram      = 30'000;          // > 20808 but < 20808 + ~0.75 GiB
+    r.gpu.total_vram         = 30'000;
+    r.ram_available          = 100'000'000;
+    auto plan = plan_sampling_backend(r, EdgeOrientation::NATURAL, dims(100, 5000),
+                                      DirCsrDims{}, SamplingBackendChoice::AUTO,
+                                      cfg_min_edges(1000));
+    EXPECT_EQ(plan.backend, SamplingBackend::GPU_UVA);
 }
 
 TEST(SamplingBackendPlan, FitsRamButNotVramPicksUva) {

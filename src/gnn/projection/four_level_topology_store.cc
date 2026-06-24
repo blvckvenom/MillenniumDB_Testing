@@ -198,8 +198,24 @@ void FourLevelTopologyStore::enable_pinned_gpu_view(
             return;  // nothing pinnable -> stay on CPU path
         }
         auto view = std::make_unique<PinnedTopologyView>();
-        if (config_.lean_symmetric_gpu) {
-            // Lean: pin ROW_PTR whole + stream COL_IDX windows (no ~13 GB pinned
+        if (plan.backend == SamplingBackend::GPU_VRAM_COPY) {
+            // Whole CSR fits VRAM: copy it device-resident so the kernel reads it
+            // from device global memory (fastest), not host pages over PCIe. On a
+            // device-allocation failure, fall back to the windowed/whole host path
+            // so the out-of-core guard stays intact.
+            try {
+                view->build_and_register_resident(*sym, HostCsrArrays{});
+            } catch (const std::exception&) {
+                view = std::make_unique<PinnedTopologyView>();
+                if (config_.lean_symmetric_gpu) {
+                    view->build_and_register_tiled(*sym, HostCsrArrays{},
+                                                   lean_window_cap_edges_);
+                } else {
+                    view->build_and_register(*sym, HostCsrArrays{});
+                }
+            }
+        } else if (config_.lean_symmetric_gpu) {
+            // Lean: pin ROW_PTR whole + stream COL_IDX windows (no whole pinned
             // copy). sym->col_idx is the mmap base used as the window source.
             view->build_and_register_tiled(*sym, HostCsrArrays{},
                                            lean_window_cap_edges_);

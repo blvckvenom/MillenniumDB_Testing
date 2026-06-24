@@ -158,15 +158,21 @@ SamplingBackendPlan plan_sampling_backend(
     // viene derateado por el factor de seguridad en detect_resources.
     plan.directions           = dirs;
     plan.estimated_vram_bytes = device_resident;
-    if (device_resident <= res.gpu.free_vram) {
+    // VRAM-resident cuando el CSR + una reserva absoluta (contexto CUDA + scratch)
+    // caben en la VRAM libre CRUDA. Durante el muestreo no hay tensores de modelo/
+    // features residentes, asi que el derate ciego (compartido con otros planners)
+    // es demasiado conservador aqui. Si no cabe, leerlo por PCIe via UVA.
+    const std::size_t vram_need = device_resident + cfg.vram_abs_headroom_bytes;
+    if (vram_need <= res.gpu.raw_free_vram) {
         plan.backend = SamplingBackend::GPU_VRAM_COPY;
-        plan.reason  = "GPU: CSR fits VRAM (" + std::to_string(device_resident)
-                     + " <= free_vram " + std::to_string(res.gpu.free_vram)
+        plan.reason  = "GPU: CSR fits VRAM device-resident (" + std::to_string(device_resident)
+                     + " + headroom " + std::to_string(cfg.vram_abs_headroom_bytes)
+                     + " <= raw_free_vram " + std::to_string(res.gpu.raw_free_vram)
                      + "), directions=" + to_string(dirs);
     } else {
         plan.backend = SamplingBackend::GPU_UVA;
         plan.reason  = "GPU via UVA (device_resident " + std::to_string(device_resident)
-                     + " > free_vram " + std::to_string(res.gpu.free_vram)
+                     + " + headroom > raw_free_vram " + std::to_string(res.gpu.raw_free_vram)
                      + "), directions=" + to_string(dirs);
     }
     return plan;

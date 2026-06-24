@@ -76,6 +76,10 @@ struct SamplingBackendConfig {
     std::uint64_t min_edges_for_gpu = 2'000'000;
     // Permitir, en UNDIRECTED, acelerar en GPU solo la direccion que cabe.
     bool     allow_single_direction = true;
+    // Reserva absoluta de VRAM (contexto CUDA + buffers de scratch por batch) que
+    // debe quedar libre ADEMAS del CSR para elegir el camino device-resident. El
+    // CSR + esta reserva deben caber en la VRAM libre cruda (sin el derate ciego).
+    std::size_t vram_abs_headroom_bytes = 768ull * 1024 * 1024;  // ~0.75 GiB
 };
 
 // Resultado de la decision. `reason` es legible y se loguea una vez. Los tamaños
