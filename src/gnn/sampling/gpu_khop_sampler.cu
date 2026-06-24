@@ -413,6 +413,58 @@ GraphSample sample_khop_gpu(const std::vector<ObjectId>& seeds, uint64_t batch_i
                vb ? static_cast<uint32_t>(vb->n_rows) : 0u};
     const uint64_t dst_tag = va->dst_type_tag;  // tag<<56, re-OR'd onto dense ids
 
+    // Tiled view: COL_IDX is not resident whole — it is streamed per node-aligned
+    // window. The CSR is fixed across layers, so compute the windows once here.
+    // buffer_cap <= va->window_cap_edges by construction (the lean store sizes the
+    // window cap to >= the max node degree, so a super-hub window still fits).
+    std::vector<Window> windows;
+    if (va->tiled) {
+        std::size_t buffer_cap = 0;
+        compute_node_aligned_windows(va->h_row_ptr,
+                                     static_cast<uint32_t>(va->n_rows),
+                                     va->window_cap_edges, windows, buffer_cap);
+    }
+
+    // Expand one layer's frontier into per-frontier-index sampled neighbours.
+    // Non-tiled: ONE launch over the whole CSR — byte-identical to the original
+    // single sample_layer_on_device_ call. Tiled (symmetric FORWARD_ONLY, so vb is
+    // null): partition the frontier by node-aligned window, stage that window's
+    // COL_IDX (map_col_window) and launch per non-empty window with
+    // CsrRange.col_base_offset, scattering results back to the frontier index.
+    // Both return the same vector<vector<uint32_t>> shape, so the reassembly tail
+    // below is untouched. Sequential windows reuse the one pinned buffer safely
+    // (sample_layer_on_device_ synchronises before returning).
+    auto expand_layer = [&](const std::vector<uint32_t>& frontier, int fanout,
+                            int layer) -> std::vector<std::vector<uint32_t>> {
+        if (!va->tiled) {
+            return sample_layer_on_device_(a, b, frontier, fanout, batch_seed,
+                                           layer);
+        }
+        std::vector<std::vector<uint32_t>> out(frontier.size());
+        for (const auto& w : windows) {
+            std::vector<uint32_t> sub;
+            std::vector<std::size_t> orig;
+            for (std::size_t i = 0; i < frontier.size(); ++i) {
+                const uint32_t v = frontier[i];
+                if (v >= w.u_lo && v < w.u_hi) {
+                    sub.push_back(v);
+                    orig.push_back(i);
+                }
+            }
+            if (sub.empty()) continue;
+            const uint32_t* d_col = view.map_col_window(*va, w.edge_lo, w.edge_hi);
+            CsrRange wa{va->d_row_ptr, d_col,
+                        static_cast<uint32_t>(va->n_rows), w.edge_lo};
+            CsrRange wb{nullptr, nullptr, 0, 0};
+            auto s = sample_layer_on_device_(wa, wb, sub, fanout, batch_seed,
+                                             layer);
+            for (std::size_t j = 0; j < s.size(); ++j) {
+                out[orig[j]] = std::move(s[j]);
+            }
+        }
+        return out;
+    };
+
     std::vector<std::unordered_map<
         uint64_t, std::vector<std::pair<ObjectId, ObjectId>>>>
         sampled_edges(K);
@@ -424,8 +476,7 @@ GraphSample sample_khop_gpu(const std::vector<ObjectId>& seeds, uint64_t batch_i
             frontier[i] = static_cast<uint32_t>(current[i].get_value());
         }
 
-        auto sampled = sample_layer_on_device_(a, b, frontier, fanouts[k],
-                                               batch_seed, static_cast<int>(k));
+        auto sampled = expand_layer(frontier, fanouts[k], static_cast<int>(k));
 
         std::unordered_set<uint64_t> next_set;
         for (size_t i = 0; i < current.size(); ++i) {
