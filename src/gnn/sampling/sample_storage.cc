@@ -160,8 +160,32 @@ struct SampleStorage::Impl {
     // Dense frequency tracking (when RowMapping available during write)
     const RowMapping* row_mapping_ = nullptr;  // non-owning, optional
     std::vector<uint64_t> node_freq_dense;     // indexed by row_index
-    std::vector<bool> node_seen;               // bitset indexed by row_index
-    uint64_t dense_unique_count = 0;           // count of unique nodes (bitset path)
+    // Expanded-unique node tracking: a packed atomic bitset over the FULL node
+    // universe (1 bit per node, keyed by ObjectId::get_value()). Unlike the
+    // row-indexed node_freq_dense above (limited to the labeled/feature subset),
+    // this counts every distinct sampled node, so catalog.unique_nodes reports
+    // the documented "unique nodes across all samples" — the same on the dense
+    // and sparse paths. fetch_or is idempotent, so concurrent shard writers may
+    // set bits without a lock.
+    uint64_t total_node_count_ = 0;
+    std::vector<std::atomic<uint64_t>> seen_bits_;
+
+    // Mark a node (by ObjectId::get_value()) seen in the expanded-unique bitset.
+    inline void mark_seen_(uint64_t node_value) {
+        if (node_value < total_node_count_) {
+            seen_bits_[node_value >> 6].fetch_or(
+                1ULL << (node_value & 63u), std::memory_order_relaxed);
+        }
+    }
+    // Distinct nodes marked seen (popcount of the bitset).
+    uint64_t seen_popcount_() const {
+        uint64_t c = 0;
+        for (const auto& w : seen_bits_) {
+            c += static_cast<uint64_t>(
+                __builtin_popcountll(w.load(std::memory_order_relaxed)));
+        }
+        return c;
+    }
 
     // Dense frequency cache (for read-mode loading of v2 files)
     std::vector<uint64_t> dense_freq_cache_;
@@ -330,17 +354,16 @@ struct SampleStorage::Impl {
         // Track unique nodes and frequencies
         for (const auto& node : sample.all_unique_nodes) {
             if (row_mapping_) {
+                // Count every distinct expanded node, with or without a feature
+                // row, so unique_nodes matches the sparse path.
+                mark_seen_(node.get_value());
                 // Dense path: O(log N) lookup per node, O(1) vector access
                 auto row = row_mapping_->find(node);
                 if (row.has_value() && *row < node_freq_dense.size()) {
                     node_freq_dense[*row]++;
-                    if (!node_seen[*row]) {
-                        node_seen[*row] = true;
-                        dense_unique_count++;
-                    }
                 }
-                // Nodes not in RowMapping are silently skipped — they are
-                // outside the projected graph and have no feature row.
+                // Nodes not in RowMapping contribute no per-row frequency — they
+                // are outside the projected graph and have no feature row.
             } else {
                 // Sparse fallback: hash-map based tracking
                 unique_nodes_seen.insert(node.id);
@@ -413,6 +436,7 @@ struct SampleStorage::Impl {
         }
         sh.content_fp ^= content_hash;
         for (const auto& node : sample.all_unique_nodes) {
+            mark_seen_(node.get_value());
             auto row = row_mapping_->find(node);
             if (row.has_value() && *row < shard_freq_.size()) {
                 shard_freq_[*row].fetch_add(1, std::memory_order_relaxed);
@@ -495,13 +519,12 @@ struct SampleStorage::Impl {
             content_fp_accumulator_    ^= sh.content_fp;
         }
 
-        // Materialize the dense frequency vector + unique count from the atomics.
+        // Materialize the dense (row-indexed) frequency vector from the atomics.
+        // The expanded-unique node count comes from seen_bits_ (full universe),
+        // not these row-filtered counts.
         node_freq_dense.assign(shard_freq_.size(), 0);
-        dense_unique_count = 0;
         for (std::size_t i = 0; i < shard_freq_.size(); ++i) {
-            const uint64_t c = shard_freq_[i].load(std::memory_order_relaxed);
-            node_freq_dense[i] = c;
-            if (c > 0) dense_unique_count++;
+            node_freq_dense[i] = shard_freq_[i].load(std::memory_order_relaxed);
         }
 
         split_index.clear();
@@ -573,7 +596,8 @@ struct SampleStorage::Impl {
         catalog.train_batches = train_batches_written;
         catalog.validation_batches = validation_batches_written;
         catalog.test_batches = test_batches_written;
-        catalog.unique_nodes = row_mapping_ ? dense_unique_count : unique_nodes_seen.size();
+        catalog.unique_nodes =
+            row_mapping_ ? seen_popcount_() : unique_nodes_seen.size();
         catalog.total_edges = total_edges_written;
 
         // Persist the content fingerprint. 0 is reserved for
@@ -992,7 +1016,8 @@ SampleStorage SampleStorage::create(
 SampleStorage SampleStorage::create(
     const std::filesystem::path& db_folder,
     const SamplingConfig& config,
-    const RowMapping& row_mapping
+    const RowMapping& row_mapping,
+    uint64_t total_node_count
 ) {
     auto path = get_storage_path(db_folder, config.sample_name);
 
@@ -1002,11 +1027,17 @@ SampleStorage SampleStorage::create(
     storage.impl_->row_mapping_ = &row_mapping;
     storage.impl_->init_write_mode(path, config);
 
-    // Initialize dense tracking structures
+    // Initialize dense (row-indexed) frequency tracking.
     uint64_t N = row_mapping.size();
     storage.impl_->node_freq_dense.assign(N, 0);
-    storage.impl_->node_seen.assign(N, false);
-    storage.impl_->dense_unique_count = 0;
+
+    // Expanded-unique bitset over the full node universe (1 bit per node).
+    storage.impl_->total_node_count_ = total_node_count;
+    storage.impl_->seen_bits_ =
+        std::vector<std::atomic<uint64_t>>((total_node_count + 63) / 64);
+    for (auto& w : storage.impl_->seen_bits_) {
+        w.store(0, std::memory_order_relaxed);
+    }
 
     return storage;
 }

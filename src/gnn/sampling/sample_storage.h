@@ -114,13 +114,17 @@ public:
      * @param db_folder Database root folder
      * @param config Sampling configuration
      * @param row_mapping RowMapping for ObjectId to row_index translation
+     * @param total_node_count Size of the full node universe (max
+     *        ObjectId::get_value() + 1) — sizes the expanded-unique bitset so
+     *        unique_nodes counts every sampled node, not just feature rows.
      * @return New SampleStorage in write mode with dense tracking enabled
      * @throws std::runtime_error if storage already exists or creation fails
      */
     static SampleStorage create(
         const std::filesystem::path& db_folder,
         const SamplingConfig& config,
-        const RowMapping& row_mapping
+        const RowMapping& row_mapping,
+        uint64_t total_node_count
     );
 
     /**

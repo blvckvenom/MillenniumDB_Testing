@@ -206,7 +206,8 @@ struct OfflineSamplingEngine::Impl {
                     && config.num_workers >= 1 && row_mapping != nullptr;
             }();
             SampleStorage sample_storage = want_shard_write
-                ? SampleStorage::create(db_folder, config, *row_mapping)
+                ? SampleStorage::create(db_folder, config, *row_mapping,
+                      khop_sampler->get_topology().get_node_count())
                 : SampleStorage::create(db_folder, config);
 
             // Get seed split

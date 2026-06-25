@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -109,7 +110,7 @@ protected:
     fs::path write_legacy(const RowMapping& rm,
                           const std::vector<GraphSample>& samples) {
         auto config = make_config("legacy");
-        auto storage = SampleStorage::create(tmp_, config, rm);
+        auto storage = SampleStorage::create(tmp_, config, rm, kNodes + 1);
         for (const auto& s : samples) storage.write_sample(s);
         storage.finalize();
         return SampleStorage::get_storage_path(tmp_, config.sample_name);
@@ -122,7 +123,7 @@ protected:
                            const std::vector<GraphSample>& samples,
                            uint32_t num_workers) {
         auto config = make_config("sharded");
-        auto storage = SampleStorage::create(tmp_, config, rm);
+        auto storage = SampleStorage::create(tmp_, config, rm, kNodes + 1);
         storage.begin_sharded_write(num_workers);
         EXPECT_TRUE(storage.sharded_write_active());
         for (size_t i = 0; i < samples.size(); ++i) {
@@ -186,6 +187,43 @@ TEST_F(ShardWriteTest, ShardFilesDeletedAfterMerge) {
     for (uint32_t w = 0; w < 3; ++w) {
         EXPECT_FALSE(fs::exists(dir / ("batches_shard_" + std::to_string(w) + ".dat")));
     }
+}
+
+// catalog.unique_nodes must report EVERY distinct sampled node (the documented
+// "unique nodes across all samples"), even when the RowMapping covers only a
+// subset of them. Without this, the dense path silently collapses the count to
+// the feature-row subset and the metric depends on the storage mode.
+TEST_F(ShardWriteTest, UniqueNodesCountsExpandedNotJustFeatureRows) {
+    auto samples = make_samples(20, 6, 8);
+
+    // Ground truth: distinct node values across every sample.
+    std::set<uint64_t> distinct;
+    for (const auto& s : samples) {
+        for (const auto& n : s.all_unique_nodes) distinct.insert(n.get_value());
+    }
+    const uint64_t expanded = distinct.size();
+
+    // RowMapping covering only the first few node values — far fewer than the
+    // distinct nodes the samples touch.
+    constexpr uint64_t kCover = 4;
+    std::vector<ObjectId> ids;
+    for (uint64_t i = 1; i <= kCover; ++i) ids.push_back(ObjectId(i));
+    auto rm = RowMapping::create(tmp_ / "subset.rmap", ids);
+
+    auto config = make_config("subset");
+    auto storage = SampleStorage::create(tmp_, config, rm, kNodes + 1);
+    storage.begin_sharded_write(4);
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto& s = samples[i];
+        std::ostringstream buf(std::ios::binary);
+        s.serialize(buf);
+        storage.shard_write(static_cast<uint32_t>(i % 4), s,
+                            buf.str(), compute_batch_content_hash(s));
+    }
+    storage.merge_shards();
+
+    EXPECT_GT(expanded, kCover);  // the samples really do exceed the mapping
+    EXPECT_EQ(storage.get_catalog().unique_nodes, expanded);
 }
 
 }  // namespace
