@@ -43,6 +43,7 @@ TEST(FourLevelTopologySym, SymTierDefaultsOff) {
 // node-id key otherwise; out(u) first, then in(u) survivors.
 // ---------------------------------------------------------------------------
 using mdb::gnn::detail::symmetric_merge_row;
+using mdb::gnn::detail::resolve_symmetric_dst_tag;
 
 // Distinct edge_ids -> out ++ in with NO node-id dedup (parallel/mutual edges
 // are PRESERVED, byte-identical to the accessor + the design correction).
@@ -133,4 +134,16 @@ TEST(FourLevelTopologySym, DropEdgeIds_ZerosEdgeIds_KeepsDstSet) {
 
     // keep: edge-id key -> no node dedup (1,2,2,3).
     ASSERT_EQ(4u, kept.size());
+}
+
+// The symmetric snapshot persists dst_type_tag==0 (the bake feeds the writer
+// tag-stripped values). The store must recover the real node type tag from a
+// directional reader, else the GPU sampler reconstructs neighbor ObjectIds
+// WITHOUT the tag and they miss the (tagged) feature RowMapping -> zero-filled.
+TEST(FourLevelTopologySym, ResolveDstTag_FallsBackToDirectionalWhenSymZero) {
+    EXPECT_EQ(0xD4u, resolve_symmetric_dst_tag(0x00, 0xD4, 0xD4));  // sym lost it -> fwd
+    EXPECT_EQ(0xD4u, resolve_symmetric_dst_tag(0x00, 0x00, 0xD4));  // -> rev
+    EXPECT_EQ(0xD4u, resolve_symmetric_dst_tag(0xD4, 0x00, 0x00));  // sym present is kept
+    EXPECT_EQ(0xABu, resolve_symmetric_dst_tag(0xAB, 0xD4, 0xD4));  // any non-zero sym wins
+    EXPECT_EQ(0x00u, resolve_symmetric_dst_tag(0x00, 0x00, 0x00));  // nothing to recover
 }

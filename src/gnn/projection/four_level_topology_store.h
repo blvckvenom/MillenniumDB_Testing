@@ -45,6 +45,13 @@ void symmetric_merge_row(const std::vector<uint64_t>& dst_fwd,
                          const std::vector<uint64_t>& eid_rev,
                          bool has_edge_ids,
                          std::vector<AdjEntry>& out);
+
+// Pick the dst type tag to re-apply to the symmetric slice's tag-stripped
+// neighbor ids. The symmetric bake persists dst_type_tag==0 (it feeds the
+// writer tag-stripped values), so prefer the slice's own tag but fall back to a
+// directional reader's tag (which captured the real node type tag, e.g. 0xD4).
+// Returns the first non-zero of (sym, fwd, rev), or 0 if all are unset.
+uint8_t resolve_symmetric_dst_tag(uint8_t sym_tag, uint8_t fwd_tag, uint8_t rev_tag);
 }  // namespace detail
 
 // Merge two narrow uint32 directional CSRs into one undirected CSR (the in-RAM
@@ -740,6 +747,11 @@ private:
     const L2CompactCsr*                                l2_rev_ = nullptr;
     const GQL::Projection::TopologySnapshotReader*     l3_fwd_ = nullptr;
     const GQL::Projection::TopologySnapshotReader*     l3_rev_ = nullptr;
+    // The directional dst type tag (e.g. 0xD4), captured before the directional
+    // readers are freed. The symmetric slice's own header persists tag 0, so
+    // materialize_symmetric_arrays re-applies this captured tag — without it the
+    // GPU sampler emits tag-less neighbor ObjectIds that miss the feature map.
+    uint8_t                                            directional_dst_tag_ = 0;
     L4Lookup                                           l4_fwd_;
     L4Lookup                                           l4_rev_;
     // Active symmetric tier references (owned-or-borrowed). Null until an

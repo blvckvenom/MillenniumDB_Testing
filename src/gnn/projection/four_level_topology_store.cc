@@ -348,8 +348,11 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
             sym_arrays_.col_idx      = l3_sym_->col_idx32_base();  // mmap window src
             sym_arrays_.n_rows       = nn;
             sym_arrays_.n_edges      = mm;
-            sym_arrays_.dst_type_tag =
-                static_cast<uint64_t>(l3_sym_->dst_type_tag()) << 56;
+            sym_arrays_.dst_type_tag = static_cast<uint64_t>(
+                detail::resolve_symmetric_dst_tag(
+                    l3_sym_->dst_type_tag(),
+                    l3_fwd_ ? l3_fwd_->dst_type_tag() : directional_dst_tag_,
+                    l3_rev_ ? l3_rev_->dst_type_tag() : 0)) << 56;
             sym_slice_is_mmap_ = false;  // ROW_PTR is heap; COL_IDX stays mmap
             sym_arrays_built_  = true;
 
@@ -405,8 +408,11 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
         sym_arrays_.col_idx      = sym_col_idx_.data();
         sym_arrays_.n_rows       = n;
         sym_arrays_.n_edges      = m;
-        sym_arrays_.dst_type_tag =
-            static_cast<uint64_t>(l3_sym_->dst_type_tag()) << 56;
+        sym_arrays_.dst_type_tag = static_cast<uint64_t>(
+            detail::resolve_symmetric_dst_tag(
+                l3_sym_->dst_type_tag(),
+                l3_fwd_ ? l3_fwd_->dst_type_tag() : directional_dst_tag_,
+                l3_rev_ ? l3_rev_->dst_type_tag() : 0)) << 56;
         sym_slice_is_mmap_ = false;  // heap-backed copy (mmap is not pinnable)
         sym_arrays_built_  = true;
         return &sym_arrays_;
@@ -544,6 +550,13 @@ std::size_t FourLevelTopologyStore::release_directional_tiers_() {
     // borrowed (owned_l3_* are null) so reset is a no-op and the caller keeps
     // ownership. Always null the borrowed aliases so a stray directional
     // dispatch faults loudly instead of dereferencing freed memory.
+    // Capture the directional dst type tag first: the symmetric slice's header
+    // persists tag 0, so materialize re-applies this captured tag. Must read it
+    // BEFORE owned_l3_*.reset() frees the readers the aliases point at.
+    if (directional_dst_tag_ == 0) {
+        if (l3_fwd_ != nullptr) directional_dst_tag_ = l3_fwd_->dst_type_tag();
+        else if (l3_rev_ != nullptr) directional_dst_tag_ = l3_rev_->dst_type_tag();
+    }
     owned_l1_fwd_.reset();
     owned_l1_rev_.reset();
     owned_l2_fwd_.reset();
@@ -877,6 +890,14 @@ void symmetric_merge_row(const std::vector<uint64_t>& dst_fwd,
         const uint64_t key = has_edge_ids ? eid : dst_rev[i];
         if (seen.insert(key).second) out.push_back(AdjEntry{ dst_rev[i], eid });
     }
+}
+
+uint8_t resolve_symmetric_dst_tag(uint8_t sym_tag, uint8_t fwd_tag, uint8_t rev_tag) {
+    // Prefer the slice's own tag; the symmetric bake persists 0, so fall back to
+    // a directional reader's tag (it captured the real node type tag).
+    if (sym_tag != 0) return sym_tag;
+    if (fwd_tag != 0) return fwd_tag;
+    return rev_tag;
 }
 }  // namespace detail
 
