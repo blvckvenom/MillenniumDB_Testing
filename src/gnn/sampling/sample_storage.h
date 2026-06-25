@@ -51,6 +51,11 @@ class RowMapping;
  * count=N (uint64), then N consecutive uint64 frequency values indexed
  * by RowMapping row_index. Requires a RowMapping for interpretation.
  *
+ * The sparse (v1) and dense (v2) layouts are written by the sparse and dense
+ * storage modes respectively and are NOT byte-identical to each other, but
+ * get_dense_frequencies() normalizes both to the same row-indexed vector for
+ * the cache-tier consumer.
+ *
  * ## Usage
  *
  * @code
@@ -200,8 +205,8 @@ public:
      * (no shared offset, no lock) via shard_write(w, ...); the only shared
      * write-state is an internal atomic dense frequency array. merge_shards()
      * then concatenates the shards in ascending batch_id order into the final
-     * batches.dat — BYTE-IDENTICAL to the single-writer path — and rebuilds the
-     * index / frequency / catalog.
+     * batches.dat — BYTE-IDENTICAL to the dense single-writer path — and
+     * rebuilds the index / frequency.dat / catalog statistics to match it.
      *
      * Requires the dense (RowMapping) create() path. @throws if not in write
      * mode or no RowMapping.
@@ -228,7 +233,7 @@ public:
      * Replaces finalize() for the sharded path: concatenates shard payloads in
      * ascending batch_id order, rebuilds batches.idx / frequency.dat / catalog,
      * and deletes the temp shard files. The result is byte-identical to a
-     * single-writer finalize().
+     * dense single-writer finalize().
      */
     void merge_shards();
 

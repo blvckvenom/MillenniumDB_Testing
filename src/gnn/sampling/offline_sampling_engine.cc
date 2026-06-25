@@ -197,9 +197,12 @@ struct OfflineSamplingEngine::Impl {
             // merged in batch_id order at the end — removing the single write
             // mutex that dominates the parallel sample loop (inlock/wall ~0.96).
             // It requires the dense (RowMapping) path + parallel workers; the
-            // final batches.dat/.idx/frequency.dat/catalog are byte-identical to
-            // the single-writer path. Falls back to the legacy sparse single
-            // writer otherwise (default OFF).
+            // final batches.dat/.idx/frequency.dat are byte-identical to the
+            // DENSE single-writer path and the catalog statistics match (the
+            // catalog.dat file itself carries a write timestamp). Falls back to
+            // the legacy sparse single writer otherwise (default OFF); that mode
+            // writes a v1 frequency.dat — a different on-disk layout than the
+            // dense v2, but one the frequency consumer normalizes identically.
             const bool want_shard_write = [&]() {
                 const char* e = std::getenv("MDB_GNN_SHARD_WRITE");
                 return e != nullptr && std::string(e) == "1"

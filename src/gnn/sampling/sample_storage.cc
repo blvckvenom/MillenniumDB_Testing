@@ -213,8 +213,9 @@ struct SampleStorage::Impl {
     // (no shared offset, no lock) and records a per-batch entry. The only shared
     // state is `shard_freq_` (an atomic dense frequency array). merge_shards()
     // then concatenates the shards in ascending batch_id order into the final
-    // batches.dat — byte-identical to the single-writer path — and rebuilds the
-    // index / frequency / catalog. Requires the dense (RowMapping) path.
+    // batches.dat — byte-identical to the dense single-writer path — and
+    // rebuilds the index / frequency.dat / catalog statistics to match it.
+    // Requires the dense (RowMapping) path.
     struct ShardEntry {
         uint64_t batch_id;
         uint8_t  split;
@@ -445,8 +446,8 @@ struct SampleStorage::Impl {
     }
 
     // Merge all shards into the final batches.dat/.idx/frequency.dat/catalog,
-    // concatenating in ASCENDING batch_id order — byte-identical to the single-
-    // writer path. Per-shard entries are already ascending (next_idx is monotone)
+    // concatenating in ASCENDING batch_id order — byte-identical to the dense
+    // single-writer path. Per-shard entries are already ascending (next_idx is monotone)
     // so the K-way merge reads each shard near-sequentially.
     void merge_shards_impl() {
         if (!sharded_) {
