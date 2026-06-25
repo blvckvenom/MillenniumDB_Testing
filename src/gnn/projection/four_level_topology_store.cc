@@ -938,10 +938,15 @@ void FourLevelTopologyStore::populate_direction_symmetric_(
     } seq_guard_(l3_fwd, l3_rev);
 
     const uint64_t num_nodes = std::max(l3_fwd.num_nodes(), l3_rev.num_nodes());
-    // Matches the accessor's per-node rule: has_edge_ids when EITHER direction
-    // carries real edge_ids (the directional sidecars are built together, so in
-    // practice both have or both lack them).
-    const bool has_eids = l3_fwd.has_edge_ids() || l3_rev.has_edge_ids();
+    // Matches the accessor/bake rule: PRESERVE duplicate neighbors only on a
+    // genuine multigraph (parallel edges), NOT merely because edge_ids exist —
+    // a simple graph node-id dedups its mutual edges even with real edge_ids.
+    // When the from_to B+Tree is available we test it directly; otherwise we
+    // conservatively fall back to the directional readers' has_edge_ids flag.
+    const bool multigraph_preserve =
+        fwd_bpt_ != nullptr
+            ? GQL::Projection::detect_parallel_edges(fwd_bpt_, num_nodes)
+            : (l3_fwd.has_edge_ids() || l3_rev.has_edge_ids());
 
     std::vector<uint64_t> df, ef, dr, er;
     std::vector<AdjEntry> merged;
@@ -979,7 +984,7 @@ void FourLevelTopologyStore::populate_direction_symmetric_(
         // the irreducible papers100M variance, and accuracy-neutral. cora is
         // all-L1 so ON==OFF stays bit-identical (0.8574939) there.
         // useSymmetricTopology:'off' gives the exact legacy behavior.
-        const bool effective_has_eids = has_eids && !config_.drop_edge_ids;
+        const bool effective_has_eids = multigraph_preserve && !config_.drop_edge_ids;
         detail::symmetric_merge_row(df, ef, dr, er, effective_has_eids, merged);
         if (config_.drop_edge_ids) {
             for (auto& e : merged) e.edge_id = 0;

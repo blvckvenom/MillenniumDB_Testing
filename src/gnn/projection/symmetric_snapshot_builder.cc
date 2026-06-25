@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "gnn/projection/edge_orientation.h"
@@ -37,13 +38,72 @@ uint64_t build_symmetric_concat_parallel_(
     const fs::path&                                proj_dir,
     uint64_t                                       N,
     GQL::Projection::TopologySnapshotReader&       rf,
-    GQL::Projection::TopologySnapshotReader&       rr) {
+    GQL::Projection::TopologySnapshotReader&       rr,
+    bool                                           dedup_by_node) {
     using GQL::Projection::TopologySnapshotWriter;
 
-    // Degrees in O(N): concat degree = out_deg + in_deg (no dedup). degree() is
-    // an O(1) ROW_PTR subtraction.
+    // Per-row undirected merge out(u) ++ in(u). On a SIMPLE graph
+    // (dedup_by_node) a u<->v mutual pair is ONE undirected neighbor, so dedup
+    // by node id; on a multigraph keep every entry (pure concat) so real
+    // parallel edges survive. The dedup set is per-row (O(degree)), so the bake
+    // stays out-of-core and parallel across disjoint node ranges.
+    auto merge_row = [dedup_by_node](const uint32_t* f, uint64_t fd,
+                                     const uint32_t* r, uint64_t rd,
+                                     std::vector<uint64_t>& dst,
+                                     std::unordered_set<uint32_t>& seen) {
+        if (!dedup_by_node) {
+            for (uint64_t i = 0; i < fd; ++i) dst.push_back(f[i]);
+            for (uint64_t i = 0; i < rd; ++i) dst.push_back(r[i]);
+            return;
+        }
+        seen.clear();
+        for (uint64_t i = 0; i < fd; ++i) if (seen.insert(f[i]).second) dst.push_back(f[i]);
+        for (uint64_t i = 0; i < rd; ++i) if (seen.insert(r[i]).second) dst.push_back(r[i]);
+    };
+
+    // PASS 1 — row_ptr degrees. Concat degree is an O(1) ROW_PTR subtraction;
+    // the dedup degree is the realized per-row merge length, computed in
+    // parallel across disjoint ranges (each writes disjoint degrees[] slots).
     std::vector<uint64_t> degrees(static_cast<std::size_t>(N));
-    for (uint64_t u = 0; u < N; ++u) degrees[u] = rf.degree(u) + rr.degree(u);
+    if (!dedup_by_node) {
+        for (uint64_t u = 0; u < N; ++u) degrees[u] = rf.degree(u) + rr.degree(u);
+    } else {
+        std::atomic<bool> failed1{false};
+        std::string err1;
+        std::mutex err1_mu;
+        auto counter = [&](uint64_t lo, uint64_t hi) {
+            try {
+                std::vector<uint64_t> dst;
+                std::unordered_set<uint32_t> seen;
+                for (uint64_t u = lo; u < hi; ++u) {
+                    dst.clear();
+                    merge_row(rf.col_idx32_row(u), rf.degree(u),
+                              rr.col_idx32_row(u), rr.degree(u), dst, seen);
+                    degrees[u] = dst.size();
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(err1_mu);
+                if (err1.empty()) err1 = e.what();
+                failed1.store(true);
+            }
+        };
+        unsigned W1 = std::max(1u, std::thread::hardware_concurrency());
+        if (N < static_cast<uint64_t>(W1) * 4096ULL)
+            W1 = std::max(1u, static_cast<unsigned>(std::max<uint64_t>(1, N / 4096ULL)));
+        std::vector<std::thread> pool1;
+        pool1.reserve(W1);
+        const uint64_t per1 = (N + W1 - 1) / W1;
+        for (unsigned w = 0; w < W1; ++w) {
+            const uint64_t lo = std::min<uint64_t>(N, static_cast<uint64_t>(w) * per1);
+            const uint64_t hi = std::min<uint64_t>(N, lo + per1);
+            if (lo >= hi) break;
+            pool1.emplace_back(counter, lo, hi);
+        }
+        for (auto& t : pool1) t.join();
+        if (failed1.load())
+            throw std::runtime_error(
+                "build_symmetric_snapshot(dedup degree pass): " + err1);
+    }
 
     TopologySnapshotWriter writer(
         proj_dir,
@@ -79,6 +139,7 @@ uint64_t build_symmetric_concat_parallel_(
             static const std::vector<uint64_t> kNoEids;
             constexpr uint64_t kChunkRows = 1ULL << 20;  // 1M rows per flush
             std::vector<uint64_t> dst;
+            std::unordered_set<uint32_t> seen;
             for (uint64_t cs = lo; cs < hi; cs += kChunkRows) {
                 const uint64_t ce = std::min<uint64_t>(hi, cs + kChunkRows);
                 std::size_t cap = 0;
@@ -86,12 +147,8 @@ uint64_t build_symmetric_concat_parallel_(
                 dst.clear();
                 dst.reserve(cap);
                 for (uint64_t u = cs; u < ce; ++u) {
-                    const uint32_t* f = rf.col_idx32_row(u);
-                    const uint64_t  fd = rf.degree(u);
-                    for (uint64_t i = 0; i < fd; ++i) dst.push_back(f[i]);
-                    const uint32_t* r = rr.col_idx32_row(u);
-                    const uint64_t  rd = rr.degree(u);
-                    for (uint64_t i = 0; i < rd; ++i) dst.push_back(r[i]);
+                    merge_row(rf.col_idx32_row(u), rf.degree(u),
+                              rr.col_idx32_row(u), rr.degree(u), dst, seen);
                 }
                 writer.append_subrange(cs, ce, dst, kNoEids);
             }
@@ -153,7 +210,12 @@ uint64_t build_symmetric_snapshot(GQL::ProjectionStorage& storage,
             && rf.num_nodes() == N && rr.num_nodes() == N
             && (rf.has_edge_ids() || rr.has_edge_ids());
         if (fast) {
-            return build_symmetric_concat_parallel_(proj_dir, N, rf, rr);
+            // PRESERVE duplicate (parallel) neighbors ONLY on a genuine
+            // multigraph; a simple graph node-id dedups its mutual edges.
+            const bool is_multigraph = GQL::Projection::detect_parallel_edges(
+                storage.get_from_to_edge_index(), N);
+            return build_symmetric_concat_parallel_(
+                proj_dir, N, rf, rr, /*dedup_by_node=*/!is_multigraph);
         }
     }
 
@@ -172,16 +234,17 @@ uint64_t build_symmetric_snapshot(GQL::ProjectionStorage& storage,
         for (auto& x : in_n.node_ids)  in_dst.push_back(x.id);
         for (auto& x : in_n.edge_ids)  in_eid.push_back(x.id);
     };
-    auto has_eids = [&]() {
-        return (!out_eid.empty() && out_eid.front() != 0)
-            || (!in_eid.empty()  && in_eid.front()  != 0);
-    };
+    // PRESERVE parallel edges only on a true multigraph; a simple graph
+    // (even with real edge_ids) node-id dedups its mutual edges. Computed once
+    // over the from_to B+Tree.
+    const bool is_multigraph = GQL::Projection::detect_parallel_edges(
+        storage.get_from_to_edge_index(), N);
 
     std::vector<uint64_t> degrees(N, 0);
     for (uint64_t u = 0; u < N; ++u) {
         fetch(u);
         degrees[u] = GQL::Projection::merge_symmetric_row(
-            out_dst, out_eid, in_dst, in_eid, has_eids(), m_dst, m_eid);
+            out_dst, out_eid, in_dst, in_eid, is_multigraph, m_dst, m_eid);
     }
 
     TopologySnapshotWriter writer(
@@ -196,7 +259,7 @@ uint64_t build_symmetric_snapshot(GQL::ProjectionStorage& storage,
     for (uint64_t u = 0; u < N; ++u) {
         fetch(u);
         GQL::Projection::merge_symmetric_row(
-            out_dst, out_eid, in_dst, in_eid, has_eids(), m_dst, m_eid);
+            out_dst, out_eid, in_dst, in_eid, is_multigraph, m_dst, m_eid);
         for (uint64_t d : m_dst) {
             writer.append_edge(ObjectId{u},
                                ObjectId{d & ObjectId::VALUE_MASK}, ObjectId{});

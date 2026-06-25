@@ -10,6 +10,7 @@
 #include "gnn/projection/four_level_topology_store.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
+#include "graph_models/gql/projection/topology_symmetric_merge.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
 #include "gnn/core/cuda_context.h"
@@ -64,6 +65,21 @@ struct TopologyAccessor::Impl {
     // existing dispatch path (in-memory adjacency cache, topology CSR sidecar
     // mmap, B+Tree direct) is preserved byte-for-byte for backwards-compat.
     std::unique_ptr<FourLevelTopologyStore> four_level_store_;
+
+    // Lazily computed + cached: does the projection contain genuine PARALLEL
+    // edges (>=2 distinct edges on the same (src,dst))? This — not the mere
+    // presence of edge_ids — is the correct predicate for whether the UNDIRECTED
+    // merge must PRESERVE duplicate neighbors. A simple graph node-id dedups its
+    // mutual edges even when its edges carry real edge_ids; only a true
+    // multigraph keeps parallel edges. Scans the from_to B+Tree once.
+    mutable std::optional<bool> is_multigraph_cache_;
+    bool is_multigraph() const {
+        if (!is_multigraph_cache_.has_value()) {
+            is_multigraph_cache_ = GQL::Projection::detect_parallel_edges(
+                storage.get_from_to_edge_index(), storage.get_node_count());
+        }
+        return *is_multigraph_cache_;
+    }
 
     explicit Impl(GQL::ProjectionStorage& storage_)
         : storage(storage_),
@@ -571,33 +587,19 @@ void TopologyAccessor::get_neighbors_into(ObjectId node_id,
 
             // Deduplicate to merge results from both out- and in- index lookups.
             //
-            // Historically we deduplicated by EDGE ID. That works for BTREE
-            // storage where each edge has a unique id, but breaks under
-            // CSR-hybrid storage (where edge-index B+Tree leaves ARE the CSR
-            // layout) because the v3 leaf format omits edge_id (edge_id = 0
-            // for every tuple). An all-zero dedup key collapses
-            // ALL neighbors of the node to a single element, which in turn
-            // makes Phase B k-hop sampling degenerate (layer-1 node count
-            // always = 1) and drags chunk-level wall-clock time into the
-            // O(N^2) regime for large projections (empirically observed on
-            // arxiv: chunk N took ~6*N seconds before this fix).
-            //
-            // The robust fix is to detect whether edge_ids are meaningful
-            // and fall back to NEIGHBOR NODE ID dedup otherwise. We sample
-            // the first tuple from each side — if either side reports a
-            // non-zero edge_id we trust the edge_id dedup key; otherwise
-            // we use the neighbor node id, which is the natural dedup key
-            // under simple graphs (no parallel edges), which covers every
-            // citation / co-purchase / knowledge-graph workload we currently
-            // target. Keep the result's parallel `edge_ids` array in sync
-            // so downstream consumers (GraphSample edge_ids) still receive
-            // zero-sentinels consistent with the storage's view of the edge
-            // space rather than synthesized values.
-            const bool has_edge_ids =
-                (!out_neighbors.edge_ids.empty()
-                     && out_neighbors.edge_ids.front().id != 0)
-                || (!in_neighbors.edge_ids.empty()
-                     && in_neighbors.edge_ids.front().id != 0);
+            // The dedup key is the neighbor NODE ID, EXCEPT on a genuine
+            // multigraph (>=2 distinct edges on the same (src,dst)), where it is
+            // the edge_id so real parallel edges are preserved. Keying on the
+            // mere PRESENCE of edge_ids was wrong: a simple graph (citations,
+            // co-purchase, knowledge graphs) carries real distinct edge_ids yet
+            // has no parallel edges, so a u<->v mutual pair must collapse to ONE
+            // undirected neighbor instead of being double-counted. The cached
+            // detect_parallel_edges is the correct predicate; on an all-zero
+            // edge_id CSR-hybrid graph it reports false, so the node-id key also
+            // avoids the historical all-zero-key collapse-to-one degeneracy. The
+            // result keeps its parallel `edge_ids` array in sync (zero-sentinels)
+            // for downstream GraphSample consumers.
+            const bool preserve_parallel = impl_->is_multigraph();
 
             // Merge into the caller's `out` buffer (capacity retained across
             // calls). Cleared here; same dedup order as before.
@@ -615,7 +617,7 @@ void TopologyAccessor::get_neighbors_into(ObjectId node_id,
             out.edge_ids.reserve(total);
 
             for (size_t i = 0; i < out_neighbors.node_ids.size(); ++i) {
-                const uint64_t key = has_edge_ids
+                const uint64_t key = preserve_parallel
                     ? out_neighbors.edge_ids[i].id
                     : out_neighbors.node_ids[i].id;
                 if (seen_arena.insert(key).second) {
@@ -625,7 +627,7 @@ void TopologyAccessor::get_neighbors_into(ObjectId node_id,
             }
 
             for (size_t i = 0; i < in_neighbors.node_ids.size(); ++i) {
-                const uint64_t key = has_edge_ids
+                const uint64_t key = preserve_parallel
                     ? in_neighbors.edge_ids[i].id
                     : in_neighbors.node_ids[i].id;
                 if (seen_arena.insert(key).second) {
