@@ -304,6 +304,26 @@ struct OfflineSamplingEngine::Impl {
                         storage.get_projection_dir());
                     if (sym.has_data() && sym.id_width() == 4) {
                         sym_dims = DirCsrDims{sym.num_nodes(), sym.num_edges(), true};
+                    } else {
+                        // The narrow topology_sym.csr is not baked yet — the common
+                        // case on a default (wide uint64) projection and on any cold
+                        // first run. The slice WILL be auto-baked narrow below
+                        // (build_symmetric_snapshot) BEFORE the pin, so the GPU/CPU
+                        // decision must size on what that slice WILL be rather than
+                        // fall through to CPU just because the file is absent — that
+                        // chicken-and-egg (the plan needs the slice present to pick
+                        // GPU, but the bake runs after the plan) is exactly what
+                        // pinned small graphs like cora on the CPU path. The merged
+                        // undirected slice holds at most fwd+rev = 2*directed entries
+                        // (reciprocal pairs only shrink it via dedup), so 2*edge_count
+                        // is a safe UPPER bound for VRAM sizing: the real baked slice
+                        // is <= this, hence "fits VRAM" here implies it still fits
+                        // after the bake. node/edge counts are O(1) catalog reads.
+                        const std::uint64_t n = topo.get_node_count();
+                        const std::uint64_t e = topo.get_edge_count();
+                        if (n > 0) {
+                            sym_dims = DirCsrDims{n, 2ull * e, true};
+                        }
                     }
                 }
                 SamplingBackendPlan plan = sym_dims.present
