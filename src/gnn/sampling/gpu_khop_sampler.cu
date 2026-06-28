@@ -411,7 +411,16 @@ GraphSample sample_khop_gpu(const std::vector<ObjectId>& seeds, uint64_t batch_i
     CsrRange a{va->d_row_ptr, va->d_col_idx, static_cast<uint32_t>(va->n_rows)};
     CsrRange b{vb ? vb->d_row_ptr : nullptr, vb ? vb->d_col_idx : nullptr,
                vb ? static_cast<uint32_t>(vb->n_rows) : 0u};
-    const uint64_t dst_tag = va->dst_type_tag;  // tag<<56, re-OR'd onto dense ids
+    uint64_t dst_tag = va->dst_type_tag;  // tag<<56, re-OR'd onto dense ids
+    // The symmetric slice persists tag 0, and a directional reader carries a
+    // non-zero tag only when NARROW (id_width==4). On a default (wide) projection
+    // the view tag is 0, so the kernel would emit tag-less neighbor ObjectIds that
+    // miss the (tagged) feature row map -> silent zero-fill. Recover the real node
+    // type tag from a seed ObjectId (seeds carry their real tag) so every expanded
+    // neighbor resolves on ANY projection (wide or narrow). get_type() = id & TYPE_MASK.
+    if (dst_tag == 0 && !seeds.empty()) {
+        dst_tag = seeds.front().get_type();
+    }
 
     // Tiled view: COL_IDX is not resident whole — it is streamed per node-aligned
     // window. The CSR is fixed across layers, so compute the windows once here.
