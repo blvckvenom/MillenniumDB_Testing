@@ -71,9 +71,13 @@ struct SamplingBackendConfig {
     double   ram_headroom_factor    = 0.60;
     // Piso de capacidad de computo CUDA (Volta+, el piso de mdb_gnn_core).
     int      min_compute_capability = 70;
-    // Bajo este nº de aristas la vía CPU es sub-segundo; el pin/copy PCIe
-    // dominaria. Espeja PlannerConfig.min_records_gpu del ordenamiento.
-    std::uint64_t min_edges_for_gpu = 2'000'000;
+    // GPU es el backend de muestreo POR DEFECTO siempre que haya GPU capaz y el CSR
+    // quepa en VRAM (cualquier tamaño de grafo), con fallback automático a CPU. Antes
+    // este piso era 2'000'000 (la vía CPU es sub-segundo en grafos chicos y el pin/copy
+    // PCIe dominaba); bajado a 1 para que grafos chicos (p.ej. cora) tomen el camino
+    // GPU device-resident por defecto. Las compuertas de compute-capability y de VRAM
+    // (+ el fallback CPU) protegen la correctitud.
+    std::uint64_t min_edges_for_gpu = 1;
     // Permitir, en UNDIRECTED, acelerar en GPU solo la direccion que cabe.
     bool     allow_single_direction = true;
     // Reserva absoluta de VRAM (contexto CUDA + buffers de scratch por batch) que
