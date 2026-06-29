@@ -270,6 +270,12 @@ fs::path addr_table_filename(const fs::path& addr_tables_dir, uint64_t batch_id)
 uint64_t build_packed_full_(SampleStorage& samples, const FeatureMatrix& fm,
                             const RowMapping& rmap, const fs::path& sample_dir,
                             uint64_t store_fp, uint64_t total_batches) {
+    // DEPRECATED AND REMOVED: the packed-full pack stores every batch's full
+    // receptive field with no cross-batch dedup (~18x the feature matrix on
+    // papers100M) and is infeasible. Hard-refuse any programmatic caller; the
+    // supported path is the four-level (deduplicated) feature store.
+    throw std::runtime_error(
+        "packed-full feature store is deprecated and removed; use the four-level store.");
     const uint64_t D         = fm.num_cols();
     const uint64_t row_bytes = fm.row_bytes();
 

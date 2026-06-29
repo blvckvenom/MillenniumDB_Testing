@@ -103,6 +103,9 @@ void BatchAssembler::init_blocks_() {
 // =============================================================================
 
 void BatchAssembler::apply_block_mode_(bool no_blocks, bool no_self_contained, bool no_packed_full) {
+    // The packed-full feature store is deprecated and removed: never consume it,
+    // even if a stale packed_full/ directory exists on disk from an older build.
+    no_packed_full = true;
     std::error_code ec;
     blocks_dir_ = samples_.get_path() / "blocks";
     // Detected here; consumed only when also !nested_aggregation_ at use time.

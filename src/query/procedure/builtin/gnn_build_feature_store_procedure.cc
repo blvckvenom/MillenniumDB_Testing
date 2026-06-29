@@ -187,10 +187,17 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
         // reused store requires buildAddrTables (the default) to be on; with
         // buildAddrTables:false + reuse, pass force to bake.
         if (auto v = opts.get_bool("bakeBlocks")) config.bake_blocks = *v;
-        // Packed-full feature pack (additive). Writes ONLY packed_full/;
-        // never builds/deletes the 4-tier or blocks/. Requires store.meta +
-        // blocks/ from a prior bakeBlocks build. Default OFF.
-        if (auto v = opts.get_bool("packFullFeatures")) config.pack_full = *v;
+        // packFullFeatures is DEPRECATED AND REMOVED. The packed-full pack stores
+        // every batch's full receptive field with no cross-batch dedup (~18x the
+        // feature matrix, ~1 TB on papers100M) and is infeasible. The default
+        // four-level feature store (which dedups across batches) is the supported
+        // path. The option is hard-refused so it can never be requested.
+        if (opts.get_bool("packFullFeatures")) {
+            throw std::runtime_error(
+                "packFullFeatures is deprecated and removed: the packed-full feature "
+                "store is infeasible (~18x the feature matrix) and is no longer "
+                "supported; use the default four-level feature store.");
+        }
         // Also emit a single consolidated packed_slim/consolidated.slim file
         // during the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF.
         // The runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
