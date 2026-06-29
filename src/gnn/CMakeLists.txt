@@ -374,6 +374,16 @@ if(BUILD_TESTING)
         )
         add_test(NAME PackedFullStoreTests COMMAND test_packed_full_store)
 
+        # Offline ratio probe (tool, not a test): measures A_{L-1}/A_L from a baked sample.
+        add_executable(ratio_probe tools/ratio_probe.cc)
+        target_link_libraries(ratio_probe mdb_gnn_core ${TORCH_LIBRARIES})
+        target_compile_options(ratio_probe PRIVATE ${TORCH_CXX_FLAGS_LIST})
+        target_compile_definitions(ratio_probe PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+        set_target_properties(ratio_probe PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+
         # Sample content fingerprint tests (staleness check, isolable)
         add_executable(test_sample_fingerprint
             tests/test_sample_fingerprint.cc
