@@ -179,7 +179,10 @@ FeatureMatrix::~FeatureMatrix() {
 }
 
 const void* FeatureMatrix::data_ptr() const {
-    return static_cast<const char*>(mmap_ptr_) + FeatureMatrixHeader::SIZE;
+    // F2: data section starts at the header-recorded offset (64 for v1, 4096 for
+    // page-aligned v2), NOT a fixed sizeof(header). row()/scan()/extract_rows()
+    // all read through here so they inherit the correct offset for both versions.
+    return static_cast<const char*>(mmap_ptr_) + header_.get_data_offset();
 }
 
 // --- create() ---
@@ -211,11 +214,12 @@ FeatureMatrix FeatureMatrix::create(
     if (rb > 0 && num_rows > SIZE_MAX / rb) {
         throw std::overflow_error("FeatureMatrix::create: data size would overflow size_t");
     }
+    const uint64_t data_off = header.get_data_offset();
     size_t data_size = header.data_bytes();
-    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+    if (data_size > SIZE_MAX - data_off) {
         throw std::overflow_error("FeatureMatrix::create: total file size would overflow size_t");
     }
-    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+    size_t file_size = data_off + data_size;
 
     // Write file: header + data
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -226,6 +230,12 @@ FeatureMatrix FeatureMatrix::create(
     FdGuard guard(fd);
 
     write_all(fd, &header, sizeof(header));
+    // F2: zero-pad from the header struct end to the data offset. No-op for v1
+    // (data_off == sizeof(header) == 64); for v2 this aligns the data section.
+    if (data_off > sizeof(header)) {
+        std::vector<char> pad(static_cast<size_t>(data_off - sizeof(header)), 0);
+        write_all(fd, pad.data(), pad.size());
+    }
     write_all(fd, data, data_size);
 
     if (::fsync(fd) < 0) {
@@ -301,15 +311,18 @@ FeatureMatrix FeatureMatrix::open(const fs::path& path) {
         throw std::runtime_error(
             "FeatureMatrix::open: num_rows * row_bytes overflows: " + path.string());
     }
+    // F2: data section starts at the header-recorded offset (64 for v1, 4096 for
+    // page-aligned v2). is_valid() already guaranteed data_off >= SIZE.
+    const uint64_t data_off = header.get_data_offset();
     size_t db = header.data_bytes();
-    if (db > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+    if (db > SIZE_MAX - data_off) {
         ::munmap(ptr, file_size);
         throw std::runtime_error(
-            "FeatureMatrix::open: header_size + data_bytes overflows: " + path.string());
+            "FeatureMatrix::open: data_offset + data_bytes overflows: " + path.string());
     }
 
     // Validate file size matches header expectations
-    size_t expected_size = FeatureMatrixHeader::SIZE + db;
+    size_t expected_size = data_off + db;
     if (file_size < expected_size) {
         ::munmap(ptr, file_size);
         throw std::runtime_error(
@@ -445,12 +458,13 @@ FeatureMatrix FeatureMatrix::create_streaming(
         throw std::overflow_error(
             "FeatureMatrix::create_streaming: data size would overflow size_t");
     }
+    const uint64_t data_off = header.get_data_offset();
     size_t data_size = header.data_bytes();
-    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+    if (data_size > SIZE_MAX - data_off) {
         throw std::overflow_error(
             "FeatureMatrix::create_streaming: total file size would overflow size_t");
     }
-    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+    size_t file_size = data_off + data_size;
 
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -462,6 +476,11 @@ FeatureMatrix FeatureMatrix::create_streaming(
 
     // Write header
     write_all(fd, &header, sizeof(header));
+    // F2: zero-pad from header end to the data offset (no-op for v1).
+    if (data_off > sizeof(header)) {
+        std::vector<char> pad(static_cast<size_t>(data_off - sizeof(header)), 0);
+        write_all(fd, pad.data(), pad.size());
+    }
 
     // Write rows one at a time via callback.
     // If the writer callback throws, clean up the partially-written file.
@@ -554,12 +573,13 @@ FeatureMatrix FeatureMatrix::create_parallel(
         throw std::overflow_error(
             "FeatureMatrix::create_parallel: data size would overflow size_t");
     }
+    const uint64_t data_off = header.get_data_offset();
     size_t data_size = header.data_bytes();
-    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+    if (data_size > SIZE_MAX - data_off) {
         throw std::overflow_error(
             "FeatureMatrix::create_parallel: total file size would overflow size_t");
     }
-    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+    size_t file_size = data_off + data_size;
 
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -578,7 +598,10 @@ FeatureMatrix FeatureMatrix::create_parallel(
             ") failed: " + std::string(std::strerror(err)));
     }
 
-    // Header at offset 0. Workers only touch offsets >= FeatureMatrixHeader::SIZE.
+    // Header at offset 0; the data section begins at data_off (== sizeof(header)
+    // for v1, 4096 for page-aligned v2). The [sizeof(header), data_off) gap is
+    // left zero by reserve_file_size's fallocate/ftruncate. Workers only pwrite
+    // at offsets >= data_off.
     pwrite_all(fd, &header, sizeof(header), 0);
 
     // Cap workers at num_rows so every worker has at least 1 row.
@@ -602,8 +625,7 @@ FeatureMatrix FeatureMatrix::create_parallel(
                 std::vector<char> row_buf(rb);
                 for (uint64_t i = start; i < end; ++i) {
                     writer(i, row_buf.data(), rb);
-                    off_t off = static_cast<off_t>(FeatureMatrixHeader::SIZE +
-                                                   i * rb);
+                    off_t off = static_cast<off_t>(data_off + i * rb);
                     pwrite_all(fd, row_buf.data(), rb, off);
                 }
             } catch (...) {
@@ -710,12 +732,13 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     // the sample/feature data it was built from.
     std::memcpy(header.reserved, &fingerprint, sizeof(fingerprint));
     const size_t rb = header.row_bytes();
+    const uint64_t data_off = header.get_data_offset();
     size_t data_size = header.data_bytes();
-    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+    if (data_size > SIZE_MAX - data_off) {
         throw std::overflow_error(
             "create_reordered_external_sort: file size would overflow");
     }
-    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+    size_t file_size = data_off + data_size;
 
     // Output file: open and pre-allocate
     int out_fd = ::open(output_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -1044,7 +1067,7 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
             while (auto rb_ready_opt = pipe.pop()) {
                 auto& rb_ready = *rb_ready_opt;
                 off_t off = static_cast<off_t>(
-                    FeatureMatrixHeader::SIZE + rb_ready.chunk_start * rb);
+                    data_off + rb_ready.chunk_start * rb);
                 pwrite_all(out_fd, rb_ready.chunk_buf.data(),
                            rb_ready.actual_rows * rb, off);
                 // This chunk's output pages are now written to disk; hint the kernel
@@ -1135,7 +1158,7 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
                 uint64_t chunk_start = b * bucket_rows;
                 uint64_t chunk_actual_rows = std::min(bucket_rows, N - chunk_start);
                 off_t off = static_cast<off_t>(
-                    FeatureMatrixHeader::SIZE + chunk_start * rb);
+                    data_off + chunk_start * rb);
                 pwrite_all(out_fd, chunk_buf.data(), chunk_actual_rows * rb, off);
                 // Hint kernel that this chunk's output pages can leave the page
                 // cache. Mirrors the pipeline-branch hint to keep memory pressure
@@ -1254,12 +1277,13 @@ FeatureMatrix FeatureMatrix::create_reordered(
         throw std::overflow_error(
             "FeatureMatrix::create_reordered: data size would overflow size_t");
     }
+    const uint64_t data_off = header.get_data_offset();
     size_t data_size = header.data_bytes();
-    if (data_size > SIZE_MAX - FeatureMatrixHeader::SIZE) {
+    if (data_size > SIZE_MAX - data_off) {
         throw std::overflow_error(
             "FeatureMatrix::create_reordered: total file size would overflow size_t");
     }
-    size_t file_size = FeatureMatrixHeader::SIZE + data_size;
+    size_t file_size = data_off + data_size;
 
     int fd = ::open(output_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -1394,7 +1418,7 @@ FeatureMatrix FeatureMatrix::create_reordered(
                 while (auto rc_opt = pipe.pop()) {
                     auto& rc = *rc_opt;
                     off_t off = static_cast<off_t>(
-                        FeatureMatrixHeader::SIZE + rc.out_start * rb);
+                        data_off + rc.out_start * rb);
                     pwrite_all(fd, rc.buf.data(), rc.rows * rb, off);
                     // This chunk's output pages are now written to disk; hint the
                     // kernel that they can leave the page cache so subsequent chunks
@@ -1462,7 +1486,7 @@ FeatureMatrix FeatureMatrix::create_reordered(
                             // pwrites and avoids the 22× write amplification
                             // observed on the per-row variant.
                             off_t off = static_cast<off_t>(
-                                FeatureMatrixHeader::SIZE + out_start * rb);
+                                data_off + out_start * rb);
                             pwrite_all(fd, chunk_buf.data(), actual_rows * rb, off);
                             // Hint kernel that this chunk's output pages can leave
                             // the page cache. Mirrors the pipeline-branch hint for

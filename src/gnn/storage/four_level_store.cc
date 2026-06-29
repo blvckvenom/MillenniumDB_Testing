@@ -2048,7 +2048,12 @@ FourLevelStore::FourLevelStore(
                 FeatureMatrixHeader fmat_hdr{};
                 hdr_stream.read(reinterpret_cast<char*>(&fmat_hdr), sizeof(fmat_hdr));
                 if (hdr_stream.good() && fmat_hdr.is_valid()) {
-                    l3_header_size_ = FeatureMatrixHeader::SIZE;
+                    // F2: honor the recorded data offset (64 for v1, 4096 for a
+                    // page-aligned v2 reordered.fmat) instead of assuming SIZE.
+                    // Flows into DirectIoReader::read_rows(..., l3_header_size_)
+                    // for the O_DIRECT L3 path; the mmap fallback reads through
+                    // FeatureMatrix::row()/extract_rows() which already honor it.
+                    l3_header_size_ = fmat_hdr.get_data_offset();
                     feature_dim_    = fmat_hdr.num_cols;
                     elem_size_      = static_cast<uint8_t>(dtype_size(fmat_hdr.get_dtype()));
                 }

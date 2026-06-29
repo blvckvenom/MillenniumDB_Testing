@@ -54,6 +54,110 @@ TEST(FeatureMatrixHeaderTest, MaxValidDtypeAccepted) {
 }
 
 // ===========================================================================
+// F2: page-aligned (v2) data offset — opt-in via env MDB_FMAT_PAGE_ALIGN.
+// The header struct stays 64 bytes; only the data-section offset changes.
+// ===========================================================================
+
+namespace {
+// RAII env setter matching the local pattern used by the ext_sort tests below.
+struct FmatAlignEnvGuard {
+    std::string old; bool had;
+    explicit FmatAlignEnvGuard(const char* val) {
+        const char* o = std::getenv("MDB_FMAT_PAGE_ALIGN");
+        had = (o != nullptr); if (had) old = o;
+        ::setenv("MDB_FMAT_PAGE_ALIGN", val, 1);
+    }
+    ~FmatAlignEnvGuard() {
+        if (had) ::setenv("MDB_FMAT_PAGE_ALIGN", old.c_str(), 1);
+        else ::unsetenv("MDB_FMAT_PAGE_ALIGN");
+    }
+};
+} // namespace
+
+TEST(FeatureMatrixHeaderTest, PageAlignV2HeaderToggle) {
+    {   // OFF (default): byte-identical legacy v1 header.
+        FmatAlignEnvGuard off("0");
+        auto h = FeatureMatrixHeader::make(10, 4, GnnDtype::FLOAT32);
+        EXPECT_TRUE(h.is_valid());
+        EXPECT_EQ(h.version, FeatureMatrixHeader::VERSION);                  // 1
+        EXPECT_EQ(h.get_data_offset(), FeatureMatrixHeader::DATA_OFFSET_V1); // 64
+    }
+    {   // ON: page-aligned v2 header.
+        FmatAlignEnvGuard on("1");
+        auto h = FeatureMatrixHeader::make(10, 4, GnnDtype::FLOAT32);
+        EXPECT_TRUE(h.is_valid());
+        EXPECT_EQ(h.version, FeatureMatrixHeader::VERSION_PAGE_ALIGNED);     // 2
+        EXPECT_EQ(h.get_data_offset(), FeatureMatrixHeader::DATA_OFFSET_V2); // 4096
+    }
+    EXPECT_EQ(sizeof(FeatureMatrixHeader), 64u);  // struct size invariant across versions
+}
+
+TEST_F(FeatureMatrixTest, PageAlignV2FileRoundTrip) {
+    const uint64_t N = 7, D = 5;
+    const size_t rb = D * sizeof(float);
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) data[i] = static_cast<float>(i) + 0.25f;
+
+    // v2: data section page-aligned -> file size = 4096 + N*row_bytes.
+    auto v2_path = test_path("v2_align.fmat");
+    {
+        FmatAlignEnvGuard on("1");
+        auto fm = FeatureMatrix::create(v2_path, N, D, GnnDtype::FLOAT32, data.data());
+        EXPECT_EQ(fm.num_rows(), N);
+    }
+    EXPECT_EQ(fs::file_size(v2_path), FeatureMatrixHeader::DATA_OFFSET_V2 + N * rb);
+
+    // Reopen with NO env — the reader honors the recorded offset, not the env.
+    {
+        auto fm = FeatureMatrix::open(v2_path);
+        for (uint64_t i = 0; i < N; ++i) {
+            const float* row = fm.row_as<float>(i);
+            for (uint64_t j = 0; j < D; ++j) EXPECT_FLOAT_EQ(row[j], data[i * D + j]);
+        }
+    }
+
+    // v1 (default) coexists: data at offset 64, reads identically.
+    auto v1_path = test_path("v1_legacy.fmat");
+    {
+        FmatAlignEnvGuard off("0");
+        FeatureMatrix::create(v1_path, N, D, GnnDtype::FLOAT32, data.data());
+    }
+    EXPECT_EQ(fs::file_size(v1_path), FeatureMatrixHeader::DATA_OFFSET_V1 + N * rb);
+    {
+        auto fm = FeatureMatrix::open(v1_path);
+        for (uint64_t i = 0; i < N; ++i) {
+            const float* row = fm.row_as<float>(i);
+            for (uint64_t j = 0; j < D; ++j) EXPECT_FLOAT_EQ(row[j], data[i * D + j]);
+        }
+    }
+}
+
+TEST_F(FeatureMatrixTest, PageAlignV2ReorderRoundTrip) {
+    const uint64_t N = 6, D = 3;
+    const size_t rb = D * sizeof(float);
+    std::vector<float> data(N * D);
+    for (uint64_t i = 0; i < N * D; ++i) data[i] = static_cast<float>(i);
+    std::vector<uint64_t> perm = {5, 4, 3, 2, 1, 0};
+
+    auto dst_path = test_path("v2_reorder_dst.fmat");
+    {
+        FmatAlignEnvGuard on("1");
+        auto src = FeatureMatrix::create(
+            test_path("v2_reorder_src.fmat"), N, D, GnnDtype::FLOAT32, data.data());
+        auto dst = FeatureMatrix::create_reordered(src, perm, dst_path);
+        EXPECT_EQ(dst.num_rows(), N);
+    }
+    // The reordered L3 file is also page-aligned v2, and rows are permuted.
+    EXPECT_EQ(fs::file_size(dst_path), FeatureMatrixHeader::DATA_OFFSET_V2 + N * rb);
+    auto reopened = FeatureMatrix::open(dst_path);
+    for (uint64_t i = 0; i < N; ++i) {
+        const float* row = reopened.row_as<float>(i);
+        const uint64_t s = perm[i];
+        for (uint64_t j = 0; j < D; ++j) EXPECT_FLOAT_EQ(row[j], data[s * D + j]);
+    }
+}
+
+// ===========================================================================
 // Parameterized Dtype Tests
 // ===========================================================================
 
