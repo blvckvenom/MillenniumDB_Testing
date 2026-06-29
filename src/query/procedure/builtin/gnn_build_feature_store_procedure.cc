@@ -17,6 +17,7 @@
 #include "gpu/gpu_device.h"
 #include "graph_models/gql/gql_model.h"
 #include "query/procedure/builtin/gnn_procedure_utils.h"
+#include "query/procedure/builtin/gnn_feature_store_config.h"
 
 namespace fs = std::filesystem;
 
@@ -123,162 +124,16 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     validate_safe_name(feature_name, "featureName");
 
     // =========================================================================
-    // Step 2: Parse options
+    // Step 2: Parse options (shared parser; single source of truth with the
+    // unified gnn_offline_sample(buildFeatureStore) path)
     // =========================================================================
     FourLevelStore::Config config;
-
-    // Dynamic per-hardware budgets: track whether the caller passed explicit
-    // budgets. When MDB_GNN_AUTO_RESOURCES=1 (default OFF) and a budget is NOT
-    // explicit, it is derived from the detected machine below. Explicit always wins.
-    bool gpu_budget_explicit = false;
-    bool cpu_budget_explicit = false;
-
     if (ctx.arguments.size() == 3) {
-        DictOptions opts(ctx.get_argument(2));
         assert_known_option_keys(ctx.get_argument(2));
-
-        auto get_int_opt = [&](const char* key, const char* alias) {
-            auto v = opts.get_int(key);
-            return v ? v : opts.get_int(alias);
-        };
-        auto get_bool_opt = [&](const char* key, const char* alias) {
-            auto v = opts.get_bool(key);
-            return v ? v : opts.get_bool(alias);
-        };
-
-        if (auto v = get_int_opt("gpu_budget_mb", "gpuBudgetMb")) {
-            if (*v < 0) throw std::runtime_error("gpu_budget_mb must be non-negative, got: " + std::to_string(*v));
-            config.gpu.budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
-            gpu_budget_explicit = true;
-        }
-        if (auto v = get_int_opt("cpu_budget_mb", "cpuBudgetMb")) {
-            if (*v <= 0) throw std::runtime_error("cpu_budget_mb must be positive, got: " + std::to_string(*v));
-            config.cpu.budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
-            cpu_budget_explicit = true;
-        }
-        if (auto v = opts.get_bool("reorder")) {
-            config.reorder = *v;
-        }
-        if (auto v = opts.get_bool("force")) {
-            config.force = *v;
-        }
-        // Granular force flags, each defaulting to true when the top-level
-        // `force: true` is set, preserving legacy all-or-nothing behaviour.
-        // Setting individual flags to false lets a caller preserve a specific
-        // build artifact while forcing the rest. Examples:
-        //   {force: true, force_reorder: false}
-        //       Rebuild L1/L2 caches + packed_slim, KEEP reordered.fmat.
-        //       Skips the MinHash recompute (typically the L3 wall-clock
-        //       leader on papers100M-scale graphs).
-        //   {force: true, force_caches: false, force_reorder: false}
-        //       Rebuild only packed_slim + meta. Useful to isolate L4 timing.
-        if (auto v = get_bool_opt("force_caches", "forceCaches"))           config.force_caches = *v;
-        if (auto v = get_bool_opt("force_reorder", "forceReorder"))         config.force_reorder = *v;
-        if (auto v = get_bool_opt("force_packed_slim", "forcePackedSlim"))  config.force_packed_slim = *v;
-        if (auto v = get_bool_opt("force_meta", "forceMeta"))               config.force_meta = *v;
-        // Pre-resolve per-batch node classification offline (added 2026-05-19).
-        // Default true — enables the fast runtime path in gnn_train via
-        // addr_tables/batch_NNNNNN.addr sidecars. Set false to skip building
-        // the offline address tables.
-        if (auto v = opts.get_bool("buildAddrTables")) config.build_addr_tables = *v;
-        // Bake per-batch computation-graph blocks (blocks/block_NNNNNN.blk)
-        // keyed by sample content hash, idempotent across re-runs. Default OFF —
-        // when off the build is byte-identical to before. NOTE: bakeBlocks on a
-        // reused store requires buildAddrTables (the default) to be on; with
-        // buildAddrTables:false + reuse, pass force to bake.
-        if (auto v = opts.get_bool("bakeBlocks")) config.bake_blocks = *v;
-        // packFullFeatures is DEPRECATED AND REMOVED. The packed-full pack stores
-        // every batch's full receptive field with no cross-batch dedup (~18x the
-        // feature matrix, ~1 TB on papers100M) and is infeasible. The default
-        // four-level feature store (which dedups across batches) is the supported
-        // path. The option is hard-refused so it can never be requested.
-        if (opts.get_bool("packFullFeatures")) {
-            throw std::runtime_error(
-                "packFullFeatures is deprecated and removed: the packed-full feature "
-                "store is infeasible (~18x the feature matrix) and is no longer "
-                "supported; use the default four-level feature store.");
-        }
-        // Also emit a single consolidated packed_slim/consolidated.slim file
-        // during the partitioned L4 pack (+ v2 addr_tables). Opt-in, default OFF.
-        // The runtime reads it only when MDB_GNN_CONSOLIDATED_SLIM is set.
-        if (auto v = opts.get_bool("writeConsolidatedSlim")) config.write_consolidated_slim = *v;
-        // cleanupIntermediate: delete the non-slim packed/ from materialize_batches
-        // after build succeeds. Default true. Set false only for debugging.
-        if (auto v = opts.get_bool("cleanupIntermediate")) {
-            config.cleanup_materialize_scratch = *v;
-        }
-        if (auto v = opts.get_string("strategy")) {
-            std::string s = *v;
-            std::transform(s.begin(), s.end(), s.begin(), ::toupper);
-            if (s == "SEGMENTED") {
-                config.minhash.strategy = MinHashReorderer::Strategy::SEGMENTED;
-            } else if (s == "MULTIPASS_BOUNDED") {
-                config.minhash.strategy = MinHashReorderer::Strategy::MULTIPASS_BOUNDED;
-            } else {
-                throw std::runtime_error(
-                    "Invalid strategy: '" + *v + "'. Must be 'SEGMENTED' or 'MULTIPASS_BOUNDED'.");
-            }
-        }
-        if (auto v = opts.get_int("numHashes")) {
-            if (*v <= 0) throw std::runtime_error("numHashes must be positive, got: " + std::to_string(*v));
-            config.minhash.num_hashes = static_cast<uint32_t>(*v);
-        }
-        if (auto v = opts.get_int("segmentSize")) {
-            if (*v <= 0) throw std::runtime_error("segmentSize must be positive, got: " + std::to_string(*v));
-            config.minhash.segment_size = static_cast<uint32_t>(*v);
-        }
-        // Expose disk_budget as a procedure parameter. 0 (default) = unlimited;
-        // otherwise a soft constraint that triggers a warning when the actual
-        // on-disk footprint of the Four-Level Feature Store (L1 GPU cache +
-        // L2 CPU cache + L3 reordered fmat + L4 packed-slim) exceeds it. A
-        // future heuristic search over MinHash segment_size could use this
-        // value to find the smallest segment_size that keeps total disk usage
-        // within budget without warning.
-        if (auto v = opts.get_int("diskBudgetMb")) {
-            if (*v < 0) throw std::runtime_error("diskBudgetMb must be non-negative, got: " + std::to_string(*v));
-            config.disk_budget_bytes = static_cast<size_t>(*v) * 1024ULL * 1024ULL;
-        }
-    }
-
-    // =========================================================================
-    // Step 2b: dynamic per-hardware — auto-detect cache budgets.
-    // =========================================================================
-    // Opt-in via env MDB_GNN_AUTO_RESOURCES=1 (default OFF). When a budget was
-    // NOT passed explicitly, derive it from the actual machine via the same
-    // probe the GPU sort planner uses (mdb::gpu::detect_resources()). This is
-    // the missing wire identified in HARDWARE_ADAPTIVITY_AUDIT.md: the GNN
-    // feature store otherwise uses fixed 2 GB GPU / 4 GB CPU defaults regardless
-    // of the host's VRAM/RAM. Budgets choose cache TIER placement only (which
-    // nodes live in L1 GPU / L2 CPU vs L3/L4 disk) — never the gathered feature
-    // values — so the trained result is INVARIANT to the budget (validate via
-    // cora 0.8574939 + a papers100M feature checksum). Explicit gpu_budget_mb /
-    // cpu_budget_mb always win. First-cut heuristic; tune the reserves via A/B.
-    if (const char* e = std::getenv("MDB_GNN_AUTO_RESOURCES"); e && std::string(e) == "1") {
-        auto res = mdb::gpu::detect_resources();
-        if (!gpu_budget_explicit && res.has_gpu) {
-            // CONSERVATIVE by design: the L1 GPU cache lives in VRAM DURING TRAINING,
-            // competing with the model + activations + the assembler's per-batch
-            // device tensors. Giving L1 most of the VRAM would OOM the train step.
-            // free_vram is already 20%-margined (gpu_device VRAM_SAFETY_FACTOR); take
-            // a quarter of it for L1 (~0.2x total VRAM), matching the empirically-safe
-            // hand-tuned ratio (e.g. 2 GB L1 on a ~12 GB free card) while adapting to
-            // bigger/smaller GPUs. A smaller L1 only shifts reads to L3/L4 disk (slower,
-            // never OOM). Tune the fraction via A/B (see HARDWARE_ADAPTIVITY_AUDIT.md).
-            config.gpu.budget_bytes = res.gpu.free_vram / 4;
-        }
-        if (!cpu_budget_explicit && res.ram_available > 0) {
-            // A quarter of available RAM for the L2 CPU cache, leaving room for the
-            // build working set (mmap'd fmat + reorder) + page cache.
-            config.cpu.budget_bytes = res.ram_available / 4;
-        }
-        std::cerr << "[gnn_build_feature_store] MDB_GNN_AUTO_RESOURCES: "
-                  << "gpu_budget=" << (config.gpu.budget_bytes >> 20) << "MB "
-                  << "cpu_budget=" << (config.cpu.budget_bytes >> 20) << "MB "
-                  << "(has_gpu=" << (res.has_gpu ? 1 : 0)
-                  << " free_vram=" << (res.gpu.free_vram >> 20) << "MB"
-                  << " ram_avail=" << (res.ram_available >> 20) << "MB"
-                  << " gpu_explicit=" << (gpu_budget_explicit ? 1 : 0)
-                  << " cpu_explicit=" << (cpu_budget_explicit ? 1 : 0) << ")\n";
+        DictOptions opts(ctx.get_argument(2));
+        config = build_feature_store_config(&opts);
+    } else {
+        config = build_feature_store_config(nullptr);
     }
 
     // =========================================================================
