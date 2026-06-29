@@ -192,6 +192,16 @@ public:
         // compatibility with a training path that still reads packed/.
         bool   cleanup_materialize_scratch = true;
 
+        // Defer the L1/L2 cache (.bin) materialization to train startup
+        // (2026-06-29). When true, build() classifies tiers and writes
+        // store.meta but does NOT write the gpu/cpu cache .bin; it drops a
+        // "<feature>_cache.deferred" marker instead. The runtime constructor
+        // then builds the L1/L2 caches lazily on first train, sized for THIS
+        // host's VRAM/RAM (detect_resources), eliminating the build-host !=
+        // train-host cache-size mismatch and keeping the .bin out of the build
+        // artifacts. Default false (caches written at build, as before).
+        bool   no_cache_bin = false;
+
         // Disk space budget for the Four-Level Feature Store (2026-05-07):
         // 0 = unlimited (current behavior). When > 0, build() emits
         // a warning if the actual on-disk usage exceeds the budget. A future

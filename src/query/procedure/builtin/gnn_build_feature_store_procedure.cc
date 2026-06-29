@@ -39,6 +39,7 @@ constexpr const char* KNOWN_OPTION_KEYS[] = {
     "force_meta",        "forceMeta",
     "buildAddrTables",
     "bakeBlocks",
+    "noCacheBin",
     "packFullFeatures",
     "writeConsolidatedSlim",
     "cleanupIntermediate",

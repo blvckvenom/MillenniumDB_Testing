@@ -37,6 +37,7 @@
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/feature_matrix_header.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "gpu/gpu_device.h"  // detect_resources() for host-adaptive lazy cache build
 #include "gnn/storage/packed_batch_store.h"
 #include "gnn/storage/packed_full_store.h"
 #include "gnn/storage/consolidated_slim_reader.h"
@@ -1138,12 +1139,25 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // --- Step 3: Build cache files ---
     fs::create_directories(gnn_dir);
     wrote_caches = true;
-    log_phase("L1 GpuCache::build start (" + std::to_string(l1_nodes.size()) + " nodes)");
-    GpuCache::build(l1_nodes, features, row_mapping, gpu_cache_path);
-    log_phase("L1 GpuCache::build done");
-    log_phase("L2 CpuCache::build start (" + std::to_string(l2_nodes.size()) + " nodes)");
-    CpuCache::build(l2_nodes, features, row_mapping, cpu_cache_path);
-    log_phase("L2 CpuCache::build done");
+    auto cache_deferred_marker = gnn_dir / (feature_name + "_cache.deferred");
+    if (!config.no_cache_bin) {
+        log_phase("L1 GpuCache::build start (" + std::to_string(l1_nodes.size()) + " nodes)");
+        GpuCache::build(l1_nodes, features, row_mapping, gpu_cache_path);
+        log_phase("L1 GpuCache::build done");
+        log_phase("L2 CpuCache::build start (" + std::to_string(l2_nodes.size()) + " nodes)");
+        CpuCache::build(l2_nodes, features, row_mapping, cpu_cache_path);
+        log_phase("L2 CpuCache::build done");
+        std::error_code mec; fs::remove(cache_deferred_marker, mec);
+    } else {
+        // Defer L1/L2 (.bin) to train startup, sized for the real train host.
+        // Drop any stale .bin so the runtime sees them absent, and leave a
+        // marker so the runtime constructor lazy-builds them on first train.
+        std::error_code ec;
+        fs::remove(gpu_cache_path, ec);
+        fs::remove(cpu_cache_path, ec);
+        std::ofstream(cache_deferred_marker).put('\n');
+        log_phase("L1/L2 cache build DEFERRED to train startup (noCacheBin)");
+    }
 
     // --- Step 4: Ensure L3 reordered FM exists ---
     const FeatureMatrix* active_fm = &features;
@@ -1832,6 +1846,68 @@ FourLevelStore::BuildResult FourLevelStore::build(
 // Runtime Constructor
 // =============================================================================
 
+// Lazily build the L1/L2 cache .bin at train startup, sized for THIS host's
+// VRAM/RAM (detect_resources) rather than the build host's. Used when build()
+// deferred them (noCacheBin). Reads from the reordered fmat — the oid->vector
+// content cached is identical to what the build path would write.
+static void lazy_build_deferred_caches(
+    SampleStorage& samples,
+    const fs::path& reord_fmat, const fs::path& reord_rmap,
+    const fs::path& gpu_path,   const fs::path& cpu_path)
+{
+    auto fm = FeatureMatrix::open(reord_fmat);
+    auto rm = RowMapping::open(reord_rmap);
+    const uint64_t N = fm.num_rows();
+    const size_t row_bytes = fm.row_bytes();
+
+    std::vector<uint64_t> freq;
+    try {
+        freq = samples.get_dense_frequencies(rm);
+    } catch (...) {
+        freq.assign(N, 0);
+        auto fmap = samples.get_node_frequencies();
+        for (const auto& [oid_id, c] : fmap) {
+            auto r = rm.find(ObjectId(oid_id));
+            if (r.has_value() && *r < N) freq[*r] = c;
+        }
+    }
+
+    struct NF { uint64_t row; uint64_t freq; };
+    std::vector<NF> sorted_nodes;
+    sorted_nodes.reserve(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        if (i < freq.size() && freq[i] > 0) sorted_nodes.push_back({i, freq[i]});
+    }
+    std::sort(sorted_nodes.begin(), sorted_nodes.end(),
+              [](const NF& a, const NF& b) { return a.freq > b.freq; });
+
+    // Budgets from THIS host (the train host) — the host-adaptive part.
+    auto res = mdb::gpu::detect_resources();
+    const bool   gpu_avail  = torch::cuda::is_available() && res.has_gpu;
+    const size_t gpu_budget = gpu_avail ? (res.gpu.free_vram / 4) : 0;
+    const size_t cpu_budget = res.ram_available > 0 ? (res.ram_available / 4)
+                                                    : (4ULL << 30);
+    uint64_t K1 = 0, K2 = 0;
+    if (row_bytes > 0) {
+        K1 = std::min<uint64_t>(gpu_budget / row_bytes, sorted_nodes.size());
+        K2 = std::min<uint64_t>(cpu_budget / row_bytes, sorted_nodes.size() - K1);
+    }
+    if (!gpu_avail && K1 > 0) { K2 += K1; K1 = 0; }
+
+    std::vector<ObjectId> l1_nodes, l2_nodes;
+    l1_nodes.reserve(K1);
+    l2_nodes.reserve(K2);
+    for (uint64_t i = 0; i < sorted_nodes.size(); ++i) {
+        auto oid = rm.get(sorted_nodes[i].row);
+        if (i < K1)            l1_nodes.push_back(oid);
+        else if (i < K1 + K2)  l2_nodes.push_back(oid);
+    }
+    std::cerr << "[FourLevelStore] lazy host-adaptive cache build: L1="
+              << l1_nodes.size() << " L2=" << l2_nodes.size() << " nodes\n";
+    GpuCache::build(l1_nodes, fm, rm, gpu_path);
+    CpuCache::build(l2_nodes, fm, rm, cpu_path);
+}
+
 FourLevelStore::FourLevelStore(
     const fs::path& db_folder,
     const std::string& feature_name,
@@ -1933,6 +2009,22 @@ FourLevelStore::FourLevelStore(
             std::cerr << "[FourLevelStore] WARNING: " << gnn_meta_path.string()
                       << " is missing or unreadable — addr_table staleness"
                          " validation DISABLED.\n";
+        }
+    }
+
+    // If build() deferred the L1/L2 caches (noCacheBin marker present and the
+    // .bin absent), build them now sized for THIS host's VRAM/RAM. Built once,
+    // reused on subsequent trains. Eliminates the build-host != train-host cache
+    // mismatch and keeps the .bin out of the build artifacts.
+    {
+        auto cache_marker = gnn_dir / (feature_name + "_cache.deferred");
+        if (fs::exists(cache_marker) && !fs::exists(gpu_path) &&
+            !fs::exists(cpu_path) && fs::exists(reord_fmat) &&
+            fs::exists(reord_rmap)) {
+            lazy_build_deferred_caches(*samples_, reord_fmat, reord_rmap,
+                                       gpu_path, cpu_path);
+            std::error_code mec;
+            fs::remove(cache_marker, mec);
         }
     }
 

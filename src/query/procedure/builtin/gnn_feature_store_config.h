@@ -65,6 +65,10 @@ inline mdb::gnn::FourLevelStore::Config build_feature_store_config(const DictOpt
         if (auto v = get_bool_opt("force_meta", "forceMeta"))               config.force_meta = *v;
         if (auto v = opts->get_bool("buildAddrTables")) config.build_addr_tables = *v;
         if (auto v = opts->get_bool("bakeBlocks")) config.bake_blocks = *v;
+        // Defer L1/L2 cache (.bin) materialization to train startup, sized for
+        // the real train host (eliminates the build-host != train-host cache
+        // mismatch and keeps the .bin out of the build artifacts).
+        if (auto v = opts->get_bool("noCacheBin")) config.no_cache_bin = *v;
         // packFullFeatures is DEPRECATED AND REMOVED (infeasible: ~18x the feature
         // matrix, no cross-batch dedup). Hard-refused from either build path.
         if (opts->get_bool("packFullFeatures")) {
