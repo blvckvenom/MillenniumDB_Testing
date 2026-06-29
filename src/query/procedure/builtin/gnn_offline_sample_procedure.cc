@@ -13,6 +13,10 @@
 #include "gnn/sampling/offline_sampling_engine.h"
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/sampling_config.h"
+#include "gnn/storage/feature_matrix.h"
+#include "gnn/storage/row_mapping.h"
+#include "gnn/storage/four_level_store.h"
+#include "query/procedure/builtin/gnn_feature_store_config.h"
 #include "graph_models/common/conversions.h"
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_object_id.h"
@@ -349,6 +353,50 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // F1 (opt-in, default OFF): fold the feature-store build into the sampling
+    // command. With buildFeatureStore:true the four-level feature store is built
+    // right after the sample is written, so the data-dependent reorder /
+    // address-tables / blocks are produced in one call instead of requiring a
+    // separate gnn_build_feature_store invocation. Default off => byte-identical
+    // to prior behavior; the standalone gnn_build_feature_store verb remains.
+    // (F1.a: reuses the existing FourLevelStore::build; the fed-from-RAM reorder
+    //  that eliminates the batches.dat re-read is a later increment.)
+    // -----------------------------------------------------------------------
+    bool build_feature_store_done = false;
+    std::string bfs_feature_name;
+    if (ctx.arguments.size() == 4) {
+        DictOptions bfs_opts(ctx.get_argument(3));
+        const bool build_feature_store =
+            bfs_opts.get_bool("buildFeatureStore").value_or(false);
+        if (build_feature_store) {
+            bfs_feature_name =
+                bfs_opts.get_string("featureName").value_or(std::string("node_features"));
+            auto sp = SampleStorage::get_storage_path(db_folder, sample_name);
+            auto fmat_path = std::filesystem::path(db_folder) / "gnn_features" /
+                             (bfs_feature_name + ".fmat");
+            auto rmap_path = std::filesystem::path(db_folder) / "gnn_features" /
+                             (bfs_feature_name + ".rmap");
+            if (!std::filesystem::exists(fmat_path) ||
+                !std::filesystem::exists(rmap_path)) {
+                throw std::runtime_error(
+                    "buildFeatureStore: '" + bfs_feature_name +
+                    ".fmat'/'.rmap' not found under gnn_features/ — import the "
+                    "tensors first (mdb import ... --with-tensors features.npy).");
+            }
+            auto bfs_samples = SampleStorage::open(sp);
+            auto bfs_fm = FeatureMatrix::open(fmat_path);
+            auto bfs_rm = RowMapping::open(rmap_path);
+            // Honor the same build options the standalone gnn_build_feature_store
+            // accepts (budgets, force flags, reorder strategy, bakeBlocks, numHashes,
+            // ...), parsed from the SAME options map (sampling keys are ignored).
+            FourLevelStore::Config bfs_config = build_feature_store_config(&bfs_opts);
+            FourLevelStore::build(bfs_fm, bfs_rm, bfs_samples, bfs_config,
+                                  db_folder, bfs_feature_name);
+            build_feature_store_done = true;
+        }
+    }
+
     // Step 13: Yield results
     auto storage_path = SampleStorage::get_storage_path(db_folder, sample_name);
     int64_t compute_millis = static_cast<int64_t>(result.total_seconds * 1000);
@@ -425,6 +473,12 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         static_cast<int64_t>(result.rss_peak_after_free_bytes)));
     ctx.yield("rssCurrentEndBytes", ctx.create_int(
         static_cast<int64_t>(result.rss_current_end_bytes)));
+
+    // F1: feature-store build telemetry (only present when buildFeatureStore:true).
+    if (build_feature_store_done) {
+        ctx.yield("buildFeatureStoreOk", ctx.create_bool(true));
+        ctx.yield("featureName", ctx.create_string(bfs_feature_name));
+    }
 
     ctx.yield_row();
 }
