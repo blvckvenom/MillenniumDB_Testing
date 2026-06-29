@@ -1181,6 +1181,17 @@ FourLevelStore::BuildResult FourLevelStore::build(
         }
         log_phase("L3 MinHash build_access_graph start");
         MinHashReorderer reorderer(config.minhash);
+        // The co-access graph only needs all_unique_nodes per batch, never the
+        // per-layer edges. Skip the edge arrays on this re-read so the reorder
+        // pass streams only the node portions of batches.dat (on papers100M:
+        // ~16 GB of node ids vs ~87.5 GB of full samples). all_unique_nodes is
+        // unaffected, so the access graph — and the resulting permutation — is
+        // bit-identical. Restored after the pass so the later addr_tables / block
+        // builds (which DO need edges) read full samples. `samples` is opened
+        // fresh for the build with edges enabled, and the reorder is the first
+        // read, so restoring to false (the default) after the pass is correct.
+        samples.set_skip_edges_on_read(true);
+        samples.set_skip_edge_ids_on_read(true);
         reorderer.build_access_graph(catalog.total_batches,
             [&](uint64_t batch_id) -> std::vector<uint64_t> {
                 auto sample = samples.read_sample(batch_id);
@@ -1192,6 +1203,8 @@ FourLevelStore::BuildResult FourLevelStore::build(
                 }
                 return rows;
             });
+        samples.set_skip_edges_on_read(false);
+        samples.set_skip_edge_ids_on_read(false);
         log_phase("L3 MinHash compute_permutation start");
         auto perm = reorderer.compute_permutation(N);
         log_phase("L3 MinHash compute_permutation done");
