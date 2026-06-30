@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "bin/mdb-csv-import.h"
 #include "bin/mdb-dump.h"
 #include "bin/mdb-import.h"
@@ -164,6 +166,13 @@ Commands:
 
 int main(int argc, char* argv[])
 {
+    // Default the CUDA caching allocator to expandable segments BEFORE any CUDA
+    // use (LibTorch reads this once at allocator init). This reclaims fragmented
+    // reserved-but-unallocated VRAM, which is what lets the GNN feature store run
+    // a large GPU feature cache (e.g. l1CacheMb:6144 on a 16 GB GPU) at N=8
+    // without the fragmentation OOM. overwrite=0 so an explicit user value wins.
+    ::setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True", 0);
+
     std::ios_base::sync_with_stdio(false);
 
     if (argc < 2) {
