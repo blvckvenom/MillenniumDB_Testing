@@ -15,6 +15,13 @@
 
 #include <torch/torch.h>
 
+#ifdef GNN_CUDA_ENABLED
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAFunctions.h>
+#endif
+
+#include "gpu/gpu_device.h"   // detect_resources() for the dynamic-cache calibration
+
 #include "query/procedure/procedure_context.h"
 
 #include "gnn/models/graphsage_model.h"
@@ -941,7 +948,28 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     };
 
     TrainingLoop loop(model, assembler, catalog, optimizer, loop_config);
+
+    // Dynamic-cache calibration (measured): baseline the peak-VRAM counter at the
+    // already-loaded cache, run train(), then read the peak. reserve = peak - L1
+    // is the workload's non-cache VRAM demand on THIS machine — used below to
+    // recommend the max-safe L1 cache size. Zero on CPU-only builds.
+    uint64_t calib_peak_vram = 0;
+#ifdef GNN_CUDA_ENABLED
+    const bool calib_on = torch::cuda::is_available();
+    c10::DeviceIndex calib_dev = 0;
+    if (calib_on) {
+        calib_dev = c10::cuda::current_device();
+        c10::cuda::CUDACachingAllocator::resetPeakStats(calib_dev);
+    }
+#endif
     auto result = loop.train();
+#ifdef GNN_CUDA_ENABLED
+    if (calib_on) {
+        calib_peak_vram = static_cast<uint64_t>(
+            c10::cuda::CUDACachingAllocator::getDeviceStats(calib_dev)
+                .allocated_bytes[0].peak);
+    }
+#endif
 
     // =========================================================================
     // Step 8d: Finalize checkpoint
@@ -1116,6 +1144,55 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
     ctx.yield("effectivePrefetchWorkers",
               ctx.create_int(static_cast<int64_t>(result.effective_prefetch_workers)));
+
+    // Dynamic-cache calibration: from the measured peak VRAM, recommend the
+    // max-safe L1 cache for this machine+workload. l1_resident = the GPU-resident
+    // bytes of the current cache (data portion of the .bin); reserve = peak - L1;
+    // recommended L1 = total_vram - reserve - margin. Yielded + logged + persisted
+    // to <feature>_vram_calib.txt so a later build can auto-size to it.
+    {
+        const int64_t  in_dim    = model.config().input_dim;
+        const uint64_t row_bytes = static_cast<uint64_t>(in_dim) * 4ull;  // float32
+        uint64_t l1_resident = 0;
+        std::error_code calib_ec;
+        auto gpu_cache_path = std::filesystem::path(db_folder) / "gnn_features"
+                            / (feature_name + "_gpu_cache.bin");
+        auto fsz = std::filesystem::file_size(gpu_cache_path, calib_ec);
+        if (!calib_ec && fsz > 32 && row_bytes > 0) {
+            const uint64_t n = (fsz - 32) / (8 + row_bytes);  // hdr + n*(8 oid + row)
+            l1_resident = n * row_bytes;
+        }
+        const uint64_t peak_mb = calib_peak_vram >> 20;
+        uint64_t recommended_l1_mb = 0, reserve_mb = 0, total_vram_mb = 0;
+        if (calib_peak_vram > 0) {
+            const auto res = mdb::gpu::detect_resources();
+            const uint64_t total_vram = res.gpu.total_vram;
+            total_vram_mb = total_vram >> 20;
+            const uint64_t reserve =
+                calib_peak_vram > l1_resident ? calib_peak_vram - l1_resident : calib_peak_vram;
+            reserve_mb = reserve >> 20;
+            const uint64_t margin = 512ull * 1024 * 1024;  // 512 MB headroom
+            const long long rec =
+                static_cast<long long>(total_vram) - static_cast<long long>(reserve)
+                - static_cast<long long>(margin);
+            recommended_l1_mb = rec > 0 ? (static_cast<uint64_t>(rec) >> 20) : 0;
+            std::cerr << "[gnn_train] VRAM calib (measured): peak=" << peak_mb
+                      << "MB L1=" << (l1_resident >> 20) << "MB reserve=" << reserve_mb
+                      << "MB total_vram=" << total_vram_mb
+                      << "MB => recommended l1CacheMb=" << recommended_l1_mb << "\n";
+            std::ofstream cf(std::filesystem::path(db_folder) / "gnn_features"
+                             / (feature_name + "_vram_calib.txt"));
+            if (cf) {
+                cf << "recommended_l1_cache_mb=" << recommended_l1_mb << "\n"
+                   << "measured_peak_mb=" << peak_mb << "\n"
+                   << "measured_reserve_mb=" << reserve_mb << "\n"
+                   << "total_vram_mb=" << total_vram_mb << "\n";
+            }
+        }
+        ctx.yield("peakVramMb", ctx.create_int(static_cast<int64_t>(peak_mb)));
+        ctx.yield("recommendedL1CacheMb",
+                  ctx.create_int(static_cast<int64_t>(recommended_l1_mb)));
+    }
     // Address-table fast-path telemetry: whether the v2 addr_table path
     // was active during training and its mean load latency in microseconds.
     ctx.yield("useAddrTablesEffective",
