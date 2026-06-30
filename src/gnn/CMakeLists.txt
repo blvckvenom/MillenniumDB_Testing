@@ -384,6 +384,17 @@ if(BUILD_TESTING)
             INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
         )
 
+        # Offline deepest-source probe (tool): how much of A_L a fused gather+mean
+        # kernel must still read (= A_{L-1} U distinct deepest-edge sources).
+        add_executable(deepest_source_probe tools/deepest_source_probe.cc)
+        target_link_libraries(deepest_source_probe mdb_gnn_core ${TORCH_LIBRARIES})
+        target_compile_options(deepest_source_probe PRIVATE ${TORCH_CXX_FLAGS_LIST})
+        target_compile_definitions(deepest_source_probe PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+        set_target_properties(deepest_source_probe PROPERTIES
+            BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        )
+
         # Sample content fingerprint tests (staleness check, isolable)
         add_executable(test_sample_fingerprint
             tests/test_sample_fingerprint.cc
