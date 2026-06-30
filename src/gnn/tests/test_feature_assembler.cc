@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <vector>
 
@@ -548,6 +549,73 @@ TEST(FeatureAssemblerTest, AssembleSimpleCudaMatchesFallback) {
 
     auto diff = (out.cpu() - ref.cpu()).abs().max().item<float>();
     EXPECT_LT(diff, 1e-5f);
+}
+
+// ===========================================================================
+// F3.a: assemble_l2direct (fused 3-source) must be BIT-IDENTICAL to assemble()
+// where the L2 rows were pre-copied into the combined cpu_data buffer. This is
+// the correctness gate for reading L2 straight from the pinned cache via UVA.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, AssembleL2DirectMatchesAssemble) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 12, D = 8;
+    FeatureAssembler assembler(D);
+
+    // L1 on GPU: 3 rows -> output positions {0,5,11}.
+    auto gpu = torch::randn({3, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 5, 11};
+
+    // L2 pinned "cache" of 6 rows; this batch hits slots {4,1,5} -> positions {2,7,9}.
+    auto l2_cache = torch::empty({6, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* l2_base = l2_cache.data_ptr<float>();
+    for (int64_t i = 0; i < 6 * D; ++i) l2_base[i] = static_cast<float>(2000 + i);
+    std::vector<uint32_t> l2_idx = {4, 1, 5};
+    std::vector<uint32_t> l2_pos = {2, 7, 9};
+
+    // L3+L4 combined pinned: 4 rows -> positions {1,3,4,8}. Positions {6,10} zero.
+    auto cpu_pinned = torch::empty({4, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu_data = cpu_pinned.data_ptr<float>();
+    for (int64_t i = 0; i < 4 * D; ++i) cpu_data[i] = static_cast<float>(9000 + i);
+    std::vector<uint32_t> cpu_pos = {1, 3, 4, 8};
+
+    // Fused L2-direct result.
+    auto fused = assembler.assemble_l2direct(N, gpu, gpu_pos,
+        l2_base, l2_idx, l2_pos, cpu_data, 4, cpu_pos);
+
+    // Reference: pre-copy L2 rows into a combined pinned buffer [L2..., L3L4...]
+    // and call the standard 2-source assemble (the pre-F3 behaviour).
+    auto combined = torch::empty({static_cast<int64_t>(l2_idx.size()) + 4, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cbuf = combined.data_ptr<float>();
+    for (size_t i = 0; i < l2_idx.size(); ++i) {
+        std::memcpy(cbuf + i * D, l2_base + static_cast<size_t>(l2_idx[i]) * D,
+                    D * sizeof(float));
+    }
+    std::memcpy(cbuf + l2_idx.size() * D, cpu_data,
+                static_cast<size_t>(4) * D * sizeof(float));
+    std::vector<uint32_t> combined_pos = {2, 7, 9, 1, 3, 4, 8};
+    auto ref = assembler.assemble(N, gpu, gpu_pos, cbuf,
+        static_cast<int64_t>(combined_pos.size()), combined_pos);
+
+    auto diff = (fused.cpu() - ref.cpu()).abs().max().item<float>();
+    EXPECT_FLOAT_EQ(diff, 0.f)
+        << "assemble_l2direct must be bit-identical to assemble() with L2 "
+           "pre-copied into cpu_data";
+}
+
+TEST(FeatureAssemblerTest, AssembleL2DirectSizeMismatchThrows) {
+    FeatureAssembler assembler(4);
+    auto gpu = torch::empty({0, 4});
+    // l2_indices (2) vs l2_positions (1) mismatch -> invalid_argument.
+    EXPECT_THROW(
+        assembler.assemble_l2direct(3, gpu, {}, nullptr, {0, 1}, {0},
+                                    nullptr, 0, {}),
+        std::invalid_argument);
 }
 #endif
 

@@ -2306,6 +2306,20 @@ static bool l4_o_direct_enabled() {
     return on;
 }
 
+// F3.a (opt-in, env MDB_GNN_FUSED_ASSEMBLER, default OFF). When on AND the CPU
+// cache is pinned, the v2 assemble path reads L2 rows STRAIGHT from the pinned
+// cache in the CUDA kernel (via UVA) instead of pre-copying each L2 row into the
+// combined pinned buffer on the host. Bit-identical output; removes the dominant
+// per-batch L2 host memcpy on papers100M-scale runs.
+static bool fused_assembler_enabled() {
+    static const bool on = []() {
+        const char* e = std::getenv("MDB_GNN_FUSED_ASSEMBLER");
+        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
+                     std::strcmp(e, "yes") == 0);
+    }();
+    return on;
+}
+
 static bool read_slim_file_o_direct(const std::string& path, size_t file_size,
                                     std::vector<char>& file_buf) {
     int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
@@ -3109,7 +3123,21 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     // fallback path is byte-identical to the pre-refactor heap path.
     std::vector<uint32_t> cpu_combined_positions;
 
-    size_t cpu_total = addr.header.num_l2
+    // F3.a: fused L2-direct. When enabled and the CPU cache is pinned, L2 rows
+    // are read straight from the pinned cache by the assembler kernel (UVA), so
+    // they are NOT pre-copied into the combined pinned buffer below. Removes the
+    // per-batch L2 host memcpy. Bit-identical: same rows, same output positions.
+    const bool fused_l2 = fused_assembler_enabled()
+                        && cpu_cache_ && cpu_cache_->is_pinned()
+                        && addr.header.num_l2 > 0;
+    std::vector<uint32_t> l2_direct_indices;
+    std::vector<uint32_t> l2_direct_positions;
+    if (fused_l2) {
+        l2_direct_indices.reserve(addr.header.num_l2);
+        l2_direct_positions.reserve(addr.header.num_l2);
+    }
+
+    size_t cpu_total = (fused_l2 ? 0u : addr.header.num_l2)
                      + addr.header.num_l3
                      + addr.header.num_l4;
     cpu_combined_positions.reserve(cpu_total);
@@ -3144,7 +3172,6 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         // the cache buffer (UB / silent wrong-node features).
         const uint64_t l2_rows = cpu_cache_->num_nodes();
         for (uint32_t h = 0; h < addr.header.num_l2; ++h) {
-            cpu_combined_positions.push_back(addr.l2_positions[h]);
             const uint32_t l2_idx = addr.l2_indices[h];
             if (static_cast<uint64_t>(l2_idx) >= l2_rows) {
                 throw std::runtime_error(
@@ -3152,10 +3179,17 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
                     + " out of bounds for CPU cache ("
                     + std::to_string(l2_rows) + " rows)");
             }
-            const float* row_ptr_f = static_cast<const float*>(
-                cpu_cache_->row_ptr(l2_idx));
-            std::memcpy(dst + cursor, row_ptr_f, feature_dim_ * sizeof(float));
-            cursor += feature_dim_;
+            if (fused_l2) {
+                // Read directly from the pinned cache in the kernel — no host copy.
+                l2_direct_positions.push_back(addr.l2_positions[h]);
+                l2_direct_indices.push_back(l2_idx);
+            } else {
+                cpu_combined_positions.push_back(addr.l2_positions[h]);
+                const float* row_ptr_f = static_cast<const float*>(
+                    cpu_cache_->row_ptr(l2_idx));
+                std::memcpy(dst + cursor, row_ptr_f, feature_dim_ * sizeof(float));
+                cursor += feature_dim_;
+            }
         }
         auto t_l2_end = std::chrono::steady_clock::now();
         last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3237,13 +3271,36 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     // I1: set the flag AFTER assemble() returns successfully.  If assemble()
     // throws, the flag stays false so the dispatcher's catch block and any
     // telemetry consumer see the correct "legacy actually served" state.
-    auto result = assembler_->assemble(
-        static_cast<int64_t>(total),
-        gpu_features, gpu_positions,
-        assembler_data,
-        static_cast<int64_t>(cpu_combined_positions.size()),
-        cpu_combined_positions
-    );
+    torch::Tensor result;
+    if (fused_l2) {
+        // One-shot confirmation that the fused path is actually live (vs a silent
+        // fallback): logged once per process the first time it engages.
+        static std::atomic<bool> fused_logged{false};
+        bool expected = false;
+        if (fused_logged.compare_exchange_strong(expected, true)) {
+            std::cerr << "[FourLevelStore] F3.a fused L2-direct assembler ACTIVE\n"
+                      << std::flush;
+        }
+        // L2 rows read directly from the pinned cache base; `assembler_data`
+        // (dst) holds only the L3+L4 rows. Same output positions => bit-identical.
+        const float* l2_base = static_cast<const float*>(cpu_cache_->row_ptr(0));
+        result = assembler_->assemble_l2direct(
+            static_cast<int64_t>(total),
+            gpu_features, gpu_positions,
+            l2_base, l2_direct_indices, l2_direct_positions,
+            assembler_data,
+            static_cast<int64_t>(cpu_combined_positions.size()),
+            cpu_combined_positions
+        );
+    } else {
+        result = assembler_->assemble(
+            static_cast<int64_t>(total),
+            gpu_features, gpu_positions,
+            assembler_data,
+            static_cast<int64_t>(cpu_combined_positions.size()),
+            cpu_combined_positions
+        );
+    }
     last_used_v2_ = true;
     return result;
 }

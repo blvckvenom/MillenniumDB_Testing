@@ -199,4 +199,63 @@ torch::Tensor FeatureAssembler::assemble(
                              cpu_data, cpu_count, cpu_positions);
 }
 
+// ============================================================================
+// Fused L2-direct dispatch (CUDA-only)
+// ============================================================================
+
+torch::Tensor FeatureAssembler::assemble_l2direct(
+    int64_t total_nodes,
+    const torch::Tensor& gpu_features,
+    const std::vector<uint32_t>& gpu_positions,
+    const float* l2_base,
+    const std::vector<uint32_t>& l2_indices,
+    const std::vector<uint32_t>& l2_positions,
+    const float* cpu_data,
+    int64_t cpu_count,
+    const std::vector<uint32_t>& cpu_positions)
+{
+    if (l2_indices.size() != l2_positions.size()) {
+        throw std::invalid_argument(
+            "FeatureAssembler::assemble_l2direct: l2_indices/l2_positions size mismatch");
+    }
+    // Bounds-check every output position against total_nodes (symmetric with assemble()).
+    for (auto pos : gpu_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range("FeatureAssembler::assemble_l2direct: gpu_position "
+                + std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+    for (auto pos : l2_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range("FeatureAssembler::assemble_l2direct: l2_position "
+                + std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+    for (auto pos : cpu_positions) {
+        if (pos >= static_cast<uint32_t>(total_nodes)) {
+            throw std::out_of_range("FeatureAssembler::assemble_l2direct: cpu_position "
+                + std::to_string(pos) + " >= total_nodes " + std::to_string(total_nodes));
+        }
+    }
+
+#ifdef ENABLE_CUDA_ASSEMBLER
+    // The kernel reads l2_base and cpu_data from device threads via UVA, which is
+    // only legal for pinned/managed/device memory. The caller gates on a pinned
+    // CPU cache, but re-verify here (cheap) so a pageable pointer can never reach
+    // the kernel — throw so the four-level dispatcher falls back to legacy.
+    if (torch::cuda::is_available() &&
+        gpu_features.defined() && gpu_features.is_cuda() &&
+        l2_base != nullptr && is_device_accessible_(l2_base) &&
+        (cpu_positions.empty() || cpu_data == nullptr ||
+         is_device_accessible_(cpu_data))) {
+        return assemble_l2direct_cuda(total_nodes, gpu_features, gpu_positions,
+                                      l2_base, l2_indices, l2_positions,
+                                      cpu_data, cpu_count, cpu_positions);
+    }
+#endif
+    throw std::runtime_error(
+        "FeatureAssembler::assemble_l2direct: CUDA assembler path unavailable "
+        "(requires ENABLE_CUDA_ASSEMBLER + CUDA gpu_features + pinned/UVA L2 base)");
+}
+
 } // namespace mdb::gnn

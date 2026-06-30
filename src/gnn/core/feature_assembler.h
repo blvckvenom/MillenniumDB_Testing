@@ -61,6 +61,27 @@ public:
         const std::vector<uint32_t>& cpu_positions
     );
 
+    /// Fused L2-direct variant (3 sources). Reads L2 rows DIRECTLY from the
+    /// (pinned) CPU cache via UVA using per-row cache indices, instead of
+    /// requiring the caller to pre-copy L2 rows into the contiguous cpu_data
+    /// buffer. Sources: L1 from gpu_features (HBM), L2 from l2_base +
+    /// l2_indices[i] (pinned cache base), L3+L4 from cpu_data (pinned combined).
+    /// Eliminates the per-batch L2 host memcpy. CUDA-only: the caller must gate
+    /// on a CUDA-eligible, pinned-cache configuration; throws otherwise so the
+    /// caller can fall back. Output is bit-identical to the equivalent
+    /// assemble() where L2 rows were pre-copied into cpu_data.
+    torch::Tensor assemble_l2direct(
+        int64_t total_nodes,
+        const torch::Tensor& gpu_features,
+        const std::vector<uint32_t>& gpu_positions,
+        const float* l2_base,
+        const std::vector<uint32_t>& l2_indices,
+        const std::vector<uint32_t>& l2_positions,
+        const float* cpu_data,
+        int64_t cpu_count,
+        const std::vector<uint32_t>& cpu_positions
+    );
+
 private:
     int64_t feature_dim_;
 
@@ -69,6 +90,18 @@ private:
         int64_t total_nodes,
         const torch::Tensor& gpu_features,
         const std::vector<uint32_t>& gpu_positions,
+        const float* cpu_data,
+        int64_t cpu_count,
+        const std::vector<uint32_t>& cpu_positions
+    );
+
+    torch::Tensor assemble_l2direct_cuda(
+        int64_t total_nodes,
+        const torch::Tensor& gpu_features,
+        const std::vector<uint32_t>& gpu_positions,
+        const float* l2_base,
+        const std::vector<uint32_t>& l2_indices,
+        const std::vector<uint32_t>& l2_positions,
         const float* cpu_data,
         int64_t cpu_count,
         const std::vector<uint32_t>& cpu_positions
