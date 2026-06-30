@@ -2,11 +2,29 @@
 
 #ifdef ENABLE_CUDA_ASSEMBLER
 
+#include <cstdlib>
+#include <cstring>
+
 #include <cuda_runtime.h>
 
 #include <c10/cuda/CUDAStream.h>
 
 namespace mdb::gnn {
+
+namespace {
+// B (opt-in, env MDB_GNN_DEVICE_SCATTER, default OFF): bulk-transfer the
+// contiguous cold buffer host->device ONCE and scatter from HBM, instead of
+// per-row UVA reads from pinned host inside the kernel. Same bytes ->
+// bit-identical output; trades ~12 GB/s random UVA for ~25 GB/s bulk H2D +
+// ~900 GB/s HBM reads.
+bool device_scatter_enabled_() {
+    // Read per-call (not cached) so it is reliably togglable in unit tests; the
+    // getenv cost is once per assemble (per batch) — negligible vs the kernel.
+    const char* e = std::getenv("MDB_GNN_DEVICE_SCATTER");
+    return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
+                 std::strcmp(e, "yes") == 0);
+}
+} // namespace
 
 // ============================================================================
 // CUDA Kernel
@@ -111,12 +129,24 @@ torch::Tensor FeatureAssembler::assemble_cuda(
     //
     // If no guard is set, getCurrentCUDAStream() returns the default stream,
     // preserving pre-2026-05-08 behaviour byte-for-byte.
+    // B: optionally stage the contiguous cold buffer to device (one bulk H2D)
+    // so the kernel scatters from HBM instead of per-row UVA host reads. The
+    // device holder must outlive the kernel (it does — synced below). Same
+    // bytes => bit-identical output.
+    torch::Tensor d_cpu_holder;
+    const float* kernel_cpu_ptr = cpu_data;
+    if (device_scatter_enabled_() && cpu_count > 0 && cpu_data != nullptr) {
+        d_cpu_holder = torch::from_blob(const_cast<float*>(cpu_data),
+                          {cpu_count, D}, torch::kFloat32).to(torch::kCUDA);
+        kernel_cpu_ptr = d_cpu_holder.data_ptr<float>();
+    }
+
     auto current_stream = c10::cuda::getCurrentCUDAStream();
 
     assemble_kernel<<<blocks, threads_per_block, 0, current_stream.stream()>>>(
         output.data_ptr<float>(),
         gpu_data_ptr,
-        cpu_data,
+        kernel_cpu_ptr,
         d_positions.data_ptr<int32_t>(),
         d_src_indices.data_ptr<int32_t>(),
         d_levels.data_ptr<uint8_t>(),

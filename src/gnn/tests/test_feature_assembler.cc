@@ -617,5 +617,39 @@ TEST(FeatureAssemblerTest, AssembleL2DirectSizeMismatchThrows) {
                                     nullptr, 0, {}),
         std::invalid_argument);
 }
+
+// ===========================================================================
+// B: device-scatter (bulk H2D + HBM read) must be BIT-IDENTICAL to the per-row
+// UVA path. Same cold bytes, just transferred in bulk and read from HBM.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, DeviceScatterMatchesUva) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 10, D = 8;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::randn({3, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 4, 7};
+
+    auto cpu_pinned = torch::empty({7, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu = cpu_pinned.data_ptr<float>();
+    std::srand(123);
+    for (int64_t i = 0; i < 7 * D; ++i)
+        cpu[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    std::vector<uint32_t> cpu_pos = {1, 2, 3, 5, 6, 8, 9};
+
+    ::unsetenv("MDB_GNN_DEVICE_SCATTER");
+    auto uva = assembler.assemble(N, gpu, gpu_pos, cpu, 7, cpu_pos);
+    ::setenv("MDB_GNN_DEVICE_SCATTER", "1", 1);
+    auto dev = assembler.assemble(N, gpu, gpu_pos, cpu, 7, cpu_pos);
+    ::unsetenv("MDB_GNN_DEVICE_SCATTER");
+
+    auto diff = (uva.cpu() - dev.cpu()).abs().max().item<float>();
+    EXPECT_FLOAT_EQ(diff, 0.f)
+        << "device-scatter (B) must be bit-identical to the per-row UVA path";
+}
 #endif
 
