@@ -1172,7 +1172,13 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             const uint64_t reserve =
                 calib_peak_vram > l1_resident ? calib_peak_vram - l1_resident : calib_peak_vram;
             reserve_mb = reserve >> 20;
-            const uint64_t margin = 512ull * 1024 * 1024;  // 512 MB headroom
+            // 1280 MB headroom. 512 MB left the auto-sized L1 at the VRAM
+            // ceiling: at the ~5.4 GB recommendation on a 16 GB device the
+            // cold-start epoch still hit transient CUDA OOMs (which fall back to
+            // a per-batch path that zero-fills the affected batches). 1280 MB
+            // covers the cold-start allocation spike plus run-to-run measurement
+            // noise, keeping the auto-applied L1 OOM-free.
+            const uint64_t margin = 1280ull * 1024 * 1024;
             const long long rec =
                 static_cast<long long>(total_vram) - static_cast<long long>(reserve)
                 - static_cast<long long>(margin);
