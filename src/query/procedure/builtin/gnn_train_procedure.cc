@@ -35,6 +35,7 @@
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/row_mapping.h"
+#include "gnn/storage/vram_calib_io.h"
 #include "gnn/storage/feature_matrix.h"
 #include "gnn/training/feature_label_integrity.h"
 #include <cstdio>
@@ -1180,14 +1181,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                       << "MB L1=" << (l1_resident >> 20) << "MB reserve=" << reserve_mb
                       << "MB total_vram=" << total_vram_mb
                       << "MB => recommended l1CacheMb=" << recommended_l1_mb << "\n";
-            std::ofstream cf(std::filesystem::path(db_folder) / "gnn_features"
-                             / (feature_name + "_vram_calib.txt"));
-            if (cf) {
-                cf << "recommended_l1_cache_mb=" << recommended_l1_mb << "\n"
-                   << "measured_peak_mb=" << peak_mb << "\n"
-                   << "measured_reserve_mb=" << reserve_mb << "\n"
-                   << "total_vram_mb=" << total_vram_mb << "\n";
-            }
+            // Persist via the shared calib format (single source of truth with
+            // the autoCache reader in gnn_build_feature_store) — byte-identical
+            // to the prior inline layout.
+            mdb::gnn::write_vram_calib(
+                std::filesystem::path(db_folder) / "gnn_features"
+                    / (feature_name + "_vram_calib.txt"),
+                mdb::gnn::VramCalib{recommended_l1_mb, peak_mb, reserve_mb,
+                                    total_vram_mb});
         }
         ctx.yield("peakVramMb", ctx.create_int(static_cast<int64_t>(peak_mb)));
         ctx.yield("recommendedL1CacheMb",

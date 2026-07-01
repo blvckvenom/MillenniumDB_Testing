@@ -391,6 +391,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             // accepts (budgets, force flags, reorder strategy, bakeBlocks, numHashes,
             // ...), parsed from the SAME options map (sampling keys are ignored).
             FourLevelStore::Config bfs_config = build_feature_store_config(&bfs_opts);
+            // autoCache: size L1 to a prior gnn_train's measured recommendation
+            // (no-op without autoCache:true / when explicit gpu_budget_mb wins).
+            apply_auto_cache_budget(bfs_config, &bfs_opts, db_folder, bfs_feature_name);
             FourLevelStore::build(bfs_fm, bfs_rm, bfs_samples, bfs_config,
                                   db_folder, bfs_feature_name);
             build_feature_store_done = true;

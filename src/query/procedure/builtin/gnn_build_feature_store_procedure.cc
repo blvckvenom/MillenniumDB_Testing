@@ -40,6 +40,7 @@ constexpr const char* KNOWN_OPTION_KEYS[] = {
     "buildAddrTables",
     "bakeBlocks",
     "noCacheBin",
+    "autoCache",
     "packFullFeatures",
     "writeConsolidatedSlim",
     "cleanupIntermediate",
@@ -126,13 +127,18 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
 
     // =========================================================================
     // Step 2: Parse options (shared parser; single source of truth with the
-    // unified gnn_offline_sample(buildFeatureStore) path)
+    // unified gnn_offline_sample(buildFeatureStore) path). db_folder is resolved
+    // first so autoCache can read this feature's VRAM calibration file.
     // =========================================================================
+    std::string db_folder = get_db_folder();
     FourLevelStore::Config config;
     if (ctx.arguments.size() == 3) {
         assert_known_option_keys(ctx.get_argument(2));
         DictOptions opts(ctx.get_argument(2));
         config = build_feature_store_config(&opts);
+        // autoCache: size L1 to the recommended budget a prior gnn_train measured
+        // (no-op without autoCache:true, or when an explicit gpu_budget_mb wins).
+        apply_auto_cache_budget(config, &opts, db_folder, feature_name);
     } else {
         config = build_feature_store_config(nullptr);
     }
@@ -140,7 +146,6 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     // Step 3: Validate inputs exist
     // =========================================================================
-    std::string db_folder = get_db_folder();
 
     // Validate feature name is registered in catalog
     const auto& names = gql_model.catalog.gnn_feature_names;

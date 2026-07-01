@@ -303,6 +303,7 @@ if(BUILD_TESTING)
         add_executable(test_gnn_storage
             tests/test_feature_matrix.cc
             tests/test_row_mapping.cc
+            tests/test_vram_calib_io.cc
         )
         # Note: ObjectId is header-only for construction/comparison;
         # operator<< lives in query/id.cc (linked via millenniumdb) but tests don't need it

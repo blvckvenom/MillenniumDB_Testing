@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 
@@ -15,6 +16,7 @@
 
 #include "gnn/sampling/minhash_reorderer.h"
 #include "gnn/storage/four_level_store.h"
+#include "gnn/storage/vram_calib_io.h"
 #include "gpu/gpu_device.h"
 #include "query/procedure/builtin/gnn_procedure_utils.h"
 
@@ -130,6 +132,59 @@ inline mdb::gnn::FourLevelStore::Config build_feature_store_config(const DictOpt
     }
 
     return config;
+}
+
+// Auto-apply the recommended L1 GPU cache budget that a prior gnn_train wrote
+// to <db_folder>/gnn_features/<feature>_vram_calib.txt (the dynamic-cache
+// calibration). Enabled per-call by autoCache:true. This closes the
+// self-calibrating loop: a first conservative build trains -> gnn_train measures
+// peak VRAM and writes the calib -> a later autoCache build sizes L1 to the
+// measured maximum-safe value, with no hand-tuned gpu_budget_mb.
+//
+// Precedence (most specific wins): an explicit gpu_budget_mb always wins (this
+// is a no-op then); otherwise autoCache overrides the MDB_GNN_AUTO_RESOURCES /
+// default budget already set by build_feature_store_config. A missing or empty
+// calib file is a no-op (logged) so the very first build still runs.
+//
+// Lives here (not in build_feature_store_config) because the budget source is a
+// file keyed by (db_folder, feature) — inputs the pure option parser does not
+// have. Both build entry points call it after parsing. Returns the applied L1
+// MB (0 = not applied).
+inline uint64_t apply_auto_cache_budget(mdb::gnn::FourLevelStore::Config& config,
+                                        const DictOptions* opts,
+                                        const std::string& db_folder,
+                                        const std::string& feature_name) {
+    if (opts == nullptr) return 0;
+    if (!opts->get_bool("autoCache").value_or(false)) return 0;
+
+    const bool gpu_explicit = opts->get_int("gpu_budget_mb").has_value() ||
+                              opts->get_int("gpuBudgetMb").has_value();
+    if (gpu_explicit) {
+        std::cerr << "[feature_store_config] autoCache: explicit gpu_budget_mb "
+                     "present, leaving it as-is (explicit wins)\n";
+        return 0;
+    }
+
+    auto calib_path = std::filesystem::path(db_folder) / "gnn_features" /
+                      (feature_name + "_vram_calib.txt");
+    auto calib = mdb::gnn::read_vram_calib(calib_path);
+    if (!calib || calib->recommended_l1_cache_mb == 0) {
+        std::cerr << "[feature_store_config] autoCache: no usable "
+                  << feature_name
+                  << "_vram_calib.txt yet (run gnn_train once to calibrate); "
+                     "leaving gpu_budget at "
+                  << (config.gpu.budget_bytes >> 20) << "MB\n";
+        return 0;
+    }
+
+    config.gpu.budget_bytes =
+        static_cast<size_t>(calib->recommended_l1_cache_mb) * 1024ULL * 1024ULL;
+    std::cerr << "[feature_store_config] autoCache: applied recommended L1="
+              << calib->recommended_l1_cache_mb << "MB (measured peak="
+              << calib->measured_peak_mb << "MB reserve="
+              << calib->measured_reserve_mb << "MB total_vram="
+              << calib->total_vram_mb << "MB)\n";
+    return calib->recommended_l1_cache_mb;
 }
 
 }  // namespace Procedures
