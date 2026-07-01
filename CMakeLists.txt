@@ -690,6 +690,49 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# Symmetric topology per-node merge unit tests
+# ============================================================================
+# Registers topology_symmetric_merge_test when GTest is available and the
+# header-only merge helper exists. Same EXISTS-gated precedent as
+# topology_snapshot_format_test above.
+if(GTest_FOUND AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_symmetric_merge.h")
+    add_executable(topology_symmetric_merge_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_symmetric_merge_test.cc
+    )
+    set_target_properties(topology_symmetric_merge_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    # GTest::gtest_main before millenniumdb so its main() wins over the serdi.cc
+    # main() pulled into libmillenniumdb.a by the recursive src/*.cc glob.
+    target_link_libraries(topology_symmetric_merge_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+    )
+    if(ENABLE_GNN)
+        target_link_libraries(topology_symmetric_merge_test mdb_gnn_core ${TORCH_LIBRARIES})
+    endif()
+    add_test(
+        NAME TopologySymmetricMergeTests
+        COMMAND $<TARGET_FILE:topology_symmetric_merge_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologySymmetricMergeTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
 # ============================================================================
 # B+Tree v2 leaf header format unit tests
@@ -1453,6 +1496,41 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# TopologyWalkProfiler unit tests
+# ============================================================================
+# EXISTS-gated on both the test file AND the profiler source so the
+# target only configures once the profiler implementation is present.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_walk_profiler_test.cc" AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/gnn/projection/topology_walk_profiler.cc")
+    add_executable(topology_walk_profiler_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_walk_profiler_test.cc
+    )
+    set_target_properties(topology_walk_profiler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+    )
+    target_link_libraries(topology_walk_profiler_test
+        GTest::gtest_main
+        GTest::gtest
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        mdb_gnn_core
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyWalkProfilerTests
+        COMMAND $<TARGET_FILE:topology_walk_profiler_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
 # ============================================================================
 # NativeProjectionBuilder × TopologySnapshot integration test
@@ -1490,28 +1568,943 @@ if(GTest_FOUND AND
     )
 endif()
 
+# ============================================================================
+# TopologyAccessor × CSR fast-path integration test
+# ============================================================================
+# Verifies the mmap fast-path integration in
+# src/gnn/projection/topology_accessor.cc and the per-direction fallback
+# behavior when sidecars are absent / stale / corrupt. Requires ENABLE_GNN
+# because the accessor itself lives in mdb_gnn_core.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_csr_path_test.cc")
+    add_executable(topology_accessor_csr_path_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_csr_path_test.cc
+    )
+    set_target_properties(topology_accessor_csr_path_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over serdi's main(), and mdb_gnn_core must come before the trailing
+    # millenniumdb so the static-archive link-order fix applies here too.
+    target_link_libraries(topology_accessor_csr_path_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyAccessorCsrPathTests
+        COMMAND $<TARGET_FILE:topology_accessor_csr_path_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# TopologyAccessor adjacency cache unit tests
+# ============================================================================
+# Validates TopologyAccessor's in-memory adjacency cache mode. Cache vs
+# B+Tree paths must produce bit-identical neighbour sets and bit-identical
+# k-hop sampling output under a fixed RNG seed. Mirrors the linker recipe
+# of topology_accessor_csr_path_test (gtest_main first, mdb_gnn_core before
+# millenniumdb).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_adjacency_cache_test.cc")
+    add_executable(topology_accessor_adjacency_cache_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_adjacency_cache_test.cc
+    )
+    set_target_properties(topology_accessor_adjacency_cache_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_accessor_adjacency_cache_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyAccessorAdjacencyCacheTests
+        COMMAND $<TARGET_FILE:topology_accessor_adjacency_cache_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Topology frequency profiler tests
+# ============================================================================
+# Validates the frequency profiler that the Four-Level Topology Store uses
+# to seed L1 / L2 / L3 tier assignment. Covers the cold-start (degree
+# proxy) path, warm-start rejection of malformed node_counts.bin files,
+# mixed orientations, and the greedy tier sizing helper. Linker recipe mirrors topology_accessor_adjacency_cache_test.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_frequency_profiler_test.cc")
+    add_executable(topology_frequency_profiler_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_frequency_profiler_test.cc
+    )
+    set_target_properties(topology_frequency_profiler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_frequency_profiler_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyFrequencyProfilerTests
+        COMMAND $<TARGET_FILE:topology_frequency_profiler_test>
+        WORKING_DIRECTORY tests
+    )
+    # Suppress known CUDA driver leak (cuInit ~408 bytes) so ctest exits 0.
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologyFrequencyProfilerTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# L1HashCache tests
+# ============================================================================
+# Pure data-structure tests for the hot-tier RAM hash cache (lifted from
+# the monolithic adjacency cache): insert
+# respects tier_assignment, round-trip parity, large-degree safety, and the
+# total_bytes() contract anchored against kL1NodeFixedOverhead /
+# kL1PerEdgeBytes from topology_frequency_profiler.h.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/l1_hash_cache_test.cc")
+    add_executable(l1_hash_cache_test
+        ${CMAKE_SOURCE_DIR}/src/tests/l1_hash_cache_test.cc
+    )
+    set_target_properties(l1_hash_cache_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(l1_hash_cache_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME L1HashCacheTests
+        COMMAND $<TARGET_FILE:l1_hash_cache_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST L1HashCacheTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# L2CompactCsr tests
+# ============================================================================
+# Pure data-structure tests for the warm-tier compact CSR cache: build/lookup
+# round-trip, out-of-order insert identity, freeze immutability, isolated
+# nodes, total_bytes contract.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/l2_compact_csr_test.cc")
+    add_executable(l2_compact_csr_test
+        ${CMAKE_SOURCE_DIR}/src/tests/l2_compact_csr_test.cc
+    )
+    set_target_properties(l2_compact_csr_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(l2_compact_csr_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME L2CompactCsrTests
+        COMMAND $<TARGET_FILE:l2_compact_csr_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST L2CompactCsrTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# sampling_backend_plan tests — pure GPU/CPU sampling-backend decision table.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/sampling_backend_plan_test.cc")
+    add_executable(sampling_backend_plan_test
+        ${CMAKE_SOURCE_DIR}/src/tests/sampling_backend_plan_test.cc
+    )
+    set_target_properties(sampling_backend_plan_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(sampling_backend_plan_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SamplingBackendPlanTests
+        COMMAND $<TARGET_FILE:sampling_backend_plan_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST SamplingBackendPlanTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# pinned_topology_view tests — cudaHostRegister round-trip for the GPU substrate.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/pinned_topology_view_test.cc")
+    add_executable(pinned_topology_view_test
+        ${CMAKE_SOURCE_DIR}/src/tests/pinned_topology_view_test.cc
+    )
+    set_target_properties(pinned_topology_view_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(pinned_topology_view_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME PinnedTopologyViewTests
+        COMMAND $<TARGET_FILE:pinned_topology_view_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST PinnedTopologyViewTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# symmetric_topology_view tests — useSymmetricTopology resolution + in-RAM merge
+# + single-slice FORWARD_ONLY pin (GPU-UVA). CI-friendly (no-GPU = documented no-op).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/symmetric_topology_view_test.cc")
+    add_executable(symmetric_topology_view_test
+        ${CMAKE_SOURCE_DIR}/src/tests/symmetric_topology_view_test.cc
+    )
+    set_target_properties(symmetric_topology_view_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(symmetric_topology_view_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SymmetricTopologyViewTests
+        COMMAND $<TARGET_FILE:symmetric_topology_view_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST SymmetricTopologyViewTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# release-directional-tiers + in-process RSS probe tests — the symmetric GPU pin
+# frees the directional tiers once the merged slice is pinned; process_memory.h
+# surfaces the peak/current RSS so the relief is observable.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_release_directional_test.cc")
+    add_executable(four_level_topology_release_directional_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_release_directional_test.cc
+    )
+    set_target_properties(four_level_topology_release_directional_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_release_directional_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyReleaseDirectionalTests
+        COMMAND $<TARGET_FILE:four_level_topology_release_directional_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyReleaseDirectionalTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# gpu_khop_sampler tests — statistical validation of the GPU reservoir+Philox
+# sampling kernel (short-circuit, no-replacement, uniformity, determinism).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gpu_khop_sampler_test.cc")
+    add_executable(gpu_khop_sampler_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gpu_khop_sampler_test.cc
+    )
+    set_target_properties(gpu_khop_sampler_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(gpu_khop_sampler_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GpuKhopSamplerTests
+        COMMAND $<TARGET_FILE:gpu_khop_sampler_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST GpuKhopSamplerTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# FourLevelTopologyStore dispatcher tests
+# ============================================================================
+# Validates the tier-dispatch skeleton: L1/L2 hits, L3 sidecar absence
+# falls through to L4, L4 BPT fallback, defensive throws on missing
+# fallback configuration, isolated nodes across tiers, multi-tier graph
+# consistency, out-of-range row_lookup behavior. The build orchestration
+# is exercised separately; this suite pins only the dispatch contract.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_store_test.cc")
+    add_executable(four_level_topology_store_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_store_test.cc
+    )
+    set_target_properties(four_level_topology_store_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_store_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyStoreTests
+        COMMAND $<TARGET_FILE:four_level_topology_store_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyStoreTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# TopologyAccessor four-level integration tests
+# ============================================================================
+# End-to-end check that enable_four_level_store() over a live ProjectionStorage
+# returns byte-identical neighbour sets vs the BPT-direct path, that the
+# default-disabled path preserves the sidecar / adjacency-cache behaviour,
+# and that SamplingConfig::validate() rejects the incompatible combination
+# (four-level store enabled while the adjacency cache is disabled).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_four_level_integration_test.cc")
+    add_executable(topology_accessor_four_level_integration_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_four_level_integration_test.cc
+    )
+    set_target_properties(topology_accessor_four_level_integration_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_accessor_four_level_integration_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologyAccessorFourLevelIntegrationTests
+        COMMAND $<TARGET_FILE:topology_accessor_four_level_integration_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologyAccessorFourLevelIntegrationTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# Four-Level Topology Store tagged-ObjectId dispatch regression
+# ============================================================================
+# Guards the row_lookup_ tag-mask fix: production projections store nodes
+# with ObjectId.id = (MASK_NODE | row_idx), and pre-fix the dispatcher
+# treated the tag bits as part of the row index — landing every lookup in
+# the L4 BPT-fallback path and emitting the "exceeds tier_lookup_ size"
+# warning observed by scripts/bench_four_level_topology.sh. The 3 tests
+# here exercise the same row_lookup_ closure that the bench's
+# `gnn_offline_sample` invocation drives, but in-process so a gtest can
+# pin the regression without spinning up the HTTP server.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_tag_dispatch_test.cc")
+    add_executable(four_level_topology_tag_dispatch_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_tag_dispatch_test.cc
+    )
+    set_target_properties(four_level_topology_tag_dispatch_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_tag_dispatch_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyTagDispatchTests
+        COMMAND $<TARGET_FILE:four_level_topology_tag_dispatch_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyTagDispatchTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# FourLevelTopologyStore symmetric (pre-merged undirected) tier unit tests
+# ============================================================================
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_sym_test.cc")
+    add_executable(four_level_topology_sym_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_sym_test.cc
+    )
+    set_target_properties(four_level_topology_sym_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_sym_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologySymTests
+        COMMAND $<TARGET_FILE:four_level_topology_sym_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologySymTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# FourLevelTopologyStore warm-start activation tests
+# ============================================================================
+# Exercises the round-trip between gnn_offline_sample's `node_counts.bin`
+# writer and the TopologyFrequencyProfiler reader, plus the activation
+# of FourLevelTopologyStore::compute_l3_minhash_reorder_'s warm-start
+# branch. Cold-start path remains the default and is preserved.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_warm_start_test.cc")
+    add_executable(four_level_topology_warm_start_test
+        ${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_warm_start_test.cc
+    )
+    set_target_properties(four_level_topology_warm_start_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(four_level_topology_warm_start_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME FourLevelTopologyWarmStartTests
+        COMMAND $<TARGET_FILE:four_level_topology_warm_start_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST FourLevelTopologyWarmStartTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# Multi-layer k-hop sampling determinism tests
+# ============================================================================
+# Complements the single-layer sample_neighbors determinism tests. Exercises
+# TopologyAccessor::sample_khop_neighbors under the 3×N matrix of
+# orientations × fanout shapes, asserting bit-identical output between the
+# CSR fast-path and the B+Tree fallback for fixed RNG seeds. Also covers
+# the mixed-path scenario where topology_rev.csr is deleted after build.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gnn_sampling_snapshot_test.cc")
+    add_executable(gnn_sampling_snapshot_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_sampling_snapshot_test.cc
+    )
+    set_target_properties(gnn_sampling_snapshot_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # Link order mirrors topology_accessor_csr_path_test: gtest_main before
+    # millenniumdb (wins over serdi's main), and mdb_gnn_core before the
+    # trailing millenniumdb so symbols from the GNN module resolve first.
+    target_link_libraries(gnn_sampling_snapshot_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnSamplingSnapshotTests
+        COMMAND $<TARGET_FILE:gnn_sampling_snapshot_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# gnn_build_topology_snapshot procedure unit tests
+# ============================================================================
+# EXISTS-gated so the target is only configured once the procedure source
+# lands. Shares the GTest linking recipe with the other projection tests.
+# Requires ENABLE_GNN because the procedure itself lives in mdb_gnn_core.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.cc")
+    add_executable(gnn_build_topology_snapshot_procedure_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_build_topology_snapshot_procedure_test.cc
+    )
+    set_target_properties(gnn_build_topology_snapshot_procedure_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
+    # over serdi's main(). mdb_gnn_core carries the procedure impl, and
+    # millenniumdb provides ProjectionStorage + BPlusTree — the usual
+    # link-order rule (mdb_gnn_core before trailing millenniumdb) applies.
+    target_link_libraries(gnn_build_topology_snapshot_procedure_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnBuildTopologySnapshotProcedureTests
+        COMMAND $<TARGET_FILE:gnn_build_topology_snapshot_procedure_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Symmetric topology parallel-edge guard unit tests
+# ============================================================================
+# Constructs ProjectionStorage + scans a BPlusTree<3>, so it needs the full
+# millenniumdb link (same recipe as gnn_build_topology_snapshot_procedure_test).
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_symmetric_parallel_edge_test.cc")
+    add_executable(topology_symmetric_parallel_edge_test
+        ${CMAKE_SOURCE_DIR}/src/tests/topology_symmetric_parallel_edge_test.cc
+    )
+    set_target_properties(topology_symmetric_parallel_edge_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(topology_symmetric_parallel_edge_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME TopologySymmetricParallelEdgeTests
+        COMMAND $<TARGET_FILE:topology_symmetric_parallel_edge_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST TopologySymmetricParallelEdgeTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# Post-hoc symmetric topology bake unit tests
+# ============================================================================
+# Builds a TopologyAccessor (needs torch + mdb_gnn_core) and a ProjectionStorage,
+# so it uses the same full link recipe as gnn_build_topology_snapshot_procedure_test.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gnn_build_topology_snapshot_symmetric_test.cc")
+    add_executable(gnn_build_topology_snapshot_symmetric_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_build_topology_snapshot_symmetric_test.cc
+    )
+    set_target_properties(gnn_build_topology_snapshot_symmetric_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(gnn_build_topology_snapshot_symmetric_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnBuildTopologySnapshotSymmetricTests
+        COMMAND $<TARGET_FILE:gnn_build_topology_snapshot_symmetric_test>
+        WORKING_DIRECTORY tests
+    )
+    set(ASAN_SUPP_FILE "${CMAKE_SOURCE_DIR}/tests/asan_suppressions.txt")
+    if(EXISTS "${ASAN_SUPP_FILE}")
+        set_property(TEST GnnBuildTopologySnapshotSymmetricTests PROPERTY
+            ENVIRONMENT "LSAN_OPTIONS=suppressions=${ASAN_SUPP_FILE}")
+    endif()
+endif()
 
+# ============================================================================
+# GNN procedure metadata consistency tests (yield_fields vs runtime yields)
+# ============================================================================
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/gnn_train_procedure_metadata_test.cc")
+    add_executable(gnn_train_procedure_metadata_test
+        ${CMAKE_SOURCE_DIR}/src/tests/gnn_train_procedure_metadata_test.cc
+    )
+    set_target_properties(gnn_train_procedure_metadata_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(gnn_train_procedure_metadata_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME GnnTrainProcedureMetadataTests
+        COMMAND $<TARGET_FILE:gnn_train_procedure_metadata_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# SampleStorage commit/abort protocol tests
+# ============================================================================
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/sample_storage_test.cc")
+    add_executable(sample_storage_test
+        ${CMAKE_SOURCE_DIR}/src/tests/sample_storage_test.cc
+    )
+    set_target_properties(sample_storage_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(sample_storage_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SampleStorageTests
+        COMMAND $<TARGET_FILE:sample_storage_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# sample_storage_shard tests — golden compare: sharded write == legacy write.
+if(GTest_FOUND AND ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/tests/sample_storage_shard_test.cc")
+    add_executable(sample_storage_shard_test
+        ${CMAKE_SOURCE_DIR}/src/tests/sample_storage_shard_test.cc
+    )
+    set_target_properties(sample_storage_shard_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    target_link_libraries(sample_storage_shard_test
+        GTest::gtest_main
+        GTest::gtest
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+    add_test(
+        NAME SampleStorageShardTests
+        COMMAND $<TARGET_FILE:sample_storage_shard_test>
+        WORKING_DIRECTORY tests
+    )
+endif()
 
+# ============================================================================
+# Isolated TopologyAccessor micro-benchmark
+# ============================================================================
+# Standalone binary that measures `TopologyAccessor::sample_khop_neighbors`
+# wall-clock on a preexisting projection under two modes (CSR sidecars
+# present vs parked). Built only when ENABLE_GNN because it links the GNN
+# module. No gtest dependency — it's a plain CLI binary but mirrors the
+# link recipe used by the snapshot/accessor unit tests.
+if(ENABLE_GNN AND
+   EXISTS "${CMAKE_SOURCE_DIR}/src/bench/bench_topology_micro.cc")
+    add_executable(bench_topology_micro
+        ${CMAKE_SOURCE_DIR}/src/bench/bench_topology_micro.cc
+    )
+    set_target_properties(bench_topology_micro PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/libtorch/lib"
+    )
+    # Link order mirrors gnn_sampling_snapshot_test: mdb_gnn_core before
+    # the trailing millenniumdb so GNN symbols resolve first.
+    target_link_libraries(bench_topology_micro
+        mdb_gnn_core
+        millenniumdb
+        antlr4_cpp_runtime
+        ${FS}
+        ssl
+        crypto
+        ${ICU_LIBRARIES}
+        ${ASYNC_IO_LIBS}
+        ${TBB_LIBS}
+        ${LZ4_LIBS}
+        ${TORCH_LIBRARIES}
+    )
+endif()
 
 # ============================================================================
 # BatchedEdgeAggregator unit tests

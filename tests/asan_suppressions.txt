@@ -1,0 +1,11 @@
+# ASan/LSan suppressions for known false positives
+#
+# CUDA driver (libcuda.so) allocates ~408 bytes during cuInit() that are
+# never freed — this is an intentional singleton in NVIDIA's proprietary
+# driver, not a leak in our code. The OS reclaims it at process exit.
+#
+# Without this suppression, any test that calls torch::cuda::is_available()
+# triggers LeakSanitizer and causes ctest to report FAILED despite all
+# test assertions passing.
+leak:cuInit
+leak:libcuda.so

@@ -1,0 +1,655 @@
+#include <gtest/gtest.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <vector>
+
+#include "gnn/core/feature_assembler.h"
+
+using namespace mdb::gnn;
+
+// =============================================================================
+// Basic Fallback Assembly Tests
+// =============================================================================
+
+TEST(FeatureAssemblerTest, FallbackAssemblesCorrectly) {
+    constexpr int64_t N = 5, D = 4;
+    FeatureAssembler assembler(D);
+
+    // 2 nodes from "GPU" (actually CPU tensor for this test)
+    auto gpu_features = torch::tensor({{1.f, 2.f, 3.f, 4.f},
+                                       {5.f, 6.f, 7.f, 8.f}});
+    std::vector<uint32_t> gpu_pos = {0, 3};
+
+    // 3 nodes from CPU buffer
+    float cpu_data[] = {10.f,  20.f,  30.f,  40.f,
+                        50.f,  60.f,  70.f,  80.f,
+                        90.f, 100.f, 110.f, 120.f};
+    std::vector<uint32_t> cpu_pos = {1, 2, 4};
+
+    auto output = assembler.assemble(N, gpu_features, gpu_pos,
+                                     cpu_data, 3, cpu_pos);
+
+    EXPECT_EQ(output.size(0), N);
+    EXPECT_EQ(output.size(1), D);
+
+    auto acc = output.accessor<float, 2>();
+    // Position 0: gpu row 0 -> [1, 2, 3, 4]
+    EXPECT_FLOAT_EQ(acc[0][0], 1.f);
+    EXPECT_FLOAT_EQ(acc[0][1], 2.f);
+    EXPECT_FLOAT_EQ(acc[0][2], 3.f);
+    EXPECT_FLOAT_EQ(acc[0][3], 4.f);
+    // Position 3: gpu row 1 -> [5, 6, 7, 8]
+    EXPECT_FLOAT_EQ(acc[3][0], 5.f);
+    EXPECT_FLOAT_EQ(acc[3][1], 6.f);
+    EXPECT_FLOAT_EQ(acc[3][2], 7.f);
+    EXPECT_FLOAT_EQ(acc[3][3], 8.f);
+    // Position 1: cpu row 0 -> [10, 20, 30, 40]
+    EXPECT_FLOAT_EQ(acc[1][0], 10.f);
+    EXPECT_FLOAT_EQ(acc[1][1], 20.f);
+    EXPECT_FLOAT_EQ(acc[1][2], 30.f);
+    EXPECT_FLOAT_EQ(acc[1][3], 40.f);
+    // Position 2: cpu row 1 -> [50, 60, 70, 80]
+    EXPECT_FLOAT_EQ(acc[2][0], 50.f);
+    EXPECT_FLOAT_EQ(acc[2][1], 60.f);
+    EXPECT_FLOAT_EQ(acc[2][2], 70.f);
+    EXPECT_FLOAT_EQ(acc[2][3], 80.f);
+    // Position 4: cpu row 2 -> [90, 100, 110, 120]
+    EXPECT_FLOAT_EQ(acc[4][0], 90.f);
+    EXPECT_FLOAT_EQ(acc[4][1], 100.f);
+    EXPECT_FLOAT_EQ(acc[4][2], 110.f);
+    EXPECT_FLOAT_EQ(acc[4][3], 120.f);
+}
+
+// =============================================================================
+// Edge Cases: Empty Partitions
+// =============================================================================
+
+TEST(FeatureAssemblerTest, EmptyGpuFeatures) {
+    FeatureAssembler assembler(4);
+    auto empty_gpu = torch::empty({0, 4});
+    float cpu_data[] = {1.f, 2.f, 3.f, 4.f};
+    auto output = assembler.assemble(1, empty_gpu, {}, cpu_data, 1, {0});
+
+    EXPECT_EQ(output.size(0), 1);
+    EXPECT_EQ(output.size(1), 4);
+    EXPECT_FLOAT_EQ(output[0][0].item<float>(), 1.f);
+    EXPECT_FLOAT_EQ(output[0][1].item<float>(), 2.f);
+    EXPECT_FLOAT_EQ(output[0][2].item<float>(), 3.f);
+    EXPECT_FLOAT_EQ(output[0][3].item<float>(), 4.f);
+}
+
+TEST(FeatureAssemblerTest, EmptyCpuFeatures) {
+    FeatureAssembler assembler(4);
+    auto gpu = torch::tensor({{1.f, 2.f, 3.f, 4.f}});
+    auto output = assembler.assemble(1, gpu, {0}, nullptr, 0, {});
+
+    EXPECT_EQ(output.size(0), 1);
+    EXPECT_EQ(output.size(1), 4);
+    EXPECT_FLOAT_EQ(output[0][0].item<float>(), 1.f);
+    EXPECT_FLOAT_EQ(output[0][1].item<float>(), 2.f);
+    EXPECT_FLOAT_EQ(output[0][2].item<float>(), 3.f);
+    EXPECT_FLOAT_EQ(output[0][3].item<float>(), 4.f);
+}
+
+TEST(FeatureAssemblerTest, AllEmpty) {
+    FeatureAssembler assembler(4);
+    auto output = assembler.assemble(0, torch::empty({0, 4}), {},
+                                     nullptr, 0, {});
+    EXPECT_EQ(output.size(0), 0);
+    EXPECT_EQ(output.size(1), 4);
+}
+
+// =============================================================================
+// Constructor Validation
+// =============================================================================
+
+TEST(FeatureAssemblerTest, InvalidFeatureDimThrows) {
+    EXPECT_THROW(FeatureAssembler(0), std::invalid_argument);
+    EXPECT_THROW(FeatureAssembler(-1), std::invalid_argument);
+}
+
+TEST(FeatureAssemblerTest, ValidFeatureDimDoesNotThrow) {
+    EXPECT_NO_THROW(FeatureAssembler(1));
+    EXPECT_NO_THROW(FeatureAssembler(128));
+    EXPECT_NO_THROW(FeatureAssembler(4096));
+}
+
+// =============================================================================
+// Single-Element Partitions
+// =============================================================================
+
+TEST(FeatureAssemblerTest, SingleGpuNode) {
+    constexpr int64_t D = 3;
+    FeatureAssembler assembler(D);
+    auto gpu = torch::tensor({{10.f, 20.f, 30.f}});
+    auto output = assembler.assemble(1, gpu, {0}, nullptr, 0, {});
+
+    auto acc = output.accessor<float, 2>();
+    EXPECT_FLOAT_EQ(acc[0][0], 10.f);
+    EXPECT_FLOAT_EQ(acc[0][1], 20.f);
+    EXPECT_FLOAT_EQ(acc[0][2], 30.f);
+}
+
+TEST(FeatureAssemblerTest, SingleCpuNode) {
+    constexpr int64_t D = 3;
+    FeatureAssembler assembler(D);
+    float cpu_data[] = {10.f, 20.f, 30.f};
+    auto output = assembler.assemble(1, torch::empty({0, D}), {},
+                                     cpu_data, 1, {0});
+
+    auto acc = output.accessor<float, 2>();
+    EXPECT_FLOAT_EQ(acc[0][0], 10.f);
+    EXPECT_FLOAT_EQ(acc[0][1], 20.f);
+    EXPECT_FLOAT_EQ(acc[0][2], 30.f);
+}
+
+// =============================================================================
+// Large Feature Dimension
+// =============================================================================
+
+TEST(FeatureAssemblerTest, LargeFeatureDim) {
+    constexpr int64_t N = 4, D = 512;
+    FeatureAssembler assembler(D);
+
+    // 2 GPU nodes, 2 CPU nodes
+    auto gpu = torch::arange(2 * D, torch::kFloat32).reshape({2, D});
+    std::vector<uint32_t> gpu_pos = {0, 2};
+
+    std::vector<float> cpu_data(2 * D);
+    std::iota(cpu_data.begin(), cpu_data.end(), 1000.f);
+    std::vector<uint32_t> cpu_pos = {1, 3};
+
+    auto output = assembler.assemble(N, gpu, gpu_pos,
+                                     cpu_data.data(), 2, cpu_pos);
+
+    ASSERT_EQ(output.size(0), N);
+    ASSERT_EQ(output.size(1), D);
+
+    auto acc = output.accessor<float, 2>();
+    // gpu row 0 -> position 0: first element is 0.f
+    EXPECT_FLOAT_EQ(acc[0][0], 0.f);
+    // gpu row 1 -> position 2: first element is D (512.f)
+    EXPECT_FLOAT_EQ(acc[2][0], static_cast<float>(D));
+    // cpu row 0 -> position 1: first element is 1000.f
+    EXPECT_FLOAT_EQ(acc[1][0], 1000.f);
+    // cpu row 1 -> position 3: first element is 1000 + D
+    EXPECT_FLOAT_EQ(acc[3][0], 1000.f + static_cast<float>(D));
+}
+
+// =============================================================================
+// Non-Contiguous Position Indices
+// =============================================================================
+
+TEST(FeatureAssemblerTest, SparsePositions) {
+    constexpr int64_t D = 2;
+    FeatureAssembler assembler(D);
+
+    // 10 total nodes, but only fill positions 1, 5, 9
+    auto gpu = torch::tensor({{1.f, 2.f}});
+    float cpu_data[] = {3.f, 4.f, 5.f, 6.f};
+
+    auto output = assembler.assemble(10, gpu, {5},
+                                     cpu_data, 2, {1, 9});
+
+    auto acc = output.accessor<float, 2>();
+    // Unfilled positions should be zero
+    EXPECT_FLOAT_EQ(acc[0][0], 0.f);
+    EXPECT_FLOAT_EQ(acc[0][1], 0.f);
+    // Position 5: gpu
+    EXPECT_FLOAT_EQ(acc[5][0], 1.f);
+    EXPECT_FLOAT_EQ(acc[5][1], 2.f);
+    // Position 1: cpu row 0
+    EXPECT_FLOAT_EQ(acc[1][0], 3.f);
+    EXPECT_FLOAT_EQ(acc[1][1], 4.f);
+    // Position 9: cpu row 1
+    EXPECT_FLOAT_EQ(acc[9][0], 5.f);
+    EXPECT_FLOAT_EQ(acc[9][1], 6.f);
+    // Spot-check another unfilled position
+    EXPECT_FLOAT_EQ(acc[7][0], 0.f);
+}
+
+// =============================================================================
+// assemble_simple Interface
+// =============================================================================
+
+TEST(FeatureAssemblerTest, AssembleSimpleMatchesAssemble) {
+    constexpr int64_t N = 4, D = 3;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::tensor({{1.f, 2.f, 3.f}, {4.f, 5.f, 6.f}});
+    std::vector<uint32_t> gpu_pos = {0, 2};
+
+    auto cpu = torch::tensor({{7.f, 8.f, 9.f}, {10.f, 11.f, 12.f}});
+    std::vector<uint32_t> cpu_pos = {1, 3};
+
+    // Use assemble_simple (takes torch::Tensor for CPU features)
+    auto simple_out = assembler.assemble_simple(N, gpu, gpu_pos, cpu, cpu_pos);
+
+    // Use assemble (takes raw float* for CPU features)
+    auto cpu_contig = cpu.contiguous();
+    auto raw_out = assembler.assemble(N, gpu, gpu_pos,
+                                      cpu_contig.data_ptr<float>(), 2, cpu_pos);
+
+    auto diff = (simple_out - raw_out).abs().max().item<float>();
+    EXPECT_FLOAT_EQ(diff, 0.f);
+}
+
+TEST(FeatureAssemblerTest, AssembleSimpleEmptyCpu) {
+    constexpr int64_t D = 3;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::tensor({{1.f, 2.f, 3.f}});
+    auto empty_cpu = torch::empty({0, D});
+
+    auto output = assembler.assemble_simple(1, gpu, {0}, empty_cpu, {});
+    EXPECT_FLOAT_EQ(output[0][0].item<float>(), 1.f);
+}
+
+// =============================================================================
+// Fallback Explicitly Called (Exposed for Testing)
+// =============================================================================
+
+TEST(FeatureAssemblerTest, FallbackDirectCall) {
+    constexpr int64_t N = 3, D = 2;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::tensor({{1.f, 2.f}});
+    float cpu_data[] = {3.f, 4.f, 5.f, 6.f};
+
+    auto output = assembler.assemble_fallback(N, gpu, {0},
+                                              cpu_data, 2, {1, 2});
+
+    auto acc = output.accessor<float, 2>();
+    EXPECT_FLOAT_EQ(acc[0][0], 1.f);
+    EXPECT_FLOAT_EQ(acc[0][1], 2.f);
+    EXPECT_FLOAT_EQ(acc[1][0], 3.f);
+    EXPECT_FLOAT_EQ(acc[1][1], 4.f);
+    EXPECT_FLOAT_EQ(acc[2][0], 5.f);
+    EXPECT_FLOAT_EQ(acc[2][1], 6.f);
+}
+
+// =============================================================================
+// Interleaved GPU/CPU Positions
+// =============================================================================
+
+TEST(FeatureAssemblerTest, InterleavedPositions) {
+    constexpr int64_t N = 6, D = 2;
+    FeatureAssembler assembler(D);
+
+    // GPU features at even positions, CPU at odd positions
+    auto gpu = torch::tensor({{10.f, 11.f}, {20.f, 21.f}, {30.f, 31.f}});
+    std::vector<uint32_t> gpu_pos = {0, 2, 4};
+
+    float cpu_data[] = {40.f, 41.f, 50.f, 51.f, 60.f, 61.f};
+    std::vector<uint32_t> cpu_pos = {1, 3, 5};
+
+    auto output = assembler.assemble(N, gpu, gpu_pos, cpu_data, 3, cpu_pos);
+
+    auto acc = output.accessor<float, 2>();
+    EXPECT_FLOAT_EQ(acc[0][0], 10.f);
+    EXPECT_FLOAT_EQ(acc[1][0], 40.f);
+    EXPECT_FLOAT_EQ(acc[2][0], 20.f);
+    EXPECT_FLOAT_EQ(acc[3][0], 50.f);
+    EXPECT_FLOAT_EQ(acc[4][0], 30.f);
+    EXPECT_FLOAT_EQ(acc[5][0], 60.f);
+}
+
+// =============================================================================
+// Many Nodes (Stress Test for Thread Cooperation)
+// =============================================================================
+
+TEST(FeatureAssemblerTest, ManyNodes) {
+    constexpr int64_t N = 1000, D = 64;
+    constexpr int64_t K_GPU = 200, K_CPU = 800;
+    FeatureAssembler assembler(D);
+
+    // GPU: positions 0..199
+    auto gpu = torch::arange(K_GPU * D, torch::kFloat32).reshape({K_GPU, D});
+    std::vector<uint32_t> gpu_pos(K_GPU);
+    std::iota(gpu_pos.begin(), gpu_pos.end(), 0);
+
+    // CPU: positions 200..999
+    std::vector<float> cpu_data(K_CPU * D);
+    for (int64_t i = 0; i < K_CPU * D; ++i) {
+        cpu_data[i] = static_cast<float>(10000 + i);
+    }
+    std::vector<uint32_t> cpu_pos(K_CPU);
+    std::iota(cpu_pos.begin(), cpu_pos.end(), static_cast<uint32_t>(K_GPU));
+
+    auto output = assembler.assemble(N, gpu, gpu_pos,
+                                     cpu_data.data(), K_CPU, cpu_pos);
+
+    ASSERT_EQ(output.size(0), N);
+    ASSERT_EQ(output.size(1), D);
+
+    auto acc = output.accessor<float, 2>();
+
+    // Check a few GPU positions
+    EXPECT_FLOAT_EQ(acc[0][0], 0.f);
+    EXPECT_FLOAT_EQ(acc[199][0], 199.f * D);
+
+    // Check a few CPU positions
+    EXPECT_FLOAT_EQ(acc[200][0], 10000.f);
+    EXPECT_FLOAT_EQ(acc[999][0], 10000.f + (K_CPU - 1) * D);
+}
+
+// =============================================================================
+// CUDA Path (only runs when CUDA is available)
+// =============================================================================
+
+// =============================================================================
+// Large Dimension Tiling (D=2048 exceeds typical CUDA block size of 256)
+// CUDA kernel should tile: for (feat = threadIdx.x; feat < D; feat += blockDim.x)
+// =============================================================================
+
+TEST(FeatureAssemblerTest, LargeDimensionTiling) {
+    constexpr int64_t N = 4, D = 2048;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::randn({2, D});
+    std::vector<uint32_t> gpu_pos = {0, 2};
+
+    std::vector<float> cpu_data(2 * D);
+    for (auto& v : cpu_data) v = 1.0f;
+    std::vector<uint32_t> cpu_pos = {1, 3};
+
+    auto output = assembler.assemble(N, gpu, gpu_pos, cpu_data.data(), 2, cpu_pos);
+    EXPECT_EQ(output.size(0), N);
+    EXPECT_EQ(output.size(1), D);
+
+    // Verify CPU rows are all 1.0
+    auto acc = output.accessor<float, 2>();
+    for (int d = 0; d < D; ++d) {
+        EXPECT_FLOAT_EQ(acc[1][d], 1.0f) << "CPU row 1, dim " << d;
+        EXPECT_FLOAT_EQ(acc[3][d], 1.0f) << "CPU row 3, dim " << d;
+    }
+
+    // Verify GPU rows match the random tensor
+    auto gpu_acc = gpu.accessor<float, 2>();
+    for (int d = 0; d < D; ++d) {
+        EXPECT_FLOAT_EQ(acc[0][d], gpu_acc[0][d]) << "GPU row 0, dim " << d;
+        EXPECT_FLOAT_EQ(acc[2][d], gpu_acc[1][d]) << "GPU row 2, dim " << d;
+    }
+}
+
+// =============================================================================
+// Position Bounds Validation (throws std::out_of_range)
+// =============================================================================
+
+TEST(FeatureAssemblerTest, GpuPositionOutOfBoundsThrows) {
+    FeatureAssembler assembler(4);
+    auto gpu = torch::randn({1, 4});
+    // Position 5 >= total_nodes 3 -> should throw
+    EXPECT_THROW(
+        assembler.assemble(3, gpu, {5}, nullptr, 0, {}),
+        std::out_of_range);
+}
+
+TEST(FeatureAssemblerTest, CpuPositionOutOfBoundsThrows) {
+    FeatureAssembler assembler(4);
+    float data[] = {1, 2, 3, 4};
+    // Position 5 >= total_nodes 2 -> should throw
+    EXPECT_THROW(
+        assembler.assemble(2, torch::empty({0, 4}), {}, data, 1, {5}),
+        std::out_of_range);
+}
+
+// =============================================================================
+// CUDA Path (only runs when CUDA is available)
+// =============================================================================
+
+#ifdef ENABLE_CUDA_ASSEMBLER
+TEST(FeatureAssemblerTest, CudaKernelMatchesFallback) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available, skipping CUDA kernel test";
+    }
+
+    constexpr int64_t N = 10, D = 8;
+    FeatureAssembler assembler(D);
+
+    // Create random test data on GPU
+    auto gpu_features = torch::randn({3, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 4, 7};
+
+    // CPU features (7 rows for positions 1,2,3,5,6,8,9). Pinned: the CUDA
+    // kernel reads this buffer from device threads via UVA, which is only
+    // legal for page-locked memory — a pageable buffer would be routed to
+    // the fallback and the kernel would never run.
+    auto cpu_pinned = torch::empty({7, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu_data = cpu_pinned.data_ptr<float>();
+    std::srand(42);
+    for (int64_t i = 0; i < 7 * D; ++i) {
+        cpu_data[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    }
+    std::vector<uint32_t> cpu_pos = {1, 2, 3, 5, 6, 8, 9};
+
+    // Run CUDA path
+    auto cuda_result = assembler.assemble(N, gpu_features, gpu_pos,
+                                          cpu_data, 7, cpu_pos);
+
+    // Run fallback on CPU
+    auto fb_result = assembler.assemble_fallback(N, gpu_features.cpu(), gpu_pos,
+                                                 cpu_data, 7, cpu_pos);
+
+    // Compare: the results should match within float precision
+    auto diff = (cuda_result.cpu() - fb_result).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-5f);
+}
+
+// ===========================================================================
+// Dual-stream training support: assemble_cuda honours the current CUDA
+// stream set via c10::cuda::CUDAStreamGuard.
+// ===========================================================================
+
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+
+TEST(FeatureAssemblerTest, AssembleCuda_BitIdenticalAcrossStreams) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    const int64_t N = 64, D = 32;
+    FeatureAssembler assembler(D);
+
+    // Build a small synthetic input: 16 nodes from GPU, 16 from CPU pinned.
+    auto gpu_features = torch::arange(0.0f, 16.0f * D,
+        torch::TensorOptions().dtype(torch::kFloat32))
+        .reshape({16, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos;
+    for (int i = 0; i < 16; ++i) gpu_pos.push_back(i);
+
+    // Pinned host buffer — required for the CUDA kernel's UVA reads.
+    auto cpu_pinned = torch::empty({16, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu_buf = cpu_pinned.data_ptr<float>();
+    for (int64_t i = 0; i < 16 * D; ++i) cpu_buf[i] = static_cast<float>(i + 1000);
+    std::vector<uint32_t> cpu_pos;
+    for (int i = 16; i < 32; ++i) cpu_pos.push_back(i);
+
+    // Run on default stream (no guard).
+    auto out_default = assembler.assemble(N, gpu_features, gpu_pos,
+                                           cpu_buf, 16, cpu_pos);
+
+    // Run on a non-default stream from the pool.
+    auto custom_stream = c10::cuda::getStreamFromPool();
+    torch::Tensor out_custom;
+    {
+        c10::cuda::CUDAStreamGuard guard(custom_stream);
+        out_custom = assembler.assemble(N, gpu_features, gpu_pos,
+                                         cpu_buf, 16, cpu_pos);
+    }
+
+    auto diff = (out_default - out_custom).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-6f)
+        << "assemble_cuda must produce bit-identical output regardless of"
+           " which stream is active when called";
+}
+
+// ===========================================================================
+// Pageable cpu_data must not reach the CUDA kernel: the UVA reads are only
+// legal for page-locked memory, so assemble() routes pageable pointers to
+// the index_copy_ fallback and still produces the correct output.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, PageableCpuPointerTakesFallbackSafely) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 6, D = 4;
+    FeatureAssembler assembler(D);
+
+    auto gpu_features = torch::randn({2, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 3};
+
+    // Plain pageable heap buffer.
+    std::vector<float> pageable(4 * D);
+    for (size_t i = 0; i < pageable.size(); ++i) {
+        pageable[i] = static_cast<float>(i);
+    }
+    std::vector<uint32_t> cpu_pos = {1, 2, 4, 5};
+
+    auto out = assembler.assemble(N, gpu_features, gpu_pos,
+                                  pageable.data(), 4, cpu_pos);
+    auto ref = assembler.assemble_fallback(N, gpu_features, gpu_pos,
+                                           pageable.data(), 4, cpu_pos);
+
+    auto diff = (out.cpu() - ref.cpu()).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-6f);
+}
+
+// ===========================================================================
+// assemble_simple must hand assemble() a device-accessible (pinned) holder
+// when dispatch will take the CUDA kernel, and the result must match the
+// fallback.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, AssembleSimpleCudaMatchesFallback) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 5, D = 3;
+    FeatureAssembler assembler(D);
+
+    auto l1 = torch::randn({2, D}).to(torch::kCUDA);
+    std::vector<uint32_t> l1_pos = {0, 2};
+
+    auto cpu = torch::tensor({{7.f, 8.f, 9.f},
+                              {10.f, 11.f, 12.f},
+                              {13.f, 14.f, 15.f}});
+    std::vector<uint32_t> cpu_pos = {1, 3, 4};
+
+    auto out = assembler.assemble_simple(N, l1, l1_pos, cpu, cpu_pos);
+    auto cpu_contig = cpu.contiguous();
+    auto ref = assembler.assemble_fallback(N, l1, l1_pos,
+                                           cpu_contig.data_ptr<float>(), 3, cpu_pos);
+
+    auto diff = (out.cpu() - ref.cpu()).abs().max().item<float>();
+    EXPECT_LT(diff, 1e-5f);
+}
+
+// ===========================================================================
+// F3.a: assemble_l2direct (fused 3-source) must be BIT-IDENTICAL to assemble()
+// where the L2 rows were pre-copied into the combined cpu_data buffer. This is
+// the correctness gate for reading L2 straight from the pinned cache via UVA.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, AssembleL2DirectMatchesAssemble) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 12, D = 8;
+    FeatureAssembler assembler(D);
+
+    // L1 on GPU: 3 rows -> output positions {0,5,11}.
+    auto gpu = torch::randn({3, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 5, 11};
+
+    // L2 pinned "cache" of 6 rows; this batch hits slots {4,1,5} -> positions {2,7,9}.
+    auto l2_cache = torch::empty({6, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* l2_base = l2_cache.data_ptr<float>();
+    for (int64_t i = 0; i < 6 * D; ++i) l2_base[i] = static_cast<float>(2000 + i);
+    std::vector<uint32_t> l2_idx = {4, 1, 5};
+    std::vector<uint32_t> l2_pos = {2, 7, 9};
+
+    // L3+L4 combined pinned: 4 rows -> positions {1,3,4,8}. Positions {6,10} zero.
+    auto cpu_pinned = torch::empty({4, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu_data = cpu_pinned.data_ptr<float>();
+    for (int64_t i = 0; i < 4 * D; ++i) cpu_data[i] = static_cast<float>(9000 + i);
+    std::vector<uint32_t> cpu_pos = {1, 3, 4, 8};
+
+    // Fused L2-direct result.
+    auto fused = assembler.assemble_l2direct(N, gpu, gpu_pos,
+        l2_base, l2_idx, l2_pos, cpu_data, 4, cpu_pos);
+
+    // Reference: pre-copy L2 rows into a combined pinned buffer [L2..., L3L4...]
+    // and call the standard 2-source assemble (the pre-F3 behaviour).
+    auto combined = torch::empty({static_cast<int64_t>(l2_idx.size()) + 4, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cbuf = combined.data_ptr<float>();
+    for (size_t i = 0; i < l2_idx.size(); ++i) {
+        std::memcpy(cbuf + i * D, l2_base + static_cast<size_t>(l2_idx[i]) * D,
+                    D * sizeof(float));
+    }
+    std::memcpy(cbuf + l2_idx.size() * D, cpu_data,
+                static_cast<size_t>(4) * D * sizeof(float));
+    std::vector<uint32_t> combined_pos = {2, 7, 9, 1, 3, 4, 8};
+    auto ref = assembler.assemble(N, gpu, gpu_pos, cbuf,
+        static_cast<int64_t>(combined_pos.size()), combined_pos);
+
+    auto diff = (fused.cpu() - ref.cpu()).abs().max().item<float>();
+    EXPECT_FLOAT_EQ(diff, 0.f)
+        << "assemble_l2direct must be bit-identical to assemble() with L2 "
+           "pre-copied into cpu_data";
+}
+
+TEST(FeatureAssemblerTest, AssembleL2DirectSizeMismatchThrows) {
+    FeatureAssembler assembler(4);
+    auto gpu = torch::empty({0, 4});
+    // l2_indices (2) vs l2_positions (1) mismatch -> invalid_argument.
+    EXPECT_THROW(
+        assembler.assemble_l2direct(3, gpu, {}, nullptr, {0, 1}, {0},
+                                    nullptr, 0, {}),
+        std::invalid_argument);
+}
+
+// ===========================================================================
+// B: device-scatter (bulk H2D + HBM read) must be BIT-IDENTICAL to the per-row
+// UVA path. Same cold bytes, just transferred in bulk and read from HBM.
+// ===========================================================================
+
+TEST(FeatureAssemblerTest, DeviceScatterMatchesUva) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    constexpr int64_t N = 10, D = 8;
+    FeatureAssembler assembler(D);
+
+    auto gpu = torch::randn({3, D}).to(torch::kCUDA);
+    std::vector<uint32_t> gpu_pos = {0, 4, 7};
+
+    auto cpu_pinned = torch::empty({7, D},
+        torch::TensorOptions().dtype(torch::kFloat32)).pin_memory();
+    float* cpu = cpu_pinned.data_ptr<float>();
+    std::srand(123);
+    for (int64_t i = 0; i < 7 * D; ++i)
+        cpu[i] = static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
+    std::vector<uint32_t> cpu_pos = {1, 2, 3, 5, 6, 8, 9};
+
+    ::unsetenv("MDB_GNN_DEVICE_SCATTER");
+    auto uva = assembler.assemble(N, gpu, gpu_pos, cpu, 7, cpu_pos);
+    ::setenv("MDB_GNN_DEVICE_SCATTER", "1", 1);
+    auto dev = assembler.assemble(N, gpu, gpu_pos, cpu, 7, cpu_pos);
+    ::unsetenv("MDB_GNN_DEVICE_SCATTER");
+
+    auto diff = (uva.cpu() - dev.cpu()).abs().max().item<float>();
+    EXPECT_FLOAT_EQ(diff, 0.f)
+        << "device-scatter (B) must be bit-identical to the per-row UVA path";
+}
+#endif
+

@@ -29,7 +29,12 @@ public:
     static constexpr char PENDING_DIRECTED_EDGES_FILENAME_PREFIX[] = "tmp_pending_directed_edges";
     static constexpr char PENDING_UNDIRECTED_EDGES_FILENAME_PREFIX[] = "tmp_pending_undirected_edges";
 
-    OnDiskImport(const std::string& db_folder, uint64_t strings_buffer_size, uint64_t tensors_buffer_size);
+    OnDiskImport(
+        const std::string& db_folder,
+        uint64_t strings_buffer_size,
+        uint64_t tensors_buffer_size,
+        const std::string& tensor_file = ""
+    );
 
     ~OnDiskImport();
 
@@ -42,6 +47,9 @@ private:
     uint64_t tensors_buffer_size;
 
     std::string db_folder;
+
+    // Path to NPY file with node embeddings (empty if not provided)
+    std::string tensor_file_;
 
     int* state_transitions;
 
@@ -215,6 +223,11 @@ private:
 
     // sets edge_id and push into undirected_edges or directed_edges
     void save_edge();
+
+#ifdef ENABLE_GNN
+    // Import node embeddings from NPY file into GNN feature matrix
+    void import_node_tensors();
+#endif
 
     // processes a pending file by iterations, until no more pending tuples are available
     // the size of the tuples and a resolve+save function must be provided.
