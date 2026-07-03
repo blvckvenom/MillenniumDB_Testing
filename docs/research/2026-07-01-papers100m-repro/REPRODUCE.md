@@ -14,8 +14,8 @@ apuntando al sample viejo `e2e5ep` que ya no existe). Este doc es la fuente úni
 | Métrica | Valor |
 |---|---|
 | **Test accuracy (final, época 50)** | **0.6527** |
-| **Test accuracy (mejor modelo registrado, época 47)** | **0.6527** |
-| **Best validation accuracy** | **0.6836** (época 47) |
+| **Test accuracy (mejor modelo registrado, época 48)** | **0.6527** |
+| **Best validation accuracy** | **0.6836** (época 48 del log; el yield `bestValEpoch` es 0-indexado y reporta 47) |
 | Épocas | 50 (patience 999, sin early-stop) |
 | Wall-clock train | 2204.5 s = 36.7 min |
 | Época steady | ~40.5 s (48 s en épocas con eval de test) |
@@ -25,10 +25,30 @@ Referencia externa: DiskGNN paper best_test 0.6591 / best_val 0.6908 → quedamo
 (dentro de la varianza irreducible de protocolo/muestreo ya caracterizada). Supera el canónico MDB
 previo (~0.6406/0.6742 sobre el sample viejo `e2e5ep`).
 
+## Variante `[20,15,10]` — orden de fanout fiel a DGL/GraphBolt (MEJOR resultado actual)
+
+DGL/GraphBolt aplican la lista de fanout INVERTIDA respecto a MDB (su `fanout[-1]` cae en el hop
+adyacente al seed; en MDB ahí cae `fanout[0]`). Para replicar la semántica del `[10,15,20]` del
+paper, MDB necesita **`[20,15,10]`**. Medido 2026-07-01 con el MISMO pipeline (solo cambian el
+fanout y el nombre del sample → `dedup_20_15_10`; build con `{autoCache:true, force:true,
+bakeBlocks:true}`, autoCache aplicó L1=4706 OOM-free, **0 OOMs cold-start**; train = misma config
+canónica de la Etapa 4):
+
+| Métrica | **[20,15,10]** (`dedup_20_15_10`) | [10,15,20] (`rev_10_15_20`) |
+|---|---|---|
+| Test accuracy (final, ép50) | **0.6564** | 0.6527 |
+| Test @ best-val (mejor modelo) | **0.6566** | 0.6527 |
+| Best validation accuracy | **0.6894** | 0.6836 |
+
+Gap al paper DiskGNN (test 0.6591): **0.27 pt** (antes 0.64) — el orden invertido corta el gap a
+menos de la mitad. `uniqueNodes` 47.95M. Para comparaciones contra papers con convención DGL,
+usar esta variante.
+
 ## Nomenclatura importante (resuelve una ambigüedad real)
 
 El sample se llama **`rev_10_15_20`** pero **NO es `orientation:REVERSE`**. Verificado decodificando
-`samples/rev_10_15_20/catalog.dat`: tiene **48,730,271 nodos únicos**, que corresponde a
+`samples/rev_10_15_20/catalog.dat`: tiene **48,731,295 nodos únicos** (decodificado
+byte-a-byte contra la struct de serialización, 2026-07-02), que corresponde a
 **`orientation:UNDIRECTED`** (REVERSE con el mismo fanout da ~9.16M, medido en la validación Plan F).
 El "rev" del nombre significa "reverse edges added" = undirected (el paper DiskGNN agrega aristas
 inversas para papers100M). **Orientación real = UNDIRECTED.** Fanout `[10,15,20]`, batchSize 1024,
@@ -174,7 +194,8 @@ bestValEpoch 47, ranEpochs 50, trainSeconds ~2205, l1HitRatio ~0.90`. Checkpoint
 `<proj_dir>/gnn_output/acc50_rev/checkpoints/{best_model,final_model}`.
 
 Convergencia (val_acc por época): ép1 0.5646 → ép5 0.6504 → ép12 0.6703 → ép18 0.6768 →
-ép38 0.6834 → **ép47 0.6836 (best)** → ép50 0.6834 (plateau ~0.683 desde ép38).
+ép38 0.6834 → **ép48 0.6836 (best; yield `bestValEpoch`=47, 0-indexado)** → ép50 0.6834
+(plateau ~0.683 desde ép38).
 
 ---
 
@@ -183,8 +204,15 @@ Convergencia (val_acc por época): ép1 0.5646 → ép5 0.6504 → ép12 0.6703 
 1. **`rev_10_15_20` = UNDIRECTED**, no REVERSE (ver "Nomenclatura" arriba). 48.73M nodos únicos.
 2. **Accuracy invariante al cache L1/L2** — solo tiering, no valores de features. 0.6527 se reproduce a
    cualquier tamaño de cache.
-3. **Sample no bit-reproducible run-to-run** con warm-start `node_counts.bin` (±~2k nodos, accuracy
-   ±0.01). Usar `MDB_GNN_FREEZE_NODE_COUNTS=1` o cold-start para bit-identidad.
+3. **Determinismo del sample — depende del path (corregido 2026-07-01):** el drift run-to-run por
+   warm-start `node_counts.bin` (±~2k nodos, accuracy ±0.01; mitigable con
+   `MDB_GNN_FREEZE_NODE_COUNTS=1` o cold-start) aplica al **path CPU/four-level** (donde se midió,
+   2026-06-18). El **path GPU-simétrico** (el default actual cuando `topology_sym.csr` existe) es
+   **bit-reproducible run-to-run**: validado [2,2] seed 42 dos veces → `sampleContentFp
+   b002078316a35e79` y `uniqueNodes 4,363,106` exactos, incluso con `node_counts.bin` reescrito
+   entre corridas (el sample GPU es función pura de seed + `topology_sym.csr` + splits). A fanout
+   completo se espera igual por construcción (no re-validado). Estudio:
+   `docs/research/2026-07-01-sampling-rng-study/RESULTS.md`.
 4. **Cold-start OOM en época 1** si L1 está al límite de VRAM (p.ej. 5426 en 16 GB): 1-6 OOMs
    transitorios → 1-2 batches zero-filled UNA vez, luego self-heal (real-sample-read). Impacto en
    accuracy: nulo. Evitable con el margen OOM-free (autoCache tras la calibración baja L1 a ~4974).

@@ -7,23 +7,28 @@ namespace {
 // Tamaños de una direccion del CSR global a pinear. `present` es false cuando esa
 // direccion no tiene sidecar narrow pineable.
 struct DirSizing {
-    std::size_t   csr_bytes = 0;  // (n_rows+1)*8 + n_edges*4 (lo que se pinea)
-    std::uint64_t edges     = 0;
-    bool          present   = false;
+    std::size_t   csr_bytes    = 0;  // (n_rows+1)*8 + n_edges*4 (el arreglo completo)
+    std::size_t   locked_bytes = 0;  // RAM sostenida no-reclamable de servir esta dir
+    std::uint64_t edges        = 0;
+    bool          present      = false;
 };
 
 // Mismo computo EXACTO que registra pinned_topology_view: ROW_PTR uint64 + COL_IDX
-// uint32 sobre TODO el grafo (no el subconjunto warm).
-DirSizing size_dir(DirCsrDims d) {
+// uint32 sobre TODO el grafo (no el subconjunto warm). El costo BLOQUEADO difiere
+// por modo de consumo: pin completo => csr_bytes; slice horneado consumido tiled
+// desde mmap => solo ROW_PTR + ventana de staging (el COL_IDX queda en page cache
+// reclamable, ya contado por MemAvailable).
+DirSizing size_dir(DirCsrDims d, std::size_t tiled_stage_bytes) {
     if (!d.present) {
         return {};
     }
     const std::size_t row_ptr_bytes = (d.n_rows + 1) * sizeof(std::uint64_t);
     const std::size_t col_idx_bytes = d.n_edges * sizeof(std::uint32_t);
     DirSizing s;
-    s.csr_bytes = row_ptr_bytes + col_idx_bytes;
-    s.edges     = d.n_edges;
-    s.present   = true;
+    s.csr_bytes    = row_ptr_bytes + col_idx_bytes;
+    s.locked_bytes = d.tiled_mmap ? row_ptr_bytes + tiled_stage_bytes : s.csr_bytes;
+    s.edges        = d.n_edges;
+    s.present      = true;
     return s;
 }
 
@@ -64,8 +69,8 @@ SamplingBackendPlan plan_sampling_backend(
     const bool use_rev = orientation == EdgeOrientation::REVERSE
                       || orientation == EdgeOrientation::UNDIRECTED;
 
-    const DirSizing fwd = use_fwd ? size_dir(fwd_dims) : DirSizing{};
-    const DirSizing rev = use_rev ? size_dir(rev_dims) : DirSizing{};
+    const DirSizing fwd = use_fwd ? size_dir(fwd_dims, cfg.tiled_stage_bytes) : DirSizing{};
+    const DirSizing rev = use_rev ? size_dir(rev_dims, cfg.tiled_stage_bytes) : DirSizing{};
     plan.fwd_csr_bytes = fwd.csr_bytes;
     plan.rev_csr_bytes = rev.csr_bytes;
     // Substrato A (sidecar global): el CSR ya esta indexado por fila densa global,
@@ -101,24 +106,30 @@ SamplingBackendPlan plan_sampling_backend(
         return plan;  // CPU
     }
 
-    // Gate C: el CSR (+ mapa) cabe en la fraccion de RAM headroom. Si NO cabe, la
-    // cola fria ya esta derramada a la vía out-of-core => quedate en CPU.
+    // Gate C: el costo de RAM SOSTENIDA de servir el CSR cabe en la fraccion de
+    // headroom. Para el pin completo ese costo es el CSR entero (paginas no-
+    // swappables toda la corrida); para un slice horneado consumido tiled desde
+    // mmap es solo ROW_PTR + ventana de staging (el COL_IDX vive en page cache
+    // reclamable). Si NO cabe, la cola fria ya esta derramada => CPU.
     const std::size_t headroom = static_cast<std::size_t>(
         cfg.ram_headroom_factor * static_cast<double>(res.ram_available));
-    // Una direccion cabe solo si tiene sidecar pineable Y sus bytes caben en el
-    // headroom (las paginas pineadas quedan no-swappables toda la corrida).
     const auto fits = [&](const DirSizing& d) {
-        return d.present && d.csr_bytes <= headroom;
+        return d.present && d.locked_bytes <= headroom;
+    };
+    // El detalle "locked X of csr Y" en reason hace observable el modo de costo.
+    const auto need_str = [](const DirSizing& a, const DirSizing& b) {
+        return std::to_string(a.locked_bytes + b.locked_bytes) + " locked (csr "
+             + std::to_string(a.csr_bytes + b.csr_bytes) + ")";
     };
 
     GpuDirections dirs            = GpuDirections::NONE;
     std::size_t   device_resident = 0;
 
     if (orientation == EdgeOrientation::UNDIRECTED) {
-        const std::size_t both = fwd.csr_bytes + rev.csr_bytes;
-        if (fwd.present && rev.present && both <= headroom) {
+        const std::size_t both_locked = fwd.locked_bytes + rev.locked_bytes;
+        if (fwd.present && rev.present && both_locked <= headroom) {
             dirs            = GpuDirections::BOTH;
-            device_resident = both;
+            device_resident = fwd.csr_bytes + rev.csr_bytes;
         } else if (cfg.allow_single_direction && (fits(fwd) || fits(rev))) {
             // Solo cabe una direccion: acelerar la de MAYOR edge_count (mas
             // lookups que acelerar); la otra cae al host. La union sigue completa.
@@ -134,7 +145,7 @@ SamplingBackendPlan plan_sampling_backend(
             }
         } else {
             plan.reason = "CSR exceeds RAM headroom (need "
-                        + std::to_string(both) + " > "
+                        + need_str(fwd, rev) + " > "
                         + std::to_string(headroom) + ") -> already out-of-core";
             return plan;  // CPU
         }
@@ -148,7 +159,7 @@ SamplingBackendPlan plan_sampling_backend(
             device_resident = d.csr_bytes;
         } else {
             plan.reason = "CSR exceeds RAM headroom (need "
-                        + std::to_string(d.csr_bytes) + " > "
+                        + need_str(d, DirSizing{}) + " > "
                         + std::to_string(headroom) + ") -> already out-of-core";
             return plan;  // CPU
         }

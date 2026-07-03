@@ -181,3 +181,49 @@ TEST(SamplingBackendPlan, ForceGpuWithoutGpuFlagsHardError) {
     EXPECT_EQ(plan.backend, SamplingBackend::CPU_OUT_OF_CORE);
     EXPECT_EQ(plan.reason.rfind("ERROR:", 0), 0u);  // empieza con "ERROR:"
 }
+
+// ---------------------------------------------------------------------------
+// Regresion 2026-07-03: el slice simetrico horneado se consume TILED desde el
+// mmap (solo ROW_PTR + ventana quedan page-locked; el COL_IDX vive en page
+// cache reclamable). El gate de RAM debe cobrar ese costo bloqueado y no el
+// CSR completo — con el CSR completo, la 2.a corrida de una misma sesion de
+// server (MemAvailable ~21 GB tras la 1.a) caia a CPU_OUT_OF_CORE aunque la
+// VRAM estaba libre. Numeros EXACTOS de la corrida papers100M que lo expuso.
+// ---------------------------------------------------------------------------
+
+TEST(SamplingBackendPlan, TiledMmapSliceNotChargedFullCsr_Papers100mRun2) {
+    // headroom = 0.60 * 21'082'181'632 = 12'649'308'979 < csr 13'800'978'504,
+    // pero locked = row_ptr 888'479'656 + ventana 268'435'456 = 1'156'915'112.
+    auto res = make_res(/*has_gpu=*/true, /*cc=*/120,
+                        /*vram=*/16'176'250'880, /*ram=*/21'082'181'632);
+    DirCsrDims sym{/*n_rows=*/111'059'956, /*n_edges=*/3'228'124'712,
+                   /*present=*/true, /*tiled_mmap=*/true};
+    auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, sym,
+                                      DirCsrDims{}, SamplingBackendChoice::AUTO);
+    EXPECT_EQ(plan.backend, SamplingBackend::GPU_VRAM_COPY)
+        << "reason: " << plan.reason;
+    EXPECT_EQ(plan.directions, GpuDirections::FORWARD_ONLY);
+}
+
+TEST(SamplingBackendPlan, FullPinStillChargedFullCsr) {
+    // Mismos numeros SIN tiled_mmap: el pin completo si retiene el CSR entero
+    // => el gate conservador de siempre debe seguir mandandolo a CPU.
+    auto res = make_res(true, 120, 16'176'250'880, 21'082'181'632);
+    DirCsrDims full{111'059'956, 3'228'124'712, /*present=*/true,
+                    /*tiled_mmap=*/false};
+    auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, full,
+                                      DirCsrDims{}, SamplingBackendChoice::AUTO);
+    EXPECT_EQ(plan.backend, SamplingBackend::CPU_OUT_OF_CORE)
+        << "reason: " << plan.reason;
+    EXPECT_NE(plan.reason.find("locked"), std::string::npos);
+}
+
+TEST(SamplingBackendPlan, TiledMmapStillCpuWhenRamTrulyTiny) {
+    // Con RAM diminuta ni siquiera el ROW_PTR + ventana caben => CPU.
+    auto res = make_res(true, 120, 16'176'250'880, /*ram=*/1'000'000'000);
+    DirCsrDims sym{111'059'956, 3'228'124'712, true, /*tiled_mmap=*/true};
+    auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, sym,
+                                      DirCsrDims{}, SamplingBackendChoice::AUTO);
+    EXPECT_EQ(plan.backend, SamplingBackend::CPU_OUT_OF_CORE)
+        << "reason: " << plan.reason;
+}

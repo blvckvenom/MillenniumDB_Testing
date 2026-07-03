@@ -28,14 +28,23 @@ namespace mdb::gnn {
 // Dimensiones de una direccion del CSR global de topologia que la GPU pinea (el
 // sidecar `topology_*.csr` narrow uint32). La decision DEBE dimensionarse sobre
 // ESTE sustrato — el que `enable_pinned_gpu_view` realmente registra — y no sobre
-// el tier-2 warm: pinear es `cudaHostRegister` de paginas ya residentes, que las
-// vuelve no-swappables durante toda la corrida, asi que el gate de RAM debe contar
-// los bytes globales completos `(n_rows+1)*8 + n_edges*4`, no el subconjunto warm.
+// el tier-2 warm. El costo de RAM SOSTENIDA depende del modo de consumo:
+//  - Pin completo (`tiled_mmap=false`): `cudaHostRegister` del arreglo entero
+//    vuelve no-swappables `(n_rows+1)*8 + n_edges*4` bytes durante toda la
+//    corrida — el gate de RAM cuenta los bytes globales completos.
+//  - Slice horneado consumido tiled desde mmap (`tiled_mmap=true`, el camino
+//    simetrico lean): solo se copian+pinean el ROW_PTR (`(n_rows+1)*8`) y una
+//    ventana de staging acotada; el COL_IDX se sirve del page cache del mmap
+//    (reclamable, ya contado en MemAvailable). Cobrarle el CSR completo al gate
+//    sobre-tasa ~11.9x en papers100M y degradaba la 2.a corrida de una misma
+//    sesion a CPU (medido 2026-07-03: headroom 12.6 GB < 13.8 GB "necesarios"
+//    que en realidad eran ~1.1 GB bloqueados).
 // `present` es false cuando esa direccion no tiene sidecar narrow pineable.
 struct DirCsrDims {
-    std::uint64_t n_rows  = 0;  // N global (nodos)
-    std::uint64_t n_edges = 0;  // aristas de esa direccion (grafo completo)
-    bool          present = false;
+    std::uint64_t n_rows     = 0;      // N global (nodos)
+    std::uint64_t n_edges    = 0;      // aristas de esa direccion (grafo completo)
+    bool          present    = false;
+    bool          tiled_mmap = false;  // true => costo bloqueado = ROW_PTR + ventana
 };
 
 // Backend de muestreo elegido por la decision por hardware.
@@ -84,6 +93,11 @@ struct SamplingBackendConfig {
     // debe quedar libre ADEMAS del CSR para elegir el camino device-resident. El
     // CSR + esta reserva deben caber en la VRAM libre cruda (sin el derate ciego).
     std::size_t vram_abs_headroom_bytes = 768ull * 1024 * 1024;  // ~0.75 GiB
+    // Bytes de la ventana de staging pinned que el camino tiled-mmap mantiene
+    // residente ademas del ROW_PTR. Debe cubrir el default del store (64 Mi
+    // aristas x 4 B = 256 MiB; la ventana real solo crece por encima si
+    // MDB_GNN_TILE_WINDOW_EDGES la agranda o un grado maximo la excede).
+    std::size_t tiled_stage_bytes = 256ull * 1024 * 1024;
 };
 
 // Resultado de la decision. `reason` es legible y se loguea una vez. Los tamaños

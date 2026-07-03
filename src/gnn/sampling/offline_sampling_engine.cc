@@ -303,7 +303,13 @@ struct OfflineSamplingEngine::Impl {
                     auto sym = GQL::Projection::TopologySnapshotReader::open_symmetric(
                         storage.get_projection_dir());
                     if (sym.has_data() && sym.id_width() == 4) {
-                        sym_dims = DirCsrDims{sym.num_nodes(), sym.num_edges(), true};
+                        // El slice horneado se consume tiled desde el mmap: el
+                        // costo bloqueado del gate es ROW_PTR + ventana de
+                        // staging, no el CSR entero (que vive en page cache
+                        // reclamable). Sin esta marca, la 2.a corrida de una
+                        // misma sesion caia a CPU (headroom < CSR completo).
+                        sym_dims = DirCsrDims{sym.num_nodes(), sym.num_edges(),
+                                              /*present=*/true, /*tiled_mmap=*/true};
                     } else {
                         // The narrow topology_sym.csr is not baked yet — the common
                         // case on a default (wide uint64) projection and on any cold
@@ -322,7 +328,10 @@ struct OfflineSamplingEngine::Impl {
                         const std::uint64_t n = topo.get_node_count();
                         const std::uint64_t e = topo.get_edge_count();
                         if (n > 0) {
-                            sym_dims = DirCsrDims{n, 2ull * e, true};
+                            // Tambien tiled_mmap: el auto-bake garantiza que al
+                            // momento del pin el slice existe como mmap.
+                            sym_dims = DirCsrDims{n, 2ull * e,
+                                                  /*present=*/true, /*tiled_mmap=*/true};
                         }
                     }
                 }
