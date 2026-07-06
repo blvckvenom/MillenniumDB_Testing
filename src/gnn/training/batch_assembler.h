@@ -468,6 +468,8 @@ private:
         std::vector<int64_t>       active_sizes_per_layer;
         torch::Tensor              labels;
         torch::Tensor              label_mask;
+        torch::Tensor              seed_ids;
+        torch::Tensor              seed_rows;
         uint64_t                   num_seeds = 0;
         uint64_t                   num_nodes = 0;
         uint64_t                   num_labeled = 0;

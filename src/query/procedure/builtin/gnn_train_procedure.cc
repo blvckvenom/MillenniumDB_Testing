@@ -182,26 +182,154 @@ static void write_training_log(
 // Helper: export embeddings (hidden representations before classifier)
 // =============================================================================
 
+// splits.npy encodes the SplitType ordinal per row; pin the mapping the
+// manifest documents so an enum reorder cannot silently change the file format.
+static_assert(static_cast<int>(mdb::gnn::SplitType::TRAIN) == 0
+              && static_cast<int>(mdb::gnn::SplitType::VALIDATION) == 1
+              && static_cast<int>(mdb::gnn::SplitType::TEST) == 2,
+              "splits.npy encoding (0=train 1=validation 2=test) must match SplitType");
+
+// Sidecar of embeddings.npy: everything an external consumer (NumPy/PyTorch/
+// DGL/PyG) needs to rebuild and evaluate the model without parsing any
+// MillenniumDB-internal binary format. All values come from the live model
+// config and sample catalog — nothing is assumed about dims or layer count.
+static void write_export_manifest(
+    const fs::path&                  output_dir,
+    const mdb::gnn::SampleCatalog&   catalog,
+    const mdb::gnn::GraphSAGEConfig& gnn_config,
+    const std::string&               feature_name,
+    int64_t                          num_rows)
+{
+    std::ofstream f(output_dir / "export_manifest.json");
+    if (!f.is_open()) {
+        throw std::runtime_error(
+            "gnn_train: cannot write export_manifest.json to: " + output_dir.string());
+    }
+
+    f << std::fixed << std::setprecision(6);
+    f << "{\n";
+    f << "  \"format\": \"mdb-gnn-export\",\n";
+    f << "  \"version\": 1,\n";
+
+    f << "  \"model\": {\n";
+    f << "    \"type\": \"graphsage_mean\",\n";
+    f << "    \"input_dim\": " << gnn_config.input_dim << ",\n";
+    f << "    \"hidden_dim\": " << gnn_config.hidden_dim << ",\n";
+    f << "    \"num_classes\": " << gnn_config.num_classes << ",\n";
+    f << "    \"num_layers\": " << gnn_config.num_layers << ",\n";
+    f << "    \"dropout\": " << gnn_config.dropout << ",\n";
+    f << "    \"normalize\": " << (gnn_config.normalize ? "true" : "false") << "\n";
+    f << "  },\n";
+
+    // Semantics the parameter shapes alone cannot convey. The weights live in
+    // model.pt (LibTorch archive; open with torch.jit.load and read the named
+    // parameters conv_0..conv_{L-1} plus classifier).
+    f << "  \"forward\": {\n";
+    f << "    \"layer_apply_order\": \"conv_{num_layers-1} first (consumes input features), "
+         "conv_0 last (produces seed hidden states)\",\n";
+    f << "    \"conv\": \"linear(concat(self, mean_neighbors)) — self half occupies the "
+         "first in_dim columns of conv_k.weight\",\n";
+    f << "    \"mean\": \"scatter-sum over incoming messages divided by "
+         "clamp_min(in_degree, 1); a node with no sampled neighbors aggregates to zero\",\n";
+    f << "    \"between_hidden_layers\": \"relu, then dropout (train only), then l2 "
+         "row-normalize when normalize=true; nothing after the last conv\",\n";
+    f << "    \"head\": \"classifier = linear(hidden_dim -> num_classes) applied to the "
+         "last conv output with no activation in between (embeddings.npy rows are that "
+         "pre-classifier hidden state)\"\n";
+    f << "  },\n";
+
+    f << "  \"sample\": {\n";
+    f << "    \"projection_name\": \"" << catalog.projection_name << "\",\n";
+    f << "    \"sample_name\": \"" << catalog.sample_name << "\",\n";
+    f << "    \"feature_name\": \"" << feature_name << "\",\n";
+    // Both fanout orders are spelled out so no consumer ever has to know which
+    // convention the producing procedure call used.
+    f << "    \"fanouts_hop_order\": [";
+    for (size_t i = 0; i < catalog.fanouts.size(); ++i) {
+        if (i > 0) f << ", ";
+        f << catalog.fanouts[i];
+    }
+    f << "],\n";
+    f << "    \"fanouts_dgl_order\": [";
+    for (size_t i = catalog.fanouts.size(); i-- > 0;) {
+        if (i + 1 < catalog.fanouts.size()) f << ", ";
+        f << catalog.fanouts[i];
+    }
+    f << "],\n";
+    f << "    \"fanout_convention\": \"fanouts_hop_order[0] samples the hop adjacent to "
+         "the seeds (the catalog's storage order); fanouts_dgl_order is the same list "
+         "reversed, as DGL/GraphBolt samplers expect it\",\n";
+    f << "    \"batch_size\": " << catalog.batch_size << ",\n";
+    f << "    \"random_seed\": " << catalog.random_seed << ",\n";
+    f << "    \"total_batches\": " << catalog.total_batches << ",\n";
+    f << "    \"train_batches\": " << catalog.train_batches << ",\n";
+    f << "    \"validation_batches\": " << catalog.validation_batches << ",\n";
+    f << "    \"test_batches\": " << catalog.test_batches << ",\n";
+    f << "    \"sample_content_fp\": \"" << std::hex << catalog.sample_content_fp
+      << std::dec << "\"\n";
+    f << "  },\n";
+
+    f << "  \"files\": {\n";
+    f << "    \"embeddings.npy\": \"float32 [" << num_rows << ", " << gnn_config.hidden_dim
+      << "] pre-classifier seed embeddings\",\n";
+    f << "    \"seed_ids.npy\": \"int64 [" << num_rows << "] raw node ids as stored in the "
+         "sample (projection ObjectId bits)\",\n";
+    f << "    \"seed_rows.npy\": \"int64 [" << num_rows << "] feature-matrix row of each "
+         "seed; -1 = node without a feature row\",\n";
+    f << "    \"labels.npy\": \"int64 [" << num_rows << "] class label per seed; -1 = "
+         "unlabeled\",\n";
+    f << "    \"splits.npy\": \"int64 [" << num_rows << "] 0=train 1=validation 2=test\"\n";
+    f << "  },\n";
+
+    f << "  \"row_alignment\": \"rows across all five files are the seeds in batch order: "
+         "batch 0 seeds, batch 1 seeds, ..., batch " << (catalog.total_batches - 1)
+      << " seeds\"\n";
+    f << "}\n";
+
+    if (!f) {
+        throw std::runtime_error(
+            "gnn_train: I/O error writing export_manifest.json to: " + output_dir.string());
+    }
+}
+
 static void export_embeddings(
-    mdb::gnn::GraphSAGEModel&      model,
-    mdb::gnn::BatchAssembler&      assembler,
-    const mdb::gnn::SampleCatalog& catalog,
-    const fs::path&                output_dir)
+    mdb::gnn::GraphSAGEModel&        model,
+    mdb::gnn::BatchAssembler&        assembler,
+    const mdb::gnn::SampleCatalog&   catalog,
+    const mdb::gnn::GraphSAGEConfig& gnn_config,
+    const std::string&               feature_name,
+    const fs::path&                  output_dir)
 {
     torch::NoGradGuard no_grad;
     model.eval();
 
     std::vector<torch::Tensor> all_embeddings;
+    std::vector<torch::Tensor> all_seed_ids;
+    std::vector<torch::Tensor> all_seed_rows;
+    std::vector<torch::Tensor> all_labels;
+    std::vector<torch::Tensor> all_splits;
     auto model_device = model.parameters().begin()->device();
 
     // Single pass: assemble each batch, compute the seed embeddings, accumulate.
     // (A previous version ran this loop twice — plus a discarded second
     // assemble() per batch, ~3x the inference work — then cleared the first
     // pass and recomputed. Output is unchanged: embeddings are laid out
-    // batch 0 seeds, batch 1 seeds, ... batch N seeds; node IDs are
-    // recoverable from the sample catalog.)
+    // batch 0 seeds, batch 1 seeds, ... batch N seeds.)
     for (uint64_t bid = 0; bid < catalog.total_batches; ++bid) {
         auto mini = assembler.assemble(bid);
+
+        // Row-aligned identity sidecars, captured on CPU before any device
+        // moves. Labels are masked to the uniform -1 = "no usable label"
+        // convention (without a LabelStore the assembler zero-fills them).
+        all_seed_ids.push_back(mini.seed_ids);
+        all_seed_rows.push_back(mini.seed_rows);
+        all_labels.push_back(
+            torch::where(mini.label_mask, mini.labels,
+                         torch::full_like(mini.labels, -1)));
+        all_splits.push_back(
+            torch::full({static_cast<int64_t>(mini.num_seeds)},
+                        static_cast<int64_t>(mini.split), torch::kInt64));
+
         if (!model_device.is_cpu()) {
             mini.features = mini.features.to(model_device);
             for (auto& ei : mini.edge_indices) {
@@ -222,6 +350,16 @@ static void export_embeddings(
     if (!all_embeddings.empty()) {
         auto combined = torch::cat(all_embeddings, /*dim=*/0);
         mdb::gnn::NpyWriter::write_float32(output_dir / "embeddings.npy", combined);
+        mdb::gnn::NpyWriter::write_int64(output_dir / "seed_ids.npy",
+                                         torch::cat(all_seed_ids, /*dim=*/0));
+        mdb::gnn::NpyWriter::write_int64(output_dir / "seed_rows.npy",
+                                         torch::cat(all_seed_rows, /*dim=*/0));
+        mdb::gnn::NpyWriter::write_int64(output_dir / "labels.npy",
+                                         torch::cat(all_labels, /*dim=*/0));
+        mdb::gnn::NpyWriter::write_int64(output_dir / "splits.npy",
+                                         torch::cat(all_splits, /*dim=*/0));
+        write_export_manifest(output_dir, catalog, gnn_config, feature_name,
+                              combined.size(0));
     }
 
     model.train();
@@ -1019,7 +1157,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     bool did_export_emb = false;
     if (export_emb) {
-        export_embeddings(model, assembler, catalog, output_dir);
+        export_embeddings(model, assembler, catalog, gnn_config, feature_name, output_dir);
         did_export_emb = true;
     }
 

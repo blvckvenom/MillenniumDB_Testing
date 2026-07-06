@@ -197,13 +197,40 @@ namespace {
 size_t estimate_struct_bytes(const std::vector<torch::Tensor>& edges,
                              const std::vector<torch::Tensor>& active,
                              const torch::Tensor& labels,
-                             const torch::Tensor& label_mask) {
+                             const torch::Tensor& label_mask,
+                             const torch::Tensor& seed_ids,
+                             const torch::Tensor& seed_rows) {
     size_t b = 0;
     for (const auto& t : edges)  b += static_cast<size_t>(t.numel()) * t.element_size();
     for (const auto& t : active) b += static_cast<size_t>(t.numel()) * t.element_size();
     if (labels.defined())     b += static_cast<size_t>(labels.numel()) * labels.element_size();
     if (label_mask.defined()) b += static_cast<size_t>(label_mask.numel()) * label_mask.element_size();
+    if (seed_ids.defined())   b += static_cast<size_t>(seed_ids.numel()) * seed_ids.element_size();
+    if (seed_rows.defined())  b += static_cast<size_t>(seed_rows.numel()) * seed_rows.element_size();
     return b + 256;  // small per-entry overhead
+}
+
+// Builds the per-seed identity tensors carried on the MiniBatch (raw node ids
+// as stored in the sample + feature-matrix rows; row -1 = node without a row).
+// seed_row_indices uses uint64_t::max as its "unmapped" sentinel, matching the
+// label-gather convention.
+void fill_seed_identity(mdb::gnn::MiniBatch& mini,
+                        const std::vector<ObjectId>& seeds,
+                        const std::vector<uint64_t>& seed_row_indices) {
+    const int64_t n = static_cast<int64_t>(seeds.size());
+    mini.seed_ids  = torch::empty({n}, torch::kInt64);
+    mini.seed_rows = torch::empty({n}, torch::kInt64);
+    if (n == 0) return;
+    auto ids  = mini.seed_ids.accessor<int64_t, 1>();
+    auto rows = mini.seed_rows.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < n; ++i) {
+        const auto idx = static_cast<size_t>(i);
+        ids[i] = static_cast<int64_t>(seeds[idx].id);
+        const uint64_t r = seed_row_indices[idx];
+        rows[i] = (r == std::numeric_limits<uint64_t>::max())
+                    ? -1
+                    : static_cast<int64_t>(r);
+    }
 }
 } // namespace
 
@@ -231,6 +258,8 @@ bool BatchAssembler::try_struct_hit_(uint64_t batch_id, MiniBatch& mini, bool co
     mini.active_sizes_per_layer   = c.active_sizes_per_layer;
     mini.labels                   = c.labels;
     mini.label_mask               = c.label_mask;
+    mini.seed_ids                 = c.seed_ids;
+    mini.seed_rows                = c.seed_rows;
     mini.num_seeds                = c.num_seeds;
     mini.num_nodes                = c.num_nodes;
     mini.num_labeled              = c.num_labeled;
@@ -243,7 +272,8 @@ void BatchAssembler::cache_struct_(uint64_t batch_id, const MiniBatch& mini) {
     if (struct_cache_.find(batch_id) != struct_cache_.end()) return;
     size_t sz = estimate_struct_bytes(mini.edge_indices,
                                       mini.active_indices_per_layer,
-                                      mini.labels, mini.label_mask);
+                                      mini.labels, mini.label_mask,
+                                      mini.seed_ids, mini.seed_rows);
     while (struct_bytes_ + sz > struct_budget_ && !struct_lru_.empty()) {
         uint64_t victim = struct_lru_.back();
         struct_lru_.pop_back();
@@ -261,6 +291,8 @@ void BatchAssembler::cache_struct_(uint64_t batch_id, const MiniBatch& mini) {
     c.active_sizes_per_layer   = mini.active_sizes_per_layer;
     c.labels                   = mini.labels;
     c.label_mask               = mini.label_mask;
+    c.seed_ids                 = mini.seed_ids;
+    c.seed_rows                = mini.seed_rows;
     c.num_seeds                = mini.num_seeds;
     c.num_nodes                = mini.num_nodes;
     c.num_labeled              = mini.num_labeled;
@@ -479,17 +511,19 @@ bool BatchAssembler::try_assemble_self_contained_(uint64_t batch_id, MiniBatch& 
     mini.num_seeds = static_cast<uint64_t>(num_seeds);
     mini.num_nodes = blk->num_unique_nodes;
 
-    if (labels_ && num_seeds > 0) {
-        std::vector<uint64_t> seed_row_indices;
-        seed_row_indices.reserve(static_cast<size_t>(num_seeds));
-        for (const auto& oid : ms.nodes_per_layer[0]) {
-            auto row = row_mapping_.find(oid);
-            if (row) {
-                seed_row_indices.push_back(*row);
-            } else {
-                seed_row_indices.push_back(std::numeric_limits<uint64_t>::max());
-            }
+    std::vector<uint64_t> seed_row_indices;
+    seed_row_indices.reserve(static_cast<size_t>(num_seeds));
+    for (const auto& oid : ms.nodes_per_layer[0]) {
+        auto row = row_mapping_.find(oid);
+        if (row) {
+            seed_row_indices.push_back(*row);
+        } else {
+            seed_row_indices.push_back(std::numeric_limits<uint64_t>::max());
         }
+    }
+    fill_seed_identity(mini, ms.nodes_per_layer[0], seed_row_indices);
+
+    if (labels_ && num_seeds > 0) {
         mini.labels     = labels_->gather(seed_row_indices);
         mini.label_mask = (mini.labels != -1);
     } else {
@@ -674,24 +708,27 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
     }
 
     // Step 5: Gather labels for seed nodes (layer 0)
-    int64_t num_seeds = static_cast<int64_t>(
-        sample.nodes_per_layer.empty() ? 0 : sample.nodes_per_layer[0].size()
-    );
+    static const std::vector<ObjectId> no_seeds;
+    const auto& seed_nodes =
+        sample.nodes_per_layer.empty() ? no_seeds : sample.nodes_per_layer[0];
+    int64_t num_seeds = static_cast<int64_t>(seed_nodes.size());
     mini.num_seeds = static_cast<uint64_t>(num_seeds);
     mini.num_nodes = sample.all_unique_nodes.size();
 
-    if (labels_ && num_seeds > 0) {
-        std::vector<uint64_t> seed_row_indices;
-        seed_row_indices.reserve(static_cast<size_t>(num_seeds));
-        for (const auto& oid : sample.nodes_per_layer[0]) {
-            auto row = row_mapping_.find(oid);
-            if (row) {
-                seed_row_indices.push_back(*row);
-            } else {
-                // Unknown node — use sentinel that LabelStore will treat as -1
-                seed_row_indices.push_back(std::numeric_limits<uint64_t>::max());
-            }
+    std::vector<uint64_t> seed_row_indices;
+    seed_row_indices.reserve(static_cast<size_t>(num_seeds));
+    for (const auto& oid : seed_nodes) {
+        auto row = row_mapping_.find(oid);
+        if (row) {
+            seed_row_indices.push_back(*row);
+        } else {
+            // Unknown node — use sentinel that LabelStore will treat as -1
+            seed_row_indices.push_back(std::numeric_limits<uint64_t>::max());
         }
+    }
+    fill_seed_identity(mini, seed_nodes, seed_row_indices);
+
+    if (labels_ && num_seeds > 0) {
         mini.labels     = labels_->gather(seed_row_indices);
         mini.label_mask = (mini.labels != -1);
     } else {

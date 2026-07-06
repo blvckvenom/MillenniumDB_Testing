@@ -82,6 +82,14 @@ struct MiniBatch {
 
     torch::Tensor labels;                          // [num_seeds] int64 — seed node labels
     torch::Tensor label_mask;                      // [num_seeds] bool — true if label != -1
+
+    /// Identity of the seed nodes (layer 0), aligned with `labels`.
+    /// seed_ids carries the raw node ids as stored in the sample (projection
+    /// ObjectId bits); seed_rows carries the feature-matrix row of each seed
+    /// (-1 when the node has no row). Consumed by the embedding exporter so
+    /// external tools can join exported rows back to nodes/labels/splits.
+    torch::Tensor seed_ids;                        // [num_seeds] int64
+    torch::Tensor seed_rows;                       // [num_seeds] int64
     uint64_t num_seeds = 0;                        // target nodes (layer 0)
     uint64_t num_nodes = 0;                        // total nodes in computational subgraph
     /// Number of seeds with label != -1, computed
