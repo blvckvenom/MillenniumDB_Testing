@@ -67,7 +67,7 @@ TRAIN_Q_TPL="CALL gnn_train('%s','node_features',{epochs:5,randomSeed:42,patienc
 declare -A ACC SHA
 for W in 0 1 2 4; do
   s="s$W"
-  body=$(gql "CALL gnn_offline_sample('cora','$s',[10,5],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED',numWorkers:$W}) YIELD totalBatches RETURN *")
+  body=$(gql "CALL gnn_offline_sample('cora','$s',[5,10],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED',numWorkers:$W}) YIELD totalBatches RETURN *")
   echo "$body" | grep -qiE "error|exception|failed" && fail "sample W=$W errored: $body"
   SHA[$W]=$(sha256sum "$DB/samples/$s/batches.dat" 2>/dev/null | awk '{print $1}')
   gql "CALL gnn_materialize_batches('$s','node_features',{reorder:1,numHashes:2,force:1}) YIELD totalBatches RETURN *" >/dev/null

@@ -40,7 +40,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             "Parameters:\n"
             "  - projectionName (STRING): Source graph projection\n"
             "  - sampleName (STRING): Name for the sample set\n"
-            "  - fanouts (LIST<INT>): Fanouts per layer, e.g., [15, 10]\n"
+            "  - fanouts (LIST<INT>): Fanouts per layer in DGL order (last "
+            "element = hop adjacent to seeds), e.g., [10, 15]\n"
             "  - options (MAP, optional): batchSize, trainRatio, randomSeed, etc.\n\n"
             "Examples:\n"
             "  CALL gnn.offline_sample('social', 'samples_v1', [15, 10])\n"
@@ -97,11 +98,12 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     } catch (const std::exception& e) {
         throw std::runtime_error(
             "Invalid fanouts parameter: " + std::string(e.what()) + "\n\n"
-            "The third parameter must be a LIST of positive integers.\n"
-            "Each value specifies neighbors to sample at that hop distance.\n\n"
+            "The third parameter must be a LIST of positive integers, read in\n"
+            "DGL/GraphBolt order: the LAST element samples the hop adjacent to\n"
+            "the seeds (pass fanoutsNearestFirst:true for the legacy hop order).\n\n"
             "Examples:\n"
-            "  [15, 10]       - 2-hop: 15 neighbors at 1-hop, 10 at 2-hop\n"
-            "  [15, 10, 5]    - 3-hop: 15, 10, 5 neighbors at each layer\n"
+            "  [10, 15]       - 2-hop: 15 direct neighbors, then 10 at 2-hop\n"
+            "  [5, 10, 15]    - 3-hop: 15 direct, 10 at 2-hop, 5 at 3-hop\n"
             "  [25]           - 1-hop: 25 neighbors"
         );
     }
@@ -127,6 +129,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     bool force = false;
     std::string sampling_backend_str = "auto";  // dynamic GPU/CPU backend choice
     std::string symmetric_topology_str = "auto";  // auto|on|off single merged slice
+    bool fanouts_nearest_first = false;  // legacy hop-order reading of the fanouts list
 
     if (ctx.arguments.size() >= 4) {
         try {
@@ -141,7 +144,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                           auto_profile_on_cold_start,
                           profile_num_walks, profile_walk_length,
                           num_workers, force, sampling_backend_str,
-                          symmetric_topology_str);
+                          symmetric_topology_str,
+                          fanouts_nearest_first);
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Invalid options parameter: " + std::string(e.what()) + "\n\n"
@@ -158,6 +162,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - l1CacheMb (INT): L1 budget in MiB (0 = auto-detect)\n"
                 "  - l2CacheMb (INT): L2 budget in MiB (0 = auto-detect)\n"
                 "  - useL3MmapSidecar (BOOL): mmap'd topology CSR sidecar as L3 (default: true)\n"
+                "  - fanoutsNearestFirst (BOOL): read fanouts in hop order, first element = hop adjacent to seeds (default: false = DGL order)\n"
                 "  - useSymmetricTopology (STRING): 'auto'|'on'|'off' single pre-merged undirected slice (default: 'auto')\n"
                 "  - force (BOOL): Drop + re-create an existing sample set (default: false)\n\n"
                 "Example:\n"
@@ -170,6 +175,16 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  })"
             );
         }
+    }
+
+    // Fanout convention: the list is read in DGL/GraphBolt order by default —
+    // the LAST element samples the hop adjacent to the seeds — so a config is
+    // comparable string-for-string with DGL-based systems. Internally (and in
+    // the sample catalog) fanouts are stored in hop order: fanouts[0] = hop
+    // adjacent to the seeds. fanoutsNearestFirst:true skips the reversal and
+    // reads the list directly in hop order (the pre-2026-07 behavior).
+    if (!fanouts_nearest_first) {
+        std::reverse(fanouts.begin(), fanouts.end());
     }
 
     // Step 6: Verify projection exists
@@ -562,7 +577,8 @@ void GnnOfflineSampleProcedure::parse_options(
     uint64_t& num_workers,
     bool& force,
     std::string& sampling_backend,
-    std::string& symmetric_topology
+    std::string& symmetric_topology,
+    bool& fanouts_nearest_first
 ) {
     DictOptions opts(ctx.get_argument(arg_index));
 
@@ -716,5 +732,10 @@ void GnnOfflineSampleProcedure::parse_options(
     // Parse force — drop + re-create the sample set when it already exists.
     if (auto v = opts.get_bool("force")) {
         force = *v;
+    }
+
+    // Parse fanoutsNearestFirst (legacy hop-order reading of the fanouts list)
+    if (auto v = opts.get_bool("fanoutsNearestFirst")) {
+        fanouts_nearest_first = *v;
     }
 }

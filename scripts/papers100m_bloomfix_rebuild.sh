@@ -72,7 +72,7 @@ log "TOPO_SNAPSHOT $(( $(now)-t0 ))s :: $b"
 
 log "Phase 4: gnn_offline_sample e2e5ep"
 t0=$(now)
-b=$(gql "CALL gnn_offline_sample('$PROJ','$SAMPLE',[10,15,20],{batchSize:1024,randomSeed:42,orientation:'UNDIRECTED',usePredefinedSplits:true,useFourLevelTopologyStore:true,useAdjacencyCache:true,useL3MmapSidecar:true,l1CacheMb:512,l2CacheMb:6144,numWorkers:16,force:true}) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes,numWorkersUsed,computeMillis,sampleContentFp RETURN *")
+b=$(gql "CALL gnn_offline_sample('$PROJ','$SAMPLE',[20,15,10],{batchSize:1024,randomSeed:42,orientation:'UNDIRECTED',usePredefinedSplits:true,useFourLevelTopologyStore:true,useAdjacencyCache:true,useL3MmapSidecar:true,l1CacheMb:512,l2CacheMb:6144,numWorkers:16,force:true}) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes,numWorkersUsed,computeMillis,sampleContentFp RETURN *")
 nonempty "$b" || exit 1; chk "$b" || exit 1
 log "SAMPLE $(( $(now)-t0 ))s :: $b"
 echo "$b" > "$OUT/sample_v5.txt"

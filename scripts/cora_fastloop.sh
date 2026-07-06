@@ -100,7 +100,7 @@ say "graph_project"
 run_gql project "CALL graph_project('cora','Paper','CITES',{orientation:'UNDIRECTED',includeFeatures:'node_features',labelProperty:'label'}) YIELD graphName, nodeCount, relationshipCount, featureDim, numClasses RETURN *" >/dev/null
 
 say "gnn_offline_sample"
-run_gql sample "CALL gnn_offline_sample('cora','s',[10,5],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED'}) YIELD totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes RETURN *" >/dev/null
+run_gql sample "CALL gnn_offline_sample('cora','s',[5,10],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED'}) YIELD totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes RETURN *" >/dev/null
 
 say "gnn_materialize_batches"
 run_gql materialize "CALL gnn_materialize_batches('s','node_features',{reorder:1,numHashes:2,force:1}) YIELD totalBatches, reordered, totalTimeMs RETURN *" >/dev/null

@@ -114,7 +114,7 @@ say "Phase A — server env OFF: project + gnn_build_topology_snapshot (wide)"
 start_server 0
 run_gql project "CALL graph_project('cora','Paper','CITES',{orientation:'UNDIRECTED',includeFeatures:'node_features',labelProperty:'label'}) YIELD graphName, nodeCount, relationshipCount RETURN *" >/dev/null
 run_gql build_wide "CALL gnn_build_topology_snapshot('cora') YIELD graphName RETURN *" >/dev/null
-WIDE_SAMPLE=$(run_gql sample_wide "CALL gnn_offline_sample('cora','s_wide',[10,5],{$SAMPLE_FLAGS}) YIELD totalBatches, uniqueNodes RETURN *")
+WIDE_SAMPLE=$(run_gql sample_wide "CALL gnn_offline_sample('cora','s_wide',[5,10],{$SAMPLE_FLAGS}) YIELD totalBatches, uniqueNodes RETURN *")
 stop_server
 
 PROJ_DIR=$(dirname "$(find "$DB" -name topology_fwd.csr 2>/dev/null | head -1)")
@@ -132,7 +132,7 @@ start_server 1
 run_gql build_narrow "CALL gnn_build_topology_snapshot('cora') YIELD graphName RETURN *" >/dev/null
 NARROW_IDW=$(id_width_of "$PROJ_DIR/topology_fwd.csr")
 [ "$NARROW_IDW" = "4" ] || fail "Phase B sidecar id_width=$NARROW_IDW, expected 4 (env opt-in not honored?)"
-NARROW_SAMPLE=$(run_gql sample_narrow "CALL gnn_offline_sample('cora','s_narrow',[10,5],{$SAMPLE_FLAGS}) YIELD totalBatches, uniqueNodes RETURN *")
+NARROW_SAMPLE=$(run_gql sample_narrow "CALL gnn_offline_sample('cora','s_narrow',[5,10],{$SAMPLE_FLAGS}) YIELD totalBatches, uniqueNodes RETURN *")
 stop_server
 
 NARROW_FWD_SZ=$(stat -c %s "$PROJ_DIR/topology_fwd.csr")

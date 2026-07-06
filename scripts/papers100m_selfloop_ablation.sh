@@ -38,7 +38,7 @@ log "server up pid=$SRV (self-loop env active)"
 # ---- Phase A: re-sample with self-loop (same config as canonical e2e5ep) ----
 log "Phase A: gnn_offline_sample $SAMPLE [10,15,20] UNDIRECTED self-loop ON  (ETA ~3-5 min)"
 tA=$(date +%s)
-b=$(gql "CALL gnn_offline_sample('$PROJ','$SAMPLE',[10,15,20],{batchSize:1024,randomSeed:42,orientation:'UNDIRECTED',usePredefinedSplits:true,useFourLevelTopologyStore:true,useAdjacencyCache:true,useL3MmapSidecar:true,l1CacheMb:512,l2CacheMb:6144,numWorkers:16,force:true}) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes,numWorkersUsed,computeMillis,sampleContentFp RETURN *")
+b=$(gql "CALL gnn_offline_sample('$PROJ','$SAMPLE',[20,15,10],{batchSize:1024,randomSeed:42,orientation:'UNDIRECTED',usePredefinedSplits:true,useFourLevelTopologyStore:true,useAdjacencyCache:true,useL3MmapSidecar:true,l1CacheMb:512,l2CacheMb:6144,numWorkers:16,force:true}) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes,numWorkersUsed,computeMillis,sampleContentFp RETURN *")
 err "$b" || { log "Phase A FAILED"; exit 1; }
 log "  A done $(( $(date +%s)-tA ))s :: $b"
 log "  SANITY: totalBatches/uniqueNodes should match canonical (1512 / ~48.7M); sampleContentFp MUST differ from e2e5ep (self-edges) — proves the flag engaged."

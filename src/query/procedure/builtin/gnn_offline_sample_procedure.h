@@ -32,7 +32,7 @@ namespace Procedures {
  * |------|------|----------|-------------|
  * | projectionName | STRING | Yes | Source graph projection to sample from |
  * | sampleName | STRING | Yes | Name for the created sample set |
- * | fanouts | LIST<INT> | Yes | Neighbors per layer, e.g., [15, 10] |
+ * | fanouts | LIST<INT> | Yes | Neighbors per layer, read in DGL/GraphBolt order: the LAST element samples the hop adjacent to the seeds. [10, 15] = 15 direct neighbors, then 10 per node at the second hop |
  * | options | MAP | No | Configuration: batchSize, trainRatio, etc. |
  *
  * ## Options Map
@@ -51,6 +51,7 @@ namespace Procedures {
  * | l1CacheMb | INT | 0 | L1 (RAM hot) budget in MiB; 0 = auto-detect from /proc/meminfo |
  * | l2CacheMb | INT | 0 | L2 (RAM warm) budget in MiB; 0 = auto-detect from /proc/meminfo |
  * | useL3MmapSidecar | BOOL | true | Open the mmap-backed CSR sidecar files (topology_{fwd,rev}.csr) as the L3 cold tier, providing O(1) neighbor slices; falls through to L4 direct B+Tree access if the sidecar files are absent |
+ * | fanoutsNearestFirst | BOOL | false | Read the fanouts list in hop order instead (FIRST element = hop adjacent to the seeds; the pre-2026-07 convention) |
  * | force | BOOL | false | Drop and re-create the sample set if it already exists |
  *
  * ## Examples
@@ -101,7 +102,8 @@ public:
             Parameter("sampleName", ParamType::STRING, true,
                 "Name for the created sample set (stored in <db>/samples/<name>/)"),
             Parameter("fanouts", ParamType::LIST, true,
-                "List of fanouts per GNN layer, e.g., [15, 10] for 2-hop sampling"),
+                "Fanouts per GNN layer in DGL order (last element = hop adjacent "
+                "to the seeds), e.g., [10, 15] for 2-hop sampling"),
             Parameter("options", ParamType::ANY, false,
                 "Optional configuration map: batchSize, trainRatio, randomSeed, etc.")
         };
@@ -233,7 +235,8 @@ private:
         uint64_t& num_workers,
         bool& force,
         std::string& sampling_backend,
-        std::string& symmetric_topology
+        std::string& symmetric_topology,
+        bool& fanouts_nearest_first
     );
 };
 

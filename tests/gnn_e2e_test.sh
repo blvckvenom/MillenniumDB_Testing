@@ -177,7 +177,7 @@ done
 # =============================================================================
 info "Step 4: Offline sampling (Planetoid splits, UNDIRECTED)"
 
-SAMPLE_OUT=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_sample', [10, 5], {batchSize: 256, randomSeed: 42, usePredefinedSplits: true, orientation: 'UNDIRECTED'}) YIELD sampleName, totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes RETURN sampleName, totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes")
+SAMPLE_OUT=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_sample', [5, 10], {batchSize: 256, randomSeed: 42, usePredefinedSplits: true, orientation: 'UNDIRECTED'}) YIELD sampleName, totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes RETURN sampleName, totalBatches, trainBatches, validationBatches, testBatches, uniqueNodes")
 
 TOTAL_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f2)
 TRAIN_BATCHES=$(echo "$SAMPLE_OUT" | tail -1 | cut -d',' -f3)
@@ -264,7 +264,7 @@ fi
 # =============================================================================
 info "Step 5b: Materialize without reorder (separate sample)"
 
-SAMPLE_NOREORD=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_noreord', [10, 5], {batchSize: 256, randomSeed: 42}) YIELD sampleName, totalBatches RETURN sampleName, totalBatches")
+SAMPLE_NOREORD=$(query "CALL gnn_offline_sample('e2e_proj', 'e2e_noreord', [5, 10], {batchSize: 256, randomSeed: 42}) YIELD sampleName, totalBatches RETURN sampleName, totalBatches")
 NR_BATCHES=$(echo "$SAMPLE_NOREORD" | tail -1 | cut -d',' -f2)
 
 MAT_NR=$(query "CALL gnn_materialize_batches('e2e_noreord', 'node_features', {reorder: 0}) YIELD totalBatches, reordered RETURN totalBatches, reordered")

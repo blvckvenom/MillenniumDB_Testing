@@ -85,7 +85,7 @@ say "project: $(dur "$t0" "$t1")s  nodes=$(col "$b" nodeCount) rels=$(col "$b" r
 
 # --- 2. sample (auto usePredefinedSplits via F#2, auto numWorkers via F#1) ---
 t0=$(now)
-b=$(gql "CALL gnn_offline_sample('arxiv_gnn','arxiv_s',[15,10],{batchSize:1024,randomSeed:42,orientation:'UNDIRECTED'}) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes,numWorkersUsed RETURN *")
+b=$(gql "CALL gnn_offline_sample('arxiv_gnn','arxiv_s',[10,15],{batchSize:1024,randomSeed:42,orientation:'UNDIRECTED'}) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes,numWorkersUsed RETURN *")
 chk "$b" "gnn_offline_sample errored"
 t1=$(now)
 say "sample: $(dur "$t0" "$t1")s  batches=$(col "$b" totalBatches) (tr=$(col "$b" trainBatches) val=$(col "$b" validationBatches) te=$(col "$b" testBatches)) uniqNodes=$(col "$b" uniqueNodes) workers=$(col "$b" numWorkersUsed)"

@@ -44,7 +44,7 @@ for p in $(pgrep -f "bin/mdb server .*-p $PORT" 2>/dev/null||true); do kill -9 "
 MDB_GNN_L4_O_DIRECT="$ODIRECT" "$MDB" server "$DB" -p $PORT -t 600 --browser false >"$DB/server.log" 2>&1 & SRVPID=$!
 for _ in $(seq 1 30); do gql "RETURN 1" 2>/dev/null|grep -q 1 && break; kill -0 $SRVPID 2>/dev/null||{ echo SERVER_DIED; exit 1; }; sleep 0.5; done
 b=$(gql "CALL graph_project('cora','Paper','CITES',{orientation:'UNDIRECTED',includeFeatures:'node_features',labelProperty:'label'}) YIELD nodeCount RETURN *"); chk "$b" project
-b=$(gql "CALL gnn_offline_sample('cora','s',[10,5],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED'}) YIELD totalBatches RETURN *"); chk "$b" sample
+b=$(gql "CALL gnn_offline_sample('cora','s',[5,10],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED'}) YIELD totalBatches RETURN *"); chk "$b" sample
 b=$(gql "CALL gnn_materialize_batches('s','node_features',{reorder:1,numHashes:2,force:1}) YIELD totalBatches RETURN *"); chk "$b" materialize
 BAKEOPT=""; [ "$BAKE" = "1" ] && BAKEOPT=",bakeBlocks:true"
 BR=$(gql "CALL gnn_build_feature_store('s','node_features',{gpu_budget_mb:2,cpu_budget_mb:1,buildAddrTables:true,force:1${BAKEOPT}}) YIELD l1Nodes,l2Nodes,l3Nodes,l4Nodes,blocksMb,blocksBuiltOk RETURN *"); chk "$BR" build

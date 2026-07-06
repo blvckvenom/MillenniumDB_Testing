@@ -23,7 +23,7 @@
 #       graphStorage=CSR_HYBRID (design §3.8 D8 — CSR supersedes sidecar).
 #   (Phase 4) `USE <proj> MATCH (n) RETURN count(n)` returns 2708 for all
 #       four runs.
-#   (Phase 5) `gnn_offline_sample(proj, name, [5, 3])` returns identical
+#   (Phase 5) `gnn_offline_sample(proj, name, [3, 5])` returns identical
 #       uniqueNodes + totalBatches across all four runs.  The adjacency
 #       semantic (src -> {dsts}) is invariant; this is the GNN workload
 #       invariant Spec #8 G-series targets.
@@ -387,7 +387,7 @@ for i in 0 1 2 3; do
     drop_q="CALL gnn_sample_drop('$sname')"
     send_query "$drop_q" >/dev/null 2>&1 || true
 
-    sample_query="CALL gnn_offline_sample('$proj', '$sname', [5, 3], "
+    sample_query="CALL gnn_offline_sample('$proj', '$sname', [3, 5], "
     sample_query+="{batchSize: 256, randomSeed: 42}) "
     sample_query+="YIELD $SAMPLE_CSV_FMT RETURN *"
     resp=$(send_query "$sample_query")

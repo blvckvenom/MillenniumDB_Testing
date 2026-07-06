@@ -187,7 +187,7 @@ fi
 # =============================================================================
 info "Step 4: gnn_offline_sample with predefined splits (fanouts [10, 5])"
 
-SAMPLE_RESULT=$(query "CALL gnn_offline_sample('cora', 'cora_s', [10, 5], {
+SAMPLE_RESULT=$(query "CALL gnn_offline_sample('cora', 'cora_s', [5, 10], {
     batchSize: 64,
     randomSeed: 42,
     usePredefinedSplits: true,

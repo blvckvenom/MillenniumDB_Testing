@@ -47,7 +47,7 @@ b=$(gql "CALL graph_project('cora','Paper','CITES',{orientation:'UNDIRECTED',inc
 run_once(){
   local tag="$1" sopts="$2" s="s_$1"
   gql "CALL gnn_sample_drop('$s')" >/dev/null 2>&1 || true
-  b=$(gql "CALL gnn_offline_sample('cora','$s',[10,5],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED'${sopts}}) YIELD totalBatches RETURN *"); chk "$b" "${tag}_sample"
+  b=$(gql "CALL gnn_offline_sample('cora','$s',[5,10],{batchSize:64,randomSeed:42,orientation:'UNDIRECTED'${sopts}}) YIELD totalBatches RETURN *"); chk "$b" "${tag}_sample"
   b=$(gql "CALL gnn_build_feature_store('$s','node_features',{gpu_budget_mb:2,cpu_budget_mb:1,buildAddrTables:true,force:1}) YIELD l1Nodes RETURN *"); chk "$b" "${tag}_build"
   local T="epochs:5,randomSeed:42,dropout:0,patience:999,saveOnBestVal:false,saveFinal:false,prefetchNumWorkers:1,prefetchQueueSize:6,lrSchedule:''"
   local out; out=$(gql "CALL gnn_train('$s','node_features',{${T}}) YIELD testAccuracy RETURN *"); chk "$out" "${tag}_train"

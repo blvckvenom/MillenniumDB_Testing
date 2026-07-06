@@ -802,7 +802,7 @@ CALL graph_project('arxiv', ':Paper', ':CITES', {
     labelProperty: 'label', splitProperty: 'split'
 }) YIELD graphName, nodeCount, featureDim, numClasses RETURN *;
 
-CALL gnn_offline_sample('arxiv', 's1', [15, 10],
+CALL gnn_offline_sample('arxiv', 's1', [10, 15],
     {batchSize: 512, usePredefinedSplits: true})
     YIELD totalBatches RETURN *;
 
