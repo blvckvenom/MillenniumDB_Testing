@@ -2281,23 +2281,88 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         current_call_argument_exprs = std::move(named_args);
     }
 
-    // TODO: procesar YIELD
     current_call_yield_var2alias.clear();
 
+    const auto available_yield_names = OpProcedure::get_procedure_available_yield_variable_names(procedure_type);
     std::vector<VarId> yield_vars;
-    if (procedure_type == OpProcedure::ProcedureType::HELLO_WORLD) {
-        yield_vars.emplace_back(get_query_ctx().get_or_create_var("message"));
-    } else if (procedure_type == OpProcedure::ProcedureType::NEIGHBORS) {
-        yield_vars.emplace_back(get_query_ctx().get_or_create_var("node"));
-        yield_vars.emplace_back(get_query_ctx().get_or_create_var("neighbor"));
-        singleton_types[yield_vars[0]] = VarType::Node;
-        singleton_types[yield_vars[1]] = VarType::Node;
-    } else if (procedure_type == OpProcedure::ProcedureType::JACCARD) {
-        yield_vars.emplace_back(get_query_ctx().get_or_create_var("node1"));
-        yield_vars.emplace_back(get_query_ctx().get_or_create_var("node2"));
-        yield_vars.emplace_back(get_query_ctx().get_or_create_var("similarity"));
-        singleton_types[yield_vars[0]] = VarType::Node;
-        singleton_types[yield_vars[1]] = VarType::Node;
+    yield_vars.reserve(available_yield_names.size());
+
+    const auto set_yield_var_type = [&](const std::string& yield_name, VarId var) {
+        if (procedure_type == OpProcedure::ProcedureType::NEIGHBORS) {
+            singleton_types[var] = VarType::Node;
+        } else if (
+            procedure_type == OpProcedure::ProcedureType::JACCARD
+            && (yield_name == "node1" || yield_name == "node2")
+        ) {
+            singleton_types[var] = VarType::Node;
+        }
+    };
+
+    if (named_procedure_call->yieldClause()) {
+        auto* yield_item_list_ctx = named_procedure_call->yieldClause()->yieldItemList();
+        const auto yield_item_count = yield_item_list_ctx->yieldItem().size();
+
+        if (yield_item_count != available_yield_names.size()) {
+            throw QueryException(
+                "CALL statement procedure \"" + procedure_name + "\" expects all available YIELD items"
+            );
+        }
+
+        std::vector<bool> seen_yield_items(available_yield_names.size(), false);
+        std::vector<std::optional<VarId>> yield_vars_by_position(available_yield_names.size());
+
+        for (auto* yield_item_ctx : yield_item_list_ctx->yieldItem()) {
+            const std::string yield_name = yield_item_ctx->yieldItemName()->getText();
+
+            std::optional<std::size_t> yield_position;
+            for (std::size_t i = 0; i < available_yield_names.size(); ++i) {
+                if (yield_name == available_yield_names[i]) {
+                    yield_position = i;
+                    break;
+                }
+            }
+
+            if (!yield_position.has_value()) {
+                throw QueryException(
+                    "CALL statement procedure \"" + procedure_name
+                    + "\" does not have a YIELD item named \"" + yield_name + "\""
+                );
+            }
+
+            if (seen_yield_items[*yield_position]) {
+                throw QueryException(
+                    "CALL statement procedure \"" + procedure_name
+                    + "\" cannot YIELD \"" + yield_name + "\" more than once"
+                );
+            }
+            seen_yield_items[*yield_position] = true;
+
+            std::string alias = yield_name;
+            if (yield_item_ctx->yieldItemAlias()) {
+                alias = yield_item_ctx->yieldItemAlias()->bindingVariable()->getText();
+            }
+
+            const auto yield_var = get_query_ctx().get_or_create_var(alias);
+            yield_vars_by_position[*yield_position] = yield_var;
+            current_call_yield_var2alias.emplace(yield_name, yield_var);
+            set_yield_var_type(yield_name, yield_var);
+        }
+
+        for (std::size_t i = 0; i < yield_vars_by_position.size(); ++i) {
+            if (!yield_vars_by_position[i].has_value()) {
+                throw QueryException(
+                    "CALL statement procedure \"" + procedure_name
+                    + "\" must YIELD \"" + available_yield_names[i] + "\""
+                );
+            }
+            yield_vars.emplace_back(*yield_vars_by_position[i]);
+        }
+    } else {
+        for (const auto& yield_name : available_yield_names) {
+            const auto yield_var = get_query_ctx().get_or_create_var(yield_name);
+            yield_vars.emplace_back(yield_var);
+            set_yield_var_type(yield_name, yield_var);
+        }
     }
 
     current_op = std::make_unique<OpProcedure>(
