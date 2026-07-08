@@ -9,6 +9,15 @@ apuntando al sample viejo `e2e5ep` que ya no existe). Este doc es la fuente úni
 - **Host:** celebi — GPU 16 GB (RTX 5070 Ti), 30 GB RAM, NVMe Gen4, 20 cores
 - **Binario:** `build/Release/bin/mdb` (Release)
 
+> **CAMBIO DE CONVENCION DE FANOUTS (2026-07-06).** Desde ese commit `gnn_offline_sample` lee la
+> lista de fanouts en orden DGL/GraphBolt: el ULTIMO elemento muestrea el hop adyacente a los seeds
+> (`fanoutsNearestFirst:true` restaura la lectura hop-order previa). Este doc fue medido ANTES del
+> cambio y su prosa usa la notacion hop-order historica; los COMANDOS ejecutables de abajo ya estan
+> actualizados a la notacion nueva. Equivalencias: el canonico hop-order `[10,15,20]` se escribe hoy
+> `[20,15,10]`; la variante MEJOR hop-order `[20,15,10]` se escribe hoy `[10,15,20]`, exactamente el
+> mismo string que usa DiskGNN. Los nombres de samples (`rev_10_15_20`, `dedup_20_15_10`) conservan
+> las etiquetas historicas.
+
 ## Resultado
 
 | Métrica | Valor |
@@ -98,7 +107,7 @@ numClasses 172).
 Produce el sample `rev_10_15_20` (los k-hop batches + splits predefinidos).
 
 ```gql
-CALL gnn_offline_sample('papers100M_e2e_opt','rev_10_15_20',[10,15,20],{
+CALL gnn_offline_sample('papers100M_e2e_opt','rev_10_15_20',[20,15,10],{
     batchSize:1024,
     randomSeed:42,
     orientation:'UNDIRECTED',
