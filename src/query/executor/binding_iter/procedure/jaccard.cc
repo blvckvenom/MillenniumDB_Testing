@@ -83,6 +83,8 @@ void Jaccard::_reset()
         return;
     }
 
+    std::map<uint64_t, std::vector<std::tuple<ObjectId, ObjectId, ObjectId>>> top_k_candidates;
+
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         const auto& neighbors_i = adjacency.at(nodes[i]);
         for (std::size_t j = i + 1; j < nodes.size(); ++j) {
@@ -104,12 +106,40 @@ void Jaccard::_reset()
                                         : static_cast<double>(intersection_size) / static_cast<double>(union_size);
 
             if (similarity >= similarity_cutoff) {
-                results.emplace_back(
-                    ObjectId(nodes[i]),
-                    ObjectId(nodes[j]),
-                    GQL::Conversions::pack_double(similarity)
-                );
+                const auto node_i = ObjectId(nodes[i]);
+                const auto node_j = ObjectId(nodes[j]);
+                const auto similarity_oid = GQL::Conversions::pack_double(similarity);
+
+                if (top_k.has_value()) {
+                    top_k_candidates[nodes[i]].emplace_back(node_i, node_j, similarity_oid);
+                    top_k_candidates[nodes[j]].emplace_back(node_j, node_i, similarity_oid);
+                } else {
+                    results.emplace_back(node_i, node_j, similarity_oid);
+                }
             }
+        }
+    }
+
+    if (top_k.has_value()) {
+        for (auto& [node, candidates] : top_k_candidates) {
+            std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+                const auto& [lhs_node1, lhs_node2, lhs_similarity_oid] = lhs;
+                const auto& [rhs_node1, rhs_node2, rhs_similarity_oid] = rhs;
+
+                const double lhs_similarity = GQL::Conversions::to_double(lhs_similarity_oid);
+                const double rhs_similarity = GQL::Conversions::to_double(rhs_similarity_oid);
+
+                if (lhs_similarity != rhs_similarity) {
+                    return lhs_similarity > rhs_similarity;
+                }
+                return lhs_node2.id < rhs_node2.id;
+            });
+
+            const auto result_count = std::min<std::size_t>(
+                static_cast<std::size_t>(*top_k),
+                candidates.size()
+            );
+            results.insert(results.end(), candidates.begin(), candidates.begin() + result_count);
         }
     }
 
@@ -263,9 +293,6 @@ void Jaccard::eval_arguments()
         );
     }
 
-    if (top_k.has_value()) {
-        throw QueryExecutionException("CALL jaccard(...): topK is not implemented yet");
-    }
 }
 
 bool Jaccard::_next()
