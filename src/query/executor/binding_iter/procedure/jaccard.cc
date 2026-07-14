@@ -20,7 +20,7 @@ Jaccard::Jaccard(
     argument_binding_exprs { std::move(argument_binding_exprs_) },
     yield_vars { std::move(yield_vars_) }
 {
-    assert(argument_binding_exprs.size() <= 5);
+    assert(argument_binding_exprs.size() <= 7);
     assert(yield_vars.size() == 3);
 }
 
@@ -161,6 +161,7 @@ void Jaccard::eval_arguments()
     similarity_cutoff = 0.0;
     degree_cutoff = 1;
     upper_degree_cutoff = UINT64_MAX;
+    top_k.reset();
     top_n.reset();
     bottom_n.reset();
 
@@ -205,6 +206,16 @@ void Jaccard::eval_arguments()
         return static_cast<uint64_t>(value);
     };
 
+    auto eval_positive_integer = [&](const ObjectId oid, const char* arg_name) -> uint64_t {
+        const uint64_t value = eval_non_negative_integer(oid, arg_name);
+        if (value == 0) {
+            throw QueryExecutionException(
+                std::string("CALL jaccard(...): ") + arg_name + " must be an integer > 0"
+            );
+        }
+        return value;
+    };
+
     if (auto maybe_cutoff_oid = eval_optional_oid(0); maybe_cutoff_oid.has_value()) {
         const ObjectId cutoff_oid = eval_numeric(*maybe_cutoff_oid, "similarityCutoff");
         similarity_cutoff = GQL::Conversions::to_double(cutoff_oid);
@@ -218,11 +229,15 @@ void Jaccard::eval_arguments()
         upper_degree_cutoff = eval_non_negative_integer(*maybe_upper_degree_cutoff_oid, "upperDegreeCutoff");
     }
 
-    if (auto maybe_top_n_oid = eval_optional_oid(3); maybe_top_n_oid.has_value()) {
+    if (auto maybe_top_k_oid = eval_optional_oid(3); maybe_top_k_oid.has_value()) {
+        top_k = eval_positive_integer(*maybe_top_k_oid, "topK");
+    }
+
+    if (auto maybe_top_n_oid = eval_optional_oid(5); maybe_top_n_oid.has_value()) {
         top_n = eval_non_negative_integer(*maybe_top_n_oid, "topN");
     }
 
-    if (auto maybe_bottom_n_oid = eval_optional_oid(4); maybe_bottom_n_oid.has_value()) {
+    if (auto maybe_bottom_n_oid = eval_optional_oid(6); maybe_bottom_n_oid.has_value()) {
         bottom_n = eval_non_negative_integer(*maybe_bottom_n_oid, "bottomN");
     }
 
@@ -240,6 +255,16 @@ void Jaccard::eval_arguments()
         throw QueryExecutionException(
             "CALL jaccard(...): topN and bottomN cannot be used together"
         );
+    }
+
+    if (top_k.has_value() && bottom_n.has_value()) {
+        throw QueryExecutionException(
+            "CALL jaccard(...): topK and bottomN cannot be used together"
+        );
+    }
+
+    if (top_k.has_value()) {
+        throw QueryExecutionException("CALL jaccard(...): topK is not implemented yet");
     }
 }
 

@@ -2221,17 +2221,20 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         auto* argument_list_ctx = named_procedure_call->procedureCallArgumentList();
         const auto argument_count = argument_list_ctx->procedureCallArgument().size();
 
-        if (argument_count > 5) {
+        const std::string allowed_jaccard_arguments =
+            "similarityCutoff, degreeCutoff, upperDegreeCutoff, topK, bottomK, topN, bottomN";
+
+        if (argument_count > 7) {
             throw QueryException(
-                "CALL jaccard(...) expects at most five named arguments: "
-                "similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
+                "CALL jaccard(...) expects at most seven named arguments: "
+                + allowed_jaccard_arguments
             );
         }
 
-        std::vector<bool> seen_named_args(5, false);
+        std::vector<bool> seen_named_args(7, false);
         std::vector<std::unique_ptr<Expr>> named_args;
-        named_args.reserve(5);
-        for (size_t i = 0; i < 5; ++i) {
+        named_args.reserve(7);
+        for (size_t i = 0; i < 7; ++i) {
             named_args.emplace_back(std::make_unique<ExprTerm>(ObjectId::get_null()));
         }
 
@@ -2239,7 +2242,7 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             if (!argument_ctx->identifier()) {
                 throw QueryException(
                     "CALL jaccard(...) only supports named arguments: "
-                    "similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
+                    + allowed_jaccard_arguments
                 );
             }
 
@@ -2252,14 +2255,18 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
                 argument_pos = 1;
             } else if (argument_name == "upperDegreeCutoff") {
                 argument_pos = 2;
-            } else if (argument_name == "topN") {
+            } else if (argument_name == "topK") {
                 argument_pos = 3;
-            } else if (argument_name == "bottomN") {
+            } else if (argument_name == "bottomK") {
                 argument_pos = 4;
+            } else if (argument_name == "topN") {
+                argument_pos = 5;
+            } else if (argument_name == "bottomN") {
+                argument_pos = 6;
             } else {
                 throw QueryException(
                     "CALL jaccard(...): unknown named argument \"" + argument_name
-                    + "\". Allowed names are: similarityCutoff, degreeCutoff, upperDegreeCutoff, topN, bottomN"
+                    + "\". Allowed names are: " + allowed_jaccard_arguments
                 );
             }
 
@@ -2274,8 +2281,16 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             named_args[argument_pos] = std::move(current_expr);
         }
 
-        if (seen_named_args[3] && seen_named_args[4]) {
+        if (seen_named_args[4]) {
+            throw QueryException("CALL jaccard(...): bottomK is not implemented yet");
+        }
+
+        if (seen_named_args[5] && seen_named_args[6]) {
             throw QueryException("CALL jaccard(...): topN and bottomN cannot be used together");
+        }
+
+        if (seen_named_args[3] && seen_named_args[6]) {
+            throw QueryException("CALL jaccard(...): topK and bottomN cannot be used together");
         }
 
         current_call_argument_exprs = std::move(named_args);
