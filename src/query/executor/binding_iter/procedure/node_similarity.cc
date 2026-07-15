@@ -116,6 +116,15 @@ void NodeSimilarity::_reset()
                                  : static_cast<double>(intersection_size) / static_cast<double>(min_degree);
                 break;
             }
+            case SimilarityMetric::COSINE: {
+                const auto denominator = std::sqrt(
+                    static_cast<double>(neighbors_i.size()) * static_cast<double>(neighbors_j.size())
+                );
+                similarity = (denominator == 0.0)
+                                 ? 0.0
+                                 : static_cast<double>(intersection_size) / denominator;
+                break;
+            }
             }
 
             if (similarity >= similarity_cutoff) {
@@ -276,11 +285,13 @@ void NodeSimilarity::eval_arguments()
             return SimilarityMetric::JACCARD;
         } else if (metric_name == "OVERLAP") {
             return SimilarityMetric::OVERLAP;
+        } else if (metric_name == "COSINE") {
+            return SimilarityMetric::COSINE;
         }
 
         throw QueryExecutionException(
             "CALL nodeSimilarity(...): unsupported similarityMetric \"" + metric_name
-            + "\". Supported values are: JACCARD, OVERLAP"
+            + "\". Supported values are: JACCARD, OVERLAP, COSINE"
         );
     };
 
