@@ -20,7 +20,7 @@ NodeSimilarity::NodeSimilarity(
     argument_binding_exprs { std::move(argument_binding_exprs_) },
     yield_vars { std::move(yield_vars_) }
 {
-    assert(argument_binding_exprs.size() <= 7);
+    assert(argument_binding_exprs.size() <= 8);
     assert(yield_vars.size() == 3);
 }
 
@@ -191,6 +191,7 @@ void NodeSimilarity::_reset()
 
 void NodeSimilarity::eval_arguments()
 {
+    similarity_metric = SimilarityMetric::JACCARD;
     similarity_cutoff = 0.0;
     degree_cutoff = 1;
     upper_degree_cutoff = UINT64_MAX;
@@ -250,32 +251,54 @@ void NodeSimilarity::eval_arguments()
         return value;
     };
 
-    if (auto maybe_cutoff_oid = eval_optional_oid(0); maybe_cutoff_oid.has_value()) {
+    auto eval_similarity_metric = [&](const ObjectId oid) -> SimilarityMetric {
+        if ((oid.id & ObjectId::GENERIC_TYPE_MASK) != ObjectId::MASK_STRING) {
+            throw QueryExecutionException(
+                "CALL nodeSimilarity(...): similarityMetric must be a string"
+            );
+        }
+
+        const std::string metric_name = GQL::Conversions::unpack_string(oid);
+        if (metric_name == "JACCARD") {
+            return SimilarityMetric::JACCARD;
+        }
+
+        throw QueryExecutionException(
+            "CALL nodeSimilarity(...): unsupported similarityMetric \"" + metric_name
+            + "\". Supported values are: JACCARD"
+        );
+    };
+
+    if (auto maybe_similarity_metric_oid = eval_optional_oid(0); maybe_similarity_metric_oid.has_value()) {
+        similarity_metric = eval_similarity_metric(*maybe_similarity_metric_oid);
+    }
+
+    if (auto maybe_cutoff_oid = eval_optional_oid(1); maybe_cutoff_oid.has_value()) {
         const ObjectId cutoff_oid = eval_numeric(*maybe_cutoff_oid, "similarityCutoff");
         similarity_cutoff = GQL::Conversions::to_double(cutoff_oid);
     }
 
-    if (auto maybe_degree_cutoff_oid = eval_optional_oid(1); maybe_degree_cutoff_oid.has_value()) {
+    if (auto maybe_degree_cutoff_oid = eval_optional_oid(2); maybe_degree_cutoff_oid.has_value()) {
         degree_cutoff = eval_non_negative_integer(*maybe_degree_cutoff_oid, "degreeCutoff");
     }
 
-    if (auto maybe_upper_degree_cutoff_oid = eval_optional_oid(2); maybe_upper_degree_cutoff_oid.has_value()) {
+    if (auto maybe_upper_degree_cutoff_oid = eval_optional_oid(3); maybe_upper_degree_cutoff_oid.has_value()) {
         upper_degree_cutoff = eval_non_negative_integer(*maybe_upper_degree_cutoff_oid, "upperDegreeCutoff");
     }
 
-    if (auto maybe_top_k_oid = eval_optional_oid(3); maybe_top_k_oid.has_value()) {
+    if (auto maybe_top_k_oid = eval_optional_oid(4); maybe_top_k_oid.has_value()) {
         top_k = eval_positive_integer(*maybe_top_k_oid, "topK");
     }
 
-    if (auto maybe_bottom_k_oid = eval_optional_oid(4); maybe_bottom_k_oid.has_value()) {
+    if (auto maybe_bottom_k_oid = eval_optional_oid(5); maybe_bottom_k_oid.has_value()) {
         bottom_k = eval_positive_integer(*maybe_bottom_k_oid, "bottomK");
     }
 
-    if (auto maybe_top_n_oid = eval_optional_oid(5); maybe_top_n_oid.has_value()) {
+    if (auto maybe_top_n_oid = eval_optional_oid(6); maybe_top_n_oid.has_value()) {
         top_n = eval_non_negative_integer(*maybe_top_n_oid, "topN");
     }
 
-    if (auto maybe_bottom_n_oid = eval_optional_oid(6); maybe_bottom_n_oid.has_value()) {
+    if (auto maybe_bottom_n_oid = eval_optional_oid(7); maybe_bottom_n_oid.has_value()) {
         bottom_n = eval_non_negative_integer(*maybe_bottom_n_oid, "bottomN");
     }
 

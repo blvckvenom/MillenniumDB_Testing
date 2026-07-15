@@ -2222,19 +2222,19 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         const auto argument_count = argument_list_ctx->procedureCallArgument().size();
 
         const std::string allowed_node_similarity_arguments =
-            "similarityCutoff, degreeCutoff, upperDegreeCutoff, topK, bottomK, topN, bottomN";
+            "similarityMetric, similarityCutoff, degreeCutoff, upperDegreeCutoff, topK, bottomK, topN, bottomN";
 
-        if (argument_count > 7) {
+        if (argument_count > 8) {
             throw QueryException(
-                "CALL nodeSimilarity(...) expects at most seven named arguments: "
+                "CALL nodeSimilarity(...) expects at most eight named arguments: "
                 + allowed_node_similarity_arguments
             );
         }
 
-        std::vector<bool> seen_named_args(7, false);
+        std::vector<bool> seen_named_args(8, false);
         std::vector<std::unique_ptr<Expr>> named_args;
-        named_args.reserve(7);
-        for (size_t i = 0; i < 7; ++i) {
+        named_args.reserve(8);
+        for (size_t i = 0; i < 8; ++i) {
             named_args.emplace_back(std::make_unique<ExprTerm>(ObjectId::get_null()));
         }
 
@@ -2249,20 +2249,22 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             const std::string argument_name = argument_ctx->identifier()->getText();
 
             size_t argument_pos = 0;
-            if (argument_name == "similarityCutoff") {
+            if (argument_name == "similarityMetric") {
                 argument_pos = 0;
-            } else if (argument_name == "degreeCutoff") {
+            } else if (argument_name == "similarityCutoff") {
                 argument_pos = 1;
-            } else if (argument_name == "upperDegreeCutoff") {
+            } else if (argument_name == "degreeCutoff") {
                 argument_pos = 2;
-            } else if (argument_name == "topK") {
+            } else if (argument_name == "upperDegreeCutoff") {
                 argument_pos = 3;
-            } else if (argument_name == "bottomK") {
+            } else if (argument_name == "topK") {
                 argument_pos = 4;
-            } else if (argument_name == "topN") {
+            } else if (argument_name == "bottomK") {
                 argument_pos = 5;
-            } else if (argument_name == "bottomN") {
+            } else if (argument_name == "topN") {
                 argument_pos = 6;
+            } else if (argument_name == "bottomN") {
+                argument_pos = 7;
             } else {
                 throw QueryException(
                     "CALL nodeSimilarity(...): unknown named argument \"" + argument_name
@@ -2281,19 +2283,19 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             named_args[argument_pos] = std::move(current_expr);
         }
 
-        if (seen_named_args[5] && seen_named_args[6]) {
+        if (seen_named_args[6] && seen_named_args[7]) {
             throw QueryException("CALL nodeSimilarity(...): topN and bottomN cannot be used together");
         }
 
-        if (seen_named_args[3] && seen_named_args[4]) {
+        if (seen_named_args[4] && seen_named_args[5]) {
             throw QueryException("CALL nodeSimilarity(...): topK and bottomK cannot be used together");
         }
 
-        if (seen_named_args[3] && seen_named_args[6]) {
+        if (seen_named_args[4] && seen_named_args[7]) {
             throw QueryException("CALL nodeSimilarity(...): topK and bottomN cannot be used together");
         }
 
-        if (seen_named_args[4] && seen_named_args[5]) {
+        if (seen_named_args[5] && seen_named_args[6]) {
             throw QueryException("CALL nodeSimilarity(...): bottomK and topN cannot be used together");
         }
 

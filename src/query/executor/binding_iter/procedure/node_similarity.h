@@ -26,12 +26,17 @@ public:
     void assign_nulls() override;
 
 private:
+    enum class SimilarityMetric {
+        JACCARD
+    };
+
     const std::vector<std::unique_ptr<BindingExpr>> argument_binding_exprs;
     const std::vector<VarId> yield_vars;
 
     Binding* parent_binding = nullptr;
     std::vector<std::tuple<ObjectId, ObjectId, ObjectId>> results;
     std::size_t cursor = 0;
+    SimilarityMetric similarity_metric = SimilarityMetric::JACCARD;
     double similarity_cutoff = 0.0;
     uint64_t degree_cutoff = 1;
     uint64_t upper_degree_cutoff = UINT64_MAX;
