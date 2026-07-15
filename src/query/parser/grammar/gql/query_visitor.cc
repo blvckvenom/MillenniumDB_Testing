@@ -2204,15 +2204,15 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         procedure_type = OpProcedure::ProcedureType::HELLO_WORLD;
     } else if (procedure_name_lowercased == "neighbors") {
         procedure_type = OpProcedure::ProcedureType::NEIGHBORS;
-    } else if (procedure_name_lowercased == "jaccard") {
-        procedure_type = OpProcedure::ProcedureType::JACCARD;
+    } else if (procedure_name_lowercased == "nodesimilarity") {
+        procedure_type = OpProcedure::ProcedureType::NODE_SIMILARITY;
     } else {
         throw QueryException("Invalid CALL statement procedure: \"" + procedure_name + "\"");
     }
 
     current_call_argument_exprs.clear();
     if (named_procedure_call->procedureCallArgumentList()) {
-        if (procedure_type != OpProcedure::ProcedureType::JACCARD) {
+        if (procedure_type != OpProcedure::ProcedureType::NODE_SIMILARITY) {
             throw QueryException(
                 "CALL statement procedure \"" + procedure_name
                 + "\" does not support arguments yet"
@@ -2221,13 +2221,13 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         auto* argument_list_ctx = named_procedure_call->procedureCallArgumentList();
         const auto argument_count = argument_list_ctx->procedureCallArgument().size();
 
-        const std::string allowed_jaccard_arguments =
+        const std::string allowed_node_similarity_arguments =
             "similarityCutoff, degreeCutoff, upperDegreeCutoff, topK, bottomK, topN, bottomN";
 
         if (argument_count > 7) {
             throw QueryException(
-                "CALL jaccard(...) expects at most seven named arguments: "
-                + allowed_jaccard_arguments
+                "CALL nodeSimilarity(...) expects at most seven named arguments: "
+                + allowed_node_similarity_arguments
             );
         }
 
@@ -2241,8 +2241,8 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         for (auto* argument_ctx : argument_list_ctx->procedureCallArgument()) {
             if (!argument_ctx->identifier()) {
                 throw QueryException(
-                    "CALL jaccard(...) only supports named arguments: "
-                    + allowed_jaccard_arguments
+                    "CALL nodeSimilarity(...) only supports named arguments: "
+                    + allowed_node_similarity_arguments
                 );
             }
 
@@ -2265,14 +2265,14 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
                 argument_pos = 6;
             } else {
                 throw QueryException(
-                    "CALL jaccard(...): unknown named argument \"" + argument_name
-                    + "\". Allowed names are: " + allowed_jaccard_arguments
+                    "CALL nodeSimilarity(...): unknown named argument \"" + argument_name
+                    + "\". Allowed names are: " + allowed_node_similarity_arguments
                 );
             }
 
             if (seen_named_args[argument_pos]) {
                 throw QueryException(
-                    "CALL jaccard(...): named argument \"" + argument_name + "\" cannot be repeated"
+                    "CALL nodeSimilarity(...): named argument \"" + argument_name + "\" cannot be repeated"
                 );
             }
             seen_named_args[argument_pos] = true;
@@ -2282,19 +2282,19 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         }
 
         if (seen_named_args[5] && seen_named_args[6]) {
-            throw QueryException("CALL jaccard(...): topN and bottomN cannot be used together");
+            throw QueryException("CALL nodeSimilarity(...): topN and bottomN cannot be used together");
         }
 
         if (seen_named_args[3] && seen_named_args[4]) {
-            throw QueryException("CALL jaccard(...): topK and bottomK cannot be used together");
+            throw QueryException("CALL nodeSimilarity(...): topK and bottomK cannot be used together");
         }
 
         if (seen_named_args[3] && seen_named_args[6]) {
-            throw QueryException("CALL jaccard(...): topK and bottomN cannot be used together");
+            throw QueryException("CALL nodeSimilarity(...): topK and bottomN cannot be used together");
         }
 
         if (seen_named_args[4] && seen_named_args[5]) {
-            throw QueryException("CALL jaccard(...): bottomK and topN cannot be used together");
+            throw QueryException("CALL nodeSimilarity(...): bottomK and topN cannot be used together");
         }
 
         current_call_argument_exprs = std::move(named_args);
@@ -2310,7 +2310,7 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
         if (procedure_type == OpProcedure::ProcedureType::NEIGHBORS) {
             singleton_types[var] = VarType::Node;
         } else if (
-            procedure_type == OpProcedure::ProcedureType::JACCARD
+            procedure_type == OpProcedure::ProcedureType::NODE_SIMILARITY
             && (yield_name == "node1" || yield_name == "node2")
         ) {
             singleton_types[var] = VarType::Node;

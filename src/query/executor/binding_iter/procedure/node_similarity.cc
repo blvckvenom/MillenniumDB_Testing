@@ -1,4 +1,4 @@
-#include "jaccard.h"
+#include "node_similarity.h"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +13,7 @@
 
 using namespace Procedure;
 
-Jaccard::Jaccard(
+NodeSimilarity::NodeSimilarity(
     std::vector<std::unique_ptr<BindingExpr>>&& argument_binding_exprs_,
     std::vector<VarId>&& yield_vars_
 ) :
@@ -24,13 +24,13 @@ Jaccard::Jaccard(
     assert(yield_vars.size() == 3);
 }
 
-void Jaccard::_begin(Binding& parent_binding_)
+void NodeSimilarity::_begin(Binding& parent_binding_)
 {
     parent_binding = &parent_binding_;
     _reset();
 }
 
-void Jaccard::_reset()
+void NodeSimilarity::_reset()
 {
     results.clear();
     cursor = 0;
@@ -189,7 +189,7 @@ void Jaccard::_reset()
     }
 }
 
-void Jaccard::eval_arguments()
+void NodeSimilarity::eval_arguments()
 {
     similarity_cutoff = 0.0;
     degree_cutoff = 1;
@@ -219,7 +219,7 @@ void Jaccard::eval_arguments()
             return oid;
         default:
             throw QueryExecutionException(
-                std::string("CALL jaccard(...): ") + arg_name + " must be numeric"
+                std::string("CALL nodeSimilarity(...): ") + arg_name + " must be numeric"
             );
         }
     };
@@ -227,14 +227,14 @@ void Jaccard::eval_arguments()
     auto eval_non_negative_integer = [&](const ObjectId oid, const char* arg_name) -> uint64_t {
         if (oid.get_sub_type() != ObjectId::MASK_INT) {
             throw QueryExecutionException(
-                std::string("CALL jaccard(...): ") + arg_name + " must be an integer >= 0"
+                std::string("CALL nodeSimilarity(...): ") + arg_name + " must be an integer >= 0"
             );
         }
 
         const int64_t value = GQL::Conversions::to_integer(oid);
         if (value < 0) {
             throw QueryExecutionException(
-                std::string("CALL jaccard(...): ") + arg_name + " must be an integer >= 0"
+                std::string("CALL nodeSimilarity(...): ") + arg_name + " must be an integer >= 0"
             );
         }
         return static_cast<uint64_t>(value);
@@ -244,7 +244,7 @@ void Jaccard::eval_arguments()
         const uint64_t value = eval_non_negative_integer(oid, arg_name);
         if (value == 0) {
             throw QueryExecutionException(
-                std::string("CALL jaccard(...): ") + arg_name + " must be an integer > 0"
+                std::string("CALL nodeSimilarity(...): ") + arg_name + " must be an integer > 0"
             );
         }
         return value;
@@ -280,42 +280,42 @@ void Jaccard::eval_arguments()
     }
 
     if (!std::isfinite(similarity_cutoff) || similarity_cutoff < 0.0 || similarity_cutoff > 1.0) {
-        throw QueryExecutionException("CALL jaccard(...): similarityCutoff must be in range [0, 1]");
+        throw QueryExecutionException("CALL nodeSimilarity(...): similarityCutoff must be in range [0, 1]");
     }
 
     if (degree_cutoff > upper_degree_cutoff) {
         throw QueryExecutionException(
-            "CALL jaccard(...): degreeCutoff must be <= upperDegreeCutoff"
+            "CALL nodeSimilarity(...): degreeCutoff must be <= upperDegreeCutoff"
         );
     }
 
     if (top_n.has_value() && bottom_n.has_value()) {
         throw QueryExecutionException(
-            "CALL jaccard(...): topN and bottomN cannot be used together"
+            "CALL nodeSimilarity(...): topN and bottomN cannot be used together"
         );
     }
 
     if (top_k.has_value() && bottom_k.has_value()) {
         throw QueryExecutionException(
-            "CALL jaccard(...): topK and bottomK cannot be used together"
+            "CALL nodeSimilarity(...): topK and bottomK cannot be used together"
         );
     }
 
     if (top_k.has_value() && bottom_n.has_value()) {
         throw QueryExecutionException(
-            "CALL jaccard(...): topK and bottomN cannot be used together"
+            "CALL nodeSimilarity(...): topK and bottomN cannot be used together"
         );
     }
 
     if (bottom_k.has_value() && top_n.has_value()) {
         throw QueryExecutionException(
-            "CALL jaccard(...): bottomK and topN cannot be used together"
+            "CALL nodeSimilarity(...): bottomK and topN cannot be used together"
         );
     }
 
 }
 
-bool Jaccard::_next()
+bool NodeSimilarity::_next()
 {
     if (cursor >= results.size()) {
         return false;
@@ -330,19 +330,19 @@ bool Jaccard::_next()
     return true;
 }
 
-void Jaccard::assign_nulls()
+void NodeSimilarity::assign_nulls()
 {
     for (const auto& var : yield_vars) {
         parent_binding->add(var, ObjectId::get_null());
     }
 }
 
-void Jaccard::print(std::ostream& os, int indent, bool stats) const
+void NodeSimilarity::print(std::ostream& os, int indent, bool stats) const
 {
     if (stats) {
         print_generic_stats(os, indent);
     }
-    os << std::string(indent, ' ') << "Jaccard() -> (";
+    os << std::string(indent, ' ') << "NodeSimilarity() -> (";
     if (!yield_vars.empty()) {
         os << yield_vars[0];
         for (std::size_t i = 1; i < yield_vars.size(); ++i) {

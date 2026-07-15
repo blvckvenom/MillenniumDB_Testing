@@ -11,9 +11,9 @@
 
 namespace Procedure {
 
-class Jaccard : public BindingIter {
+class NodeSimilarity : public BindingIter {
 public:
-    Jaccard(
+    NodeSimilarity(
         std::vector<std::unique_ptr<BindingExpr>>&& argument_binding_exprs_,
         std::vector<VarId>&& yield_vars_
     );
