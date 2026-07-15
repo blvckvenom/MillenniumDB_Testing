@@ -27,7 +27,8 @@ public:
 
 private:
     enum class SimilarityMetric {
-        JACCARD
+        JACCARD,
+        OVERLAP
     };
 
     const std::vector<std::unique_ptr<BindingExpr>> argument_binding_exprs;

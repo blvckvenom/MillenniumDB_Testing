@@ -100,10 +100,23 @@ void NodeSimilarity::_reset()
                 }
             }
 
-            const auto union_size = neighbors_i.size() + neighbors_j.size() - intersection_size;
-            const auto similarity = (union_size == 0)
-                                        ? 0.0
-                                        : static_cast<double>(intersection_size) / static_cast<double>(union_size);
+            double similarity = 0.0;
+            switch (similarity_metric) {
+            case SimilarityMetric::JACCARD: {
+                const auto union_size = neighbors_i.size() + neighbors_j.size() - intersection_size;
+                similarity = (union_size == 0)
+                                 ? 0.0
+                                 : static_cast<double>(intersection_size) / static_cast<double>(union_size);
+                break;
+            }
+            case SimilarityMetric::OVERLAP: {
+                const auto min_degree = std::min(neighbors_i.size(), neighbors_j.size());
+                similarity = (min_degree == 0)
+                                 ? 0.0
+                                 : static_cast<double>(intersection_size) / static_cast<double>(min_degree);
+                break;
+            }
+            }
 
             if (similarity >= similarity_cutoff) {
                 const auto node_i = ObjectId(nodes[i]);
@@ -261,11 +274,13 @@ void NodeSimilarity::eval_arguments()
         const std::string metric_name = GQL::Conversions::unpack_string(oid);
         if (metric_name == "JACCARD") {
             return SimilarityMetric::JACCARD;
+        } else if (metric_name == "OVERLAP") {
+            return SimilarityMetric::OVERLAP;
         }
 
         throw QueryExecutionException(
             "CALL nodeSimilarity(...): unsupported similarityMetric \"" + metric_name
-            + "\". Supported values are: JACCARD"
+            + "\". Supported values are: JACCARD, OVERLAP"
         );
     };
 
