@@ -36,6 +36,7 @@ private:
     uint64_t degree_cutoff = 1;
     uint64_t upper_degree_cutoff = UINT64_MAX;
     std::optional<uint64_t> top_k;
+    std::optional<uint64_t> bottom_k;
     std::optional<uint64_t> top_n;
     std::optional<uint64_t> bottom_n;
 

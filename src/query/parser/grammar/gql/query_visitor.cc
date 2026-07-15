@@ -2281,16 +2281,20 @@ std::any QueryVisitor::visitCallQueryStatement(GQLParser::CallQueryStatementCont
             named_args[argument_pos] = std::move(current_expr);
         }
 
-        if (seen_named_args[4]) {
-            throw QueryException("CALL jaccard(...): bottomK is not implemented yet");
-        }
-
         if (seen_named_args[5] && seen_named_args[6]) {
             throw QueryException("CALL jaccard(...): topN and bottomN cannot be used together");
         }
 
+        if (seen_named_args[3] && seen_named_args[4]) {
+            throw QueryException("CALL jaccard(...): topK and bottomK cannot be used together");
+        }
+
         if (seen_named_args[3] && seen_named_args[6]) {
             throw QueryException("CALL jaccard(...): topK and bottomN cannot be used together");
+        }
+
+        if (seen_named_args[4] && seen_named_args[5]) {
+            throw QueryException("CALL jaccard(...): bottomK and topN cannot be used together");
         }
 
         current_call_argument_exprs = std::move(named_args);

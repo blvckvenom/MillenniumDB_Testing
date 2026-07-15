@@ -83,7 +83,7 @@ void Jaccard::_reset()
         return;
     }
 
-    std::map<uint64_t, std::vector<std::tuple<ObjectId, ObjectId, ObjectId>>> top_k_candidates;
+    std::map<uint64_t, std::vector<std::tuple<ObjectId, ObjectId, ObjectId>>> k_candidates;
 
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         const auto& neighbors_i = adjacency.at(nodes[i]);
@@ -110,9 +110,9 @@ void Jaccard::_reset()
                 const auto node_j = ObjectId(nodes[j]);
                 const auto similarity_oid = GQL::Conversions::pack_double(similarity);
 
-                if (top_k.has_value()) {
-                    top_k_candidates[nodes[i]].emplace_back(node_i, node_j, similarity_oid);
-                    top_k_candidates[nodes[j]].emplace_back(node_j, node_i, similarity_oid);
+                if (top_k.has_value() || bottom_k.has_value()) {
+                    k_candidates[nodes[i]].emplace_back(node_i, node_j, similarity_oid);
+                    k_candidates[nodes[j]].emplace_back(node_j, node_i, similarity_oid);
                 } else {
                     results.emplace_back(node_i, node_j, similarity_oid);
                 }
@@ -120,9 +120,9 @@ void Jaccard::_reset()
         }
     }
 
-    if (top_k.has_value()) {
-        for (auto& [node, candidates] : top_k_candidates) {
-            std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+    if (top_k.has_value() || bottom_k.has_value()) {
+        for (auto& [node, candidates] : k_candidates) {
+            std::sort(candidates.begin(), candidates.end(), [&](const auto& lhs, const auto& rhs) {
                 const auto& [lhs_node1, lhs_node2, lhs_similarity_oid] = lhs;
                 const auto& [rhs_node1, rhs_node2, rhs_similarity_oid] = rhs;
 
@@ -130,13 +130,16 @@ void Jaccard::_reset()
                 const double rhs_similarity = GQL::Conversions::to_double(rhs_similarity_oid);
 
                 if (lhs_similarity != rhs_similarity) {
-                    return lhs_similarity > rhs_similarity;
+                    return top_k.has_value()
+                               ? lhs_similarity > rhs_similarity
+                               : lhs_similarity < rhs_similarity;
                 }
                 return lhs_node2.id < rhs_node2.id;
             });
 
+            const auto k = top_k.has_value() ? *top_k : *bottom_k;
             const auto result_count = std::min<std::size_t>(
-                static_cast<std::size_t>(*top_k),
+                static_cast<std::size_t>(k),
                 candidates.size()
             );
             results.insert(results.end(), candidates.begin(), candidates.begin() + result_count);
@@ -192,6 +195,7 @@ void Jaccard::eval_arguments()
     degree_cutoff = 1;
     upper_degree_cutoff = UINT64_MAX;
     top_k.reset();
+    bottom_k.reset();
     top_n.reset();
     bottom_n.reset();
 
@@ -263,6 +267,10 @@ void Jaccard::eval_arguments()
         top_k = eval_positive_integer(*maybe_top_k_oid, "topK");
     }
 
+    if (auto maybe_bottom_k_oid = eval_optional_oid(4); maybe_bottom_k_oid.has_value()) {
+        bottom_k = eval_positive_integer(*maybe_bottom_k_oid, "bottomK");
+    }
+
     if (auto maybe_top_n_oid = eval_optional_oid(5); maybe_top_n_oid.has_value()) {
         top_n = eval_non_negative_integer(*maybe_top_n_oid, "topN");
     }
@@ -287,9 +295,21 @@ void Jaccard::eval_arguments()
         );
     }
 
+    if (top_k.has_value() && bottom_k.has_value()) {
+        throw QueryExecutionException(
+            "CALL jaccard(...): topK and bottomK cannot be used together"
+        );
+    }
+
     if (top_k.has_value() && bottom_n.has_value()) {
         throw QueryExecutionException(
             "CALL jaccard(...): topK and bottomN cannot be used together"
+        );
+    }
+
+    if (bottom_k.has_value() && top_n.has_value()) {
+        throw QueryExecutionException(
+            "CALL jaccard(...): bottomK and topN cannot be used together"
         );
     }
 
