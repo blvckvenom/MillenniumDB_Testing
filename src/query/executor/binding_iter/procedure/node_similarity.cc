@@ -67,8 +67,8 @@ void NodeSimilarity::_reset()
         // Directed edge contributes only in outgoing direction: from->to => neighbors(from)+=to
         adjacency[from].insert(to);
     }
-    // Note: Self-loop indexes (equal_u_edge/equal_d_edge) are intentionally not scanned here yet.
-    // They are not projection-aware, and calling their getters under USE projection throws.
+    // Self-loops are included through the main edge indexes above. The equal_u_edge/equal_d_edge
+    // indexes are only specialized access paths for explicit self-loop patterns.
 
     std::vector<uint64_t> nodes;
     nodes.reserve(adjacency.size());
