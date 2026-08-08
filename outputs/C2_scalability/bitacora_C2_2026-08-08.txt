@@ -1,0 +1,119 @@
+BITÁCORA C2 — CARACTERIZACIÓN EXPERIMENTAL Y ESCALABILIDAD
+Fecha: 2026-08-08
+Rama: integration/native-gql-feature-engineering-gnn
+Repo: /home/svergara/tesis/MillenniumDB_Testing
+
+1. Objetivo de la sesión
+Se retomó la Línea 1 / C2, orientada a pasar desde la validación funcional sobre Cora hacia una caracterización experimental del pipeline GNN, midiendo tiempos, memoria y almacenamiento generado.
+
+2. Estado inicial
+Se verificó que la rama activa era:
+integration/native-gql-feature-engineering-gnn
+
+Último commit observado:
+ac1923d0 test(gnn): add controlled Cora experiment runner
+
+Se encontró el script principal de C1:
+scripts/gnn_experiments/run_c1_cora_all.sh
+
+3. Revalidación de C1 sobre Cora
+Se re-ejecutaron las cinco configuraciones:
+- Cora original.
+- Atributos estructurales nativos.
+- Atributos estructurales desde GQL.
+- Originales + estructurales nativos.
+- Originales + atributos desde GQL.
+
+Resultados reproducidos:
+- Cora original: testAccuracy = 0.750.
+- B5 structural: testAccuracy = 0.385.
+- B6 query rich: testAccuracy = 0.319.
+- B5 combined: testAccuracy = 0.721.
+- B6 query combined: testAccuracy = 0.717.
+
+4. Medición de tiempo y memoria sobre Cora
+Se creó y ejecutó:
+scripts/gnn_experiments/run_c2_cora_time_memory.sh
+
+Se midió cada experimento con /usr/bin/time -v.
+
+Resumen:
+- cora_original: 3.67 s, max RSS 1442.75 MB, testAccuracy 0.750.
+- b5_structural_cora: 2.64 s, max RSS 1439.72 MB, testAccuracy 0.385.
+- b6_query_rich_cora: 2.63 s, max RSS 1442.36 MB, testAccuracy 0.319.
+- b5_combined_cora: 3.66 s, max RSS 1460.40 MB, testAccuracy 0.721.
+- b6_query_combined_cora: 3.66 s, max RSS 1464.50 MB, testAccuracy 0.717.
+
+5. Medición de almacenamiento sobre Cora
+Se midieron tamaños de directorios, archivos .fmat, .rmap, cachés y feature store.
+
+Resumen:
+- cora_b5_structural: 6.1041 MB total.
+- cora_b6_query_rich: 6.1039 MB total.
+- cora_original: 58.9284 MB total.
+- cora_b5_combined: 74.0159 MB total.
+- cora_b6_query_combined: 74.0159 MB total.
+
+Interpretación:
+La ruta GQL y la ruta nativa equivalente generan costos de almacenamiento prácticamente iguales en Cora. Las diferencias de almacenamiento se explican principalmente por la dimensionalidad de las matrices de atributos.
+
+6. Preparación de ogbn-arxiv
+Se encontró el script:
+scripts/arxiv_e2e.sh
+
+Se creó una copia adaptada al entorno local:
+scripts/gnn_experiments/run_c2_arxiv_e2e.sh
+
+Se corrigieron:
+- REPO=/home/svergara/tesis/MillenniumDB_Testing
+- MDB=$REPO/build/GNN/bin/mdb
+
+Se descargó/generó ogbn-arxiv en:
+data/example/gql/ogbn-arxiv/ogbn-arxiv/
+
+Archivos generados:
+- ogbn_arxiv.gql
+- ogbn_arxiv_features.npy
+- ogbn_arxiv_labels.npy
+
+7. Ejecución de ogbn-arxiv
+Se ejecutó el pipeline end-to-end sobre ogbn-arxiv.
+
+Resultados principales:
+- Nodos: 169,343.
+- Relaciones: 1,166,243.
+- Feature dimension: 128.
+- Clases: 40.
+- Batches totales: 167.
+- train / validation / test batches: 89 / 30 / 48.
+- testAccuracy aprox.: 0.653–0.654.
+- bestValAccuracy aprox.: 0.675–0.680.
+- Tiempo total: entre 11.46 s y 14.51 s.
+- Memoria máxima: aprox. 1.85–1.89 GB.
+- Feature store reuse validado correctamente.
+- useAddrTablesEffective=true.
+- l1Hit=1.0.
+
+8. Medición de almacenamiento sobre ogbn-arxiv
+Se creó una versión keepdb:
+scripts/gnn_experiments/run_c2_arxiv_e2e_keepdb.sh
+
+Se conservó la DB temporal:
+ARXIV_DB=/tmp/arxiv_e2e.m7dv5D
+
+Resumen de almacenamiento:
+- DB total: 868.5535 MB.
+- fmat total: 165.3741 MB.
+- rmap total: 7.752 MB.
+- cache total: 83.9791 MB.
+- store total: 0.0003 MB.
+
+9. Interpretación preliminar
+Cora permite comparar rutas nativas y GQL en un entorno controlado.
+ogbn-arxiv permite validar que el pipeline escala a un grafo considerablemente mayor.
+En Cora, la ruta GQL combinada logra resultados cercanos a la ruta nativa combinada y costos de almacenamiento equivalentes.
+En ogbn-arxiv, se obtuvo una línea base de escalabilidad del pipeline base, que servirá para comparar futuras extensiones con generación de atributos mediante GQL.
+
+10. Próximo paso
+En la siguiente sesión se continuará con un dataset aún más grande para cerrar la Línea 1 / C2.
+Después de eso, se pasará a la Línea 2: explorar nuevas optimizaciones del pipeline mediante GQL / álgebra de consultas sobre grafos.

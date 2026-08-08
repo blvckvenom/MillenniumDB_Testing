@@ -1,0 +1,6 @@
+experiment,total_dir_mb,fmat_files,fmat_total_mb,rmap_files,rmap_total_mb,cache_files,cache_total_mb,store_files,store_total_mb
+cora_b5_combined,74.0159,3,44.5337,6,0.1861,2,13.7205,2,0.0003
+cora_b5_structural,6.1041,2,0.1241,4,0.124,2,0.0762,2,0.0003
+cora_b6_query_combined,74.0159,3,44.5337,6,0.1861,2,13.7205,2,0.0003
+cora_b6_query_rich,6.1039,2,0.1241,4,0.124,2,0.0762,2,0.0003
+cora_original,58.9284,2,29.6065,4,0.124,2,13.6634,2,0.0003

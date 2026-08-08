@@ -1,0 +1,2 @@
+dataset,db_path,total_dir_mb,fmat_files,fmat_total_mb,rmap_files,rmap_total_mb,cache_files,cache_total_mb,store_files,store_total_mb
+ogbn-arxiv,/tmp/arxiv_e2e.m7dv5D,868.5535,2,165.3741,4,7.752,2,83.9791,2,0.0003

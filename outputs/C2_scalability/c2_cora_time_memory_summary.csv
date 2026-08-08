@@ -1,0 +1,6 @@
+experiment,elapsed_wall_clock,max_rss_kbytes,max_rss_mb,user_time_seconds,system_time_seconds,ranEpochs,bestValAccuracy,testAccuracy,trainSeconds
+b5_combined_cora,03.66,1495452,1460.4,7.84,1.60,27,8.0E-1,7.21E-1,8.840895E-1
+b5_structural_cora,02.64,1474276,1439.72,2.22,0.88,30,4.44E-1,3.85E-1,1.0416157E-1
+b6_query_combined_cora,03.66,1499648,1464.5,6.05,1.46,19,7.86E-1,7.17E-1,6.0896385E-1
+b6_query_rich_cora,02.63,1476976,1442.36,2.19,0.90,21,4.18E-1,3.19E-1,1.0076616E-1
+cora_original,03.67,1477376,1442.75,6.21,1.43,19,8.0E-1,7.5E-1,6.438464E-1

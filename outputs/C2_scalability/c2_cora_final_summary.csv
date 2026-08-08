@@ -1,0 +1,6 @@
+experiment,testAccuracy,trainSeconds,elapsed_wall_clock,max_rss_mb,total_dir_mb,fmat_total_mb,cache_total_mb
+cora_b5_combined,7.21E-1,8.840895E-1,03.66,1460.4,74.0159,44.5337,13.7205
+cora_b5_structural,3.85E-1,1.0416157E-1,02.64,1439.72,6.1041,0.1241,0.0762
+cora_b6_query_combined,7.17E-1,6.0896385E-1,03.66,1464.5,74.0159,44.5337,13.7205
+cora_b6_query_rich,3.19E-1,1.0076616E-1,02.63,1442.36,6.1039,0.1241,0.0762
+cora_original,7.5E-1,6.438464E-1,03.67,1442.75,58.9284,29.6065,13.6634
