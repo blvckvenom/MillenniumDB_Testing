@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <map>
 #include <set>
 
@@ -12,6 +14,131 @@
 #include "query/exceptions.h"
 
 using namespace Procedure;
+
+namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+using ProfileDurationMS = std::chrono::duration<double, std::milli>;
+
+static constexpr const char* NODE_SIMILARITY_PROFILE_PATH =
+    "/Users/andres/Documents/beauchef/memoria/node_similarity_benchmarks/results/node_similarity_profile.csv";
+
+double profile_ms(ProfileClock::time_point start, ProfileClock::time_point end)
+{
+    return ProfileDurationMS(end - start).count();
+}
+
+struct NodeSimilarityProfile {
+    const char* similarity_metric = "JACCARD";
+    double similarity_cutoff = 0.0;
+    uint64_t degree_cutoff = 1;
+    uint64_t upper_degree_cutoff = UINT64_MAX;
+    bool has_top_k = false;
+    uint64_t top_k = 0;
+    bool has_bottom_k = false;
+    uint64_t bottom_k = 0;
+    bool has_top_n = false;
+    uint64_t top_n = 0;
+    bool has_bottom_n = false;
+    uint64_t bottom_n = 0;
+
+    double eval_arguments_ms = 0.0;
+    double scan_undirected_ms = 0.0;
+    double scan_directed_ms = 0.0;
+    double degree_filter_ms = 0.0;
+    double pair_scoring_ms = 0.0;
+    double per_node_ranking_ms = 0.0;
+    double global_ranking_ms = 0.0;
+    double total_reset_ms = 0.0;
+
+    uint64_t undirected_records = 0;
+    uint64_t directed_records = 0;
+    uint64_t adjacency_nodes = 0;
+    uint64_t neighbor_entries = 0;
+    uint64_t nodes_after_degree_filter = 0;
+    uint64_t pairs_checked = 0;
+    uint64_t pairs_after_similarity_cutoff = 0;
+    uint64_t results_size = 0;
+};
+
+void write_profile_csv(const NodeSimilarityProfile& profile)
+{
+    const bool write_header = []() {
+        std::ifstream input(NODE_SIMILARITY_PROFILE_PATH);
+        return !input.good() || input.peek() == std::ifstream::traits_type::eof();
+    }();
+
+    std::ofstream output(NODE_SIMILARITY_PROFILE_PATH, std::ios::app);
+    if (!output.good()) {
+        return;
+    }
+
+    if (write_header) {
+        output << "similarity_metric,"
+               << "similarity_cutoff,"
+               << "degree_cutoff,"
+               << "upper_degree_cutoff,"
+               << "top_k,"
+               << "bottom_k,"
+               << "top_n,"
+               << "bottom_n,"
+               << "eval_arguments_ms,"
+               << "scan_undirected_ms,"
+               << "scan_directed_ms,"
+               << "degree_filter_ms,"
+               << "pair_scoring_ms,"
+               << "per_node_ranking_ms,"
+               << "global_ranking_ms,"
+               << "total_reset_ms,"
+               << "undirected_records,"
+               << "directed_records,"
+               << "adjacency_nodes,"
+               << "neighbor_entries,"
+               << "nodes_after_degree_filter,"
+               << "pairs_checked,"
+               << "pairs_after_similarity_cutoff,"
+               << "results_size\n";
+    }
+
+    output << profile.similarity_metric << ','
+           << profile.similarity_cutoff << ','
+           << profile.degree_cutoff << ','
+           << profile.upper_degree_cutoff << ',';
+    if (profile.has_top_k) {
+        output << profile.top_k;
+    }
+    output << ',';
+    if (profile.has_bottom_k) {
+        output << profile.bottom_k;
+    }
+    output << ',';
+    if (profile.has_top_n) {
+        output << profile.top_n;
+    }
+    output << ',';
+    if (profile.has_bottom_n) {
+        output << profile.bottom_n;
+    }
+    output << ','
+           << profile.eval_arguments_ms << ','
+           << profile.scan_undirected_ms << ','
+           << profile.scan_directed_ms << ','
+           << profile.degree_filter_ms << ','
+           << profile.pair_scoring_ms << ','
+           << profile.per_node_ranking_ms << ','
+           << profile.global_ranking_ms << ','
+           << profile.total_reset_ms << ','
+           << profile.undirected_records << ','
+           << profile.directed_records << ','
+           << profile.adjacency_nodes << ','
+           << profile.neighbor_entries << ','
+           << profile.nodes_after_degree_filter << ','
+           << profile.pairs_checked << ','
+           << profile.pairs_after_similarity_cutoff << ','
+           << profile.results_size << '\n';
+}
+
+} // namespace
 
 NodeSimilarity::NodeSimilarity(
     std::vector<std::unique_ptr<BindingExpr>>&& argument_binding_exprs_,
@@ -32,15 +159,52 @@ void NodeSimilarity::_begin(Binding& parent_binding_)
 
 void NodeSimilarity::_reset()
 {
+    const auto total_reset_start = ProfileClock::now();
+    NodeSimilarityProfile profile;
+
     results.clear();
     cursor = 0;
+
+    const auto eval_arguments_start = ProfileClock::now();
     eval_arguments();
+    profile.eval_arguments_ms = profile_ms(eval_arguments_start, ProfileClock::now());
+    switch (similarity_metric) {
+    case SimilarityMetric::JACCARD:
+        profile.similarity_metric = "JACCARD";
+        break;
+    case SimilarityMetric::OVERLAP:
+        profile.similarity_metric = "OVERLAP";
+        break;
+    case SimilarityMetric::COSINE:
+        profile.similarity_metric = "COSINE";
+        break;
+    }
+    profile.similarity_cutoff = similarity_cutoff;
+    profile.degree_cutoff = degree_cutoff;
+    profile.upper_degree_cutoff = upper_degree_cutoff;
+    if (top_k.has_value()) {
+        profile.has_top_k = true;
+        profile.top_k = *top_k;
+    }
+    if (bottom_k.has_value()) {
+        profile.has_bottom_k = true;
+        profile.bottom_k = *bottom_k;
+    }
+    if (top_n.has_value()) {
+        profile.has_top_n = true;
+        profile.top_n = *top_n;
+    }
+    if (bottom_n.has_value()) {
+        profile.has_bottom_n = true;
+        profile.bottom_n = *bottom_n;
+    }
 
     std::array<uint64_t, 3> min_ids = { 0, 0, 0 };
     std::array<uint64_t, 3> max_ids = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
 
     std::map<uint64_t, std::set<uint64_t>> adjacency;
 
+    const auto scan_undirected_start = ProfileClock::now();
     auto undirected_edge_iter = gql_model.get_n1_n2_edge().get_range(
         &get_query_ctx().thread_info.interruption_requested,
         min_ids,
@@ -53,8 +217,11 @@ void NodeSimilarity::_reset()
         // Undirected edge contributes both ways: node1~node2 => neighbors(node1)+=node2 and neighbors(node2)+=node1
         adjacency[node1].insert(node2);
         adjacency[node2].insert(node1);
+        ++profile.undirected_records;
     }
+    profile.scan_undirected_ms = profile_ms(scan_undirected_start, ProfileClock::now());
 
+    const auto scan_directed_start = ProfileClock::now();
     auto directed_edge_iter = gql_model.get_from_to_edge().get_range(
         &get_query_ctx().thread_info.interruption_requested,
         min_ids,
@@ -66,10 +233,18 @@ void NodeSimilarity::_reset()
 
         // Directed edge contributes only in outgoing direction: from->to => neighbors(from)+=to
         adjacency[from].insert(to);
+        ++profile.directed_records;
     }
+    profile.scan_directed_ms = profile_ms(scan_directed_start, ProfileClock::now());
     // Self-loops are included through the main edge indexes above. The equal_u_edge/equal_d_edge
     // indexes are only specialized access paths for explicit self-loop patterns.
 
+    profile.adjacency_nodes = static_cast<uint64_t>(adjacency.size());
+    for (const auto& [node, neighbors] : adjacency) {
+        profile.neighbor_entries += static_cast<uint64_t>(neighbors.size());
+    }
+
+    const auto degree_filter_start = ProfileClock::now();
     std::vector<uint64_t> nodes;
     nodes.reserve(adjacency.size());
     for (const auto& [node, neighbors] : adjacency) {
@@ -78,17 +253,24 @@ void NodeSimilarity::_reset()
             nodes.push_back(node);
         }
     }
+    profile.nodes_after_degree_filter = static_cast<uint64_t>(nodes.size());
+    profile.degree_filter_ms = profile_ms(degree_filter_start, ProfileClock::now());
 
     if (nodes.size() < 2) {
+        profile.results_size = static_cast<uint64_t>(results.size());
+        profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
+        write_profile_csv(profile);
         return;
     }
 
     std::map<uint64_t, std::vector<std::tuple<ObjectId, ObjectId, ObjectId>>> k_candidates;
 
+    const auto pair_scoring_start = ProfileClock::now();
     for (std::size_t i = 0; i < nodes.size(); ++i) {
         const auto& neighbors_i = adjacency.at(nodes[i]);
         for (std::size_t j = i + 1; j < nodes.size(); ++j) {
             const auto& neighbors_j = adjacency.at(nodes[j]);
+            ++profile.pairs_checked;
 
             const auto& smaller = (neighbors_i.size() <= neighbors_j.size()) ? neighbors_i : neighbors_j;
             const auto& larger = (neighbors_i.size() <= neighbors_j.size()) ? neighbors_j : neighbors_i;
@@ -128,6 +310,7 @@ void NodeSimilarity::_reset()
             }
 
             if (similarity >= similarity_cutoff) {
+                ++profile.pairs_after_similarity_cutoff;
                 const auto node_i = ObjectId(nodes[i]);
                 const auto node_j = ObjectId(nodes[j]);
                 const auto similarity_oid = GQL::Conversions::pack_double(similarity);
@@ -141,7 +324,9 @@ void NodeSimilarity::_reset()
             }
         }
     }
+    profile.pair_scoring_ms = profile_ms(pair_scoring_start, ProfileClock::now());
 
+    const auto per_node_ranking_start = ProfileClock::now();
     if (top_k.has_value() || bottom_k.has_value()) {
         for (auto& [node, candidates] : k_candidates) {
             std::sort(candidates.begin(), candidates.end(), [&](const auto& lhs, const auto& rhs) {
@@ -167,7 +352,9 @@ void NodeSimilarity::_reset()
             results.insert(results.end(), candidates.begin(), candidates.begin() + result_count);
         }
     }
+    profile.per_node_ranking_ms = profile_ms(per_node_ranking_start, ProfileClock::now());
 
+    const auto global_ranking_start = ProfileClock::now();
     if (top_n.has_value()) {
         std::sort(results.begin(), results.end(), [](const auto& lhs, const auto& rhs) {
             const auto& [lhs_node1, lhs_node2, lhs_similarity_oid] = lhs;
@@ -209,6 +396,11 @@ void NodeSimilarity::_reset()
             results.resize(static_cast<std::size_t>(*bottom_n));
         }
     }
+    profile.global_ranking_ms = profile_ms(global_ranking_start, ProfileClock::now());
+    profile.results_size = static_cast<uint64_t>(results.size());
+    profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
+
+    write_profile_csv(profile);
 }
 
 void NodeSimilarity::eval_arguments()
