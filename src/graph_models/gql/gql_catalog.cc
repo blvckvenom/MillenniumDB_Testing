@@ -50,8 +50,10 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
 #endif
 
         switch (on_disk_version) {
-            case 3: {
-                // Current format: feature name registry + HNSW index metadata
+            case 4: {
+                // Current format: feature name registry + HNSW index metadata,
+                // the latter carrying which kind of source it was declared over
+                // and, for a projection property, which projection.
                 gnn_feature_names = read_strvec();
 
                 const auto hnsw_count = read_uint64();
@@ -61,6 +63,37 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
                     HNSW::HNSWIndexManager::HNSWIndexMetadata metadata;
                     metadata.metric_type = static_cast<HNSW::MetricType>(read_uint8());
                     metadata.predicate = read_string();
+                    metadata.source = static_cast<HNSW::HNSWSource>(read_uint8());
+                    metadata.projection = read_string();
+                    hnsw_index_manager.load_hnsw_index(name, metadata);
+                }
+#else
+                // Skip HNSW metadata when GNN is disabled
+                for (uint_fast32_t i = 0; i < hnsw_count; ++i) {
+                    read_string();  // name
+                    read_uint8();   // metric_type
+                    read_string();  // predicate
+                    read_uint8();   // source
+                    read_string();  // projection
+                }
+#endif
+                break;
+            }
+            case 3: {
+                // v3 → v4 migration: metadata without source/projection. The only
+                // GQL builder that existed at v3 read a feature matrix, so those
+                // indexes are raw-embedding ones over the base graph.
+                gnn_feature_names = read_strvec();
+
+                const auto hnsw_count = read_uint64();
+#ifdef ENABLE_GNN
+                for (uint_fast32_t i = 0; i < hnsw_count; ++i) {
+                    const auto name = read_string();
+                    HNSW::HNSWIndexManager::HNSWIndexMetadata metadata;
+                    metadata.metric_type = static_cast<HNSW::MetricType>(read_uint8());
+                    metadata.predicate = read_string();
+                    metadata.source = HNSW::HNSWSource::RAW_FEATURES;
+                    metadata.projection.clear();
                     hnsw_index_manager.load_hnsw_index(name, metadata);
                 }
 #else
@@ -71,6 +104,7 @@ GQLCatalog::GQLCatalog(const std::string& filename) :
                     read_string();  // predicate
                 }
 #endif
+                has_changes = true;  // re-save at v4
                 break;
             }
             case 2:
@@ -174,7 +208,7 @@ void GQLCatalog::save()
     // GNN feature registry
     write_strvec(gnn_feature_names);
 
-    // HNSW index metadata (minor version 3)
+    // HNSW index metadata (minor version 4)
 #ifdef ENABLE_GNN
     const auto hnsw_metadata = hnsw_index_manager.get_name2metadata();
     write_uint64(hnsw_metadata.size());
@@ -182,6 +216,8 @@ void GQLCatalog::save()
         write_string(name);
         write_uint8(static_cast<uint8_t>(metadata.metric_type));
         write_string(metadata.predicate);
+        write_uint8(static_cast<uint8_t>(metadata.source));
+        write_string(metadata.projection);
     }
 #else
     write_uint64(0);

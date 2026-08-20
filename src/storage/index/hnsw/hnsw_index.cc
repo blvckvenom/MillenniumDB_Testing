@@ -12,6 +12,9 @@
 #include "graph_models/quad_model/quad_object_id.h"
 #include "graph_models/rdf_model/conversions.h"
 #include "graph_models/rdf_model/rdf_model.h"
+#include "graph_models/gql/conversions.h"
+#include "graph_models/gql/gql_model.h"
+#include "query/optimizer/property_graph_model/plan/node_property_plan.h"
 #include "query/optimizer/quad_model/plan/property_plan.h"
 #include "query/optimizer/rdf_model/plan/triple_plan.h"
 #include "query/query_context.h"
@@ -190,6 +193,21 @@ HNSWHeap HNSWIndex::query(
     HNSWHeap* discarded_heap_ptr
 )
 {
+    if (uses_raw_embeddings_) {
+        // Raw-mode nodes carry a placeholder tensor_oid, so resolving it below
+        // would hand a meaningless id to the tensor store. query_raw is the
+        // entry point for those indexes.
+        throw std::runtime_error(
+            "HNSW index holds raw embeddings and must be queried through its raw path."
+        );
+    }
+
+    if (node_storage.empty()) {
+        // An index whose builder matched no rows leaves entry_point_id pointing
+        // at nothing; indexing node_storage with it reads out of bounds.
+        return HNSWHeap(num_neighbors);
+    }
+
     const uint64_t top_layer = params.layers - 1;
 
     // Initialize with entry point
@@ -349,11 +367,100 @@ uint_fast32_t HNSWIndex::index_property(const std::string& key)
     return total_inserted_elements;
 }
 
+// GQL analogue of index_property. The plan shape is what selects the scan: the
+// key is bound to an ObjectId and the node and value are left as free variables,
+// which sends NodePropertyPlan down its key_value_node branch and walks every
+// (key, value, node) triple for that key in one contiguous range.
+static std::unique_ptr<BindingIter> node_property_iter(
+    const std::string& key,
+    VarId object_var,
+    VarId value_var
+)
+{
+    const auto key_val = GQL::Conversions::pack_node_property(key);
+    if (key_val.is_null()) {
+        // pack_node_property returns null for a name the graph has never seen.
+        // Feeding that into the plan would scan nothing and yield an empty index
+        // that looks successfully built, so refuse instead.
+        throw std::runtime_error(
+            "Unknown node property: \"" + key + "\". No node in the active graph carries it."
+        );
+    }
+
+    const auto plan = NodePropertyPlan(object_var, key_val, value_var);
+    return plan.get_binding_iter();
+}
+
+uint_fast32_t HNSWIndex::index_node_property(const std::string& key)
+{
+    const auto object_var = get_query_ctx().get_internal_var();
+    const auto value_var = get_query_ctx().get_internal_var();
+
+    auto iter = node_property_iter(key, object_var, value_var);
+
+    Binding binding(get_query_ctx().get_var_size());
+    iter->begin(binding);
+
+    uint_fast32_t total_inserted_elements { 0 };
+    while (iter->next()) {
+        const auto object_oid = binding[object_var];
+        const auto value_oid = binding[value_var];
+
+        if (index_single<false>(object_oid, value_oid)) {
+            ++total_inserted_elements;
+        }
+    }
+
+    return total_inserted_elements;
+}
+
+uint64_t HNSWIndex::probe_node_property_dimension(const std::string& key)
+{
+    const auto object_var = get_query_ctx().get_internal_var();
+    const auto value_var = get_query_ctx().get_internal_var();
+
+    auto iter = node_property_iter(key, object_var, value_var);
+
+    Binding binding(get_query_ctx().get_var_size());
+    iter->begin(binding);
+
+    while (iter->next()) {
+        const auto value_oid = binding[value_var];
+        switch (value_oid.get_type()) {
+        case ObjectId::MASK_TENSOR_FLOAT_INLINED:
+        case ObjectId::MASK_TENSOR_FLOAT_EXTERN:
+        case ObjectId::MASK_TENSOR_FLOAT_TMP:
+        case ObjectId::MASK_TENSOR_DOUBLE_INLINED:
+        case ObjectId::MASK_TENSOR_DOUBLE_EXTERN:
+        case ObjectId::MASK_TENSOR_DOUBLE_TMP:
+            return Common::Conversions::to_tensor<float>(value_oid).size();
+        default:
+            // Not a tensor. Keep looking, the property may be mixed-typed.
+            break;
+        }
+    }
+
+    return 0;
+}
+
 template<bool CheckTombstones>
 bool HNSWIndex::index_single(ObjectId ref_object_id, ObjectId tensor_object_id)
 {
-    const auto gen_t = RDF_OID::get_generic_type(tensor_object_id);
-    if (gen_t != RDF_OID::GenericType::TENSOR) {
+    // The tensor type bytes live in the generic ObjectId and are shared by every
+    // graph model, so the check is made against them rather than against a single
+    // model's type helper. Testing RDF_OID::get_generic_type() here made the index
+    // usable only from RDF and Quad Model, and rejected GQL tensors even though
+    // they carry the very same masks. These are the same cases Conversions::
+    // to_tensor dispatches on, so anything accepted here can be unpacked below.
+    switch (tensor_object_id.get_type()) {
+    case ObjectId::MASK_TENSOR_FLOAT_INLINED:
+    case ObjectId::MASK_TENSOR_FLOAT_EXTERN:
+    case ObjectId::MASK_TENSOR_FLOAT_TMP:
+    case ObjectId::MASK_TENSOR_DOUBLE_INLINED:
+    case ObjectId::MASK_TENSOR_DOUBLE_EXTERN:
+    case ObjectId::MASK_TENSOR_DOUBLE_TMP:
+        break;
+    default:
         // Object is not a tensor
         return false;
     }

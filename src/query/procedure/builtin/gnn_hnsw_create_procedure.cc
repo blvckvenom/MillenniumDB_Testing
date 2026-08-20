@@ -255,11 +255,10 @@ void GnnHnswCreateProcedure::execute(ProcedureContext& ctx) {
     );
 
     // Step 11: Index the embeddings (parallel if multiple threads specified)
-    // NOTE: HNSW find-similar reconstructs ObjectIds as (MASK_NODE | hnsw_node_id),
-    // assuming a 1:1 identity mapping between row position and node ordinal.
-    // If FeatureMatrix rows are ever reordered (e.g., MinHash locality optimization),
-    // find-similar must be updated to use RowMapping for ObjectId lookup.
-    // TODO: Use RowMapping when row reordering is introduced (Step 2+).
+    // NOTE: rows are written as (MASK_NODE | row_index) into each node's
+    // object_oid, so this path requires row position to equal node ordinal.
+    // find-similar no longer rebuilds that value and reads object_oid instead,
+    // so an index whose rows carry their own ObjectIds resolves correctly.
 
     // IO2: Guard overflow in total_bytes computation
     if (dimension > 0 && num_nodes > SIZE_MAX / dimension / sizeof(float)) {

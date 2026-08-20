@@ -20,6 +20,8 @@
 #include "query/procedure/builtin/gnn_sample_info_procedure.h"
 #include "query/procedure/builtin/gnn_sample_drop_procedure.h"
 #include "query/procedure/builtin/gnn_hnsw_create_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_create_property_procedure.h"
+#include "query/procedure/builtin/gnn_hnsw_search_procedure.h"
 #include "query/procedure/builtin/gnn_hnsw_find_similar_procedure.h"
 #include "query/procedure/builtin/gnn_hnsw_list_procedure.h"
 #include "query/procedure/builtin/gnn_hnsw_drop_procedure.h"
@@ -71,6 +73,9 @@ std::unique_ptr<ModelDestroyer> GQLModel::init(const std::string& db_folder)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswListProcedure>());
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswDropProcedure>());
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswInfoProcedure>());
+    // Indexes declared over a node property, the way RDF and Quad Model do it.
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswCreatePropertyProcedure>());
+    catalog.register_procedure(std::make_unique<GQL::Procedures::GnnHnswSearchProcedure>());
 
     // Register GNN batch materialization procedure (L3 reorder + L4 packing)
     catalog.register_procedure(std::make_unique<GQL::Procedures::GnnMaterializeBatchesProcedure>());

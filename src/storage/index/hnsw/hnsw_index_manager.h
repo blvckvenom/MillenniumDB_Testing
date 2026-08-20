@@ -14,16 +14,37 @@
 
 namespace HNSW {
 
+// What an index was declared over. The four builders store different things in
+// HNSWIndexMetadata::predicate, and a reader cannot tell them apart from the
+// string alone: PREDICATE holds an IRI, PROPERTY and NODE_PROPERTY hold a
+// property key, RAW_FEATURES holds a feature-matrix name. Only NODE_PROPERTY
+// indexes can resolve a seed node back to its vector through the database, so
+// the query procedure has to be able to check which kind it is looking at.
+enum class HNSWSource : uint8_t {
+    PREDICATE = 0,     // RDF, CREATE HNSW INDEX ... "predicate"
+    PROPERTY = 1,      // Quad Model, CREATE HNSW INDEX ... "property"
+    RAW_FEATURES = 2,  // GQL, gnn_hnsw_create over a .fmat (row-position identity)
+    NODE_PROPERTY = 3, // GQL, gnn_hnsw_create_property over a node property
+};
+
 class HNSWIndexManager {
 public:
     struct HNSWIndexMetadata {
         MetricType metric_type;
         std::string predicate;
+        // Defaulted so the RDF and Quad catalogs, which serialize the two fields
+        // above and nothing else, keep round-tripping unchanged.
+        HNSWSource source { HNSWSource::PREDICATE };
+        // Empty means the base graph. Set for indexes declared over a property of
+        // a GQL projection, which is where the GNN pipeline writes embeddings.
+        std::string projection;
 
         friend std::ostream& operator<<(std::ostream& os, const HNSWIndexMetadata& metadata)
         {
             os << "{\"metric_type\": " << metadata.metric_type;
-            os << ", \"predicate\": " << metadata.predicate << "}";
+            os << ", \"predicate\": " << metadata.predicate;
+            os << ", \"source\": " << static_cast<int>(metadata.source);
+            os << ", \"projection\": " << metadata.projection << "}";
             return os;
         }
     };

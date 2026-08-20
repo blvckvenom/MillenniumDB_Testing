@@ -182,8 +182,14 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
 
     // Step 13: Yield results
     for (const auto& [distance, result_node_id] : sorted_results) {
-        // Create ObjectId for the node
-        ObjectId node_oid(ObjectId::MASK_NODE | result_node_id);
+        // Read the node's ObjectId from the index instead of rebuilding it as
+        // (MASK_NODE | internal_id). Both agree for indexes built from a raw
+        // embedding buffer, which stores exactly that value, but rebuilding it
+        // assumes row position equals node ordinal. That assumption silently
+        // returns the wrong nodes for any index whose rows are not in node
+        // order, which is the case for the embeddings the GNN pipeline exports
+        // in batch order, and it blocks the MinHash row reordering.
+        const ObjectId node_oid = hnsw_index->get_node(result_node_id).object_oid;
 
         ctx.yield("similar_node", node_oid);
         ctx.yield("distance", ctx.create_float(distance));

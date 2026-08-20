@@ -41,7 +41,7 @@ class GQLCatalog : public Catalog {
 public:
     static constexpr uint8_t MODEL_ID = 2;         ///< GQL model identifier (distinguishes from RDF=0, QM=1)
     static constexpr uint8_t MAJOR_VERSION = 1;    ///< Catalog format major version
-    static constexpr uint8_t MINOR_VERSION = 3;    ///< Catalog format minor version (3 = feature names + HNSW metadata)
+    static constexpr uint8_t MINOR_VERSION = 4;    ///< Catalog format minor version (4 = + HNSW source/projection)
 
     /**
      * @brief Constructs catalog from file.

@@ -99,6 +99,32 @@ public:
     // returns total inserted elements
     uint_fast32_t index_property(const std::string& key);
 
+    // index all { node, value } pairs given a node property key (GQL)
+    // returns total inserted elements
+    //
+    // The caller must have already routed the thread's QueryContext at the graph
+    // it wants scanned, with load_projection for a projection or a cleared
+    // active_projection for the base graph, and must keep that routing alive for
+    // the whole call. GQLModel::get_key_value_node() resolves the B+Tree at plan
+    // construction time and the iterator holds it by reference.
+    uint_fast32_t index_node_property(const std::string& key);
+
+    // width of the first tensor found under a node property key, 0 if the
+    // property has no tensor values. Same context requirement as above. Lets a
+    // caller size the index from the data instead of asking the user for it.
+    static uint64_t probe_node_property_dimension(const std::string& key);
+
+    // Reseed the layer generator so an index build is reproducible.
+    //
+    // Layer assignment is otherwise drawn from std::random_device, which makes
+    // two builds over identical data return different neighbours whenever
+    // several candidates tie on distance. Left alone the behaviour is unchanged,
+    // so the RDF and Quad builders keep their current semantics.
+    void set_level_seed(uint64_t seed)
+    {
+        level_generator.seed(static_cast<std::default_random_engine::result_type>(seed));
+    }
+
     // index a single entry
     template<bool CheckTombstones>
     bool index_single(ObjectId ref_object_id, ObjectId tensor_object_id);

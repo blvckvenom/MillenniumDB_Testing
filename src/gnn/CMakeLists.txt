@@ -141,6 +141,8 @@ add_library(mdb_gnn_core STATIC
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_list_procedure.cc
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_drop_procedure.cc
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_info_procedure.cc
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_create_property_procedure.cc
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_hnsw_search_procedure.cc
 
     # Phase 3: Batch Materialization (L3 reorder + L4 packing)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_materialize_batches_procedure.cc

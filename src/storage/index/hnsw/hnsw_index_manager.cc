@@ -245,7 +245,12 @@ uint_fast32_t HNSWIndexManager::create_hnsw_index(
 
         std::unique_lock lck(name2hnsw_index_mutex);
         name2hnsw_index[name] = std::move(hnsw_index);
-        name2metadata[name] = { metric_type, predicate };
+        name2metadata[name] = {
+            metric_type,
+            predicate,
+            model_id == Catalog::ModelID::QUAD ? HNSWSource::PROPERTY : HNSWSource::PREDICATE,
+            "" // these two builders always read the base graph
+        };
         predicate2names[predicate].emplace_back(name);
         has_changes_.store(true, std::memory_order_release);
         return result;
