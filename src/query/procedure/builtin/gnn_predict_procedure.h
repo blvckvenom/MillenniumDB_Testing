@@ -23,7 +23,7 @@ public:
             Parameter("checkpointPath",  ParamType::STRING, true,
                 "Checkpoint basename (relative or absolute, no extension)"),
             Parameter("options",         ParamType::ANY,    false,
-                "Options: {writeProperty, exportEmbeddings, outputDir}"),
+                "Options: {writeProperty, writeCoverage, exportEmbeddings, outputDir}"),
         };
     }
 
@@ -39,6 +39,7 @@ public:
             YieldField{"nodesInferred",          YieldType::INT,    "Non-seed nodes inferred during write-back"},
             YieldField{"inferenceMillis",        YieldType::FLOAT,  "Wall-clock time for non-seed inference"},
             YieldField{"writeMillis",            YieldType::FLOAT,  "Wall-clock time for projection writes"},
+            YieldField{"writeCoverage",          YieldType::STRING, "Node set the write-back covered: 'all' or 'seeds' (empty if writeProperty unset)"},
             YieldField{"l1HitRatio",             YieldType::FLOAT,  "FourLevelStore L1 hit ratio"},
             YieldField{"l2HitRatio",             YieldType::FLOAT,  "FourLevelStore L2 hit ratio"},
             YieldField{"l3Reads",                YieldType::INT,    "FourLevelStore L3 read count"},

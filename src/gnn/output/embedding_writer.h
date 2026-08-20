@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -68,12 +69,36 @@ public:
     // Configuration
     // =========================================================================
 
+    /**
+     * @brief Which nodes receive an embedding property.
+     *
+     * ALL is the historical behaviour and stays the default: seeds come from
+     * the pre-computed batches (Phase A) and every remaining node in the
+     * RowMapping is inferred on the fly (Phase B).  That is affordable while
+     * the projection fits in RAM, and unaffordable past it -- papers100M has
+     * ~109.5 M non-seed nodes, whose inference is both a multi-hundred-GB
+     * resident map and weeks of random feature-row gathers.  write_all()
+     * refuses such a run up front rather than discovering it mid-flight.
+     *
+     * SEEDS writes only the nodes that appeared as a seed in some batch and
+     * skips Phase B entirely.  Note the contract is the SEED set, not the
+     * labelled set: the two coincide only when the sample was built with
+     * `usePredefinedSplits`, which drops unlabelled rows in SeedSelector.
+     * Under the default ratio-based splitting every row is a seed, so SEEDS
+     * and ALL cover the same nodes and the mode saves nothing.
+     */
+    enum class Coverage {
+        ALL,   ///< Seeds plus on-the-fly inference for every other node (default)
+        SEEDS  ///< Only nodes that were seeds in some batch (no Phase B)
+    };
+
     struct Config {
         std::string              property_name;     ///< Target property for embeddings
         uint64_t                 batch_size = 2048; ///< Inference batch size (Phase B)
         std::vector<uint64_t>    fanouts;           ///< Sampling fanouts   (Phase B)
         EdgeOrientation          orientation = EdgeOrientation::UNDIRECTED;
         std::filesystem::path    feature_matrix_path; ///< Path to .fmat for inference feature loading
+        Coverage                 coverage = Coverage::ALL; ///< Node set to write
     };
 
     // =========================================================================
@@ -171,7 +196,74 @@ public:
         GQL::ProjectionStorage& storage,
         const std::string&      property_name);
 
+    // =========================================================================
+    // Memory estimation (Coverage::ALL affordability gate)
+    // =========================================================================
+
+    /// Heap bytes charged to each embedding held in the row_index -> tensor
+    /// map: the unordered_map node (key, value, next pointer, and its share
+    /// of the bucket array) plus the TensorImpl/StorageImpl pair backing one
+    /// [hidden_dim] tensor.  Rounded up so the gate errs towards refusing.
+    static constexpr uint64_t EMBEDDING_ENTRY_OVERHEAD_BYTES = 320;
+
+    /// Heap bytes charged to each source node in the Phase B adjacency cache:
+    /// the unordered_map node plus the std::vector<AdjEntry> header it holds.
+    static constexpr uint64_t ADJACENCY_NODE_OVERHEAD_BYTES = 80;
+
+    /**
+     * @brief Peak resident bytes for a Coverage::SEEDS write.
+     *
+     * One [hidden_dim] float32 embedding per seed, held in the dedup map.
+     */
+    static uint64_t estimate_seed_write_bytes(uint64_t num_seeds,
+                                              uint64_t hidden_dim);
+
+    /**
+     * @brief Peak resident bytes for a Coverage::ALL write.
+     *
+     * The seed cost extended to every node, plus the two structures only full
+     * coverage builds: the worst-case `missing` row-index vector and the
+     * Phase B adjacency cache.
+     *
+     * Exposed (like next_available_key_id) so the gate's arithmetic can be
+     * exercised at papers100M shape without materializing such a fixture.
+     *
+     * @param num_nodes    Nodes in the RowMapping.
+     * @param hidden_dim   Embedding width.
+     * @param adj_entries  Directed entries the orientation makes the adjacency
+     *                     cache scan (both directions when UNDIRECTED).
+     */
+    static uint64_t estimate_all_write_bytes(uint64_t num_nodes,
+                                             uint64_t hidden_dim,
+                                             uint64_t adj_entries);
+
 private:
+    // =========================================================================
+    // Coverage::ALL affordability gate
+    // =========================================================================
+
+    /**
+     * @brief Refuse a full-coverage write this host cannot hold.
+     *
+     * No-op unless Phase B would actually run (Coverage::ALL with a non-empty
+     * fanout list) and /proc/meminfo is readable -- we never refuse on a
+     * number we could not read.  Called at the top of write_all() so an
+     * unaffordable run fails in a second instead of after the full batch scan.
+     *
+     * @throws std::runtime_error naming writeCoverage:'seeds' as the remedy.
+     */
+    void check_all_coverage_fits_() const;
+
+    /**
+     * @brief Lazily construct (once) and return the TopologyAccessor.
+     *
+     * Kept out of the constructor because the TopologyAccessor constructor
+     * opens the CSR sidecar readers and runs their SHA-256 staleness pass --
+     * minutes of I/O on a papers100M-scale projection -- while Phase B reaches
+     * the topology through adj_cache_ instead, so no current path needs it.
+     */
+    TopologyAccessor& get_topology_();
+
     // =========================================================================
     // Phase A: Seed embedding collection
     // =========================================================================
@@ -307,8 +399,11 @@ private:
     GQL::ProjectionStorage&    projection_storage_;
 
     /// TopologyAccessor for on-the-fly k-hop sampling (Phase B).
-    /// Owned by this object; constructed from projection_storage in ctor.
-    TopologyAccessor           topology_;
+    /// Owned by this object but constructed on demand by get_topology_():
+    /// its constructor opens the CSR sidecar readers and runs a SHA-256
+    /// staleness pass, which no path through this class currently needs.
+    /// Null until first use.
+    std::unique_ptr<TopologyAccessor> topology_;
 
     /// RNG for uniform neighbor sampling (Phase B).
     std::mt19937_64            rng_;

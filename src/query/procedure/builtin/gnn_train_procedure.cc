@@ -430,6 +430,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     bool        export_emb       = true;
     int64_t     sample_cache_mb  = -1;  // -1 = auto (RAM/4), 0 = disabled, >0 = MB
     std::string write_property;              // writeProperty option (empty = no write-back)
+    // writeCoverage option: which nodes get the embedding property. 'all'
+    // (the default, and the historical behaviour) writes every node in the
+    // projection, inferring the non-seeds on the fly; 'seeds' writes only the
+    // nodes that were sampling seeds, which under usePredefinedSplits is
+    // exactly the labelled train/val/test set. 'all' is unaffordable at
+    // papers100M scale, and EmbeddingWriter refuses it when the host cannot
+    // hold the result.
+    EmbeddingWriter::Coverage write_coverage = EmbeddingWriter::Coverage::ALL;
     uint64_t    inference_batch_size = 0;    // 0 = use EmbeddingWriter default (Phase B chunk size)
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
@@ -568,6 +576,20 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                 throw std::runtime_error("writeProperty must be a non-empty string");
             }
             validate_safe_name(write_property, "writeProperty");
+        }
+        // Node set the write-back covers. Case-insensitive, mirroring the
+        // `model` option's parse.
+        if (auto v = opts.get_string("writeCoverage")) {
+            std::string c = *v;
+            std::transform(c.begin(), c.end(), c.begin(), ::tolower);
+            if (c == "all") {
+                write_coverage = EmbeddingWriter::Coverage::ALL;
+            } else if (c == "seeds") {
+                write_coverage = EmbeddingWriter::Coverage::SEEDS;
+            } else {
+                throw std::runtime_error(
+                    "writeCoverage must be 'all' or 'seeds', got: '" + *v + "'");
+            }
         }
         if (auto v = opts.get_int("inferenceBatchSize")) {
             if (*v <= 0) {
@@ -1167,22 +1189,36 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // Opens ProjectionStorage for the EmbeddingWriter which needs topology
     // access (Phase B: on-the-fly k-hop inference for non-seed nodes) and
     // property write access (Phase C: persist embeddings as tensor properties).
-    // Fanouts are taken from the SampleCatalog so the Phase B sampling depth
-    // matches the original offline sampling. Orientation is NOT persisted in
-    // the SampleCatalog and EmbeddingWriter's Phase B always builds an
-    // UNDIRECTED adjacency cache (Config::orientation is not consulted), so
-    // for samples built with NATURAL or REVERSE orientation the non-seed
-    // inference neighborhoods differ from the training-time neighborhoods.
+    // Under 'all' coverage the fanouts are taken from the SampleCatalog so the
+    // Phase B sampling depth matches the original offline sampling; under
+    // 'seeds' they are left empty and Phase B never runs. Orientation is NOT
+    // persisted in the SampleCatalog, and gnn_train never sets
+    // Config::orientation, so Phase B falls back to the UNDIRECTED default when
+    // build_adjacency_cache_ selects its directions: for samples built with
+    // NATURAL or REVERSE orientation the non-seed inference neighborhoods
+    // differ from the training-time neighborhoods.
     // =========================================================================
     uint64_t nodes_written  = 0;
     uint64_t nodes_inferred = 0;
     double   inference_ms   = 0.0;
     double   write_ms       = 0.0;
+    // Coverage the write-back actually ran under; empty when writeProperty was
+    // not set, since then no write happened and no coverage applies.
+    std::string write_coverage_str;
 
     if (!write_property.empty()) {
+        write_coverage_str =
+            write_coverage == EmbeddingWriter::Coverage::SEEDS ? "seeds" : "all";
+
         EmbeddingWriter::Config wconfig;
         wconfig.property_name      = write_property;
-        wconfig.fanouts            = catalog.fanouts;
+        wconfig.coverage           = write_coverage;
+        // Phase B's on-the-fly k-hop inference is what makes 'all' coverage
+        // expensive; 'seeds' leaves the fanouts empty so the phase is skipped
+        // outright and only the pre-computed seed embeddings are written.
+        if (write_coverage == EmbeddingWriter::Coverage::ALL) {
+            wconfig.fanouts        = catalog.fanouts;
+        }
         wconfig.feature_matrix_path = fmat_path;
         if (inference_batch_size > 0) {
             wconfig.batch_size = inference_batch_size;
@@ -1278,6 +1314,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("nodesInferred",   ctx.create_int(static_cast<int64_t>(nodes_inferred)));
     ctx.yield("inferenceMillis", ctx.create_float(static_cast<float>(inference_ms)));
     ctx.yield("writeMillis",     ctx.create_float(static_cast<float>(write_ms)));
+    ctx.yield("writeCoverage",   ctx.create_string(write_coverage_str));
     ctx.yield("bestCheckpointPath",  ctx.create_string(best_checkpoint_str));
     ctx.yield("finalCheckpointPath", ctx.create_string(final_checkpoint_str));
     ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));

@@ -11,8 +11,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +27,7 @@
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
+#include "misc/available_ram.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
 namespace mdb::gnn {
@@ -49,9 +52,105 @@ EmbeddingWriter::EmbeddingWriter(
     , catalog_(catalog)
     , config_(std::move(config))
     , projection_storage_(projection_storage)
-    , topology_(projection_storage)
     , rng_(42)  // deterministic seed for reproducible inference
 {
+}
+
+// =============================================================================
+// Coverage::ALL affordability gate
+//
+// Full coverage holds one hidden-dim tensor per node in the RowMapping and,
+// once Phase B starts, an in-memory adjacency map over the whole projection.
+// Both peak simultaneously.  On papers100M (111 M nodes, 1.6 G edges scanned
+// in both directions) that runs to hundreds of GB, so the run has to be
+// refused BEFORE Phase A's full batch scan -- otherwise the failure surfaces
+// hours in, or as the OOM killer.
+// =============================================================================
+
+uint64_t EmbeddingWriter::estimate_seed_write_bytes(uint64_t num_seeds,
+                                                    uint64_t hidden_dim)
+{
+    // float32 payload + the map node and TensorImpl behind each entry.
+    return num_seeds * (hidden_dim * 4ull + EMBEDDING_ENTRY_OVERHEAD_BYTES);
+}
+
+uint64_t EmbeddingWriter::estimate_all_write_bytes(uint64_t num_nodes,
+                                                   uint64_t hidden_dim,
+                                                   uint64_t adj_entries)
+{
+    return estimate_seed_write_bytes(num_nodes, hidden_dim)  // emb_map, all nodes
+         + num_nodes * sizeof(uint64_t)                      // `missing` row indices
+         + adj_entries * sizeof(AdjEntry)                    // adjacency payload
+         + num_nodes * ADJACENCY_NODE_OVERHEAD_BYTES;        // one bucket per source
+}
+
+void EmbeddingWriter::check_all_coverage_fits_() const {
+    // Only Coverage::ALL with a non-empty fanout list reaches Phase B; every
+    // other combination writes at most the seeds Phase A already collected.
+    if (config_.coverage != Coverage::ALL || config_.fanouts.empty()) {
+        return;
+    }
+
+    const uint64_t mem_available = get_mem_available();
+    if (mem_available == 0) {
+        // /proc/meminfo unreadable (non-Linux, procfs-less container).  Never
+        // refuse on a number we could not read.
+        return;
+    }
+
+    const uint64_t num_nodes  = row_mapping_.size();
+    const uint64_t hidden_dim = static_cast<uint64_t>(model_.config().hidden_dim);
+
+    // build_adjacency_cache_ scans from_to_edge for NATURAL, to_from_edge for
+    // REVERSE, and both for UNDIRECTED -- each holding one record per edge.
+    const uint64_t directions =
+        config_.orientation == EdgeOrientation::UNDIRECTED ? 2ull : 1ull;
+    const uint64_t adj_entries =
+        projection_storage_.get_edge_count() * directions;
+
+    // The estimate is deliberately generous: it charges the Phase B adjacency
+    // cache in full even though build_adjacency_cache_() only ever runs when
+    // some node is missing an embedding, and it rounds every per-entry
+    // overhead up.  Refusing on a bare `required > mem_available` would put a
+    // products-scale write (about 5.1 GB estimated, of which ~2.2 GB is that
+    // possibly-unbuilt cache) one memory dip away from failing a run that
+    // completes today.  Refuse only past a 2x margin: papers100M still clears
+    // the bar by roughly 5x (about 210 GB estimated), and nothing that fits
+    // today starts refusing.
+    const uint64_t required =
+        estimate_all_write_bytes(num_nodes, hidden_dim, adj_entries);
+    if (required <= mem_available * 2) {
+        return;
+    }
+
+    // One decimal place without pulling <iomanip>/<sstream> into this TU.
+    auto gb = [](uint64_t bytes) {
+        const uint64_t tenths = (bytes * 10ull) / (1024ull * 1024 * 1024);
+        return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10);
+    };
+
+    // The seed set is only known after Phase A, so size the hint from the
+    // catalog's batch layout (an upper bound: the last batch may be short).
+    const uint64_t seed_estimate =
+        std::min(catalog_.total_batches * catalog_.batch_size, num_nodes);
+    std::string seeds_hint;
+    if (seed_estimate > 0) {
+        seeds_hint = ", about "
+                   + gb(estimate_seed_write_bytes(seed_estimate, hidden_dim))
+                   + " GB for this sample's " + std::to_string(seed_estimate)
+                   + " seeds";
+    }
+
+    throw std::runtime_error(
+        "EmbeddingWriter: writing property '" + config_.property_name
+        + "' over all " + std::to_string(num_nodes)
+        + " projection nodes needs about " + gb(required)
+        + " GB of RAM, but only " + gb(mem_available)
+        + " GB is available on this host. Re-run with writeCoverage:'seeds'"
+        + seeds_hint
+        + ", which writes only the nodes that were sampling seeds -- with "
+          "usePredefinedSplits that is the whole labelled train/val/test set "
+          "-- or run the full write on a host with more RAM.");
 }
 
 // =============================================================================
@@ -60,6 +159,10 @@ EmbeddingWriter::EmbeddingWriter(
 
 EmbeddingWriter::Result EmbeddingWriter::write_all() {
     Result result;
+
+    // Refuse an unaffordable full-coverage run before anything expensive has
+    // been paid for -- Phase A alone reads every batch in the sample.
+    check_all_coverage_fits_();
 
     // --- Phase A: collect seed embeddings from pre-computed batches ----------
     auto seed_embs = collect_seed_embeddings();
@@ -71,30 +174,36 @@ EmbeddingWriter::Result EmbeddingWriter::write_all() {
         emb_map[idx] = std::move(emb);
     }
 
-    // Identify missing indices (nodes in RowMapping without embeddings)
-    std::vector<uint64_t> missing;
-    missing.reserve(row_mapping_.size() > emb_map.size()
-                        ? row_mapping_.size() - emb_map.size()
-                        : 0);
-    for (uint64_t i = 0; i < row_mapping_.size(); ++i) {
-        if (emb_map.find(i) == emb_map.end()) {
-            missing.push_back(i);
+    // Coverage::SEEDS writes exactly what Phase A collected, so neither the
+    // missing-node scan nor Phase B runs.  Skipping the scan is not just a
+    // shortcut: on papers100M the `missing` vector alone is ~876 MB of row
+    // indices built only to be discarded.
+    if (config_.coverage == Coverage::ALL) {
+        // Identify missing indices (nodes in RowMapping without embeddings)
+        std::vector<uint64_t> missing;
+        missing.reserve(row_mapping_.size() > emb_map.size()
+                            ? row_mapping_.size() - emb_map.size()
+                            : 0);
+        for (uint64_t i = 0; i < row_mapping_.size(); ++i) {
+            if (emb_map.find(i) == emb_map.end()) {
+                missing.push_back(i);
+            }
         }
-    }
 
-    // --- Phase B: infer non-seed nodes via on-the-fly k-hop sampling --------
-    if (!missing.empty() && !config_.fanouts.empty()) {
-        auto infer_start = std::chrono::steady_clock::now();
-        auto inferred = infer_non_seed_embeddings(missing);
-        auto infer_end = std::chrono::steady_clock::now();
+        // --- Phase B: infer non-seed nodes via on-the-fly k-hop sampling ----
+        if (!missing.empty() && !config_.fanouts.empty()) {
+            auto infer_start = std::chrono::steady_clock::now();
+            auto inferred = infer_non_seed_embeddings(missing);
+            auto infer_end = std::chrono::steady_clock::now();
 
-        result.inference_ms = std::chrono::duration<double, std::milli>(
-            infer_end - infer_start).count();
-        result.nodes_inferred = inferred.size();
+            result.inference_ms = std::chrono::duration<double, std::milli>(
+                infer_end - infer_start).count();
+            result.nodes_inferred = inferred.size();
 
-        // Merge inferred into map
-        for (auto& [idx, emb] : inferred) {
-            emb_map[idx] = std::move(emb);
+            // Merge inferred into map
+            for (auto& [idx, emb] : inferred) {
+                emb_map[idx] = std::move(emb);
+            }
         }
     }
 
@@ -679,8 +788,14 @@ uint64_t EmbeddingWriter::write_to_projection(
                     stale_value_ids.push_back((*rec)[2]);
                 }
             }
+            //     A record carrying exactly the value we are about to write is
+            //     not stale, it is already the target state.  Remember that so
+            //     the inserts below can tell "already present" (legitimate on
+            //     a re-run) apart from "refused", which is a defect.
+            bool already_present = false;
             for (uint64_t stale_value_id : stale_value_ids) {
                 if (stale_value_id == tensor_oid.id) {
+                    already_present = true;
                     continue;  // identical record; the insert below is a no-op
                 }
                 Record<3> stale_nkv = { node_oid.id, key_oid.id, stale_value_id };
@@ -699,14 +814,30 @@ uint64_t EmbeddingWriter::write_to_projection(
             nkv_record[0] = node_oid.id;
             nkv_record[1] = key_oid.id;
             nkv_record[2] = tensor_oid.id;
-            nkv_index->insert(nkv_record);
+            const bool nkv_inserted = nkv_index->insert(nkv_record);
 
             //     Auxiliary: (key_id, value_id, node_id) -- for property -> node lookups
             Record<3> kvn_record;
             kvn_record[0] = key_oid.id;
             kvn_record[1] = tensor_oid.id;
             kvn_record[2] = node_oid.id;
-            kvn_index->insert(kvn_record);
+            const bool kvn_inserted = kvn_index->insert(kvn_record);
+
+            //     BPlusTree::insert returns false only when the identical
+            //     record was already in the tree.  After the pass above that
+            //     can be true only for the record we deliberately kept, so any
+            //     other refusal is a write that did NOT happen -- surface it
+            //     instead of counting it.  `written` is the value reported as
+            //     nodesWritten, and it must never exceed what is on disk.
+            if ((!nkv_inserted || !kvn_inserted) && !already_present) {
+                throw std::runtime_error(
+                    "property record refused by the index for node "
+                    + std::to_string(node_oid.id)
+                    + " (node_key_value inserted="
+                    + (nkv_inserted ? "true" : "false")
+                    + ", key_value_node inserted="
+                    + (kvn_inserted ? "true" : "false") + ")");
+            }
 
             ++written;
         }
@@ -741,7 +872,61 @@ uint64_t EmbeddingWriter::write_to_projection(
     // they won't, since we used direct insert).
     projection_storage_.flush();
 
+    // -------------------------------------------------------------------------
+    // Step 5: Structural verification of both property indexes
+    //
+    // Every record above went in through BPlusTree::insert one at a time, so
+    // both trees took the directory-split path -- and key_value_node takes it
+    // with keys in ASCENDING order (its leading columns are the property key
+    // and the tensor id, and tensor ids are monotonically growing blob
+    // offsets), which makes "the child that splits is the rightmost child" the
+    // normal case rather than a rare one.
+    //
+    // check() verifies, for every directory entry in both trees,
+    //
+    //     greatest_left_record < separator <= smallest_right_record
+    //
+    // A separator that violates it leaves records physically present but
+    // unreachable by descent: the procedure would report every node written
+    // while `n.embedding IS NULL` holds for some of them, and a lookup landing
+    // past the end of the left leaf would follow next_leaf and answer with
+    // ANOTHER node's tensor.  Because that invariant is exactly what makes a
+    // record findable, check() passing is what licenses `written` below to be
+    // reported as nodesWritten.  Refuse to report a number we cannot stand
+    // behind.
+    // -------------------------------------------------------------------------
+    {
+        std::ostringstream nkv_report;
+        std::ostringstream kvn_report;
+        const bool nkv_sane = nkv_index->check(nkv_report);
+        const bool kvn_sane = kvn_index->check(kvn_report);
+
+        if (!nkv_sane || !kvn_sane) {
+            throw std::runtime_error(
+                "EmbeddingWriter::write_to_projection: property index corrupted "
+                "after writing " + std::to_string(written) + " embeddings for '"
+                + config_.property_name + "'. Records are on disk but not all of "
+                "them are reachable by lookup, so the write must not be reported "
+                "as complete; the projection's property indexes need to be "
+                "rebuilt. node_key_value: "
+                + (nkv_sane ? std::string("ok") : nkv_report.str())
+                + " key_value_node: "
+                + (kvn_sane ? std::string("ok") : kvn_report.str()));
+        }
+    }
+
     return written;
+}
+
+// =============================================================================
+// Lazy TopologyAccessor
+// =============================================================================
+
+TopologyAccessor& EmbeddingWriter::get_topology_() {
+    if (!topology_) {
+        topology_ = std::make_unique<TopologyAccessor>(projection_storage_);
+    }
+    return *topology_;
 }
 
 // =============================================================================

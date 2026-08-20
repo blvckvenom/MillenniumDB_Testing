@@ -50,6 +50,7 @@ int main() {
         "nodesInferred",
         "inferenceMillis",
         "writeMillis",
+        "writeCoverage",
         "bestCheckpointPath",
         "finalCheckpointPath",
         "resumedFromEpoch",

@@ -13,8 +13,10 @@
  *     implementation of that logic is caught by the E2E gate, NOT by these.
  *   - Tests 13-16 drive the REAL production key-allocation statics
  *     (next_available_key_id / resolve_property_key_id).
- *   - Test 17 constructs a REAL EmbeddingWriter and drives write_all() on
- *     the orchestration path executable without the full database stack.
+ *   - Tests 17-18 construct a REAL EmbeddingWriter and drive write_all() on
+ *     the orchestration paths executable without the full database stack.
+ *   - Tests 19-20 cover the Coverage option's default and the arithmetic
+ *     behind the Coverage::ALL affordability gate.
  *
  * Strategy:
  *   - Use the same GnnStorageTest fixture pattern as test_batch_assembler.cc
@@ -24,18 +26,38 @@
  *   - Verify shapes, deduplication, and missing-node detection
  */
 
+// Include the System / storage headers FIRST, before any GNN header that
+// transitively pulls in <linux/fs.h> (via liburing.h -> direct_io_reader.h),
+// which #defines BLOCK_SIZE as a macro and would break the
+// StringManager::BLOCK_SIZE member declaration. This mirrors the ordering
+// constraint documented at the top of embedding_writer.cc.
+#include "system/system.h"
+
+#include "query/query_context.h"
+#include "storage/index/bplus_tree/bplus_tree.h"
+#include "storage/index/record.h"
+#include "storage/page/page.h"
+#include "system/buffer_manager.h"
+#include "system/file_manager.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 #include <torch/torch.h>
 
@@ -1030,10 +1052,10 @@ TEST_F(EmbeddingWriterTest, ResolveReusesPersistedCatalogKeys) {
 // buffer pool): a single empty batch with Phase B disabled (no fanouts).
 //
 // This exercises the instance entry points the per-phase tests above cannot
-// reach: construction (including the TopologyAccessor over the projection),
-// the real Phase A batch loop (assemble + read_sample on the empty batch),
-// missing-node detection, the Phase B skip condition, and the Phase C
-// empty-map early return.
+// reach: construction (which no longer opens a TopologyAccessor -- Phase B
+// reaches the topology through the adjacency cache), the real Phase A batch
+// loop (assemble + read_sample on the empty batch), missing-node detection,
+// the Phase B skip condition, and the Phase C empty-map early return.
 // =============================================================================
 
 TEST_F(EmbeddingWriterTest, WriteAllRunsRealOrchestration) {
@@ -1069,3 +1091,108 @@ TEST_F(EmbeddingWriterTest, WriteAllRunsRealOrchestration) {
     EXPECT_EQ(res.nodes_inferred, 0u);
     EXPECT_GE(res.write_ms, 0.0);
 }
+
+// =============================================================================
+// Test 18: SeedsCoverageSkipsNonSeedInference
+//
+// Coverage::SEEDS must skip the missing-node scan and Phase B even when the
+// fanouts are non-empty and nodes are uncovered.  The empty-batch layout
+// leaves all N nodes uncovered, so a Coverage::ALL run with these exact
+// fanouts would enter Phase B; SEEDS must return with nothing inferred.
+//
+// This is the contract that makes the mode usable on papers100M: what is
+// skipped is ~109.5 M on-the-fly k-hop inferences, not a formality.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, SeedsCoverageSkipsNonSeedInference) {
+    const std::string sname = "seeds_coverage_test";
+    auto [storage, catalog] = create_storage_empty_batch(sname);
+
+    auto fm = FeatureMatrix::open(fmat_path_);
+    auto rm = RowMapping::open(rmap_path_);
+    auto ls = LabelStore::open(labels_path_);
+
+    BatchAssembler assembler(fm, storage, &ls, nullptr, rm);
+    GraphSAGEModel model = make_model();
+
+    fs::path proj_dir = test_dir_ / "proj_seeds_coverage";
+    fs::create_directories(proj_dir);
+    GQL::ProjectionStorage proj_storage(
+        proj_dir.string(), test_dir_.string(), "proj_seeds_coverage");
+
+    EmbeddingWriter::Config wconfig;
+    wconfig.property_name       = "embedding";
+    wconfig.batch_size          = 4;
+    wconfig.fanouts             = {4};  // non-empty: Phase B is reachable
+    wconfig.coverage            = EmbeddingWriter::Coverage::SEEDS;
+    wconfig.feature_matrix_path = fmat_path_;
+
+    EmbeddingWriter writer(model, assembler, storage, rm, catalog,
+                           proj_storage, std::move(wconfig));
+
+    EmbeddingWriter::Result res = writer.write_all();
+
+    EXPECT_EQ(res.nodes_inferred, 0u)
+        << "Coverage::SEEDS must not infer non-seed nodes";
+    EXPECT_DOUBLE_EQ(res.inference_ms, 0.0)
+        << "Phase B must not have run under Coverage::SEEDS";
+    EXPECT_EQ(res.nodes_written, 0u)
+        << "the only batch has no seeds, so there is nothing to write";
+}
+
+// =============================================================================
+// Test 19: CoverageDefaultsToAll
+//
+// The new mode is opt-in: a Config left alone must still request the full
+// coverage every pre-existing caller got.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, CoverageDefaultsToAll) {
+    EmbeddingWriter::Config cfg;
+    EXPECT_TRUE(cfg.coverage == EmbeddingWriter::Coverage::ALL)
+        << "default coverage must stay ALL -- the seeds-only mode is opt-in";
+}
+
+// =============================================================================
+// Test 20: WriteBytesEstimateSeparatesSeedsFromFullCoverage
+//
+// write_all() refuses a Coverage::ALL run the host cannot hold, so the
+// estimate behind that refusal has to be right at papers100M scale -- which no
+// fixture can materialize.  Drive the estimators directly with that shape.
+// =============================================================================
+
+TEST_F(EmbeddingWriterTest, WriteBytesEstimateSeparatesSeedsFromFullCoverage) {
+    constexpr uint64_t GB = 1024ull * 1024 * 1024;
+
+    // ogbn-papers100M: 111,059,956 nodes and 1,615,685,872 edges, the latter
+    // scanned in both directions by the UNDIRECTED adjacency cache.
+    constexpr uint64_t PAPERS_NODES = 111059956ull;
+    constexpr uint64_t PAPERS_ADJ   = 2ull * 1615685872ull;
+    constexpr uint64_t HIDDEN       = 256;
+
+    const uint64_t all_bytes = EmbeddingWriter::estimate_all_write_bytes(
+        PAPERS_NODES, HIDDEN, PAPERS_ADJ);
+    EXPECT_GT(all_bytes, 100 * GB)
+        << "full coverage on papers100M must estimate far past a 30 GiB host";
+
+    // The labelled train/val/test set is ~1.55 M nodes -- a couple of GB.
+    constexpr uint64_t LABELLED = 1546782ull;
+    const uint64_t seed_bytes =
+        EmbeddingWriter::estimate_seed_write_bytes(LABELLED, HIDDEN);
+    EXPECT_GT(seed_bytes, 1 * GB);
+    EXPECT_LT(seed_bytes, 4 * GB);
+
+    // Full coverage is the seed cost over every node, plus the scan structures
+    // only that mode builds.
+    EXPECT_GT(all_bytes,
+              EmbeddingWriter::estimate_seed_write_bytes(PAPERS_NODES, HIDDEN));
+
+    // An empty projection costs nothing, so it can never trip the gate.
+    EXPECT_EQ(EmbeddingWriter::estimate_seed_write_bytes(0, HIDDEN), 0u);
+    EXPECT_EQ(EmbeddingWriter::estimate_all_write_bytes(0, HIDDEN, 0), 0u);
+}
+
+// The directory-split separator regression that this suite once carried now
+// lives in src/tests/bpt_dir_split_separator_test.cc. It is a defect in core
+// storage, and this suite only builds under ENABLE_GNN, which is OFF by
+// default, so the gate belonged somewhere a default build always compiles.

@@ -21,7 +21,7 @@ public:
             Parameter("options",     ParamType::ANY,    false,
                 "Options: {model, hiddenDim, dropout, epochs, lr, weightDecay, "
                 "patience, tolerance, normalize, randomSeed, outputDir, "
-                "exportEmbeddings, writeProperty, inferenceBatchSize, resumeFrom, "
+                "exportEmbeddings, writeProperty, writeCoverage, inferenceBatchSize, resumeFrom, "
                 "saveOnBestVal, saveFinal, sampleCacheMb, useAsyncPrefetcher, "
                 "useCudaStreams, prefetchNumWorkers, prefetchQueueSize, profileLog, "
                 "readOnlyBench, noBlocks, noSelfContained, noPackedFull, "
@@ -54,6 +54,7 @@ public:
             YieldField{"nodesInferred",   YieldType::INT,    "Non-seed nodes inferred during write-back (0 if writeProperty not set)"},
             YieldField{"inferenceMillis", YieldType::FLOAT,  "Wall-clock time for non-seed inference in ms (0.0 if writeProperty not set)"},
             YieldField{"writeMillis",     YieldType::FLOAT,  "Wall-clock time for projection writes in ms (0.0 if writeProperty not set)"},
+            YieldField{"writeCoverage",   YieldType::STRING, "Node set the write-back covered: 'all' or 'seeds' (empty if writeProperty not set)"},
             YieldField{"bestCheckpointPath",  YieldType::STRING, "Absolute path (no extension) to best_model checkpoint; empty if disabled or no improvement"},
             YieldField{"finalCheckpointPath", YieldType::STRING, "Absolute path (no extension) to final_model checkpoint; empty if disabled"},
             YieldField{"resumedFromEpoch",    YieldType::INT,    "Epoch index from which training resumed (0 if fresh training)"},

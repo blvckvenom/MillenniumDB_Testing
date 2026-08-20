@@ -47,6 +47,10 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     validate_safe_name(feature_name, "featureName");
 
     std::string write_property;
+    // Node set the write-back covers: 'all' (default, historical behaviour)
+    // infers every non-seed node on the fly; 'seeds' writes only the sampling
+    // seeds, which under usePredefinedSplits is the labelled train/val/test set.
+    EmbeddingWriter::Coverage write_coverage = EmbeddingWriter::Coverage::ALL;
     bool        export_emb       = true;
     std::string output_dir_name;
 
@@ -55,6 +59,18 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_string("writeProperty")) {
             write_property = *v;
             if (!write_property.empty()) validate_safe_name(write_property, "writeProperty");
+        }
+        if (auto v = opts.get_string("writeCoverage")) {
+            std::string c = *v;
+            std::transform(c.begin(), c.end(), c.begin(), ::tolower);
+            if (c == "all") {
+                write_coverage = EmbeddingWriter::Coverage::ALL;
+            } else if (c == "seeds") {
+                write_coverage = EmbeddingWriter::Coverage::SEEDS;
+            } else {
+                throw std::runtime_error(
+                    "writeCoverage must be 'all' or 'seeds', got: '" + *v + "'");
+            }
         }
         if (auto v = opts.get_bool("exportEmbeddings")) {
             export_emb = *v;
@@ -198,11 +214,22 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     uint64_t nodes_inferred = 0;
     double   inference_ms   = 0.0;
     double   write_ms       = 0.0;
+    // Coverage the write-back actually ran under; empty when writeProperty was
+    // not set, since then no write happened and no coverage applies.
+    std::string write_coverage_str;
 
     if (!write_property.empty()) {
+        write_coverage_str =
+            write_coverage == EmbeddingWriter::Coverage::SEEDS ? "seeds" : "all";
+
         EmbeddingWriter::Config wconfig;
         wconfig.property_name       = write_property;
-        wconfig.fanouts             = catalog.fanouts;
+        wconfig.coverage            = write_coverage;
+        // 'seeds' leaves the fanouts empty so Phase B's on-the-fly k-hop
+        // inference is skipped outright.
+        if (write_coverage == EmbeddingWriter::Coverage::ALL) {
+            wconfig.fanouts         = catalog.fanouts;
+        }
         wconfig.orientation         = EdgeOrientation::UNDIRECTED;
         wconfig.feature_matrix_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
 
@@ -250,6 +277,7 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("nodesInferred",         ctx.create_int(static_cast<int64_t>(nodes_inferred)));
     ctx.yield("inferenceMillis",       ctx.create_float(static_cast<float>(inference_ms)));
     ctx.yield("writeMillis",           ctx.create_float(static_cast<float>(write_ms)));
+    ctx.yield("writeCoverage",         ctx.create_string(write_coverage_str));
     ctx.yield("l1HitRatio",            ctx.create_float(static_cast<float>(l1r)));
     ctx.yield("l2HitRatio",            ctx.create_float(static_cast<float>(l2r)));
     ctx.yield("l3Reads",               ctx.create_int(static_cast<int64_t>(l3r_count)));
