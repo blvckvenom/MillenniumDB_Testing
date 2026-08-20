@@ -792,6 +792,16 @@ std::optional<ObjectId> ProjectionStorage::get_node_property(ObjectId node_id, O
         return std::nullopt;
     }
 
+    // BptIter bounds the scan from ABOVE only (it filters against `max` and
+    // never against `min`), and when the cursor runs past the end of a leaf it
+    // follows next_leaf. A directory separator that is too large therefore
+    // hands us the first record of the NEXT leaf -- another node's property --
+    // instead of nothing. Serving that would be a silent wrong answer, which
+    // is strictly worse than a missing one: verify the record is actually ours.
+    if ((*record)[0] != node_id.id || (*record)[1] != key_id.id) {
+        return std::nullopt;
+    }
+
     // Return the value (third element)
     return ObjectId((*record)[2]);
 }
@@ -818,6 +828,13 @@ std::optional<ObjectId> ProjectionStorage::get_edge_property(ObjectId edge_id, O
 
     const Record<3>* record = iter.next();
     if (record == nullptr) {
+        return std::nullopt;
+    }
+
+    // Same lower-bound guard as get_node_property: the iterator only filters
+    // against `max`, so a bad directory separator can surface the next edge's
+    // property record here. Never answer with a record that is not ours.
+    if ((*record)[0] != edge_id.id || (*record)[1] != key_id.id) {
         return std::nullopt;
     }
 
