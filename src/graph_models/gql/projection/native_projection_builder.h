@@ -87,17 +87,53 @@ static_assert(
  * Activated by MDB_BENCHMARK=1 environment variable. Zero overhead when disabled
  * (all timing calls short-circuit on `!enabled`). Prints to stderr with
  * [BENCHMARK] prefix for easy grep.
+ *
+ * Three properties this struct is required to hold, each of which it previously
+ * did not:
+ *
+ * 1. The clock is `Clock`, aliased to steady_clock, and every call site uses
+ *    that alias rather than naming a clock itself. libstdc++ aliases
+ *    high_resolution_clock to system_clock, whose `is_steady` is false and which
+ *    steps under NTP correction; a projection of a large graph runs for tens of
+ *    minutes, which is ample time for that to happen mid-measurement.
+ *
+ * 2. `total_ms` spans the builder's whole lifetime, from construction to the end
+ *    of finalize(), so it CONTAINS every phase below it. It shares its anchor
+ *    with `Statistics::duration_ms` but not its endpoint: duration_ms closes
+ *    before the finalize tail (GNN sidecars, topology snapshot, catalog
+ *    refresh), so total_ms is that duration plus the tail and can never be the
+ *    smaller of the two.
+ *
+ * 3. Whatever the phase timers do not account for is printed as `residual`
+ *    rather than left invisible. The columns therefore sum to 100% by
+ *    construction, and an unmeasured phase surfaces as a large residual instead
+ *    of silently pushing the other columns past 100%.
+ *
+ * Phases named here are only those actually measured. A phase that is not timed
+ * is absent rather than printed as 0.0 ms, because a zero reads as "this costs
+ * nothing" when the truth is "nobody looked".
  */
 struct ProjectionTimers {
-    double node_scan_ms     = 0;
-    double edge_scan_ms     = 0;
-    double property_ms      = 0;
-    double sort_ms          = 0;
-    double btree_write_ms   = 0;
-    double aggregation_ms   = 0;
-    double metadata_ms      = 0;
-    double total_ms         = 0;
-    bool enabled            = false;
+    using Clock = std::chrono::steady_clock;
+
+    double node_scan_ms  = 0;
+    double edge_scan_ms  = 0;
+    /// Sort and index build combined. These two are NOT separated: the code
+    /// times one interval that covers both. Splitting them requires timing
+    /// inside the sorter, which the interval here cannot see.
+    double sort_btree_ms = 0;
+    double metadata_ms   = 0;
+    double total_ms      = 0;
+    bool enabled         = false;
+
+    double accounted_ms() const {
+        return node_scan_ms + edge_scan_ms + sort_btree_ms + metadata_ms;
+    }
+
+    /// Time inside the total that no phase timer claimed. Must never be
+    /// negative: a negative residual means two timers covered the same
+    /// interval, which would inflate every percentage.
+    double residual_ms() const { return total_ms - accounted_ms(); }
 
     void print(const std::string& proj_name, uint64_t edge_count) const {
         if (!enabled) return;
@@ -106,13 +142,15 @@ struct ProjectionTimers {
                 proj_name.c_str(), (unsigned long long)edge_count);
         fprintf(stderr, "[BENCHMARK]   node_scan:     %8.1f ms  (%4.1f%%)\n", node_scan_ms, pct(node_scan_ms));
         fprintf(stderr, "[BENCHMARK]   edge_scan:     %8.1f ms  (%4.1f%%)\n", edge_scan_ms, pct(edge_scan_ms));
-        fprintf(stderr, "[BENCHMARK]   property:      %8.1f ms  (%4.1f%%)\n", property_ms, pct(property_ms));
-        fprintf(stderr, "[BENCHMARK]   sort:          %8.1f ms  (%4.1f%%)\n", sort_ms, pct(sort_ms));
-        fprintf(stderr, "[BENCHMARK]   btree_write:   %8.1f ms  (%4.1f%%)\n", btree_write_ms, pct(btree_write_ms));
-        fprintf(stderr, "[BENCHMARK]   aggregation:   %8.1f ms  (%4.1f%%)\n", aggregation_ms, pct(aggregation_ms));
+        fprintf(stderr, "[BENCHMARK]   sort+btree:    %8.1f ms  (%4.1f%%)\n", sort_btree_ms, pct(sort_btree_ms));
         fprintf(stderr, "[BENCHMARK]   metadata:      %8.1f ms  (%4.1f%%)\n", metadata_ms, pct(metadata_ms));
-        fprintf(stderr, "[BENCHMARK]   total:         %8.1f ms\n", total_ms);
-        fprintf(stderr, "[BENCHMARK]   sort_fraction: %.3f\n", total_ms > 0 ? sort_ms / total_ms : 0);
+        fprintf(stderr, "[BENCHMARK]   residual:      %8.1f ms  (%4.1f%%)\n", residual_ms(), pct(residual_ms()));
+        fprintf(stderr, "[BENCHMARK]   total:         %8.1f ms  (100.0%%)\n", total_ms);
+        if (residual_ms() < 0) {
+            fprintf(stderr,
+                    "[BENCHMARK]   WARNING: negative residual — phase timers overlap, "
+                    "percentages above are not trustworthy\n");
+        }
     }
 };
 

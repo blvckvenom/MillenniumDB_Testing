@@ -592,8 +592,8 @@ bool NativeProjectionBuilder::all_single_no_aggprop_(
 }
 
 void NativeProjectionBuilder::scan_nodes_impl_classic_(const std::vector<std::string>& labels) {
-    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                               : std::chrono::high_resolution_clock::time_point{};
+    auto bench_t0 = benchmark_timers_.enabled ? ProjectionTimers::Clock::now()
+                                               : ProjectionTimers::Clock::time_point{};
 
     for (const auto& label : labels) {
         validate_label_exists(label);
@@ -649,13 +649,13 @@ void NativeProjectionBuilder::scan_nodes_impl_classic_(const std::vector<std::st
 
     if (benchmark_timers_.enabled) {
         benchmark_timers_.node_scan_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - bench_t0).count();
+            ProjectionTimers::Clock::now() - bench_t0).count();
     }
 }
 
 void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::string>& types) {
-    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                               : std::chrono::high_resolution_clock::time_point{};
+    auto bench_t0 = benchmark_timers_.enabled ? ProjectionTimers::Clock::now()
+                                               : ProjectionTimers::Clock::time_point{};
 
     // STREAMING AGGREGATION DECISION:
     // For COUNT/SUM aggregation on large graphs, use external sort-aggregate
@@ -1008,13 +1008,13 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
 
     if (benchmark_timers_.enabled) {
         benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - bench_t0).count();
+            ProjectionTimers::Clock::now() - bench_t0).count();
     }
 }
 
 void NativeProjectionBuilder::scan_edges_impl_parallel_(const std::vector<std::string>& types) {
-    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                               : std::chrono::high_resolution_clock::time_point{};
+    auto bench_t0 = benchmark_timers_.enabled ? ProjectionTimers::Clock::now()
+                                               : ProjectionTimers::Clock::time_point{};
 
     std::cout << "[Builder] Using PARALLEL edge scan (has_node + orientation "
                  "in TBB workers; mutex-guarded parallel emit, detector dropped)" << std::endl;
@@ -1138,13 +1138,17 @@ void NativeProjectionBuilder::scan_edges_impl_parallel_(const std::vector<std::s
 
     if (benchmark_timers_.enabled) {
         benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - bench_t0).count();
+            ProjectionTimers::Clock::now() - bench_t0).count();
     }
 }
 
 NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
-    auto bench_total_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                                       : std::chrono::high_resolution_clock::time_point{};
+    // total_ms is measured from `start_time`, set in the constructor's init
+    // list, NOT from here. Anchoring it here excluded both the node scan and
+    // the edge scan, which run before finalize() is ever called, so every phase
+    // was divided by a total that did not contain it and the percentages summed
+    // to more than 100. Using `start_time` also makes total_ms agree with
+    // Statistics::duration_ms, which is measured over the same window.
 
     finalized_ = true;
 
@@ -1171,15 +1175,26 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     // storage->flush() → build_all_indexes_bulk() does sort+build+Phase 4.
     if (get_scan_mode() == ScanMode::SERIALIZED && scan_inputs_captured_) {
         auto bench_sort_start = benchmark_timers_.enabled
-            ? std::chrono::high_resolution_clock::now()
-            : std::chrono::high_resolution_clock::time_point{};
+            ? ProjectionTimers::Clock::now()
+            : ProjectionTimers::Clock::time_point{};
+        // The serialized path runs the node and edge scans INSIDE
+        // finalize_serialized_() — once per index pass, 5 for nodes and 9 for
+        // edges — so their timers fire within the interval measured here. The
+        // scan time has to be subtracted back out, otherwise the same
+        // nanoseconds land in two buckets and every percentage is inflated.
+        // This is what keeps the phase timers disjoint in all three scan modes,
+        // which is what makes the residual meaningful.
+        const double scan_ms_before =
+            benchmark_timers_.node_scan_ms + benchmark_timers_.edge_scan_ms;
         finalize_serialized_();
         if (benchmark_timers_.enabled) {
-            auto bench_sort_end = std::chrono::high_resolution_clock::now();
-            double sort_btree_ms = std::chrono::duration<double, std::milli>(
+            auto bench_sort_end = ProjectionTimers::Clock::now();
+            const double wall_ms = std::chrono::duration<double, std::milli>(
                 bench_sort_end - bench_sort_start).count();
-            benchmark_timers_.sort_ms     += sort_btree_ms * 0.5;
-            benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
+            const double scan_ms_inside =
+                (benchmark_timers_.node_scan_ms + benchmark_timers_.edge_scan_ms)
+                - scan_ms_before;
+            benchmark_timers_.sort_btree_ms += wall_ms - scan_ms_inside;
         }
     }
 
@@ -1205,16 +1220,18 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
         storage->flush();
     } else {
         auto bench_sort_start = benchmark_timers_.enabled
-            ? std::chrono::high_resolution_clock::now()
-            : std::chrono::high_resolution_clock::time_point{};
+            ? ProjectionTimers::Clock::now()
+            : ProjectionTimers::Clock::time_point{};
         storage->flush();
         if (benchmark_timers_.enabled) {
-            auto bench_sort_end = std::chrono::high_resolution_clock::now();
-            double sort_btree_ms = std::chrono::duration<double, std::milli>(
+            auto bench_sort_end = ProjectionTimers::Clock::now();
+            // One interval covers sort and index build together. It used to be
+            // halved into two fields by a hardcoded 0.5, which reported a
+            // constant as if it were a measurement; the two are reported
+            // combined instead until something inside the sorter times them
+            // apart.
+            benchmark_timers_.sort_btree_ms += std::chrono::duration<double, std::milli>(
                 bench_sort_end - bench_sort_start).count();
-            // Attribute combined sort+btree time; detailed breakdown deferred to future pass
-            benchmark_timers_.sort_ms     += sort_btree_ms * 0.5;
-            benchmark_timers_.btree_write_ms += sort_btree_ms * 0.5;
         }
     }
 
@@ -1355,18 +1372,17 @@ NativeProjectionBuilder::Statistics NativeProjectionBuilder::finalize() {
     build_topology_snapshots_();
 
     // Refresh projection cache so new projection is immediately visible
-    auto bench_meta_start = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                                      : std::chrono::high_resolution_clock::time_point{};
+    auto bench_meta_start = benchmark_timers_.enabled ? ProjectionTimers::Clock::now()
+                                                      : ProjectionTimers::Clock::time_point{};
     ProjectionManager::get_instance().scan_projections();
     if (benchmark_timers_.enabled) {
         benchmark_timers_.metadata_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - bench_meta_start).count();
+            ProjectionTimers::Clock::now() - bench_meta_start).count();
     }
 
     if (benchmark_timers_.enabled) {
-        auto bench_total_end = std::chrono::high_resolution_clock::now();
         benchmark_timers_.total_ms = std::chrono::duration<double, std::milli>(
-            bench_total_end - bench_total_start).count();
+            ProjectionTimers::Clock::now() - start_time).count();
         benchmark_timers_.print(projection_name, stats.relationship_count);
     }
 
@@ -2189,8 +2205,8 @@ void NativeProjectionBuilder::scan_nodes_impl_serialized_(
     const std::vector<std::string>& labels,
     ProjectionIndex target_mask)
 {
-    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                               : std::chrono::high_resolution_clock::time_point{};
+    auto bench_t0 = benchmark_timers_.enabled ? ProjectionTimers::Clock::now()
+                                               : ProjectionTimers::Clock::time_point{};
 
     // NODES               -> emit to node_batch (main nodes index).
     // NODE_LABEL/LABEL_NODE -> emit to node<->label pairs via storage.
@@ -2247,7 +2263,7 @@ void NativeProjectionBuilder::scan_nodes_impl_serialized_(
 
     if (benchmark_timers_.enabled) {
         benchmark_timers_.node_scan_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - bench_t0).count();
+            ProjectionTimers::Clock::now() - bench_t0).count();
     }
 }
 
@@ -2376,8 +2392,8 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
     ProjectionIndex target_mask,
     const EdgeFilter* filter)
 {
-    auto bench_t0 = benchmark_timers_.enabled ? std::chrono::high_resolution_clock::now()
-                                              : std::chrono::high_resolution_clock::time_point{};
+    auto bench_t0 = benchmark_timers_.enabled ? ProjectionTimers::Clock::now()
+                                              : ProjectionTimers::Clock::time_point{};
 
     if (filter == nullptr) {
         throw std::logic_error(
@@ -2539,7 +2555,7 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
 
     if (benchmark_timers_.enabled) {
         benchmark_timers_.edge_scan_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - bench_t0).count();
+            ProjectionTimers::Clock::now() - bench_t0).count();
     }
 }
 
