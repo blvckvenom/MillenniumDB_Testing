@@ -259,6 +259,7 @@ set(PROFILE_TARGETS
 )
 set(TEST_TARGETS
     available_ram-test
+    bpt_dir_split_separator_test
     compare_datetime
     iri_prefixes-test
     # native_projection_builder_test  # DISABLED: needs API updates
