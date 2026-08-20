@@ -147,6 +147,9 @@ add_library(mdb_gnn_core STATIC
     # Native feature creation from GQL query procedure (.fmat/.rmap)
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_create_features_from_query_procedure.cc
 
+    # Post-hoc GNN projection metadata/label/split preparation procedure
+    ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_prepare_projection_procedure.cc
+
     # Spec #4-B T4.9: Post-hoc topology snapshot build procedure
     ${CMAKE_SOURCE_DIR}/src/query/procedure/builtin/gnn_build_topology_snapshot_procedure.cc
 
