@@ -208,3 +208,8 @@ scripts/papers100m_sample_probe.sh
 scripts/papers100m_shard_write_ab.sh
 scripts/papers100m_train_repro.sh
 scripts/papers100m_writeprep_ab.sh
+
+# Generated at runtime in the repository root, never source
+cufile.log
+texput.log
+*.pdf
