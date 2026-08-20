@@ -213,3 +213,9 @@ scripts/papers100m_writeprep_ab.sh
 cufile.log
 texput.log
 *.pdf
+
+# Registros que dejan los guiones de medicion al correr desde la raiz.
+# Sin esto, cada medicion marca el arbol como sucio y la bitacora la declara
+# no reproducible, que es justo lo contrario de para lo que existe.
+m1_srv_*.log
+m1_disco_*.log
