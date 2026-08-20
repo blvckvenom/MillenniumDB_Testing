@@ -23,8 +23,11 @@ analyses with no run behind them; and some are **design-space explorations run b
 whose own header says `DESIGN ONLY — nothing implemented` (e.g. `GRAPH_PROJECT_REDESIGN.md`). The
 last kind is not evidence of any sort.
 
-**Canonical papers100M figures (from the paper):** preparation 95.7 min = projection 44.6 +
-sampling 13.3 + feature store 37.9 (the block bake is NOT included); training 41.2 min for 50
+**Canonical papers100M figures (from the paper):** preparation 95.7 min = projection **44.5** +
+sampling 13.3 + feature store 37.9 (the block bake is NOT included). *Corrected 2026-08-17: this
+line said 44.6, which sums to 95.8 and contradicts the 95.7 in the same sentence. The paper's figure
+generators (`make_results_figure.py:180`, `make_cost_figure.py:83`) and `REPRODUCE.md:81,235` all
+use 44.5.* training 41.2 min for 50
 epochs = 48.9 s/epoch mean over 19 runs; test@bestVal 0.6579 ± 0.0009; bestVal 0.6907 ± 0.0011;
 peak 96 % of the 16 GB GPU and 26.7 GiB of host RAM; feature cache 9.2 GB.
 
