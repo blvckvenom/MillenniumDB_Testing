@@ -608,6 +608,47 @@ std::size_t RadixPartitionSort<N>::scan_and_partition(
     }
 
     partition_paths_ = partitioner.collect_merged_partition_paths();
+
+    // How the records actually landed across the partitions.
+    //
+    // WHY THIS LINE EXISTS. The whole point of this backend is that Phase 2
+    // sorts P partitions concurrently; if the bucket function routes everything
+    // into one, Phase 2 has a single unit of work and the backend degrades into
+    // a single-threaded external sort that also paid to write P files first.
+    // That degradation is INVISIBLE from the outside: the output is still
+    // correct and still sorted, because one sorted partition IS the sorted
+    // whole. It was in fact happening on every graph in this project, and the
+    // only reason anyone noticed is that a measurement went looking.
+    //
+    // Emitted here rather than in Phase 2 because the distribution is a
+    // property of the PARTITIONING, and reporting it next to the sort would
+    // conflate "the bucket function is broken" with "the sorter is slow".
+    {
+        std::uint64_t nonempty = 0, total_bytes = 0, max_bytes = 0;
+        for (const auto& p : partition_paths_) {
+            std::uintmax_t sz = 0;
+            try { sz = fs::file_size(p); } catch (...) { sz = 0; }
+            if (sz > 0) ++nonempty;
+            total_bytes += sz;
+            if (sz > max_bytes) max_bytes = sz;
+        }
+        // Ratio of the largest partition to the perfectly balanced share. 1.0
+        // is ideal; P means total collapse into one bucket.
+        const double desbalance =
+            (total_bytes > 0 && num_partitions_ > 0)
+                ? static_cast<double>(max_bytes) * num_partitions_ / total_bytes
+                : 0.0;
+        std::cerr << "[RADIX] partition balance: nonempty=" << nonempty
+                  << "/" << num_partitions_
+                  << " max_bytes=" << max_bytes
+                  << " total_bytes=" << total_bytes
+                  << " imbalance=" << desbalance
+                  << (nonempty <= 1 && num_partitions_ > 1
+                          ? "  COLLAPSED: Phase 2 has one unit of work"
+                          : "")
+                  << "\n";
+    }
+
     return num_partitions_;
 }
 
