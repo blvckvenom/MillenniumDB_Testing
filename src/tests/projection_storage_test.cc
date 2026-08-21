@@ -304,6 +304,274 @@ int main() {
                 }
             }
             std::cout << " OK" << std::endl;
+
+            // ============================================================
+            // Node presence bitmap. has_node() answers from a dense bitmap
+            // when the collected id span fits NODE_BITMAP_MAX_BYTES. The
+            // bitmap is an exact image of collected_nodes_, so NO assertion
+            // about a RESULT can tell the two apart. NB-2 is the only test
+            // here that discriminates: it makes them disagree on purpose.
+            // The rest pin the budget arithmetic (NB-1, NB-1b, NB-3) and the
+            // invalidation contract (NB-4, NB-5).
+
+            // NB-1: the bitmap is built over the REAL (tagged) id space.
+            std::cout << "Test NB-1: bitmap over tagged ids...";
+            {
+                GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                constexpr uint64_t N = 1000;
+                for (uint64_t i = 0; i < N; i++) {
+                    GQL::ProjectedNode n;
+                    // Production ids carry a constant type tag in the high
+                    // byte (MASK_NODE = 0xD4..), src/import/gql/import.cc:143.
+                    // A budget computed on max_id instead of (max_id - min_id)
+                    // sees ~1.5e16 here, refuses, and the whole optimization
+                    // ships as a silent no-op on every real graph. Only this
+                    // assertion catches that.
+                    n.node_id = ObjectId(ObjectId::MASK_NODE | (7000 + i));
+                    s.add_node(n);
+                }
+                s.finalize_node_scan();
+                // span 999 -> 1000 bits -> (1000+7)/8 = 125 bytes.
+                if (s.node_bitmap_bytes() != 125) {
+                    std::cerr << "\nFAIL NB-1: expected 125 bitmap bytes, got "
+                              << s.node_bitmap_bytes() << " status="
+                              << s.node_bitmap_status() << std::endl;
+                    return 1;
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-1b: byte-count boundary (63 / 64 / 65 ids). An off-by-one in
+            // the span arithmetic is an out-of-range set_kept, which
+            // EdgeKeepBitmap would silently absorb by GROWING the vector -
+            // i.e. no crash, just a bitmap that no longer matches its budget.
+            std::cout << "Test NB-1b: span boundary...";
+            {
+                const uint64_t counts[3] = {63, 64, 65};
+                const std::size_t expect[3] = {8, 8, 9};
+                for (int k = 0; k < 3; k++) {
+                    GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                    for (uint64_t i = 0; i < counts[k]; i++) {
+                        GQL::ProjectedNode n;
+                        n.node_id = ObjectId(ObjectId::MASK_NODE | (10000 + i));
+                        s.add_node(n);
+                    }
+                    s.finalize_node_scan();
+                    if (s.node_bitmap_bytes() != expect[k]) {
+                        std::cerr << "\nFAIL NB-1b: " << counts[k] << " ids expected "
+                                  << expect[k] << " B, got " << s.node_bitmap_bytes()
+                                  << std::endl;
+                        return 1;
+                    }
+                    for (uint64_t i = 0; i < counts[k]; i++) {
+                        if (!s.has_node(ObjectId(ObjectId::MASK_NODE | (10000 + i)))) {
+                            std::cerr << "\nFAIL NB-1b: missing id at count "
+                                      << counts[k] << std::endl;
+                            return 1;
+                        }
+                    }
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-2: has_node answers FROM the bitmap, not from the vector.
+            // THE discriminating test. Everything else passes in both worlds.
+            std::cout << "Test NB-2: bitmap is CONSULTED...";
+            {
+                GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                constexpr uint64_t N = 1000;
+                for (uint64_t i = 0; i < N; i++) {
+                    GQL::ProjectedNode n;
+                    n.node_id = ObjectId(ObjectId::MASK_NODE | (20000 + i));
+                    s.add_node(n);
+                }
+                s.finalize_node_scan();
+
+                // Destroy the sorted vector behind has_node's back. The bitmap
+                // is a SEPARATE exact image of the same set, so every answer
+                // below must be unchanged. Without a bitmap in the hot path
+                // every probe returns false: binary_search over an empty
+                // vector misses and nodes_index is null (this storage was
+                // never init()'d). That asymmetry is what makes this the only
+                // non-tautological assertion in the group.
+                //
+                // The const_cast is defined behaviour: `s` is a non-const
+                // object, so modifying it through a reference obtained from
+                // its const accessor is legal. No production code frees this
+                // vector - EdgeKeepBitmapGpuBatcher still uploads it verbatim -
+                // so this is a test-only poisoning, not a supported state.
+                auto& v = const_cast<std::vector<uint64_t>&>(s.collected_nodes());
+                v.clear();
+
+                for (uint64_t i = 0; i < N; i++) {
+                    if (!s.has_node(ObjectId(ObjectId::MASK_NODE | (20000 + i)))) {
+                        std::cerr << "\nFAIL NB-2: id " << (20000 + i)
+                                  << " unreachable with the vector emptied; "
+                                     "has_node is not reading the bitmap"
+                                  << std::endl;
+                        return 1;
+                    }
+                }
+                if (s.has_node(ObjectId(ObjectId::MASK_NODE | 19999))
+                    || s.has_node(ObjectId(ObjectId::MASK_NODE | 21000))) {
+                    std::cerr << "\nFAIL NB-2: bitmap boundary false positive"
+                              << std::endl;
+                    return 1;
+                }
+                // Same payload, different type tag: must NOT collide onto a
+                // set bit. This is the guard against someone "simplifying"
+                // the index to (id & VALUE_MASK).
+                if (s.has_node(ObjectId(ObjectId::MASK_NODE_LABEL | 20500))
+                    || s.has_node(ObjectId(20500))) {
+                    std::cerr << "\nFAIL NB-2: type-tag collision (bitmap is "
+                                 "being indexed by payload, not raw id)"
+                              << std::endl;
+                    return 1;
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-3: a span over budget is refused and answers stay correct.
+            // With a 64 MiB ceiling this branch is unreachable on every graph
+            // in the project, so this is the ONLY place it ever executes.
+            std::cout << "Test NB-3: over-budget span falls back...";
+            {
+                GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                const uint64_t ids[3] = {1ULL, 1ULL << 40, 1ULL << 41};
+                for (uint64_t id : ids) {
+                    GQL::ProjectedNode n;
+                    n.node_id = ObjectId(id);
+                    s.add_node(n);
+                }
+                s.finalize_node_scan();
+                // span = 2^41 bits = 256 GB. The budget MUST refuse it.
+                if (s.node_bitmap_bytes() != 0
+                    || std::string(s.node_bitmap_status()) != "span-exceeds-budget") {
+                    std::cerr << "\nFAIL NB-3: budget accepted a 256 GB range ("
+                              << s.node_bitmap_bytes() << " B, status="
+                              << s.node_bitmap_status() << ")" << std::endl;
+                    return 1;
+                }
+                // Oracle: identical answers to a plain binary search.
+                std::vector<uint64_t> oracle(ids, ids + 3);
+                std::sort(oracle.begin(), oracle.end());
+                const uint64_t probes[6] = {1ULL, 2ULL, 1ULL << 39, 1ULL << 40,
+                                            1ULL << 41, ~0ULL};
+                for (uint64_t p : probes) {
+                    const bool want = std::binary_search(oracle.begin(), oracle.end(), p);
+                    if (s.has_node(ObjectId(p)) != want) {
+                        std::cerr << "\nFAIL NB-3: fallback disagrees with the "
+                                     "oracle on " << p << std::endl;
+                        return 1;
+                    }
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-4: mixed type tags refuse the bitmap AND stay distinguishable.
+            std::cout << "Test NB-4: mixed type tags...";
+            {
+                GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                GQL::ProjectedNode a, b;
+                a.node_id = ObjectId(ObjectId::MASK_NODE | 1);
+                b.node_id = ObjectId(ObjectId::MASK_NAMED_NODE | 1);
+                s.add_node(a);
+                s.add_node(b);
+                s.finalize_node_scan();
+                if (s.node_bitmap_bytes() != 0) {
+                    std::cerr << "\nFAIL NB-4: a 0xB4<<56 span must not fit"
+                              << std::endl;
+                    return 1;
+                }
+                if (!s.has_node(a.node_id) || !s.has_node(b.node_id)) {
+                    std::cerr << "\nFAIL NB-4: a mixed-tag set lost a member"
+                              << std::endl;
+                    return 1;
+                }
+                if (s.has_node(ObjectId(1)) || s.has_node(ObjectId(ObjectId::MASK_NODE | 2))) {
+                    std::cerr << "\nFAIL NB-4: mixed-tag false positive" << std::endl;
+                    return 1;
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-5: add_node after finalize invalidates the bitmap.
+            // Guard, not a discriminator: this passes today. It fails only if
+            // the bitmap is built and NOT dropped on a late append, which is
+            // the one defect of this change that yields a silently SMALLER
+            // projection instead of an error.
+            std::cout << "Test NB-5: late add_node invalidates...";
+            {
+                GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                for (uint64_t i = 0; i < 100; i++) {
+                    GQL::ProjectedNode n;
+                    n.node_id = ObjectId(ObjectId::MASK_NODE | (30000 + i));
+                    s.add_node(n);
+                }
+                s.finalize_node_scan();
+                GQL::ProjectedNode late;
+                late.node_id = ObjectId(ObjectId::MASK_NODE | 40000);  // outside span
+                s.add_node(late);
+                if (!s.has_node(late.node_id)) {
+                    std::cerr << "\nFAIL NB-5: node added after finalize is "
+                                 "invisible (stale bitmap)" << std::endl;
+                    return 1;
+                }
+                if (!s.has_node(ObjectId(ObjectId::MASK_NODE | 30050))) {
+                    std::cerr << "\nFAIL NB-5: pre-finalize node lost" << std::endl;
+                    return 1;
+                }
+                // And a re-finalize rebuilds a bitmap that covers both.
+                s.finalize_node_scan();
+                if (s.node_bitmap_bytes() == 0
+                    || !s.has_node(late.node_id)
+                    || !s.has_node(ObjectId(ObjectId::MASK_NODE | 30050))) {
+                    std::cerr << "\nFAIL NB-5: re-finalize did not rebuild"
+                              << std::endl;
+                    return 1;
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-6: zero nodes. front()/back() on an empty vector is UB; this
+            // is the most likely way the implementation crashes.
+            std::cout << "Test NB-6: empty node set...";
+            {
+                GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                s.finalize_node_scan();
+                if (s.node_bitmap_bytes() != 0
+                    || std::string(s.node_bitmap_status()) != "empty-node-set"
+                    || s.has_node(ObjectId(ObjectId::MASK_NODE | 1))
+                    || s.has_node(ObjectId(0))) {
+                    std::cerr << "\nFAIL NB-6: empty finalize misbehaved, status="
+                              << s.node_bitmap_status() << std::endl;
+                    return 1;
+                }
+            }
+            std::cout << " OK" << std::endl;
+
+            // NB-7: single node, including the UINT64_MAX edge.
+            std::cout << "Test NB-7: single node...";
+            {
+                for (uint64_t x : {ObjectId::MASK_NODE | 42ULL, ~0ULL}) {
+                    GQL::ProjectionStorage s(proj_dir, "test_db_storage");
+                    GQL::ProjectedNode n;
+                    n.node_id = ObjectId(x);
+                    s.add_node(n);
+                    s.finalize_node_scan();
+                    if (s.node_bitmap_bytes() != 1) {
+                        std::cerr << "\nFAIL NB-7: span 0 must be 1 byte, got "
+                                  << s.node_bitmap_bytes() << std::endl;
+                        return 1;
+                    }
+                    if (!s.has_node(ObjectId(x)) || s.has_node(ObjectId(x - 1))
+                        || s.has_node(ObjectId(0))) {
+                        std::cerr << "\nFAIL NB-7: single-node boundary" << std::endl;
+                        return 1;
+                    }
+                }
+            }
+            std::cout << " OK" << std::endl;
         } // storage and catalog destruct here, before drop
 
         // ================================================================
