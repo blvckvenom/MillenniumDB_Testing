@@ -11,15 +11,22 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "misc/ablation_registry.h"
+
 namespace mdb::gnn {
 
 namespace pch_detail {
 inline bool disabled() {
+    // The static is what keeps the registry's mutex off the hot path: the hints
+    // fire once per written chunk, per packed-slim file and per consumed
+    // batches.dat range, so only the first call may pay for resolving anything.
     static const bool cached = []{
-        const char* env = std::getenv("MDB_GNN_NO_FADVISE");
-        return env != nullptr && (std::strcmp(env, "1") == 0 ||
-                                  std::strcmp(env, "true") == 0 ||
-                                  std::strcmp(env, "yes") == 0);
+        // "1", "true" and "yes" are the only spellings this switch has ever
+        // acted on, so they stay the accepted set and the meaning of a run does
+        // not shift. What changes is that any OTHER value is now reported as
+        // unrecognised instead of quietly reading as off, which is the case
+        // where an ablation arm looks like it disabled the hints and did not.
+        return Ablation::choice("MDB_GNN_NO_FADVISE", "0", {"1", "true", "yes"}) != "0";
     }();
     return cached;
 }

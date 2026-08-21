@@ -9,6 +9,7 @@
 #include <torch/nn/init.h>
 
 #include "gnn/core/sparse_ops.h"
+#include "misc/ablation_registry.h"
 
 namespace mdb::gnn {
 
@@ -51,10 +52,13 @@ GraphSAGEModel::GraphSAGEModel(const GraphSAGEConfig& config) : config_(config) 
     // gates are unaffected. Rationale: docs/research/2026-06-10-thesis-measurements/
     // WEIGHT_INIT_THEORY.md (the live candidate for the MDB<->DiskGNN ~1pt gap).
     {
-        const char* xe = std::getenv("MDB_GNN_XAVIER_INIT");
-        const bool xavier = xe && (std::string(xe) == "1" ||
-                                   std::string(xe) == "true" ||
-                                   std::string(xe) == "yes");
+        // "1", "true" and "yes" are the only spellings this switch has ever
+        // acted on and remain the accepted set, so an existing run keeps its
+        // meaning. This one moves the weights a run starts from, so a value the
+        // code declines has to be visible: a mistyped arm that silently trained
+        // with the PyTorch default would be read as evidence about the init.
+        static const bool xavier =
+            Ablation::choice("MDB_GNN_XAVIER_INIT", "0", {"1", "true", "yes"}) != "0";
         if (xavier) {
             torch::NoGradGuard no_grad;
             const double relu_gain = std::sqrt(2.0);  // He/DGL ReLU gain

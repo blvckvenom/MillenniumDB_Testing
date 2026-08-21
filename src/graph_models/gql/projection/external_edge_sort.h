@@ -54,6 +54,7 @@
 
 #include "graph_models/gql/projection/edge_aggregation_record.h"
 #include "graph_models/gql/projection/parallel_merge.h"
+#include "misc/ablation_registry.h"
 #include "misc/available_ram.h"
 #include "storage/async_io/async_io.h"
 #include "storage/index/record.h"
@@ -265,6 +266,13 @@ public:
         }
 
 #ifdef MDB_GPU_ENABLED
+        // The DECISION below stays a presence test, unchanged: setting
+        // MDB_FORCE_CPU_SORT=0 has always forced the CPU path, and flag() would
+        // read that as "off" — a different switch. text() only puts the value
+        // the process saw into the log, which is what was missing.
+        static const std::string forced_cpu_sort =
+            Ablation::text("MDB_FORCE_CPU_SORT", "(unset)");
+        (void) forced_cpu_sort;
         if (!std::getenv("MDB_FORCE_CPU_SORT")) {
             // Verify binary compatibility: EdgeAggregationRecord (5 contiguous uint64_t)
             // must match Record<5> (std::array<uint64_t, 5>) in size so that spill files
@@ -308,6 +316,14 @@ public:
                 }
             }
         }
+#else
+        // No CUDA in this build: there is no GPU sort for this switch to force
+        // off, so it is declared inert instead of passing for an effective arm.
+        static const bool cpu_sort_switch_declared = [] {
+            Ablation::inert("MDB_FORCE_CPU_SORT", "built without CUDA");
+            return true;
+        }();
+        (void) cpu_sort_switch_declared;
 #endif
 
         // Existing fallback unchanged

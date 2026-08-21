@@ -22,6 +22,7 @@
 
 #include "gpu/gpu_device.h"   // detect_resources() for the dynamic-cache calibration
 
+#include "misc/ablation_registry.h"
 #include "query/procedure/procedure_context.h"
 
 #include "gnn/models/graphsage_model.h"
@@ -715,9 +716,15 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // needs a manual sampleCacheMb to avoid the documented N>1 OOM.
     if (prefetch_num_workers == 0) {
         unsigned auto_n = 1;
-        if (const char* env = std::getenv("MDB_GNN_PREFETCH_WORKERS")) {
-            std::string s(env);
-            if (s == "auto") {
+        // text() and not number(): the knob takes either a count or the word
+        // "auto", so the parse has to stay here and stays byte-for-byte what it
+        // was. What the registry adds is the record that the process saw this
+        // value, which is what a reproducibility claim about N>1 rests on.
+        {
+            const std::string s = Ablation::text("MDB_GNN_PREFETCH_WORKERS", "");
+            if (s.empty()) {
+                // Unset: keep the reproducible single-worker default.
+            } else if (s == "auto") {
                 unsigned hw = std::thread::hardware_concurrency();
                 unsigned a = (hw > 6u) ? (hw - 4u) : 2u;
                 auto_n = std::clamp<unsigned>(a, 2u, 8u);
@@ -843,9 +850,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // carry no label signal). Source-independent. Opt out via env
     // MDB_GNN_SKIP_INTEGRITY=1.
     {
-        const char* skip_env = std::getenv("MDB_GNN_SKIP_INTEGRITY");
-        const bool skip_integrity = skip_env && (std::string(skip_env) == "1" ||
-                                    std::string(skip_env) == "true" || std::string(skip_env) == "yes");
+        // The accepted list is exactly the three spellings the old condition
+        // compared against, so "TRUE" or "2" still leave the guard armed. The
+        // difference is that they are now reported as unrecognised rather than
+        // silently reading as "do not skip", which for a data-integrity gate is
+        // the difference between a deliberate opt-out and a mistyped one.
+        const std::string skip_raw
+            = Ablation::choice("MDB_GNN_SKIP_INTEGRITY", "0", {"0", "1", "true", "yes"});
+        const bool skip_integrity = (skip_raw != "0");
         auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
         if (!skip_integrity && labels && splits && meta.feature_dim > 0 &&
             meta.num_classes >= 2 && fs::exists(fmat_path)) {

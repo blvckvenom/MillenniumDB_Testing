@@ -84,6 +84,7 @@
 #endif
 
 #include "graph_models/gql/projection/spill_codec.h"
+#include "misc/ablation_registry.h"
 #include "misc/available_ram.h"
 #include "storage/index/record.h"
 #include "storage/page/page.h"
@@ -267,6 +268,13 @@ public:
         }
 
 #ifdef MDB_GPU_ENABLED
+        // The DECISION below stays a presence test, unchanged: setting
+        // MDB_FORCE_CPU_SORT=0 has always forced the CPU path, and flag() would
+        // read that as "off" — a different switch. text() only puts the value
+        // the process saw into the log, which is what was missing.
+        static const std::string forced_cpu_sort =
+            Ablation::text("MDB_FORCE_CPU_SORT", "(unset)");
+        (void) forced_cpu_sort;
         if (!std::getenv("MDB_FORCE_CPU_SORT")) {
             auto resources = mdb::gpu::detect_resources();
             auto plan = mdb::gpu::plan_sort(total_records_, N, resources);
@@ -280,6 +288,14 @@ public:
                 if (used) return;
             }
         }
+#else
+        // No CUDA in this build: there is no GPU sort for this switch to force
+        // off, so it is declared inert instead of passing for an effective arm.
+        static const bool cpu_sort_switch_declared = [] {
+            Ablation::inert("MDB_FORCE_CPU_SORT", "built without CUDA");
+            return true;
+        }();
+        (void) cpu_sort_switch_declared;
 #endif
 
         // Existing fallback unchanged

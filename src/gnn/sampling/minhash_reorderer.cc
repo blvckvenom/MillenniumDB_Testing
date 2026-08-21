@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "gnn/common/posix_io.h"
+#include "misc/ablation_registry.h"
 
 namespace mdb::gnn {
 
@@ -107,12 +108,17 @@ void MinHashReorderer::build_segmented(uint64_t num_batches, const BatchProvider
     // capped at hardware_concurrency() and num_batches. With 4 workers
     // each holding an N-sized uint64 array (888 MB at N=111M), heap is
     // ~3.5 GB — fine on the 30 GB host.
+    // number() replaces stoi-with-swallowed-exception: a value that did not
+    // parse used to leave the default standing with nothing said, so a run asked
+    // for 16 workers reported exactly like one that got 4. The >0 test and the
+    // int range test reproduce what stoi did (a non-positive value was ignored,
+    // an out-of-range one threw and kept the default); only a value with
+    // trailing garbage now reads differently, and it falls back declaring so.
+    static const long minhash_workers_env =
+        Ablation::number("MDB_GNN_MINHASH_WORKERS", 4);
     unsigned num_workers = 4;
-    if (const char* env = std::getenv("MDB_GNN_MINHASH_WORKERS")) {
-        try {
-            int parsed = std::stoi(env);
-            if (parsed > 0) num_workers = static_cast<unsigned>(parsed);
-        } catch (...) { /* ignore */ }
+    if (minhash_workers_env > 0 && minhash_workers_env <= INT_MAX) {
+        num_workers = static_cast<unsigned>(minhash_workers_env);
     }
     if (num_workers > std::thread::hardware_concurrency() &&
         std::thread::hardware_concurrency() > 0)

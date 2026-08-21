@@ -18,6 +18,7 @@
 #include "gnn/storage/four_level_store.h"
 #include "gnn/storage/vram_calib_io.h"
 #include "gpu/gpu_device.h"
+#include "misc/ablation_registry.h"
 #include "query/procedure/builtin/gnn_procedure_utils.h"
 
 namespace GQL {
@@ -113,7 +114,11 @@ inline mdb::gnn::FourLevelStore::Config build_feature_store_config(const DictOpt
     // default OFF). Budgets choose cache TIER placement only (which nodes live in
     // L1 GPU / L2 CPU vs L3/L4 disk), never the gathered feature values, so the
     // trained result is invariant to the budget. Explicit budgets always win.
-    if (const char* e = std::getenv("MDB_GNN_AUTO_RESOURCES"); e && std::string(e) == "1") {
+    // choice() and not flag(): this site only ever honoured the exact string "1",
+    // so "true" or "2" must keep falling through to the static budgets. What
+    // changes is that they are now reported as unrecognised instead of passing
+    // for a deliberate off, which is how a typo used to produce a silent arm.
+    if (Ablation::choice("MDB_GNN_AUTO_RESOURCES", "0", {"0", "1"}) == "1") {
         auto res = mdb::gpu::detect_resources();
         if (!gpu_budget_explicit && res.has_gpu) {
             config.gpu.budget_bytes = res.gpu.free_vram / 4;

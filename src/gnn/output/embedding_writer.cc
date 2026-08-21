@@ -27,6 +27,7 @@
 #include "graph_models/gql/projection/projection_catalog.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/object_id.h"
+#include "misc/ablation_registry.h"
 #include "misc/available_ram.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -330,9 +331,9 @@ EmbeddingWriter::infer_non_seed_embeddings(const std::vector<uint64_t>& missing)
     // Optional per-chunk timing instrumentation (env MDB_EMBWRITER_TIMING=1).
     // Emits one line per chunk with wall-clock breakdown of each step so we
     // can diagnose O(N^2)-style growth without a profiler.
-    const char* timing_env = std::getenv("MDB_EMBWRITER_TIMING");
-    const bool  emit_timing = (timing_env != nullptr && timing_env[0] != '0'
-                               && timing_env[0] != '\0');
+    // Static because Phase B reaches this line on every writeback and the
+    // switch cannot change meaning mid-run anyway.
+    static const bool emit_timing = Ablation::flag("MDB_EMBWRITER_TIMING", false);
 
     for (uint64_t start = 0; start < missing.size(); start += chunk_size) {
         uint64_t end = std::min(start + chunk_size,

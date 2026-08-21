@@ -25,6 +25,7 @@
 #include "graph_models/gql/projection/sorter_dispatch.h"
 #include "graph_models/gql/projection/topology_snapshot_from_leaf.h"
 #include "graph_models/gql/projection/topology_snapshot_writer.h"
+#include "misc/ablation_registry.h"
 #include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
@@ -734,8 +735,13 @@ void ProjectionStorage::resize_bloom_filter(size_t expected_edges, double fpr) {
 // swaps.
 static bool node_bitmap_enabled() {
     static const bool cached = []() {
-        const char* env = std::getenv("MDB_PROJECTION_NODE_MEMBERSHIP");
-        return env == nullptr || std::strcmp(env, "binary") != 0;
+        // Truth rule unchanged: only "binary" restores the pre-bitmap search.
+        // The gain is that "binray" no longer selects the bitmap by merely
+        // failing to spell the other arm — it falls back AND is reported, which
+        // is the whole reason a mistyped arm used to look like a correct run.
+        // The static keeps the per-name lock off the callers of has_node().
+        return Ablation::choice("MDB_PROJECTION_NODE_MEMBERSHIP", "bitmap",
+                                {"binary", "bitmap"}) != "binary";
     }();
     return cached;
 }
@@ -2109,26 +2115,29 @@ void ProjectionStorage::initialize_streaming_buffers() {
     // =========================================================================
 
     std::string spill_base = projection_dir;
-    if (const char* env_dir = std::getenv("MDB_PROJECTION_SPILL_DIR")) {
-        if (env_dir[0] != '\0') {
-            // Derive a subdir named after the projection so concurrent
-            // projection builds don't collide. Extracting the trailing path
-            // component of projection_dir (e.g. "papers100M_proj" from
-            // "data/dbs/gql/papers100M/projections/papers100M_proj").
-            std::filesystem::path pd(projection_dir);
-            std::string subname = pd.filename().string();
-            if (subname.empty()) {
-                subname = "projection";
-            }
-            spill_base = std::string(env_dir) + "/" + subname;
-            std::error_code ec;
-            std::filesystem::create_directories(spill_base, ec);
-            if (ec) {
-                throw std::runtime_error(
-                    "MDB_PROJECTION_SPILL_DIR='" + std::string(env_dir) +
-                    "': cannot create spill directory '" + spill_base +
-                    "': " + ec.message());
-            }
+    // text(), not choice(): a spill path has no closed set of valid values. It
+    // is still declared, because "which volume absorbed the spill I/O" changes
+    // what a timing arm measures and was nowhere in the run's record.
+    const std::string env_dir =
+        Ablation::text("MDB_PROJECTION_SPILL_DIR", "");
+    if (!env_dir.empty()) {
+        // Derive a subdir named after the projection so concurrent
+        // projection builds don't collide. Extracting the trailing path
+        // component of projection_dir (e.g. "papers100M_proj" from
+        // "data/dbs/gql/papers100M/projections/papers100M_proj").
+        std::filesystem::path pd(projection_dir);
+        std::string subname = pd.filename().string();
+        if (subname.empty()) {
+            subname = "projection";
+        }
+        spill_base = env_dir + "/" + subname;
+        std::error_code ec;
+        std::filesystem::create_directories(spill_base, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "MDB_PROJECTION_SPILL_DIR='" + env_dir +
+                "': cannot create spill directory '" + spill_base +
+                "': " + ec.message());
         }
     }
 

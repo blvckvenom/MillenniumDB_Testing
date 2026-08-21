@@ -1,5 +1,7 @@
 #include "gnn/sampling/node_counts_io.h"
 
+#include "misc/ablation_registry.h"
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -51,10 +53,14 @@ void persist(const std::filesystem::path&  projection_dir,
     // and validated to be the SUFFICIENT fix where canonical neighbor order alone was not). Default OFF =>
     // unchanged behavior. Seed deterministic counts by doing ONE cold-start build (no node_counts.bin) first.
     {
-        static const bool kFreeze = []() {
-            const char* e = std::getenv("MDB_GNN_FREEZE_NODE_COUNTS");
-            return e != nullptr && std::string(e) == "1";
-        }();
+        // choice() and not flag(): only "1" ever froze the counts, so every
+        // other value already meant "keep overwriting" and the conversion is
+        // exact. The declaration matters more here than for any other switch in
+        // the sampler: a run that believes it froze the counts and did not is
+        // not reproducible, and every measurement compared against it inherits
+        // the drift. A mistyped value now reports itself as unrecognised.
+        static const bool kFreeze =
+            Ablation::choice("MDB_GNN_FREEZE_NODE_COUNTS", "0", {"0", "1"}) == "1";
         if (kFreeze) {
             std::error_code fec;
             if (std::filesystem::exists(projection_dir / "node_counts.bin", fec)) {

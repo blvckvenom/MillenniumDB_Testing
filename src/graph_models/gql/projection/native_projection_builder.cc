@@ -26,6 +26,7 @@
 #include "graph_models/gql/projection/projection_manager.h"
 #include "graph_models/gql/projection/streaming_aggregator.h"
 #include "graph_models/gql/projection/topology_snapshot_writer.h"
+#include "misc/ablation_registry.h"
 #include "query/exceptions.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "system/string_manager.h"
@@ -58,14 +59,28 @@ bool truthy_env_(const char* env) {
     return v == "1" || v == "true" || v == "yes";
 }
 
+// Same truth rule as truthy_env_ — deliberately by CONSTRUCTION, since it
+// forwards the resolved string to it. choice() returns either a value the rule
+// already recognises or the "0" fallback, and truthy_env_("0") is false, which
+// is exactly what an unrecognised value meant before. The only difference in
+// the log: that unrecognised value is now named instead of passing as "off".
+bool truthy_ablation_(const char* name) {
+    const std::string v =
+        Ablation::choice(name, "0", {"0", "1", "true", "yes"});
+    return truthy_env_(v.c_str());
+}
+
 NativeProjectionBuilder::ScanMode init_scan_mode() {
     // SERIALIZED is the more invasive pipeline and wins when both env vars
     // are set. PARALLEL gates on its OWN separate env var so it never
     // collides with the scanner's MDB_PROJECTION_PARALLEL_EDGE_SCAN knob.
-    if (truthy_env_(std::getenv("MDB_PROJECTION_SERIAL_SCAN"))) {
+    if (truthy_ablation_("MDB_PROJECTION_SERIAL_SCAN")) {
         return NativeProjectionBuilder::ScanMode::SERIALIZED;
     }
-    if (truthy_env_(std::getenv("MDB_PROJECTION_PARALLEL_SCAN"))) {
+    // Reached only when SERIAL_SCAN did not win, so PARALLEL_SCAN is declared
+    // only when the run actually consulted it — the sequence of [ABLATION]
+    // lines then reconstructs the decisions taken, not the ones bypassed.
+    if (truthy_ablation_("MDB_PROJECTION_PARALLEL_SCAN")) {
         return NativeProjectionBuilder::ScanMode::PARALLEL;
     }
     return NativeProjectionBuilder::ScanMode::CLASSIC;
@@ -307,8 +322,14 @@ NativeProjectionBuilder::NativeProjectionBuilder(
         edge_key_id_to_name[id | ObjectId::MASK_EDGE_KEY] = name;
     }
 
-    // Enable benchmark timers if MDB_BENCHMARK env var is set
-    benchmark_timers_.enabled = (std::getenv("MDB_BENCHMARK") != nullptr);
+    // Enable benchmark timers if MDB_BENCHMARK env var is set.
+    //
+    // PRESENCE, not value, has always decided this one: MDB_BENCHMARK=0 turns
+    // the timers ON today. flag() would read that as off, i.e. a different
+    // switch; the sentinel default keeps the presence rule intact and still
+    // puts the resolved value in the log.
+    benchmark_timers_.enabled =
+        Ablation::text("MDB_BENCHMARK", "(unset)") != "(unset)";
 
 #ifdef ENABLE_GNN
     // Load RowMapping and FeatureMatrix metadata for GNN label/split extraction.
@@ -722,8 +743,10 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
     // lever pays off); if it is a small fraction, the parallel walk dominates
     // and a serial-tail lever cannot help. Zero overhead when the flag is off
     // (a single predictable branch per edge).
-    const bool edge_scan_profile =
-        truthy_env_(std::getenv("MDB_PROJECTION_EDGE_SCAN_PROFILE"));
+    // static: the registry memoises by name anyway, so re-reading per call
+    // would only pay its lock without being able to observe a change.
+    static const bool edge_scan_profile =
+        truthy_ablation_("MDB_PROJECTION_EDGE_SCAN_PROFILE");
     // ---- Serial-tail lever (env MDB_PROJECTION_SKIP_WINDOWED_DEDUP=1).
     //
     // For SINGLE aggregation with no aggregation property, the windowed
@@ -737,8 +760,8 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
     // which is acceptable for GNN-equivalence projections (papers100M/cora_gnn
     // have no duplicate (from,to,type) edges, so behavior is unchanged and the
     // cora bit-identical gate holds). Default OFF; only engaged for the A/B.
-    const bool edge_scan_skip_dedup =
-        truthy_env_(std::getenv("MDB_PROJECTION_SKIP_WINDOWED_DEDUP"));
+    static const bool edge_scan_skip_dedup =
+        truthy_ablation_("MDB_PROJECTION_SKIP_WINDOWED_DEDUP");
     uint64_t consumer_ns_acc = 0;
     uint64_t detector_ns_acc = 0;
     uint64_t has_node_ns_acc = 0;
@@ -788,7 +811,7 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
             type_id,
             [this, &detector, type_id, type_orientation,
              type_aggregation, &type_agg_property, skip_windowed_dedup,
-             edge_scan_profile, &consumer_ns_acc, &detector_ns_acc,
+             &consumer_ns_acc, &detector_ns_acc,
              &has_node_ns_acc, &consumer_calls]
             (ObjectId edge_id, ObjectId from_node, ObjectId to_node) {
             EdgeScanProfileGuard _consumer_guard(consumer_ns_acc, edge_scan_profile);
@@ -1067,8 +1090,8 @@ void NativeProjectionBuilder::scan_edges_impl_parallel_(const std::vector<std::s
     // cora bit-identical (0.8574939) gates this. Opt-in via
     // MDB_PROJECTION_PARALLEL_SCAN (ScanMode::PARALLEL); the default classic path
     // is unchanged.
-    const bool edge_scan_profile_par =
-        truthy_env_(std::getenv("MDB_PROJECTION_EDGE_SCAN_PROFILE"));
+    static const bool edge_scan_profile_par =
+        truthy_ablation_("MDB_PROJECTION_EDGE_SCAN_PROFILE");
     const auto par_wall_t0 = std::chrono::steady_clock::now();
     uint64_t emitted_count = 0;
     std::mutex emit_mutex;

@@ -13,6 +13,7 @@
 #include "gnn/common/posix_io.h"
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "misc/ablation_registry.h"
 
 #ifdef GNN_CUDA_ENABLED
 #include <cuda_runtime.h>
@@ -106,11 +107,12 @@ void CpuCache::build(
     // (a thread-safe const operation), so splitting the index range across threads
     // produces bit-identical output (each thread owns a non-overlapping slice).
     {
+        // One resolution shared with the GPU cache builder: both gathers have to
+        // run at the same width or their timings cannot be compared, and the
+        // registry guarantees the two sites cannot disagree.
+        static const long env_cache_workers = Ablation::number("MDB_GNN_CACHE_WORKERS", 1);
         unsigned cache_workers = 1;
-        if (const char* env = std::getenv("MDB_GNN_CACHE_WORKERS")) {
-            long v = std::strtol(env, nullptr, 10);
-            if (v > 1) cache_workers = static_cast<unsigned>(v);
-        }
+        if (env_cache_workers > 1) cache_workers = static_cast<unsigned>(env_cache_workers);
         const unsigned hw = std::thread::hardware_concurrency();
         if (hw > 0 && cache_workers > hw) cache_workers = hw;
         auto gather_range = [&](uint64_t lo, uint64_t hi) {

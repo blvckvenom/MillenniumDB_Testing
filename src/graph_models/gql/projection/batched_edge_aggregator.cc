@@ -23,6 +23,7 @@
 #include <limits>
 
 #include "gpu/gpu_device.h"
+#include "misc/ablation_registry.h"
 #include "query/exceptions.h"
 
 namespace GQL {
@@ -38,15 +39,24 @@ namespace GQL {
 // convention).
 bool BatchedEdgeAggregator::gpu_path_available() {
 #ifndef MDB_GPU_ENABLED
+    // Declared inert rather than silently ignored: in a build without CUDA the
+    // two arms of an A/B over this switch are the same code path.
+    static const bool declared = [] {
+        Ablation::inert("MDB_PROJECTION_AGGREGATION_GPU", "built without CUDA");
+        return true;
+    }();
+    (void) declared;
     return false;
 #else
     static const bool cached = []() {
-        const char* env = std::getenv("MDB_PROJECTION_AGGREGATION_GPU");
-        if (env == nullptr || env[0] != '1' || env[1] != '\0') {
-            // Default-off + any non-"1" value disables. We deliberately do
-            // NOT treat unset == on (unlike MDB_PROJECTION_BITMAP_GPU) so
-            // the stub doesn't masquerade as a working GPU path while
-            // the GPU body is still a CPU-equivalent stub.
+        // Default-off + any non-"1" value disables. We deliberately do
+        // NOT treat unset == on (unlike MDB_PROJECTION_BITMAP_GPU) so
+        // the stub doesn't masquerade as a working GPU path while
+        // the GPU body is still a CPU-equivalent stub. choice() keeps that
+        // rule — the "0" fallback catches unset and unrecognised alike — and
+        // additionally distinguishes the two in the log.
+        if (Ablation::choice("MDB_PROJECTION_AGGREGATION_GPU", "0", {"0", "1"})
+            != "1") {
             return false;
         }
         const auto res = mdb::gpu::detect_resources();

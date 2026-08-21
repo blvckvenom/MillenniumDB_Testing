@@ -47,6 +47,7 @@
 #include "gnn/sampling/sample_fingerprint.h"  // sample content fingerprint (store reuse key)
 #include "gnn/sampling/sample_storage.h"
 #include "graph_models/object_id.h"
+#include "misc/ablation_registry.h"  // Ablation::*: resolve an env switch and declare it in the same act
 // query_context.h must be included after liburing (via four_level_store.h ->
 // direct_io_reader.h -> liburing.h -> linux/fs.h) which defines BLOCK_SIZE
 // as a macro.  string_manager.h (included by query_context.h) uses the same
@@ -363,12 +364,12 @@ void build_addr_tables_(
     unsigned num_workers = std::thread::hardware_concurrency();
     if (num_workers == 0) num_workers = 4;
     if (num_workers > 20) num_workers = 20;
-    if (const char* env = std::getenv("MDB_GNN_ADDR_TABLE_WORKERS")) {
-        try {
-            int v = std::stoi(env);
-            if (v > 0) num_workers = static_cast<unsigned>(v);
-        } catch (...) {}
-    }
+    // The fallback is the auto-detected width computed just above, so the
+    // declared line carries the count actually used even when nobody set the
+    // variable, so an auto-sized run and a hand-sized one stay comparable.
+    const long addr_table_workers =
+        Ablation::number("MDB_GNN_ADDR_TABLE_WORKERS", static_cast<long>(num_workers));
+    if (addr_table_workers > 0) num_workers = static_cast<unsigned>(addr_table_workers);
     if (num_workers > std::thread::hardware_concurrency() &&
         std::thread::hardware_concurrency() > 0)
     {
@@ -1273,15 +1274,12 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // for tuning. The reads from `samples` (per-call ifstream) and
     // `active_fm` (mmap) and `active_rm` (built-once index then read-only)
     // are all thread-safe.
+    // L4 width is the knob most often swept, so the value has to appear in the
+    // log beside the throughput it produced; a swept arm whose width was
+    // rejected as unparseable is otherwise reported as the default's result.
+    static const long l4_workers = Ablation::number("MDB_GNN_L4_WORKERS", 4);
     unsigned num_l4_workers = 4;
-    if (const char* env = std::getenv("MDB_GNN_L4_WORKERS")) {
-        try {
-            int parsed = std::stoi(env);
-            if (parsed > 0) num_l4_workers = static_cast<unsigned>(parsed);
-        } catch (...) {
-            // ignore malformed env value, keep default
-        }
-    }
+    if (l4_workers > 0) num_l4_workers = static_cast<unsigned>(l4_workers);
     if (num_l4_workers > std::thread::hardware_concurrency() &&
         std::thread::hardware_concurrency() > 0)
     {
@@ -1305,11 +1303,11 @@ FourLevelStore::BuildResult FourLevelStore::build(
         (void) active_rm->find(active_rm->get(0));
     }
 
-    bool use_pipeline_overlap = false;
-    if (const char* env = std::getenv("MDB_GNN_PIPELINE_OVERLAP")) {
-        std::string s(env);
-        if (s == "1" || s == "true" || s == "yes") use_pipeline_overlap = true;
-    }
+    // Third reader of this switch (the two reorder passes are the others). The
+    // registry resolves it once per process, so the reorder and the packer
+    // cannot disagree about whether this build was pipelined.
+    static const bool use_pipeline_overlap =
+        Ablation::choice("MDB_GNN_PIPELINE_OVERLAP", "0", {"1", "true", "yes"}) != "0";
 
     auto worker_fn = [&]() {
         // PackedBatch and pipeline state live OUTSIDE the try so the RAII
@@ -1496,12 +1494,19 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // (one sequential .fmat scan vs per-batch random gather of cold on-disk
     // rows) and produces BIT-IDENTICAL output (validated cora testAccuracy
     // 0.86240786 classic vs partitioned). Disable with MDB_GNN_SLIM_PARTITIONED=0.
-    bool use_slim_partitioned = true;
-    if (const char* env = std::getenv("MDB_GNN_SLIM_PARTITIONED")) {
-        std::string s(env);
-        if (s == "0" || s == "false" || s == "no")       use_slim_partitioned = false;
-        else if (s == "1" || s == "true" || s == "yes")  use_slim_partitioned = true;
-    }
+    // Both arms are spelled out in the accepted list because the chain below
+    // branched on both. An unrecognised value keeps the ON default exactly as
+    // falling through the chain did, with the difference that the rejected
+    // spelling is now on the record rather than passing for a deliberate off.
+    static const std::string slim_partitioned =
+        Ablation::choice("MDB_GNN_SLIM_PARTITIONED", "1",
+                         {"1", "true", "yes", "0", "false", "no"});
+    // Stays mutable: the NOFILE check further down turns the partitioned packer
+    // off when the fd budget cannot cover one fd per batch, and that decision is
+    // the process's, not the operator's.
+    bool use_slim_partitioned = !(slim_partitioned == "0" ||
+                                  slim_partitioned == "false" ||
+                                  slim_partitioned == "no");
 
     // The partitioned packer keeps ONE fd open per batch through its final
     // phase, so it needs NOFILE >= total_batches + headroom. Raise the soft
@@ -1568,12 +1573,13 @@ FourLevelStore::BuildResult FourLevelStore::build(
 
     if (use_slim_partitioned) {
         log_phase("L4 packed_slim: partitioned sequential-scan path (Lever B)");
+        // Partition size decides how many sequential passes the packer makes,
+        // so it belongs in the log next to the pack time it explains.
+        static const long slim_partition_mb =
+            Ablation::number("MDB_GNN_SLIM_PARTITION_MB", 256);
         size_t slim_partition_bytes = 256ULL * 1024 * 1024;
-        if (const char* mb = std::getenv("MDB_GNN_SLIM_PARTITION_MB")) {
-            try {
-                long v = std::stol(mb);
-                if (v > 0) slim_partition_bytes = static_cast<size_t>(v) * 1024 * 1024;
-            } catch (...) { /* keep default */ }
+        if (slim_partition_mb > 0) {
+            slim_partition_bytes = static_cast<size_t>(slim_partition_mb) * 1024 * 1024;
         }
         // Cold-node entries for batch b, sorted by row ascending — mirrors the
         // worker-loop collection exactly so output is row-order-equivalent.
@@ -1585,10 +1591,12 @@ FourLevelStore::BuildResult FourLevelStore::build(
         // SAME b, so a 1-slot memo eliminates the 2nd read_sample(b)+find per batch.
         // The returned vector is identical => packed output bit-identical (gate cora
         // 0.8574939). Default OFF for a clean A/B; flip default after papers100M A/B.
-        const bool dedup_cold = []() {
-            const char* e = std::getenv("MDB_GNN_DEDUP_COLD_ENTRIES");
-            return e && std::string(e) == "1";
-        }();
+        // "1" was the only value the comparison ever honoured, so it is the
+        // only accepted one; every other spelling means OFF as before, and now
+        // says which spelling it rejected. This one exists to be A/B'd, which
+        // is exactly the case where an unread switch invalidates the result.
+        static const bool dedup_cold =
+            Ablation::choice("MDB_GNN_DEDUP_COLD_ENTRIES", "0", {"1"}) == "1";
         uint64_t cold_memo_b = UINT64_MAX;
         std::vector<SlimEntry> cold_memo;
         auto cold_entries = [&](uint64_t b) -> const std::vector<SlimEntry>& {
@@ -2085,10 +2093,12 @@ FourLevelStore::FourLevelStore(
     // sets use_consolidated_slim_. Any mismatch/absence leaves it false so the
     // per-batch .bin read path is used instead. NEVER throws out of the ctor.
     {
-        const char* ce = std::getenv("MDB_GNN_CONSOLIDATED_SLIM");
-        const bool cons_enabled = ce && (std::strcmp(ce, "1") == 0 ||
-                                          std::strcmp(ce, "true") == 0 ||
-                                          std::strcmp(ce, "yes") == 0);
+        // Same three spellings the strcmp chain honoured; anything else still
+        // leaves the per-batch .bin path in place, now reported. The probe runs
+        // per store, so the answer is memoised to keep the ctor lock-free.
+        static const bool cons_enabled =
+            Ablation::choice("MDB_GNN_CONSOLIDATED_SLIM", "0",
+                             {"1", "true", "yes"}) != "0";
         auto cons_path = fs::path(packed_slim_dir_) / "consolidated.slim";
         if (cons_enabled && fs::exists(cons_path)) {
             try {
@@ -2298,11 +2308,11 @@ torch::Tensor FourLevelStore::load_batch_features(const GraphSample& sample,
 // true with file_buf filled to exactly file_size; false to fall back to the
 // buffered read (O_DIRECT unsupported on the fs, alignment/short-read failure).
 static bool l4_o_direct_enabled() {
-    static const bool on = []() {
-        const char* e = std::getenv("MDB_GNN_L4_O_DIRECT");
-        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
-                     std::strcmp(e, "yes") == 0);
-    }();
+    // The static stays: this sits on the per-batch read path, so the registry
+    // lock must be paid once and not per file. Accepted values are the three
+    // the strcmp chain honoured; anything else means buffered, as before.
+    static const bool on =
+        Ablation::choice("MDB_GNN_L4_O_DIRECT", "0", {"1", "true", "yes"}) != "0";
     return on;
 }
 
@@ -2312,11 +2322,9 @@ static bool l4_o_direct_enabled() {
 // combined pinned buffer on the host. Bit-identical output; removes the dominant
 // per-batch L2 host memcpy on papers100M-scale runs.
 static bool fused_assembler_enabled() {
-    static const bool on = []() {
-        const char* e = std::getenv("MDB_GNN_FUSED_ASSEMBLER");
-        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "true") == 0 ||
-                     std::strcmp(e, "yes") == 0);
-    }();
+    // Memoised for the same reason as the O_DIRECT probe above: per-batch path.
+    static const bool on =
+        Ablation::choice("MDB_GNN_FUSED_ASSEMBLER", "0", {"1", "true", "yes"}) != "0";
     return on;
 }
 

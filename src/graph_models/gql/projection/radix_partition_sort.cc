@@ -27,6 +27,7 @@
 #include "graph_models/gql/projection/leaf_compression.h"
 #include "graph_models/gql/projection/parallel_scan_partitioner.h"
 #include "graph_models/gql/projection/partition_file.h"
+#include "misc/ablation_registry.h"
 #include "misc/available_ram.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
@@ -901,6 +902,19 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
             // preserved on a `false` return per the wrapper contract.
         }
     }
+#else
+    // The three switches above steer a block this build does not contain. An
+    // arm that sets one of them here runs the same CPU sort as the arm that
+    // does not, so they are declared inert rather than left looking effective.
+    // Resolved once: this runs per partition, on every worker.
+    static const bool gpu_sort_switches_declared = [] {
+        Ablation::inert("MDB_PROJECTION_RADIX_GPU", "built without CUDA");
+        Ablation::inert("MDB_PROJECTION_RADIX_GPU_MIN_RECORDS",
+                        "built without CUDA");
+        Ablation::inert("MDB_FORCE_CPU_SORT", "built without CUDA");
+        return true;
+    }();
+    (void) gpu_sort_switches_declared;
 #endif  // MDB_GPU_ENABLED
 
     // CPU std::sort fallback path: GPU disabled, build lacks CUDA, partition

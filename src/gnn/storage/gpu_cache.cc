@@ -14,6 +14,7 @@
 
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/gnn_dtype.h"
+#include "misc/ablation_registry.h"
 
 namespace mdb::gnn {
 
@@ -165,11 +166,11 @@ void GpuCache::build(
     // and reads from the const mmap source via features.row(), so splitting the
     // i-range across threads is both thread-safe and bit-identical.
     {
+        // Shares one resolution with the CPU cache builder: same switch, same
+        // answer, so an L1/L2 build cannot end up half parallel and half not.
+        static const long env_cache_workers = Ablation::number("MDB_GNN_CACHE_WORKERS", 1);
         unsigned cache_workers = 1;
-        if (const char* env = std::getenv("MDB_GNN_CACHE_WORKERS")) {
-            long v = std::strtol(env, nullptr, 10);
-            if (v > 1) cache_workers = static_cast<unsigned>(v);
-        }
+        if (env_cache_workers > 1) cache_workers = static_cast<unsigned>(env_cache_workers);
         const unsigned hw = std::thread::hardware_concurrency();
         if (hw > 0 && cache_workers > hw) cache_workers = hw;
         auto gather_range = [&](uint64_t lo, uint64_t hi) {

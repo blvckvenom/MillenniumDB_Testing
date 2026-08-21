@@ -7,6 +7,7 @@
 
 #include <boost/beast.hpp>
 
+#include "misc/ablation_registry.h"
 #include "misc/fatal_error.h"
 #include "misc/logger.h"
 #include "network/server/listener.h"
@@ -190,11 +191,15 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
             return;
         }
 
-        // if ENV MDB_BROWSER is set use that
-        char* env_browser = std::getenv("MDB_BROWSER");
+        // Resolved once instead of per request: the document root cannot change
+        // under a running server, and going through the registry puts the root the
+        // process actually served from into the same log as every other switch.
+        // Unlike its neighbours there, this one selects an interface and not a
+        // code path under measurement.
+        static const std::string browser_root
+            = Ablation::text("MDB_BROWSER", MDBServer::Protocol::DEFAULT_BROWSER_PATH);
 
-        std::string path = env_browser == nullptr ? MDBServer::Protocol::DEFAULT_BROWSER_PATH : env_browser;
-        path = path_cat(path, req.target());
+        std::string path = path_cat(browser_root, req.target());
         if (req.target().back() == '/')
             path.append("index.html");
 

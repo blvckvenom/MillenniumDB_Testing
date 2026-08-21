@@ -30,6 +30,7 @@
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
 #include "gpu/gpu_device.h"
 #include "graph_models/gql/projection/projection_storage.h"
+#include "misc/ablation_registry.h"
 #include "query/query_context.h"
 
 namespace mdb::gnn {
@@ -50,9 +51,14 @@ namespace mdb::gnn {
 bool lean_symmetric_gpu_eligible(GQL::ProjectionStorage& storage,
                                  const SamplingConfig& config) {
     if (config.sampling_backend == SamplingBackendChoice::FORCE_CPU) return false;
-    if (const char* e = std::getenv("MDB_GNN_SAMPLING_BACKEND")) {
-        if (std::string(e) == "cpu") return false;
-    }
+    // Same name, same accepted list, same answer as the backend decision in
+    // do_run: the registry resolves once per name, so the eligibility probe and
+    // the plan can no longer disagree about what was asked for. The fallback
+    // names the outcome and not a backend, because an absent or unrecognised
+    // value leaves the decision to SamplingConfig.
+    static const std::string backend_env = Ablation::choice(
+        "MDB_GNN_SAMPLING_BACKEND", "config", {"auto", "cpu", "gpu"});
+    if (backend_env == "cpu") return false;
     if (!config.use_four_level_topology_store) return false;
     if (!config.symmetric_resolved_on(config.orientation)) return false;
     auto sym = GQL::Projection::TopologySnapshotReader::open_symmetric(
@@ -203,11 +209,14 @@ struct OfflineSamplingEngine::Impl {
             // the legacy sparse single writer otherwise (default OFF); that mode
             // writes a v1 frequency.dat — a different on-disk layout than the
             // dense v2, but one the frequency consumer normalizes identically.
-            const bool want_shard_write = [&]() {
-                const char* e = std::getenv("MDB_GNN_SHARD_WRITE");
-                return e != nullptr && std::string(e) == "1"
-                    && config.num_workers >= 1 && row_mapping != nullptr;
-            }();
+            // Only the environment part is resolved through the registry and
+            // memoised; the worker-count and row-mapping conditions are run
+            // state and must stay per-call. Only "1" ever enabled the sharded
+            // writer, so every other value already meant OFF.
+            static const bool shard_write_env =
+                Ablation::choice("MDB_GNN_SHARD_WRITE", "0", {"0", "1"}) == "1";
+            const bool want_shard_write = shard_write_env
+                && config.num_workers >= 1 && row_mapping != nullptr;
             SampleStorage sample_storage = want_shard_write
                 ? SampleStorage::create(db_folder, config, *row_mapping,
                       khop_sampler->get_topology().get_node_count())
@@ -257,12 +266,15 @@ struct OfflineSamplingEngine::Impl {
             SamplingBackendPlan active_gpu_plan;
             {
                 SamplingBackendChoice backend_choice = config.sampling_backend;
-                if (const char* env = std::getenv("MDB_GNN_SAMPLING_BACKEND")) {
-                    const std::string e(env);
-                    if (e == "cpu")       backend_choice = SamplingBackendChoice::FORCE_CPU;
-                    else if (e == "gpu")  backend_choice = SamplingBackendChoice::FORCE_GPU;
-                    else if (e == "auto") backend_choice = SamplingBackendChoice::AUTO;
-                }
+                // The accepted list is exactly what the branches below act on.
+                // An unrecognised value resolves to "config", which is what it
+                // already did (leave SamplingConfig in charge), except that it
+                // now says so instead of passing for an honoured override.
+                static const std::string backend_env = Ablation::choice(
+                    "MDB_GNN_SAMPLING_BACKEND", "config", {"auto", "cpu", "gpu"});
+                if (backend_env == "cpu")       backend_choice = SamplingBackendChoice::FORCE_CPU;
+                else if (backend_env == "gpu")  backend_choice = SamplingBackendChoice::FORCE_GPU;
+                else if (backend_env == "auto") backend_choice = SamplingBackendChoice::AUTO;
                 mdb::gpu::SystemResources res = mdb::gpu::detect_resources();
                 const TopologyAccessor& topo = khop_sampler->get_topology();
 
@@ -526,9 +538,11 @@ struct OfflineSamplingEngine::Impl {
                 const bool resident_ok =
                     pv != nullptr && pv->is_registered()
                     && pv->fwd() != nullptr && pv->fwd()->resident;
-                const char* serial_env = std::getenv("MDB_GNN_GPU_SERIAL");
-                const bool want_serial =
-                    serial_env != nullptr && std::string(serial_env) == "1";
+                // Only "1" ever forced the serial GPU loop, so every other
+                // value already meant OFF. Declared because the alternative is a
+                // GPU run whose worker count cannot be recovered from the log.
+                static const bool want_serial =
+                    Ablation::choice("MDB_GNN_GPU_SERIAL", "0", {"0", "1"}) == "1";
                 if (!resident_ok || want_serial) {
                     effective_workers = 0;  // legacy GPU-serial loop
                 }
@@ -746,10 +760,9 @@ struct OfflineSamplingEngine::Impl {
                 // are pure functions of the sample, so moving them out is
                 // bit-identical (batches.dat + content_fp unchanged) and shrinks the
                 // serial section to just the shared disk write + freq + bookkeeping.
-                const bool parallel_write_prep = []() {
-                    const char* e = std::getenv("MDB_GNN_PARALLEL_WRITE_PREP");
-                    return e != nullptr && std::string(e) == "1";
-                }();
+                static const bool parallel_write_prep =
+                    Ablation::choice("MDB_GNN_PARALLEL_WRITE_PREP", "0",
+                                     {"0", "1"}) == "1";
 
                 auto worker_fn = [&](BasicKHopSampler* sampler,
                                      uint32_t worker_index) {

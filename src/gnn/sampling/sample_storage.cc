@@ -20,6 +20,7 @@
 #include "gnn/common/page_cache_hint.h"  // page-cache relief via posix_fadvise/madvise DONTNEED
 #include "gnn/sampling/sample_fingerprint.h"  // per-batch content fingerprint (staleness check)
 #include "gnn/storage/row_mapping.h"
+#include "misc/ablation_registry.h"
 #include "misc/logger.h"
 
 namespace mdb::gnn {
@@ -711,11 +712,16 @@ struct SampleStorage::Impl {
         // 5.5 → 3.6 batches/s (+121 s wall-clock penalty) despite saving
         // ~6 s on MinHash compute. Net loss on memory-constrained systems.
         // Enable only when the host has >> file size in RAM.
-        bool enable_mmap = false;
-        if (const char* env = std::getenv("MDB_GNN_MMAP_BATCHES_DAT")) {
-            std::string s(env);
-            if (s == "1" || s == "true" || s == "yes") enable_mmap = true;
-        }
+        // choice() and not flag(): the ON set is exactly {"1","true","yes"},
+        // and everything else, an unset variable and a mistyped one alike,
+        // already meant off, so the fallback coincides with the old
+        // anything-else branch and the conversion is exact. "0" is accepted so
+        // an explicit off is not reported as a typo.
+        static const std::string mmap_batches_env = Ablation::choice(
+            "MDB_GNN_MMAP_BATCHES_DAT", "0", {"0", "1", "true", "yes"});
+        const bool enable_mmap = mmap_batches_env == "1" ||
+                                 mmap_batches_env == "true" ||
+                                 mmap_batches_env == "yes";
         if (enable_mmap) {
             struct stat st{};
             if (::stat(data_path.c_str(), &st) == 0 && st.st_size > 0) {

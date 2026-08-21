@@ -16,6 +16,7 @@
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/graph_sample.h"
 #include "graph_models/object_id.h"
+#include "misc/ablation_registry.h"
 
 namespace fs = std::filesystem;
 
@@ -200,22 +201,25 @@ BatchMaterializer::Result BatchMaterializer::materialize(
     // (1× sequential .fmat scan + scatter pwrites). Default classic preserves
     // pre-2026-04-27 behavior; flip to partitioned only after measuring on
     // your dataset (mirrors MDB_PROJECTION_SORTER pattern from ADR-004).
-    const char* packer_env = std::getenv("MDB_BATCH_PACKER");
-    const bool use_partitioned = (packer_env != nullptr
-                                  && std::string(packer_env) == "partitioned");
+    // Resolved through the registry because the two arms differ only in write
+    // pattern: a run that silently took the default is otherwise
+    // indistinguishable from one that asked for it. "partitioned" is the only
+    // value the comparison below ever honoured, so anything else still means
+    // classic, now with the rejected spelling on the record.
+    static const std::string packer =
+        Ablation::choice("MDB_BATCH_PACKER", "classic", {"classic", "partitioned"});
+    const bool use_partitioned = (packer == "partitioned");
 
     if (use_partitioned) {
         std::cout << "[Materialize] L4 packer mode: partitioned (Spec B1)\n"
                   << std::flush;
+        // Resolved on the partitioned path only, so the log records the knob
+        // where it actually applies. A value that does not parse is reported by
+        // the registry instead of vanishing into the default.
+        static const long partition_mb = Ablation::number("MDB_BATCH_PARTITION_MB", 256);
         size_t partition_bytes = 256ULL * 1024 * 1024;
-        if (const char* mb_env = std::getenv("MDB_BATCH_PARTITION_MB")) {
-            try {
-                long mb = std::stol(mb_env);
-                if (mb > 0) partition_bytes = static_cast<size_t>(mb) * 1024 * 1024;
-            } catch (...) {
-                std::cout << "[Materialize] warning: MDB_BATCH_PARTITION_MB='"
-                          << mb_env << "' invalid, using default 256 MB\n";
-            }
+        if (partition_mb > 0) {
+            partition_bytes = static_cast<size_t>(partition_mb) * 1024 * 1024;
         }
         // OID provider: feed sample.all_unique_nodes so the partitioned
         // packer can write a v2 OID table alongside the data section. The

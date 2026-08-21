@@ -50,6 +50,11 @@ struct FeatureMatrixHeader {
 
     // F2: page-aligned data section is opt-in via env MDB_FMAT_PAGE_ALIGN.
     // Default OFF -> legacy v1 layout (data offset 64), byte-identical output.
+    // NOT routed through the ablation registry: the registry resolves a name
+    // once per process, and FeatureMatrixHeaderTest.PageAlignV2HeaderToggle
+    // flips this variable from "0" to "1" inside a single test and asserts both
+    // data offsets. Re-reading the environment on every call is load-bearing
+    // here, so the switch keeps its own resolution until that test is reworked.
     static bool page_align_enabled() {
         const char* e = std::getenv("MDB_FMAT_PAGE_ALIGN");
         if (e == nullptr) return false;

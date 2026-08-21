@@ -42,6 +42,7 @@
 #include <cstring>
 #include <string>
 
+#include "misc/ablation_registry.h"
 #include "storage/index/record.h"
 
 namespace GQL {
@@ -51,9 +52,14 @@ namespace GQL {
 // providing an escape hatch if a problem surfaces.
 inline bool leaf_compression_disabled() {
     static const bool disabled = [] {
-        const char* v = std::getenv("MDB_PROJECTION_NO_LEAF_COMPRESSION");
-        if (v == nullptr) return false;
-        std::string s(v);
+        // The five truthy spellings are the ones this switch has always
+        // honoured, and they stay the whole of it: "on" or "y" read as "leave
+        // compression enabled" before and still do. choice() only adds that
+        // such a value is now reported instead of being indistinguishable from
+        // an unset variable. The static keeps the lock out of the writers.
+        const std::string s = Ablation::choice(
+            "MDB_PROJECTION_NO_LEAF_COMPRESSION", "0",
+            {"0", "1", "true", "yes", "TRUE", "YES"});
         return s == "1" || s == "true" || s == "yes" || s == "TRUE" || s == "YES";
     }();
     return disabled;

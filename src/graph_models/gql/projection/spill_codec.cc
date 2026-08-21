@@ -9,6 +9,8 @@
 #include <mutex>
 #include <stdexcept>
 
+#include "misc/ablation_registry.h"
+
 #ifdef HAS_LZ4
   #include <lz4frame.h>
 #endif
@@ -58,10 +60,13 @@ SpillCompression resolve_default_spill_compression() {
         return s_resolved_value.load(std::memory_order_relaxed);
     }
 
-    const char* env = std::getenv("MDB_SPILL_COMPRESSION");
+    // text() and not choice(): the comparison below is case-INSENSITIVE, so a
+    // validated list would reject "LZ4", which works today. The switch is still
+    // declared, and an invalid value keeps its existing stderr warning.
+    const std::string env = Ablation::text("MDB_SPILL_COMPRESSION", "");
     SpillCompression resolved = compiled_default();
 
-    if (env != nullptr && env[0] != '\0') {
+    if (!env.empty()) {
         std::string v = to_lower(env);
         if (v == "none" || v == "off" || v == "0") {
             resolved = SpillCompression::NONE;

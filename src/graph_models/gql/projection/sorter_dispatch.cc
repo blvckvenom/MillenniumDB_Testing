@@ -21,6 +21,7 @@
 #include "graph_models/gql/projection/external_record_sort.h"
 #include "graph_models/gql/projection/radix_partition_sort.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
+#include "misc/ablation_registry.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 
 namespace GQL {
@@ -32,18 +33,19 @@ SorterBackend cached_backend_ = SorterBackend::CLASSIC;
 std::once_flag cached_backend_flag_;
 
 void init_cached_backend() {
-    const char* env = std::getenv("MDB_PROJECTION_SORTER");
-    if (env == nullptr) {
-        cached_backend_ = SorterBackend::CLASSIC;
-        return;
-    }
-    const std::string v(env);
-    if (v == "radix") {
-        cached_backend_ = SorterBackend::RADIX;
-    } else {
-        // Unknown value → safe default.
-        cached_backend_ = SorterBackend::CLASSIC;
-    }
+    // Which backend sorted the indexes decided an entire measurement campaign,
+    // and until now the run left no record of it: the only trace was that the
+    // RADIX path prints [RADIX] lines from another file, so the CLASSIC arm was
+    // identified by the ABSENCE of output. Resolving through the registry makes
+    // the arm a stated fact instead of an inference.
+    //
+    // Truth rule is unchanged: only "radix" selects RADIX, everything else is
+    // CLASSIC. What is new is that "radxi" is now reported as unrecognised
+    // rather than silently reading as the default.
+    const std::string v = Ablation::choice("MDB_PROJECTION_SORTER", "classic",
+                                           {"classic", "radix"});
+    cached_backend_ = (v == "radix") ? SorterBackend::RADIX
+                                     : SorterBackend::CLASSIC;
 }
 
 /**

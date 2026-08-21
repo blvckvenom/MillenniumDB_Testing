@@ -32,6 +32,7 @@
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
 #include "graph_models/gql/projection/topology_symmetric_merge.h"  // detect_parallel_edges
+#include "misc/ablation_registry.h"
 #include "misc/available_ram.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -356,10 +357,16 @@ const HostCsrArrays* FourLevelTopologyStore::materialize_symmetric_arrays() {
             sym_slice_is_mmap_ = false;  // ROW_PTR is heap; COL_IDX stays mmap
             sym_arrays_built_  = true;
 
+            // Resolved through the registry so the window the run actually used
+            // is on the record. A tiling A/B whose arm cannot be shown to have
+            // taken the requested window measures nothing. The >0 guard is kept:
+            // a non-positive value has always meant "leave the default alone".
+            static const long tile_window_edges =
+                Ablation::number("MDB_GNN_TILE_WINDOW_EDGES",
+                                 static_cast<long>(std::size_t(64) << 20));
             std::size_t env_cap = std::size_t(64) << 20;  // 64 Mi edges (~256 MB)
-            if (const char* e = std::getenv("MDB_GNN_TILE_WINDOW_EDGES")) {
-                const long long v = std::atoll(e);
-                if (v > 0) env_cap = static_cast<std::size_t>(v);
+            if (tile_window_edges > 0) {
+                env_cap = static_cast<std::size_t>(tile_window_edges);
             }
             uint64_t max_deg = 0;
             for (uint64_t u = 0; u < nn; ++u) {
@@ -775,8 +782,14 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
         bool active = false;
         explicit SeqAdviseGuard(const GQL::Projection::TopologySnapshotReader& rr)
             : r(&rr) {
-            const char* off = std::getenv("MDB_GNN_NO_POPULATE_SEQUENTIAL");
-            if (!(off && (off[0] == '1' || off[0] == 't' || off[0] == 'T'))) {
+            // text() and not flag(): this switch turns off on a LEADING
+            // '1'/'t'/'T', and the registry's boolean rule disagrees with that
+            // on values like "2", "on" or "yes". Declaring the raw string keeps
+            // the predicate below byte-for-byte while still putting the value
+            // the process saw in the log, which is what an A/B needs from it.
+            static const std::string off =
+                Ablation::text("MDB_GNN_NO_POPULATE_SEQUENTIAL", "0");
+            if (!(!off.empty() && (off[0] == '1' || off[0] == 't' || off[0] == 'T'))) {
                 r->advise_access(/*sequential=*/true);
                 active = true;
             }
@@ -792,9 +805,13 @@ void FourLevelTopologyStore::populate_direction_via_sidecar_(
     // window; explicitly prefetching a large COL_IDX window AHEAD of the cursor
     // keeps more of the 27.6 GB sidecar in flight, raising the NVMe queue depth.
     // Pure perf hint; correctness-neutral.
-    const bool do_prefetch = []() {
-        const char* off = std::getenv("MDB_GNN_NO_POPULATE_PREFETCH");
-        return !(off && (off[0] == '1' || off[0] == 't' || off[0] == 'T'));
+    // Same leading-character reading rule as the sequential-advice switch, so
+    // the same reason to declare it with text() instead of flag(). static: the
+    // registry memoises by name, but the lambda would otherwise re-run per call.
+    static const bool do_prefetch = []() {
+        const std::string off =
+            Ablation::text("MDB_GNN_NO_POPULATE_PREFETCH", "0");
+        return !(!off.empty() && (off[0] == '1' || off[0] == 't' || off[0] == 'T'));
     }();
     constexpr uint64_t kPrefetchStride = 1ull << 20;  // ~1M rows / window
     uint64_t next_prefetch_row = 0;
@@ -922,8 +939,14 @@ void FourLevelTopologyStore::populate_direction_symmetric_(
         SeqAdviseGuard(const GQL::Projection::TopologySnapshotReader& aa,
                        const GQL::Projection::TopologySnapshotReader& bb)
             : a(&aa), b(&bb) {
-            const char* off = std::getenv("MDB_GNN_NO_POPULATE_SEQUENTIAL");
-            if (!(off && (off[0] == '1' || off[0] == 't' || off[0] == 'T'))) {
+            // text() and not flag(): this switch turns off on a LEADING
+            // '1'/'t'/'T', and the registry's boolean rule disagrees with that
+            // on values like "2", "on" or "yes". Declaring the raw string keeps
+            // the predicate below byte-for-byte while still putting the value
+            // the process saw in the log, which is what an A/B needs from it.
+            static const std::string off =
+                Ablation::text("MDB_GNN_NO_POPULATE_SEQUENTIAL", "0");
+            if (!(!off.empty() && (off[0] == '1' || off[0] == 't' || off[0] == 'T'))) {
                 a->advise_access(/*sequential=*/true);
                 b->advise_access(/*sequential=*/true);
                 active = true;
@@ -1457,12 +1480,15 @@ void FourLevelTopologyStore::build() {
         // (the dominant build cost on papers100M). Output is bit-identical to
         // the sequential path (each direction writes only its own caches);
         // validate via sampleContentFp OFF==ON. Default OFF => sequential.
+        // choice() and not flag(): only "1" ever enabled this, so every other
+        // value already meant OFF and the conversion is exact. What it adds is
+        // that a mistyped value now reports itself as unrecognised instead of
+        // passing for a deliberate "off" arm.
+        static const bool populate_parallel_env =
+            Ablation::choice("MDB_GNN_POPULATE_PARALLEL", "0", {"0", "1"}) == "1";
         const bool s1a_parallel_populate =
             (config_.orientation == EdgeOrientation::UNDIRECTED) &&
-            []() {
-                const char* e = std::getenv("MDB_GNN_POPULATE_PARALLEL");
-                return e != nullptr && std::string(e) == "1";
-            }();
+            populate_parallel_env;
 
         if (s1a_parallel_populate) {
             std::exception_ptr fwd_ex;

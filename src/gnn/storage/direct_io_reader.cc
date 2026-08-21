@@ -1,5 +1,7 @@
 #include "gnn/storage/direct_io_reader.h"
 
+#include "misc/ablation_registry.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -94,6 +96,10 @@ DirectIoReader::DirectIoReader(const fs::path& file_path) {
     // kernels) while others succeed. We use whichever rings init'd; if zero,
     // fall back to pread silently. MDB_GNN_NO_IO_URING=1 skips ring init
     // entirely, forcing the synchronous pread path.
+    // NOT routed through the ablation registry: three DirectIoReaderTest cases
+    // set this variable per-test and assert EXPECT_FALSE(is_io_uring()), which
+    // needs the environment re-read on every construction. A memoised answer
+    // would freeze whatever the first reader in the process saw.
     const char* no_uring = std::getenv("MDB_GNN_NO_IO_URING");
     if (!(no_uring && std::strcmp(no_uring, "0") != 0)) {
         for (auto& slot : rings_) {
@@ -103,6 +109,16 @@ DirectIoReader::DirectIoReader(const fs::path& file_path) {
             }
         }
     }
+#else
+    // Without liburing compiled in there is no ring to skip, so setting the
+    // switch here produces two arms running the same pread path and whatever
+    // the clock shows between them is noise. Declaring it inert is the
+    // difference between "the other path ran" and "the same path ran twice".
+    static const bool uring_switch_declared = [] {
+        Ablation::inert("MDB_GNN_NO_IO_URING", "built without ENABLE_IO_URING");
+        return true;
+    }();
+    (void) uring_switch_declared;
 #endif
 }
 

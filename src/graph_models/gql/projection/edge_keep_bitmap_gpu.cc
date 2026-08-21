@@ -11,6 +11,7 @@
 
 #include "graph_models/gql/projection/projection_storage.h"
 #include "gpu/gpu_device.h"
+#include "misc/ablation_registry.h"
 
 #ifdef MDB_GPU_ENABLED
 #include <cuda_runtime.h>
@@ -48,16 +49,24 @@ namespace GQL {
 // a single Phase B run.
 bool EdgeKeepBitmapGpuBatcher::gpu_path_available() {
 #ifndef MDB_GPU_ENABLED
+    // Without CUDA this switch cannot move anything. Saying so is the whole
+    // point: an arm that sets it in this binary runs the SAME code as the arm
+    // that does not, and whatever the clock then shows is noise.
+    static const bool declared = [] {
+        Ablation::inert("MDB_PROJECTION_BITMAP_GPU", "built without CUDA");
+        return true;
+    }();
+    (void) declared;
     return false;
 #else
     static const bool cached = []() {
-        if (const char* env = std::getenv("MDB_PROJECTION_BITMAP_GPU")) {
-            // Only "0" (the documented disable value) is treated as an opt-out.
-            // Any other value — including empty string — keeps GPU on, matching
-            // the convention of MDB_PROJECTION_SORTER (CLAUDE.md L240).
-            if (env[0] == '0' && env[1] == '\0') {
-                return false;
-            }
+        // Only "0" (the documented disable value) is treated as an opt-out.
+        // Any other value — including empty string — keeps GPU on, matching
+        // the convention of MDB_PROJECTION_SORTER (CLAUDE.md L240). choice()
+        // reproduces that exactly, since an unrecognised value falls back to
+        // "1"; the difference is that it is now reported rather than assumed.
+        if (Ablation::choice("MDB_PROJECTION_BITMAP_GPU", "1", {"0", "1"}) == "0") {
+            return false;
         }
         const auto res = mdb::gpu::detect_resources();
         return res.has_gpu;

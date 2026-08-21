@@ -18,6 +18,7 @@
 #include "gnn/sampling/seek_based_gnn_sampler.h"
 #include "graph_models/gql/projection/projection_storage.h"
 #include "graph_models/gql/projection/topology_snapshot_reader.h"
+#include "misc/ablation_registry.h"
 
 #include <filesystem>
 #include <iostream>
@@ -42,10 +43,21 @@ struct ExpandProfile {
 };
 ExpandProfile g_expand_profile;
 
-const bool g_expand_profile_on = [] {
-    const char* e = std::getenv("MDB_GNN_EXPAND_PROFILE");
-    return e != nullptr && std::string(e) == "1";
-}();
+// choice() and not flag(): only "1" ever turned the profile on, so every other
+// value already meant off. The accepted list is what makes a mistyped value say
+// so, instead of looking like a deliberately disabled arm.
+// A FUNCTION and not a namespace-scope global. As a global it resolved during
+// static initialisation, before main(), so every invocation of the binary
+// declared this switch first: `mdb help` opened with an [ABLATION] line ahead
+// of its banner. Worse, the order of static initialisation across translation
+// units is unspecified, so which switch got declared first was not even stable.
+// A function-local static defers the decision to the first sampler that asks,
+// which is also when the declaration carries information.
+inline bool expand_profile_on() {
+    static const bool on =
+        Ablation::choice("MDB_GNN_EXPAND_PROFILE", "0", {"0", "1"}) == "1";
+    return on;
+}
 
 inline uint64_t now_us_() {
     return static_cast<uint64_t>(
@@ -404,10 +416,10 @@ struct BasicKHopSampler::Impl {
         ObjectId node_id,
         uint64_t fanout
     ) {
-        const uint64_t tf = g_expand_profile_on ? now_us_() : 0;
+        const uint64_t tf = expand_profile_on() ? now_us_() : 0;
         topology->get_neighbors_into(node_id, config.orientation, nbr_scratch_);
         Neighbors& all_neighbors = nbr_scratch_;
-        if (g_expand_profile_on) {
+        if (expand_profile_on()) {
             g_expand_profile.fetch_us.fetch_add(now_us_() - tf,
                                                 std::memory_order_relaxed);
         }
@@ -424,10 +436,17 @@ struct BasicKHopSampler::Impl {
         // add_self_loop (self competes for the fanout slots, and even a
         // degree-0 node gets a self-loop). Default OFF keeps cora bit-identical;
         // ON is the accuracy-gap ablation (re-sample + rebuild store + train).
+        // text() and not flag(): the off-set here is {"0","false","off"},
+        // compared case-sensitively, and it disagrees with the registry's
+        // boolean rule on "off" (off here, ON there) and on "no" (on here, OFF
+        // there). This switch decides whether the self enters the neighbour
+        // MEAN, so an arm that silently flipped would be an accuracy result
+        // about a different sampler. The raw value is declared; the rule below
+        // is unchanged.
         static const bool kSampleSelfLoop = [] {
-            const char* e = std::getenv("MDB_GNN_SAMPLE_SELF_LOOP");
-            return e != nullptr && std::string(e) != "0" &&
-                   std::string(e) != "false" && std::string(e) != "off";
+            const std::string e =
+                Ablation::text("MDB_GNN_SAMPLE_SELF_LOOP", "0");
+            return e != "0" && e != "false" && e != "off";
         }();
         if (kSampleSelfLoop) {
             all_neighbors.node_ids.push_back(node_id);
@@ -579,7 +598,7 @@ struct BasicKHopSampler::Impl {
 
             BatchNeighbors batch_result;
 
-            const bool prof = g_expand_profile_on;
+            const bool prof = expand_profile_on();
             uint64_t   ts   = prof ? now_us_() : 0;
 
             switch (strategy) {
@@ -674,9 +693,9 @@ struct BasicKHopSampler::Impl {
         }
 
         // Build edge indices
-        uint64_t te = g_expand_profile_on ? now_us_() : 0;
+        uint64_t te = expand_profile_on() ? now_us_() : 0;
         build_edges(sample, sampled_edges);
-        if (g_expand_profile_on) {
+        if (expand_profile_on()) {
             g_expand_profile.edges_us.fetch_add(now_us_() - te,
                                                 std::memory_order_relaxed);
             te = now_us_();
@@ -684,7 +703,7 @@ struct BasicKHopSampler::Impl {
 
         // Build all_unique_nodes
         sample.rebuild_unique_nodes();
-        if (g_expand_profile_on) {
+        if (expand_profile_on()) {
             g_expand_profile.unique_us.fetch_add(now_us_() - te,
                                                  std::memory_order_relaxed);
         }
@@ -761,7 +780,7 @@ const std::vector<uint64_t>& BasicKHopSampler::node_access_counts() const {
 }
 
 std::string BasicKHopSampler::dump_expand_profile() {
-    if (!g_expand_profile_on) return "";
+    if (!expand_profile_on()) return "";
     auto take = [](std::atomic<uint64_t>& a) {
         return a.exchange(0, std::memory_order_relaxed) / 1000.0;  // us -> ms
     };

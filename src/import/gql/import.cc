@@ -1,6 +1,7 @@
 #include "import.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,7 @@
 #include "graph_models/inliner.h"
 #include "import/import_helper.h"
 #include "import/npy_loader.h"
+#include "misc/ablation_registry.h"
 #include "misc/fatal_error.h"
 #include "misc/unicode_escape.h"
 #include "storage/index/lists/list_encoder.h"
@@ -1035,6 +1037,11 @@ void OnDiskImport::start_import(MDBIstream& in)
         WARN("--with-tensors was specified but this build has ENABLE_GNN=OFF.\n"
              "  Tensor file '", tensor_file_, "' was NOT imported.\n"
              "  Rebuild with -D ENABLE_GNN=ON to enable tensor import.");
+        // The worker knob below is read only by the tensor-import path, which is
+        // not in this build. Saying so is the difference between an arm that took
+        // the other path and an arm that ran the same code twice.
+        Ablation::inert("MDB_TENSOR_IMPORT_WORKERS",
+                        "ENABLE_GNN=OFF, tensor import not compiled in");
     }
 #endif
 
@@ -1176,16 +1183,16 @@ void OnDiskImport::import_node_tensors() {
     //   unset / 0 — auto-detect: min(8, hardware_concurrency() - 1)
     //   1         — force the legacy sequential path (for A/B benchmarking)
     //   N > 1     — explicit worker count
+    //
+    // Resolved through the registry so the count lands in the log: a
+    // sequential-vs-parallel A/B on this knob is otherwise indistinguishable
+    // after the fact, because nothing else records which arm ran. The INT_MAX
+    // bound reproduces the old std::stoi range check — a value past int used to
+    // throw and fall through to auto-detect, and still does.
     unsigned tensor_workers = 0;
-    if (const char* env = std::getenv("MDB_TENSOR_IMPORT_WORKERS")) {
-        try {
-            int parsed = std::stoi(env);
-            if (parsed >= 0) {
-                tensor_workers = static_cast<unsigned>(parsed);
-            }
-        } catch (...) {
-            // Ignore malformed values, fall through to auto-detect.
-        }
+    const long requested_workers = Ablation::number("MDB_TENSOR_IMPORT_WORKERS", 0);
+    if (requested_workers >= 0 && requested_workers <= INT_MAX) {
+        tensor_workers = static_cast<unsigned>(requested_workers);
     }
     if (tensor_workers == 0) {
         unsigned hw = std::thread::hardware_concurrency();

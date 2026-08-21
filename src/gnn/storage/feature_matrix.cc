@@ -2,6 +2,7 @@
 
 #include "gnn/common/page_cache_hint.h"   // fadvise_dontneed / madvise_dontneed: page-cache relief after sequential writes
 #include "gnn/common/pipeline_overlap.h"  // ChunkPipeline: opt-in producer-consumer overlap for reorder passes
+#include "misc/ablation_registry.h"       // Ablation::*: resolve an env switch and declare it in the same act
 
 #include <algorithm>
 #include <atomic>
@@ -757,6 +758,10 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
 
     // Bucket sizing: ~1 GB per bucket → 2M rows for D=128 float32. With
     // 56 GB output that's 56 buckets, well under the FD limit.
+    // NOT routed through the ablation registry: two FeatureMatrixTest cases in
+    // the same binary set this to different values ("1" and "3") to reach
+    // different bucket geometries, and a once-per-process answer would give the
+    // second one the first one's buckets.
     size_t bucket_bytes = 1ULL * 1024 * 1024 * 1024;
     if (const char* env = std::getenv("MDB_GNN_REORDER_BUCKET_MB")) {
         try {
@@ -979,11 +984,13 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     // Disabled by default because empirical measurement shows it is neutral-to-
     // negative on the external_sort path (+8% on Pass 2) and a regression on the
     // chunked path; enable with MDB_GNN_PIPELINE_OVERLAP=1 for ablation only.
-    bool use_pipeline_overlap = false;
-    if (const char* env = std::getenv("MDB_GNN_PIPELINE_OVERLAP")) {
-        std::string s(env);
-        if (s == "1" || s == "true" || s == "yes") use_pipeline_overlap = true;
-    }
+    // The same switch is read by the chunked reorder path and by the L4 packer.
+    // The registry resolves it once per process, so a run cannot end up
+    // pipelined in one phase and not in another, which is what would make its
+    // wall-clock unattributable. Only the three spellings the previous chain
+    // honoured turn it on; anything else is reported rather than read as off.
+    static const bool use_pipeline_overlap =
+        Ablation::choice("MDB_GNN_PIPELINE_OVERLAP", "0", {"1", "true", "yes"}) != "0";
 
     // --- Pass 2: merge ---
     // For each bucket: open file, read all entries, scatter into
@@ -1247,15 +1254,18 @@ FeatureMatrix FeatureMatrix::create_reordered(
     // bucket files (~N * row_bytes) is tight. Pipeline overlap stays opt-in
     // OFF: empirical A/B/C/D bench shows it is neutral-to-negative on the
     // external_sort path (Pass 2 +8%) and a regression on chunked.
-    bool use_external_sort = true;
-    if (const char* env = std::getenv("MDB_GNN_REORDER_STRATEGY")) {
-        std::string s(env);
-        if (s == "chunked" || s == "legacy" || s == "0") {
-            use_external_sort = false;
-        } else if (s == "external_sort" || s == "ext_sort" || s == "external") {
-            use_external_sort = true;
-        }
-    }
+    // The accepted list carries every spelling the chain below branched on, not
+    // just the two documented names: an alias that fell through would leave the
+    // default in place while looking like the arm the operator asked for. An
+    // unrecognised value still keeps external_sort, now with the rejection said
+    // out loud.
+    static const std::string reorder_strategy =
+        Ablation::choice("MDB_GNN_REORDER_STRATEGY", "external_sort",
+                         {"external_sort", "ext_sort", "external",
+                          "chunked", "legacy", "0"});
+    const bool use_external_sort = !(reorder_strategy == "chunked" ||
+                                     reorder_strategy == "legacy" ||
+                                     reorder_strategy == "0");
     if (use_external_sort && N > 0) {
         return create_reordered_external_sort_(source, permutation, output_path, fingerprint);
     }
@@ -1313,16 +1323,13 @@ FeatureMatrix FeatureMatrix::create_reordered(
         // tiny compared to 111M one-row pwrites). Larger chunks improve
         // sequential write throughput but eat RAM that competes with the
         // source mmap page cache.
+        // 1024 MB is the same 1 GB the literal below expresses; the registry
+        // reports a value that does not parse instead of dropping it silently,
+        // which used to turn a mistyped chunk size into an unnoticed default.
+        static const long chunk_mb = Ablation::number("MDB_GNN_REORDER_CHUNK_MB", 1024);
         size_t chunk_bytes = 1ULL * 1024 * 1024 * 1024;  // 1 GB
-        if (const char* env = std::getenv("MDB_GNN_REORDER_CHUNK_MB")) {
-            try {
-                long long parsed = std::stoll(env);
-                if (parsed > 0) {
-                    chunk_bytes = static_cast<size_t>(parsed) * 1024ULL * 1024ULL;
-                }
-            } catch (...) {
-                // ignore malformed env value
-            }
+        if (chunk_mb > 0) {
+            chunk_bytes = static_cast<size_t>(chunk_mb) * 1024ULL * 1024ULL;
         }
         if (chunk_bytes < rb) chunk_bytes = rb;  // at least one row
         uint64_t chunk_rows = std::max<uint64_t>(1, chunk_bytes / rb);
@@ -1334,15 +1341,12 @@ FeatureMatrix FeatureMatrix::create_reordered(
         // via env MDB_GNN_REORDER_WORKERS. More workers help when the
         // page cache has free room AND chunks are small enough that
         // their buffers + the source working-set fit in RAM together.
+        // Worker count drives peak heap (one chunk buffer each), so the value
+        // the run settled on belongs in the log next to the chunk size it pairs
+        // with. Non-positive values keep the default, as before.
+        static const long reorder_workers = Ablation::number("MDB_GNN_REORDER_WORKERS", 2);
         unsigned num_workers = 2;
-        if (const char* env = std::getenv("MDB_GNN_REORDER_WORKERS")) {
-            try {
-                int parsed = std::stoi(env);
-                if (parsed > 0) num_workers = static_cast<unsigned>(parsed);
-            } catch (...) {
-                // ignore malformed env value
-            }
-        }
+        if (reorder_workers > 0) num_workers = static_cast<unsigned>(reorder_workers);
         if (num_workers > std::thread::hardware_concurrency() &&
             std::thread::hardware_concurrency() > 0)
         {
@@ -1371,11 +1375,10 @@ FeatureMatrix FeatureMatrix::create_reordered(
         // is ignored in this mode — the pipeline already provides I/O/compute overlap
         // without the kernel-side pwrite contention that concurrent multi-worker
         // pwrites cause on a single NVMe. Enable with MDB_GNN_PIPELINE_OVERLAP=1.
-        bool use_pipeline_overlap = false;
-        if (const char* env = std::getenv("MDB_GNN_PIPELINE_OVERLAP")) {
-            std::string s(env);
-            if (s == "1" || s == "true" || s == "yes") use_pipeline_overlap = true;
-        }
+        // Same switch as Pass 2 above, resolved once by the registry so both
+        // phases of one build necessarily agree on whether they were pipelined.
+        static const bool use_pipeline_overlap =
+            Ablation::choice("MDB_GNN_PIPELINE_OVERLAP", "0", {"1", "true", "yes"}) != "0";
 
         auto t_write_start_outer = std::chrono::high_resolution_clock::now();
 
