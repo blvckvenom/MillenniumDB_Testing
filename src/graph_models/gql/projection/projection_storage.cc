@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bitset>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -352,6 +353,24 @@ void ProjectionStorage::add_node(const ProjectedNode& node) {
     collected_nodes_.push_back(node.node_id.id);
     collected_nodes_sorted_ = false;  // appended unsorted → invalidates invariant
 
+    // The same append invalidates the bitmap, but with a far worse failure
+    // mode: an unsorted vector only makes has_node() SLOW (the linear fallback,
+    // which is what happens today anyway), while a stale bitmap makes it WRONG.
+    // It would answer "absent" for the node just added, the edge scan would
+    // silently drop every edge touching it, and the projection would come out
+    // smaller with no error anywhere — the same shape as the Bloom discard that
+    // cost 2.69 M edges on papers100M.
+    //
+    // Not hypothetical: finalize() calls flush_nodes() unconditionally, after
+    // finalize_node_scan() already ran. node_batch is provably drained by then,
+    // so it is a no-op today; this line is what keeps it harmless if it ever
+    // stops being one. The null-pointer test costs nothing on the 111 M
+    // add_node() calls of a normal build.
+    if (node_bitmap_) {
+        node_bitmap_.reset();
+        node_bitmap_status_ = "invalidated-by-late-add";
+    }
+
     node_batch.push_back(node);
 
     // Flush batch if it reaches threshold
@@ -483,7 +502,28 @@ bool ProjectionStorage::has_node(ObjectId node_id) const {
     // so we can use O(log N) binary search. The pre-finalize fallback is
     // defensive (e.g. unit tests that query mid-scan) and correctness-
     // preserving.
-    if (collected_nodes_sorted_) {
+    // Three representations of the SAME set, in decreasing order of speed:
+    //   1. node_bitmap_   one bit per id in [min,max]; ~1.6 ns, one cache
+    //                     line. Built by finalize_node_scan() when the span
+    //                     fits NODE_BITMAP_MAX_BYTES.
+    //   2. binary search  built unconditionally by finalize_node_scan();
+    //                     292.0 ns measured at papers100M scale.
+    //   3. linear scan    pre-finalize fallback. Defensive: unit tests query
+    //                     mid-scan. The builder always finalizes first.
+    //
+    // 1 and 2 are answer-for-answer equivalent by construction, so a bitmap
+    // MISS must NOT re-ask the vector; the else-if chain enforces that. The
+    // invariant that makes it safe is add_node() dropping the bitmap.
+    //
+    // is_kept() does the whole range check in one unsigned comparison:
+    // `id - min` wraps upward for id < min and lands past the span, and a
+    // foreign type tag shifts it by a multiple of 2^56, far past any span this
+    // budget admits. No masking, no second branch.
+    if (node_bitmap_) {
+        if (node_bitmap_->is_kept(node_id.id - node_bitmap_min_)) {
+            return true;
+        }
+    } else if (collected_nodes_sorted_) {
         if (std::binary_search(collected_nodes_.begin(), collected_nodes_.end(),
                                node_id.id)) {
             return true;
@@ -678,6 +718,28 @@ void ProjectionStorage::resize_bloom_filter(size_t expected_edges, double fpr) {
     edge_bloom_filter_ = std::make_unique<BloomFilter>(expected_edges, fpr);
 }
 
+// Read ONCE per process, like the MDB_PROJECTION_SORTER=classic|radix
+// precedent. "binary" restores the pre-bitmap structure so the A/B protocol can
+// measure both arms without recompiling; anything else, including unset, keeps
+// the bitmap.
+//
+// Deliberately NOT named with "BITMAP" in it: MDB_PROJECTION_BITMAP_GPU already
+// exists two files away and means a different thing (a parallel binary search
+// over EDGES on the GPU).
+//
+// There is no second variable for the budget. "budget refused" and "disabled by
+// env" produce the IDENTICAL state (node_bitmap_ == nullptr), so this one
+// switch already exercises the fallback branch end to end; a max-megabytes knob
+// would only add a tunable whose sole misuse is raising it until the host
+// swaps.
+static bool node_bitmap_enabled() {
+    static const bool cached = []() {
+        const char* env = std::getenv("MDB_PROJECTION_NODE_MEMBERSHIP");
+        return env == nullptr || std::strcmp(env, "binary") != 0;
+    }();
+    return cached;
+}
+
 void ProjectionStorage::finalize_node_scan() {
     if (collected_nodes_sorted_) {
         return;  // Idempotent: second call is a no-op.
@@ -689,6 +751,93 @@ void ProjectionStorage::finalize_node_scan() {
     // Release any excess capacity from multi-label over-collection.
     collected_nodes_.shrink_to_fit();
     collected_nodes_sorted_ = true;
+
+    // AFTER the sort (min/max are front()/back() at O(1), and the fill is one
+    // sequential pass) and AFTER shrink_to_fit(), which transiently holds two
+    // copies of the vector: there is no reason to add 13 MiB to the worst
+    // instant of the phase.
+    build_node_bitmap_();
+}
+
+void ProjectionStorage::build_node_bitmap_() {
+    // Always start from nothing: this also runs on a RE-finalize, i.e. after an
+    // add_node() that dropped a previous bitmap, and a stale one would be the
+    // single worst defect this change can have (see add_node).
+    node_bitmap_.reset();
+    node_bitmap_min_ = 0;
+
+    if (collected_nodes_.empty()) {
+        // front()/back() on an empty vector is undefined behaviour. This guard
+        // is why, not elegance: finalize_node_scan() on a reopened storage, or
+        // a node filter that selects nothing, both land here. Logged with zero
+        // extents because there are none to report.
+        node_bitmap_status_ = "empty-node-set";
+        log_node_bitmap_decision_(0, 0, 0, 0);
+        return;
+    }
+    if (!node_bitmap_enabled()) {
+        // Logged like every other outcome, and NOT skipped: this is the line
+        // the A/B protocol reads to confirm that the reference arm really ran
+        // without the bitmap. A silent arm is an unverifiable arm.
+        node_bitmap_status_ = "disabled-by-env";
+        log_node_bitmap_decision_(collected_nodes_.size(),
+                                  collected_nodes_.front(),
+                                  collected_nodes_.back(),
+                                  collected_nodes_.back() - collected_nodes_.front());
+        return;
+    }
+
+    const uint64_t min_id = collected_nodes_.front();
+    const uint64_t max_id = collected_nodes_.back();
+    const uint64_t span   = max_id - min_id;   // inclusive: span + 1 ids
+
+    // Compare in BITS against the budget. Written as `span >= BYTES * 8` and
+    // never as `(span + 1 + 63) / 64`, because span + 1 overflows to 0 when the
+    // set spans the whole 64-bit space (min = 0, max = UINT64_MAX) — which is
+    // precisely the pathological mixed-tag case this check must reject.
+    // BYTES * 8 = 2^29 cannot overflow.
+    if (span >= static_cast<uint64_t>(NODE_BITMAP_MAX_BYTES) * 8ULL) {
+        node_bitmap_status_ = "span-exceeds-budget";
+        log_node_bitmap_decision_(collected_nodes_.size(), min_id, max_id, span);
+        return;
+    }
+
+    auto bm = std::make_unique<EdgeKeepBitmap>();
+    bm->reserve(static_cast<std::size_t>(span) + 1);   // zero-initialised
+    for (const uint64_t id : collected_nodes_) {
+        bm->set_kept(id - min_id);                     // duplicates collapse free
+    }
+    bm->finalize();   // immutable from here: no writer can race the edge scan
+
+    node_bitmap_min_    = min_id;
+    node_bitmap_        = std::move(bm);
+    node_bitmap_status_ = "adopted";
+    log_node_bitmap_decision_(collected_nodes_.size(), min_id, max_id, span);
+
+    // The vector is NOT freed. Its external reader uploads it verbatim for the
+    // GPU membership path and would read an emptied vector as "the projection
+    // has no nodes" = keep no edges, in silence. The bitmap ACCOMPANIES the
+    // vector; replacing it is a separate change with its own test surgery.
+}
+
+// Printed on EVERY finalize, adopt or refuse. Rationale: with a 64 MiB ceiling
+// the refusal branch is unreachable for every graph in this project, so if it
+// ever fires the only symptom will be the whole projection quietly running 1.4x
+// slower. This line is the one thing that gives that regression a name. One
+// line per projection build; it is not on any hot path.
+void ProjectionStorage::log_node_bitmap_decision_(std::size_t num_ids,
+                                                  uint64_t min_id,
+                                                  uint64_t max_id,
+                                                  uint64_t span) const {
+    std::cout << "[NODE_BITMAP]"
+              << " status=" << node_bitmap_status_
+              << " nodes=" << num_ids
+              << " min=" << min_id
+              << " max=" << max_id
+              << " span=" << span
+              << " bytes=" << node_bitmap_bytes()
+              << " budget_bytes=" << NODE_BITMAP_MAX_BYTES
+              << std::endl;
 }
 
 std::vector<ObjectId> ProjectionStorage::get_all_node_ids() const {

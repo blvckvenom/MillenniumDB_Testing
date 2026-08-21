@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "graph_models/gql/projection/bloom_filter.h"
+#include "graph_models/gql/projection/edge_keep_bitmap.h"
 #include "graph_models/gql/projection/streaming_record_buffer.h"
 #include "graph_models/object_id.h"
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
@@ -116,6 +117,36 @@ public:
     /// @{
     static constexpr size_t BATCH_SIZE = 250;          ///< Flush threshold for batched writes (reduced from 1000 to lower buffer pool pressure)
     static constexpr size_t INITIAL_CAPACITY = 10000;  ///< Pre-allocation size for buffers
+
+    /**
+     * @brief Hard cap on the node presence bitmap (see `node_bitmap_`).
+     *
+     * WHY A CAP EXISTS. The bitmap costs one bit per id in [min_id, max_id],
+     * so it is sized by the id RANGE, not by the node count. Density is a
+     * property of the data, never an invariant of this class: a node filter
+     * selecting a sparse subset, or a projection whose nodes carry more than
+     * one ObjectId type tag, makes that range arbitrarily large while the node
+     * count stays small. Without a cap the allocation is unbounded.
+     *
+     * WHY 64 MiB, AND WHY A CONSTANT. 64 MiB covers a contiguous range of
+     * 536,870,912 ids; papers100M spans 111,059,955, i.e. 20.7% of the
+     * ceiling, and no graph in this project comes near it. A constant makes
+     * the decision a pure function of the DATA, so two runs of the same A/B
+     * protocol cannot silently take different paths — which is exactly what a
+     * MemAvailable-derived budget would allow.
+     *
+     * WHY NOT BIGGER. The one failure mode of this optimization with a
+     * catastrophic penalty is the bitmap being paged out: a scattered probe
+     * against a swapped page costs ~66 us instead of ~1.6 ns, and only 0.44%
+     * of the 3.231e9 probes need to hit one to erase the whole saving. A
+     * ceiling this small cannot be the allocation that swaps a host, and it is
+     * 7.6% of the 847 MB `collected_nodes_` already holds for the same node
+     * set and never releases.
+     *
+     * A range that does not fit is NOT an error: the bitmap is simply not
+     * built and has_node() runs exactly the code it ran before.
+     */
+    static constexpr size_t NODE_BITMAP_MAX_BYTES = 64ULL * 1024 * 1024;
     /// @}
 
     /**
@@ -575,6 +606,27 @@ public:
     const std::vector<uint64_t>& collected_nodes() const noexcept {
         return collected_nodes_;
     }
+
+    /**
+     * @brief Bytes held by the node presence bitmap; 0 when it was not built.
+     *
+     * Exists so the BUDGET DECISION is assertable from outside the class.
+     * Without it, "built a bitmap" and "fell back to binary search" are
+     * indistinguishable, because both answer every query identically by
+     * construction. That indistinguishability is exactly how a bitmap that is
+     * never adopted would ship as a silent no-op: correct, tested, and worth
+     * nothing. It is also what the edge-scan profile line reads to report
+     * which structure served the run being measured.
+     */
+    std::size_t node_bitmap_bytes() const noexcept {
+        return node_bitmap_ ? node_bitmap_->bytes_allocated() : 0;
+    }
+
+    /// Why the bitmap was or was not adopted. Stable, greppable strings:
+    /// "adopted", "span-exceeds-budget", "empty-node-set", "disabled-by-env",
+    /// "invalidated-by-late-add", "not-finalized". Printed in the
+    /// [NODE_BITMAP] line and asserted in tests.
+    const char* node_bitmap_status() const noexcept { return node_bitmap_status_; }
     /// @}
 
     /// @name Const Index Accessors
@@ -806,6 +858,52 @@ private:
      */
     std::vector<uint64_t> collected_nodes_;
     bool                  collected_nodes_sorted_ = false;
+
+    /**
+     * @brief Dense presence bitmap over [node_bitmap_min_, +span], keyed by
+     *        `raw_object_id - node_bitmap_min_`.
+     *
+     * WHY. has_node() is called twice per candidate edge
+     * (native_projection_builder.cc:799-800) and is the single most expensive
+     * thing the projection does: 943.4 s on papers100M, 29.01% of the entire
+     * build, 292.0 ns per probe (measured 2026-08-20). The cost is not
+     * computation, it is memory latency: binary search over the 847 MB sorted
+     * vector above walks ~27 steps across lines that are nowhere near each
+     * other, and 847 MB cannot live in a 30 MiB L3. One bit per id answers the
+     * same question from ONE cache line: 1.56 ns measured at real scale with
+     * the real access pattern, a 174.5x ratio, in a harness whose
+     * binary-search arm reproduced the in-situ 292.0 ns to within 6.5%. Huge
+     * pages changed nothing (1.59 ns), which is the proof that the win is
+     * cache residency and not address-translation reach.
+     *
+     * WHY IT FITS. GQL node ids are minted as a dense counter OR'd with a
+     * constant type tag, so a whole-graph projection collects a contiguous
+     * range: papers100M spans exactly its 111,059,956 ids, i.e. 100% dense,
+     * for 13.24 MiB — 1.6% of what the vector above already costs.
+     *
+     * WHY THE TAG IS NOT MASKED OFF. Indexing is by RAW id minus the minimum,
+     * so a foreign type tag shifts the index by a multiple of 2^56 and lands
+     * far past any span the budget admits, where EdgeKeepBitmap::is_kept()'s
+     * own bound check rejects it. Masking would cost an extra operation on
+     * every probe AND would make two ids with different tags collide.
+     *
+     * NULL means "not built": either it did not fit, the env switch disabled
+     * it, the node set is empty, or a late add_node() dropped it. In every one
+     * of those cases has_node() runs the pre-existing binary search.
+     */
+    std::unique_ptr<EdgeKeepBitmap> node_bitmap_;
+    uint64_t                        node_bitmap_min_ = 0;
+    const char*                     node_bitmap_status_ = "not-finalized";
+
+    /// Builds `node_bitmap_` from the finalized `collected_nodes_`, or leaves
+    /// it null and records why. Called only from finalize_node_scan().
+    void build_node_bitmap_();
+
+    /// One line per projection build recording the adopt/refuse decision.
+    void log_node_bitmap_decision_(std::size_t num_ids,
+                                   uint64_t min_id,
+                                   uint64_t max_id,
+                                   uint64_t span) const;
 
     /**
      * @brief Bloom filter for memory-efficient edge deduplication.
