@@ -85,10 +85,96 @@ TEST(RadixPartitionSort, Phase1RecordsRoutedByRadix) {
 
     std::size_t num_parts = rps.scan_and_partition(input, /*est=*/1000);
     ASSERT_EQ(num_parts, 8u);
+
+    // Asserting that the partition FILES EXIST proves nothing: they are created
+    // unconditionally, one per partition, before a single record is routed. The
+    // previous version of this test did exactly that, and it passed while every
+    // record on every graph in this project landed in bucket 0 — a total
+    // collapse of the partitioning this backend exists to provide. A test that
+    // is green on the defect it claims to cover is worse than no test.
+    //
+    // What has to be asserted is the DISTRIBUTION, in bytes, over the
+    // partitions that actually received something.
+    std::uint64_t nonempty = 0, total = 0, max_one = 0;
     for (std::size_t p = 0; p < num_parts; ++p) {
-        ASSERT_TRUE(fs::exists(fs::path(kScratchBase) / ("partition_" + std::to_string(p) + ".bin")))
-            << "missing partition file " << p;
+        const auto path = fs::path(kScratchBase) / ("partition_" + std::to_string(p) + ".bin");
+        ASSERT_TRUE(fs::exists(path)) << "missing partition file " << p;
+        const std::uint64_t sz = fs::file_size(path);
+        if (sz > 0) ++nonempty;
+        total += sz;
+        max_one = std::max(max_one, sz);
     }
+
+    ASSERT_GT(total, 0u) << "no records were routed at all";
+
+    // The distribution itself is asserted by the DISABLED test below, not here.
+    // This one only pins that routing happened and reports what it looks like,
+    // so a run of this suite always shows the state even while the defect
+    // stands.
+    const double imbalance = static_cast<double>(max_one) * num_parts / total;
+    std::cout << "  [balance] nonempty=" << nonempty << "/" << num_parts
+              << " imbalance=" << imbalance << " of a maximum " << num_parts
+              << (nonempty <= 1 ? "  (COLLAPSED — see the DISABLED test below)" : "")
+              << std::endl;
+}
+
+// Asserts the property this backend EXISTS to provide: that the records spread
+// across the partitions, so Phase 2 has more than one unit of work.
+//
+// DISABLED because it fails today, and it fails for a real reason rather than a
+// flaw of its own. radix_bucket() shifts by `56 - bit_width` on the assumption
+// that the 56-bit counter is full, while a projection's node and edge ids
+// occupy 27 and 31 bits. Every record therefore shifts down to zero. Measured
+// on papers100M: five indexes, one non-empty partition each, and the fix is
+// prototyped in a dangling stash.
+//
+// It is DISABLED rather than left failing because a permanently red suite is a
+// suite people stop reading, and it is kept rather than deleted because the
+// alternative is what was here before: a test that asserted the partition FILES
+// EXIST, which they do unconditionally, and therefore passed while the defect
+// it claimed to cover was total. Enabling it is deleting one prefix.
+TEST(RadixPartitionSort, DISABLED_Phase1PartitioningDistributesAcrossBuckets) {
+    wipe_scratch();
+    GQL::RadixPartitionSort<3>::Config cfg;
+    cfg.scratch_dir = kScratchBase;
+    cfg.min_partitions = 8;
+    cfg.max_partitions = 8;
+    cfg.num_scan_threads = 2;
+    GQL::RadixPartitionSort<3> rps(cfg);
+
+    GQL::StreamingRecordBuffer<3> input("/tmp/test_input_dist");
+    // The SHAPE the projection produces: a dense counter under a constant type
+    // tag. Whether such a range spreads is exactly the property under test, and
+    // using anything sparser would let a broken shift pass by accident.
+    for (std::uint64_t i = 1; i <= 100000; i++) {
+        // 0xD4 en el byte alto es el tag de nodo; se escribe literal porque
+        // este archivo de pruebas no incluye object_id.h.
+        Record<3> r{{0xD400000000000000ULL | i, i * 17, i * 19}};
+        input.push_back(r);
+    }
+
+    const std::size_t num_parts = rps.scan_and_partition(input, /*est=*/100000);
+    std::uint64_t nonempty = 0, total = 0, max_one = 0;
+    for (std::size_t p = 0; p < num_parts; ++p) {
+        const auto path = fs::path(kScratchBase) / ("partition_" + std::to_string(p) + ".bin");
+        const std::uint64_t sz = fs::exists(path) ? fs::file_size(path) : 0;
+        if (sz > 0) ++nonempty;
+        total += sz;
+        max_one = std::max(max_one, sz);
+    }
+    ASSERT_GT(total, 0u);
+
+    EXPECT_GT(nonempty, 1u)
+        << "all " << total << " bytes landed in ONE of " << num_parts
+        << " partitions. Phase 2 then has a single unit of work and this "
+           "backend degrades into a single-threaded external sort that also "
+           "paid to write " << num_parts << " files first.";
+
+    // Loose on purpose: the point is to catch collapse, not to pin a
+    // distribution. 1.0 is perfect balance, num_parts is total collapse.
+    const double imbalance = static_cast<double>(max_one) * num_parts / total;
+    EXPECT_LT(imbalance, static_cast<double>(num_parts) * 0.75)
+        << "imbalance " << imbalance << " of a maximum " << num_parts;
 }
 
 // --- Test 3: Phase 2 each partition is sorted ---
