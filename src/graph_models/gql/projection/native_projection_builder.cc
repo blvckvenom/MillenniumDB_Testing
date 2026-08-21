@@ -999,6 +999,13 @@ void NativeProjectionBuilder::scan_edges_impl_classic_(const std::vector<std::st
                   << " (" << detector_pct << "% of consumer)"
                   << " emit_ms=" << static_cast<uint64_t>(emit_ms)
                   << " (" << emit_pct << "% of consumer)"
+                  // Which structure actually served this run. Without it, a
+                  // budget written against max_id instead of (max-min) would
+                  // reject on every real graph and be indistinguishable from
+                  // success: correct in everything, worth nothing.
+                  << " has_node_mode="
+                  << (storage->node_bitmap_bytes() > 0 ? "bitmap" : "binary")
+                  << " has_node_bitmap_bytes=" << storage->node_bitmap_bytes()
                   << std::endl;
         std::cout << "[EDGE_SCAN_PROFILE] interpretation:"
                   << " consumer>=~80% of wall => consumer-bound (serial-tail lever helps);"
@@ -1918,12 +1925,25 @@ void NativeProjectionBuilder::scan_edges_with_streaming_aggregation(
     // Optimization: Cache recent has_node() results to reduce hash lookups
     // Consecutive edges often share endpoints, so this can reduce lookup overhead by 30-50%
     // Cache size of 10K entries uses ~160KB memory and provides good hit rate
+    //
+    // With the node-id bitmap live, has_node() is a single L3 load (~1.6 ns)
+    // while an unordered_map probe is 20-50 ns: the memo turns into a 12x to
+    // 30x PESSIMIZATION. It is bypassed, not deleted, because in the fallback
+    // world has_node() is a 292 ns binary search over 847 MB and the memo
+    // genuinely pays there. The mode is read ONCE, outside the loop, so the
+    // cost is one perfectly predicted branch per probe.
+    const bool membership_is_o1 = storage->node_bitmap_bytes() > 0;
+
     constexpr size_t NODE_CACHE_SIZE = 10000;
     std::unordered_map<uint64_t, bool> node_in_projection_cache;
     node_in_projection_cache.reserve(NODE_CACHE_SIZE);
 
     // Helper lambda to check if node is in projection with caching
-    auto cached_has_node = [this, &node_in_projection_cache](ObjectId node_id) -> bool {
+    auto cached_has_node =
+        [this, &node_in_projection_cache, membership_is_o1](ObjectId node_id) -> bool {
+        if (membership_is_o1) {
+            return storage->has_node(node_id);
+        }
         // Check cache first
         auto cache_it = node_in_projection_cache.find(node_id.id);
         if (cache_it != node_in_projection_cache.end()) {
