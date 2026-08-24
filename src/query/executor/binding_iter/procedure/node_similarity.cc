@@ -58,6 +58,9 @@ struct NodeSimilarityProfile {
     uint64_t nodes_after_degree_filter = 0;
     uint64_t pairs_checked = 0;
     uint64_t pairs_after_similarity_cutoff = 0;
+    uint64_t results_before_global_limit = 0;
+    uint64_t k_candidates_total = 0;
+    uint64_t max_k_candidates_for_node = 0;
     uint64_t results_size = 0;
 };
 
@@ -97,6 +100,9 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
                << "nodes_after_degree_filter,"
                << "pairs_checked,"
                << "pairs_after_similarity_cutoff,"
+               << "results_before_global_limit,"
+               << "k_candidates_total,"
+               << "max_k_candidates_for_node,"
                << "results_size\n";
     }
 
@@ -135,6 +141,9 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
            << profile.nodes_after_degree_filter << ','
            << profile.pairs_checked << ','
            << profile.pairs_after_similarity_cutoff << ','
+           << profile.results_before_global_limit << ','
+           << profile.k_candidates_total << ','
+           << profile.max_k_candidates_for_node << ','
            << profile.results_size << '\n';
 }
 
@@ -257,6 +266,7 @@ void NodeSimilarity::_reset()
     profile.degree_filter_ms = profile_ms(degree_filter_start, ProfileClock::now());
 
     if (nodes.size() < 2) {
+        profile.results_before_global_limit = static_cast<uint64_t>(results.size());
         profile.results_size = static_cast<uint64_t>(results.size());
         profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
         write_profile_csv(profile);
@@ -329,6 +339,12 @@ void NodeSimilarity::_reset()
     const auto per_node_ranking_start = ProfileClock::now();
     if (top_k.has_value() || bottom_k.has_value()) {
         for (auto& [node, candidates] : k_candidates) {
+            profile.k_candidates_total += static_cast<uint64_t>(candidates.size());
+            profile.max_k_candidates_for_node = std::max<uint64_t>(
+                profile.max_k_candidates_for_node,
+                static_cast<uint64_t>(candidates.size())
+            );
+
             std::sort(candidates.begin(), candidates.end(), [&](const auto& lhs, const auto& rhs) {
                 const auto& [lhs_node1, lhs_node2, lhs_similarity_oid] = lhs;
                 const auto& [rhs_node1, rhs_node2, rhs_similarity_oid] = rhs;
@@ -353,6 +369,7 @@ void NodeSimilarity::_reset()
         }
     }
     profile.per_node_ranking_ms = profile_ms(per_node_ranking_start, ProfileClock::now());
+    profile.results_before_global_limit = static_cast<uint64_t>(results.size());
 
     const auto global_ranking_start = ProfileClock::now();
     if (top_n.has_value()) {
