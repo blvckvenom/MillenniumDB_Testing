@@ -927,6 +927,40 @@ if [ -x "$MDB_HOME/scripts/validate-gnn-environment.sh" ]; then
         log_warn "validate-gnn-environment reported warnings — review output above"
 fi
 
+# Runtime GPU gate.
+#
+# validate-gnn-environment warns about a dead GPU but does not stop, and a
+# warning scrolls past between two screens of output. That is how a host ends
+# up printing "Onboarding complete" while every training run silently uses
+# the CPU. When a GPU stack was deliberately selected, verify it actually
+# works and make the exit code say so.
+ONBOARD_GPU_OK=1
+if [ "$ENABLE_GPU" -eq 1 ]; then
+    if [ "$NEEDS_REBOOT" -eq 1 ]; then
+        log_info "GPU verification deferred: a driver install is pending a reboot."
+        log_info "  After rebooting, re-run: scripts/onboard.sh --resume"
+    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        log_ok "GPU runtime verified: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+    else
+        ONBOARD_GPU_OK=0
+        log_err "GPU stack was selected but the GPU is NOT usable at runtime."
+        log_err "  nvidia-smi cannot talk to the driver, so CUDA sees zero devices."
+        log_err ""
+        log_err "  Everything still BUILDS and RUNS, silently, on the CPU. Symptoms"
+        log_err "  you would otherwise chase for hours:"
+        log_err "    gnn_build_feature_store -> gpuAvailable=false, l1Nodes=0"
+        log_err "    gnn_train               -> l1HitRatio=0.0, useAddrTablesEffective=false"
+        log_err ""
+        log_err "  Diagnose which half is missing:"
+        log_err "    uname -r                              # kernel in use"
+        log_err "    find /lib/modules -name 'nvidia.ko*'  # kernels that HAVE the module"
+        log_err "    ls /var/lib/dkms/                     # 'nvidia' here => DKMS model"
+        log_err ""
+        log_err "  Re-running scripts/onboard.sh now queues the right fix for both cases."
+        log_err "  To build CPU-only on purpose instead: scripts/onboard.sh --no-gpu"
+    fi
+fi
+
 if [ "$SKIP_TESTS" -eq 0 ]; then
     log_step "Step 12: Test suite (unit tests only — full suite is long)"
     bash "$MDB_HOME/scripts/run-tests" unit || \
@@ -939,9 +973,16 @@ fi
 # Done
 # ---------------------------------------------------------------------------
 echo ""
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}${BOLD}  Onboarding complete ✓${NC}"
-echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+if [ "${ONBOARD_GPU_OK:-1}" -eq 1 ]; then
+    echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}${BOLD}  Onboarding complete ✓${NC}"
+    echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+else
+    echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}${BOLD}  Onboarding finished, but the GPU is NOT usable ⚠${NC}"
+    echo -e "${YELLOW}${BOLD}  The build is fine. Training would run on the CPU.${NC}"
+    echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+fi
 echo ""
 echo "  Binary:   $MDB_HOME/build/Release/bin/mdb help"
 echo "  Stack:    LibTorch=$LIBTORCH_EXPECTED, GPU=$GPU_CHOICE"
@@ -949,6 +990,7 @@ echo "  Logs:     $LOG_DIR/"
 echo ""
 echo "  Next steps:"
 echo "    source ~/.bashrc               # reload env in new shells"
+echo "    ./scripts/cora_fastloop.sh     # 5 s end-to-end GNN gate (start here)"
 echo "    ./scripts/run-tests gql        # full GQL test suite"
 echo "    ./scripts/run-tests            # every suite (unit+sparql+mql+gql)"
 if [ "$ENABLE_GPU" -eq 1 ]; then
@@ -958,3 +1000,10 @@ echo ""
 # Dataset pre-staging hook is now executed earlier, before the NEEDS_REBOOT
 # branch, so datasets download even in the path where the script exits for
 # a driver-reboot checkpoint.
+
+# The exit code carries the GPU verdict, so CI and wrapper scripts can react
+# to a CPU-only outcome instead of parsing the banner text.
+#   0 = everything verified
+#   2 = built fine, but the GPU is not usable at runtime
+[ "${ONBOARD_GPU_OK:-1}" -eq 1 ] || exit 2
+exit 0
