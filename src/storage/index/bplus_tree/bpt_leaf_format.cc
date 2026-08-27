@@ -5,8 +5,6 @@
 // little-endian regardless of the host byte order. We deliberately avoid
 // memcpy of the whole struct because that would couple the disk format to
 // the host's representation and to compiler-specific struct padding.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
 
 #include "storage/index/bplus_tree/bpt_leaf_format.h"
 

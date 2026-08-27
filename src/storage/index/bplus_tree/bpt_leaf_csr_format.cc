@@ -8,8 +8,6 @@
 //
 // Mirrors the pattern established by bpt_leaf_format.cc, which implements
 // the delta + LEB128-varint B+Tree leaf compression format.
-//
-// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
 
 #include "storage/index/bplus_tree/bpt_leaf_csr_format.h"
 

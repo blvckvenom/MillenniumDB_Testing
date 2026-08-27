@@ -6,7 +6,7 @@
 // Each v3 leaf page encodes one or more (src, [dst...], [eid...]) groups
 // in a compact offset-table + varint-stream layout.
 //
-// The reader validates the v3 header at construction (per design §5.5),
+// The reader validates the v3 header at construction,
 // caches a pointer to the in-page offset table, and exposes:
 //   - find_src_entry(src_id) — O(log value_count) binary search over the
 //     offset table.
@@ -22,7 +22,8 @@
 // std::logic_error because v3 pages are immutable post-build; to modify
 // the graph, the projection must be rebuilt.
 //
-// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
+// The format invariants this reader enforces are written out at the top of
+// bplus_tree_leaf_csr.h.
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_csr.h"
 
@@ -117,7 +118,12 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
             + " exceeds per-page cap " + std::to_string(kMaxSrcsPerPage));
     }
 
-    // --- Offset table bounds + monotonicity (design I8) ---
+    // --- Offset table bounds + monotonicity ---
+    //
+    // The writer guarantees every offset lands inside the payload region
+    // and that offsets are strictly increasing; re-check both here so a
+    // corrupt or truncated table faults at page open instead of serving a
+    // wrong record later.
 
     offset_table_ = reinterpret_cast<const uint8_t*>(page_bytes_) + kHeaderBytes;
 
@@ -151,7 +157,7 @@ BPTLeafCSR<N>::BPTLeafCSR(const char* page_bytes, ReadTag) :
 
     // --- Compute physical tuple counts per entry ---
     //
-    // Hub entries' stored `degree` is the TOTAL chain size (design §3.9), and
+    // Hub entries' stored `degree` is the TOTAL chain size, and
     // only a subset of those dsts is physically serialized on the chain-head
     // page — the rest spills onto continuation pages. Simply accumulating
     // stored degrees would inflate total_tuples_, causing BptIter to walk
@@ -988,7 +994,8 @@ void BPTLeafCSR<N>::update_record(uint_fast32_t pos, Record<N>& out) const
 template <std::size_t N>
 uint_fast32_t BPTLeafCSR<N>::search_index(const Record<N>& target) const noexcept
 {
-    // Design §3.4 analogue: linear scan over the tuple sequence, return the
+    // Linear scan over the tuple sequence (like the v2 reader: the delta
+    // encoding makes decoding sequential), returning the
     // index of the first tuple >= target (lex). For N=3 edge indexes the
     // primary key is src; since src is stored once per entry (not per
     // tuple), we could short-circuit on src alone when target.get_key()

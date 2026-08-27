@@ -254,7 +254,7 @@ private:
 // lexicographic order on the first field (src) — this matches the output of
 // sorter_dispatch (classic/radix). Violation of the order invariant is UB.
 //
-// Output format (see design §3.9, §5.1, §5.2):
+// Output format:
 //   - Chain-head page: 16-byte BPTLeafCSRHeader with format_version=3,
 //     flags=0, value_count=number of src entries; uint16 offset_table of
 //     value_count slots; packed src entries [varint(src), varint(degree),
@@ -265,9 +265,9 @@ private:
 //     raw dst varints in this chunk, chain_head_page_id back-pointer;
 //     continuation payload is raw varints only — the first dst of the chunk
 //     is zigzag-varint(delta) against the last dst of the previous chunk
-//     (the running cursor carries across chain pages per design §5.4).
+//     (the running cursor carries across chain pages).
 //
-// Hub overflow handling (D2): when a single src's entry would exceed the
+// Hub overflow handling: when a single src's entry would exceed the
 // per-page budget, the writer packs as many dsts as fit into the chain-head
 // page, then emits 1+ continuation pages for the remainder. The chain-head's
 // next_leaf field points to the first continuation; each continuation's
@@ -289,7 +289,7 @@ private:
 // next_leaf chain: continuation pages chain via next_leaf just like regular
 // leaf pages. When a chain-head's hub run finishes, its LAST continuation's
 // next_leaf points forward to the next chain-head page (the src following
-// the hub) — the design intent is that a single leaf chain walks the entire
+// the hub) — the intent is that a single leaf chain walks the entire
 // B+Tree in src-ascending order, whether or not individual srcs are hubs.
 template<std::size_t N>
 class BPTLeafCSRWriter {
@@ -661,8 +661,8 @@ private:
     //
     // `dsts_slice` is the portion of the hub's dsts to serialize on this
     // chunk. The FIRST dst in the slice is encoded as zigzag(delta against
-    // prev_dst_carry) — the running cursor crosses chain boundaries per
-    // design §5.4. Subsequent dsts within the slice are zigzag(delta) against
+    // prev_dst_carry) — the running cursor crosses chain boundaries.
+    // Subsequent dsts within the slice are zigzag(delta) against
     // the previous dst in the same slice.
     //
     // `next_leaf` is the forward pointer in this continuation's header.
@@ -808,8 +808,7 @@ private:
         // (hub_emit_eids ? varint(k_on_head) : 0) + varint(dst[0]) +
         // sum_i>=1 zigzag-varint-delta + (hub_emit_eids ? eid stream).
         // The chain-head's degree field is the TOTAL degree (including
-        // dsts on continuations), per design §3.4's "header carries
-        // total_degree" note.
+        // dsts on continuations).
         //
         // Greedy K-packing: we walk dsts, tracking the running on-page
         // byte cost INCLUDING the parallel eid stream that would be
@@ -972,16 +971,15 @@ private:
         std::size_t i = k_on_head;
         const std::size_t total = dsts.size();
 
-        // Collect continuation-page metadata BEFORE emitting, so we can set
-        // each continuation's next_leaf correctly (pointing forward to the
-        // next continuation OR to 0 for the last-in-chain — which becomes
-        // the overall "next forward page" at flush_finalize time, but for a
-        // hub in the middle of a stream it's the next chain-head page; we
-        // use 0 here and let the surrounding code patch if needed — the
-        // simplest correct behaviour is to leave the tail continuation's
-        // next_leaf=0; the caller's subsequent emit for a following src
-        // page will not be reached by chain-walking from the hub, since
-        // continuation chains terminate at chain end per design).
+        // Collect continuation-page metadata BEFORE emitting, so each
+        // continuation's next_leaf can be set correctly: forward to the
+        // next continuation, or 0 for the last-in-chain. The 0 is
+        // provisional — the last continuation's page number is remembered
+        // in pending_cont_patch_page_, and when a subsequent page is
+        // written, patch_pending_continuation_next_leaf_ seeks back and
+        // rewrites the 0 to point at it, keeping the leaf chain walkable
+        // across hub boundaries. If nothing follows, the 0 correctly marks
+        // end-of-chain.
         //
         // Page-slicing walk: for each chunk, compute how many dsts fit.
         // When edge_ids are being persisted, each chunk also carries an eid

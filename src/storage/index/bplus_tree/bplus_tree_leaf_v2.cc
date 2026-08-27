@@ -5,18 +5,17 @@
 // 16-byte v2 header plus the accumulated payload to the backing 4 KB page
 // buffer, zero-padding to Page::SIZE.
 //
-// The reader (ReadTag ctor + get_record + search_index): ctor validates
-// the header, get_record linear-decodes through the
-// varint stream accumulating the running cursor, and search_index scans
-// the records in-stream (design §3.4 — no binary search, no offset index).
+// The reader (ReadTag ctor + get_record + search_index): the ctor
+// validates the header, get_record linear-decodes through the varint
+// stream accumulating the running cursor, and search_index scans the
+// records in-stream. There is deliberately no binary search and no
+// in-page offset index: each record is delta-encoded against the
+// previous one, so decoding is inherently sequential and an offset table
+// would spend page bytes without changing the access pattern.
 //
 // Mutation paths (insert, delete_record, update_to_next_leaf) throw
-// std::logic_error: v2 pages are immutable post-build per design §2.2
-// non-goal 6 ("Not supporting in-place mutation of v2 leaf pages").
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-//                 (§5.2 layout, §5.3 worked example, §5.4 padding, §5.5
-//                  page-open validation)
+// std::logic_error: v2 pages are immutable post-build. Changing an index
+// stored in this format requires rebuilding the projection that owns it.
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
 
@@ -183,7 +182,8 @@ BPTLeafV2<N>::BPTLeafV2(const char* page_bytes, ReadTag) :
     std::memcpy(raw, page_bytes, sizeof(raw));
     read_header_ = BPT::deserialize_header(raw);
 
-    // Validate (design §5.5).
+    // Header validation: reject anything that is not a well-formed v2
+    // page of width N.
     if (read_header_.format_version != 2) {
         throw BPT::BPTLeafV2DecodeException(
             "invalid format_version at page offset 0 (expected 2, got "
@@ -316,8 +316,8 @@ void BPTLeafV2<N>::set_record(uint_fast32_t pos, Record<N>& out) const
 template <std::size_t N>
 void BPTLeafV2<N>::set_redundant_record(Record<N>& out) const
 {
-    // V2 has no redundant-bitset concept (design §3.4 — delta encoding
-    // obsoletes it). Zero out `out` so callers that use this as an initial
+    // V2 has no redundant-bitset concept: delta encoding replaces the v1
+    // shared-prefix bitset. Zero out `out` so callers that use this as an initial
     // scratch value see a well-defined state. V1 callers that relied on
     // set_redundant_record populating bitset-redundant bytes are not valid
     // on a V2 page.
@@ -340,7 +340,8 @@ void BPTLeafV2<N>::update_record(uint_fast32_t pos, Record<N>& out) const
 template <std::size_t N>
 uint_fast32_t BPTLeafV2<N>::search_index(const Record<N>& target) const noexcept
 {
-    // Design §3.4: linear scan, no binary search, no offset index.
+    // Linear scan; the delta encoding makes decoding sequential, so there
+    // is no binary search and no offset index to consult.
     // `noexcept` because the caller (BptIter) cannot handle exceptions
     // here; a malformed page should have failed at ctor time. On
     // per-record varint corruption we return value_count_ (no match) and
@@ -401,27 +402,27 @@ bool BPTLeafV2<N>::check_range(const Record<N>& r) const
 }
 
 
-// ===== Mutation path: V2 is immutable (design §2.2 non-goal 6). ==============
+// ===== Mutation path: V2 pages are immutable post-build. =====================
 
 template <std::size_t N>
 std::unique_ptr<BPlusTreeSplit<N>>
 BPTLeafV2<N>::insert(const Record<N>&, bool&)
 {
-    // V2 pages are immutable post-build (design §2.2 non-goal 6).
+    // V2 pages are immutable post-build.
     throw std::logic_error("BPTLeafV2 is immutable; insert() is not supported");
 }
 
 template <std::size_t N>
 bool BPTLeafV2<N>::delete_record(const Record<N>&)
 {
-    // V2 pages are immutable post-build (design §2.2 non-goal 6).
+    // V2 pages are immutable post-build.
     throw std::logic_error("BPTLeafV2 is immutable; delete_record() is not supported");
 }
 
 template <std::size_t N>
 void BPTLeafV2<N>::update_to_next_leaf()
 {
-    // V2 pages are immutable post-build (design §2.2 non-goal 6).
+    // V2 pages are immutable post-build.
     // Caller should construct a new BPTLeafV2(page_bytes, ReadTag) on the
     // next page rather than mutating this instance.
     throw std::logic_error("BPTLeafV2 is immutable; update_to_next_leaf() is not supported");

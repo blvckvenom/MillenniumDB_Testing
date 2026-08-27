@@ -13,13 +13,13 @@ namespace GQL {
 /**
  * Binding iterator for executing CALL procedure statements.
  *
- * Phase 1 implementation (minimal CALL, no YIELD):
- * - Evaluates procedure arguments
- * - Executes procedure once
- * - Returns single result (indicating success)
- * - Handles OPTIONAL flag (error suppression)
- *
- * Phase 2 will extend this to handle YIELD with multiple result rows.
+ * - Evaluates procedure arguments and executes the procedure once per
+ *   begin/reset cycle.
+ * - Without YIELD: returns a single row indicating success.
+ * - With YIELD: iterates the procedure's result rows, binding each YIELD
+ *   field to its variable (fields missing from a row bind to null).
+ * - OPTIONAL flag: a failing procedure produces one row with every YIELD
+ *   variable set to null instead of propagating the error.
  */
 class CallProcedure : public BindingIter {
 public:

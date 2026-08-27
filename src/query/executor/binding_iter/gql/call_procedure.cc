@@ -49,7 +49,7 @@ bool CallProcedure::_next()
 
     // If already executed and returned result, we're done
     if (executed) {
-        // Phase 2: If procedure has YIELD items, iterate through result rows
+        // If the procedure has YIELD items, iterate through result rows
         if (!yield_items.empty() && context) {
             const auto& result_rows = context->get_result_rows();
             if (current_result_row < result_rows.size()) {
@@ -87,12 +87,12 @@ bool CallProcedure::_next()
 
         executed = true;
 
-        // Phase 1: If no YIELD items, return once to indicate success
+        // If no YIELD items, return once to indicate success
         if (yield_items.empty()) {
             return true;
         }
 
-        // Phase 2: If YIELD items exist, start iterating through results
+        // If YIELD items exist, start iterating through results
         const auto& result_rows = context->get_result_rows();
         if (!result_rows.empty()) {
             // Bind first result row
@@ -115,8 +115,14 @@ bool CallProcedure::_next()
 
     } catch (const std::exception& e) {
         if (optional) {
-            // ISO §15.1 OPTIONAL CALL: Return row with null fields (not empty result)
-            // When procedure fails, OPTIONAL returns one record with all fields set to null
+            // OPTIONAL CALL suppression. ISO/IEC 39075:2024 §15.1,
+            // "<call procedure statement> and <procedure call>": when the
+            // statement contains OPTIONAL and the call produces an empty
+            // binding table result, the result is one record in which every
+            // field value is the null value (not an empty result). We apply
+            // that same null-record shape when the procedure raises an
+            // error; the standard defines the rule for the empty-result
+            // case, and folding errors into it is our extension.
             executed = true;
 
             // Bind all YIELD variables to NULL

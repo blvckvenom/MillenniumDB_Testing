@@ -32,8 +32,12 @@ std::unique_ptr<BPTLeafBase<N>> BPlusTree<N>::open_leaf_page(Page& page,
     switch (fmt) {
         case BPT::LeafFormat::BITSET:
             // V1 owns the Page* pin through its destructor. No byte-0
-            // cross-check here: a V1 page with value_count=2 legitimately
-            // has byte 0 == 2 (design §6.1 edge case).
+            // cross-check here: V1 has no format-version byte. Its byte 0
+            // is the low byte of value_count, so a leaf holding exactly 2
+            // (or 3) records legitimately collides with the V2 (or V3)
+            // version sentinel. That is why the catalog's per-index leaf
+            // format is the dispatch key and byte-0 checks exist only for
+            // the versioned formats below.
             return std::make_unique<BPTLeafV1<N>>(&page);
 
         case BPT::LeafFormat::DELTA_VARINT: {
@@ -282,8 +286,9 @@ static std::unique_ptr<BPTLeafBase<N>> open_v3_reader_over_pinned_page_(
             v1->get_page().get_bytes(),
             typename BPTLeafCSR<N>::ReadTag{});
     } else {
-        // N outside [2..3] has no BPTLeafCSR<N> instantiation per design
-        // §3.6 D6 (CSR_HYBRID is edge-index-only).
+        // N outside [2..3] has no BPTLeafCSR<N> instantiation: CSR_HYBRID
+        // applies only to the edge-topology indexes (FROM_TO_EDGE /
+        // TO_FROM_EDGE), which are the width-2/3 trees.
         return nullptr;
     }
 }

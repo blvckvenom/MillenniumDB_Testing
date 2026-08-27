@@ -21,13 +21,24 @@
 // back via chain_head_page_id (stored in the repurposed
 // min_src_id_low slot).
 //
-// This class is READ-ONLY. v3 pages are immutable post-build — the
-// mutation methods on BPTLeafBase<N> all throw std::logic_error (I6).
+// This class is READ-ONLY. Two format invariants govern it (the writer in
+// bpt_mem_import.h enforces them; this reader cross-checks them):
 //
-// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
-//   §3.1 (D1 multi-source layout), §3.3 (D3 offset table),
-//   §3.5 (D5 composition with varint), §3.10 (D10 read path),
-//   §5 (on-disk format).
+// Immutability invariant: v3 pages are read-only post-build. The mutation
+//   methods on BPTLeafBase<N> (insert / delete_record / update_to_next_leaf)
+//   all throw std::logic_error; changing a CSR-hybrid projection requires
+//   rebuilding it. A corollary is that the directory only ever routes to
+//   chain-head pages: continuation pages are reachable exclusively through
+//   chain traversal from their chain head, so the reader-mode ctor rejects
+//   them.
+//
+// Offset-table well-formedness invariant: every offset in
+//   offset_table[0..value_count) points to an entry-start byte inside the
+//   payload region (past the 16-byte header and the uint16-per-entry offset
+//   table, before the 4096-byte page end), and offsets are strictly
+//   increasing. The reader re-checks this at page open and raises
+//   BPTLeafCSRDecodeException on violation, so a corrupt table can never
+//   silently serve a wrong record.
 
 #include <climits>
 #include <cstddef>
@@ -53,14 +64,16 @@ public:
     /// Continuation-mode tag. Enables BptIter to open a hub continuation page
     /// as a BPTLeafBase<N> view during cross-page transitions, so BptIter can
     /// iterate the hub's remaining dsts that spilled onto continuations. The
-    /// chain-head reader cannot do this — its ctor rejects continuations per I6.
+    /// chain-head reader cannot do this — its ctor rejects continuation
+    /// pages, which carry no offset table or src_id and are only meaningful
+    /// mid-chain.
     ///
     /// `owning_src_id` is the hub's src_id decoded from its chain-head entry;
     /// continuation pages do not store it.
     /// `prev_dst_carry` is the running dst cursor at the end of the previous
     /// chunk (chain-head's last dst, or the previous continuation's last dst).
     /// The first varint on this continuation decodes as a zigzag-delta
-    /// against this carry per the writer's §5.4 convention.
+    /// against this carry, matching the writer's cross-chunk convention.
     /// `prev_eid_carry` is the running edge_id cursor at the end of the previous
     /// chunk's eid stream, enabling the parallel edge_id varint stream to be
     /// resumed across hub chain continuation pages. Only consulted when the
@@ -73,7 +86,7 @@ public:
     };
 
     /// Read-mode construction. Validates the v3 header at the start of
-    /// `page_bytes` (design §5.5 format invariants) and caches metadata,
+    /// `page_bytes` and caches metadata,
     /// including a pointer to the in-page uint16 offset table that
     /// begins immediately after the 16-byte header.
     ///
@@ -140,8 +153,7 @@ public:
     ///
     /// Returns false if `src_id` is not present on this page.
     ///
-    /// O(log value_count) via binary search over the in-page offset table
-    /// (design §3.3 R-A).
+    /// O(log value_count) via binary search over the in-page offset table.
     bool find_src_entry(uint64_t src_id,
                         uint32_t& out_start_offset,
                         uint32_t& out_degree) const noexcept;
@@ -182,7 +194,7 @@ public:
 
     /// Chain support: returns true if this is a chain-head page (always
     /// the case when the reader-mode ctor accepts the page, since
-    /// continuation pages are rejected at construction per I6 —
+    /// continuation pages are rejected at construction —
     /// kept as an explicit accessor for the TopologyAccessor hub-shortcut
     /// path that needs to distinguish chain-head from continuation pages
     /// without re-inspecting raw flags).
@@ -224,7 +236,7 @@ private:
     // Cached total tuple count: sum of PHYSICAL degrees across all src
     // entries on this page — i.e. the count of varints actually serialized
     // here. For a chain-head page carrying a hub, the on-disk `degree` field
-    // describes the TOTAL chain size (§3.9), so physical_degrees_[i] holds
+    // describes the TOTAL chain size, so physical_degrees_[i] holds
     // only the dsts serialized on THIS page — varints past the entry boundary /
     // page end are not counted. For a non-hub entry physical_degrees_[i] ==
     // stored degree.

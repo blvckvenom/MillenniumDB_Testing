@@ -2852,9 +2852,12 @@ std::any QueryVisitor::visitGraphExpression(GQLParser::GraphExpressionContext* c
         // instead of graphReference. Extract just the graph name (last component after final dot).
         //
         // CURRENT LIMITATION (2025-12):
-        // MillenniumDB uses a flat projection namespace (like Neo4j GDS).
-        // Catalog/schema prefixes are parsed but ignored for projection resolution.
-        // See: ISO/IEC 39075:2024 Section 17.2 <graph reference>
+        // MillenniumDB uses a flat projection namespace: catalog/schema
+        // prefixes (ISO/IEC 39075:2024 §17.2, "<graph reference> and
+        // <catalog graph parent and name>") are parsed but ignored for
+        // projection resolution. Neo4j GDS addresses projections the same
+        // way, by a single name in its graph catalog with no catalog/schema
+        // hierarchy (Neo4j Graph Data Science Manual, "Graph management").
         // See: GraphReference struct in graph_models/gql/graph_reference.h
         auto last_dot = projection_name.rfind('.');
         if (last_dot != std::string::npos) {
@@ -2899,7 +2902,8 @@ std::any QueryVisitor::visitGraphReference(GQLParser::GraphReferenceContext* ctx
 {
     LOG_VISITOR
 
-    // ISO GQL (ISO/IEC 39075:2024) Section 17.2 defines <graph reference> as:
+    // ISO/IEC 39075:2024 §17.2, "<graph reference> and <catalog graph
+    // parent and name>", defines:
     //   <graph reference> ::=
     //       <catalog object parent reference> <graph name>
     //     | <delimited graph name>
@@ -2907,15 +2911,18 @@ std::any QueryVisitor::visitGraphReference(GQLParser::GraphReferenceContext* ctx
     //     | <reference parameter specification>
     //
     // CURRENT LIMITATION (2025-12):
-    // MillenniumDB uses a flat projection namespace (like Neo4j GDS).
-    // Qualified references (catalog.schema.graph) are parsed and stored in
-    // GraphReference struct for future extensibility, but only the graph_name
-    // is used for resolution. This is intentional:
-    // - Full catalog support requires Feature GT03 (multi-graph transactions)
-    // - Neo4j GDS also uses flat namespace for projections
-    // - GNN training workflows don't require multi-catalog support
+    // MillenniumDB uses a flat projection namespace. Qualified references
+    // (catalog.schema.graph) are parsed and stored in the GraphReference
+    // struct for future extensibility, but only the graph_name is used for
+    // resolution. This is intentional:
+    // - Working with several graphs at once is ISO/IEC 39075:2024 Feature
+    //   GT03, "Use of multiple graphs in a transaction", which is not
+    //   implemented.
+    // - Neo4j GDS also addresses projections by a single name in its graph
+    //   catalog, with no catalog/schema hierarchy (Neo4j Graph Data Science
+    //   Manual, "Graph management").
+    // - GNN training workflows don't require multi-catalog support.
     //
-    // See: docs/external_references/ISO_IEC_39075_extracted/sections/section_014_pages_261-280.md
     // See: GraphReference struct in graph_models/gql/graph_reference.h
 
     GraphReference ref;
