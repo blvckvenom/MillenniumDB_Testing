@@ -498,7 +498,69 @@ if [ "$ENABLE_GPU" -eq 1 ] && [ "$SKIP_DRIVER" -eq 0 ] && [ "$RESUME" -eq 0 ]; t
         fi
     fi
 
+    # Two very different situations both make nvidia-smi fail, and they need
+    # opposite fixes:
+    #
+    #   a) No driver at all           -> install DRIVER_PKG.
+    #   b) Driver userspace installed, but its KERNEL MODULE was never built
+    #      for the kernel currently running -> install only the per-kernel
+    #      module (or rebuild via DKMS). This is what a kernel-series upgrade
+    #      leaves behind. Installing DRIVER_PKG here is wrong: the userspace
+    #      half is already present and is often NEWER than DRIVER_PKG, so a
+    #      blind install can queue a downgrade and still not load a module.
+    #
+    # Case (b) is worth detecting explicitly because its symptom is silence:
+    # CUDA reports zero devices, and the whole GNN pipeline degrades to CPU
+    # without a single error message.
+    MODULE_MISSING=0
     if [ "$DRIVER_OK" -eq 0 ]; then
+        RUNNING_KERNEL="$(uname -r)"
+        INSTALLED_DRIVER_PKG="$(dpkg-query -W -f='${Package} ${Status}\n' 'nvidia-driver-*' 2>/dev/null \
+            | awk '$NF=="installed"{print $1; exit}' || true)"
+        MODULE_FOR_KERNEL="$(find "/lib/modules/$RUNNING_KERNEL" -name 'nvidia.ko*' 2>/dev/null | head -1 || true)"
+
+        if [ -n "$INSTALLED_DRIVER_PKG" ] && [ -z "$MODULE_FOR_KERNEL" ]; then
+            MODULE_MISSING=1
+            log_warn "Driver userspace is installed ($INSTALLED_DRIVER_PKG) but no kernel"
+            log_warn "  module exists for the running kernel $RUNNING_KERNEL."
+            OTHER_KERNEL_MOD="$(find /lib/modules -name 'nvidia.ko*' 2>/dev/null | head -1 || true)"
+            if [ -n "$OTHER_KERNEL_MOD" ]; then
+                log_info "  A module does exist for another kernel: $OTHER_KERNEL_MOD"
+                log_info "  Booting that kernel from GRUB restores the GPU without installing anything."
+            fi
+
+            if [ -d /var/lib/dkms/nvidia ]; then
+                log_info "  Packaging model: DKMS. Queueing a module rebuild."
+                queue_root "rebuild NVIDIA kernel module via DKMS" "dkms autoinstall"
+            else
+                # Prebuilt per-kernel modules (Ubuntu / Pop!_OS default).
+                # Derive the package prefix from whatever is already installed
+                # instead of hardcoding a branch or an -open/-server variant.
+                EXISTING_MOD_PKG="$(dpkg-query -W -f='${Package} ${Status}\n' 'linux-modules-nvidia-*' 2>/dev/null \
+                    | awk '$NF=="installed"{print $1}' \
+                    | grep -E -- '-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z]+$' | head -1 || true)"
+                if [ -n "$EXISTING_MOD_PKG" ]; then
+                    MOD_PREFIX="$(echo "$EXISTING_MOD_PKG" | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z]+$//')"
+                    WANTED_MOD_PKG="${MOD_PREFIX}-${RUNNING_KERNEL}"
+                    if apt-cache show "$WANTED_MOD_PKG" >/dev/null 2>&1; then
+                        log_info "  Packaging model: prebuilt per-kernel modules."
+                        log_info "  Queueing $WANTED_MOD_PKG"
+                        queue_root "install NVIDIA kernel module for $RUNNING_KERNEL" \
+                            "apt-get install -y $WANTED_MOD_PKG"
+                    else
+                        log_err "  No package $WANTED_MOD_PKG in the configured repositories."
+                        log_err "  Either boot a kernel that has its module, or install a kernel"
+                        log_err "  series that NVIDIA modules are published for."
+                    fi
+                else
+                    log_warn "  Could not infer the module package name; install it manually:"
+                    log_warn "    apt-cache search \"linux-modules-nvidia.*$RUNNING_KERNEL\""
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$DRIVER_OK" -eq 0 ] && [ "$MODULE_MISSING" -eq 0 ]; then
         log_info "Queueing $DRIVER_PKG for install (reboot will be required)"
         queue_root "install NVIDIA driver $DRIVER_PKG" \
             "apt-get install -y $DRIVER_PKG nvidia-utils-${DRIVER_PKG##*-}"
