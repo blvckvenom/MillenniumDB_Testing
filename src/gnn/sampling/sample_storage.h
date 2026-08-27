@@ -388,7 +388,7 @@ public:
      * @brief Get node access frequency.
      *
      * Returns how many times each node appears across all samples.
-     * Used for cache priority in Phase 3.
+     * Used to prioritize hot nodes when sizing the feature-store caches.
      *
      * @return Map of node_id -> access_count
      */

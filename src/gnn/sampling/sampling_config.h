@@ -233,9 +233,10 @@ struct SamplingConfig {
      * @brief Lean tiled-symmetric GPU sampling path. Set by the engine (NOT a
      * user knob) when the AUTO eligibility check passes: UNDIRECTED + symmetric
      * resolved-on + a baked narrow topology_sym.csr + a capable GPU. Threaded
-     * into FourLevelTopologyStore::Config so build() skips the ~25 GB L1/L2
-     * tiers and the ~13 GB whole-COL_IDX copy, pinning the symmetric slice as a
-     * tiled view instead. Default false.
+     * into FourLevelTopologyStore::Config so build() skips the L1/L2 RAM tiers
+     * and the whole-COL_IDX copy (either of which can exceed host RAM at
+     * 100M-node scale), pinning the symmetric slice as a tiled view instead.
+     * Default false.
      */
     bool lean_symmetric_gpu = false;
 
@@ -297,13 +298,13 @@ struct SamplingConfig {
     bool auto_profile_on_cold_start = true;
 
     /**
-     * @brief Number of random walks performed by Phase 0 profiler. 0 ⇒
+     * @brief Number of random walks performed by the cold-start profiler. 0 ⇒
      *        `TopologyWalkProfiler::kDefaultNumWalks` (100k).
      */
     std::size_t profile_num_walks = 0;
 
     /**
-     * @brief Steps per walk in Phase 0 profiler. 0 ⇒
+     * @brief Steps per walk in the cold-start profiler. 0 ⇒
      *        `TopologyWalkProfiler::kDefaultWalkLength` (5).
      */
     std::size_t profile_walk_length = 0;
@@ -315,8 +316,13 @@ struct SamplingConfig {
     /**
      * @brief Number of worker threads for the outer per-batch sampling loop.
      *
-     * Enables a SALIENT-style shared-memory parallelization of the per-batch
-     * `khop_sampler->sample()` calls in `OfflineSamplingEngine::do_run`.
+     * Enables a shared-memory parallelization of the per-batch
+     * `khop_sampler->sample()` calls in `OfflineSamplingEngine::do_run` — the
+     * same "shared-memory parallelization strategy" for mini-batch
+     * preparation that SALIENT applies (Kaler et al., "Accelerating Training
+     * and Inference of Graph Neural Networks with Fast Sampling and
+     * Pipelining", MLSys 2022, abstract; the paper does not prescribe this
+     * particular pool layout).
      * Workers pull batches from a shared atomic counter and write results
      * through a single mutex-serialized write call. Each worker thread owns
      * a private `BasicKHopSampler` + `LeapfrogGnnSampler` +
@@ -339,9 +345,12 @@ struct SamplingConfig {
      *   - >=2: spawn that many workers. Capped at
      *        `std::thread::hardware_concurrency()` at engine startup.
      *
-     * Expected speedup on celebi 20-core for papers100M 3-layer: 6-12×
-     * (SALIENT MLSys 2022, NextDoor EuroSys 2021 empirical range — sync
-     * overhead + cache contention limits linear scaling).
+     * Scaling is sub-linear: dispatch synchronization, the serialized write,
+     * and cache contention keep the speedup below the worker count, and the
+     * gain grows with the per-batch work — small fanouts do not amortize the
+     * per-batch dispatch overhead, while deep multi-layer fanouts benefit
+     * the most (per-lookup page reads also parallelize naturally across the
+     * kernel page cache on a high-IOPS NVMe).
      *
      * **Thread-safety.** Workers borrow the primary's `TopologyAccessor`
      * (the Four-Level Topology Store + adjacency caches are read-only
@@ -370,9 +379,10 @@ struct SamplingConfig {
      * (historical behaviour).
      *
      * @details Motivation: UNDIRECTED orientation on dense graphs causes
-     * super-linear layer growth (papers100M fanout [10,15,20] saw layer 2
-     * peak at 5.6M nodes/worker, contributing to the silent SIGSEGV
-     * observed when N=20 workers exhausted RAM). With this cap set to
+     * super-linear layer growth (on a 100M-node citation graph with 3-layer
+     * fanouts, a middle layer peaked at ~5M nodes per worker; multiplied by
+     * 20 workers that exhausted a 30 GB host and killed the server with a
+     * silent SIGSEGV). With this cap set to
      * e.g. `10 * batch_size`, the sampler aborts with an actionable
      * message (the offending layer index + suggestion to reduce fanout
      * or batch_size) instead of crashing the whole server.

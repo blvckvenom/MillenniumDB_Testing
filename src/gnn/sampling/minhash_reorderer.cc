@@ -99,15 +99,16 @@ void MinHashReorderer::build_access_graph(uint64_t num_batches, const BatchProvi
 // ===========================================================================
 
 void MinHashReorderer::build_segmented(uint64_t num_batches, const BatchProvider& provider) {
-    // Fix (2026-05-13): parallelise the per-batch loop. Each worker owns a
-    // local min-hash array, accumulating updates independently; we merge
-    // post-pass with a sequential reduction. This avoids the CAS-min
-    // contention that would arise from atomic shared-state updates.
+    // The per-batch loop is parallelised. Each worker owns a local min-hash
+    // array, accumulating updates independently; we merge post-pass with a
+    // sequential reduction. This avoids the CAS-min contention that would
+    // arise from atomic shared-state updates.
     //
     // Worker count default 4 (configurable via MDB_GNN_MINHASH_WORKERS),
-    // capped at hardware_concurrency() and num_batches. With 4 workers
-    // each holding an N-sized uint64 array (888 MB at N=111M), heap is
-    // ~3.5 GB — fine on the 30 GB host.
+    // capped at hardware_concurrency() and num_batches. Each worker holds an
+    // N-sized uint64 array (8 bytes per node), so heap grows linearly with
+    // the worker count; the default 4 workers cost ~32 bytes per node, which
+    // stays a small fraction of host RAM even at 100M-node scale.
     // number() replaces stoi-with-swallowed-exception: a value that did not
     // parse used to leave the default standing with nothing said, so a run asked
     // for 16 workers reported exactly like one that got 4. The >0 test and the
@@ -231,7 +232,7 @@ void MinHashReorderer::build_segmented(uint64_t num_batches, const BatchProvider
 void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider& provider) {
     namespace fs = std::filesystem;
 
-    // Phase 0: Materialize batch assignments to temp file
+    // Pass 0: Materialize batch assignments to temp file
     temp_dir_ = fs::temp_directory_path()
         / ("mdb_minhash_" + std::to_string(getpid()) + "_" + std::to_string(config_.random_seed));
     fs::create_directories(temp_dir_);
@@ -272,7 +273,7 @@ void MinHashReorderer::build_multipass(uint64_t num_batches, const BatchProvider
 
     fsync_directory(temp_path);
 
-    // Phase 1..P: Multi-pass MinHash over temp file
+    // Pass 1..P: Multi-pass MinHash over temp file
     uint64_t N = accessed_.size();
     hash_values_.resize(N, 0); // fingerprint accumulator
 

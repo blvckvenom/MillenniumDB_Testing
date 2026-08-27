@@ -44,7 +44,8 @@ namespace mdb::gnn {
 // not force CPU, the four-level store is in play, the orientation resolves to a
 // symmetric (UNDIRECTED) sample, a baked NARROW topology_sym.csr exists, and a
 // GPU is present. When true the engine builds the sampler with
-// lean_symmetric_gpu set, so the four-level L1/L2 build (the papers100M OOM) is
+// lean_symmetric_gpu set, so the four-level L1/L2 build — which can OOM the
+// host when the RAM tiers of a 100M-node graph exceed available memory — is
 // skipped and the symmetric slice is pinned tiled. Pure read-only probe (opens
 // the sidecar header + queries the device); no ordering dependency on storage
 // state established later in do_run.
@@ -175,11 +176,11 @@ struct OfflineSamplingEngine::Impl {
 
         auto start_time = std::chrono::steady_clock::now();
 
-        // Coarse do_run phase timers (sample-loop rank-1 follow-up): the
-        // direct sample-loop measurement showed the parallel batch loop is
-        // only ~27s, leaving ~188s of the ~382s total unaccounted between
-        // build() and the loop. These spans pin it: init (incl. the
-        // four-level build), seed/batch prep, and worker-pool setup.
+        // Coarse do_run phase timers. Direct measurement of the sample loop
+        // showed the parallel batch loop accounts for well under half the total
+        // wall-clock of a large run — most of the time sits between build() and
+        // the loop. These spans pin down where: init (incl. the four-level
+        // build), seed/batch prep, and worker-pool setup.
         auto phase_ms_ = [](std::chrono::steady_clock::time_point a,
                              std::chrono::steady_clock::time_point b) -> long long {
             return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
@@ -315,11 +316,11 @@ struct OfflineSamplingEngine::Impl {
                     auto sym = GQL::Projection::TopologySnapshotReader::open_symmetric(
                         storage.get_projection_dir());
                     if (sym.has_data() && sym.id_width() == 4) {
-                        // El slice horneado se consume tiled desde el mmap: el
-                        // costo bloqueado del gate es ROW_PTR + ventana de
-                        // staging, no el CSR entero (que vive en page cache
-                        // reclamable). Sin esta marca, la 2.a corrida de una
-                        // misma sesion caia a CPU (headroom < CSR completo).
+                        // The baked slice is consumed tiled from the mmap: the
+                        // gate's locked cost is ROW_PTR + the staging window,
+                        // not the whole CSR (which lives in reclaimable page
+                        // cache). Without this flag, the second run of a server
+                        // session fell back to CPU (headroom < full CSR).
                         sym_dims = DirCsrDims{sym.num_nodes(), sym.num_edges(),
                                               /*present=*/true, /*tiled_mmap=*/true};
                     } else {
@@ -340,8 +341,8 @@ struct OfflineSamplingEngine::Impl {
                         const std::uint64_t n = topo.get_node_count();
                         const std::uint64_t e = topo.get_edge_count();
                         if (n > 0) {
-                            // Tambien tiled_mmap: el auto-bake garantiza que al
-                            // momento del pin el slice existe como mmap.
+                            // Also tiled_mmap: the auto-bake guarantees that by
+                            // pin time the slice exists as an mmap.
                             sym_dims = DirCsrDims{n, 2ull * e,
                                                   /*present=*/true, /*tiled_mmap=*/true};
                         }
@@ -478,7 +479,7 @@ struct OfflineSamplingEngine::Impl {
                     }
                 }
 #endif
-                // CPU / no-pin path: the Part C symmetric tier (single dispatch)
+                // CPU / no-pin path: the symmetric tier (single dispatch)
                 // delivers the benefit, not the flat GPU arrays. Report whether
                 // that tier is active; do NOT materialize the flat merge (only
                 // the GPU pin consumes it) just for telemetry — on a large graph
@@ -668,8 +669,8 @@ struct OfflineSamplingEngine::Impl {
                 const std::size_t total_work = work.size();
 
                 // Build worker samplers. Worker 0 reuses the primary
-                // `khop_sampler` (already through Phase 0 + four-level
-                // enable). Workers 1..N-1 borrow the topology and own their
+                // `khop_sampler` (already through the cold-start profiler +
+                // four-level enable). Workers 1..N-1 borrow the topology and own their
                 // own Leapfrog/Seek samplers + RNG + tally vector.
                 std::vector<std::unique_ptr<BasicKHopSampler>> worker_samplers;
                 if (effective_workers > 1) {
@@ -714,13 +715,13 @@ struct OfflineSamplingEngine::Impl {
                     sample_storage.begin_sharded_write(effective_workers);
                 }
 
-                // Sample-loop sub-stage instrumentation (analogous to the
-                // FourLevelTopologyStore::build() rank-1 split). Three atomic
+                // Sample-loop sub-stage instrumentation. Three atomic
                 // microsecond accumulators across all workers answer the
-                // decisive question for the 215s/56% sample loop: is it
-                // SERIAL-write-bound (in_lock ≈ wall) or CONCURRENT-assemble-
-                // bound (expand dominates, in_lock small)? wait_us is the
-                // lock-contention indicator. Logged once to stderr after join.
+                // decisive question for a sample loop that dominates the run:
+                // is it SERIAL-write-bound (in_lock ≈ wall) or
+                // CONCURRENT-assemble-bound (expand dominates, in_lock small)?
+                // wait_us is the lock-contention indicator. Logged once to
+                // stderr after join.
                 std::atomic<uint64_t> expand_us{0};   // sampler->sample() (concurrent)
                 std::atomic<uint64_t> wait_us{0};      // blocked acquiring write_mutex
                 std::atomic<uint64_t> inlock_us{0};    // write_sample + progress (serial)
@@ -941,9 +942,9 @@ struct OfflineSamplingEngine::Impl {
                               << " effParallelism=" << eff_par
                               << " (inlock/wall=" << (loop_wall_ms > 0 ? lock_ms / loop_wall_ms : 0.0)
                               << ")\n";
-                    // Coarse do_run phases (locates the ~188s that is neither
-                    // build() nor the sample loop): init (incl. four-level
-                    // build), seed/batch prep, worker-pool setup.
+                    // Coarse do_run phases (locates the wall-clock that is
+                    // neither build() nor the sample loop): init (incl.
+                    // four-level build), seed/batch prep, worker-pool setup.
                     std::cerr << "[OfflineSamplingEngine] do_run phases — "
                               << "initMs=" << init_ms_
                               << " seedPrepMs=" << seedprep_ms_

@@ -43,14 +43,15 @@ void persist(const std::filesystem::path&  projection_dir,
     if (projection_dir.empty()) return;
     if (counts.empty())         return;
 
-    // Part 2 reproducibility fix (c), opt-in via env MDB_GNN_FREEZE_NODE_COUNTS=1 (default OFF):
+    // Reproducibility freeze, opt-in via env MDB_GNN_FREEZE_NODE_COUNTS=1 (default OFF):
     // once node_counts.bin exists, do NOT overwrite it. The frequency-based four-level TIER ASSIGNMENT
     // reads these per-node access counts; rewriting them each run with THIS run's post-sample counts makes
-    // the tier assignment — and thus the served neighbor sets — drift run-to-run, so a fixed seed yields a
-    // DIFFERENT sample each warm run (root cause: cold-start reproduces 46f7, warm-start drifts — see
-    // docs/research/2026-06-18-feature-store-study/FINAL_REPORT.md). Freezing the counts gives every warm run
-    // an identical tier layout => bit-reproducible sample (det4-proven: identical counts => identical sample;
-    // and validated to be the SUFFICIENT fix where canonical neighbor order alone was not). Default OFF =>
+    // the tier assignment — and thus the served neighbor sets — drift run-to-run, because the four tiers
+    // emit a node's neighbors in different orders, so a fixed-seed sampler draws different neighbors. The
+    // result: a cold start (no node_counts.bin) is bit-reproducible, but every warm run produces a
+    // DIFFERENT sample. Freezing the counts gives every warm run an identical tier layout =>
+    // bit-reproducible sample (validated empirically: identical counts => identical sample, and this was
+    // the SUFFICIENT fix where canonicalizing neighbor order alone was not). Default OFF =>
     // unchanged behavior. Seed deterministic counts by doing ONE cold-start build (no node_counts.bin) first.
     {
         // choice() and not flag(): only "1" ever froze the counts, so every

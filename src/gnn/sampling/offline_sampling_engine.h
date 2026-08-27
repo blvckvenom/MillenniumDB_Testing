@@ -86,11 +86,14 @@ struct SamplingResult {
     // serializes writes through a mutex.
     std::uint32_t num_workers_used = 1;
 
-    // Dynamic sampling-backend decision (Phase 1). Which backend the
-    // hardware-based planner chose for the neighbor fetch, the directions it
-    // would serve on GPU, and the human-readable reason — exposed for the
-    // procedure yields. Phase 1 is INERT: GPU_* is logged but treated as the
-    // CPU out-of-core path (no kernel yet), so sampling output is byte-identical.
+    // Dynamic sampling-backend decision. Which backend the hardware-based
+    // planner chose for the neighbor fetch, the directions it would serve on
+    // GPU, and the planner's human-readable reason — exposed for the
+    // procedure yields. When a GPU_* backend is chosen AND the pinned CSR
+    // view registers successfully, the GPU kernel actually runs; if pinning
+    // fails the engine silently falls back to the CPU out-of-core path
+    // (these fields still report the planner's choice — the engine's stderr
+    // log line is what records which path actually ran).
     std::string sampling_backend     = "CPU_OUT_OF_CORE";
     std::string sampling_directions  = "NONE";
     std::string sampling_plan_reason;

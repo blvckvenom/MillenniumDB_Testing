@@ -4,20 +4,20 @@ namespace mdb::gnn {
 
 namespace {
 
-// Tamaños de una direccion del CSR global a pinear. `present` es false cuando esa
-// direccion no tiene sidecar narrow pineable.
+// Sizes of one direction of the global CSR to pin. `present` is false when that
+// direction has no pinnable narrow sidecar.
 struct DirSizing {
-    std::size_t   csr_bytes    = 0;  // (n_rows+1)*8 + n_edges*4 (el arreglo completo)
-    std::size_t   locked_bytes = 0;  // RAM sostenida no-reclamable de servir esta dir
+    std::size_t   csr_bytes    = 0;  // (n_rows+1)*8 + n_edges*4 (the full array)
+    std::size_t   locked_bytes = 0;  // sustained non-reclaimable RAM to serve it
     std::uint64_t edges        = 0;
     bool          present      = false;
 };
 
-// Mismo computo EXACTO que registra pinned_topology_view: ROW_PTR uint64 + COL_IDX
-// uint32 sobre TODO el grafo (no el subconjunto warm). El costo BLOQUEADO difiere
-// por modo de consumo: pin completo => csr_bytes; slice horneado consumido tiled
-// desde mmap => solo ROW_PTR + ventana de staging (el COL_IDX queda en page cache
-// reclamable, ya contado por MemAvailable).
+// EXACTLY the same computation pinned_topology_view registers: uint64 ROW_PTR +
+// uint32 COL_IDX over the WHOLE graph (not the warm subset). The LOCKED cost
+// differs by consumption mode: full pin => csr_bytes; baked slice consumed
+// tiled from mmap => only ROW_PTR + the staging window (COL_IDX stays in
+// reclaimable page cache, already counted by MemAvailable).
 DirSizing size_dir(DirCsrDims d, std::size_t tiled_stage_bytes) {
     if (!d.present) {
         return {};
@@ -63,7 +63,7 @@ SamplingBackendPlan plan_sampling_backend(
 
     SamplingBackendPlan plan;  // defaults: CPU_OUT_OF_CORE / NONE
 
-    // Alcance segun orientacion: que direcciones del grafo se muestrean.
+    // Scope by orientation: which graph directions get sampled.
     const bool use_fwd = orientation == EdgeOrientation::NATURAL
                       || orientation == EdgeOrientation::UNDIRECTED;
     const bool use_rev = orientation == EdgeOrientation::REVERSE
@@ -73,11 +73,11 @@ SamplingBackendPlan plan_sampling_backend(
     const DirSizing rev = use_rev ? size_dir(rev_dims, cfg.tiled_stage_bytes) : DirSizing{};
     plan.fwd_csr_bytes = fwd.csr_bytes;
     plan.rev_csr_bytes = rev.csr_bytes;
-    // Substrato A (sidecar global): el CSR ya esta indexado por fila densa global,
-    // asi que el kernel no necesita un mapa global->fila => node_map_bytes = 0.
+    // Global sidecar substrate: the CSR is already indexed by dense global row,
+    // so the kernel needs no global->row map => node_map_bytes = 0.
     plan.node_map_bytes = 0;
 
-    // Override: forzar CPU salta todas las gates.
+    // Override: forcing CPU skips every gate.
     if (choice == SamplingBackendChoice::FORCE_CPU) {
         plan.reason = "forced CPU by user (FORCE_CPU)";
         return plan;
@@ -85,8 +85,9 @@ SamplingBackendPlan plan_sampling_backend(
 
     const bool force_gpu = choice == SamplingBackendChoice::FORCE_GPU;
 
-    // Gate A: hay GPU y es capaz (Volta+). FORCE_GPU sin GPU capaz = error duro
-    // (se señala en reason con prefijo ERROR: para que el motor lo eleve).
+    // Gate A: a GPU exists and is capable (Volta+). FORCE_GPU without a capable
+    // GPU is a hard error (flagged in reason with an ERROR: prefix so the
+    // engine can raise it).
     const bool gate_a = res.has_gpu
                      && res.gpu.compute_capability >= cfg.min_compute_capability;
     if (!gate_a) {
@@ -95,10 +96,10 @@ SamplingBackendPlan plan_sampling_backend(
                                  + " < " + std::to_string(cfg.min_compute_capability);
         plan.reason = (force_gpu ? "ERROR: FORCE_GPU but no capable GPU (" : "no capable GPU (")
                     + detail + ")";
-        return plan;  // CPU (el motor convierte el prefijo ERROR: en hard-error)
+        return plan;  // CPU (the engine turns the ERROR: prefix into a hard error)
     }
 
-    // Gate B: workload suficientemente grande (salvo FORCE_GPU, que lo ignora).
+    // Gate B: workload is large enough (FORCE_GPU ignores this gate).
     const std::uint64_t total_edges = fwd.edges + rev.edges;
     if (!force_gpu && total_edges < cfg.min_edges_for_gpu) {
         plan.reason = "workload too small (" + std::to_string(total_edges)
@@ -106,17 +107,17 @@ SamplingBackendPlan plan_sampling_backend(
         return plan;  // CPU
     }
 
-    // Gate C: el costo de RAM SOSTENIDA de servir el CSR cabe en la fraccion de
-    // headroom. Para el pin completo ese costo es el CSR entero (paginas no-
-    // swappables toda la corrida); para un slice horneado consumido tiled desde
-    // mmap es solo ROW_PTR + ventana de staging (el COL_IDX vive en page cache
-    // reclamable). Si NO cabe, la cola fria ya esta derramada => CPU.
+    // Gate C: the SUSTAINED RAM cost of serving the CSR fits in the headroom
+    // fraction. For a full pin that cost is the whole CSR (pages non-swappable
+    // for the entire run); for a baked slice consumed tiled from mmap it is
+    // only ROW_PTR + the staging window (COL_IDX lives in reclaimable page
+    // cache). If it does NOT fit, the cold tail is already spilled => CPU.
     const std::size_t headroom = static_cast<std::size_t>(
         cfg.ram_headroom_factor * static_cast<double>(res.ram_available));
     const auto fits = [&](const DirSizing& d) {
         return d.present && d.locked_bytes <= headroom;
     };
-    // El detalle "locked X of csr Y" en reason hace observable el modo de costo.
+    // The "locked X of csr Y" detail in reason makes the cost mode observable.
     const auto need_str = [](const DirSizing& a, const DirSizing& b) {
         return std::to_string(a.locked_bytes + b.locked_bytes) + " locked (csr "
              + std::to_string(a.csr_bytes + b.csr_bytes) + ")";
@@ -131,8 +132,9 @@ SamplingBackendPlan plan_sampling_backend(
             dirs            = GpuDirections::BOTH;
             device_resident = fwd.csr_bytes + rev.csr_bytes;
         } else if (cfg.allow_single_direction && (fits(fwd) || fits(rev))) {
-            // Solo cabe una direccion: acelerar la de MAYOR edge_count (mas
-            // lookups que acelerar); la otra cae al host. La union sigue completa.
+            // Only one direction fits: accelerate the one with the LARGER
+            // edge_count (more lookups to accelerate); the other falls back to
+            // the host. The neighbor union stays complete.
             const bool fwd_fits = fits(fwd);
             const bool rev_fits = fits(rev);
             const bool pick_fwd = fwd_fits && (!rev_fits || fwd.edges >= rev.edges);
@@ -150,7 +152,7 @@ SamplingBackendPlan plan_sampling_backend(
             return plan;  // CPU
         }
     } else {
-        // NATURAL o REVERSE: una sola direccion.
+        // NATURAL or REVERSE: a single direction.
         const DirSizing& d = (orientation == EdgeOrientation::NATURAL) ? fwd : rev;
         if (fits(d)) {
             dirs            = (orientation == EdgeOrientation::NATURAL)
@@ -165,14 +167,14 @@ SamplingBackendPlan plan_sampling_backend(
         }
     }
 
-    // Gate D: la VRAM decide UVA vs copia a VRAM (no GPU vs CPU). free_vram ya
-    // viene derateado por el factor de seguridad en detect_resources.
+    // Gate D: VRAM decides UVA vs VRAM copy (not GPU vs CPU). free_vram already
+    // comes derated by the safety factor in detect_resources.
     plan.directions           = dirs;
     plan.estimated_vram_bytes = device_resident;
-    // VRAM-resident cuando el CSR + una reserva absoluta (contexto CUDA + scratch)
-    // caben en la VRAM libre CRUDA. Durante el muestreo no hay tensores de modelo/
-    // features residentes, asi que el derate ciego (compartido con otros planners)
-    // es demasiado conservador aqui. Si no cabe, leerlo por PCIe via UVA.
+    // Device-resident when the CSR + an absolute reserve (CUDA context +
+    // scratch) fit in the RAW free VRAM. During sampling no model/feature
+    // tensors are resident, so the blanket derate (shared with other planners)
+    // is too conservative here. If it does not fit, read over PCIe via UVA.
     const std::size_t vram_need = device_resident + cfg.vram_abs_headroom_bytes;
     if (vram_need <= res.gpu.raw_free_vram) {
         plan.backend = SamplingBackend::GPU_VRAM_COPY;

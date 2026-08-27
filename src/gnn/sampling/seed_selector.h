@@ -103,9 +103,10 @@ using EpochBatches = SplitBatches;
  * ## DiskGNN Architecture
  *
  * Following DiskGNN (SIGMOD 2025), batches are generated ONCE and reused
- * across training epochs. The training layer handles:
- * - Epoch iteration
- * - Batch order shuffling per epoch (via `torch.randperm(num_batches)`)
+ * across training epochs. The training layer handles epoch iteration and
+ * owns the batch ORDER (our training loop currently consumes the
+ * pre-generated batches sequentially; a per-epoch order shuffle would also
+ * belong there, never here).
  *
  * ## Deterministic Shuffling
  *

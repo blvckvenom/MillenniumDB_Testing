@@ -102,8 +102,8 @@ struct BasicKHopSampler::Impl {
 
     // Optional shared atomic tally. When non-null, all parallel workers
     // fetch_add into this single N-sized array instead of each growing its
-    // own `node_access_counts` vector (which would cost 0.83 GB × numWorkers
-    // on papers100M). Owned by OfflineSamplingEngine; pre-sized + zero-init;
+    // own `node_access_counts` vector (8 bytes per node PER WORKER — close to
+    // 1 GB each at 100M-node scale). Owned by OfflineSamplingEngine; pre-sized + zero-init;
     // outlives every sampler. nullptr ⇒ legacy private-vector path.
     std::atomic<uint64_t>* shared_counts_   = nullptr;
     std::size_t            shared_counts_n_  = 0;
@@ -218,7 +218,7 @@ struct BasicKHopSampler::Impl {
     // TopologyAccessor (which has already completed the cold-start profile,
     // four-level store initialisation, and adjacency-cache build) and creates
     // fresh Leapfrog/Seek samplers owning their own RNG state. Skips the
-    // expensive Phase 0 / cache setup since the primary did all that work.
+    // expensive cold-start profile / cache setup since the primary did all that work.
     Impl(GQL::ProjectionStorage& storage_,
          const SamplingConfig& config_,
          TopologyAccessor* shared_topology,
@@ -266,8 +266,8 @@ struct BasicKHopSampler::Impl {
     //   - the projection_dir cannot be resolved (synthetic test paths
     //     that don't have a real on-disk projection)
     //
-    // Outcomes are also surfaced via the public `last_phase0_result_`
-    // member so `gnn_offline_sample_procedure` can yield them.
+    // Outcomes are recorded in `last_phase0_result` and exposed through
+    // `phase0_report()` so `gnn_offline_sample_procedure` can yield them.
     struct Phase0Telemetry {
         bool          triggered     = false;
         bool          succeeded     = false;
@@ -312,7 +312,7 @@ struct BasicKHopSampler::Impl {
 
         last_phase0_result.triggered = true;
 
-        std::cerr << "[BasicKHopSampler] Phase 0 auto-profile: "
+        std::cerr << "[BasicKHopSampler] cold-start auto-profile: "
                   << "no node_counts.bin found, running "
                   << (config.profile_num_walks
                           ? config.profile_num_walks
@@ -336,7 +336,7 @@ struct BasicKHopSampler::Impl {
                                 config.orientation);
         last_phase0_result.succeeded = true;
 
-        std::cerr << "[BasicKHopSampler] Phase 0 done: "
+        std::cerr << "[BasicKHopSampler] cold-start profile done: "
                   << result.lookups_done << " lookups in "
                   << result.elapsed_seconds << "s ("
                   << result.restarts << " restarts). "
@@ -426,8 +426,9 @@ struct BasicKHopSampler::Impl {
 
         // ---- Self-loop ablation (env MDB_GNN_SAMPLE_SELF_LOOP=1, default OFF).
         //
-        // GAP_REOPEN_2026-06-16: DiskGNN's papers100M graph prep does
-        // dgl.add_self_loop (load_graph.py:24), so the node itself is one of
+        // DiskGNN's papers100M graph prep does dgl.add_self_loop
+        // (examples/load_graph.py, load_ogb: remove_self_loop then
+        // add_self_loop), so the node itself is one of
         // the (deg+1) candidates and is sampled w.p. ~min(1, fanout/(deg+1)) —
         // its features then enter the neighbor-MEAN. MDB normally excludes self
         // from the neighbor set (self handled separately by SAGEConv's
@@ -470,8 +471,10 @@ struct BasicKHopSampler::Impl {
                 result.emplace_back(all_neighbors.node_ids[i], all_neighbors.edge_ids[i]);
                 // Count each visited neighbour for the frequency-based tier
                 // assignment: a node's "frequency" is its total visit count
-                // across the sampling run, matching DiskGNN's
-                // `node_counts[v] += 1` in mega_batch_sampling.py:50.
+                // across the sampling run. DiskGNN keeps the same kind of
+                // tally (`node_counts[input_nodes] += 1` per batch in
+                // examples/mega_batch_sampling.py), though that counts once
+                // per batch appearance while we count once per visit.
                 tally_(all_neighbors.node_ids[i]);
             }
         } else {
@@ -663,10 +666,12 @@ struct BasicKHopSampler::Impl {
             }
 
             // Defensive cap against unbounded growth. UNDIRECTED on
-            // dense graphs can explode layer-2 to millions of nodes per
-            // worker (papers100M fanout [10,15,20] N=20 silently SIGSEGV
-            // pre-cap). Abort with an actionable error so the user can
-            // reduce fanout or batch_size instead of crashing the server.
+            // dense graphs can explode a middle layer to millions of nodes
+            // per worker (on a 100M-node citation graph with 3-layer fanouts
+            // and 20 workers this exhausted RAM and silently SIGSEGV'd the
+            // server before the cap existed). Abort with an actionable error
+            // so the user can reduce fanout or batch_size instead of
+            // crashing the server.
             if (config.max_layer_nodes > 0
                 && next_layer_set.size() > config.max_layer_nodes)
             {

@@ -50,7 +50,7 @@ class TopologyAccessor;
  * - Loads all neighbors into memory before sampling
  * - No reservoir sampling for high-degree nodes
  *
- * For optimized sampling, see Phase 2B: SortedBatchSampler, ReservoirSampler.
+ * For optimized sampling, see SortedBatchSampler and ReservoirSampler.
  *
  * @see GraphSample for output format
  * @see SamplingConfig for configuration
@@ -273,13 +273,14 @@ public:
     /**
      * @brief Install a SHARED atomic access-counts array.
      *
-     * Replaces the per-worker N-sized `node_access_counts` vector (0.83 GB
-     * each on papers100M) with a single shared `std::atomic<uint64_t>` array
-     * of size `n`, owned by the OfflineSamplingEngine and pointed-to by every
-     * worker sampler. `tally_` then does a relaxed `fetch_add` into it instead
-     * of growing its private vector, so total tally RAM is 0.83 GB regardless
-     * of the number of parallel workers (with per-worker vectors, cost grew
-     * linearly and capped worker count on memory-constrained machines). The
+     * Replaces the per-worker N-sized `node_access_counts` vector (8 bytes per
+     * node PER WORKER — close to 1 GB each at 100M-node scale) with a single
+     * shared `std::atomic<uint64_t>` array of size `n`, owned by the
+     * OfflineSamplingEngine and pointed-to by every worker sampler. `tally_`
+     * then does a relaxed `fetch_add` into it instead of growing its private
+     * vector, so total tally RAM is 8 bytes per node ONCE, regardless of the
+     * number of parallel workers (with per-worker vectors, cost grew linearly
+     * and capped worker count on memory-constrained hosts). The
      * array MUST be pre-sized to the projection's node count and
      * zero-initialized before sampling; it must outlive every sampler.
      * Correctness: the final per-node count is a commutative sum, so it is
@@ -296,7 +297,7 @@ public:
      * After the parallel run, the offline sampling engine snapshots the
      * shared atomic array into a plain `std::vector<uint64_t>` and hands it
      * to the primary so the existing `node_access_counts()` accessor
-     * (consumed by `persist_node_counts_`) returns the full run's tally
+     * (consumed by `node_counts_io::persist`) returns the full run's tally
      * without requiring a per-worker merge pass.
      */
     void adopt_counts(std::vector<uint64_t> counts);

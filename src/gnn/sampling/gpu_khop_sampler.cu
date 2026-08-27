@@ -34,7 +34,9 @@ namespace mdb::gnn {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Philox 4x32-10 counter-based RNG (Random123 constants). Pure function of
+// Philox 4x32-10 counter-based RNG (Salmon et al., "Parallel Random Numbers:
+// As Easy as 1, 2, 3", SC 2011, sec. 4.3 — the Philox-4x32 multipliers
+// 0xD2511F53 / 0xCD9E8D57 come from there). Pure function of
 // (key, counter): no per-thread state, so the draw for a given (node, layer,
 // stream-index) is identical regardless of how threads are scheduled.
 // ---------------------------------------------------------------------------
@@ -70,13 +72,18 @@ __device__ __forceinline__ uint32_t philox_u32_(uint64_t batch_seed,
 #pragma unroll
     for (int i = 0; i < 10; ++i) {
         philox_round_(ctr, key);
-        key[0] += 0x9E3779B9u;  // Weyl bump (golden ratio / sqrt5 constants)
-        key[1] += 0xBB67AE85u;
+        key[0] += 0x9E3779B9u;  // Weyl key increments: 32-bit truncations of the
+        key[1] += 0xBB67AE85u;  // golden-ratio and sqrt(3)-1 constants (Salmon et
+                                // al., "Parallel Random Numbers: As Easy as
+                                // 1, 2, 3", SC 2011, sec. 4.2).
     }
     return ctr[0];
 }
 
-// Unbiased-enough uniform in [0, m): Lemire's multiply-shift. m fits uint32.
+// Uniform in [0, m) via the multiply-shift reduction (Lemire, "Fast Random
+// Integer Generation in an Interval", ACM TOMACS 2019). We omit the paper's
+// rejection step, so a residual bias of at most m/2^32 per draw remains —
+// negligible against fanout-sized m. m fits uint32.
 __device__ __forceinline__ uint32_t uniform_below_(uint32_t r, uint32_t m) {
     return static_cast<uint32_t>((static_cast<uint64_t>(r) * static_cast<uint64_t>(m)) >> 32);
 }

@@ -7,8 +7,8 @@
 // phase of the Four-Level Topology Store: L1 RAM hash / L2 compact uint32 CSR /
 // L3 mmap sidecar / L4 direct B+Tree) and produced by:
 //   (a) `OfflineSamplingEngine::run()` at the END of a sample build
-//       (acumulates real access counts during sampling), and
-//   (b) `TopologyWalkProfiler` as a Phase-0 cheap profiler (random walks over
+//       (accumulates real access counts during sampling), and
+//   (b) `TopologyWalkProfiler` as a cheap cold-start profiler (random walks over
 //       the mmap-backed topology CSR sidecar files topology_{fwd,rev}.csr that
 //       provide O(1) neighbor slices) when no `node_counts.bin` exists yet.
 //
@@ -16,7 +16,7 @@
 // `TopologyFrequencyProfiler::compute_from_node_counts_` doesn't care
 // which producer wrote it.
 //
-// Format (mirrors offline_sampling_engine.cc::persist_node_counts_):
+// Format (written by `persist()` below):
 //
 //   Offset  Size              Field
 //   0       8B                Magic "NODECNT0"
