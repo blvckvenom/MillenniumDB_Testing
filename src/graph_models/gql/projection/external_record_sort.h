@@ -27,7 +27,7 @@
  *   - For 100M records at 256 MB buffer: R ≈ 20 runs, peak ≈ 320 MB
  * - I/O: ~3 passes over data (collection, sort, merge)
  *
- * ## Memory model — what `MDB_SORT_BUFFER_MB` bounds (Task 3.2)
+ * ## Memory model — what `MDB_SORT_BUFFER_MB` bounds
  *
  * `buffer_size_` is the single memory knob, sourced from `MDB_SORT_BUFFER_MB`
  * (or the adaptive `MemAvailable * 3/4`, floored at 256 MB) via

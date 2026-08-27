@@ -8,7 +8,7 @@
  * C++20 <semaphore> header (std::counting_semaphore) is unavailable. This
  * tiny helper provides just the acquire()/release() + RAII-guard surface
  * that RadixPartitionSort needs to bound how many Phase 2 workers submit to
- * the GPU concurrently (Task 5.1). It is intentionally not a general-purpose
+ * the GPU concurrently. It is intentionally not a general-purpose
  * synchronization primitive — only the operations exercised here are
  * implemented.
  */

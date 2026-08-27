@@ -235,7 +235,8 @@ NativeProjectionBuilder::NativeProjectionBuilder(
     // Default (Neo4j-GDS parity) is to always build node+edge label indexes.
     // The opt-out (`includeLabelIndexes: false` in graph_project config) skips
     // those 4 indexes when the workload has no `MATCH (n:Label)` queries
-    // — e.g. pure GNN training on the projection. See analysis doc §3.A.
+    // — e.g. pure GNN training on the projection — saving their disk and
+    // build time.
     features.include_node_labels = include_label_indexes_;
     features.include_edge_labels = include_label_indexes_;
 
@@ -462,7 +463,7 @@ bool EdgeAggregator::process_edge(ObjectId edge_id, std::optional<double> proper
 
         case Aggregation::COUNT:
             // Just count, no property needed
-            return false;  // Aggregate away
+            return false;
 
         default:
             throw std::runtime_error("Unknown aggregation strategy");
@@ -1507,8 +1508,6 @@ void NativeProjectionBuilder::try_extract_gnn_property(
 }
 
 void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
-    // Phase 3: Support property configurations with renaming and defaults
-
     // If we have property configs, use them for selective extraction with renaming/defaults
     if (!node_prop_configs.empty()) {
         bool interruption = false;
@@ -1634,8 +1633,6 @@ void NativeProjectionBuilder::extract_node_properties(ObjectId node_id) {
 }
 
 void NativeProjectionBuilder::extract_edge_properties(ObjectId edge_id) {
-    // Phase 3: Support property configurations with renaming and defaults
-
     // If we have property configs, use them for selective extraction with renaming/defaults
     if (!edge_prop_configs.empty()) {
         bool interruption = false;
@@ -1747,7 +1744,6 @@ void NativeProjectionBuilder::extract_edge_properties_excluding(
     // exclude_property. Used for SUM/COUNT aggregation to prevent storing
     // the original value before the aggregated value is computed.
 
-    // Phase 3: Support property configurations with renaming and defaults
     if (!edge_prop_configs.empty()) {
         bool interruption = false;
         auto& edge_key_value = gql_model.get_edge_key_value();
@@ -2385,8 +2381,9 @@ NativeProjectionBuilder::precompute_edge_filter_(const std::vector<std::string>&
     // heuristic.
     //
     // NOTE: ParallelEdgeDetector is NOT run here.  A detector that is never
-    // cleared grows to hold ALL kept edges (~138 bytes per entry), which
-    // caused 25 GB RSS on papers100M (Run 7 PSI-abort).  Detection instead
+    // cleared grows to hold ALL kept edges (~138 bytes per entry) — tens of
+    // GB of RSS on billion-edge graphs, enough to stall the host under
+    // memory pressure.  Detection instead
     // runs in scan_edges_impl_serialized_ on the first Phase C pass
     // (FROM_TO_EDGE), mirroring the per-batch clear() pattern of the classic
     // path (scan_edges_impl_classic_, line 723).
@@ -2474,8 +2471,9 @@ void NativeProjectionBuilder::scan_edges_impl_serialized_(
     // while still throwing the same QueryException before any B+Tree build begins.
     // The per-batch clear() mirrors classic's pattern in scan_edges_impl_classic_:
     // after each BATCH_SIZE flush the map is cleared, keeping peak RSS bounded
-    // regardless of graph size.  This replaces the unbounded Phase B detector
-    // that caused 25 GB RSS on papers100M (Run 7 PSI-abort).  The bound makes
+    // regardless of graph size.  This replaces an earlier unbounded Phase B
+    // detector whose RSS grew with the kept-edge count (tens of GB on
+    // billion-edge graphs).  The bound makes
     // detection windowed, not exact — parallels more than BATCH_SIZE apart in
     // scan order escape detection (see the ParallelEdgeDetector class doc).
     const bool run_detection = has_flag(target_mask, ProjectionIndex::FROM_TO_EDGE);
@@ -2644,7 +2642,8 @@ std::vector<ProjectionIndex> NativeProjectionBuilder::enabled_indexes_() const {
     std::vector<ProjectionIndex> out;
 
     // Phase A: nodes first (CRITICAL — finalize_node_scan populates
-    // collected_nodes_ that Phase B's has_node() depends on, spec §6 I1).
+    // collected_nodes_ that Phase B's has_node() depends on — the node
+    // scan must complete before any edge scan).
     // Label and property indexes follow in a fixed order.
     out.push_back(ProjectionIndex::NODES);
 
@@ -2662,9 +2661,9 @@ std::vector<ProjectionIndex> NativeProjectionBuilder::enabled_indexes_() const {
     // empty. Under SERIALIZED, property extraction only runs during
     // NODE_KEY_VALUE / KEY_VALUE_NODE passes — so we MUST include them
     // whenever GNN is active, regardless of features.include_node_properties.
-    // Without this, Cora's testAccuracy drops from 0.7900 to random
-    // (code-review finding, see TODO(serialized-gnn-property-pass) in
-    // scan_nodes_impl_serialized_).
+    // Without this, the labels/splits never reach the GNN buffers and
+    // downstream training degrades to random accuracy (see
+    // TODO(serialized-gnn-property-pass) in scan_nodes_impl_serialized_).
     bool needs_node_properties = !node_property_keys.empty() || !node_prop_configs.empty();
 #ifdef ENABLE_GNN
     needs_node_properties = needs_node_properties || (gnn_row_mapping_ != nullptr);
@@ -2776,7 +2775,8 @@ void NativeProjectionBuilder::finalize_serialized_() {
     }
 
     // ---- Phase A: node indexes — one scan + build + reset per index ----
-    // NODES pass runs first and calls finalize_node_scan() (spec §6 I1).
+    // NODES pass runs first and calls finalize_node_scan() — the node
+    // scan must complete before any edge scan.
     // Subsequent label/property passes scan the same label_node index
     // but emit only to their target buffers.
     //
@@ -2786,7 +2786,8 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // build runs, causing those records to be omitted from the B+Tree and later
     // re-processed by the flush() call, which overwrites the correct index with
     // a partial dataset (correctness invariant: buffers must be fully flushed
-    // before build_one_index() reads them — I4 golden compare guard).
+    // before build_one_index() reads them; the serialized path must produce
+    // B+Trees bit-identical to the classic build).
     for (auto idx : node_phase) {
         // Skip topology index materialization when its bit is not set in the
         // active IndexSet preset mask. Property indexes bypass this gate (see
@@ -2818,7 +2819,8 @@ void NativeProjectionBuilder::finalize_serialized_() {
     // ---- Phase C: edge indexes — one scan + build + reset per index ----
     // Each pass calls scan_edges_impl_serialized_ with a single-bit mask;
     // the EdgeFilter (Phase B) replaces per-edge has_node() lookups with
-    // O(1) bitmap probes (spec §6 I2: filter is immutable after finalize()).
+    // O(1) bitmap probes (the filter is write-once: immutable after
+    // finalize(), so every pass reads the same bits).
     // drain_pending_batches() before each build ensures the streaming buffer
     // is fully populated (same correctness argument as Phase A above).
     for (auto idx : edge_phase) {
@@ -2987,7 +2989,7 @@ void NativeProjectionBuilder::build_one_topology_snapshot_(
     // — so we mask off the type tag via ObjectId::VALUE_MASK before using
     // the value as a degrees[] subscript. This assumes the projection's
     // node ObjectIds are a dense [0, N) range after stripping the type
-    // tag, which holds for single-label projections (the thesis case:
+    // tag, which holds for single-label projections (e.g.
     // cora_gnn, ogbn-*, papers100M). Non-dense multi-label projections
     // are a known limitation (skipped+warned in future work).
     std::vector<uint64_t> degrees(num_nodes, 0);

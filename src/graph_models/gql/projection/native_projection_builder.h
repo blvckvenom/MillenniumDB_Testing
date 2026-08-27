@@ -391,8 +391,6 @@ ObjectId pack_aggregated_property_value(Aggregation aggregation, double agg_valu
  *   2. Batch nodes/edges in memory (BATCH_SIZE = 1000)
  *   3. Flush batches to ProjectionStorage
  *   4. Track statistics and progress
- *
- * @see ARCHITECTURE_DESIGN.md Section 3.2 for complete design
  */
 class NativeProjectionBuilder {
 public:
@@ -476,13 +474,12 @@ public:
      *        Queries that require labels on a projection built with
      *        include_label_indexes=false will throw QueryException with a
      *        message suggesting re-creation.
-     *        See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md §3.A.
      * @param index_set User-selected preset controlling which B+Tree indexes
      *        will be materialized at build time. Defaults to IndexSet::ALL
-     *        which preserves prior behavior. The value is stored on the
-     *        builder for later consumption by catalog serialization and
-     *        build-phase gating. Does NOT yet affect the indexes produced
-     *        by this constructor.
+     *        which preserves prior behavior. The value is propagated to
+     *        ProjectionStorage and consulted by the build phases, which skip
+     *        any topology index absent from the preset's mask; property
+     *        indexes remain governed solely by the property configuration.
      * @param build_topology_snapshot When true, emit `topology_fwd.csr`
      *        and/or `topology_rev.csr` mmap-backed CSR sidecar files
      *        alongside the projection's B+Tree files after the normal
@@ -577,10 +574,9 @@ public:
      * Reflects the value wired in by graph_project's `indexSet` config key
      * (or IndexSet::ALL when the key is absent / the legacy positional
      * constructor is used). Exposed for testability of the parsing logic;
-     * the build pipeline itself does not yet consume this value (catalog
-     * serialization and build-phase gating consume it later). Defined
-     * out-of-line in the .cc so this header can keep IndexSet as a forward
-     * declaration.
+     * the build phases and catalog serialization consume the same stored
+     * value. Defined out-of-line in the .cc so this header can keep
+     * IndexSet as a forward declaration.
      */
     IndexSet get_index_set() const noexcept;
 
@@ -705,7 +701,7 @@ private:
      * has_node() work is paid once instead of 9×. ParallelEdgeDetector
      * is NOT run here — it lives in scan_edges_impl_serialized_ (first
      * FROM_TO_EDGE pass) with per-batch clear() to keep memory bounded.
-     * Called exactly once by finalize_serialized_ (Task 10) after
+     * Called exactly once by finalize_serialized_ after
      * Phase A has populated ProjectionStorage::collected_nodes_.
      *
      * Also resizes ProjectionStorage's Bloom filter based on the total
@@ -787,8 +783,8 @@ private:
      * IMPORTANT: under ENABLE_GNN, pushes NODE_KEY_VALUE + KEY_VALUE_NODE
      * whenever gnn_row_mapping_ is non-null, even if no node properties are
      * configured. This preserves classic's GNN label/split extraction
-     * side-effect via try_extract_gnn_property (see
-     * scan_nodes_impl_serialized_'s TODO(task10-gnn)).
+     * side-effect via try_extract_gnn_property (see the matching
+     * comment in scan_nodes_impl_serialized_).
      */
     std::vector<ProjectionIndex> enabled_indexes_() const;
 
@@ -796,14 +792,16 @@ private:
      * @brief Returns true if any type in stored_types_ uses an aggregation
      *        mode other than SINGLE.
      *
-     * Serialized mode falls back to classic in that case (spec §3 D8).
-     * Aggregation state (COUNT/SUM/MIN/MAX maps) is too large to persist
-     * across 9 edge-index passes.
+     * Serialized mode falls back to classic (with a warning) in that case:
+     * the aggregation state (COUNT/SUM/MIN/MAX maps) grows with the number
+     * of distinct (from, to, type) groups — tens of GB on billion-edge
+     * graphs — and holding it across 9 edge-index passes would defeat the
+     * bounded-memory point of the serialized pipeline.
      */
     bool has_non_single_aggregation_() const;
 
     // Input state captured from the public scan_* methods for later
-    // replay in finalize_serialized_ (Task 10). scan_inputs_captured_
+    // replay in finalize_serialized_. scan_inputs_captured_
     // prevents double-capture.
     std::vector<std::string> stored_labels_;
     std::vector<std::string> stored_types_;
@@ -831,7 +829,7 @@ private:
     Aggregation aggregation;
     std::string aggregation_property_key;  // Property to use for MIN/MAX/SUM aggregation
 
-    // GNN extension fields (stored for Task 11 extraction logic)
+    // GNN extension fields consumed by try_extract_gnn_property
     std::string include_features_;
     std::string label_property_;
     std::string split_property_;

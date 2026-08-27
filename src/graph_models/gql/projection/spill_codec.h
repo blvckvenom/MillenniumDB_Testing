@@ -8,10 +8,8 @@
 // ObjectIds. For billion-scale graphs (papers100M, MAG240M) the spill peak
 // dominates disk pressure during projection build. Compressing spills
 // transparently reduces peak disk by ~3-4x without touching query paths,
-// B+Tree layout, or the projection ABI — spills are ephemeral by design.
-//
-// See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md
-// for root-cause analysis, design rationale, and safety matrix.
+// B+Tree layout, or the projection ABI — spills are ephemeral by design,
+// so a codec change can never corrupt anything durable.
 
 #include <cstddef>
 #include <cstdint>
@@ -24,9 +22,13 @@ namespace GQL {
 /// Compression algorithm used for spill files.
 ///
 /// Sorted uint64 tuples (graph edge records) compress 3-5x with LZ4 in
-/// practice. LZ4 was chosen over zstd because decompress speed exceeds
-/// NVMe read throughput — compression is effectively free for I/O-bound
-/// spill reads. See analysis doc §3.B for the full justification.
+/// practice: adjacent sorted records share long key prefixes, and ObjectIds
+/// allocated sequentially share their top bits, so most of each 8-byte word
+/// is a repeat of the previous record. LZ4 was chosen over zstd because
+/// single-threaded LZ4 decompression outruns sustained consumer-NVMe read
+/// throughput — decompression is effectively free for I/O-bound spill
+/// reads — while zstd's better ratio costs severalfold more encode CPU,
+/// which would move the bottleneck from I/O to CPU.
 enum class SpillCompression : uint8_t {
     NONE = 0,  ///< Raw bytes. Always supported; legacy-compatible output.
     LZ4  = 1,  ///< LZ4 frame format. Requires HAS_LZ4 (liblz4) at build time.

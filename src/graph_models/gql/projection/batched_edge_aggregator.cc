@@ -12,7 +12,7 @@
 // GPU path: a CPU-equivalent stub today. The contract is intentional: the
 // stub returns the same output as the CPU path so any consumer that wires
 // `Backend::AUTO` (or `Backend::GPU` once enabled) sees no behavioural
-// change pre-v2. A future GPU version swaps the stub body for `cub::DeviceRadixSort`
+// change until a real GPU body lands, which would swap the stub for `cub::DeviceRadixSort`
 // + `cub::DeviceReduce::ReduceByKey` (or `DeviceSegmentedReduce` once
 // segment offsets are computed) without touching consumers.
 

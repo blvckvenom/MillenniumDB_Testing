@@ -25,9 +25,6 @@
 // Error model: every I/O failure throws `std::runtime_error` with a
 // filesystem-qualified message. The `.tmp` file is best-effort removed on
 // destruction if `finalize()` did not run.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
-//                 §3.7, §4.3, §5.1, §5.3
 
 #include <atomic>
 #include <cstddef>

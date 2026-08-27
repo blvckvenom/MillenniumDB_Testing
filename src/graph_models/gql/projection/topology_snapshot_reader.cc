@@ -23,7 +23,7 @@ namespace GQL::Projection {
 
 namespace {
 
-// Output filename for each direction (§5.1), mirrors topology_snapshot_writer.cc.
+// Output filename for each direction; mirrors topology_snapshot_writer.cc.
 const char* output_basename_for(TopologySnapshotReader::Direction d) {
     switch (d) {
     case TopologySnapshotReader::Direction::FORWARD: return "topology_fwd.csr";
@@ -32,7 +32,7 @@ const char* output_basename_for(TopologySnapshotReader::Direction d) {
     return "topology_fwd.csr";  // unreachable; keeps compiler happy
 }
 
-// Source `.leaf` basename for each direction (§3.7). Mirrors the matching
+// Source `.leaf` basename for each direction. Mirrors the matching
 // helper in topology_snapshot_writer.cc so producer and consumer agree on
 // *which* file's bytes feed the SHA-256 — keeps the producer/consumer hash
 // chain symmetric.
@@ -395,8 +395,8 @@ TopologySnapshotReader TopologySnapshotReader::open(
     // staleness gate. When the caller KNOWS the projection's .leaf is unchanged
     // since the sidecar was built (the common repeated-sampling workflow), this
     // trades the safety net for the time. Default OFF (verify) — a stale
-    // sidecar silently producing wrong topology is a thesis-grade correctness
-    // bug, so trust must be explicit.
+    // sidecar silently producing wrong topology corrupts every downstream
+    // sample, so trust must be explicit.
     {
         const char* trust = std::getenv("MDB_GNN_TRUST_SIDECAR");
         if (trust && (trust[0] == '1' || trust[0] == 't' || trust[0] == 'T')) {
@@ -773,7 +773,7 @@ ConstU64Span TopologySnapshotReader::edge_ids(uint64_t node_idx) const {
             + std::to_string(header_.num_nodes));
     }
     if (edge_ids_ == nullptr) {
-        return {};  // No EDGE_IDS section in this file — spec §4.3 contract.
+        return {};  // No EDGE_IDS section in this file — empty span, not an error.
     }
     const uint64_t start = row_ptr_[node_idx];
     const uint64_t end   = row_ptr_[node_idx + 1];

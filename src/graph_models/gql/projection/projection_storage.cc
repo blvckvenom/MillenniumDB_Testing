@@ -1754,7 +1754,8 @@ void ProjectionStorage::reset_sort_scratch_() {
 
 void ProjectionStorage::begin_serial_edge_pass_(ProjectionIndex which) {
     // -----------------------------------------------------------------------
-    // Disk-bound fix for papers100M Run 7 (SERIAL+RADIX ENOSPC).
+    // Disk-bound fix: SERIAL+RADIX exhausted disk (ENOSPC) on
+    // billion-edge graphs before this per-pass masking existed.
     //
     // Root cause: flush_edge_batch() distributes every edge to ALL 5 edge
     // streaming buffers simultaneously. In the old design, pass 1
@@ -2111,7 +2112,7 @@ void ProjectionStorage::initialize_streaming_buffers() {
     //   different volume (HDD archive, tmpfs, separate SSD) when the DB
     //   volume is disk-constrained, without affecting where the final B+Tree
     //   indexes and catalog live. Spills are ephemeral so no persistent data
-    //   leaves the projection dir. See analysis doc §3.C.
+    //   leaves the projection dir.
     // =========================================================================
 
     std::string spill_base = projection_dir;

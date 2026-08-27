@@ -7,10 +7,7 @@
 // reader will share. No file I/O, no mmap, no SHA-256 state lives
 // here — those layers build on top of this format contract.
 //
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
-//                 §3.5, §4.3, §5.1, §5.2
-//
-// On-disk layout (little-endian, see §5.1):
+// On-disk layout (little-endian):
 //
 //   Offset  Size  Field              Notes
 //   ────────────────────────────────────────────────────────────────────
@@ -92,7 +89,7 @@ inline constexpr std::size_t kTopologySnapshotHeaderSize = 64;
 // Header struct — byte-exact on-disk representation
 // ---------------------------------------------------------------------------
 //
-// Field ordering is intentional (§5.1) for natural alignment under the C++
+// Field ordering is intentional for natural alignment under the C++
 // standard layout rules so that `sizeof == 64` holds without padding on
 // every supported target. `static_assert` below locks this in at compile
 // time.
@@ -117,7 +114,7 @@ struct TopologySnapshotHeader {
 };
 
 static_assert(sizeof(TopologySnapshotHeader) == kTopologySnapshotHeaderSize,
-              "TopologySnapshotHeader must be exactly 64 bytes — see spec §5.1");
+              "TopologySnapshotHeader must be exactly 64 bytes to match the on-disk layout");
 static_assert(alignof(TopologySnapshotHeader) <= 8,
               "TopologySnapshotHeader alignment must be <= 8 to match disk layout");
 
@@ -127,7 +124,9 @@ static_assert(alignof(TopologySnapshotHeader) <= 8,
 
 /// Exception type raised by `parse_topology_snapshot_header` when a byte
 /// buffer fails validation. Use this to drive the reader's "stale/corrupt
-/// → fall back to B+Tree" policy (§3.4, §5.2).
+/// → fall back to B+Tree" policy: a snapshot that fails any check is not an
+/// error for the caller — the reader reports no data and neighbor lookups
+/// take the original B+Tree path instead.
 class TopologySnapshotFormatError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;

@@ -51,7 +51,7 @@ class BPlusTree;
  *
  * @note This is a singleton - use the global `gql_model` reference
  * @see GQLCatalog for metadata and statistics
- * @see docs/native_projection_review/ for projection architecture
+ * @see ProjectionManager and NativeProjectionBuilder for the projection machinery
  */
 class GQLModel {
 public:

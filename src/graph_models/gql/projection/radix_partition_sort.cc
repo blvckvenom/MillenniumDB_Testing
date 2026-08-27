@@ -362,11 +362,12 @@ static std::size_t write_btree_from_sorted_partitions_delta_varint_(
 // BPTLeafCSRWriter, which groups by record[0] (src) and emits chain-head +
 // optional continuation pages. A trivial root .dir (key_count=0) is emitted;
 // lookups route to leaf 0 and walk the next_leaf chain. Correctness-first MVP:
-// src-keyed directory routing is deferred to a later Gate D bench optimization.
+// src-keyed directory routing is deferred until scan benchmarks show the
+// leaf-chain walk is a bottleneck.
 //
 // N == 3 is the only instantiation that produces sensible CSR output
-// (src, dst, edge_id). The writer drops edge_id (design §3.4 notes the
-// single-stream v3 payload does not encode it) — on read, v3 returns 0
+// (src, dst, edge_id). The writer drops edge_id (the single-stream v3
+// payload does not encode it) — on read, v3 returns 0
 // for position 2, which GnnProjectionAdapter / TopologyAccessor callers
 // tolerate.
 template<std::size_t N>
@@ -497,7 +498,7 @@ RadixPartitionSort<N>::RadixPartitionSort(Config config)
     }
     fs::create_directories(config_.scratch_dir);
 
-    // Task 5.1: size the GPU-submission semaphore once, from the environment.
+    // Size the GPU-submission semaphore once, from the environment.
     // Default 1 (serialize all GPU submits — the single device sorts one
     // partition at a time while the other workers run CPU sorts in parallel).
     // Clamp to [1, 8] to keep a bound on contention even on a misconfigured
@@ -748,7 +749,7 @@ std::size_t RadixPartitionSort<N>::sort_and_write(
         }
     }
 
-    // Task 4.2: one-line summary of where Phase 2 sorted each partition.
+    // One-line summary of where Phase 2 sorted each partition.
     // Proves the GPU per-partition path actually ran (gpu>0) vs everything
     // routing to CPU (gpu==0, e.g. partitions below the planner's
     // min_records_gpu threshold or a non-CUDA build).
@@ -825,7 +826,7 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
                          partition_idx);
         }
         if (gpu_eligible) {
-            // Task 5.1: bound concurrent GPU submissions. Acquire the
+            // Bound concurrent GPU submissions. Acquire the
             // semaphore immediately before the GPU-submission region and
             // release it on every exit/exception path via the RAII guard;
             // the other Phase 2 workers sort their partitions on the CPU
@@ -866,7 +867,7 @@ void RadixPartitionSort<N>::sort_partition_in_memory(
             std::vector<std::string> empty_spill_files;
             std::vector<std::size_t> empty_spill_counts;
 
-            // Task 4.2: determine whether the GPU will *actually* sort this
+            // Determine whether the GPU will *actually* sort this
             // partition (vs sort_and_stream internally downgrading to CPU for a
             // sub-threshold or oversized partition) by replaying the same plan
             // the wrapper computes. Without this the telemetry would count a

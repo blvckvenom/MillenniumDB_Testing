@@ -58,7 +58,7 @@ class ProjectionStorage;  // forward decl — full definition not needed in head
 
 class EdgeKeepBitmapGpuBatcher {
 public:
-    /// Tunables. Defaults chosen for the celebi target hardware:
+    /// Tunables. Defaults tuned on a PCIe Gen5 host with a consumer GPU:
     ///   - 1 M edges per flush ≈ 24 MB SoA, fits a single H2D burst at
     ///     PCIe Gen5 in <1 ms.
     ///   - min_edges_for_gpu = 64 K is the empirical break-even point on

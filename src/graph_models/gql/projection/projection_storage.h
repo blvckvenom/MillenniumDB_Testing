@@ -842,9 +842,9 @@ private:
      * @brief Sorted-vector tracker for inserted node IDs during scan.
      *
      * Replaces an earlier std::unordered_set<uint64_t>, whose per-entry
-     * overhead (~48 B on libstdc++) was dominating scan-phase RSS on
-     * 100M+ node graphs (see
-     * `docs/superpowers/thesis_analysis/2026-04-20-node-bloom-scan-memory-design.md`).
+     * overhead (~48 B on libstdc++ — node header, bucket pointer, and
+     * padding around the 8-byte key) was dominating scan-phase RSS on
+     * 100M+ node graphs. A sorted vector stores only the key itself.
      *
      * Protocol:
      *   - `add_node` appends unconditionally (no per-call dedup check).

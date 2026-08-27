@@ -4,14 +4,16 @@
 //
 // Opens `topology_fwd.csr` (FORWARD) or `topology_rev.csr` (REVERSE) from a
 // projection directory, validates the 64-byte header plus the structural
-// invariants defined in §5.2 of the spec, and exposes O(1) slices into the
-// COL_IDX (and optional EDGE_IDS) sections via `ConstU64Span` — a minimal
-// `std::span<const uint64_t>`-shaped view. The spec writes `std::span`
-// (§4.3) but the project targets C++17; `ConstU64Span` is the smallest
+// invariants (exact file size implied by the header fields, ROW_PTR[0] == 0,
+// ROW_PTR[N] == M, and ROW_PTR monotonicity where the O(N) pass is cheap
+// enough to be always-on), and exposes O(1) slices into the COL_IDX (and
+// optional EDGE_IDS) sections via `ConstU64Span` — a minimal
+// `std::span<const uint64_t>`-shaped view. The natural type would be
+// `std::span`, but the project targets C++17; `ConstU64Span` is the smallest
 // possible substitute that keeps the reader's public surface unchanged
 // when we later upgrade to C++20.
 //
-// Fallback-first architecture (§3.4): missing / malformed / stale sidecars
+// Fallback-first architecture: missing / malformed / stale sidecars
 // are NOT errors. `open()` always succeeds (modulo out-of-memory during its
 // own construction) and returns a reader whose `has_data() == false`. The
 // caller — today `TopologyAccessor::Impl`, tomorrow anything that
@@ -24,10 +26,6 @@
 // `verify_source_sha256()`. `open()` runs the verification
 // after structural validation and collapses a mismatch into the same
 // has_data()==false fallback path used for the "sidecar absent" case.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
-//                 §3.4 (fallback-first arch), §4.3 (C++ surface),
-//                 §5.1 (on-disk layout), §5.2 (validation checklist).
 
 #include <cstddef>
 #include <cstdint>
@@ -166,7 +164,8 @@ public:
     /// this is a memcpy of the stored uint64s; for id_width==4 each stored
     /// uint32 is widened and OR'd with `dst_type_tag()` shifted into the top
     /// byte, reproducing the exact tagged ObjectId the uint64 layout would
-    /// have stored (the losslessness contract — see spec §"Why lossless").
+    /// have stored. The writer only chooses the narrow layout when that
+    /// reconstruction is exact for every value, so no information is lost.
     /// `out` is appended to (not cleared); the caller may `reserve` via
     /// `degree()`. Same out-of-range / no-data hardening as `neighbors()`.
     void copy_neighbors(uint64_t node_idx, std::vector<uint64_t>& out) const;
@@ -256,7 +255,8 @@ private:
     TopologySnapshotHeader header_ = {};
 
     // Raw mmap base + byte length. mmap'd with MAP_PRIVATE + MADV_RANDOM.
-    // `file_size_` equals the size computed from the header (§5.2 step 4).
+    // `file_size_` equals the exact size the header implies (64-byte header
+    // + ROW_PTR + COL_IDX + optional EDGE_IDS); `open()` rejects any mismatch.
     void*       map_base_  = nullptr;
     std::size_t file_size_ = 0;
 

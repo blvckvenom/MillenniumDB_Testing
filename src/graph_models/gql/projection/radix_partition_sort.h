@@ -9,9 +9,6 @@
  * Implemented in radix_partition_sort.cc; unit tests live in
  * src/tests/radix_partition_sort_test.cc, and golden-compare integration
  * against the CLASSIC backend in scripts/test_projection_radix.sh.
- *
- * Design notes:
- *   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2
  */
 
 #include <atomic>
@@ -62,7 +59,9 @@ public:
         // When CSR_HYBRID, Phase 3 emits v3 CSR leaves via BPTLeafCSRWriter<N>
         // (the edge-index B+Tree leaves themselves become the CSR layout, enabling
         // O(1) neighbor slices without a separate sidecar). Callers gate this to
-        // N==3 edge indexes (FROM_TO_EDGE / TO_FROM_EDGE) per design §3.6 D6.
+        // N==3 edge indexes (FROM_TO_EDGE / TO_FROM_EDGE): only their
+        // (src, dst, edge_id) records have a clean CSR interpretation where
+        // src becomes implicit; other indexes keep their leaf_format layout.
         // Default BTREE preserves byte-identical RADIX output with standard
         // BITSET/DELTA_VARINT leaf encoding.
         BPT::GraphStorage graph_storage    = BPT::GraphStorage::BTREE;

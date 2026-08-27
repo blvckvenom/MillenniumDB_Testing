@@ -24,7 +24,8 @@ namespace GQL {
  * prefixes are parsed but ignored. This is intentional:
  *
  * - Full catalog support requires Feature GT03 (multi-graph transactions)
- * - Neo4j GDS also uses flat namespace for projections
+ * - Neo4j GDS likewise references projections by a single name in its
+ *   graph catalog (no catalog/schema hierarchy)
  * - GNN training workflows don't require multi-catalog support
  *
  * FUTURE EXTENSIBILITY:

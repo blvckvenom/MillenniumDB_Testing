@@ -62,7 +62,8 @@ bool EdgeKeepBitmapGpuBatcher::gpu_path_available() {
     static const bool cached = []() {
         // Only "0" (the documented disable value) is treated as an opt-out.
         // Any other value — including empty string — keeps GPU on, matching
-        // the convention of MDB_PROJECTION_SORTER (CLAUDE.md L240). choice()
+        // the convention of MDB_PROJECTION_SORTER (an unrecognised value
+        // falls back to the default rather than erroring). choice()
         // reproduces that exactly, since an unrecognised value falls back to
         // "1"; the difference is that it is now reported rather than assumed.
         if (Ablation::choice("MDB_PROJECTION_BITMAP_GPU", "1", {"0", "1"}) == "0") {
@@ -135,9 +136,9 @@ void EdgeKeepBitmapGpuBatcher::flush() {
 // Heuristic: GPU if (a) gpu_path_available() and (b) the batch is large
 // enough to amortize PCIe round-trip + kernel launch. Tiny graphs
 // (cora_gnn: 5 K edges total) always go through CPU even when GPU is
-// healthy — H2D + kernel + D2H overhead is ~200 µs on celebi, vs ~5 ms
-// for the entire CPU loop on 5 K edges, so GPU is a regression at that
-// scale. The threshold lives in cfg_.min_edges_for_gpu so tests can
+// healthy — the fixed H2D + kernel + D2H overhead (~200 µs on a PCIe
+// Gen5 host) is pure loss when the whole CPU loop is only a few ms, so
+// GPU buys nothing at that scale. The threshold lives in cfg_.min_edges_for_gpu so tests can
 // override it (see edge_keep_bitmap_gpu_test.cc).
 // ---------------------------------------------------------------------------
 void EdgeKeepBitmapGpuBatcher::flush_n_(std::size_t n) {
@@ -204,9 +205,9 @@ void EdgeKeepBitmapGpuBatcher::run_cpu_(std::size_t n) {
 //                          In Phase B, finalize_node_scan has already been
 //                          called by Phase A, so the array is stable, and
 //                          re-uploading is just wasted bandwidth.
-//                          OPTIMISATION DEFERRED to a follow-up spec — the
-//                          simple version is correct and the bandwidth cost
-//                          is small relative to the kernel work.)
+//                          OPTIMISATION DEFERRED — the simple version is
+//                          correct and the bandwidth cost is small
+//                          relative to the kernel work.)
 //   - d_keep_flags:        n × uint8         → n bytes
 //
 // For papers100M (1.6 B edges, 56 M nodes): one flush of 1 M edges is

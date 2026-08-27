@@ -21,7 +21,7 @@ namespace GQL::Projection {
 
 namespace {
 
-// Source `.leaf` basename for each direction (§3.7).
+// Source `.leaf` basename for each direction.
 const char* source_basename_for(TopologySnapshotWriter::Direction d) {
     switch (d) {
     case TopologySnapshotWriter::Direction::FORWARD: return "from_to_edge.leaf";
@@ -30,7 +30,7 @@ const char* source_basename_for(TopologySnapshotWriter::Direction d) {
     return "from_to_edge.leaf";  // unreachable
 }
 
-// Output filename for each direction (§5.1).
+// Output filename for each direction.
 const char* output_basename_for(TopologySnapshotWriter::Direction d) {
     switch (d) {
     case TopologySnapshotWriter::Direction::FORWARD: return "topology_fwd.csr";
@@ -182,7 +182,7 @@ TopologySnapshotWriter::TopologySnapshotWriter(
     }
 
     // Build row_ptr as prefix sum of degrees. row_ptr has length N+1 and
-    // encodes invariant row_ptr[0]=0, row_ptr[N]=M (§5.1).
+    // encodes the format invariant row_ptr[0]=0, row_ptr[N]=M.
     row_ptr_.resize(static_cast<std::size_t>(num_nodes_) + 1);
     row_ptr_[0] = 0;
     uint64_t running = 0;
@@ -271,11 +271,11 @@ TopologySnapshotWriter::TopologySnapshotWriter(
                 + " (errno=" + std::to_string(e) + ")");
         }
 
-        // Step 1 (§5.3): 64-byte zero placeholder. Rewritten in finalize().
+        // 64-byte zero placeholder header. Rewritten in finalize().
         std::array<uint8_t, kTopologySnapshotHeaderSize> zero_header{};
         pwrite_all(zero_header.data(), zero_header.size(), 0);
 
-        // Step 2 (§5.3 extended): write ROW_PTR immediately. The body layout
+        // Write ROW_PTR immediately. The body layout
         // is fixed — ROW_PTR is right after the header — so we can commit it
         // now. COL_IDX and (optionally) EDGE_IDS are filled in by
         // append_edge() via pwrite at the per-edge offsets implied by row_ptr_.
@@ -329,7 +329,7 @@ TopologySnapshotWriter::TopologySnapshotWriter(
     }
 
     // Build row_ptr as prefix sum of degrees. row_ptr has length N+1 and
-    // encodes invariant row_ptr[0]=0, row_ptr[N]=M (§5.1).
+    // encodes the format invariant row_ptr[0]=0, row_ptr[N]=M.
     row_ptr_.resize(static_cast<std::size_t>(num_nodes_) + 1);
     row_ptr_[0] = 0;
     uint64_t running = 0;
@@ -460,9 +460,9 @@ void TopologySnapshotWriter::append_edge(ObjectId src, ObjectId dst, ObjectId ed
 
     // Always-on invariant checks. Release-build silent corruption of the
     // CSR body would not be caught by the reader's SHA-256 (that hashes the
-    // source .leaf, not the CSR). Wrong sampling output is a thesis-grade
-    // correctness bug; the extra branch cost per edge is negligible vs the
-    // 8-byte pwrite syscall that follows.
+    // source .leaf, not the CSR). Wrong sampling output would silently
+    // corrupt every downstream training run; the extra branch cost per edge
+    // is negligible vs the 8-byte pwrite syscall that follows.
     if (src_idx >= num_nodes_) {
         throw std::runtime_error(
             "TopologySnapshotWriter: src_idx " + std::to_string(src_idx)
@@ -754,7 +754,7 @@ void TopologySnapshotWriter::finalize() {
         }
     }
 
-    // Rewrite header at offset 0 with real values (§5.3 step 5). Symmetric mode
+    // Rewrite header at offset 0 with real values. Symmetric mode
     // uses the "TOPOSYM1" magic/version so directional readers never mis-parse it.
     TopologySnapshotHeader header = symmetric_format_
         ? make_default_topology_snapshot_sym_header()
@@ -784,7 +784,8 @@ void TopologySnapshotWriter::finalize() {
     serialize_topology_snapshot_header(header, hdr_buf);
     pwrite_all(hdr_buf, kTopologySnapshotHeaderSize, 0);
 
-    // fsync the file data + rename + fsync parent dir (§5.3 steps 6-8).
+    // Commit atomically: fsync the file data, rename .tmp into place, then
+    // fsync the parent dir so the rename itself is durable.
     if (::fsync(out_fd_) != 0) {
         int e = errno;
         throw std::runtime_error(

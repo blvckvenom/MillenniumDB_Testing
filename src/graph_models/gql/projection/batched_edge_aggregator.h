@@ -40,7 +40,8 @@
 // matching the legacy `EdgeAggregator::process_edge` SINGLE branch text, so
 // existing test assertions over the SINGLE error message remain valid.
 //
-// Integration plan (NOT done in this commit — see commit body):
+// Integration note (the wiring below is NOT yet done; only unit tests
+// exercise this class today):
 //   `ExternalEdgeSort::stream_sorted` is the natural wiring point. When the
 //   in-memory branch (`fits_in_memory()` true) runs, the existing per-record
 //   callback can be replaced by a single
@@ -48,11 +49,11 @@
 //   stays on the streaming path because the records arrive lazily through a
 //   k-way merge and never form a contiguous span. That asymmetry is fine:
 //   the in-memory branch is the one that hits multi-billion-record graphs
-//   with VRAM-resident data (papers100M scale when using the Four-Level
-//   Topology Store, which keeps hot hubs in L1 RAM hash / L2 compact uint32
-//   CSR / L3 mmap sidecar / L4 direct B+Tree and returns neighbor slices
-//   in O(1) for the frequently-accessed nodes), which is exactly the
-//   wave 2 acceleration target.
+//   with VRAM-resident data (papers100M scale when using the four-level
+//   topology store, which keeps hot hubs in a RAM hash / compact uint32
+//   CSR / mmap sidecar / direct B+Tree tiering and returns neighbor slices
+//   in O(1) for the frequently-accessed nodes) — the case GPU
+//   acceleration is meant for.
 
 #pragma once
 

@@ -5,22 +5,21 @@
  * @brief Thin dispatch facade that selects a sorting backend for projection
  *        B+tree index building.
  *
- * Introduced for the Radix-Partition Sort campaign. Reads the environment
+ * Introduced together with the RADIX backend. Reads the environment
  * variable MDB_PROJECTION_SORTER once on first call:
  *
  *   - unset (or any unrecognized value)  → SorterBackend::CLASSIC  (default)
- *   - "radix"                            → SorterBackend::RADIX    (wired later)
+ *   - "radix"                            → SorterBackend::RADIX
  *
- * In the M1 scaffolding step, the RADIX case falls through to CLASSIC so that
- * the facade is a no-op behavioral change. The new RadixPartitionSort backend
- * is wired into the RADIX case in a later task (Task 12) once it passes unit
- * tests.
+ * The RADIX case runs the RadixPartitionSort backend end-to-end (parallel
+ * scan → per-partition sort → B+Tree build); CLASSIC preserves the
+ * pre-facade ExternalRecordSort path unchanged.
  *
- * ## Signature adaptation (recorded here for future reviewers)
+ * ## Why `sort_and_build_index` takes a build callback
  *
- * The design plan originally specified a hypothetical static API
- * `ExternalRecordSort<N>::build_index_from_stream(buffer, base_path)` which
- * does NOT exist in this codebase. The real flow (see
+ * A natural-looking static API such as
+ * `ExternalRecordSort<N>::build_index_from_stream(buffer, base_path)` does
+ * NOT exist in this codebase. The real flow (see
  * `ProjectionStorage::build_all_indexes_bulk`) is:
  *
  *   1. Drain a `StreamingRecordBuffer<N>` (spill paths + in-memory records)
@@ -38,8 +37,8 @@
  *       return this->build_index_streaming<N>(s, p);
  *   }
  *
- * This mirrors the existing pattern in `projection_storage.cc`. A later task
- * can, if desired, promote `build_index_streaming` to a free function and drop
+ * This mirrors the existing pattern in `projection_storage.cc`. A future
+ * refactor could promote `build_index_streaming` to a free function and drop
  * the callback parameter.
  */
 
@@ -56,7 +55,7 @@ namespace GQL {
 
 enum class SorterBackend {
     CLASSIC,  ///< Existing ExternalRecordSort path (default).
-    RADIX,    ///< New RadixPartitionSort path (M5+). Selected via env var.
+    RADIX,    ///< RadixPartitionSort path. Selected via env var.
 };
 
 /**
@@ -92,9 +91,9 @@ using BuildFromSorterFn =
  *                          the sorter). Its spill files and memory buffer
  *                          are moved into the sorter and cleared.
  * @param  index_base_path  Path prefix for `.leaf` and `.dir` output files.
- * @param  estimated_count  Reserved for the RADIX backend (partition-count
- *                          adaptive calculation, wired in Task 12). Unused
- *                          by the CLASSIC backend.
+ * @param  estimated_count  Consumed by the RADIX backend's scan-and-partition
+ *                          step for its adaptive partition-count calculation.
+ *                          Unused by the CLASSIC backend.
  * @param  build_from_sorter Callback that consumes the populated sorter and
  *                          writes the B+tree index. Typically a lambda
  *                          forwarding to `ProjectionStorage::build_index_streaming`.
