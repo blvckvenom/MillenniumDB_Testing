@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -784,72 +785,76 @@ uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder,
 }
 
 // =============================================================================
-// build() — The Core Pipeline
+// build() stage helpers (anonymous namespace — internal to this TU)
+//
+// Each helper is one stage of FourLevelStore::build(), extracted verbatim so
+// the pipeline reads as a sequence of named stages. All of them are pure
+// functions of their arguments (no FourLevelStore instance state — build()
+// is static).
 // =============================================================================
+namespace {
 
-FourLevelStore::BuildResult FourLevelStore::build(
-    const FeatureMatrix&         features,
-    const RowMapping&            row_mapping,
-    SampleStorage&               samples,
-    const Config&                config,
-    const fs::path&              db_folder,
-    const std::string&           feature_name)
+// Phase-log callback type: build() constructs one lambda stamping T+<seconds>
+// and every stage helper logs through it, so all stages share one time base.
+using LogPhaseFn = std::function<void(const std::string&)>;
+
+// All on-disk locations derived from (db_folder, feature_name, sample). Field
+// names match the historical locals in build() so stage helpers can bind
+// references with identical names and keep their moved bodies verbatim.
+struct BuildPaths {
+    fs::path    gnn_dir;
+    fs::path    gpu_cache_path;
+    fs::path    cpu_cache_path;
+    fs::path    meta_path;
+    fs::path    reordered_fmat;
+    fs::path    reordered_rmap;
+    std::string sample_dir;       // SampleStorage storage path (string form)
+    fs::path    packed_slim_dir;
+    fs::path    addr_tables_dir;
+    fs::path    store_fp_path;
+};
+
+// Derive every artifact path build() touches. Pure; assumes the samples'
+// catalog is already loaded (get_catalog() is a const accessor).
+BuildPaths make_build_paths(const fs::path&    db_folder,
+                            const std::string& feature_name,
+                            SampleStorage&     samples)
 {
-    auto total_start = std::chrono::high_resolution_clock::now();
-    BuildResult result;
+    BuildPaths p;
+    p.gnn_dir         = db_folder / "gnn_features";
+    p.gpu_cache_path  = p.gnn_dir / (feature_name + "_gpu_cache.bin");
+    p.cpu_cache_path  = p.gnn_dir / (feature_name + "_cpu_cache.bin");
+    p.meta_path       = p.gnn_dir / (feature_name + "_store.meta");
+    p.reordered_fmat  = p.gnn_dir / (feature_name + "_reordered.fmat");
+    p.reordered_rmap  = p.gnn_dir / (feature_name + "_reordered.rmap");
+    const auto& catalog = samples.get_catalog();
+    p.sample_dir      = SampleStorage::get_storage_path(
+                            db_folder.string(), catalog.sample_name);
+    p.packed_slim_dir = fs::path(p.sample_dir) / "packed_slim";
+    p.addr_tables_dir = fs::path(p.sample_dir) / "addr_tables";
+    p.store_fp_path   = p.gnn_dir / (feature_name + "_store.fp");
+    return p;
+}
 
-    auto gnn_dir         = db_folder / "gnn_features";
-    auto gpu_cache_path  = gnn_dir / (feature_name + "_gpu_cache.bin");
-    auto cpu_cache_path  = gnn_dir / (feature_name + "_cpu_cache.bin");
-    auto meta_path       = gnn_dir / (feature_name + "_store.meta");
-    auto reordered_fmat  = gnn_dir / (feature_name + "_reordered.fmat");
-    auto reordered_rmap  = gnn_dir / (feature_name + "_reordered.rmap");
+// Force cleanup: delete the artifacts selected by the granular force flags.
+// Granular force flags let callers preserve specific outputs (e.g.
+// force=true with force_reorder=false keeps an existing reordered.fmat).
+// Callers that pass only force=true get unchanged behaviour because
+// all the granular flags default to true. No-op when config.force is false;
+// every removal is best-effort (errors ignored via error_code).
+void remove_force_selected_artifacts(const FourLevelStore::Config& config,
+                                     const BuildPaths&             paths)
+{
+    const auto& gpu_cache_path  = paths.gpu_cache_path;
+    const auto& cpu_cache_path  = paths.cpu_cache_path;
+    const auto& meta_path       = paths.meta_path;
+    const auto& reordered_fmat  = paths.reordered_fmat;
+    const auto& reordered_rmap  = paths.reordered_rmap;
+    const auto& sample_dir      = paths.sample_dir;
+    const auto& packed_slim_dir = paths.packed_slim_dir;
+    const auto& addr_tables_dir = paths.addr_tables_dir;
+    const auto& store_fp_path   = paths.store_fp_path;
 
-    const auto& catalog  = samples.get_catalog();
-    auto sample_dir      = SampleStorage::get_storage_path(
-                               db_folder.string(), catalog.sample_name);
-    auto packed_slim_dir  = fs::path(sample_dir) / "packed_slim";
-    auto addr_tables_dir  = fs::path(sample_dir) / "addr_tables";
-    auto store_fp_path    = gnn_dir / (feature_name + "_store.fp");
-    result.packed_slim_dir = packed_slim_dir.string();
-
-    // The feature store's reuse key = the sample's persisted content
-    // fingerprint (catalog) mixed with this store's identity (name + dim +
-    // dtype). 0 = UNKNOWN (legacy sample with no content fingerprint) →
-    // always recompute.
-    const uint64_t cur_fp = mix_feature_store_fingerprint(
-        catalog.sample_content_fp, feature_name,
-        features.num_cols(), static_cast<uint8_t>(features.dtype()));
-
-    // Packed-full build mode (additive): a single gather pass over the
-    // source fmat into <sample_dir>/packed_full/, keyed by cur_fp. Writes ONLY
-    // packed_full/; never builds/deletes the 4-tier or blocks/. Requires
-    // store.meta + blocks/ to already exist (a prior bakeBlocks build). The
-    // train-time consumer (BatchAssembler packed-full mode) prefers this pack.
-    if (config.pack_full) {
-        if (cur_fp == 0) {
-            throw std::runtime_error(
-                "packFullFeatures: sample has no content fingerprint (legacy/pre-STEP8 sample); "
-                "the packed-full pack would never be adopted at train. Re-run gnn_offline_sample "
-                "so the sample carries a content fingerprint, then bakeBlocks, then packFullFeatures.");
-        }
-        std::cerr << "[FourLevelStore] packed-full build start (additive)\n";
-        result.packed_full_bytes = build_packed_full_(
-            samples, features, row_mapping, fs::path(sample_dir),
-            cur_fp, catalog.total_batches);
-        std::cerr << "[FourLevelStore] packed-full build done ("
-                  << (result.packed_full_bytes / (1024ULL * 1024)) << " MiB)\n";
-        auto pf_end = std::chrono::high_resolution_clock::now();
-        result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            pf_end - total_start).count();
-        return result;
-    }
-
-    // --- Force cleanup ---
-    // Granular force flags let callers preserve specific outputs (e.g.
-    // force=true with force_reorder=false keeps an existing reordered.fmat).
-    // Callers that pass only force=true get unchanged behaviour because
-    // all the granular flags default to true.
     if (config.force) {
         std::error_code ec;
         if (config.force_packed_slim) fs::remove_all(packed_slim_dir, ec);
@@ -864,175 +869,208 @@ FourLevelStore::BuildResult FourLevelStore::build(
         if (config.force_reorder)     fs::remove(reordered_fmat, ec);
         if (config.force_reorder)     fs::remove(reordered_rmap, ec);
     }
+}
 
-    // --- Pre-condition checks (content-fingerprint reuse-or-recompute gate) ---
-    // Replaces the legacy unconditional "already exists" throw: when a store is
-    // present and we are NOT forcing, compare its content fingerprint to cur_fp.
-    // Match → reuse (skip the whole rebuild). Mismatch/UNKNOWN → delete the
-    // stale artifacts and fall through to a full recompute (never silent reuse).
-    if (fs::exists(meta_path)) {
-        if (config.force) {
-            // force + force_meta=false intentionally preserved meta — keep the
-            // historical behaviour for this contradictory combination.
-            throw std::runtime_error(
-                "Feature store already exists at: " + meta_path.string() + "\n"
-                "force:1 with force_meta:false preserves store.meta, which "
-                "conflicts with a full rebuild. Pass force_meta:true (the "
-                "default) to overwrite, or drop force to reuse-or-recompute "
-                "by fingerprint.");
-        }
+// Content-fingerprint reuse-or-recompute gate for an existing store.meta.
+// Precondition: store.meta exists (the caller checks). Replaces the legacy
+// unconditional "already exists" throw: when a store is present and we are
+// NOT forcing, compare its content fingerprint to cur_fp.
+//   - force (with force_meta=false, the only way meta survives cleanup):
+//     throws — the historical behaviour for this contradictory combination.
+//   - fingerprint match + all tier artifacts on disk: returns a fully
+//     populated BuildResult (the caller returns it — no rebuild). May also
+//     satisfy a pending addr-table/bake-blocks request against the reused
+//     artifacts (best-effort, logged on failure).
+//   - mismatch / UNKNOWN / missing artifacts: deletes the stale artifacts
+//     (same set force would, plus store.fp) and returns nullopt so the
+//     caller falls through to a full recompute (never silent reuse).
+std::optional<FourLevelStore::BuildResult> try_reuse_or_invalidate_existing_store(
+    SampleStorage&                samples,
+    const FourLevelStore::Config& config,
+    const fs::path&               db_folder,
+    const BuildPaths&             paths,
+    uint64_t                      cur_fp,
+    std::chrono::high_resolution_clock::time_point total_start)
+{
+    const auto& gpu_cache_path  = paths.gpu_cache_path;
+    const auto& cpu_cache_path  = paths.cpu_cache_path;
+    const auto& meta_path       = paths.meta_path;
+    const auto& reordered_fmat  = paths.reordered_fmat;
+    const auto& reordered_rmap  = paths.reordered_rmap;
+    const auto& sample_dir      = paths.sample_dir;
+    const auto& packed_slim_dir = paths.packed_slim_dir;
+    const auto& addr_tables_dir = paths.addr_tables_dir;
+    const auto& store_fp_path   = paths.store_fp_path;
+    const auto& catalog         = samples.get_catalog();
 
-        uint64_t prior_fp = read_store_fp(store_fp_path);
-        if (prior_fp != 0 && prior_fp == cur_fp) {
-            std::cerr << "[FourLevelStore] feature store fingerprint matches (fp="
-                      << prior_fp << ") — reusing existing artifacts\n" << std::flush;
+    // Mirrors the caller's BuildResult state at this point in the pipeline
+    // (only packed_slim_dir has been set so far).
+    FourLevelStore::BuildResult result;
+    result.packed_slim_dir = packed_slim_dir.string();
 
-            StoreMetaHeader meta{};
-            bool meta_ok = false;
-            int fd = ::open(meta_path.c_str(), O_RDONLY);
-            if (fd >= 0) {
-                FdGuard guard(fd);
-                read_all(fd, &meta, sizeof(meta), meta_path.string());
-                meta_ok = meta.is_valid();
-            }
-            // Reuse is only valid while the artifacts store.meta promises are
-            // still on disk. A fingerprint match with missing tier files
-            // (partial cleanup, packed-full surgery) must recompute — a
-            // silently reused broken store would zero-fill features at train.
-            bool artifacts_ok = false;
-            if (meta_ok) {
-                std::error_code ae;
-                artifacts_ok = true;
-                if (meta.l1_count > 0 && !fs::exists(gpu_cache_path, ae)) {
-                    artifacts_ok = false;
-                }
-                if (meta.l2_count > 0 && !fs::exists(cpu_cache_path, ae)) {
-                    artifacts_ok = false;
-                }
-                if ((meta.l3_count + meta.l4_count) > 0 &&
-                    !fs::exists(packed_slim_dir, ae)) {
-                    artifacts_ok = false;
-                }
-                // reordered.fmat/.rmap are written together; exactly one
-                // present means a partially-deleted artifact.
-                if (fs::exists(reordered_fmat, ae) != fs::exists(reordered_rmap, ae)) {
-                    artifacts_ok = false;
-                }
-            }
-            if (meta_ok && artifacts_ok) {
-                auto fsz = [](const fs::path& p) -> uint64_t {
-                    std::error_code e; auto s = fs::file_size(p, e);
-                    return e ? 0 : static_cast<uint64_t>(s);
-                };
-                result.l1_nodes       = meta.l1_count;
-                result.l2_nodes       = meta.l2_count;
-                result.l3_nodes       = meta.l3_count;
-                result.l4_nodes       = meta.l4_count;
-                result.gpu_available  = meta.gpu_available != 0;
-                result.packed_slim_dir = meta.get_packed_slim_dir();
-                result.total_batches  = catalog.total_batches;
-                result.gpu_cache_bytes = fsz(gpu_cache_path);
-                result.cpu_cache_bytes = fsz(cpu_cache_path);
-                result.reordered_bytes = config.reorder ? fsz(reordered_fmat) : 0;
-                uint64_t slim = 0;
-                std::error_code de;
-                if (fs::exists(packed_slim_dir, de)) {
-                    for (const auto& ent :
-                         fs::directory_iterator(packed_slim_dir, de)) {
-                        std::error_code se;
-                        auto s = fs::file_size(ent.path(), se);
-                        if (!se) slim += static_cast<uint64_t>(s);
-                    }
-                }
-                result.slim_bytes = slim;
-                result.total_disk_bytes = result.slim_bytes + result.gpu_cache_bytes
-                                        + result.cpu_cache_bytes + result.reordered_bytes;
-                result.addr_tables_built_ok = fs::exists(addr_tables_dir, de);
-
-                // An explicitly requested addr-table build must not be dropped by the
-                // reuse fast path: bake_blocks (and a missing addr_tables/)
-                // can be satisfied against the reused tier artifacts without
-                // any rebuild. Baking is idempotent per block via
-                // BlockReader::is_fresh, so re-requesting it on a fully baked
-                // store only re-reads the samples.
-                const bool need_addr = config.build_addr_tables
-                                       && !result.addr_tables_built_ok;
-                if (need_addr || config.bake_blocks) {
-                    try {
-                        auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
-                        auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
-                        auto meta_sha_head = compute_meta_sha_head(
-                            gnn_meta_path_for(db_folder, catalog.projection_name));
-                        std::optional<RowMapping> reordered_rm_reuse;
-                        if (fs::exists(reordered_rmap)) {
-                            reordered_rm_reuse.emplace(RowMapping::open(reordered_rmap));
-                        }
-                        auto blocks_dir = fs::path(sample_dir) / "blocks";
-                        build_addr_tables_(
-                            samples,
-                            addr_tables_dir,
-                            packed_slim_dir,
-                            l1_adapter,
-                            l2_adapter,
-                            reordered_rm_reuse,
-                            meta_sha_head,
-                            catalog.total_batches,
-                            result.addr_tables_bytes,
-                            /*write_addr_tables=*/need_addr,
-                            /*bake_blocks=*/config.bake_blocks,
-                            blocks_dir,
-                            result.blocks_bytes,
-                            /*store_fp=*/catalog.sample_content_fp);
-                        if (need_addr) result.addr_tables_built_ok = true;
-                        if (config.bake_blocks) result.blocks_built_ok = true;
-                    } catch (const std::exception& ex) {
-                        std::cerr << "FourLevelStore::build: WARNING "
-                                     "addr_tables build failed on the reuse path: "
-                                  << ex.what()
-                                  << " — runtime will use per-batch lookup fallback.\n";
-                    }
-                }
-
-                auto now = std::chrono::high_resolution_clock::now();
-                result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                           now - total_start).count();
-                return result;  // full reuse — no rebuild
-            }
-            std::cerr << (meta_ok
-                          ? "[FourLevelStore] fingerprint matches but tier"
-                            " artifacts are missing — recomputing\n"
-                          : "[FourLevelStore] existing store.meta unreadable/invalid"
-                            " — recomputing\n")
-                      << std::flush;
-        } else {
-            std::cerr << "[FourLevelStore] feature store fingerprint mismatch (prior="
-                      << prior_fp << " cur=" << cur_fp
-                      << ") — recomputing stale artifacts\n" << std::flush;
-        }
-
-        // Recompute: delete the same set force would, plus store.fp, then fall
-        // through to the normal full rebuild below.
-        std::error_code ec;
-        fs::remove_all(packed_slim_dir, ec);
-        fs::remove_all(addr_tables_dir, ec);
-        fs::remove_all(fs::path(sample_dir) / "blocks", ec);  // stale baked blocks
-        fs::remove(gpu_cache_path, ec);
-        fs::remove(cpu_cache_path, ec);
-        fs::remove(meta_path, ec);
-        fs::remove(reordered_fmat, ec);
-        fs::remove(reordered_rmap, ec);
-        fs::remove(store_fp_path, ec);
+    if (config.force) {
+        // force + force_meta=false intentionally preserved meta — keep the
+        // historical behaviour for this contradictory combination.
+        throw std::runtime_error(
+            "Feature store already exists at: " + meta_path.string() + "\n"
+            "force:1 with force_meta:false preserves store.meta, which "
+            "conflicts with a full rebuild. Pass force_meta:true (the "
+            "default) to overwrite, or drop force to reuse-or-recompute "
+            "by fingerprint.");
     }
 
-    auto log_phase = [&total_start](const std::string& tag) {
-        auto now = std::chrono::high_resolution_clock::now();
-        double t = std::chrono::duration<double>(now - total_start).count();
-        std::cerr << "[FourLevelStore] T+" << std::fixed << std::setprecision(1)
-                  << t << "s " << tag << "\n" << std::flush;
-    };
-    log_phase("build() start");
+    uint64_t prior_fp = read_store_fp(store_fp_path);
+    if (prior_fp != 0 && prior_fp == cur_fp) {
+        std::cerr << "[FourLevelStore] feature store fingerprint matches (fp="
+                  << prior_fp << ") — reusing existing artifacts\n" << std::flush;
 
-    // --- Step 1: Read frequencies ---
+        StoreMetaHeader meta{};
+        bool meta_ok = false;
+        int fd = ::open(meta_path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            FdGuard guard(fd);
+            read_all(fd, &meta, sizeof(meta), meta_path.string());
+            meta_ok = meta.is_valid();
+        }
+        // Reuse is only valid while the artifacts store.meta promises are
+        // still on disk. A fingerprint match with missing tier files
+        // (partial cleanup, packed-full surgery) must recompute — a
+        // silently reused broken store would zero-fill features at train.
+        bool artifacts_ok = false;
+        if (meta_ok) {
+            std::error_code ae;
+            artifacts_ok = true;
+            if (meta.l1_count > 0 && !fs::exists(gpu_cache_path, ae)) {
+                artifacts_ok = false;
+            }
+            if (meta.l2_count > 0 && !fs::exists(cpu_cache_path, ae)) {
+                artifacts_ok = false;
+            }
+            if ((meta.l3_count + meta.l4_count) > 0 &&
+                !fs::exists(packed_slim_dir, ae)) {
+                artifacts_ok = false;
+            }
+            // reordered.fmat/.rmap are written together; exactly one
+            // present means a partially-deleted artifact.
+            if (fs::exists(reordered_fmat, ae) != fs::exists(reordered_rmap, ae)) {
+                artifacts_ok = false;
+            }
+        }
+        if (meta_ok && artifacts_ok) {
+            auto fsz = [](const fs::path& p) -> uint64_t {
+                std::error_code e; auto s = fs::file_size(p, e);
+                return e ? 0 : static_cast<uint64_t>(s);
+            };
+            result.l1_nodes       = meta.l1_count;
+            result.l2_nodes       = meta.l2_count;
+            result.l3_nodes       = meta.l3_count;
+            result.l4_nodes       = meta.l4_count;
+            result.gpu_available  = meta.gpu_available != 0;
+            result.packed_slim_dir = meta.get_packed_slim_dir();
+            result.total_batches  = catalog.total_batches;
+            result.gpu_cache_bytes = fsz(gpu_cache_path);
+            result.cpu_cache_bytes = fsz(cpu_cache_path);
+            result.reordered_bytes = config.reorder ? fsz(reordered_fmat) : 0;
+            uint64_t slim = 0;
+            std::error_code de;
+            if (fs::exists(packed_slim_dir, de)) {
+                for (const auto& ent :
+                     fs::directory_iterator(packed_slim_dir, de)) {
+                    std::error_code se;
+                    auto s = fs::file_size(ent.path(), se);
+                    if (!se) slim += static_cast<uint64_t>(s);
+                }
+            }
+            result.slim_bytes = slim;
+            result.total_disk_bytes = result.slim_bytes + result.gpu_cache_bytes
+                                    + result.cpu_cache_bytes + result.reordered_bytes;
+            result.addr_tables_built_ok = fs::exists(addr_tables_dir, de);
+
+            // An explicitly requested addr-table build must not be dropped by the
+            // reuse fast path: bake_blocks (and a missing addr_tables/)
+            // can be satisfied against the reused tier artifacts without
+            // any rebuild. Baking is idempotent per block via
+            // BlockReader::is_fresh, so re-requesting it on a fully baked
+            // store only re-reads the samples.
+            const bool need_addr = config.build_addr_tables
+                                   && !result.addr_tables_built_ok;
+            if (need_addr || config.bake_blocks) {
+                try {
+                    auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
+                    auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
+                    auto meta_sha_head = compute_meta_sha_head(
+                        FourLevelStore::gnn_meta_path_for(db_folder, catalog.projection_name));
+                    std::optional<RowMapping> reordered_rm_reuse;
+                    if (fs::exists(reordered_rmap)) {
+                        reordered_rm_reuse.emplace(RowMapping::open(reordered_rmap));
+                    }
+                    auto blocks_dir = fs::path(sample_dir) / "blocks";
+                    build_addr_tables_(
+                        samples,
+                        addr_tables_dir,
+                        packed_slim_dir,
+                        l1_adapter,
+                        l2_adapter,
+                        reordered_rm_reuse,
+                        meta_sha_head,
+                        catalog.total_batches,
+                        result.addr_tables_bytes,
+                        /*write_addr_tables=*/need_addr,
+                        /*bake_blocks=*/config.bake_blocks,
+                        blocks_dir,
+                        result.blocks_bytes,
+                        /*store_fp=*/catalog.sample_content_fp);
+                    if (need_addr) result.addr_tables_built_ok = true;
+                    if (config.bake_blocks) result.blocks_built_ok = true;
+                } catch (const std::exception& ex) {
+                    std::cerr << "FourLevelStore::build: WARNING "
+                                 "addr_tables build failed on the reuse path: "
+                              << ex.what()
+                              << " — runtime will use per-batch lookup fallback.\n";
+                }
+            }
+
+            auto now = std::chrono::high_resolution_clock::now();
+            result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       now - total_start).count();
+            return result;  // full reuse — no rebuild
+        }
+        std::cerr << (meta_ok
+                      ? "[FourLevelStore] fingerprint matches but tier"
+                        " artifacts are missing — recomputing\n"
+                      : "[FourLevelStore] existing store.meta unreadable/invalid"
+                        " — recomputing\n")
+                  << std::flush;
+    } else {
+        std::cerr << "[FourLevelStore] feature store fingerprint mismatch (prior="
+                  << prior_fp << " cur=" << cur_fp
+                  << ") — recomputing stale artifacts\n" << std::flush;
+    }
+
+    // Recompute: delete the same set force would, plus store.fp, then fall
+    // through to the normal full rebuild below.
+    std::error_code ec;
+    fs::remove_all(packed_slim_dir, ec);
+    fs::remove_all(addr_tables_dir, ec);
+    fs::remove_all(fs::path(sample_dir) / "blocks", ec);  // stale baked blocks
+    fs::remove(gpu_cache_path, ec);
+    fs::remove(cpu_cache_path, ec);
+    fs::remove(meta_path, ec);
+    fs::remove(reordered_fmat, ec);
+    fs::remove(reordered_rmap, ec);
+    fs::remove(store_fp_path, ec);
+
+    return std::nullopt;  // stale artifacts removed — caller recomputes
+}
+
+// Step 1 of build(): per-row access frequencies for every node in the
+// RowMapping, dense-indexed by row. Prefers the sample set's dense counters;
+// falls back to converting the sparse hash map when the dense path throws
+// (legacy samples). Rows never accessed stay 0.
+std::vector<uint64_t> read_dense_frequencies_with_fallback(
+    SampleStorage&    samples,
+    const RowMapping& row_mapping)
+{
     std::vector<uint64_t> freq_dense;
     try {
         freq_dense = samples.get_dense_frequencies(row_mapping);
@@ -1048,14 +1086,33 @@ FourLevelStore::BuildResult FourLevelStore::build(
             }
         }
     }
+    return freq_dense;
+}
 
-    // --- Step 2: Classify nodes ---
-    uint64_t N = features.num_rows();
-    uint64_t D = features.num_cols();
-    GnnDtype dt = features.dtype();
-    size_t elem = dtype_size(dt);
-    size_t row_bytes = D * elem;
+// Output of the Step-2 tier classification: the node lists the cache builds
+// consume (L1/L2), the joint L1+L2 membership set the L4 packer filters
+// against, and whether a GPU was available when the budgets were split.
+struct TierPlan {
+    std::vector<ObjectId>        l1_nodes;
+    std::vector<ObjectId>        l2_nodes;
+    std::unordered_set<uint64_t> cached_oid_set;  // L1 + L2 OIDs
+    bool                         gpu_available = false;
+};
 
+// Step 2 of build(): sort nodes by access frequency (descending) and split
+// them into tiers under the configured GPU/CPU cache budgets: top-K1 -> L1,
+// next-K2 -> L2, remaining freq>1 -> L3, the rest (freq<=1 or never
+// accessed) -> L4. Fills result's per-tier node counts, gpu_available and
+// total_batches; the caller keeps N/row_bytes (they outlive this stage).
+TierPlan classify_nodes_into_tiers(
+    const std::vector<uint64_t>&  freq_dense,
+    uint64_t                      N,
+    size_t                        row_bytes,
+    const FourLevelStore::Config& config,
+    const RowMapping&             row_mapping,
+    const SampleCatalog&          catalog,
+    FourLevelStore::BuildResult&  result)
+{
     // Sort by frequency descending
     struct NodeFreq { uint64_t row; uint64_t freq; };
     std::vector<NodeFreq> sorted_nodes;
@@ -1123,23 +1180,30 @@ FourLevelStore::BuildResult FourLevelStore::build(
     result.gpu_available = gpu_available;
     result.total_batches = catalog.total_batches;
 
-    // Track which artifacts THIS invocation (re)writes so the failure-cleanup
-    // catch below removes only this run's partial outputs. Artifacts reused
-    // fresh (e.g. a fingerprint-matched reordered.fmat) survive a later-phase
-    // failure — their embedded fingerprints make the retry's reuse-or-recompute
-    // decision safe.
-    bool wrote_caches  = false;
-    bool wrote_reorder = false;
-    bool wrote_slim    = false;
-    bool wrote_addr    = false;
-    bool wrote_meta    = false;
+    return TierPlan{std::move(l1_nodes), std::move(l2_nodes),
+                    std::move(cached_oid_set), gpu_available};
+}
 
-    // --- Cleanup guard for partial outputs ---
-    try {
+// Step 3 of build(): materialize the L1 (GPU) and L2 (CPU) cache .bin files
+// for the tier plan's node lists — or, under config.no_cache_bin, defer them
+// to train startup by dropping stale .bin files and leaving a
+// "<feature>_cache.deferred" marker for the runtime constructor.
+// Assumes paths.gnn_dir already exists (the caller creates it).
+void build_or_defer_l1_l2_caches(
+    const FourLevelStore::Config& config,
+    const TierPlan&               tiers,
+    const FeatureMatrix&          features,
+    const RowMapping&             row_mapping,
+    const BuildPaths&             paths,
+    const std::string&            feature_name,
+    const LogPhaseFn&             log_phase)
+{
+    const auto& gnn_dir        = paths.gnn_dir;
+    const auto& gpu_cache_path = paths.gpu_cache_path;
+    const auto& cpu_cache_path = paths.cpu_cache_path;
+    const auto& l1_nodes       = tiers.l1_nodes;
+    const auto& l2_nodes       = tiers.l2_nodes;
 
-    // --- Step 3: Build cache files ---
-    fs::create_directories(gnn_dir);
-    wrote_caches = true;
     auto cache_deferred_marker = gnn_dir / (feature_name + "_cache.deferred");
     if (!config.no_cache_bin) {
         log_phase("L1 GpuCache::build start (" + std::to_string(l1_nodes.size()) + " nodes)");
@@ -1159,115 +1223,96 @@ FourLevelStore::BuildResult FourLevelStore::build(
         std::ofstream(cache_deferred_marker).put('\n');
         log_phase("L1/L2 cache build DEFERRED to train startup (noCacheBin)");
     }
+}
 
-    // --- Step 4: Ensure L3 reordered FM exists ---
-    const FeatureMatrix* active_fm = &features;
-    std::optional<FeatureMatrix> reordered_holder;
-    const RowMapping* active_rm = &row_mapping;
-    std::optional<RowMapping> reordered_rm_holder;
-
-    // reordered.fmat is "fresh" only if it exists AND its embedded
-    // fingerprint matches cur_fp (with cur_fp known). A reordered.fmat left by a
-    // different sample (e.g. force + force_reorder=false) is detected here and
-    // rebuilt instead of being opened with the wrong shape.
-    bool reordered_fresh = false;
-    if (config.reorder && cur_fp != 0 &&
-        fs::exists(reordered_fmat) && fs::exists(reordered_rmap)) {
-        try {
-            reordered_fresh =
-                (FeatureMatrix::open(reordered_fmat).fingerprint() == cur_fp);
-        } catch (...) {
-            reordered_fresh = false;
-        }
+// Step 4 of build(): (re)create the MinHash-reordered L3 artifacts
+// (reordered.fmat + reordered.rmap) from the source FeatureMatrix, stamping
+// them with cur_fp. Precondition: the caller decided the existing pair is
+// stale/absent (fingerprint mismatch) — any leftover files, including the
+// orphaned .rmap.idx sidecar, are removed first. Toggles the samples'
+// skip-edges read mode for the access-graph pass and restores it before
+// returning (samples must not be read concurrently during this stage).
+void rebuild_reordered_artifacts(
+    const FeatureMatrix&          features,
+    const RowMapping&             row_mapping,
+    SampleStorage&                samples,
+    const SampleCatalog&          catalog,
+    const FourLevelStore::Config& config,
+    uint64_t                      N,
+    uint64_t                      cur_fp,
+    const fs::path&               reordered_fmat,
+    const fs::path&               reordered_rmap,
+    const LogPhaseFn&             log_phase)
+{
+    if (fs::exists(reordered_fmat)) {
+        std::error_code rec;
+        fs::remove(reordered_fmat, rec);
+        fs::remove(reordered_rmap, rec);
+        // Drop the orphaned sorted-index sidecar too: a fresh permutation
+        // is about to be written, and a stale <rmap>.idx from the OLD
+        // permutation would otherwise be silently adopted at open() and
+        // serve wrong feature rows (this once silently corrupted every
+        // cold L4 feature). RowMapping::create now also removes it, but make
+        // the intent explicit at the rebuild site.
+        fs::remove(fs::path(reordered_rmap.string() + ".idx"), rec);
     }
-    if (config.reorder && !reordered_fresh) {
-        wrote_reorder = true;
-        if (fs::exists(reordered_fmat)) {
-            std::error_code rec;
-            fs::remove(reordered_fmat, rec);
-            fs::remove(reordered_rmap, rec);
-            // Drop the orphaned sorted-index sidecar too: a fresh permutation
-            // is about to be written, and a stale <rmap>.idx from the OLD
-            // permutation would otherwise be silently adopted at open() and
-            // serve wrong feature rows (this once silently corrupted every
-            // cold L4 feature). RowMapping::create now also removes it, but make
-            // the intent explicit at the rebuild site.
-            fs::remove(fs::path(reordered_rmap.string() + ".idx"), rec);
-        }
-        log_phase("L3 MinHash build_access_graph start");
-        MinHashReorderer reorderer(config.minhash);
-        // The co-access graph only needs all_unique_nodes per batch, never the
-        // per-layer edges. Skip the edge arrays on this re-read so the reorder
-        // pass streams only the node portions of batches.dat (on papers100M:
-        // ~16 GB of node ids vs ~87.5 GB of full samples). all_unique_nodes is
-        // unaffected, so the access graph — and the resulting permutation — is
-        // bit-identical. Restored after the pass so the later addr_tables / block
-        // builds (which DO need edges) read full samples. `samples` is opened
-        // fresh for the build with edges enabled, and the reorder is the first
-        // read, so restoring to false (the default) after the pass is correct.
-        samples.set_skip_edges_on_read(true);
-        samples.set_skip_edge_ids_on_read(true);
-        reorderer.build_access_graph(catalog.total_batches,
-            [&](uint64_t batch_id) -> std::vector<uint64_t> {
-                auto sample = samples.read_sample(batch_id);
-                std::vector<uint64_t> rows;
-                rows.reserve(sample.all_unique_nodes.size());
-                for (const auto& oid : sample.all_unique_nodes) {
-                    auto row = row_mapping.find(oid);
-                    if (row.has_value()) rows.push_back(*row);
-                }
-                return rows;
-            });
-        samples.set_skip_edges_on_read(false);
-        samples.set_skip_edge_ids_on_read(false);
-        log_phase("L3 MinHash compute_permutation start");
-        auto perm = reorderer.compute_permutation(N);
-        log_phase("L3 MinHash compute_permutation done");
+    log_phase("L3 MinHash build_access_graph start");
+    MinHashReorderer reorderer(config.minhash);
+    // The co-access graph only needs all_unique_nodes per batch, never the
+    // per-layer edges. Skip the edge arrays on this re-read so the reorder
+    // pass streams only the node portions of batches.dat (on papers100M:
+    // ~16 GB of node ids vs ~87.5 GB of full samples). all_unique_nodes is
+    // unaffected, so the access graph — and the resulting permutation — is
+    // bit-identical. Restored after the pass so the later addr_tables / block
+    // builds (which DO need edges) read full samples. `samples` is opened
+    // fresh for the build with edges enabled, and the reorder is the first
+    // read, so restoring to false (the default) after the pass is correct.
+    samples.set_skip_edges_on_read(true);
+    samples.set_skip_edge_ids_on_read(true);
+    reorderer.build_access_graph(catalog.total_batches,
+        [&](uint64_t batch_id) -> std::vector<uint64_t> {
+            auto sample = samples.read_sample(batch_id);
+            std::vector<uint64_t> rows;
+            rows.reserve(sample.all_unique_nodes.size());
+            for (const auto& oid : sample.all_unique_nodes) {
+                auto row = row_mapping.find(oid);
+                if (row.has_value()) rows.push_back(*row);
+            }
+            return rows;
+        });
+    samples.set_skip_edges_on_read(false);
+    samples.set_skip_edge_ids_on_read(false);
+    log_phase("L3 MinHash compute_permutation start");
+    auto perm = reorderer.compute_permutation(N);
+    log_phase("L3 MinHash compute_permutation done");
 
-        log_phase("L3 FeatureMatrix::create_reordered start");
-        FeatureMatrix::create_reordered(features, perm, reordered_fmat, cur_fp);
-        log_phase("L3 FeatureMatrix::create_reordered done");
+    log_phase("L3 FeatureMatrix::create_reordered start");
+    FeatureMatrix::create_reordered(features, perm, reordered_fmat, cur_fp);
+    log_phase("L3 FeatureMatrix::create_reordered done");
 
-        // Create reordered RowMapping
-        log_phase("L3 RowMapping::create start");
-        std::vector<ObjectId> reordered_ids(N);
-        for (uint64_t i = 0; i < N; ++i) {
-            reordered_ids[i] = row_mapping.get(perm[i]);
-        }
-        RowMapping::create(reordered_rmap, reordered_ids);
-        log_phase("L3 RowMapping::create done");
-    } else if (config.reorder) {
-        log_phase("L3 reorder fresh (fingerprint match) — reusing reordered.fmat");
-    } else {
-        log_phase("L3 reorder disabled");
+    // Create reordered RowMapping
+    log_phase("L3 RowMapping::create start");
+    std::vector<ObjectId> reordered_ids(N);
+    for (uint64_t i = 0; i < N; ++i) {
+        reordered_ids[i] = row_mapping.get(perm[i]);
     }
+    RowMapping::create(reordered_rmap, reordered_ids);
+    log_phase("L3 RowMapping::create done");
+}
 
-    if (config.reorder && fs::exists(reordered_fmat)) {
-        reordered_holder.emplace(FeatureMatrix::open(reordered_fmat));
-        active_fm = &*reordered_holder;
-        reordered_rm_holder.emplace(RowMapping::open(reordered_rmap));
-        active_rm = &*reordered_rm_holder;
-    }
+// Per-entry pair so we can sort by row ascending. Reading the reordered
+// FM in row-monotone order keeps mmap access sequential and avoids
+// page-cache thrash when the FM exceeds host RAM (papers100M: 56 GB
+// FM vs 30 GB host saw the writeback collapse with random reads).
+struct SlimEntry { uint64_t row; ObjectId oid; };
 
-    // --- Step 5: Re-pack L4 slim ---
-    // For each batch: filter out L1/L2 nodes, write only remaining nodes as v2.
-    // L3 nodes are INCLUDED in slim files because load_batch_features() reads
-    // the OID table to identify L4 nodes -- excluding L3 here would lose them.
-    // Instead, we keep all non-cached nodes in slim files (L3+L4), and at
-    // runtime load_batch_features() resolves L3 from the reordered FM while
-    // L4 features come directly from the slim file data section.
-    wrote_slim = true;
-    fs::create_directories(packed_slim_dir);
-
-    // Per-entry pair so we can sort by row ascending. Reading the reordered
-    // FM in row-monotone order keeps mmap access sequential and avoids
-    // page-cache thrash when the FM exceeds host RAM (papers100M: 56 GB
-    // FM vs 30 GB host saw the writeback collapse with random reads).
-    struct SlimEntry { uint64_t row; ObjectId oid; };
-
-    log_phase("L4 packed_slim start");
-    auto l4_start = std::chrono::high_resolution_clock::now();
-    std::atomic<uint64_t> batches_done{0};
+// Resolve the L4 packer worker-pool width: env-overridable default 4, capped
+// at hardware_concurrency() and at the batch count, floored at 1. Reads (and
+// thereby declares) the MDB_GNN_L4_WORKERS ablation switch; must be called
+// unconditionally once per build so the switch's declaration frequency is
+// unchanged from when this block lived inline in build().
+unsigned resolve_l4_worker_count(const SampleCatalog& catalog)
+{
     // Parallel L4 materialisation: each batch writes its own .bin file, so
     // workers can run independently. Default 4 workers — caps at
     // hardware_concurrency() and is overridable via env MDB_GNN_L4_WORKERS
@@ -1289,25 +1334,36 @@ FourLevelStore::BuildResult FourLevelStore::build(
         num_l4_workers = static_cast<unsigned>(catalog.total_batches);
     }
     if (num_l4_workers == 0) num_l4_workers = 1;
+    return num_l4_workers;
+}
 
+// Step 5 of build(), legacy arm: materialize packed_slim/batch_NNNNNN.bin
+// with a worker pool. Each worker pulls batch ids from a shared atomic,
+// reads the sample, gathers its cold (non-L1/L2) rows from the active FM in
+// row-ascending order, and writes the v2 [header][OID table][features] file
+// (write + fsync + DONTNEED hint; optional pipeline overlap between packing
+// and writing). Returns total bytes written. Assumes packed_slim_dir exists
+// and active_rm's lazy index is pre-built (the caller warm-touches it);
+// rethrows the first worker exception after all workers join.
+uint64_t pack_slim_batches_worker_pool(
+    SampleStorage&                      samples,
+    const SampleCatalog&                catalog,
+    const std::unordered_set<uint64_t>& cached_oid_set,
+    const FeatureMatrix*                active_fm,
+    const RowMapping*                   active_rm,
+    size_t                              row_bytes,
+    uint64_t                            D,
+    GnnDtype                            dt,
+    const fs::path&                     packed_slim_dir,
+    unsigned                            num_l4_workers,
+    bool                                use_pipeline_overlap,
+    std::chrono::high_resolution_clock::time_point l4_start)
+{
+    std::atomic<uint64_t> batches_done{0};
     std::atomic<uint64_t> next_batch{0};
     std::atomic<uint64_t> shared_slim_bytes{0};
     std::exception_ptr first_exception;
     std::mutex exception_mutex;
-
-    // Touch RowMapping index once before workers spawn — RowMapping::find()
-    // lazy-builds a sorted index under std::call_once on first call. If we
-    // didn't force-init here, the first worker pays an O(N log N) sort
-    // while the rest stall on the call_once barrier.
-    if (N > 0) {
-        (void) active_rm->find(active_rm->get(0));
-    }
-
-    // Third reader of this switch (the two reorder passes are the others). The
-    // registry resolves it once per process, so the reorder and the packer
-    // cannot disagree about whether this build was pipelined.
-    static const bool use_pipeline_overlap =
-        Ablation::choice("MDB_GNN_PIPELINE_OVERLAP", "0", {"1", "true", "yes"}) != "0";
 
     auto worker_fn = [&]() {
         // PackedBatch and pipeline state live OUTSIDE the try so the RAII
@@ -1479,54 +1535,46 @@ FourLevelStore::BuildResult FourLevelStore::build(
         }
     };
 
-    // Opt-in partitioned packed_slim materialisation. The default worker loop
-    // above gathers each batch's cold (non-L1/L2) rows RANDOMLY from the
-    // reordered FM; on papers100M (54 GB FM > 30 GB RAM) those rows are by
-    // definition the on-disk cold tier, so every gather faults a page ->
-    // ~0.3 batches/s page-cache thrash (IOPS-bound; more workers do not help).
-    // MDB_GNN_SLIM_PARTITIONED=1 instead performs ONE sequential .fmat scan in
-    // row-range partitions and scatter-pwrites each row into the batch files
-    // that need it. Output is the identical v2 [header][OID table][features]
-    // format read_slim_oid_table consumes; the OID table travels with each row
-    // so AddrTable resolution is positionally agnostic (correctness independent
-    // of within-batch order).
-    // DEFAULT ON: the partitioned packer is ~5.7x faster on papers100M-scale
-    // (one sequential .fmat scan vs per-batch random gather of cold on-disk
-    // rows) and produces BIT-IDENTICAL output (validated cora testAccuracy
-    // 0.86240786 classic vs partitioned). Disable with MDB_GNN_SLIM_PARTITIONED=0.
-    // Both arms are spelled out in the accepted list because the chain below
-    // branched on both. An unrecognised value keeps the ON default exactly as
-    // falling through the chain did, with the difference that the rejected
-    // spelling is now on the record rather than passing for a deliberate off.
-    static const std::string slim_partitioned =
-        Ablation::choice("MDB_GNN_SLIM_PARTITIONED", "1",
-                         {"1", "true", "yes", "0", "false", "no"});
-    // Stays mutable: the NOFILE check further down turns the partitioned packer
-    // off when the fd budget cannot cover one fd per batch, and that decision is
-    // the process's, not the operator's.
-    bool use_slim_partitioned = !(slim_partitioned == "0" ||
-                                  slim_partitioned == "false" ||
-                                  slim_partitioned == "no");
+    std::vector<std::thread> workers;
+    workers.reserve(num_l4_workers);
+    for (unsigned i = 0; i < num_l4_workers; ++i) {
+        workers.emplace_back(worker_fn);
+    }
+    for (auto& t : workers) t.join();
+    if (first_exception) std::rethrow_exception(first_exception);
 
-    // The partitioned packer keeps ONE fd open per batch through its final
-    // phase, so it needs NOFILE >= total_batches + headroom. Raise the soft
-    // limit toward the hard limit; if even the hard limit can't cover it, fall
-    // back to the (slower but unbounded-fd) worker loop instead of failing the
-    // build with EMFILE. This makes the fast path a safe default regardless of
-    // the inherited ulimit. The raise is build-phase-only: the inherited soft
-    // limit is restored once the pack finishes (or throws), so the long-running
-    // server keeps its operator-configured fd tripwire.
-    struct NofileRestore {
-        bool          armed = false;
-        struct rlimit saved {};
-        void restore() noexcept {
-            if (armed) {
-                ::setrlimit(RLIMIT_NOFILE, &saved);  // best-effort
-                armed = false;
-            }
+    return shared_slim_bytes.load(std::memory_order_relaxed);
+}
+
+// RAII holder for a temporarily raised RLIMIT_NOFILE soft limit. restore()
+// re-applies the saved limit (idempotent; also runs at destruction so throw
+// paths are covered).
+struct NofileRestore {
+    bool          armed = false;
+    struct rlimit saved {};
+    void restore() noexcept {
+        if (armed) {
+            ::setrlimit(RLIMIT_NOFILE, &saved);  // best-effort
+            armed = false;
         }
-        ~NofileRestore() { restore(); }
-    } nofile_restore;
+    }
+    ~NofileRestore() { restore(); }
+};
+
+// The partitioned packer keeps ONE fd open per batch through its final
+// phase, so it needs NOFILE >= total_batches + headroom. Raise the soft
+// limit toward the hard limit; if even the hard limit can't cover it, fall
+// back to the (slower but unbounded-fd) worker loop instead of failing the
+// build with EMFILE. This makes the fast path a safe default regardless of
+// the inherited ulimit. The raise is build-phase-only: the inherited soft
+// limit is restored once the pack finishes (or throws), so the long-running
+// server keeps its operator-configured fd tripwire.
+void maybe_raise_nofile_for_partitioned_pack(
+    bool&                use_slim_partitioned,
+    NofileRestore&       nofile_restore,
+    const SampleCatalog& catalog,
+    const LogPhaseFn&    log_phase)
+{
     if (use_slim_partitioned) {
         const rlim_t need = static_cast<rlim_t>(catalog.total_batches) + 64;
         struct rlimit rl;
@@ -1549,198 +1597,196 @@ FourLevelStore::BuildResult FourLevelStore::build(
             }
         }
     }
+}
 
-    // Consolidated cold-feature file (opt-in). Computed before the partitioned
-    // pack so the writer can stamp the perm/meta fingerprints; per-batch
-    // (offset, length) are captured for the v2 addr_tables so the runtime can
-    // pread a single range instead of opening a per-batch .bin file.
-    // Only the partitioned sequential-scan path writes it; the legacy worker
-    // loop ignores it.
-    const bool write_consolidated =
-        config.write_consolidated_slim && use_slim_partitioned;
-    fs::path              consolidated_path =
-        write_consolidated ? (packed_slim_dir / "consolidated.slim") : fs::path{};
-    uint64_t              cons_perm_fp  = 0;
-    uint64_t              cons_meta_sha = 0;
-    std::vector<uint64_t> cons_offsets, cons_lengths;
-    if (write_consolidated) {
-        cons_perm_fp = reordered_rm_holder.has_value()
-                         ? reordered_rm_holder->perm_fingerprint() : 0;
-        cons_meta_sha = compute_meta_sha_head(
-            gnn_meta_path_for(db_folder, catalog.projection_name));
-        log_phase("L4 consolidated.slim: enabled");
+// Step 5 of build(), fast arm: materialize packed_slim via ONE sequential
+// scan of the active FM in row-range partitions, scatter-pwriting each row
+// into every batch .bin that needs it. Output is byte-identical to the
+// worker-pool arm; ~5.7x faster when the FM exceeds host RAM. When
+// cons_offsets/cons_lengths are non-null, also emits the consolidated.slim
+// cold-feature file stamped with cons_perm_fp/cons_meta_sha. Returns total
+// .bin bytes measured from the written files. Assumes packed_slim_dir exists
+// and the NOFILE soft limit already covers one fd per batch (the caller
+// raised it). Reads (and declares) the MDB_GNN_SLIM_PARTITION_MB and
+// MDB_GNN_DEDUP_COLD_ENTRIES ablation switches — it must stay called exactly
+// when the partitioned arm runs, so their declaration frequency is unchanged.
+uint64_t pack_slim_batches_partitioned(
+    SampleStorage&                      samples,
+    const SampleCatalog&                catalog,
+    const std::unordered_set<uint64_t>& cached_oid_set,
+    const FeatureMatrix*                active_fm,
+    const RowMapping*                   active_rm,
+    const fs::path&                     packed_slim_dir,
+    const fs::path&                     consolidated_path,
+    uint64_t                            cons_perm_fp,
+    uint64_t                            cons_meta_sha,
+    std::vector<uint64_t>*              cons_offsets,
+    std::vector<uint64_t>*              cons_lengths,
+    const LogPhaseFn&                   log_phase)
+{
+    log_phase("L4 packed_slim: partitioned sequential-scan path");
+    // Partition size decides how many sequential passes the packer makes,
+    // so it belongs in the log next to the pack time it explains.
+    static const long slim_partition_mb =
+        Ablation::number("MDB_GNN_SLIM_PARTITION_MB", 256);
+    size_t slim_partition_bytes = 256ULL * 1024 * 1024;
+    if (slim_partition_mb > 0) {
+        slim_partition_bytes = static_cast<size_t>(slim_partition_mb) * 1024 * 1024;
     }
-
-    if (use_slim_partitioned) {
-        log_phase("L4 packed_slim: partitioned sequential-scan path");
-        // Partition size decides how many sequential passes the packer makes,
-        // so it belongs in the log next to the pack time it explains.
-        static const long slim_partition_mb =
-            Ablation::number("MDB_GNN_SLIM_PARTITION_MB", 256);
-        size_t slim_partition_bytes = 256ULL * 1024 * 1024;
-        if (slim_partition_mb > 0) {
-            slim_partition_bytes = static_cast<size_t>(slim_partition_mb) * 1024 * 1024;
-        }
-        // Cold-node entries for batch b, sorted by row ascending — mirrors the
-        // worker-loop collection exactly so output is row-order-equivalent.
-        // The partitioned packer pairs oid_provider[k] with row_provider[k],
-        // so BOTH lambdas must return the same row-sorted order.
-        //
-        // Opt-in (env MDB_GNN_DEDUP_COLD_ENTRIES=1, default OFF): the partitioned
-        // packer calls row_provider(b) then oid_provider(b) back-to-back for the
-        // SAME b, so a 1-slot memo eliminates the 2nd read_sample(b)+find per batch.
-        // The returned vector is identical => packed output bit-identical.
-        // Default OFF so the memo can be A/B-measured cleanly before it earns
-        // a default flip.
-        // "1" was the only value the comparison ever honoured, so it is the
-        // only accepted one; every other spelling means OFF as before, and now
-        // says which spelling it rejected. This one exists to be A/B'd, which
-        // is exactly the case where an unread switch invalidates the result.
-        static const bool dedup_cold =
-            Ablation::choice("MDB_GNN_DEDUP_COLD_ENTRIES", "0", {"1"}) == "1";
-        uint64_t cold_memo_b = UINT64_MAX;
-        std::vector<SlimEntry> cold_memo;
-        auto cold_entries = [&](uint64_t b) -> const std::vector<SlimEntry>& {
-            if (dedup_cold && b == cold_memo_b) return cold_memo;
-            auto sample = samples.read_sample(b);
-            std::vector<SlimEntry> e;
-            e.reserve(sample.all_unique_nodes.size());
-            for (const auto& oid : sample.all_unique_nodes) {
-                if (cached_oid_set.count(oid.id) != 0) continue;
-                auto row = active_rm->find(oid);
-                if (row.has_value()) e.push_back({*row, oid});
-            }
-            std::sort(e.begin(), e.end(),
-                      [](const SlimEntry& a, const SlimEntry& c) { return a.row < c.row; });
-            cold_memo = std::move(e);
-            cold_memo_b = b;
-            return cold_memo;
-        };
-        generate_packed_batches_partitioned(
-            *active_fm,
-            catalog.total_batches,
-            [&](uint64_t b) {
-                auto e = cold_entries(b);
-                std::vector<uint64_t> rows;
-                rows.reserve(e.size());
-                for (const auto& x : e) rows.push_back(x.row);
-                return rows;
-            },
-            packed_slim_dir,
-            slim_partition_bytes,
-            [&](uint64_t b) {
-                auto e = cold_entries(b);
-                std::vector<ObjectId> oids;
-                oids.reserve(e.size());
-                for (const auto& x : e) oids.push_back(x.oid);
-                return oids;
-            },
-            consolidated_path,
-            cons_perm_fp,
-            cons_meta_sha,
-            write_consolidated ? &cons_offsets : nullptr,
-            write_consolidated ? &cons_lengths : nullptr);
-        // Account slim bytes from the written files (the partitioned packer
-        // does not thread through shared_slim_bytes).
-        std::error_code de_ec;
-        uint64_t acc = 0;
-        for (auto& de : fs::directory_iterator(packed_slim_dir, de_ec)) {
-            if (de.path().extension() == ".bin") {
-                std::error_code sz_ec;
-                auto sz = fs::file_size(de.path(), sz_ec);
-                if (!sz_ec) acc += sz;
-            }
-        }
-        shared_slim_bytes.store(acc, std::memory_order_relaxed);
-    } else {
-        std::vector<std::thread> workers;
-        workers.reserve(num_l4_workers);
-        for (unsigned i = 0; i < num_l4_workers; ++i) {
-            workers.emplace_back(worker_fn);
-        }
-        for (auto& t : workers) t.join();
-        if (first_exception) std::rethrow_exception(first_exception);
-    }
-
-    // The per-batch fds are closed now — drop the NOFILE raise immediately
-    // (the RAII destructor also covers the throw paths above).
-    nofile_restore.restore();
-
-    uint64_t slim_bytes_acc = shared_slim_bytes.load(std::memory_order_relaxed);
-
-    log_phase("L4 packed_slim done, fsync_directory next");
-    // Each batch file's data pages were fsync'd at write time; this directory
-    // fsync persists the directory entries so the file names survive a crash.
-    fsync_directory(packed_slim_dir);
-    log_phase("L4 fsync_directory done");
-
-    // --- Build AddrTable sidecars ---
-    // Pre-classify every batch's unique nodes into {L1, L2, L4, L3, zero}
-    // and write addr_tables/batch_NNNNNN.addr next to packed_slim/. This
-    // lets runtime load_batch_features() skip the per-node hash lookups on
-    // the hot path, amortising them to build time instead.
+    // Cold-node entries for batch b, sorted by row ascending — mirrors the
+    // worker-loop collection exactly so output is row-order-equivalent.
+    // The partitioned packer pairs oid_provider[k] with row_provider[k],
+    // so BOTH lambdas must return the same row-sorted order.
     //
-    // We reconstruct OidIdxAdapters by reading the already-written GNNC cache
-    // files' OID tables rather than loading them into GPU/CPU memory.
-    // GpuCache/CpuCache::build() sorts entries by FeatureMatrix row before
-    // writing, so the on-disk OID table is the ground truth for find_index().
-    if (config.build_addr_tables || config.bake_blocks) {
-        log_phase("addr_tables start");
-        if (config.build_addr_tables) wrote_addr = true;
-        try {
-            auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
-            auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
-
-            auto meta_sha_head = compute_meta_sha_head(
-                gnn_meta_path_for(db_folder, catalog.projection_name));
-
-            auto blocks_dir = fs::path(sample_dir) / "blocks";
-
-            build_addr_tables_(
-                samples,
-                addr_tables_dir,
-                packed_slim_dir,
-                l1_adapter,
-                l2_adapter,
-                reordered_rm_holder,
-                meta_sha_head,
-                catalog.total_batches,
-                result.addr_tables_bytes,
-                /*write_addr_tables=*/config.build_addr_tables,
-                /*bake_blocks=*/config.bake_blocks,
-                blocks_dir,
-                result.blocks_bytes,
-                /*store_fp=*/catalog.sample_content_fp,
-                write_consolidated ? &cons_offsets : nullptr,
-                write_consolidated ? &cons_lengths : nullptr);
-
-            result.addr_tables_built_ok = true;
-            if (config.bake_blocks) result.blocks_built_ok = true;
-            log_phase("addr_tables done");
-        } catch (const std::exception& ex) {
-            // The addr-table build is best-effort: a failure logs a warning
-            // but does not abort the feature store build. The runtime consumer
-            // falls back to the legacy per-batch hash-lookup path.
-            std::cerr << "FourLevelStore::build: WARNING addr_tables build failed: "
-                      << ex.what() << " — runtime will use per-batch lookup fallback.\n";
-            result.addr_tables_built_ok = false;
-            result.blocks_built_ok = false;
+    // Opt-in (env MDB_GNN_DEDUP_COLD_ENTRIES=1, default OFF): the partitioned
+    // packer calls row_provider(b) then oid_provider(b) back-to-back for the
+    // SAME b, so a 1-slot memo eliminates the 2nd read_sample(b)+find per batch.
+    // The returned vector is identical => packed output bit-identical.
+    // Default OFF so the memo can be A/B-measured cleanly before it earns
+    // a default flip.
+    // "1" was the only value the comparison ever honoured, so it is the
+    // only accepted one; every other spelling means OFF as before, and now
+    // says which spelling it rejected. This one exists to be A/B'd, which
+    // is exactly the case where an unread switch invalidates the result.
+    static const bool dedup_cold =
+        Ablation::choice("MDB_GNN_DEDUP_COLD_ENTRIES", "0", {"1"}) == "1";
+    uint64_t cold_memo_b = UINT64_MAX;
+    std::vector<SlimEntry> cold_memo;
+    auto cold_entries = [&](uint64_t b) -> const std::vector<SlimEntry>& {
+        if (dedup_cold && b == cold_memo_b) return cold_memo;
+        auto sample = samples.read_sample(b);
+        std::vector<SlimEntry> e;
+        e.reserve(sample.all_unique_nodes.size());
+        for (const auto& oid : sample.all_unique_nodes) {
+            if (cached_oid_set.count(oid.id) != 0) continue;
+            auto row = active_rm->find(oid);
+            if (row.has_value()) e.push_back({*row, oid});
+        }
+        std::sort(e.begin(), e.end(),
+                  [](const SlimEntry& a, const SlimEntry& c) { return a.row < c.row; });
+        cold_memo = std::move(e);
+        cold_memo_b = b;
+        return cold_memo;
+    };
+    generate_packed_batches_partitioned(
+        *active_fm,
+        catalog.total_batches,
+        [&](uint64_t b) {
+            auto e = cold_entries(b);
+            std::vector<uint64_t> rows;
+            rows.reserve(e.size());
+            for (const auto& x : e) rows.push_back(x.row);
+            return rows;
+        },
+        packed_slim_dir,
+        slim_partition_bytes,
+        [&](uint64_t b) {
+            auto e = cold_entries(b);
+            std::vector<ObjectId> oids;
+            oids.reserve(e.size());
+            for (const auto& x : e) oids.push_back(x.oid);
+            return oids;
+        },
+        consolidated_path,
+        cons_perm_fp,
+        cons_meta_sha,
+        cons_offsets,
+        cons_lengths);
+    // Account slim bytes from the written files (the partitioned packer
+    // does not report bytes itself).
+    std::error_code de_ec;
+    uint64_t acc = 0;
+    for (auto& de : fs::directory_iterator(packed_slim_dir, de_ec)) {
+        if (de.path().extension() == ".bin") {
+            std::error_code sz_ec;
+            auto sz = fs::file_size(de.path(), sz_ec);
+            if (!sz_ec) acc += sz;
         }
     }
 
-    // The source FM and reordered FM are no longer needed by this procedure.
-    // Issue POSIX_FADV_DONTNEED hints so the next caller (typically gnn_train
-    // running back-to-back) starts with a clean page-cache budget instead of
-    // inheriting ~110 GB of stale source+reordered pages.
-    features.release_cache();
-    if (config.reorder && reordered_holder.has_value()) {
-        reordered_holder->release_cache();
-    }
+    return acc;
+}
 
-    // --- Step 5b: Measure on-disk footprint for telemetry ---
-    // We measure files that ALREADY exist on disk (caches were written in
-    // Step 3, slim was just written in Step 5, reordered.fmat was written
-    // in Step 4 if reorder=true). All measurements are post-fsync.
+// Addr-table / block-bake stage of build(): reconstruct the L1/L2 OID->index
+// adapters from the already-written GNNC cache files, then pre-classify every
+// batch's unique nodes and write the addr_tables/ sidecars (and/or bake the
+// computation-graph blocks per config). Best-effort: a failure logs a warning
+// and clears the result flags but never aborts the build — the runtime
+// consumer falls back to the legacy per-batch hash-lookup path. Assumes the
+// caches (Step 3) and packed_slim (Step 5) for this build are on disk.
+void run_addr_table_stage(
+    SampleStorage&                   samples,
+    const SampleCatalog&             catalog,
+    const FourLevelStore::Config&    config,
+    const fs::path&                  db_folder,
+    const BuildPaths&                paths,
+    const std::optional<RowMapping>& reordered_rm_holder,
+    std::vector<uint64_t>*           cons_offsets,
+    std::vector<uint64_t>*           cons_lengths,
+    FourLevelStore::BuildResult&     result,
+    const LogPhaseFn&                log_phase)
+{
+    const auto& gpu_cache_path  = paths.gpu_cache_path;
+    const auto& cpu_cache_path  = paths.cpu_cache_path;
+    const auto& sample_dir      = paths.sample_dir;
+    const auto& packed_slim_dir = paths.packed_slim_dir;
+    const auto& addr_tables_dir = paths.addr_tables_dir;
+
+    try {
+        auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
+        auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
+
+        auto meta_sha_head = compute_meta_sha_head(
+            FourLevelStore::gnn_meta_path_for(db_folder, catalog.projection_name));
+
+        auto blocks_dir = fs::path(sample_dir) / "blocks";
+
+        build_addr_tables_(
+            samples,
+            addr_tables_dir,
+            packed_slim_dir,
+            l1_adapter,
+            l2_adapter,
+            reordered_rm_holder,
+            meta_sha_head,
+            catalog.total_batches,
+            result.addr_tables_bytes,
+            /*write_addr_tables=*/config.build_addr_tables,
+            /*bake_blocks=*/config.bake_blocks,
+            blocks_dir,
+            result.blocks_bytes,
+            /*store_fp=*/catalog.sample_content_fp,
+            cons_offsets,
+            cons_lengths);
+
+        result.addr_tables_built_ok = true;
+        if (config.bake_blocks) result.blocks_built_ok = true;
+        log_phase("addr_tables done");
+    } catch (const std::exception& ex) {
+        // The addr-table build is best-effort: a failure logs a warning
+        // but does not abort the feature store build. The runtime consumer
+        // falls back to the legacy per-batch hash-lookup path.
+        std::cerr << "FourLevelStore::build: WARNING addr_tables build failed: "
+                  << ex.what() << " — runtime will use per-batch lookup fallback.\n";
+        result.addr_tables_built_ok = false;
+        result.blocks_built_ok = false;
+    }
+}
+
+// Step 5b of build(): record the per-tier on-disk footprint in result and
+// flag over_budget when a disk budget is configured and exceeded. Measures
+// files that ALREADY exist on disk (caches from Step 3, slim from Step 5,
+// reordered.fmat from Step 4 when reorder=true); all measurements post-fsync.
+void measure_store_disk_footprint(
+    const FourLevelStore::Config& config,
+    const BuildPaths&             paths,
+    uint64_t                      slim_bytes_acc,
+    FourLevelStore::BuildResult&  result)
+{
+    const auto& gpu_cache_path = paths.gpu_cache_path;
+    const auto& cpu_cache_path = paths.cpu_cache_path;
+    const auto& reordered_fmat = paths.reordered_fmat;
+
     auto safe_size = [](const fs::path& p) -> uint64_t {
         std::error_code ec;
         if (!fs::exists(p, ec)) return 0;
@@ -1766,14 +1812,30 @@ FourLevelStore::BuildResult FourLevelStore::build(
                   << " Consider retrying with a smaller fanout, smaller batch,"
                   << " or larger disk budget.\n";
     }
+}
 
-    // --- Step 6: Write metadata ---
+// Step 6 of build(): persist store.meta (open|write|fsync|fsync-dir) and then
+// the content-fingerprint sidecar. The sidecar is written after the meta
+// fsync so the two together mark a fully built store bound to this specific
+// sample+feature. Precondition: every result tier count is final. Throws on
+// I/O failure (the caller's cleanup catch removes both files).
+void write_store_meta_and_fingerprint(
+    const BuildPaths&                  paths,
+    const FourLevelStore::BuildResult& result,
+    uint64_t                           D,
+    GnnDtype                           dt,
+    bool                               gpu_available,
+    uint64_t                           cur_fp)
+{
+    const auto& meta_path       = paths.meta_path;
+    const auto& packed_slim_dir = paths.packed_slim_dir;
+    const auto& store_fp_path   = paths.store_fp_path;
+
     auto meta = StoreMetaHeader::make(
         result.l1_nodes, result.l2_nodes, result.l3_nodes, result.l4_nodes,
         D, dt, gpu_available, packed_slim_dir.string());
 
     {
-        wrote_meta = true;
         int fd = ::open(meta_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             throw std::runtime_error(
@@ -1790,58 +1852,449 @@ FourLevelStore::BuildResult FourLevelStore::build(
         fsync_directory(meta_path);
     }
 
-    // Write the content-fingerprint sidecar next to store.meta. Written
-    // after the meta fsync so the two together mark a fully built store bound to
-    // this specific sample+feature. The failure-cleanup catch removes it too.
     write_store_fp(store_fp_path, cur_fp);
+}
+
+// Post-build cleanup: delete the non-slim packed/ scratch directory left by
+// gnn_materialize_batches. It is NEVER read at runtime (training reads
+// packed_slim/ instead) and on large graphs occupies tens of GBs. Non-fatal:
+// a removal failure is logged and the build result is unaffected.
+void remove_materialize_scratch(const std::string& sample_dir)
+{
+    auto packed_scratch = fs::path(sample_dir) / "packed";
+    if (fs::exists(packed_scratch)) {
+        std::error_code cleanup_ec;
+        auto removed_count = fs::remove_all(packed_scratch, cleanup_ec);
+        if (cleanup_ec) {
+            // Non-fatal: log via cerr but don't abort the build.
+            std::cerr << "FourLevelStore::build: warning, failed to cleanup "
+                      << packed_scratch.string() << ": " << cleanup_ec.message()
+                      << " (you can remove it manually)\n";
+        } else if (removed_count > 0) {
+            std::cout << "  [cleanup] removed " << (removed_count - 1)
+                      << " files from materialize_batches scratch dir "
+                      << packed_scratch.string() << "\n";
+        }
+    }
+}
+
+// Packed-full build mode (additive): a single gather pass over the
+// source fmat into <sample_dir>/packed_full/, keyed by cur_fp. Writes ONLY
+// packed_full/; never builds/deletes the 4-tier or blocks/. Requires
+// store.meta + blocks/ to already exist (a prior bakeBlocks build). The
+// train-time consumer (BatchAssembler packed-full mode) prefers this pack.
+// Precondition: config.pack_full is set. Throws when the sample carries no
+// content fingerprint (the pack would never be adopted at train).
+FourLevelStore::BuildResult build_packed_full_only(
+    const FeatureMatrix& features,
+    const RowMapping&    row_mapping,
+    SampleStorage&       samples,
+    const SampleCatalog& catalog,
+    const BuildPaths&    paths,
+    uint64_t             cur_fp,
+    std::chrono::high_resolution_clock::time_point total_start)
+{
+    const auto& sample_dir = paths.sample_dir;
+
+    // Mirrors the caller's BuildResult state at this point in the pipeline.
+    FourLevelStore::BuildResult result;
+    result.packed_slim_dir = paths.packed_slim_dir.string();
+
+    if (cur_fp == 0) {
+        throw std::runtime_error(
+            "packFullFeatures: sample has no content fingerprint (legacy/pre-STEP8 sample); "
+            "the packed-full pack would never be adopted at train. Re-run gnn_offline_sample "
+            "so the sample carries a content fingerprint, then bakeBlocks, then packFullFeatures.");
+    }
+    std::cerr << "[FourLevelStore] packed-full build start (additive)\n";
+    result.packed_full_bytes = build_packed_full_(
+        samples, features, row_mapping, fs::path(sample_dir),
+        cur_fp, catalog.total_batches);
+    std::cerr << "[FourLevelStore] packed-full build done ("
+              << (result.packed_full_bytes / (1024ULL * 1024)) << " MiB)\n";
+    auto pf_end = std::chrono::high_resolution_clock::now();
+    result.build_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        pf_end - total_start).count();
+    return result;
+}
+
+// Opt-in partitioned packed_slim materialisation. The default worker loop
+// gathers each batch's cold (non-L1/L2) rows RANDOMLY from the
+// reordered FM; on papers100M (54 GB FM > 30 GB RAM) those rows are by
+// definition the on-disk cold tier, so every gather faults a page ->
+// ~0.3 batches/s page-cache thrash (IOPS-bound; more workers do not help).
+// MDB_GNN_SLIM_PARTITIONED=1 instead performs ONE sequential .fmat scan in
+// row-range partitions and scatter-pwrites each row into the batch files
+// that need it. Output is the identical v2 [header][OID table][features]
+// format read_slim_oid_table consumes; the OID table travels with each row
+// so AddrTable resolution is positionally agnostic (correctness independent
+// of within-batch order).
+// DEFAULT ON: the partitioned packer is ~5.7x faster on papers100M-scale
+// (one sequential .fmat scan vs per-batch random gather of cold on-disk
+// rows) and produces BIT-IDENTICAL output (validated cora testAccuracy
+// 0.86240786 classic vs partitioned). Disable with MDB_GNN_SLIM_PARTITIONED=0.
+// Both arms are spelled out in the accepted list because the chain below
+// branched on both. An unrecognised value keeps the ON default exactly as
+// falling through the chain did, with the difference that the rejected
+// spelling is now on the record rather than passing for a deliberate off.
+// Reads (and declares) the MDB_GNN_SLIM_PARTITIONED ablation switch; must be
+// called unconditionally once per build (same frequency as the inline read).
+bool slim_partitioned_packer_requested()
+{
+    static const std::string slim_partitioned =
+        Ablation::choice("MDB_GNN_SLIM_PARTITIONED", "1",
+                         {"1", "true", "yes", "0", "false", "no"});
+    return !(slim_partitioned == "0" ||
+             slim_partitioned == "false" ||
+             slim_partitioned == "no");
+}
+
+// Decision + stamps for the consolidated cold-feature file (opt-in).
+// Computed before the partitioned pack so the writer can stamp the perm/meta
+// fingerprints; per-batch (offset, length) are captured by the caller for the
+// v2 addr_tables so the runtime can pread a single range instead of opening a
+// per-batch .bin file. Only the partitioned sequential-scan path writes it;
+// the legacy worker loop ignores it.
+struct ConsolidatedSlimPlan {
+    bool     enabled  = false;
+    fs::path path;            // packed_slim/consolidated.slim when enabled
+    uint64_t perm_fp  = 0;    // reordered permutation fingerprint stamp
+    uint64_t meta_sha = 0;    // gnn_meta.bin staleness stamp
+};
+
+// Resolve whether this build writes consolidated.slim and compute its
+// staleness stamps. Pure apart from the enabling log line.
+ConsolidatedSlimPlan plan_consolidated_slim(
+    const FourLevelStore::Config&    config,
+    bool                             use_slim_partitioned,
+    const BuildPaths&                paths,
+    const fs::path&                  db_folder,
+    const SampleCatalog&             catalog,
+    const std::optional<RowMapping>& reordered_rm_holder,
+    const LogPhaseFn&                log_phase)
+{
+    ConsolidatedSlimPlan plan;
+    plan.enabled = config.write_consolidated_slim && use_slim_partitioned;
+    plan.path    = plan.enabled ? (paths.packed_slim_dir / "consolidated.slim")
+                                : fs::path{};
+    if (plan.enabled) {
+        plan.perm_fp = reordered_rm_holder.has_value()
+                         ? reordered_rm_holder->perm_fingerprint() : 0;
+        plan.meta_sha = compute_meta_sha_head(
+            FourLevelStore::gnn_meta_path_for(db_folder, catalog.projection_name));
+        log_phase("L4 consolidated.slim: enabled");
+    }
+    return plan;
+}
+
+// reordered.fmat is "fresh" only if it exists AND its embedded
+// fingerprint matches cur_fp (with cur_fp known). A reordered.fmat left by a
+// different sample (e.g. force + force_reorder=false) is detected here and
+// rebuilt instead of being opened with the wrong shape. Never throws: any
+// open/validation failure reads as stale.
+bool reordered_artifacts_fresh(const FourLevelStore::Config& config,
+                               uint64_t                      cur_fp,
+                               const fs::path&               reordered_fmat,
+                               const fs::path&               reordered_rmap)
+{
+    bool reordered_fresh = false;
+    if (config.reorder && cur_fp != 0 &&
+        fs::exists(reordered_fmat) && fs::exists(reordered_rmap)) {
+        try {
+            reordered_fresh =
+                (FeatureMatrix::open(reordered_fmat).fingerprint() == cur_fp);
+        } catch (...) {
+            reordered_fresh = false;
+        }
+    }
+    return reordered_fresh;
+}
+
+// Failure cleanup for build(): best-effort removal of the artifacts THIS
+// run (re)wrote, per the wrote_* flags the pipeline sets as each stage
+// starts writing. Artifacts reused fresh from a previous build survive — their
+// embedded fingerprints make the retry's reuse-or-recompute decision safe.
+// Never throws (all removals go through the error_code overloads).
+void remove_partial_build_outputs(const BuildPaths& paths,
+                                  bool wrote_caches,
+                                  bool wrote_reorder,
+                                  bool wrote_slim,
+                                  bool wrote_addr,
+                                  bool wrote_meta)
+{
+    const auto& gpu_cache_path  = paths.gpu_cache_path;
+    const auto& cpu_cache_path  = paths.cpu_cache_path;
+    const auto& meta_path       = paths.meta_path;
+    const auto& reordered_fmat  = paths.reordered_fmat;
+    const auto& reordered_rmap  = paths.reordered_rmap;
+    const auto& packed_slim_dir = paths.packed_slim_dir;
+    const auto& addr_tables_dir = paths.addr_tables_dir;
+    const auto& store_fp_path   = paths.store_fp_path;
+
+    std::error_code ec;
+    if (wrote_slim || wrote_addr) {
+        // addr_tables index into packed_slim slots, so removing the slim
+        // dir makes any addr_tables stale — they go together.
+        fs::remove_all(addr_tables_dir, ec);
+    }
+    if (wrote_slim) fs::remove_all(packed_slim_dir, ec);
+    if (wrote_caches) {
+        fs::remove(gpu_cache_path, ec);
+        fs::remove(cpu_cache_path, ec);
+    }
+    if (wrote_meta) {
+        fs::remove(meta_path, ec);
+        fs::remove(store_fp_path, ec);  // content-fingerprint sidecar
+    }
+    if (wrote_reorder) {
+        fs::remove(reordered_fmat, ec);
+        fs::remove(reordered_rmap, ec);
+        fs::remove(fs::path(reordered_rmap.string() + ".idx"), ec);
+    }
+}
+
+} // anonymous namespace
+
+// =============================================================================
+// build() — The Core Pipeline
+// =============================================================================
+
+FourLevelStore::BuildResult FourLevelStore::build(
+    const FeatureMatrix&         features,
+    const RowMapping&            row_mapping,
+    SampleStorage&               samples,
+    const Config&                config,
+    const fs::path&              db_folder,
+    const std::string&           feature_name)
+{
+    auto total_start = std::chrono::high_resolution_clock::now();
+    BuildResult result;
+
+    // Bindings for the paths build() itself still touches; the stage helpers
+    // receive `paths` and bind their own.
+    const BuildPaths paths = make_build_paths(db_folder, feature_name, samples);
+    const auto& gnn_dir         = paths.gnn_dir;
+    const auto& meta_path       = paths.meta_path;
+    const auto& reordered_fmat  = paths.reordered_fmat;
+    const auto& reordered_rmap  = paths.reordered_rmap;
+    const auto& sample_dir      = paths.sample_dir;
+    const auto& packed_slim_dir = paths.packed_slim_dir;
+
+    const auto& catalog  = samples.get_catalog();
+    result.packed_slim_dir = packed_slim_dir.string();
+
+    // The feature store's reuse key = the sample's persisted content
+    // fingerprint (catalog) mixed with this store's identity (name + dim +
+    // dtype). 0 = UNKNOWN (legacy sample with no content fingerprint) →
+    // always recompute.
+    const uint64_t cur_fp = mix_feature_store_fingerprint(
+        catalog.sample_content_fp, feature_name,
+        features.num_cols(), static_cast<uint8_t>(features.dtype()));
+
+    // Packed-full build mode (additive): writes ONLY packed_full/; never
+    // builds/deletes the 4-tier or blocks/.
+    if (config.pack_full) {
+        return build_packed_full_only(features, row_mapping, samples, catalog,
+                                      paths, cur_fp, total_start);
+    }
+
+    // --- Force cleanup ---
+    remove_force_selected_artifacts(config, paths);
+
+    // --- Pre-condition checks (content-fingerprint reuse-or-recompute gate) ---
+    // Reuse when the persisted fingerprint matches; otherwise the helper has
+    // already deleted the stale artifacts and we fall through to a recompute.
+    if (fs::exists(meta_path)) {
+        if (auto reused = try_reuse_or_invalidate_existing_store(
+                samples, config, db_folder, paths, cur_fp, total_start)) {
+            return *reused;
+        }
+    }
+
+    auto log_phase = [&total_start](const std::string& tag) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double t = std::chrono::duration<double>(now - total_start).count();
+        std::cerr << "[FourLevelStore] T+" << std::fixed << std::setprecision(1)
+                  << t << "s " << tag << "\n" << std::flush;
+    };
+    log_phase("build() start");
+
+    // --- Step 1: Read frequencies ---
+    std::vector<uint64_t> freq_dense =
+        read_dense_frequencies_with_fallback(samples, row_mapping);
+
+    // --- Step 2: Classify nodes ---
+    uint64_t N = features.num_rows();
+    uint64_t D = features.num_cols();
+    GnnDtype dt = features.dtype();
+    size_t elem = dtype_size(dt);
+    size_t row_bytes = D * elem;
+
+    TierPlan tiers = classify_nodes_into_tiers(
+        freq_dense, N, row_bytes, config, row_mapping, catalog, result);
+    const auto& cached_oid_set = tiers.cached_oid_set;
+    const bool  gpu_available  = tiers.gpu_available;
+
+    // Track which artifacts THIS invocation (re)writes so the failure-cleanup
+    // catch below removes only this run's partial outputs. Artifacts reused
+    // fresh (e.g. a fingerprint-matched reordered.fmat) survive a later-phase
+    // failure — their embedded fingerprints make the retry's reuse-or-recompute
+    // decision safe.
+    bool wrote_caches  = false;
+    bool wrote_reorder = false;
+    bool wrote_slim    = false;
+    bool wrote_addr    = false;
+    bool wrote_meta    = false;
+
+    // --- Cleanup guard for partial outputs ---
+    try {
+
+    // --- Step 3: Build cache files ---
+    fs::create_directories(gnn_dir);
+    wrote_caches = true;
+    build_or_defer_l1_l2_caches(config, tiers, features, row_mapping,
+                                paths, feature_name, log_phase);
+
+    // --- Step 4: Ensure L3 reordered FM exists ---
+    const FeatureMatrix* active_fm = &features;
+    std::optional<FeatureMatrix> reordered_holder;
+    const RowMapping* active_rm = &row_mapping;
+    std::optional<RowMapping> reordered_rm_holder;
+
+    bool reordered_fresh =
+        reordered_artifacts_fresh(config, cur_fp, reordered_fmat, reordered_rmap);
+    if (config.reorder && !reordered_fresh) {
+        wrote_reorder = true;
+        rebuild_reordered_artifacts(features, row_mapping, samples, catalog,
+                                    config, N, cur_fp, reordered_fmat,
+                                    reordered_rmap, log_phase);
+    } else if (config.reorder) {
+        log_phase("L3 reorder fresh (fingerprint match) — reusing reordered.fmat");
+    } else {
+        log_phase("L3 reorder disabled");
+    }
+
+    if (config.reorder && fs::exists(reordered_fmat)) {
+        reordered_holder.emplace(FeatureMatrix::open(reordered_fmat));
+        active_fm = &*reordered_holder;
+        reordered_rm_holder.emplace(RowMapping::open(reordered_rmap));
+        active_rm = &*reordered_rm_holder;
+    }
+
+    // --- Step 5: Re-pack L4 slim ---
+    // For each batch: filter out L1/L2 nodes, write only remaining nodes as v2.
+    // L3 nodes are INCLUDED in slim files because load_batch_features() reads
+    // the OID table to identify L4 nodes -- excluding L3 here would lose them.
+    // Instead, we keep all non-cached nodes in slim files (L3+L4), and at
+    // runtime load_batch_features() resolves L3 from the reordered FM while
+    // L4 features come directly from the slim file data section.
+    wrote_slim = true;
+    fs::create_directories(packed_slim_dir);
+
+    log_phase("L4 packed_slim start");
+    auto l4_start = std::chrono::high_resolution_clock::now();
+    unsigned num_l4_workers = resolve_l4_worker_count(catalog);
+
+    // Touch RowMapping index once before workers spawn — RowMapping::find()
+    // lazy-builds a sorted index under std::call_once on first call. If we
+    // didn't force-init here, the first worker pays an O(N log N) sort
+    // while the rest stall on the call_once barrier.
+    if (N > 0) {
+        (void) active_rm->find(active_rm->get(0));
+    }
+
+    // Third reader of this switch (the two reorder passes are the others). The
+    // registry resolves it once per process, so the reorder and the packer
+    // cannot disagree about whether this build was pipelined.
+    static const bool use_pipeline_overlap =
+        Ablation::choice("MDB_GNN_PIPELINE_OVERLAP", "0", {"1", "true", "yes"}) != "0";
+
+    // Stays mutable: the NOFILE check just below turns the partitioned packer
+    // off when the fd budget cannot cover one fd per batch, and that decision
+    // is the process's, not the operator's.
+    bool use_slim_partitioned = slim_partitioned_packer_requested();
+
+    // The partitioned packer needs NOFILE >= total_batches + headroom; raise
+    // it (recorded in nofile_restore) or fall back to the worker loop.
+    NofileRestore nofile_restore;
+    maybe_raise_nofile_for_partitioned_pack(use_slim_partitioned, nofile_restore,
+                                            catalog, log_phase);
+
+    // Consolidated cold-feature file (opt-in; partitioned path only).
+    const ConsolidatedSlimPlan cons = plan_consolidated_slim(
+        config, use_slim_partitioned, paths, db_folder, catalog,
+        reordered_rm_holder, log_phase);
+    const bool write_consolidated = cons.enabled;
+    std::vector<uint64_t> cons_offsets, cons_lengths;
+
+    uint64_t slim_bytes_acc = 0;
+    if (use_slim_partitioned) {
+        slim_bytes_acc = pack_slim_batches_partitioned(
+            samples, catalog, cached_oid_set, active_fm, active_rm,
+            packed_slim_dir, cons.path, cons.perm_fp, cons.meta_sha,
+            write_consolidated ? &cons_offsets : nullptr,
+            write_consolidated ? &cons_lengths : nullptr,
+            log_phase);
+    } else {
+        slim_bytes_acc = pack_slim_batches_worker_pool(
+            samples, catalog, cached_oid_set, active_fm, active_rm,
+            row_bytes, D, dt, packed_slim_dir, num_l4_workers,
+            use_pipeline_overlap, l4_start);
+    }
+
+    // The per-batch fds are closed now — drop the NOFILE raise immediately
+    // (the RAII destructor also covers the throw paths above).
+    nofile_restore.restore();
+
+    log_phase("L4 packed_slim done, fsync_directory next");
+    // Each batch file's data pages were fsync'd at write time; this directory
+    // fsync persists the directory entries so the file names survive a crash.
+    fsync_directory(packed_slim_dir);
+    log_phase("L4 fsync_directory done");
+
+    // --- Build AddrTable sidecars ---
+    // Pre-classify every batch's nodes into tiers and persist the results so
+    // the runtime hot path skips the per-node hash lookups (see the helper).
+    if (config.build_addr_tables || config.bake_blocks) {
+        log_phase("addr_tables start");
+        if (config.build_addr_tables) wrote_addr = true;
+        run_addr_table_stage(samples, catalog, config, db_folder, paths,
+                             reordered_rm_holder,
+                             write_consolidated ? &cons_offsets : nullptr,
+                             write_consolidated ? &cons_lengths : nullptr,
+                             result, log_phase);
+    }
+
+    // The source FM and reordered FM are no longer needed by this procedure.
+    // Issue POSIX_FADV_DONTNEED hints so the next caller (typically gnn_train
+    // running back-to-back) starts with a clean page-cache budget instead of
+    // inheriting ~110 GB of stale source+reordered pages.
+    features.release_cache();
+    if (config.reorder && reordered_holder.has_value()) {
+        reordered_holder->release_cache();
+    }
+
+    // --- Step 5b: Measure on-disk footprint for telemetry ---
+    // We measure files that ALREADY exist on disk (caches were written in
+    // Step 3, slim was just written in Step 5, reordered.fmat was written
+    // in Step 4 if reorder=true). All measurements are post-fsync.
+    measure_store_disk_footprint(config, paths, slim_bytes_acc, result);
+
+    // --- Step 6: Write metadata ---
+    wrote_meta = true;
+    write_store_meta_and_fingerprint(paths, result, D, dt, gpu_available, cur_fp);
 
     } catch (...) {
         // Best-effort cleanup of THIS run's partial outputs only (see the
         // wrote_* tracking above).
-        std::error_code ec;
-        if (wrote_slim || wrote_addr) {
-            // addr_tables index into packed_slim slots, so removing the slim
-            // dir makes any addr_tables stale — they go together.
-            fs::remove_all(addr_tables_dir, ec);
-        }
-        if (wrote_slim) fs::remove_all(packed_slim_dir, ec);
-        if (wrote_caches) {
-            fs::remove(gpu_cache_path, ec);
-            fs::remove(cpu_cache_path, ec);
-        }
-        if (wrote_meta) {
-            fs::remove(meta_path, ec);
-            fs::remove(store_fp_path, ec);  // content-fingerprint sidecar
-        }
-        if (wrote_reorder) {
-            fs::remove(reordered_fmat, ec);
-            fs::remove(reordered_rmap, ec);
-            fs::remove(fs::path(reordered_rmap.string() + ".idx"), ec);
-        }
+        remove_partial_build_outputs(paths, wrote_caches, wrote_reorder,
+                                     wrote_slim, wrote_addr, wrote_meta);
         throw;
     }
 
     // --- Step 6: Cleanup materialize_batches scratch ---
-    // The non-slim packed/ directory is scratch intermediate: it was written
-    // by gnn_materialize_batches but is NEVER read at runtime (training reads
-    // packed_slim/ instead). On large graphs it can occupy tens of GBs.
-    // Delete it here unless the caller opted out via Config::cleanup_materialize_scratch=false.
     if (config.cleanup_materialize_scratch) {
-        auto packed_scratch = fs::path(sample_dir) / "packed";
-        if (fs::exists(packed_scratch)) {
-            std::error_code cleanup_ec;
-            auto removed_count = fs::remove_all(packed_scratch, cleanup_ec);
-            if (cleanup_ec) {
-                // Non-fatal: log via cerr but don't abort the build.
-                std::cerr << "FourLevelStore::build: warning, failed to cleanup "
-                          << packed_scratch.string() << ": " << cleanup_ec.message()
-                          << " (you can remove it manually)\n";
-            } else if (removed_count > 0) {
-                std::cout << "  [cleanup] removed " << (removed_count - 1)
-                          << " files from materialize_batches scratch dir "
-                          << packed_scratch.string() << "\n";
-            }
-        }
+        remove_materialize_scratch(sample_dir);
     }
 
     auto total_end = std::chrono::high_resolution_clock::now();
@@ -2359,33 +2812,15 @@ static bool read_slim_file_o_direct(const std::string& path, size_t file_size,
     return ok;
 }
 
-torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sample) {
-    const auto& oids = sample.all_unique_nodes;
-    const uint64_t batch_id = sample.batch_id;
-    uint64_t total = oids.size();
-
-    if (total == 0) {
-        return torch::empty(
-            {0, static_cast<int64_t>(feature_dim_)},
-            torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
-    }
-
-    stats_.total_requests += total;
-
-    // Per-call profiling instrumentation: reset per-call profile timers. Each tier wraps its
-    // own block with steady_clock::now() and accumulates nanoseconds into the
-    // corresponding last_*_ns_ member. last_rmap_ns_ is a SUB-counter that
-    // tracks the (single, on the L3-fallback path) reordered_rm_->find() call
-    // and is also already included inside last_l3_ns_.
-    last_l1_ns_   = 0;
-    last_l2_ns_   = 0;
-    last_l3_ns_   = 0;
-    last_l4_ns_   = 0;
-    last_rmap_ns_ = 0;
-
-    size_t row_bytes = feature_dim_ * elem_size_;
-
-    // Step 1: Read L4 packed_slim for this batch to get OID table
+// Legacy step 1 (see the declaration in four_level_store.h): bulk-read this
+// batch's packed_slim .bin and parse [header][OID table][features] into the
+// (empty at entry) out-params. Missing/invalid/truncated files leave them
+// empty, matching the historical no-file branch.
+void FourLevelStore::load_l4_slim_for_batch_(
+    uint64_t batch_id,
+    std::unordered_map<uint64_t, uint32_t>& slim_oid_to_idx,
+    std::vector<char>& slim_data)
+{
     auto t_l4_step1_start = std::chrono::steady_clock::now();
     char fname[32];
     std::snprintf(fname, sizeof(fname), "batch_%06lu.bin",
@@ -2393,8 +2828,6 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
     auto slim_path = fs::path(packed_slim_dir_) / fname;
 
     // Read slim file header and OID table
-    std::unordered_map<uint64_t, uint32_t> slim_oid_to_idx;
-    std::vector<char> slim_data;
     uint64_t slim_nodes = 0;
 
     if (fs::exists(slim_path)) {
@@ -2496,8 +2929,23 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
                            t_l4_step1_end - t_l4_step1_start)
                            .count();
     }
+}
 
-    // Step 2: Partition nodes into L1/L2/L3/L4 buckets.
+// Legacy step 2 (see four_level_store.h): per-node hash classification into
+// the four tier buckets. Each bucket stores (output_position, source index)
+// for later assembly. The classification loop stores cache row indices
+// directly (l1_indices, l2_indices) so the assembly step can skip a second
+// hash lookup — one hash per oid via find_index, down from two
+// (contains() + lookup()/lookup_uva()).
+FourLevelStore::LegacyTierBuckets FourLevelStore::classify_batch_nodes_legacy_(
+    const std::vector<ObjectId>& oids,
+    uint64_t batch_id,
+    size_t row_bytes,
+    const std::unordered_map<uint64_t, uint32_t>& slim_oid_to_idx,
+    const std::vector<char>& slim_data)
+{
+    uint64_t total = oids.size();
+
     // Each bucket stores (output_position, source_data) for later assembly.
     //
     // The classification loop stores cache row indices directly (l1_indices,
@@ -2622,9 +3070,20 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
                          zero_filled, total);
     }
 
-    // Step 3: Batch-read L3 rows via DirectIoReader (zero page cache)
-    // or mmap fallback. Result is a contiguous buffer of l3_row_indices.size() rows.
-    // Profiling instrumentation: time the L3 disk read.
+    return LegacyTierBuckets{
+        std::move(l1_input_positions), std::move(l1_indices),
+        std::move(l2_positions),       std::move(l2_indices),
+        std::move(l3_positions),       std::move(l3_row_indices),
+        std::move(l4_positions),       std::move(l4_slim_indices)};
+}
+
+// Legacy step 3 (see four_level_store.h): batch-read the classified L3 rows.
+// Result is a contiguous buffer of l3_row_indices.size() rows.
+// Profiling instrumentation: times the L3 disk read into last_l3_ns_.
+std::vector<char> FourLevelStore::read_l3_rows_legacy_(
+    const std::vector<uint64_t>& l3_row_indices,
+    size_t row_bytes)
+{
     std::vector<char> l3_buf;
     {
         auto t_l3_read_start = std::chrono::steady_clock::now();
@@ -2649,137 +3108,161 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
                            t_l3_read_end - t_l3_read_start)
                            .count();
     }
+    return l3_buf;
+}
 
-    // Step 4: Assemble output tensor.
-    // Use FeatureAssembler when dtype is FLOAT32 and GPU cache is present
-    // (assembler targets GPU output via CUDA kernel / index_copy_).
-    // Otherwise fall back to direct CPU memcpy.
-    //
-    // TODO: extend FeatureAssembler for float64 support.
-    bool use_assembler = (assembler_ != nullptr)
-                         && (dtype_ == GnnDtype::FLOAT32)
-                         && gpu_cache_
-                         && gpu_cache_->is_on_gpu();
+// Legacy step 4, GPU arm (see four_level_store.h). Gathers L1 rows on-GPU,
+// combines L2+L3+L4 rows into one contiguous host buffer (pinned when
+// available), and scatters everything into the [total, D] output through
+// FeatureAssembler. Precondition: dispatcher verified float32 dtype and a
+// GPU-resident L1 cache.
+torch::Tensor FourLevelStore::assemble_batch_gpu_legacy_(
+    uint64_t total,
+    const LegacyTierBuckets& buckets,
+    const std::vector<char>& l3_buf,
+    const std::vector<char>& slim_data)
+{
+    const auto& l1_input_positions = buckets.l1_input_positions;
+    const auto& l1_indices         = buckets.l1_indices;
+    const auto& l2_positions       = buckets.l2_positions;
+    const auto& l2_indices         = buckets.l2_indices;
+    const auto& l3_positions       = buckets.l3_positions;
+    const auto& l4_positions       = buckets.l4_positions;
+    const auto& l4_slim_indices    = buckets.l4_slim_indices;
 
-    if (use_assembler) {
-        // --- GPU-accelerated assembly path ---
-
-        // L1: gather rows by pre-computed cache indices. The classification
-        // loop already validated each L1 hit, so every l1_indices[k] is
-        // in-range — skip the second hash pass. Time the L1 GPU gather.
-        torch::Tensor gpu_features;
-        std::vector<uint32_t> gpu_positions;
-        if (!l1_indices.empty()) {
-            auto t_l1_gather_start = std::chrono::steady_clock::now();
-            gpu_features = gpu_cache_->gather_by_indices(l1_indices);
-            auto t_l1_gather_end = std::chrono::steady_clock::now();
-            last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               t_l1_gather_end - t_l1_gather_start)
-                               .count();
-            // Every entry in l1_indices was already a hit; positions
-            // match 1:1 with l1_input_positions.
-            gpu_positions = l1_input_positions;
-        }
-
-        // Combine L2 + L3 + L4 CPU features into one contiguous float buffer
-        std::vector<float> cpu_combined;
-        std::vector<uint32_t> cpu_combined_positions;
-
-        size_t cpu_total = l2_positions.size() + l3_positions.size() + l4_positions.size();
-        cpu_combined.reserve(cpu_total * feature_dim_);
-        cpu_combined_positions.reserve(cpu_total);
-
-        // L2 features: use pre-computed l2_indices via row_ptr() directly —
-        // skip the find loop inside lookup_uva() since each L2 hit was
-        // already validated in the classification loop. The row data is
-        // copied exactly once from the pinned L2 region into cpu_combined
-        // (previously it was copied twice via an intermediate heap vector).
-        // Time the L2 pinned-row copy.
-        if (!l2_positions.empty()) {
-            auto t_l2_copy_start = std::chrono::steady_clock::now();
-            for (size_t h = 0; h < l2_positions.size(); ++h) {
-                cpu_combined_positions.push_back(l2_positions[h]);
-                const float* row_ptr_f = static_cast<const float*>(
-                    cpu_cache_->row_ptr(l2_indices[h]));
-                cpu_combined.insert(cpu_combined.end(),
-                                    row_ptr_f,
-                                    row_ptr_f + feature_dim_);
-            }
-            auto t_l2_copy_end = std::chrono::steady_clock::now();
-            last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               t_l2_copy_end - t_l2_copy_start)
-                               .count();
-        }
-
-        // L3 features (already in l3_buf, in order of l3_row_indices).
-        // Time the L3 copy into the combined buffer.
-        if (!l3_positions.empty() && !l3_buf.empty()) {
-            auto t_l3_copy_start = std::chrono::steady_clock::now();
-            const float* l3_data = reinterpret_cast<const float*>(l3_buf.data());
-            for (size_t j = 0; j < l3_positions.size(); ++j) {
-                cpu_combined_positions.push_back(l3_positions[j]);
-                cpu_combined.insert(cpu_combined.end(),
-                                    l3_data + j * feature_dim_,
-                                    l3_data + (j + 1) * feature_dim_);
-            }
-            auto t_l3_copy_end = std::chrono::steady_clock::now();
-            last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               t_l3_copy_end - t_l3_copy_start)
-                               .count();
-        }
-
-        // L4 features (from slim_data). Time the L4 copy into the combined buffer.
-        if (!l4_positions.empty()) {
-            auto t_l4_copy_start = std::chrono::steady_clock::now();
-            const float* slim_float = reinterpret_cast<const float*>(slim_data.data());
-            for (size_t j = 0; j < l4_positions.size(); ++j) {
-                cpu_combined_positions.push_back(l4_positions[j]);
-                uint32_t idx = l4_slim_indices[j];
-                cpu_combined.insert(cpu_combined.end(),
-                                    slim_float + idx * feature_dim_,
-                                    slim_float + (idx + 1) * feature_dim_);
-            }
-            auto t_l4_copy_end = std::chrono::steady_clock::now();
-            last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               t_l4_copy_end - t_l4_copy_start)
-                               .count();
-        }
-
-        // Pin the CPU combined buffer for UVA access from the CUDA assembler
-        // kernel. Unpinned heap memory forces the GPU to read through UVA at
-        // ~120 MB/s; pinned memory achieves ~12 GB/s. Uses the persistent
-        // pinned-host buffer pool (grows geometrically, freed once in
-        // ~FourLevelStore()) instead of cudaHostAlloc+cudaFreeHost per batch.
-        const float* assembler_data = cpu_combined.data();
-#ifdef GNN_CUDA_ENABLED
-        size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
-        void* worker_pinned = nullptr;
-        if (cpu_combined_bytes > 0
-            && ensure_pinned_capacity_for_worker_(cpu_combined_bytes, worker_pinned)
-            && worker_pinned != nullptr) {
-            // Per-worker pinned buffer: the calling prefetch worker owns this
-            // slot exclusively, so the memcpy and the CUDA assembler kernel
-            // that reads it cannot race another worker. assemble() is
-            // host-blocking, so the buffer is safe to reuse on this worker's
-            // next batch.
-            std::memcpy(worker_pinned, cpu_combined.data(), cpu_combined_bytes);
-            assembler_data = reinterpret_cast<const float*>(worker_pinned);
-        }
-#endif
-
-        auto result_tensor = assembler_->assemble(
-            static_cast<int64_t>(total),
-            gpu_features, gpu_positions,
-            assembler_data,
-            static_cast<int64_t>(cpu_combined_positions.size()),
-            cpu_combined_positions
-        );
-
-        // No per-batch cudaFreeHost — pinned_ptr_ is reused; freed in dtor.
-        return result_tensor;
+    // L1: gather rows by pre-computed cache indices. The classification
+    // loop already validated each L1 hit, so every l1_indices[k] is
+    // in-range — skip the second hash pass. Time the L1 GPU gather.
+    torch::Tensor gpu_features;
+    std::vector<uint32_t> gpu_positions;
+    if (!l1_indices.empty()) {
+        auto t_l1_gather_start = std::chrono::steady_clock::now();
+        gpu_features = gpu_cache_->gather_by_indices(l1_indices);
+        auto t_l1_gather_end = std::chrono::steady_clock::now();
+        last_l1_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l1_gather_end - t_l1_gather_start)
+                           .count();
+        // Every entry in l1_indices was already a hit; positions
+        // match 1:1 with l1_input_positions.
+        gpu_positions = l1_input_positions;
     }
 
-    // --- CPU-only assembly path (no GPU, or non-float32 dtype) ---
+    // Combine L2 + L3 + L4 CPU features into one contiguous float buffer
+    std::vector<float> cpu_combined;
+    std::vector<uint32_t> cpu_combined_positions;
+
+    size_t cpu_total = l2_positions.size() + l3_positions.size() + l4_positions.size();
+    cpu_combined.reserve(cpu_total * feature_dim_);
+    cpu_combined_positions.reserve(cpu_total);
+
+    // L2 features: use pre-computed l2_indices via row_ptr() directly —
+    // skip the find loop inside lookup_uva() since each L2 hit was
+    // already validated in the classification loop. The row data is
+    // copied exactly once from the pinned L2 region into cpu_combined
+    // (previously it was copied twice via an intermediate heap vector).
+    // Time the L2 pinned-row copy.
+    if (!l2_positions.empty()) {
+        auto t_l2_copy_start = std::chrono::steady_clock::now();
+        for (size_t h = 0; h < l2_positions.size(); ++h) {
+            cpu_combined_positions.push_back(l2_positions[h]);
+            const float* row_ptr_f = static_cast<const float*>(
+                cpu_cache_->row_ptr(l2_indices[h]));
+            cpu_combined.insert(cpu_combined.end(),
+                                row_ptr_f,
+                                row_ptr_f + feature_dim_);
+        }
+        auto t_l2_copy_end = std::chrono::steady_clock::now();
+        last_l2_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l2_copy_end - t_l2_copy_start)
+                           .count();
+    }
+
+    // L3 features (already in l3_buf, in order of l3_row_indices).
+    // Time the L3 copy into the combined buffer.
+    if (!l3_positions.empty() && !l3_buf.empty()) {
+        auto t_l3_copy_start = std::chrono::steady_clock::now();
+        const float* l3_data = reinterpret_cast<const float*>(l3_buf.data());
+        for (size_t j = 0; j < l3_positions.size(); ++j) {
+            cpu_combined_positions.push_back(l3_positions[j]);
+            cpu_combined.insert(cpu_combined.end(),
+                                l3_data + j * feature_dim_,
+                                l3_data + (j + 1) * feature_dim_);
+        }
+        auto t_l3_copy_end = std::chrono::steady_clock::now();
+        last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l3_copy_end - t_l3_copy_start)
+                           .count();
+    }
+
+    // L4 features (from slim_data). Time the L4 copy into the combined buffer.
+    if (!l4_positions.empty()) {
+        auto t_l4_copy_start = std::chrono::steady_clock::now();
+        const float* slim_float = reinterpret_cast<const float*>(slim_data.data());
+        for (size_t j = 0; j < l4_positions.size(); ++j) {
+            cpu_combined_positions.push_back(l4_positions[j]);
+            uint32_t idx = l4_slim_indices[j];
+            cpu_combined.insert(cpu_combined.end(),
+                                slim_float + idx * feature_dim_,
+                                slim_float + (idx + 1) * feature_dim_);
+        }
+        auto t_l4_copy_end = std::chrono::steady_clock::now();
+        last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           t_l4_copy_end - t_l4_copy_start)
+                           .count();
+    }
+
+    // Pin the CPU combined buffer for UVA access from the CUDA assembler
+    // kernel. Unpinned heap memory forces the GPU to read through UVA at
+    // ~120 MB/s; pinned memory achieves ~12 GB/s. Uses the persistent
+    // pinned-host buffer pool (grows geometrically, freed once in
+    // ~FourLevelStore()) instead of cudaHostAlloc+cudaFreeHost per batch.
+    const float* assembler_data = cpu_combined.data();
+#ifdef GNN_CUDA_ENABLED
+    size_t cpu_combined_bytes = cpu_combined.size() * sizeof(float);
+    void* worker_pinned = nullptr;
+    if (cpu_combined_bytes > 0
+        && ensure_pinned_capacity_for_worker_(cpu_combined_bytes, worker_pinned)
+        && worker_pinned != nullptr) {
+        // Per-worker pinned buffer: the calling prefetch worker owns this
+        // slot exclusively, so the memcpy and the CUDA assembler kernel
+        // that reads it cannot race another worker. assemble() is
+        // host-blocking, so the buffer is safe to reuse on this worker's
+        // next batch.
+        std::memcpy(worker_pinned, cpu_combined.data(), cpu_combined_bytes);
+        assembler_data = reinterpret_cast<const float*>(worker_pinned);
+    }
+#endif
+
+    auto result_tensor = assembler_->assemble(
+        static_cast<int64_t>(total),
+        gpu_features, gpu_positions,
+        assembler_data,
+        static_cast<int64_t>(cpu_combined_positions.size()),
+        cpu_combined_positions
+    );
+
+    // No per-batch cudaFreeHost — pinned_ptr_ is reused; freed in dtor.
+    return result_tensor;
+}
+
+// Legacy step 4, CPU arm (see four_level_store.h): no GPU, or non-float32
+// dtype. Copies each tier's rows straight into a zero-initialized CPU
+// tensor; unresolved positions stay zero.
+torch::Tensor FourLevelStore::assemble_batch_cpu_legacy_(
+    uint64_t total,
+    const LegacyTierBuckets& buckets,
+    const std::vector<char>& l3_buf,
+    const std::vector<char>& slim_data,
+    size_t row_bytes)
+{
+    const auto& l1_input_positions = buckets.l1_input_positions;
+    const auto& l1_indices         = buckets.l1_indices;
+    const auto& l2_positions       = buckets.l2_positions;
+    const auto& l2_indices         = buckets.l2_indices;
+    const auto& l3_positions       = buckets.l3_positions;
+    const auto& l4_positions       = buckets.l4_positions;
+    const auto& l4_slim_indices    = buckets.l4_slim_indices;
+
     auto output = torch::zeros(
         {static_cast<int64_t>(total), static_cast<int64_t>(feature_dim_)},
         torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
@@ -2858,58 +3341,10 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
     return output;
 }
 
-// =============================================================================
-// load_batch_features_v2_() — addr-table-driven fast path
-// =============================================================================
-//
-// Reads the pre-classified addr_table sidecar for this batch and assembles
-// the output tensor using the same GPU assembler path as legacy_ — but
-// without the per-node hash lookup loop (Steps 1-2 of legacy_).
-//
-// Only called when assembler_ is active and gpu_cache_->is_on_gpu() (the
-// dispatcher enforces this gate). On meta_sha mismatch throws
-// AddrTableStaleException so the dispatcher catches and falls back cleanly.
-//
-// Stats accounting matches legacy_ so disk-traffic reports stay comparable
-// across the two paths.
-// =============================================================================
-
-torch::Tensor FourLevelStore::load_batch_features_v2_(
-    const GraphSample& sample,
-    const fs::path&    addr_path)
-{
-    // Reset per-tier timers (v2 does not time individual hash lookups, but
-    // we zero them so stale ns values from a previous batch do not bleed
-    // through if the caller inspects last_l?_us() after a v2 serve).
-    last_l1_ns_   = 0;
-    last_l2_ns_   = 0;
-    last_l3_ns_   = 0;
-    last_l4_ns_   = 0;
-    last_rmap_ns_ = 0;
-
-    // --- Open and validate the addr_table sidecar ---
-    auto t_addr_start = std::chrono::steady_clock::now();
-    auto addr = AddrTableReader::open(addr_path, expected_meta_sha_head_);
-    auto t_addr_end = std::chrono::steady_clock::now();
-    last_addr_load_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             t_addr_end - t_addr_start).count();
-
-    // C3: validate that the addr_table was built for this exact sample.
-    // If gnn_offline_sample was re-run without rebuilding addr_tables, the
-    // header total will disagree with the sample's actual node count — the
-    // resulting tensor would silently have the wrong shape.  Throw
-    // AddrTableStaleException so the dispatcher logs "stale" and falls back
-    // to legacy cleanly.
-    if (addr.header.total != static_cast<uint32_t>(sample.all_unique_nodes.size())) {
-        throw AddrTableStaleException(
-            "v2: addr_table total " + std::to_string(addr.header.total)
-            + " != sample.all_unique_nodes.size() "
-            + std::to_string(sample.all_unique_nodes.size())
-            + " — sample regenerated without rebuilding addr_tables");
-    }
-
-    const uint64_t total    = addr.header.total;
-    const size_t   row_bytes = feature_dim_ * elem_size_;
+torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sample) {
+    const auto& oids = sample.all_unique_nodes;
+    const uint64_t batch_id = sample.batch_id;
+    uint64_t total = oids.size();
 
     if (total == 0) {
         return torch::empty(
@@ -2919,22 +3354,72 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
 
     stats_.total_requests += total;
 
-    // --- Step 1 (v2): Read L4 packed_slim file for this batch ---
+    // Per-call profiling instrumentation: reset per-call profile timers. Each tier wraps its
+    // own block with steady_clock::now() and accumulates nanoseconds into the
+    // corresponding last_*_ns_ member. last_rmap_ns_ is a SUB-counter that
+    // tracks the (single, on the L3-fallback path) reordered_rm_->find() call
+    // and is also already included inside last_l3_ns_.
+    last_l1_ns_   = 0;
+    last_l2_ns_   = 0;
+    last_l3_ns_   = 0;
+    last_l4_ns_   = 0;
+    last_rmap_ns_ = 0;
+
+    size_t row_bytes = feature_dim_ * elem_size_;
+
+    // Step 1: Read L4 packed_slim for this batch to get OID table
+    std::unordered_map<uint64_t, uint32_t> slim_oid_to_idx;
+    std::vector<char> slim_data;
+    load_l4_slim_for_batch_(batch_id, slim_oid_to_idx, slim_data);
+
+    // Step 2: Partition nodes into L1/L2/L3/L4 buckets.
+    LegacyTierBuckets buckets = classify_batch_nodes_legacy_(
+        oids, batch_id, row_bytes, slim_oid_to_idx, slim_data);
+
+    // Step 3: Batch-read L3 rows via DirectIoReader (zero page cache)
+    // or mmap fallback.
+    std::vector<char> l3_buf = read_l3_rows_legacy_(buckets.l3_row_indices,
+                                                    row_bytes);
+
+    // Step 4: Assemble output tensor.
+    // Use FeatureAssembler when dtype is FLOAT32 and GPU cache is present
+    // (assembler targets GPU output via CUDA kernel / index_copy_).
+    // Otherwise fall back to direct CPU memcpy.
     //
-    // Same as legacy_ Step 1: read the entire .bin file, parse header + OID
-    // table, extract slim_data. We need slim_data to supply L4 features by
-    // their pre-classified l4_indices. The OID table lookup is not needed
-    // (addr table already has indices), but we still read the file for the
-    // feature payload and for l4_bytes_disk accounting parity with legacy_.
+    // TODO: extend FeatureAssembler for float64 support.
+    bool use_assembler = (assembler_ != nullptr)
+                         && (dtype_ == GnnDtype::FLOAT32)
+                         && gpu_cache_
+                         && gpu_cache_->is_on_gpu();
+
+    if (use_assembler) {
+        return assemble_batch_gpu_legacy_(total, buckets, l3_buf, slim_data);
+    }
+
+    // --- CPU-only assembly path (no GPU, or non-float32 dtype) ---
+    return assemble_batch_cpu_legacy_(total, buckets, l3_buf, slim_data,
+                                      row_bytes);
+}
+
+// v2 step 1 (see four_level_store.h). Same job as legacy step 1: obtain the
+// batch's L4 feature payload — but by pre-resolved indices, so the OID table
+// is never parsed. Consolidated path: one pread of the exact range; per-batch
+// path: whole-file read (O_DIRECT opt-in), then the payload is indexed inside
+// the moved-in file buffer to avoid copying tens of MB per batch.
+void FourLevelStore::read_l4_slim_payload_v2_(
+    const GraphSample& sample,
+    const AddrTableReader::Result& addr,
+    size_t row_bytes,
+    std::vector<char>& slim_owner,
+    size_t& slim_data_offset,
+    size_t& slim_data_bytes)
+{
     auto t_l4_read_start = std::chrono::steady_clock::now();
     // The L4 data section lives inside slim_owner at
     // [slim_data_offset, slim_data_offset + slim_data_bytes). For the per-batch
     // .bin path we MOVE the whole file buffer in and index it (no separate copy
     // of the data section); the consolidated path owns its exact-range buffer at
     // offset 0.
-    std::vector<char> slim_owner;
-    size_t slim_data_offset = 0;
-    size_t slim_data_bytes  = 0;
     if (addr.header.num_l4 > 0) {
       if (use_consolidated_slim_ &&
           addr.header.version >= AddrTableHeader::VERSION_V2 &&
@@ -3052,11 +3537,15 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         last_l4_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l4_read_end - t_l4_read_start).count();
     }
+}
 
-    // --- Step 2 (v2): Read L3 rows from disk ---
-    //
-    // Use addr.l3_row_idxs (pre-resolved row indices in the reordered FM)
-    // directly — skips the per-node RowMapping::find() call.
+// v2 step 2 (see four_level_store.h). Uses addr.l3_row_idxs (pre-resolved
+// row indices in the reordered FM) directly — skips the per-node
+// RowMapping::find() call the legacy path pays.
+std::vector<char> FourLevelStore::read_l3_rows_v2_(
+    const AddrTableReader::Result& addr,
+    size_t row_bytes)
+{
     std::vector<char> l3_buf;
     {
         auto t_l3_read_start = std::chrono::steady_clock::now();
@@ -3082,13 +3571,18 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         last_l3_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
                            t_l3_read_end - t_l3_read_start).count();
     }
+    return l3_buf;
+}
 
-    // --- Step 3 (v2): GPU gather for L1 ---
-    //
-    // l1_indices from the addr_table are gpu_cache row indices; gather_by_indices
-    // returns a GPU tensor of shape [num_l1, D].
-    torch::Tensor gpu_features;
-    std::vector<uint32_t> gpu_positions;
+// v2 step 3 (see four_level_store.h). l1_indices from the addr_table are
+// gpu_cache row indices; gather_by_indices returns a GPU tensor of shape
+// [num_l1, D].
+void FourLevelStore::gather_l1_rows_v2_(
+    const AddrTableReader::Result& addr,
+    size_t row_bytes,
+    torch::Tensor& gpu_features,
+    std::vector<uint32_t>& gpu_positions)
+{
     if (addr.header.num_l1 > 0) {
         auto t_l1_start = std::chrono::steady_clock::now();
         std::vector<uint32_t> l1_indices(
@@ -3118,7 +3612,28 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         stats_.l1_hits        += addr.header.num_l1;
         stats_.l1_bytes_served += addr.header.num_l1 * row_bytes;
     }
+}
 
+// v2 steps 4+5: assemble the output tensor from the pre-gathered tiers.
+// Combines L2 (from the CPU cache by pre-resolved indices; read directly by
+// the kernel when the fused assembler is on), L3 (l3_buf) and L4 (the slim
+// payload) straight into the worker's pinned buffer (heap fallback), then
+// scatters everything plus the L1 GPU rows via FeatureAssembler. Bounds-
+// checks every L2/L4 index against its source (stale-but-format-valid addr
+// tables) and throws so the dispatcher falls back to legacy. Sets
+// last_used_v2_ only after assemble() returns successfully.
+torch::Tensor FourLevelStore::assemble_batch_gpu_v2_(
+    const GraphSample&             sample,
+    const AddrTableReader::Result& addr,
+    const torch::Tensor&           gpu_features,
+    const std::vector<uint32_t>&   gpu_positions,
+    const std::vector<char>&       l3_buf,
+    const std::vector<char>&       slim_owner,
+    size_t                         slim_data_offset,
+    size_t                         slim_data_bytes,
+    uint64_t                       total,
+    size_t                         row_bytes)
+{
     // --- Step 4+5 (v2): assemble L2 + L3 + L4 directly into the pinned buffer ---
     //
     // Previously this built a std::vector<float> cpu_combined (row-by-row
@@ -3226,14 +3741,14 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         stats_.l3_bytes_wanted += addr.header.num_l3 * row_bytes;
     } else if (addr.header.num_l3 > 0 && l3_buf.empty()) {
         // L3 rows requested but nothing was readable (no reader + no mmap).
-        // Count as reads with no data — same semantics as legacy_ line 1414.
+        // Count as reads with no data — same semantics as legacy_'s zero-fill path.
         // (No row written and no position pushed — identical to the old
         // insert-of-nothing; dst was over-sized by num_l3 rows, harmless.)
         stats_.l3_reads += addr.header.num_l3;
     }
 
     // Zero-classified misses (unresolved nodes): just count as l3_reads with
-    // no data, matching legacy_'s "leave as zeros" path (line 1414).
+    // no data, matching legacy_'s "leave as zeros" path.
     stats_.l3_reads += addr.header.num_zero;
     if (addr.header.num_zero > 0) {
         warn_zero_filled("v2 batch " + std::to_string(sample.batch_id),
@@ -3313,6 +3828,100 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     }
     last_used_v2_ = true;
     return result;
+}
+
+// =============================================================================
+// load_batch_features_v2_() — addr-table-driven fast path
+// =============================================================================
+//
+// Reads the pre-classified addr_table sidecar for this batch and assembles
+// the output tensor using the same GPU assembler path as legacy_ — but
+// without the per-node hash lookup loop (Steps 1-2 of legacy_).
+//
+// Only called when assembler_ is active and gpu_cache_->is_on_gpu() (the
+// dispatcher enforces this gate). On meta_sha mismatch throws
+// AddrTableStaleException so the dispatcher catches and falls back cleanly.
+//
+// Stats accounting matches legacy_ so disk-traffic reports stay comparable
+// across the two paths.
+// =============================================================================
+
+torch::Tensor FourLevelStore::load_batch_features_v2_(
+    const GraphSample& sample,
+    const fs::path&    addr_path)
+{
+    // Reset per-tier timers (v2 does not time individual hash lookups, but
+    // we zero them so stale ns values from a previous batch do not bleed
+    // through if the caller inspects last_l?_us() after a v2 serve).
+    last_l1_ns_   = 0;
+    last_l2_ns_   = 0;
+    last_l3_ns_   = 0;
+    last_l4_ns_   = 0;
+    last_rmap_ns_ = 0;
+
+    // --- Open and validate the addr_table sidecar ---
+    auto t_addr_start = std::chrono::steady_clock::now();
+    auto addr = AddrTableReader::open(addr_path, expected_meta_sha_head_);
+    auto t_addr_end = std::chrono::steady_clock::now();
+    last_addr_load_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             t_addr_end - t_addr_start).count();
+
+    // C3: validate that the addr_table was built for this exact sample.
+    // If gnn_offline_sample was re-run without rebuilding addr_tables, the
+    // header total will disagree with the sample's actual node count — the
+    // resulting tensor would silently have the wrong shape.  Throw
+    // AddrTableStaleException so the dispatcher logs "stale" and falls back
+    // to legacy cleanly.
+    if (addr.header.total != static_cast<uint32_t>(sample.all_unique_nodes.size())) {
+        throw AddrTableStaleException(
+            "v2: addr_table total " + std::to_string(addr.header.total)
+            + " != sample.all_unique_nodes.size() "
+            + std::to_string(sample.all_unique_nodes.size())
+            + " — sample regenerated without rebuilding addr_tables");
+    }
+
+    const uint64_t total    = addr.header.total;
+    const size_t   row_bytes = feature_dim_ * elem_size_;
+
+    if (total == 0) {
+        return torch::empty(
+            {0, static_cast<int64_t>(feature_dim_)},
+            torch::TensorOptions().dtype(to_torch_dtype(dtype_)));
+    }
+
+    stats_.total_requests += total;
+
+    // --- Step 1 (v2): Read L4 packed_slim file for this batch ---
+    //
+    // Same as legacy_ Step 1: read the entire .bin file, parse header + OID
+    // table, extract slim_data. We need slim_data to supply L4 features by
+    // their pre-classified l4_indices. The OID table lookup is not needed
+    // (addr table already has indices), but we still read the file for the
+    // feature payload and for l4_bytes_disk accounting parity with legacy_.
+    std::vector<char> slim_owner;
+    size_t slim_data_offset = 0;
+    size_t slim_data_bytes  = 0;
+    read_l4_slim_payload_v2_(sample, addr, row_bytes,
+                             slim_owner, slim_data_offset, slim_data_bytes);
+
+    // --- Step 2 (v2): Read L3 rows from disk ---
+    //
+    // Use addr.l3_row_idxs (pre-resolved row indices in the reordered FM)
+    // directly — skips the per-node RowMapping::find() call.
+    std::vector<char> l3_buf = read_l3_rows_v2_(addr, row_bytes);
+
+    // --- Step 3 (v2): GPU gather for L1 ---
+    //
+    // l1_indices from the addr_table are gpu_cache row indices; gather_by_indices
+    // returns a GPU tensor of shape [num_l1, D].
+    torch::Tensor gpu_features;
+    std::vector<uint32_t> gpu_positions;
+    gather_l1_rows_v2_(addr, row_bytes, gpu_features, gpu_positions);
+
+    // --- Steps 4+5 (v2): scatter L2 + L3 + L4 + L1 into the output tensor ---
+    return assemble_batch_gpu_v2_(sample, addr, gpu_features, gpu_positions,
+                                  l3_buf, slim_owner, slim_data_offset,
+                                  slim_data_bytes, total, row_bytes);
 }
 
 } // namespace mdb::gnn

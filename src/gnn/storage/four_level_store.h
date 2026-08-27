@@ -10,11 +10,13 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include <torch/torch.h>
 
 #include "gnn/core/feature_assembler.h"
+#include "gnn/storage/addr_table_reader.h"
 #include "gnn/storage/cache_file.h"
 #include "gnn/storage/cpu_cache.h"
 #include "gnn/storage/direct_io_reader.h"
@@ -569,6 +571,70 @@ private:
     /// missing, stale, or unreadable, or when the assembler gate is not met.
     torch::Tensor load_batch_features_legacy_(const GraphSample& sample);
 
+    /// Per-tier buckets produced by the legacy classification loop: for each
+    /// tier, the output row positions and the matching source indices
+    /// (cache rows for L1/L2, reordered-FM rows for L3, slim slots for L4).
+    /// Positions across all buckets partition [0, total) minus the
+    /// zero-filled misses.
+    struct LegacyTierBuckets {
+        std::vector<uint32_t> l1_input_positions;  // positions in oids[] for L1 lookup
+        std::vector<uint32_t> l1_indices;          // L1 cache row indices for the hits
+        std::vector<uint32_t> l2_positions;        // output positions resolved from L2
+        std::vector<uint32_t> l2_indices;          // L2 cache row indices for the hits
+        std::vector<uint32_t> l3_positions;        // output positions resolved from L3
+        std::vector<uint64_t> l3_row_indices;      // corresponding rows in reordered FM
+        std::vector<uint32_t> l4_positions;        // output positions resolved from L4
+        std::vector<uint32_t> l4_slim_indices;     // index into slim_data per L4 node
+    };
+
+    /// Legacy step 1: read this batch's packed_slim .bin (one bulk read,
+    /// O_DIRECT opt-in) and parse it into an OID->slot map plus the raw
+    /// feature payload. A missing/invalid/truncated file leaves both outputs
+    /// empty (identical to the historical no-file branch). Accumulates
+    /// last_l4_ns_ and stats_.l4_bytes_disk.
+    void load_l4_slim_for_batch_(uint64_t batch_id,
+                                 std::unordered_map<uint64_t, uint32_t>& slim_oid_to_idx,
+                                 std::vector<char>& slim_data);
+
+    /// Legacy step 2: classify every node of the batch into L1/L2/L4/L3
+    /// buckets by hash lookup (L4 checked before L3 because slim data is
+    /// exact). Unresolved nodes are counted as zero-filled L3 misses and
+    /// warned about. Accumulates the per-tier lookup timers and hit stats.
+    LegacyTierBuckets classify_batch_nodes_legacy_(
+        const std::vector<ObjectId>& oids,
+        uint64_t batch_id,
+        size_t row_bytes,
+        const std::unordered_map<uint64_t, uint32_t>& slim_oid_to_idx,
+        const std::vector<char>& slim_data);
+
+    /// Legacy step 3: batch-read the classified L3 rows from the reordered FM
+    /// (per-worker O_DIRECT reader, mmap fallback) into one contiguous buffer
+    /// ordered like l3_row_indices. Empty input yields an empty buffer.
+    /// Accumulates last_l3_ns_ and stats_.l3_bytes_disk.
+    std::vector<char> read_l3_rows_legacy_(
+        const std::vector<uint64_t>& l3_row_indices,
+        size_t row_bytes);
+
+    /// Legacy step 4, GPU arm: gather L1 rows on-GPU, combine L2/L3/L4 rows
+    /// into one pinned (or heap-fallback) host buffer, and scatter everything
+    /// into the [total, D] output via FeatureAssembler. Preconditions: the
+    /// assembler gate held (float32 dtype, GPU-resident L1 cache).
+    torch::Tensor assemble_batch_gpu_legacy_(
+        uint64_t total,
+        const LegacyTierBuckets& buckets,
+        const std::vector<char>& l3_buf,
+        const std::vector<char>& slim_data);
+
+    /// Legacy step 4, CPU arm (no GPU, or non-float32 dtype): memcpy each
+    /// tier's rows straight into a zero-initialized CPU tensor. Unresolved
+    /// positions stay zero.
+    torch::Tensor assemble_batch_cpu_legacy_(
+        uint64_t total,
+        const LegacyTierBuckets& buckets,
+        const std::vector<char>& l3_buf,
+        const std::vector<char>& slim_data,
+        size_t row_bytes);
+
     /// addr_table fast path: read addr_tables/batch_<bid>.addr,
     /// dispatch scatter-from-tier without per-node classification.
     /// Only called when assembler_ is active and gpu_cache_->is_on_gpu() —
@@ -577,6 +643,61 @@ private:
     /// mismatch so the dispatcher can catch and fall back cleanly.
     torch::Tensor load_batch_features_v2_(const GraphSample& sample,
                                            const std::filesystem::path& addr_path);
+
+    /// v2 step 1: read this batch's L4 cold-feature payload — ONE pread of
+    /// [slim_offset, slim_length) from consolidated.slim when that path is
+    /// active, otherwise the whole per-batch .bin (O_DIRECT opt-in). On
+    /// return the payload lives in slim_owner at
+    /// [slim_data_offset, slim_data_offset + slim_data_bytes). No-op when
+    /// the addr table has no L4 rows (out-params must arrive empty/zero).
+    /// Throws so the dispatcher falls back to legacy on any read failure.
+    /// Accumulates last_l4_ns_ and stats_.l4_bytes_disk.
+    void read_l4_slim_payload_v2_(const GraphSample& sample,
+                                  const AddrTableReader::Result& addr,
+                                  size_t row_bytes,
+                                  std::vector<char>& slim_owner,
+                                  size_t& slim_data_offset,
+                                  size_t& slim_data_bytes);
+
+    /// v2 step 2: batch-read the pre-resolved L3 rows (addr.l3_row_idxs)
+    /// from the reordered FM — per-worker O_DIRECT reader, mmap fallback —
+    /// into one contiguous buffer in l3_row_idxs order. Empty when the addr
+    /// table has no L3 rows or no reader is available (the caller accounts
+    /// that case). Accumulates last_l3_ns_ and stats_.l3_bytes_disk.
+    std::vector<char> read_l3_rows_v2_(const AddrTableReader::Result& addr,
+                                       size_t row_bytes);
+
+    /// v2 step 3: GPU gather of the pre-resolved L1 cache rows. Bounds-checks
+    /// every index against the GPU cache on the host (an out-of-range index
+    /// from a stale-but-format-valid addr_table would fire a device assert
+    /// and poison the CUDA context) and throws so the dispatcher falls back.
+    /// Fills gpu_features ([num_l1, D] CUDA tensor) and gpu_positions;
+    /// leaves both untouched when the addr table has no L1 rows.
+    /// Accumulates last_l1_ns_ and the L1 hit stats.
+    void gather_l1_rows_v2_(const AddrTableReader::Result& addr,
+                            size_t row_bytes,
+                            torch::Tensor& gpu_features,
+                            std::vector<uint32_t>& gpu_positions);
+
+    /// v2 steps 4+5: assemble the [total, D] output from the pre-gathered
+    /// tiers — L2 rows by pre-resolved cache indices (kernel-direct when the
+    /// fused assembler is enabled), L3 rows from l3_buf, L4 rows from the
+    /// slim payload at [slim_data_offset, +slim_data_bytes) in slim_owner —
+    /// written straight into the worker's pinned buffer (heap fallback) and
+    /// scattered together with the L1 GPU rows via FeatureAssembler.
+    /// Bounds-checks L2/L4 indices and throws so the dispatcher falls back
+    /// to legacy; sets last_used_v2_ only after a successful assemble.
+    torch::Tensor assemble_batch_gpu_v2_(
+        const GraphSample&             sample,
+        const AddrTableReader::Result& addr,
+        const torch::Tensor&           gpu_features,
+        const std::vector<uint32_t>&   gpu_positions,
+        const std::vector<char>&       l3_buf,
+        const std::vector<char>&       slim_owner,
+        size_t                         slim_data_offset,
+        size_t                         slim_data_bytes,
+        uint64_t                       total,
+        size_t                         row_bytes);
 };
 
 } // namespace mdb::gnn
