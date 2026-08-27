@@ -13,7 +13,7 @@
 set -u -o pipefail
 
 # --------------------------------------------------------------------------
-REPO=/home/bfuentes/MillenniumDB_Testing
+REPO="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MDB="$REPO/build/Release/bin/mdb"
 CORA_GQL="$REPO/data/example/gql/cora/cora.gql"
 CORA_NPY="$REPO/data/example/gql/cora/cora_features.npy"

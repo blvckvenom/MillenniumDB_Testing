@@ -18,7 +18,7 @@
 # Exit 0 = PASS.
 set -u -o pipefail
 
-REPO=/home/bfuentes/MillenniumDB_Testing
+REPO="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MDB="$REPO/build/Release/bin/mdb"
 DSET="$REPO/data/example/gql/ogbn-arxiv/ogbn-arxiv"
 GQL="$DSET/ogbn_arxiv.gql"
