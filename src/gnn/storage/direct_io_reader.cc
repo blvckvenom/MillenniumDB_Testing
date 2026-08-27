@@ -91,8 +91,8 @@ DirectIoReader::DirectIoReader(const fs::path& file_path) {
     }
 
 #ifdef ENABLE_IO_URING
-    // Spec A3: initialize NUM_RINGS rings (DiskGNN config: 4 rings × 1024 SQEs).
-    // Each ring is independent — one may fail (e.g., RLIMIT_MEMLOCK on old
+    // Initialize NUM_RINGS independent rings (see the header for the
+    // NUM_RINGS/QUEUE_DEPTH sizing rationale). Each ring is independent — one may fail (e.g., RLIMIT_MEMLOCK on old
     // kernels) while others succeed. We use whichever rings init'd; if zero,
     // fall back to pread silently. MDB_GNN_NO_IO_URING=1 skips ring init
     // entirely, forcing the synchronous pread path.
@@ -347,7 +347,7 @@ void DirectIoReader::submit_io_uring_spans(
 {
     if (spans.empty()) return;
 
-    // Spec A3: collect active rings, partition spans into contiguous chunks
+    // Collect active rings, partition spans into contiguous chunks
     // (preserving sequential file_offset ordering within each ring), and
     // dispatch one std::async thread per ring. Each ring is driven by
     // exactly one thread — io_uring rings are not internally thread-safe.
@@ -453,7 +453,7 @@ DirectIoReader::ReadResult DirectIoReader::read_rows(
         return {std::move(out), total_bytes, row_indices.size(), bytes_disk_total};
     }
 
-    // ----- O_DIRECT: page-level dedup (Spec A2, 2026-04-27) -----
+    // ----- O_DIRECT: page-level dedup -----
     // Walk sorted ops, merging consecutive aligned regions when they overlap
     // or are adjacent. Each merged AlignedSpan becomes one io_uring/pread
     // read; CopyOps record where to scatter wanted bytes back to output.

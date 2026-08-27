@@ -96,11 +96,13 @@ private:
     size_t block_align_ = 4096;
 
 #ifdef ENABLE_IO_URING
-    /// Spec A3 (2026-04-27): multiple io_uring rings for parallel submission.
-    /// Each ring is used by exactly one thread (no internal locking) — spans
-    /// are partitioned across rings, then std::async dispatches per-ring
-    /// submit/wait loops. DiskGNN paper config: 4 rings × 1024 SQEs.
-    /// QUEUE_DEPTH=1024 keeps ~4096 SQEs in-flight, saturating NVMe Gen4.
+    /// Multiple io_uring rings for parallel submission. Each ring is used
+    /// by exactly one thread (no internal locking) — spans are partitioned
+    /// across rings, then std::async dispatches per-ring submit/wait loops.
+    /// NUM_RINGS=4 follows DiskGNN (SIGMOD'25 §6: "uses 4 threads with each
+    /// thread holding a ring"); the paper gives no queue depth, so
+    /// QUEUE_DEPTH=1024 is our choice — up to ~4096 requests in flight
+    /// across the 4 rings, enough to saturate a Gen4 NVMe with 4 KiB reads.
     static constexpr unsigned NUM_RINGS   = 4;
     static constexpr unsigned QUEUE_DEPTH = 1024;
 
@@ -140,24 +142,25 @@ private:
     /// into the destination buffer. Used when O_DIRECT is active.
     /// Returns the number of bytes actually read at OS level (== aligned_size
     /// in O_DIRECT mode, == wanted_bytes otherwise). Caller sums these into
-    /// ReadResult::bytes_disk for paper-comparable disk-traffic accounting.
+    /// ReadResult::bytes_disk for read-amplification accounting.
     size_t read_aligned_region(
         char* dest,
         uint64_t file_offset,
         uint64_t wanted_bytes
     );
 
-    /// Spec A2 (2026-04-27): aligned span used by the read_rows dedup path.
-    /// Multiple wanted rows can share a single AlignedSpan when their
-    /// aligned regions overlap or are adjacent — typical for papers100M
-    /// where 8 rows of 512 B share a single 4 KB page after MinHash reorder.
+    /// Aligned span used by the read_rows dedup path. Multiple wanted rows
+    /// can share a single AlignedSpan when their aligned regions overlap or
+    /// are adjacent — common after the MinHash reorder, which packs
+    /// co-accessed rows into the same block (e.g. 8 rows of 512 B sharing
+    /// one 4 KiB page).
     struct AlignedSpan {
         uint64_t aligned_off;   ///< block-aligned start offset in file
         uint64_t aligned_size;  ///< block-aligned size (always multiple of block_align_)
         size_t   buf_offset;    ///< offset within scratch buffer
     };
 
-    /// Spec A2: per-row scatter copy from a deduped scratch span to output.
+    /// Per-row scatter copy from a deduped scratch span to output.
     struct CopyOp {
         size_t   span_idx;      ///< index into AlignedSpan vector
         size_t   src_in_span;   ///< byte offset within the merged span
@@ -169,14 +172,14 @@ private:
     /// Batch-submit reads via io_uring (one read per AlignedSpan) and
     /// collect completions. Caller is responsible for the subsequent
     /// scatter copies via the matching CopyOp list.
-    /// Spec A3: distributes spans across all initialized rings via
+    /// Distributes spans across all initialized rings via
     /// std::async; each ring is driven by a single thread.
     void submit_io_uring_spans(
         const std::vector<AlignedSpan>& spans,
         char* scratch_buf
     );
 
-    /// Spec A3: per-ring submit/wait loop. Submits spans[begin..end) to
+    /// Per-ring submit/wait loop. Submits spans[begin..end) to
     /// the given ring in batches of QUEUE_DEPTH SQEs, waits for all
     /// completions, returns. Throws on ring/IO errors.
     void submit_to_ring(

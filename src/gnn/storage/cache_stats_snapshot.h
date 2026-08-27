@@ -12,14 +12,15 @@ namespace mdb::gnn {
 /// TrainingLoop::Config::cache_stats_provider) and external prints
 /// (gnn procedure layer JSON / YIELD output).
 ///
-/// Spec A1 (2026-04-27) added byte-level counters for paper-comparable
-/// disk-traffic accounting (DiskGNN SIGMOD'25 Table 1 column
-/// "Disk access volume (GB)" = total_bytes_disk()).
+/// The byte-level counters allow disk-traffic accounting directly
+/// comparable to published out-of-core GNN systems (total_bytes_disk()
+/// matches the "Disk access volume (GB)" row of Table 1 in DiskGNN,
+/// SIGMOD'25).
 ///
-/// Spec B2 (2026-04-27): operator- enables per-epoch delta computation
-/// without resetting the live Stats — the per-epoch print can show
-/// ΔL3 / ΔL4 disk traffic between consecutive epochs while the
-/// cumulative end-of-run total stays available for the JSON log.
+/// operator- enables per-epoch delta computation without resetting the
+/// live Stats — the per-epoch print can show ΔL3 / ΔL4 disk traffic
+/// between consecutive epochs while the cumulative end-of-run total
+/// stays available for the JSON log.
 struct CacheStatsSnapshot {
     // Per-tier node-count counters.
     uint64_t l1_hits         = 0;
@@ -28,7 +29,7 @@ struct CacheStatsSnapshot {
     uint64_t l4_reads        = 0;
     uint64_t total_requests  = 0;
 
-    // Byte-level counters (Spec A1).
+    // Byte-level counters.
     uint64_t l1_bytes_served = 0;
     uint64_t l2_bytes_served = 0;
     uint64_t l3_bytes_wanted = 0;
@@ -52,7 +53,7 @@ struct CacheStatsSnapshot {
         return snap;
     }
 
-    /// Spec B2: per-epoch delta. Subtraction is field-wise unsigned —
+    /// Per-epoch delta. Subtraction is field-wise unsigned —
     /// the live Stats counters are monotonic non-decreasing, so the
     /// result is always non-negative when both snapshots come from
     /// the same FourLevelStore in temporal order.
@@ -84,7 +85,7 @@ struct CacheStatsSnapshot {
     }
 
     /// Total physical disk traffic across L3 + L4 — the headline number
-    /// comparable to DiskGNN Table 1 column "Disk access volume (GB)".
+    /// comparable to the "Disk access volume (GB)" row of DiskGNN's Table 1.
     uint64_t total_bytes_disk() const {
         return l3_bytes_disk + l4_bytes_disk;
     }
@@ -95,8 +96,10 @@ struct CacheStatsSnapshot {
     }
 
     /// Read amplification on the L3 path: bytes_disk / bytes_wanted.
-    /// 1.0 = no overhead. Pre-A2 typically ~8× on papers100M; post-A2
-    /// ~2-4× depending on MinHash clustering.
+    /// 1.0 = no overhead. For scattered point lookups the worst case
+    /// approaches page_size / row_size (8× for 512 B feature rows read
+    /// through 4 KiB pages); page-level dedup plus the MinHash row
+    /// clustering typically brings it down to ~2-4×.
     double l3_read_amplification() const {
         return l3_bytes_wanted > 0
             ? static_cast<double>(l3_bytes_disk) / static_cast<double>(l3_bytes_wanted)

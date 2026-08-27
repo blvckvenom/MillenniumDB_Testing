@@ -403,10 +403,12 @@ void generate_packed_batches_partitioned(
     // We open all num_batches output files up-front and KEEP them open until
     // Phase 3. Relies on ulimit -n >= num_batches + small overhead.
     //
-    // Pre-fix B1 (the in-RAM buffer approach) needed total_refs * row_bytes
-    // of RAM (~36 GB on papers100M), which OOM-killed celebi. The persistent
-    // FD design lets each (partition × batch) contribution land in its final
-    // file slot via pwrite using a per-batch cursor — no full-batch buffering.
+    // An earlier in-RAM buffer approach needed total_refs * row_bytes of RAM
+    // — the receptive fields of all batches summed, which is several times
+    // the feature matrix itself and OOMs any host whose RAM does not dwarf
+    // the dataset. The persistent FD design lets each (partition × batch)
+    // contribution land in its final file slot via pwrite using a per-batch
+    // cursor — no full-batch buffering.
     auto t_phase01_start = std::chrono::steady_clock::now();
 
     std::vector<std::vector<RowRef>>    inverted(num_partitions);

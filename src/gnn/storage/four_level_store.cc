@@ -63,7 +63,7 @@ namespace fs = std::filesystem;
 namespace mdb::gnn {
 
 // =============================================================================
-// Phase 5 helpers (anonymous namespace — internal to this TU)
+// addr-table build helpers (anonymous namespace — internal to this TU)
 // =============================================================================
 namespace {
 
@@ -76,7 +76,7 @@ namespace {
 // sorts entries by FeatureMatrix row before writing to disk, so the cache
 // file's OID table (not the original l1_nodes/l2_nodes input order) is
 // the ground truth for what find_index() returns. We read that table
-// directly at Phase 5 build time rather than loading the full cache
+// directly at addr-table build time rather than loading the full cache
 // (which would allocate GPU memory and take seconds).
 // ---------------------------------------------------------------------------
 struct OidIdxAdapter {
@@ -99,7 +99,7 @@ OidIdxAdapter build_oid_idx_adapter(const fs::path& cache_path)
     int fd = ::open(cache_path.c_str(), O_RDONLY);
     if (fd < 0) {
         throw std::runtime_error(
-            "FourLevelStore Phase 5: cannot open cache file " +
+            "FourLevelStore addr_tables: cannot open cache file " +
             cache_path.string() + ": " + safe_strerror(errno));
     }
     struct FdCleanup { int fd; ~FdCleanup() { if (fd >= 0) ::close(fd); } } cleanup{fd};
@@ -328,7 +328,7 @@ uint64_t build_packed_full_(SampleStorage& samples, const FeatureMatrix& fm,
 }
 
 // ---------------------------------------------------------------------------
-// build_addr_tables_ — Phase 5 of FourLevelStore::build()
+// build_addr_tables_ — the addr-table stage of FourLevelStore::build()
 //
 // For each batch in [0, total_batches):
 //   1. Read sample.all_unique_nodes (classify input).
@@ -336,7 +336,7 @@ uint64_t build_packed_full_(SampleStorage& samples, const FeatureMatrix& fm,
 //   3. Classify all_unique_nodes into {L1,L2,L4,L3,zero}.
 //   4. Atomically write batch_NNNNNN.addr to addr_tables/.
 //
-// Workers are dispatched via a SALIENT-style atomic counter. QueryContext
+// Workers pull batch ids from a shared atomic counter. QueryContext
 // is propagated from the primary thread so BPT lookups inside read_sample
 // do not null-deref the thread_local context pointer.
 // ---------------------------------------------------------------------------
@@ -593,8 +593,8 @@ torch::ScalarType FourLevelStore::to_torch_dtype(GnnDtype dt) {
 // =============================================================================
 //
 // load_batch_features() previously did cudaHostAlloc + cudaFreeHost per
-// batch. Each call is a synchronous driver entry (~100-500 us); on
-// papers100M training (1300+ batches/epoch) that burned 150-600 ms/epoch
+// batch. Each call is a synchronous driver entry (~100-500 us); at
+// 1300+ batches/epoch that burned 150-600 ms/epoch
 // purely on alloc churn. The fix is to keep one persistent pinned buffer
 // that grows monotonically and is released once in the destructor.
 //
@@ -717,7 +717,7 @@ FourLevelStore::~FourLevelStore() {
 }
 
 // =============================================================================
-// Rebuild addr_tables on a loaded runtime instance (added 2026-05-20)
+// Rebuild addr_tables on a loaded runtime instance
 // =============================================================================
 // Used when source FeatureMatrix is unavailable (e.g. placeholder / deleted)
 // but the rest of the feature store (L1/L2/L3/L4 + caches + reordered_rm) is
@@ -739,17 +739,17 @@ uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder,
         gnn_meta_path_for(db_folder, catalog.projection_name));
 
     // Reconstruct OidIdxAdapters from the already-written GNNC cache files
-    // (same approach as FourLevelStore::build's Phase 5 step at line 880+).
+    // (same approach as FourLevelStore::build's addr-table stage).
     auto gnn_dir       = db_folder / "gnn_features";
     auto gpu_cache_path = gnn_dir / "node_features_gpu_cache.bin";
     auto cpu_cache_path = gnn_dir / "node_features_cpu_cache.bin";
-    // Note: feature_name is fixed to "node_features" here — single-feature
-    // pipeline as of 2026-05-20. Generalize if multi-feature lands.
+    // Note: feature_name is fixed to "node_features" here — the pipeline is
+    // single-feature today. Generalize if multi-feature lands.
     auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
     auto l2_adapter = build_oid_idx_adapter(cpu_cache_path);
 
-    // Match the path convention used by FourLevelStore::build() at the Phase 5
-    // wiring (line 460): addr_tables_dir = sample_dir / "addr_tables".
+    // Match the path convention used by FourLevelStore::build()'s addr-table
+    // wiring: addr_tables_dir = sample_dir / "addr_tables".
     auto addr_tables_dir = sample_dir_ / "addr_tables";
     auto blocks_dir      = sample_dir_ / "blocks";
 
@@ -773,7 +773,7 @@ uint64_t FourLevelStore::rebuild_addr_tables(const fs::path& db_folder,
 
     if (out_blocks_bytes) *out_blocks_bytes = blocks_bytes;
 
-    // After Phase 5 completes, this instance's v2 dispatch can serve
+    // After the addr-table build completes, this instance's v2 dispatch can serve
     // load_batch_features() immediately. (The runtime ctor would have
     // disabled use_addr_tables_ if addr_tables/ was absent at construction
     // time — flip it on now that we've created the sidecars.)
@@ -821,7 +821,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
         catalog.sample_content_fp, feature_name,
         features.num_cols(), static_cast<uint8_t>(features.dtype()));
 
-    // Packed-full build mode (additive, PS-class): a single gather pass over the
+    // Packed-full build mode (additive): a single gather pass over the
     // source fmat into <sample_dir>/packed_full/, keyed by cur_fp. Writes ONLY
     // packed_full/; never builds/deletes the 4-tier or blocks/. Requires
     // store.meta + blocks/ to already exist (a prior bakeBlocks build). The
@@ -949,7 +949,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
                                         + result.cpu_cache_bytes + result.reordered_bytes;
                 result.addr_tables_built_ok = fs::exists(addr_tables_dir, de);
 
-                // An explicitly requested Phase 5 must not be dropped by the
+                // An explicitly requested addr-table build must not be dropped by the
                 // reuse fast path: bake_blocks (and a missing addr_tables/)
                 // can be satisfied against the reused tier artifacts without
                 // any rebuild. Baking is idempotent per block via
@@ -986,8 +986,8 @@ FourLevelStore::BuildResult FourLevelStore::build(
                         if (need_addr) result.addr_tables_built_ok = true;
                         if (config.bake_blocks) result.blocks_built_ok = true;
                     } catch (const std::exception& ex) {
-                        std::cerr << "FourLevelStore::build: WARNING Phase 5 "
-                                     "addr_tables failed on the reuse path: "
+                        std::cerr << "FourLevelStore::build: WARNING "
+                                     "addr_tables build failed on the reuse path: "
                                   << ex.what()
                                   << " — runtime will use per-batch lookup fallback.\n";
                     }
@@ -1189,8 +1189,8 @@ FourLevelStore::BuildResult FourLevelStore::build(
             // Drop the orphaned sorted-index sidecar too: a fresh permutation
             // is about to be written, and a stale <rmap>.idx from the OLD
             // permutation would otherwise be silently adopted at open() and
-            // serve wrong feature rows (root cause of the 2026-06-01 L4
-            // corruption). RowMapping::create now also removes it, but make
+            // serve wrong feature rows (this once silently corrupted every
+            // cold L4 feature). RowMapping::create now also removes it, but make
             // the intent explicit at the rebuild site.
             fs::remove(fs::path(reordered_rmap.string() + ".idx"), rec);
         }
@@ -1360,7 +1360,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
                                       pb.out_buf.size(), pb.batch_path.string());
                             // Persist the file data before store.meta can mark
                             // the build complete (matches the partitioned
-                            // packer's per-fd fsync in Phase 3).
+                            // packer's final per-fd fsync pass).
                             if (::fsync(wfd) < 0) {
                                 throw std::runtime_error(
                                     "FourLevelStore::build: fsync failed on " +
@@ -1568,11 +1568,11 @@ FourLevelStore::BuildResult FourLevelStore::build(
                          ? reordered_rm_holder->perm_fingerprint() : 0;
         cons_meta_sha = compute_meta_sha_head(
             gnn_meta_path_for(db_folder, catalog.projection_name));
-        log_phase("L4 consolidated.slim: enabled (Plan 1)");
+        log_phase("L4 consolidated.slim: enabled");
     }
 
     if (use_slim_partitioned) {
-        log_phase("L4 packed_slim: partitioned sequential-scan path (Lever B)");
+        log_phase("L4 packed_slim: partitioned sequential-scan path");
         // Partition size decides how many sequential passes the packer makes,
         // so it belongs in the log next to the pack time it explains.
         static const long slim_partition_mb =
@@ -1586,11 +1586,12 @@ FourLevelStore::BuildResult FourLevelStore::build(
         // The partitioned packer pairs oid_provider[k] with row_provider[k],
         // so BOTH lambdas must return the same row-sorted order.
         //
-        // OPT #1 (env MDB_GNN_DEDUP_COLD_ENTRIES=1, default OFF): the partitioned
+        // Opt-in (env MDB_GNN_DEDUP_COLD_ENTRIES=1, default OFF): the partitioned
         // packer calls row_provider(b) then oid_provider(b) back-to-back for the
         // SAME b, so a 1-slot memo eliminates the 2nd read_sample(b)+find per batch.
-        // The returned vector is identical => packed output bit-identical (gate cora
-        // 0.8574939). Default OFF for a clean A/B; flip default after papers100M A/B.
+        // The returned vector is identical => packed output bit-identical.
+        // Default OFF so the memo can be A/B-measured cleanly before it earns
+        // a default flip.
         // "1" was the only value the comparison ever honoured, so it is the
         // only accepted one; every other spelling means OFF as before, and now
         // says which spelling it rejected. This one exists to be A/B'd, which
@@ -1673,7 +1674,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
     fsync_directory(packed_slim_dir);
     log_phase("L4 fsync_directory done");
 
-    // --- Phase 5: Build AddrTable sidecars ---
+    // --- Build AddrTable sidecars ---
     // Pre-classify every batch's unique nodes into {L1, L2, L4, L3, zero}
     // and write addr_tables/batch_NNNNNN.addr next to packed_slim/. This
     // lets runtime load_batch_features() skip the per-node hash lookups on
@@ -1684,7 +1685,7 @@ FourLevelStore::BuildResult FourLevelStore::build(
     // GpuCache/CpuCache::build() sorts entries by FeatureMatrix row before
     // writing, so the on-disk OID table is the ground truth for find_index().
     if (config.build_addr_tables || config.bake_blocks) {
-        log_phase("Phase 5 addr_tables start");
+        log_phase("addr_tables start");
         if (config.build_addr_tables) wrote_addr = true;
         try {
             auto l1_adapter = build_oid_idx_adapter(gpu_cache_path);
@@ -1715,12 +1716,12 @@ FourLevelStore::BuildResult FourLevelStore::build(
 
             result.addr_tables_built_ok = true;
             if (config.bake_blocks) result.blocks_built_ok = true;
-            log_phase("Phase 5 addr_tables done");
+            log_phase("addr_tables done");
         } catch (const std::exception& ex) {
-            // Phase 5 is best-effort: a failure logs a warning but does not
-            // abort the feature store build. The runtime consumer falls back
-            // to the legacy per-batch hash-lookup path.
-            std::cerr << "FourLevelStore::build: WARNING Phase 5 addr_tables failed: "
+            // The addr-table build is best-effort: a failure logs a warning
+            // but does not abort the feature store build. The runtime consumer
+            // falls back to the legacy per-batch hash-lookup path.
+            std::cerr << "FourLevelStore::build: WARNING addr_tables build failed: "
                       << ex.what() << " — runtime will use per-batch lookup fallback.\n";
             result.addr_tables_built_ok = false;
             result.blocks_built_ok = false;
@@ -2056,7 +2057,7 @@ FourLevelStore::FourLevelStore(
                 FeatureMatrixHeader fmat_hdr{};
                 hdr_stream.read(reinterpret_cast<char*>(&fmat_hdr), sizeof(fmat_hdr));
                 if (hdr_stream.good() && fmat_hdr.is_valid()) {
-                    // F2: honor the recorded data offset (64 for v1, 4096 for a
+                    // Honor the recorded data offset (64 for v1, 4096 for a
                     // page-aligned v2 reordered.fmat) instead of assuming SIZE.
                     // Flows into DirectIoReader::read_rows(..., l3_header_size_)
                     // for the O_DIRECT L3 path; the mmap fallback reads through
@@ -2316,7 +2317,7 @@ static bool l4_o_direct_enabled() {
     return on;
 }
 
-// F3.a (opt-in, env MDB_GNN_FUSED_ASSEMBLER, default OFF). When on AND the CPU
+// Opt-in fused assembler (env MDB_GNN_FUSED_ASSEMBLER, default OFF). When on AND the CPU
 // cache is pinned, the v2 assemble path reads L2 rows STRAIGHT from the pinned
 // cache in the CUDA kernel (via UVA) instead of pre-copying each L2 row into the
 // combined pinned buffer on the host. Bit-identical output; removes the dominant
@@ -2858,7 +2859,7 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
 }
 
 // =============================================================================
-// load_batch_features_v2_() — addr-table-driven fast path (added 2026-05-19)
+// load_batch_features_v2_() — addr-table-driven fast path
 // =============================================================================
 //
 // Reads the pre-classified addr_table sidecar for this batch and assembles
@@ -2869,7 +2870,8 @@ torch::Tensor FourLevelStore::load_batch_features_legacy_(const GraphSample& sam
 // dispatcher enforces this gate). On meta_sha mismatch throws
 // AddrTableStaleException so the dispatcher catches and falls back cleanly.
 //
-// Stats accounting matches legacy_ for paper-comparable I/O reporting.
+// Stats accounting matches legacy_ so disk-traffic reports stay comparable
+// across the two paths.
 // =============================================================================
 
 torch::Tensor FourLevelStore::load_batch_features_v2_(
@@ -3131,7 +3133,7 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
     // fallback path is byte-identical to the pre-refactor heap path.
     std::vector<uint32_t> cpu_combined_positions;
 
-    // F3.a: fused L2-direct. When enabled and the CPU cache is pinned, L2 rows
+    // Fused L2-direct. When enabled and the CPU cache is pinned, L2 rows
     // are read straight from the pinned cache by the assembler kernel (UVA), so
     // they are NOT pre-copied into the combined pinned buffer below. Removes the
     // per-batch L2 host memcpy. Bit-identical: same rows, same output positions.
@@ -3286,7 +3288,7 @@ torch::Tensor FourLevelStore::load_batch_features_v2_(
         static std::atomic<bool> fused_logged{false};
         bool expected = false;
         if (fused_logged.compare_exchange_strong(expected, true)) {
-            std::cerr << "[FourLevelStore] F3.a fused L2-direct assembler ACTIVE\n"
+            std::cerr << "[FourLevelStore] fused L2-direct assembler ACTIVE\n"
                       << std::flush;
         }
         // L2 rows read directly from the pinned cache base; `assembler_data`

@@ -19,8 +19,9 @@ class SampleStorage;
  * @brief Orchestrates L3 (MinHash reorder) + L4 (packed batch) generation.
  *
  * Bridges offline sampling output (GraphSamples with node IDs) to
- * training-ready packed feature batches. Implements DiskGNN Section 5:
- * disk cache reordering via MinHash, then per-batch feature packing.
+ * training-ready packed feature batches. Follows DiskGNN (SIGMOD'25):
+ * disk-cache reordering via MinHash (§5.1), then per-batch feature
+ * packing (§5.2).
  *
  * All building blocks are existing tested components:
  * - FeatureMatrix::extract_rows() for feature lookup

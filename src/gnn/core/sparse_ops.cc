@@ -97,7 +97,6 @@ torch::Tensor scatter_sum(
     auto output_shape = src.sizes().vec();
     output_shape[0] = dim_size;
 
-    // Initialize output to zeros
     auto out = torch::zeros(output_shape, src.options());
 
     // Use scatter_add_ for the operation
@@ -130,7 +129,6 @@ torch::Tensor scatter_mean(
 
     validate_scatter_inputs(src, idx, dim_size);
 
-    // Compute sum
     auto sum = scatter_sum(src, idx, dim_size);
 
     // Count occurrences of each index
@@ -171,7 +169,7 @@ std::tuple<torch::Tensor, torch::Tensor> scatter_max(
     auto output_shape = src.sizes().vec();
     output_shape[0] = dim_size;
 
-    // Initialize to -inf
+    // -inf is the identity for max: untouched rows stay -inf rather than 0.
     auto out = torch::full(output_shape, -std::numeric_limits<float>::infinity(), src.options());
 
     // For argmax, we'll build on CPU then transfer
@@ -529,7 +527,6 @@ torch::Tensor symmetric_norm(
     const torch::Tensor& edge_index,
     int64_t num_nodes
 ) {
-    // Compute degree
     auto deg = compute_degree(edge_index, num_nodes, "in");
 
     // D^{-1/2}

@@ -180,7 +180,7 @@ FeatureMatrix::~FeatureMatrix() {
 }
 
 const void* FeatureMatrix::data_ptr() const {
-    // F2: data section starts at the header-recorded offset (64 for v1, 4096 for
+    // Data section starts at the header-recorded offset (64 for v1, 4096 for
     // page-aligned v2), NOT a fixed sizeof(header). row()/scan()/extract_rows()
     // all read through here so they inherit the correct offset for both versions.
     return static_cast<const char*>(mmap_ptr_) + header_.get_data_offset();
@@ -231,7 +231,7 @@ FeatureMatrix FeatureMatrix::create(
     FdGuard guard(fd);
 
     write_all(fd, &header, sizeof(header));
-    // F2: zero-pad from the header struct end to the data offset. No-op for v1
+    // Zero-pad from the header struct end to the data offset. No-op for v1
     // (data_off == sizeof(header) == 64); for v2 this aligns the data section.
     if (data_off > sizeof(header)) {
         std::vector<char> pad(static_cast<size_t>(data_off - sizeof(header)), 0);
@@ -312,7 +312,7 @@ FeatureMatrix FeatureMatrix::open(const fs::path& path) {
         throw std::runtime_error(
             "FeatureMatrix::open: num_rows * row_bytes overflows: " + path.string());
     }
-    // F2: data section starts at the header-recorded offset (64 for v1, 4096 for
+    // Data section starts at the header-recorded offset (64 for v1, 4096 for
     // page-aligned v2). is_valid() already guaranteed data_off >= SIZE.
     const uint64_t data_off = header.get_data_offset();
     size_t db = header.data_bytes();
@@ -477,7 +477,7 @@ FeatureMatrix FeatureMatrix::create_streaming(
 
     // Write header
     write_all(fd, &header, sizeof(header));
-    // F2: zero-pad from header end to the data offset (no-op for v1).
+    // Zero-pad from header end to the data offset (no-op for v1).
     if (data_off > sizeof(header)) {
         std::vector<char> pad(static_cast<size_t>(data_off - sizeof(header)), 0);
         write_all(fd, pad.data(), pad.size());
@@ -686,28 +686,29 @@ FeatureMatrix FeatureMatrix::create_parallel(
 // with a callback that did `source.row(perm[output_row])` — random reads keyed by
 // the destination row, which is uncorrelated with the source position. With 30 GB
 // RAM hosting a 56 GB source mmap, the page cache thrashed and the phase took
-// 3 h 21 min wall-clock on celebi.
+// 3 h 21 min of wall-clock.
 //
 // This implementation supports two strategies, selected by env var
 // MDB_GNN_REORDER_STRATEGY:
-//   chunked       (default before 2026-06-01): chunked output writes, random
+//   chunked       (legacy): chunked output writes, random
 //                 source reads. Best when source FM fits comfortably in RAM
 //                 (e.g. < ~30% of total RAM). Avoids per-row pwrite amplification
 //                 by gathering a contiguous output chunk into a heap buffer then
 //                 issuing one large pwrite per chunk.
-//   external_sort (default since 2026-06-01): two-pass radix partition. Pass 1
+//   external_sort (the default): two-pass radix partition. Pass 1
 //                 reads source sequentially and scatters rows into per-bucket temp
 //                 files. Pass 2 reads each bucket sequentially, assembles the
 //                 output range in memory and writes it with a single pwrite. Both
 //                 passes are sequential I/O; eliminates the source page-cache
 //                 thrash that dominates `chunked` when the FM exceeds ~70% of RAM.
 //
-// Earlier history for posterity:
-//   Original (2026-04-22): per-row write_all with random mmap reads keyed by
-//     `perm[output_row]`. 3 h 21 min on papers100M.
-//   Intermediate (2026-05-13): sorted (src,out) moves, per-row pwrite to scattered
-//     offsets. 1 h 24 min — write amplification (22×) dominated.
-//   Chunked sequential writes: target sub-30 min. Still slow when source > RAM.
+// Earlier implementations, kept for the record (all timed on the same
+// 56 GB-matrix / 30 GB-RAM configuration):
+//   Per-row write_all with random mmap reads keyed by `perm[output_row]`:
+//     3 h 21 min.
+//   Sorted (src,out) moves, per-row pwrite to scattered offsets:
+//     1 h 24 min — write amplification (22×) dominated.
+//   Chunked sequential writes: sub-30 min. Still slow when source > RAM.
 //
 // Two-pass external radix sort helper: used when env var
 // MDB_GNN_REORDER_STRATEGY=external_sort. Pass 1 scans source mmap sequentially
@@ -876,7 +877,8 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
         // MADV per branch: the bijection path reads sequentially (src=0..N) so we
         // re-enable readahead via MADV_SEQUENTIAL (the whole point of the
         // inversion). The fallback keeps the random pattern, so it must keep
-        // MADV_RANDOM (the 2026-05-17 fix that disabled readahead for random reads).
+        // MADV_RANDOM — readahead on random reads only prefetches neighbours
+        // that will never be used, evicting pages that will.
         MadviseGuard madvise_guard(source.mmap_ptr_, source.mmap_size_,
                                    is_bijection ? MADV_SEQUENTIAL : MADV_RANDOM);
 
@@ -1245,11 +1247,11 @@ FeatureMatrix FeatureMatrix::create_reordered(
     const uint64_t D  = source.num_cols();
     const GnnDtype dt = source.dtype();
 
-    // Strategy selector — env-var driven. DEFAULT external_sort since 2026-06-01:
+    // Strategy selector — env-var driven. The DEFAULT is external_sort:
     // the two-pass radix-partition strategy keeps BOTH reads and writes sequential,
     // avoiding the random-gather source page-cache thrash that collapses the legacy
     // `chunked` path to ~27 MB/s whenever the source FM exceeds host RAM
-    // (papers100M on 30 GB celebi: chunked ~34 min vs external_sort ~7 min).
+    // (56 GB matrix on a 30 GB-RAM host: chunked ~34 min vs external_sort ~7 min).
     // Override with MDB_GNN_REORDER_STRATEGY=chunked when temp disk for the
     // bucket files (~N * row_bytes) is tight. Pipeline overlap stays opt-in
     // OFF: empirical A/B/C/D bench shows it is neutral-to-negative on the

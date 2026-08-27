@@ -74,11 +74,11 @@ public:
     /// feature region. Caller MUST NOT free or modify the returned pointers;
     /// they remain valid for the CpuCache lifetime.
     ///
-    /// Zero-copy variant of lookup() (2026-05-15) — avoids the
+    /// Zero-copy variant of lookup() — avoids the
     /// per-call std::vector<char> allocation + memcpy that the standard
-    /// lookup() performs. The DiskGNN paper accesses L2 features via UVA
-    /// directly from the pinned host region; this method exposes the same
-    /// path. Callers either (a) consume the pointers via memcpy into their
+    /// lookup() performs. DiskGNN (SIGMOD'25 §6) likewise fetches
+    /// CPU-resident node features via UVA rather than staging copies; this
+    /// method exposes the same path. Callers either (a) consume the pointers via memcpy into their
     /// own destination buffer, or (b) hand the pointers + dst buffer to a
     /// GPU kernel that reads through UVA.
     struct UvaLookupResult {
@@ -89,7 +89,7 @@ public:
 
     UvaLookupResult lookup_uva(const std::vector<ObjectId>& oids) const;
 
-    /// Single-hash lookup (2026-05-15) returning the cache row
+    /// Single-hash lookup returning the cache row
     /// index if present, nullopt otherwise. Used by FourLevelStore to
     /// eliminate the double hash on the L2 hit path (previously contains()
     /// then lookup_uva() both call find()).

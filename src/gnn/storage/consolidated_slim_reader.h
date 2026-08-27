@@ -11,12 +11,12 @@ namespace mdb::gnn {
 /**
  * @brief Validate a ConsolidatedSlimHeader against the runtime's expectations.
  *
- * DiskGNN-adoption Plan 1, Phase 2.1. Called once at FourLevelStore ctor when
+ * Called once at FourLevelStore ctor when
  * probing `packed_slim/consolidated.slim`. A false return means "refuse the
  * consolidated file, fall back to the per-batch read" — never a hard error, so
  * a stale/foreign/mismatched file degrades gracefully instead of serving wrong
- * features (the IDX_VERSION-2 discipline; a silently-adopted stale sidecar is
- * exactly what capped papers100M val_acc at 0.16).
+ * features (a silently-adopted stale sidecar feeds rows in the wrong order:
+ * training completes but accuracy collapses with no error raised).
  *
  * Checks: structural validity, feature_dim, dtype, and the two stale-rejection
  * fingerprints. `expected_perm_fp == 0` disables the permutation check (stores
@@ -33,8 +33,8 @@ bool validate_consolidated_header(const ConsolidatedSlimHeader& h,
  * @brief pread exactly `len` bytes from `fd` at `offset` into `dst`.
  *
  * Loops on short reads and retries EINTR. For an O_DIRECT fd the caller must
- * guarantee `offset`, `len`, and `dst` are all block-aligned — Plan 1 satisfies
- * this by construction: the consolidated per-batch offsets are 4096-aligned, the
+ * guarantee `offset`, `len`, and `dst` are all block-aligned — the consolidated
+ * layout satisfies this by construction: the per-batch offsets are 4096-aligned, the
  * worker buffer is aligned_alloc'd, and the caller reads align_up(payload, 4096)
  * (the file is ftruncated to the aligned total, so the padding read stays
  * in-file). Returns true iff all `len` bytes were read; false on any error,

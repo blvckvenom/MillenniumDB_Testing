@@ -1,9 +1,9 @@
 #pragma once
 
-// Spec C3 stage 3 (started 2026-05-08): CUDA stream helpers for pipeline
-// overlap of assemble_kernel with model forward+backward on the GPU.
+// CUDA stream helpers for pipeline overlap of assemble_kernel with model
+// forward+backward on the GPU.
 //
-// Background (DiskGNN SIGMOD'25 §5.3, §6):
+// Background (DiskGNN SIGMOD'25 §5.3):
 //   "we run the model trainer and feature assembler on separate CUDA streams
 //    to improve GPU utilization"
 //
@@ -15,8 +15,9 @@
 //   5. Main thread blocks `train_stream` on ready_event (non-blocking on host)
 //   6. Main thread launches model.forward() on train_stream
 //   7. The two streams run concurrently on GPU — overlap appears when the
-//      GPU has spare SMs (paper says SAGE/GAT graph samples don't saturate
-//      GPU, so spare exists).
+//      GPU has spare SMs; GNN forward/backward is lightweight relative to
+//      data movement (DiskGNN §7.3: "computations are lightweight for GNN
+//      models"), so spare capacity typically exists.
 //
 // LibTorch provides the primitives:
 //   - c10::cuda::CUDAStream      (pooled wrapper around cudaStream_t)

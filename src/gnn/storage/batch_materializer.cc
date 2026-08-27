@@ -196,11 +196,13 @@ BatchMaterializer::Result BatchMaterializer::materialize(
         return translate_to_rows(sample.all_unique_nodes, row_mapping, inv_ptr, batch_id);
     };
 
-    // Spec B1: dispatch between classic and partitioned packer via env var.
-    // MDB_BATCH_PACKER=partitioned activates the DiskGNN-style inverted loop
-    // (1× sequential .fmat scan + scatter pwrites). Default classic preserves
-    // pre-2026-04-27 behavior; flip to partitioned only after measuring on
-    // your dataset (mirrors MDB_PROJECTION_SORTER pattern from ADR-004).
+    // Dispatch between classic and partitioned packer via env var.
+    // MDB_BATCH_PACKER=partitioned inverts the loop: instead of one random
+    // gather over the .fmat per batch, it makes 1× sequential .fmat scan and
+    // scatter-pwrites each row into every batch file that needs it. Default
+    // classic preserves the legacy per-batch gather; flip to partitioned only
+    // after measuring on your dataset (same opt-in pattern as the
+    // MDB_PROJECTION_SORTER backend selector in the projection builder).
     // Resolved through the registry because the two arms differ only in write
     // pattern: a run that silently took the default is otherwise
     // indistinguishable from one that asked for it. "partitioned" is the only
@@ -211,7 +213,7 @@ BatchMaterializer::Result BatchMaterializer::materialize(
     const bool use_partitioned = (packer == "partitioned");
 
     if (use_partitioned) {
-        std::cout << "[Materialize] L4 packer mode: partitioned (Spec B1)\n"
+        std::cout << "[Materialize] L4 packer mode: partitioned\n"
                   << std::flush;
         // Resolved on the partitioned path only, so the log records the knob
         // where it actually applies. A value that does not parse is reported by

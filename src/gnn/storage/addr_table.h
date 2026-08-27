@@ -21,14 +21,14 @@ namespace mdb::gnn {
  *   l4_indices    [num_l4] uint32  — packed_slim file slot indices
  *   zero_positions[num_zero] uint32 — positions left as zeros (unresolved)
  *
- * v2 (DiskGNN-adoption Plan 1) appends `slim_offset`/`slim_length` (16 B, header
+ * v2 appends `slim_offset`/`slim_length` (16 B, header
  * grows 40 -> 56) carrying this batch's payload location in the consolidated slim
  * file (see consolidated_slim.h). The 9 arrays then start at offset 56. v1 and v2
  * are distinguished by the `version` field; both round-trip (a v1-equivalent v2
  * header has slim_offset == slim_length == 0 but the writer still emits a 40-byte
  * v1 header for backwards-compat byte-identity). The struct is always 56 bytes in
  * memory; `header_bytes()` returns the on-disk size for the header's version, and
- * the writer/reader use it so v1 files stay byte-identical to pre-Plan-1 output.
+ * the writer/reader use it so v1 files stay byte-identical to pre-v2 output.
  */
 struct AddrTableHeader {
     static constexpr uint32_t MAGIC       = 0x41444452u;  // "ADDR" (MSB-first, matches storage/ convention)

@@ -28,9 +28,9 @@ namespace fs = std::filesystem;
 // =============================================================================
 
 // Skip rebuild if an existing cache file's header already matches the
-// requested (num_nodes, feature_dim, dtype). Cuts ~19 min off papers100M
-// L2 build on idempotent re-runs by avoiding a re-read of the source
-// feature matrix.
+// requested (num_nodes, feature_dim, dtype). On idempotent re-runs this
+// avoids re-reading the source feature matrix, whose full scan dominates
+// the L2 build (tens of minutes when the matrix is tens of GB on disk).
 static bool cache_header_matches(
     const fs::path& path,
     uint64_t        expected_N,

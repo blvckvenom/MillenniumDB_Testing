@@ -38,7 +38,7 @@ void AddrTableWriter::write_atomic(const fs::path& path,
 
     try {
         // Version-aware header size: v1 writes 40 bytes (byte-identical to
-        // pre-Plan-1 output), v2 writes 56 bytes (incl. slim_offset/slim_length).
+        // pre-v2 output), v2 writes 56 bytes (incl. slim_offset/slim_length).
         // sizeof(buf.header) is always 56 (the in-memory struct), so write only
         // header_bytes() to keep v1 sidecars unchanged on disk.
         mdb::gnn::write_all(fd, &buf.header, buf.header.header_bytes(), tmp);

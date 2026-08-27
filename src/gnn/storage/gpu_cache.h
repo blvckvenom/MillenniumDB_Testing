@@ -57,13 +57,13 @@ public:
     /// Returns hits gathered into a contiguous tensor, plus position vectors.
     LookupResult lookup(const std::vector<ObjectId>& oids) const;
 
-    /// Single-hash lookup (2026-05-15) returning the cache row index
+    /// Single-hash lookup returning the cache row index
     /// if present, nullopt otherwise. Used by FourLevelStore to eliminate the
     /// double hash on the L1 hit path (previously contains() then lookup()
     /// both call find()).
     std::optional<uint32_t> find_index(ObjectId oid) const;
 
-    /// Gather feature rows by pre-validated cache row indices (2026-05-15)
+    /// Gather feature rows by pre-validated cache row indices
     /// (e.g. from find_index). Skips the per-oid find loop in
     /// lookup() and just calls index_select(0, ...). Caller is responsible
     /// for ensuring all indices are valid (< num_nodes_).

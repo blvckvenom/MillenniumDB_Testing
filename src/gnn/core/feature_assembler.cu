@@ -121,15 +121,15 @@ torch::Tensor FeatureAssembler::assemble_cuda(
     const float* gpu_data_ptr = (gpu_features.defined() && gpu_features.numel() > 0)
         ? gpu_features.data_ptr<float>() : nullptr;
 
-    // Spec C3 stage 3 (2026-05-08): use the current CUDA stream rather than
+    // Use the current CUDA stream rather than
     // the default stream so callers can drive this kernel onto a non-default
     // stream via c10::cuda::CUDAStreamGuard. With a guard set by the worker
     // thread, the kernel ends up on the worker's stream and can run
     // concurrently with model.forward+backward on a different stream.
     //
     // If no guard is set, getCurrentCUDAStream() returns the default stream,
-    // preserving pre-2026-05-08 behaviour byte-for-byte.
-    // B: optionally stage the contiguous cold buffer to device (one bulk H2D)
+    // identical to launching on the default stream directly.
+    // Optionally stage the contiguous cold buffer to device (one bulk H2D)
     // so the kernel scatters from HBM instead of per-row UVA host reads. The
     // device holder must outlive the kernel (it does — synced below). Same
     // bytes => bit-identical output.

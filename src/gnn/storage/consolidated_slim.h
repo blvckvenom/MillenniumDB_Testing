@@ -10,13 +10,15 @@ namespace mdb::gnn {
 /**
  * @brief On-disk header for the consolidated cold-feature file (64 bytes, LE).
  *
- * DiskGNN-adoption Plan 1 (docs/superpowers/plans/2026-06-03-diskgnn-adoption-plan1-*).
- * Mirrors DiskGNN's single `train-aux` file: instead of MDB's ~1512 separate
- * per-batch `batch_NNNNNN.bin` files (read buffered, page-cache-contended, ~0.2
- * GB/s), all batches' cold-feature payloads are concatenated into ONE file
+ * Consolidates the packed cold features of every batch into a single file:
+ * instead of one `batch_NNNNNN.bin` per batch (thousands of small buffered
+ * reads that contend for page cache — measured ~0.2 GB/s on a Gen4 NVMe),
+ * all batches' cold-feature payloads are concatenated into ONE file
  * `<sample_dir>/packed_slim/consolidated.slim`, batch `b` at `slim_offset[b]`
  * (stored per-batch in the v2 AddrTableHeader), read with ONE O_DIRECT
- * sequential pread per batch (~1.36 GB/s target).
+ * sequential pread per batch (~1.4 GB/s on the same drive). The idea of
+ * storing each mini-batch's features contiguously so one sequential read
+ * serves the whole batch is "feature packing" (DiskGNN, SIGMOD'25 §5.2).
  *
  * File layout: [ConsolidatedSlimHeader: 64 B][pad to data_start][batch 0 payload]
  *              [pad to 4096][batch 1 payload][pad]... Each batch payload is the
@@ -24,11 +26,12 @@ namespace mdb::gnn {
  * aligned up to `alignment`. Row order matches the per-batch `.bin` data section
  * (partition-iteration order), so addr_table.l4_indices[j] index rows identically.
  *
- * Stale-rejection (IDX_VERSION-2 discipline): `perm_fingerprint` must equal the
- * reordered `.rmap.idx` fingerprint and `meta_sha256_head` the store's expected
- * value; a mismatch at open => refuse the consolidated file, fall back to the
- * per-batch read. This is the exact failure class that capped papers100M val_acc
- * at 0.16 (a stale sidecar silently adopted), so the fingerprints are mandatory.
+ * Stale-rejection: `perm_fingerprint` must equal the reordered `.rmap.idx`
+ * permutation fingerprint (see row_mapping.h) and `meta_sha256_head` the
+ * store's expected value; a mismatch at open => refuse the consolidated file,
+ * fall back to the per-batch read. A stale file from a previous permutation
+ * serves rows in the wrong order — training still runs to completion but
+ * accuracy silently collapses — so the fingerprints are mandatory.
  */
 struct ConsolidatedSlimHeader {
     static constexpr uint32_t MAGIC   = 0x43534C4Du;  // "CSLM" (MSB-first, matches storage/ convention)

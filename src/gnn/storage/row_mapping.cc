@@ -178,8 +178,8 @@ RowMapping RowMapping::create(const fs::path& path, const std::vector<ObjectId>&
     // persisted sorted-index sidecar built from the OLD permutation. Remove the
     // orphan so a later open() rebuilds the index from THIS .rmap rather than
     // silently adopting a stale <path>.idx (the v1 count-only guard could not
-    // detect a same-N permutation change — root cause of the L4 feature-row
-    // corruption fixed 2026-06-01). The IDX_VERSION-2 fingerprint is the
+    // detect a same-N permutation change, which once corrupted the packed L4
+    // feature rows). The IDX_VERSION-2 fingerprint is the
     // defense-in-depth; this removal is the direct fix at the write site.
     {
         std::error_code ec;
@@ -346,7 +346,7 @@ void RowMapping::build_index() const {
 #endif
 }
 
-// --- Permutation fingerprint (2026-06-01) ---
+// --- Permutation fingerprint ---
 
 uint64_t RowMapping::compute_perm_fingerprint_() const {
     // Order-sensitive FNV-1a-64 over the ObjectId array. A permutation change

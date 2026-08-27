@@ -14,7 +14,8 @@ namespace mdb::gnn {
  * each GPU thread reads from the appropriate source (GPU HBM or CPU pinned
  * via UVA) in a single pass. Otherwise falls back to LibTorch index_copy_.
  *
- * DiskGNN equivalent: the "Feature Assembler" stage in the training pipeline.
+ * Corresponds to the "feature assembler" stage of DiskGNN's training
+ * pipeline (SIGMOD'25 §5.3).
  */
 class FeatureAssembler {
 public:

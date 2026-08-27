@@ -35,11 +35,11 @@ namespace mdb::gnn {
 struct FeatureMatrixHeader {
     static constexpr uint32_t MAGIC   = 0x474E4E46; // "GNNF"
     static constexpr uint32_t VERSION = 1;          // default/legacy write version (data at offset 64)
-    static constexpr uint32_t VERSION_PAGE_ALIGNED = 2;  // F2: explicit page-aligned data offset
+    static constexpr uint32_t VERSION_PAGE_ALIGNED = 2;  // v2: explicit page-aligned data offset
     static constexpr uint32_t MAX_SUPPORTED_VERSION = 2; // highest version open() accepts
     static constexpr size_t   SIZE    = 64;         // on-disk header struct size (UNCHANGED across versions)
     static constexpr uint64_t DATA_OFFSET_V1 = 64;     // legacy: data immediately after the 64-byte header
-    static constexpr uint64_t DATA_OFFSET_V2 = 4096;   // F2: page-aligned data section start
+    static constexpr uint64_t DATA_OFFSET_V2 = 4096;   // v2: page-aligned data section start
 
     uint32_t magic;
     uint32_t version;
@@ -48,7 +48,7 @@ struct FeatureMatrixHeader {
     uint8_t  dtype;
     uint8_t  reserved[39]; // pad to 64 bytes; see reserved[] layout in the struct doc
 
-    // F2: page-aligned data section is opt-in via env MDB_FMAT_PAGE_ALIGN.
+    // Page-aligned data section is opt-in via env MDB_FMAT_PAGE_ALIGN.
     // Default OFF -> legacy v1 layout (data offset 64), byte-identical output.
     // NOT routed through the ablation registry: the registry resolves a name
     // once per process, and FeatureMatrixHeaderTest.PageAlignV2HeaderToggle
@@ -93,7 +93,7 @@ struct FeatureMatrixHeader {
             && get_data_offset() >= SIZE;  // data section cannot start inside the header
     }
 
-    // F2: byte offset where the data section begins. v1 files (and any header
+    // Byte offset where the data section begins. v1 files (and any header
     // that did not record an explicit offset) store 0 in reserved[8..15] and the
     // data follows immediately after the 64-byte header. v2 files store the
     // page-aligned offset (4096) so the data section starts on a block boundary.

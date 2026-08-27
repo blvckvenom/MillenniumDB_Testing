@@ -178,12 +178,12 @@ void generate_packed_batches(
     const std::filesystem::path& output_dir
 );
 
-/// Spec B1 (DiskGNN-style inverted loop): partitioned packer.
+/// Partitioned packer (single-scan inverted loop).
 ///
 /// Inverts the per-batch outer loop into a feature-partition-oriented
 /// sequential scan. Each region of the FeatureMatrix is read exactly once,
 /// then per-(partition, batch) contributions are appended to their batch
-/// files via pwrite. All batch FDs are kept open across Phase 2 (relies on
+/// files via pwrite. All batch FDs are kept open across the scan (relies on
 /// ulimit -n; 1024+ recommended).
 ///
 /// Two output formats, selected by whether `oid_provider` is supplied:
@@ -199,12 +199,12 @@ void generate_packed_batches(
 ///     equivalent to v1 but byte layout differs.
 ///
 /// Memory profile: peak ~ row_bytes * partition_rows + 16B/ref inverted
-/// index + 8B/ref OID array (v2 only). Partition size of 256 MB on
-/// papers100M-class datasets keeps peak RSS under 2 GB.
+/// index + 8B/ref OID array (v2 only). The default 256 MB partition keeps
+/// peak RSS under ~2 GB even at ogbn-papers100M scale (111 M nodes).
 ///
 /// partition_bytes: target bytes per partition (rounded down to whole rows).
 ///
-/// DiskGNN-adoption Plan 1 (optional consolidated cold-feature file): when
+/// Optional consolidated cold-feature file: when
 /// `consolidated_path` is non-empty, the SAME single .fmat scan ALSO writes one
 /// consolidated file — a ConsolidatedSlimHeader (consolidated_slim.h) followed
 /// by every batch's data section concatenated, batch b at a 4096-aligned offset.

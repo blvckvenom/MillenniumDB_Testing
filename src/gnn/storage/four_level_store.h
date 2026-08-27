@@ -138,7 +138,7 @@ public:
         bool   reorder = true;
         bool   force   = false;
 
-        // Granular force flags (2026-05-13): when `force=true`, these toggles
+        // Granular force flags: when `force=true`, these toggles
         // let callers preserve specific outputs across a rebuild. Useful for
         // validating individual phases without paying the cost of recomputing
         // parts that are still valid.
@@ -155,10 +155,11 @@ public:
         bool   force_packed_slim = true;  // delete packed_slim/
         bool   force_meta        = true;  // delete store.meta
 
-        // Phase 5 (2026-05-19): pre-classify every batch's unique nodes into
+        // Pre-classify every batch's unique nodes into
         // {L1, L2, L4, L3, zero} and persist the results as
         // addr_tables/batch_NNNNNN.addr sidecars next to packed_slim/.
-        // Set to false only to skip Phase 5 (e.g., when rebuilding caches only).
+        // Set to false only to skip that stage (e.g., when rebuilding caches
+        // only).
         bool   build_addr_tables = true;
 
         // Bake per-batch computation-graph blocks (blocks/block_NNNNNN.blk)
@@ -166,7 +167,7 @@ public:
         // when present+fresh.
         bool   bake_blocks = false;
 
-        // Packed-full build mode (additive, PS-class): a single gather pass over
+        // Packed-full build mode (additive): a single gather pass over
         // the source fmat into <sample_dir>/packed_full/ (one contiguous
         // [N_b, D] pack per batch, in all_unique_nodes order). Writes ONLY
         // packed_full/; never builds or deletes the 4-tier (reordered/caches/
@@ -182,7 +183,7 @@ public:
         // true, the addr_table sidecars are written as v2 (carrying per-batch
         // slim_offset/slim_length). Opt-in, default OFF; the per-batch .bin files
         // are still written so the legacy read path remains valid. Requires the
-        // partitioned packer (Lever B); ignored on the legacy worker-loop path.
+        // partitioned packer; ignored on the legacy worker-loop path.
         bool   write_consolidated_slim = false;
 
         // After build() succeeds, delete the non-slim packed/ directory left
@@ -192,8 +193,8 @@ public:
         // compatibility with a training path that still reads packed/.
         bool   cleanup_materialize_scratch = true;
 
-        // Defer the L1/L2 cache (.bin) materialization to train startup
-        // (2026-06-29). When true, build() classifies tiers and writes
+        // Defer the L1/L2 cache (.bin) materialization to train startup.
+        // When true, build() classifies tiers and writes
         // store.meta but does NOT write the gpu/cpu cache .bin; it drops a
         // "<feature>_cache.deferred" marker instead. The runtime constructor
         // then builds the L1/L2 caches lazily on first train, sized for THIS
@@ -202,7 +203,7 @@ public:
         // artifacts. Default false (caches written at build, as before).
         bool   no_cache_bin = false;
 
-        // Disk space budget for the Four-Level Feature Store (2026-05-07):
+        // Disk space budget for the Four-Level Feature Store:
         // 0 = unlimited (current behavior). When > 0, build() emits
         // a warning if the actual on-disk usage exceeds the budget. A future
         // heuristic-search phase would use this to find the disk-cache segment
@@ -237,19 +238,20 @@ public:
         uint64_t total_disk_bytes = 0;
         bool     over_budget      = false;
 
-        // Phase 5 (2026-05-19): addr_table sidecar telemetry.
+        // addr_table sidecar telemetry.
         // addr_tables_bytes — total bytes written to addr_tables/*.addr files.
-        // addr_tables_built_ok — true iff Phase 5 completed without error.
+        // addr_tables_built_ok — true iff the addr-table stage completed
+        //   without error.
         uint64_t addr_tables_bytes    = 0;
         bool     addr_tables_built_ok = false;
 
-        // Task 6 (2026-06-07): baked computation-graph block telemetry.
+        // Baked computation-graph block telemetry.
         // blocks_bytes — total bytes written to blocks/*.blk files.
         // blocks_built_ok — true iff block baking completed without error.
         uint64_t blocks_bytes    = 0;
         bool     blocks_built_ok = false;
 
-        // Task 4 (2026-06-08): packed-full feature pack telemetry.
+        // Packed-full feature pack telemetry.
         // packed_full_bytes — size of packed_full/packed_full.dat (0 if not built).
         uint64_t packed_full_bytes = 0;
     };
@@ -275,7 +277,7 @@ public:
     ~FourLevelStore();
 
     /// Rebuild addr_tables/ sidecars from this loaded runtime instance's
-    /// already-resolved caches (gpu/cpu/reordered_rm) (2026-05-20).
+    /// already-resolved caches (gpu/cpu/reordered_rm).
     /// Used when the source FeatureMatrix is unavailable (placeholder /
     /// deleted), but the rest of the feature store is intact. Idempotent —
     /// overwrites any existing addr_tables/. Returns total bytes written.
@@ -317,7 +319,7 @@ public:
     /// to the overload below. Pays the deserialize cost once.
     torch::Tensor load_batch_features(uint64_t batch_id);
 
-    /// Load batch features given an already-deserialized GraphSample (2026-05-15).
+    /// Load batch features given an already-deserialized GraphSample.
     /// Avoids re-reading + re-parsing the sample when the caller
     /// (e.g., BatchAssembler::assemble_from_sample) already has it in hand.
     ///
@@ -335,8 +337,9 @@ public:
         std::atomic<uint64_t> l3_reads{0}, l4_reads{0};
         std::atomic<uint64_t> total_requests{0};
 
-        // Byte-level counters for paper-comparable disk-traffic accounting
-        // (2026-04-27) (cf. DiskGNN SIGMOD'25 Table 1 "Disk access volume (GB)").
+        // Byte-level counters for disk-traffic accounting comparable to
+        // published systems (cf. DiskGNN SIGMOD'25 Table 1, row
+        // "Disk access volume (GB)").
         //
         // *_bytes_served — bytes copied from RAM/GPU caches into output.
         //                  Useful for hit-rate by data volume vs node count.
@@ -379,7 +382,7 @@ public:
     /// Device the model should train on for this store. Mirrors the v2 gather's
     /// device decision: CUDA only for a float32 store on a GPU host (the v2
     /// assembler path), else CPU. Keeps the packed-full TrainingLoop device-probe
-    /// consistent with the 4-tier path across dtypes (packed-full is PS-class
+    /// consistent with the 4-tier path across dtypes (packed-full stores are
     /// float32 in practice; this just avoids a CPU/GPU mismatch on other dtypes).
     torch::Device feature_device() const {
         return (torch::cuda::is_available() && dtype_ == GnnDtype::FLOAT32)
@@ -387,13 +390,13 @@ public:
                    : torch::Device(torch::kCPU);
     }
 
-    // Phase 0 (2026-05-17) profile instrumentation getters. Each returns the
+    // Profile instrumentation getters. Each returns the
     // per-tier microseconds captured during the most recent
     // load_batch_features() call. last_rmap_us() is a SUB-counter and its time
     // is already included inside the L1/L2/L3/L4 totals; it is tracked
-    // separately to quantify the Phase 1 address-table candidate.
+    // separately to quantify how much an address-table fast path saves.
     //
-    // Phase 0 (2026-05-17): public API still in microseconds (matches the
+    // Public API is in microseconds (matches the
     // `_us` fields of BatchTiming). Internal storage uses nanoseconds for
     // precision; conversion happens here, once per batch (not per node).
     uint64_t last_l1_us() const   { return last_l1_ns_.load() / 1000; }
@@ -402,7 +405,7 @@ public:
     uint64_t last_l4_us() const   { return last_l4_ns_.load() / 1000; }
     uint64_t last_rmap_us() const { return last_rmap_ns_.load() / 1000; }
 
-    // Path 4 (2026-05-19): v2 runtime path telemetry.
+    // v2 (addr_table) runtime path telemetry.
     // last_addr_load_us() — microseconds to open + parse the addr_table sidecar
     //   for the most recent batch. 0 if the v2 path was not taken.
     // last_used_addr_tables() — whether the most recent load_batch_features
@@ -413,7 +416,7 @@ public:
     uint64_t last_addr_load_us() const { return last_addr_load_ns_.load() / 1000; }
     bool last_used_addr_tables() const { return last_used_v2_.load(); }
 
-    // Multi-worker prefetch support (2026-06-01): the AsyncBatchPrefetcher
+    // Multi-worker prefetch support: the AsyncBatchPrefetcher
     // can drive load_batch_features() from N concurrent worker threads
     // (prefetchNumWorkers>1). Every shared mutable resource on the hot path
     // that is NOT thread-safe is replicated per worker so there is no
@@ -456,10 +459,10 @@ private:
     uint64_t       l3_header_size_ = FeatureMatrixHeader::SIZE; // data offset past header
     Stats          stats_;
 
-    // Persistent pinned host buffer reused across load_batch_features() calls
-    // (2026-05-15). Replaces per-batch cudaHostAlloc + cudaFreeHost (each is a
-    // synchronous driver call ~100-500 us). On papers100M with 1300+ batches/
-    // epoch the old path burned ~150-600 ms/epoch on alloc churn alone.
+    // Persistent pinned host buffer reused across load_batch_features()
+    // calls. Replaces per-batch cudaHostAlloc + cudaFreeHost (each is a
+    // synchronous driver call ~100-500 us). At 1300+ batches per epoch the
+    // old path burned ~150-600 ms/epoch on alloc churn alone.
     //
     // ensure_pinned_capacity(bytes) grows the buffer if needed (geometric
     // x1.5 plus 64-byte alignment headroom) and is thread-safe via
@@ -469,7 +472,7 @@ private:
     void*              pinned_ptr_      = nullptr;
     size_t             pinned_capacity_ = 0;
 
-    // Per-worker IO resources for safe N>1 prefetch (2026-06-01).
+    // Per-worker IO resources for safe N>1 prefetch.
     // Worker id 0 uses the primary l3_reader_ + pinned_ptr_ above (so the
     // single-worker path is byte-identical to pre-change). Workers 1..N-1 use
     // extra_workers_[id-1]. prepare_worker_io(N) populates this vector ONCE,
@@ -494,7 +497,7 @@ private:
     // once workers are running.
     bool ensure_pinned_capacity_for_worker_(size_t bytes, void*& out);
 
-    // Phase 0 (2026-05-17) profile instrumentation. Per-call sub-timers in
+    // Profile instrumentation. Per-call sub-timers in
     // nanoseconds (high precision to avoid integer-microsecond truncation of
     // sub-μs hash lookups). Accessors below convert to μs at the API boundary.
     // rmap_lookup_ns is a SUB-counter: already included in the L3 total;
@@ -510,7 +513,7 @@ private:
     mutable std::atomic<uint64_t> last_l4_ns_{0};
     mutable std::atomic<uint64_t> last_rmap_ns_{0};
 
-    // Path 4 (2026-05-19): v2 path dispatch state.
+    // v2 (addr_table) path dispatch state.
     //
     // use_addr_tables_ — set true at construction when addr_tables/ directory
     //   exists alongside the packed_slim/ dir. Controls whether the dispatcher
@@ -560,12 +563,13 @@ private:
     static torch::ScalarType to_torch_dtype(GnnDtype dt);
 
     /// Legacy path: per-node hash classification across L1/L2/L4/L3, scatter
-    /// via FeatureAssembler. Preserves pre-Path-4 behavior bit-identically.
+    /// via FeatureAssembler. Preserves the pre-addr-table behavior
+    /// bit-identically.
     /// Public dispatcher falls through to this when the addr_table sidecar is
     /// missing, stale, or unreadable, or when the assembler gate is not met.
     torch::Tensor load_batch_features_legacy_(const GraphSample& sample);
 
-    /// Path 4 fast path (2026-05-19): read addr_tables/batch_<bid>.addr,
+    /// addr_table fast path: read addr_tables/batch_<bid>.addr,
     /// dispatch scatter-from-tier without per-node classification.
     /// Only called when assembler_ is active and gpu_cache_->is_on_gpu() —
     /// the CPU-only assembly case is served by legacy_ to avoid duplicating
