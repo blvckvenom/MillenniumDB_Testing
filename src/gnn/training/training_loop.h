@@ -308,6 +308,59 @@ public:
     double evaluate(uint64_t start_batch, uint64_t count);
 
 private:
+    // =========================================================================
+    // train() stage helpers
+    // =========================================================================
+
+    // Prints the training start banner (device, epoch window, batch counts,
+    // resume seeds). Assumes the device probe already ran; output only.
+    void print_training_banner_(const torch::Device& device,
+                                uint64_t train_batches,
+                                uint64_t val_batches) const;
+
+    // Resolves the effective AsyncBatchPrefetcher worker count for this run
+    // (clamping rules in Config::prefetch_num_workers). Call ONCE per train()
+    // BEFORE the epoch loop: it provisions per-worker FourLevelStore IO when
+    // applicable, sets fls_prefetch_workers_, and emits the one-time stderr
+    // notice. Returns the count the epoch loop must use.
+    unsigned resolve_effective_prefetch_workers_();
+
+    // Sets the Adam lr for this epoch when config_.lr_schedule == "cosine";
+    // no-op otherwise. Call at the top of each epoch, BEFORE any
+    // forward/backward. Mutates optimizer_ param groups only.
+    void apply_cosine_lr_schedule_(uint64_t epoch);
+
+    // Runs the training phase of ONE epoch: the per-batch loop
+    // (assemble/prefetch, h→d transfer, forward/backward), the end-of-epoch
+    // stream sync + allocator reclaim, and the single-sync loss reduction.
+    // Returns the epoch's average training loss. Assumes model_ is already on
+    // `device` and effective_workers came from
+    // resolve_effective_prefetch_workers_(). Accumulates per-stage timings and
+    // addr-table telemetry into `result` (epoch_losses is the caller's job).
+    double run_training_phase_(const torch::Device& device,
+                               unsigned             effective_workers,
+                               uint64_t             train_batches,
+                               Result&              result);
+
+    // Copies the assembler-stamped sub-stage timings from mini.timing into
+    // this batch's profile record. When sequential_path is true (no
+    // prefetcher), also reads the per-tier L1..L4/rmap counters off the
+    // FourLevelStore — only then are they attributable to this batch.
+    void record_batch_stage_timings_(BatchTiming&     bt,
+                                     const MiniBatch& mini,
+                                     bool             sequential_path) const;
+
+    // One optimizer step for a train batch: zero_grad, forward, and — when
+    // the batch has labeled seeds — loss, backward, optimizer step, and the
+    // on-device loss accumulation. Assumes mini's tensors are already on the
+    // model's device. Mutates the epoch accumulators and the forward/backward
+    // wall-time fields of bt and result.
+    void forward_backward_step_(MiniBatch&     mini,
+                                BatchTiming&   bt,
+                                torch::Tensor& epoch_loss_sum,
+                                uint64_t&      num_labeled_batches,
+                                Result&        result);
+
     GraphSAGEModel&      model_;
     BatchAssembler&      assembler_;
     const SampleCatalog& catalog_;

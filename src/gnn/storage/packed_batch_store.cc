@@ -320,6 +320,319 @@ void generate_packed_batches(
 // therefore O(partition_bytes + num_batches * sizeof(fd)) — a small constant.
 // ===========================================================================
 
+// --- Stage helpers for generate_packed_batches_partitioned -----------------
+namespace {
+
+// RowRef: 16 bytes — one inverted-index entry per (row, batch, position).
+// batch_id < 2^32 covers any realistic dataset; pos_in_batch < 2^32 too
+// (a 4 B-node batch would need terabytes of features per single batch,
+// way past any practical workload).
+struct RowRef {
+    uint32_t batch_id;
+    uint32_t pos_in_batch;
+    uint64_t fmat_row;
+};
+static_assert(sizeof(RowRef) == 16, "RowRef must be 16 bytes");
+
+// Writes exactly `remaining` bytes at file offset `off_curr` via pwrite,
+// retrying on EINTR and on short writes. `what` names the slice for the
+// error message (e.g. "pwrite OIDs"). Throws std::runtime_error on failure.
+// Positional writes only — the fd's file position is never used or moved.
+void pwrite_exact(int fd, const char* src, size_t remaining, off_t off_curr,
+                  const char* what)
+{
+    while (remaining > 0) {
+        ssize_t n = ::pwrite(fd, src, remaining, off_curr);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: " + std::string(what) +
+                " failed: " + safe_strerror(errno));
+        }
+        if (n == 0) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: " + std::string(what) +
+                " returned 0");
+        }
+        src       += n;
+        off_curr  += n;
+        remaining -= static_cast<size_t>(n);
+    }
+}
+
+// Buckets each of one batch's feature-matrix rows into the inverted index of
+// the partition that holds the row, recording (batch_id, position-in-batch)
+// so Phase 2 can pwrite the row into its final file slot. Assumes `inverted`
+// has one bucket per partition. Throws std::out_of_range on any row outside
+// the matrix.
+void bucket_rows_into_partitions(const std::vector<uint64_t>&      rows,
+                                 uint64_t                          batch_id,
+                                 uint64_t                          total_rows,
+                                 uint64_t                          partition_rows,
+                                 std::vector<std::vector<RowRef>>& inverted)
+{
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const uint64_t fmat_row = rows[i];
+        if (fmat_row >= total_rows) {
+            throw std::out_of_range(
+                "generate_packed_batches_partitioned: row " +
+                std::to_string(fmat_row) +
+                " out of range [0, " + std::to_string(total_rows) + ")");
+        }
+        const uint64_t partition_id = fmat_row / partition_rows;
+        inverted[partition_id].push_back({
+            static_cast<uint32_t>(batch_id),
+            static_cast<uint32_t>(i),
+            fmat_row
+        });
+    }
+}
+
+// Writes the PackedBatchHeader (v2 when has_oids) at the start of a batch
+// file and ftruncates it to its final size (header + optional OID table +
+// data) so Phase 2 can pwrite slices at their final offsets. Assumes fd is
+// freshly opened O_WRONLY|O_TRUNC and is already registered in the caller's
+// cleanup list (so a throw here does not leak it). Leaves the file position
+// just after the header.
+void write_batch_header_and_reserve(int                fd,
+                                    const std::string& path_str,
+                                    uint64_t           N,
+                                    uint64_t           feature_dim,
+                                    GnnDtype           dtype,
+                                    uint64_t           row_bytes,
+                                    bool               has_oids)
+{
+    auto header = has_oids
+        ? PackedBatchHeader::make_v2(N, feature_dim, dtype)
+        : PackedBatchHeader::make(N, feature_dim, dtype);
+    write_all(fd, &header, sizeof(header), path_str);
+
+    if (N > 0) {
+        const off_t total_size = static_cast<off_t>(
+            sizeof(header)
+            + (has_oids ? N * sizeof(uint64_t) : 0)
+            + N * row_bytes);
+        if (::ftruncate(fd, total_size) < 0) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: ftruncate failed for " +
+                path_str + ": " + safe_strerror(errno));
+        }
+    }
+}
+
+// Creates the consolidated cold-feature file, writes its
+// ConsolidatedSlimHeader, and ftruncates it to the full pre-computed size
+// (cons_cursor). Assigns the descriptor into cons_fd IMMEDIATELY after the
+// open succeeds so the caller's cleanup handler owns it even when the header
+// write or ftruncate below throws.
+void open_consolidated_output(const fs::path&               consolidated_path,
+                              const ConsolidatedSlimHeader& cons_header,
+                              uint64_t                      cons_cursor,
+                              int&                          cons_fd)
+{
+    std::string cpath = consolidated_path.string();
+    cons_fd = ::open(cpath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (cons_fd < 0) {
+        throw std::runtime_error(
+            "generate_packed_batches_partitioned: cannot create consolidated " +
+            cpath + ": " + safe_strerror(errno));
+    }
+    write_all(cons_fd, &cons_header, sizeof(cons_header), cpath);
+    if (cons_cursor > cons_header.data_start) {
+        if (::ftruncate(cons_fd, static_cast<off_t>(cons_cursor)) < 0) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: ftruncate consolidated "
+                "failed for " + cpath + ": " + safe_strerror(errno));
+        }
+    }
+}
+
+// Prints the Phase 0+1 completion line: elapsed seconds plus the inverted
+// index's total ref count and in-RAM footprint. Read-only; output only.
+void print_inverted_index_summary(
+    const std::vector<std::vector<RowRef>>& inverted,
+    uint64_t                                num_partitions,
+    std::chrono::steady_clock::time_point   t_phase01_start,
+    std::chrono::steady_clock::time_point   t_phase01_end)
+{
+    uint64_t total_refs = 0;
+    for (const auto& bucket : inverted) total_refs += bucket.size();
+    std::cout << "[Materialize] phase 0+1 done in "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase01_end - t_phase01_start).count()
+              << "s — inverted index: " << total_refs << " refs across "
+              << num_partitions << " partitions ("
+              << (total_refs * sizeof(RowRef) / (1024 * 1024)) << " MB)"
+              << std::endl;
+}
+
+// Copies one partition's rows out of the mmap'd FeatureMatrix into
+// partition_buf and sorts the partition's inverted-index refs so each
+// batch's contribution becomes one contiguous group. Assumes every ref in
+// `refs` falls inside the partition starting at fmat row row_start, whose
+// payload is this_bytes long.
+void load_and_sort_partition(const FeatureMatrix& features,
+                             uint64_t             row_start,
+                             size_t               this_bytes,
+                             std::vector<char>&   partition_buf,
+                             std::vector<RowRef>& refs)
+{
+    // (1) Sequential memcpy from mmap.
+    partition_buf.resize(this_bytes);
+    std::memcpy(partition_buf.data(),
+                features.row(row_start),
+                this_bytes);
+
+    // (2) Sort refs by (batch_id, pos_in_batch) so each batch's
+    // contribution is one contiguous group — one open/pwrite per batch
+    // contribution. pos_in_batch is part of the key because std::sort
+    // is unstable: keyed on batch_id alone it may permute equal-key
+    // refs, breaking the v1 positional contract (rows within a group
+    // must keep row_provider order).
+    std::sort(refs.begin(), refs.end(),
+              [](const RowRef& a, const RowRef& b) {
+                  return a.batch_id != b.batch_id
+                           ? a.batch_id < b.batch_id
+                           : a.pos_in_batch < b.pos_in_batch;
+              });
+}
+
+// Builds the contiguous data (and, for v2, OID) slices for one batch's
+// contribution within the current partition. refs_group points at
+// group_size consecutive refs of the SAME batch, already sorted by
+// pos_in_batch; partition_buf holds the partition's rows starting at fmat
+// row row_start. Pass oids == nullptr for v1 output (no OID table).
+// Resizes and overwrites the two contrib buffers (reused across calls to
+// avoid reallocation).
+void build_group_contribution(const RowRef*                refs_group,
+                              size_t                       group_size,
+                              uint64_t                     row_start,
+                              uint64_t                     row_bytes,
+                              const std::vector<char>&     partition_buf,
+                              const std::vector<ObjectId>* oids,
+                              std::vector<char>&           contrib_data,
+                              std::vector<uint64_t>&       contrib_oids)
+{
+    // Build contiguous data + OID slices for this contribution.
+    contrib_data.resize(group_size * row_bytes);
+    if (oids) contrib_oids.resize(group_size);
+
+    for (size_t k = 0; k < group_size; ++k) {
+        const auto& ref = refs_group[k];
+        const size_t buf_offset =
+            static_cast<size_t>((ref.fmat_row - row_start) * row_bytes);
+        std::memcpy(contrib_data.data() + k * row_bytes,
+                    partition_buf.data() + buf_offset,
+                    row_bytes);
+        if (oids) {
+            contrib_oids[k] = (*oids)[ref.pos_in_batch].id;
+        }
+    }
+}
+
+// Prints the Phase 2 progress line (percent, elapsed, ETA) every
+// progress_step partitions and on the final one; no-op otherwise.
+void print_partition_progress(uint64_t p,
+                              uint64_t num_partitions,
+                              uint64_t progress_step,
+                              std::chrono::steady_clock::time_point t_phase2_start)
+{
+    if ((p + 1) % progress_step == 0 || p + 1 == num_partitions) {
+        auto t_now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(
+            t_now - t_phase2_start).count();
+        double rate = (p + 1) / elapsed;
+        double eta  = (num_partitions - p - 1) / rate;
+        std::cout << "[Materialize] phase 2 partition " << (p + 1) << "/"
+                  << num_partitions
+                  << " (" << std::fixed << std::setprecision(1)
+                  << (100.0 * (p + 1) / num_partitions) << "%)"
+                  << "  elapsed=" << std::fixed << std::setprecision(0)
+                  << elapsed << "s"
+                  << "  ETA=" << std::fixed << std::setprecision(0)
+                  << eta << "s"
+                  << std::endl;
+    }
+}
+
+// Sanity check after the Phase 2 scan: each batch should have its full row
+// count written (write cursor == expected batch size). Throws
+// std::runtime_error naming the first mismatching batch.
+void verify_all_batches_written(const std::vector<uint64_t>& cursor,
+                                const std::vector<uint64_t>& batch_size,
+                                uint64_t                     num_batches)
+{
+    for (uint64_t b = 0; b < num_batches; ++b) {
+        if (cursor[b] != batch_size[b]) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: batch " +
+                std::to_string(b) + " cursor mismatch: " +
+                std::to_string(cursor[b]) + " written, expected " +
+                std::to_string(batch_size[b]));
+        }
+    }
+}
+
+// Phase 3: fsyncs and closes every batch fd (marking each closed slot -1),
+// fsyncs the output directory entry, then does the same for the consolidated
+// file when one was written. Assumes all writes are complete. On failure it
+// throws with the fd lists partially closed — the caller's cleanup handler
+// closes whatever is still open.
+void fsync_and_close_outputs(std::vector<int>& fds,
+                             uint64_t          num_batches,
+                             const fs::path&   output_dir,
+                             bool              write_consolidated,
+                             int&              cons_fd,
+                             const fs::path&   consolidated_path)
+{
+    for (uint64_t b = 0; b < num_batches; ++b) {
+        if (fds[b] < 0) continue;
+        if (::fsync(fds[b]) < 0) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: fsync failed for batch " +
+                std::to_string(b) + ": " + safe_strerror(errno));
+        }
+        ::close(fds[b]);
+        fds[b] = -1;
+    }
+    if (num_batches > 0) {
+        fsync_directory(output_dir / make_batch_filename(0));
+    }
+    if (write_consolidated && cons_fd >= 0) {
+        if (::fsync(cons_fd) < 0) {
+            throw std::runtime_error(
+                "generate_packed_batches_partitioned: fsync consolidated failed: " +
+                safe_strerror(errno));
+        }
+        ::close(cons_fd);
+        cons_fd = -1;
+        fsync_directory(consolidated_path);
+    }
+}
+
+// Prints the final per-phase wall-clock summary of the partitioned packer.
+// Output only.
+void print_packer_phase_times(std::chrono::steady_clock::time_point t_phase01_start,
+                              std::chrono::steady_clock::time_point t_phase01_end,
+                              std::chrono::steady_clock::time_point t_phase2_start,
+                              std::chrono::steady_clock::time_point t_phase2_end,
+                              std::chrono::steady_clock::time_point t_phase3_start,
+                              std::chrono::steady_clock::time_point t_phase3_end)
+{
+    std::cout << "[Materialize] partitioned packer DONE — total "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase3_end - t_phase01_start).count() << "s ("
+              << "phase01=" << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase01_end - t_phase01_start).count() << "s, "
+              << "phase2=" << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase2_end - t_phase2_start).count() << "s, "
+              << "phase3=" << std::chrono::duration_cast<std::chrono::seconds>(
+                     t_phase3_end - t_phase3_start).count() << "s)"
+              << std::endl;
+}
+
+} // anonymous namespace
+
 void generate_packed_batches_partitioned(
     const FeatureMatrix& features,
     uint64_t num_batches,
@@ -387,17 +700,6 @@ void generate_packed_batches_partitioned(
               << (has_oids ? "v2" : "v1")
               << "\n" << std::flush;
 
-    // RowRef: 16 bytes — one inverted-index entry per (row, batch, position).
-    // batch_id < 2^32 covers any realistic dataset; pos_in_batch < 2^32 too
-    // (a 4 B-node batch would need terabytes of features per single batch,
-    // way past any practical workload).
-    struct RowRef {
-        uint32_t batch_id;
-        uint32_t pos_in_batch;
-        uint64_t fmat_row;
-    };
-    static_assert(sizeof(RowRef) == 16, "RowRef must be 16 bytes");
-
     // ----- Phase 0+1: build inverted index, OID lists, open all batch FDs -----
     //
     // We open all num_batches output files up-front and KEEP them open until
@@ -455,21 +757,8 @@ void generate_packed_batches_partitioned(
             }
 
             // Bucket each row into its partition.
-            for (size_t i = 0; i < N; ++i) {
-                const uint64_t fmat_row = rows[i];
-                if (fmat_row >= total_rows) {
-                    throw std::out_of_range(
-                        "generate_packed_batches_partitioned: row " +
-                        std::to_string(fmat_row) +
-                        " out of range [0, " + std::to_string(total_rows) + ")");
-                }
-                const uint64_t partition_id = fmat_row / partition_rows;
-                inverted[partition_id].push_back({
-                    static_cast<uint32_t>(b),
-                    static_cast<uint32_t>(i),
-                    fmat_row
-                });
-            }
+            bucket_rows_into_partitions(rows, b, total_rows, partition_rows,
+                                        inverted);
 
             // Open file, write header, ftruncate to total size.
             auto path = output_dir / make_batch_filename(b);
@@ -483,43 +772,16 @@ void generate_packed_batches_partitioned(
             }
             fds[b] = fd;
 
-            auto header = has_oids
-                ? PackedBatchHeader::make_v2(N, feature_dim, dtype)
-                : PackedBatchHeader::make(N, feature_dim, dtype);
-            write_all(fd, &header, sizeof(header), path_str);
-
-            if (N > 0) {
-                const off_t total_size = static_cast<off_t>(
-                    sizeof(header)
-                    + (has_oids ? N * sizeof(uint64_t) : 0)
-                    + N * row_bytes);
-                if (::ftruncate(fd, total_size) < 0) {
-                    throw std::runtime_error(
-                        "generate_packed_batches_partitioned: ftruncate failed for " +
-                        path_str + ": " + safe_strerror(errno));
-                }
-            }
+            write_batch_header_and_reserve(fd, path_str, N, feature_dim, dtype,
+                                           row_bytes, has_oids);
         }
 
         // Consolidated file: write the header and size the whole file once
         // (header + sum of 4096-aligned per-batch payloads). Payloads are
         // pwritten during Phase 2 alongside the per-batch data.
         if (write_consolidated) {
-            std::string cpath = consolidated_path.string();
-            cons_fd = ::open(cpath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (cons_fd < 0) {
-                throw std::runtime_error(
-                    "generate_packed_batches_partitioned: cannot create consolidated " +
-                    cpath + ": " + safe_strerror(errno));
-            }
-            write_all(cons_fd, &cons_header, sizeof(cons_header), cpath);
-            if (cons_cursor > cons_header.data_start) {
-                if (::ftruncate(cons_fd, static_cast<off_t>(cons_cursor)) < 0) {
-                    throw std::runtime_error(
-                        "generate_packed_batches_partitioned: ftruncate consolidated "
-                        "failed for " + cpath + ": " + safe_strerror(errno));
-                }
-            }
+            open_consolidated_output(consolidated_path, cons_header,
+                                     cons_cursor, cons_fd);
         }
     } catch (...) {
         cleanup_fds();
@@ -528,15 +790,8 @@ void generate_packed_batches_partitioned(
 
     auto t_phase01_end = std::chrono::steady_clock::now();
 
-    uint64_t total_refs = 0;
-    for (const auto& bucket : inverted) total_refs += bucket.size();
-    std::cout << "[Materialize] phase 0+1 done in "
-              << std::chrono::duration_cast<std::chrono::seconds>(
-                     t_phase01_end - t_phase01_start).count()
-              << "s — inverted index: " << total_refs << " refs across "
-              << num_partitions << " partitions ("
-              << (total_refs * sizeof(RowRef) / (1024 * 1024)) << " MB)"
-              << std::endl;
+    print_inverted_index_summary(inverted, num_partitions,
+                                 t_phase01_start, t_phase01_end);
 
     // ----- Phase 2: single pass over .fmat, pwrite per (partition × batch) ----
     //
@@ -574,24 +829,8 @@ void generate_packed_batches_partitioned(
             const uint64_t this_rows = row_end - row_start;
             const size_t   this_bytes = static_cast<size_t>(this_rows * row_bytes);
 
-            // (1) Sequential memcpy from mmap.
-            partition_buf.resize(this_bytes);
-            std::memcpy(partition_buf.data(),
-                        features.row(row_start),
-                        this_bytes);
-
-            // (2) Sort refs by (batch_id, pos_in_batch) so each batch's
-            // contribution is one contiguous group — one open/pwrite per batch
-            // contribution. pos_in_batch is part of the key because std::sort
-            // is unstable: keyed on batch_id alone it may permute equal-key
-            // refs, breaking the v1 positional contract (rows within a group
-            // must keep row_provider order).
-            std::sort(refs.begin(), refs.end(),
-                      [](const RowRef& a, const RowRef& b) {
-                          return a.batch_id != b.batch_id
-                                   ? a.batch_id < b.batch_id
-                                   : a.pos_in_batch < b.pos_in_batch;
-                      });
+            load_and_sort_partition(features, row_start, this_bytes,
+                                    partition_buf, refs);
 
             size_t i = 0;
             while (i < refs.size()) {
@@ -601,21 +840,10 @@ void generate_packed_batches_partitioned(
 
                 const size_t group_size = j - i;
 
-                // Build contiguous data + OID slices for this contribution.
-                contrib_data.resize(group_size * row_bytes);
-                if (has_oids) contrib_oids.resize(group_size);
-
-                for (size_t k = 0; k < group_size; ++k) {
-                    const auto& ref = refs[i + k];
-                    const size_t buf_offset =
-                        static_cast<size_t>((ref.fmat_row - row_start) * row_bytes);
-                    std::memcpy(contrib_data.data() + k * row_bytes,
-                                partition_buf.data() + buf_offset,
-                                row_bytes);
-                    if (has_oids) {
-                        contrib_oids[k] = batch_oids[bid][ref.pos_in_batch].id;
-                    }
-                }
+                build_group_contribution(
+                    &refs[i], group_size, row_start, row_bytes, partition_buf,
+                    has_oids ? &batch_oids[bid] : nullptr,
+                    contrib_data, contrib_oids);
 
                 // Compute target offsets in this batch's file.
                 const uint64_t batch_oid_off  = sizeof(PackedBatchHeader)
@@ -628,74 +856,30 @@ void generate_packed_batches_partitioned(
 
                 // pwrite OID slice (v2 only).
                 if (has_oids) {
-                    size_t       remaining = group_size * sizeof(uint64_t);
-                    const char*  src       = reinterpret_cast<const char*>(contrib_oids.data());
-                    off_t        off_curr  = static_cast<off_t>(batch_oid_off);
-                    while (remaining > 0) {
-                        ssize_t n = ::pwrite(fds[bid], src, remaining, off_curr);
-                        if (n < 0) {
-                            if (errno == EINTR) continue;
-                            throw std::runtime_error(
-                                "generate_packed_batches_partitioned: pwrite OIDs failed: " +
-                                safe_strerror(errno));
-                        }
-                        if (n == 0) {
-                            throw std::runtime_error(
-                                "generate_packed_batches_partitioned: pwrite OIDs returned 0");
-                        }
-                        src       += n;
-                        off_curr  += n;
-                        remaining -= static_cast<size_t>(n);
-                    }
+                    pwrite_exact(fds[bid],
+                                 reinterpret_cast<const char*>(contrib_oids.data()),
+                                 group_size * sizeof(uint64_t),
+                                 static_cast<off_t>(batch_oid_off),
+                                 "pwrite OIDs");
                 }
 
                 // pwrite data slice.
-                {
-                    size_t       remaining = group_size * row_bytes;
-                    const char*  src       = contrib_data.data();
-                    off_t        off_curr  = static_cast<off_t>(batch_data_off);
-                    while (remaining > 0) {
-                        ssize_t n = ::pwrite(fds[bid], src, remaining, off_curr);
-                        if (n < 0) {
-                            if (errno == EINTR) continue;
-                            throw std::runtime_error(
-                                "generate_packed_batches_partitioned: pwrite data failed: " +
-                                safe_strerror(errno));
-                        }
-                        if (n == 0) {
-                            throw std::runtime_error(
-                                "generate_packed_batches_partitioned: pwrite data returned 0");
-                        }
-                        src       += n;
-                        off_curr  += n;
-                        remaining -= static_cast<size_t>(n);
-                    }
-                }
+                pwrite_exact(fds[bid],
+                             contrib_data.data(),
+                             group_size * row_bytes,
+                             static_cast<off_t>(batch_data_off),
+                             "pwrite data");
 
                 // Consolidated file: same contrib_data at this batch's aligned
                 // base + the same row cursor, so the consolidated payload is
                 // byte-identical to the per-batch .bin data section.
                 if (write_consolidated) {
-                    size_t       remaining = group_size * row_bytes;
-                    const char*  src       = contrib_data.data();
-                    off_t        off_curr  = static_cast<off_t>(
-                        cons_offset[bid] + cursor[bid] * row_bytes);
-                    while (remaining > 0) {
-                        ssize_t n = ::pwrite(cons_fd, src, remaining, off_curr);
-                        if (n < 0) {
-                            if (errno == EINTR) continue;
-                            throw std::runtime_error(
-                                "generate_packed_batches_partitioned: pwrite consolidated failed: " +
-                                safe_strerror(errno));
-                        }
-                        if (n == 0) {
-                            throw std::runtime_error(
-                                "generate_packed_batches_partitioned: pwrite consolidated returned 0");
-                        }
-                        src       += n;
-                        off_curr  += n;
-                        remaining -= static_cast<size_t>(n);
-                    }
+                    pwrite_exact(cons_fd,
+                                 contrib_data.data(),
+                                 group_size * row_bytes,
+                                 static_cast<off_t>(
+                                     cons_offset[bid] + cursor[bid] * row_bytes),
+                                 "pwrite consolidated");
                 }
 
                 cursor[bid] += group_size;
@@ -705,34 +889,12 @@ void generate_packed_batches_partitioned(
             // Free this partition's inverted bucket.
             std::vector<RowRef>().swap(refs);
 
-            if ((p + 1) % progress_step == 0 || p + 1 == num_partitions) {
-                auto t_now = std::chrono::steady_clock::now();
-                double elapsed = std::chrono::duration<double>(
-                    t_now - t_phase2_start).count();
-                double rate = (p + 1) / elapsed;
-                double eta  = (num_partitions - p - 1) / rate;
-                std::cout << "[Materialize] phase 2 partition " << (p + 1) << "/"
-                          << num_partitions
-                          << " (" << std::fixed << std::setprecision(1)
-                          << (100.0 * (p + 1) / num_partitions) << "%)"
-                          << "  elapsed=" << std::fixed << std::setprecision(0)
-                          << elapsed << "s"
-                          << "  ETA=" << std::fixed << std::setprecision(0)
-                          << eta << "s"
-                          << std::endl;
-            }
+            print_partition_progress(p, num_partitions, progress_step,
+                                     t_phase2_start);
         }
 
         // Sanity: each batch should have its full row count written.
-        for (uint64_t b = 0; b < num_batches; ++b) {
-            if (cursor[b] != batch_size[b]) {
-                throw std::runtime_error(
-                    "generate_packed_batches_partitioned: batch " +
-                    std::to_string(b) + " cursor mismatch: " +
-                    std::to_string(cursor[b]) + " written, expected " +
-                    std::to_string(batch_size[b]));
-            }
-        }
+        verify_all_batches_written(cursor, batch_size, num_batches);
     } catch (...) {
         cleanup_fds();
         throw;
@@ -743,45 +905,17 @@ void generate_packed_batches_partitioned(
     // ----- Phase 3: fsync + close all batch FDs -----
     auto t_phase3_start = std::chrono::steady_clock::now();
     try {
-        for (uint64_t b = 0; b < num_batches; ++b) {
-            if (fds[b] < 0) continue;
-            if (::fsync(fds[b]) < 0) {
-                throw std::runtime_error(
-                    "generate_packed_batches_partitioned: fsync failed for batch " +
-                    std::to_string(b) + ": " + safe_strerror(errno));
-            }
-            ::close(fds[b]);
-            fds[b] = -1;
-        }
-        if (num_batches > 0) {
-            fsync_directory(output_dir / make_batch_filename(0));
-        }
-        if (write_consolidated && cons_fd >= 0) {
-            if (::fsync(cons_fd) < 0) {
-                throw std::runtime_error(
-                    "generate_packed_batches_partitioned: fsync consolidated failed: " +
-                    safe_strerror(errno));
-            }
-            ::close(cons_fd);
-            cons_fd = -1;
-            fsync_directory(consolidated_path);
-        }
+        fsync_and_close_outputs(fds, num_batches, output_dir,
+                                write_consolidated, cons_fd, consolidated_path);
     } catch (...) {
         cleanup_fds();
         throw;
     }
     auto t_phase3_end = std::chrono::steady_clock::now();
 
-    std::cout << "[Materialize] partitioned packer DONE — total "
-              << std::chrono::duration_cast<std::chrono::seconds>(
-                     t_phase3_end - t_phase01_start).count() << "s ("
-              << "phase01=" << std::chrono::duration_cast<std::chrono::seconds>(
-                     t_phase01_end - t_phase01_start).count() << "s, "
-              << "phase2=" << std::chrono::duration_cast<std::chrono::seconds>(
-                     t_phase2_end - t_phase2_start).count() << "s, "
-              << "phase3=" << std::chrono::duration_cast<std::chrono::seconds>(
-                     t_phase3_end - t_phase3_start).count() << "s)"
-              << std::endl;
+    print_packer_phase_times(t_phase01_start, t_phase01_end,
+                             t_phase2_start, t_phase2_end,
+                             t_phase3_start, t_phase3_end);
 }
 
 } // namespace mdb::gnn
