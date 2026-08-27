@@ -20,9 +20,6 @@
 //      `has_data()` validation.
 //   3. Neighbor slices returned by the reader match the hand-authored
 //      adjacency list exactly.
-//
-// Design reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
-//                   §3.7 (integration point), §5.1 / §5.2 (reader validation).
 
 #include <cstdint>
 #include <filesystem>

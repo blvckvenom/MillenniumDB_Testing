@@ -17,15 +17,14 @@
 //   - Sidecar suppression: when `graph_storage_ == CSR_HYBRID` the builder
 //     short-circuits `build_topology_snapshots_()` and no `topology_fwd.csr`
 //     / `topology_rev.csr` file is produced. Covered indirectly by the
-//     config-layer test plus a direct check that the disk-format supersede
-//     mirrors design §3.8 D8.
+//     config-layer test plus a direct on-disk check. The rule exists
+//     because the v3 leaves already provide the O(1) neighbour access the
+//     sidecar was introduced for, so emitting both would double the disk
+//     cost for no read-path benefit.
 //
 // End-to-end behavior (CALL graph_project + USE / MATCH) is covered by
 // the gql integration suite run via scripts/run-tests gql; those tests
 // spin a full mdb server which is out of scope for the gtest unit target.
-//
-// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.6-§3.10
-// Implementation reference: docs/superpowers/plans/2026-04-25-csr-hybrid-plan.md
 
 #include <array>
 #include <cstdint>
@@ -162,9 +161,9 @@ TEST(CSRHybridIntegration, SidecarFilesNotBuilt) {
     write_csr_index_3(dir + "/to_from_edge", records);
 
     EXPECT_FALSE(fs::exists(fs::path(dir) / "topology_fwd.csr"))
-        << "CSR_HYBRID must not emit topology_fwd.csr (design §3.8 D8)";
+        << "CSR_HYBRID must not emit topology_fwd.csr (the v3 leaves supersede the sidecar)";
     EXPECT_FALSE(fs::exists(fs::path(dir) / "topology_rev.csr"))
-        << "CSR_HYBRID must not emit topology_rev.csr (design §3.8 D8)";
+        << "CSR_HYBRID must not emit topology_rev.csr (the v3 leaves supersede the sidecar)";
 
     fs::remove_all(dir);
 }
@@ -235,8 +234,9 @@ TEST(CSRHybridIntegration, USEQueryReadsCorrectV3Header) {
 // ============================================================================
 // Test 6: Semantic-equality sanity — a CSR-mode build and a BITSET-mode
 // build over the same set of (src, dst, edge_id) tuples produce:
-//   - the same set of unique (src, dst) pairs on decode (edge_id is
-//     encoded in BITSET but dropped in CSR — design §3.4);
+//   - the same set of unique (src, dst) pairs on decode (edge_id
+//     round-trips in BITSET; the CSR writer mode used here emits no
+//     edge-id stream, so edge ids read back as 0);
 //   - different byte-0 magics (0x03 vs 0x00).
 // The (src, dst) equality across the two formats is the correctness anchor
 // used by the CSR_HYBRID scan throughput benchmark (scripts/bench_csr_hybrid.sh);

@@ -1,7 +1,7 @@
 // four_level_topology_tag_dispatch_test.cc
 //
 // Four-Level Topology Store regression test — verifies that the FourLevelTopologyStore's
-// Phase 3 ctor + production dispatch path correctly handles ObjectIds whose
+// build ctor + production dispatch path correctly handles ObjectIds whose
 // 8-bit type tag is non-zero (the production case: real GQL projections
 // store nodes as `(MASK_NODE | row_idx)`, not raw `row_idx`).
 //

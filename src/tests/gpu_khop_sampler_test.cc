@@ -1,6 +1,6 @@
 // gpu_khop_sampler_test.cc
 //
-// Statistical validation of the GPU k-hop sampling primitive (Phase 3). These
+// Statistical validation of the GPU k-hop sampling primitive. These
 // exercise the reservoir + Philox kernel via the test-only entry
 // gpu_sample_neighbors_for_test. They confirm the kernel honors the SAME
 // distribution as the CPU sampler (uniform without replacement, k=min(fanout,deg),

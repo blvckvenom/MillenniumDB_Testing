@@ -2,17 +2,18 @@
 //
 // Four-Level Topology Store (frequency-tiered: L1 RAM hash / L2 compact uint32 CSR /
 // L3 mmap sidecar / L4 direct B+Tree) — TopologyFrequencyProfiler unit tests.
-// This covers Phase 1 of the store build: scanning the edge B+Trees to derive
-// per-node degree (cold start) or reading previously persisted node_counts.bin
-// (warm start), then assigning every node to a tier based on access frequency.
+// This covers the profiling stage of the store build: scanning the edge
+// B+Trees to derive per-node degree (cold start) or reading a previously
+// persisted node_counts.bin (warm start), then assigning every node to a
+// tier based on access frequency.
 //
 // Coverage:
 //   1. ColdStart_FallsBackToDegree — without `node_counts.bin`, the cold
 //      path emits a frequency vector that matches per-node degree.
-//   2. WarmStart_StubbedReturnsFalse — even with a fake `node_counts.bin`
-//      present in the projection directory, Phase 1's stubbed reader
-//      MUST report `warm_start_used() == false` and fall through to the
-//      cold path. Sanity-checks that no Phase 2 code accidentally landed.
+//   2. WarmStart_MalformedFileRejected — a `node_counts.bin` whose
+//      content is not a valid NODECNT0 file MUST be rejected: the
+//      profiler reports `warm_start_used() == false` and falls through
+//      to the cold path instead of trusting garbage counts.
 //   3. MixedOrientation_DegreesCombined — for a graph with asymmetric
 //      in/out degrees, NATURAL → out, REVERSE → in,
 //      UNDIRECTED → out + in.
@@ -178,12 +179,13 @@ BuiltFixture build_asym_storage(const std::string& projection_name,
     return out;
 }
 
-// Plants a non-empty file at `<projection_dir>/node_counts.bin` so we can
-// confirm that Phase 1's stub does NOT consume it (Phase 2 will).
+// Plants an invalid file at `<projection_dir>/node_counts.bin` (its bytes
+// do not start with the "NODECNT0" magic) so we can confirm the warm-start
+// reader rejects it instead of consuming it.
 void plant_fake_node_counts(const fs::path& projection_dir) {
     fs::create_directories(projection_dir);
     std::ofstream out(projection_dir / "node_counts.bin", std::ios::binary);
-    const char garbage[] = "FAKE_NODE_COUNTS_BIN_PHASE1";
+    const char garbage[] = "NOT_A_VALID_NODE_COUNTS_FILE";
     out.write(garbage, sizeof(garbage));
 }
 
@@ -212,15 +214,16 @@ TEST(TopologyFrequencyProfiler, ColdStart_FallsBackToDegree) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2 — WarmStart_StubbedReturnsFalse.
+// Test 2 — WarmStart_MalformedFileRejected.
 //
-// Even with a fake node_counts.bin sitting in the projection directory,
-// the Phase 1 stub MUST not claim warm-start. If a future Phase 2 patch
-// makes this start returning true accidentally, this test will catch it.
+// Even with a node_counts.bin sitting in the projection directory, the
+// warm-start reader MUST NOT claim warm-start when the file fails
+// validation (here: wrong magic). A regression that starts trusting
+// unvalidated files would silently seed tier assignment from garbage.
 // ---------------------------------------------------------------------------
-TEST(TopologyFrequencyProfiler, WarmStart_StubbedReturnsFalse) {
+TEST(TopologyFrequencyProfiler, WarmStart_MalformedFileRejected) {
     (void)MdbFixture::instance();
-    auto fx = build_asym_storage("freq_profiler_warm_start_stubbed");
+    auto fx = build_asym_storage("freq_profiler_warm_start_malformed");
 
     plant_fake_node_counts(fx.projection_dir);
     ASSERT_TRUE(fs::exists(fx.projection_dir / "node_counts.bin"));

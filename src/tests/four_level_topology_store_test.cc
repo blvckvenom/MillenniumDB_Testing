@@ -21,8 +21,9 @@
 //   1. Dispatch_L1_Hits — node tier=1 routes to L1HashCache.
 //   2. Dispatch_L2_Hits — node tier=2 routes to L2CompactCsr.
 //   3. Dispatch_L3_Sidecar_AbsentFallsThroughToL4 — tier=3 with nullptr L3
-//      reader plus a wired L4 dispatches to L4 (graceful degradation path,
-//      same as Phase 3 will use when buildTopologySnapshot:false).
+//      reader plus a wired L4 dispatches to L4 (the same graceful
+//      degradation the production build path takes when
+//      buildTopologySnapshot:false left no sidecar on disk).
 //   4. Dispatch_L4_BptFallback — tier=4 routes to the L4 callable.
 //   5. NoL4Configured_TierMismatch_Throws — tier=3/4 with no L4 callable
 //      configured throws a clear runtime_error.
@@ -216,7 +217,8 @@ TEST(FourLevelTopologyStore, Dispatch_L2_ReappliesTypeTag) {
 // Test 3 — Dispatch_L3_Sidecar_AbsentFallsThroughToL4.
 //
 // Real L3 mmap-sidecar hits are exercised by the existing
-// topology_snapshot_reader_test suite + Phase 3 integration tests. Here we
+// topology_snapshot_reader_test suite + the accessor-level integration
+// tests. Here we
 // validate the dispatch contract: a tier=3 node with nullptr L3 reader and a
 // wired L4 callable falls through to L4, *not* to a throw.
 // ---------------------------------------------------------------------------
@@ -609,8 +611,9 @@ TEST(FourLevelTopologyStore, BuildAndLookup_MatchesBpt_Synthetic) {
 // ---------------------------------------------------------------------------
 // Test — Build_StreamingDoesNotMaterializeAllNodes.
 //
-// Behavioural assertion for the Phase 3 streaming-distribution refactor (the
-// papers100M peak-RSS bound): in a graph dominated by tier-3 / tier-4 nodes,
+// Behavioural assertion for the streaming-distribution build (the
+// peak-RSS bound required at hundred-million-node scale): in a graph
+// dominated by tier-3 / tier-4 nodes,
 // L1 must hold ONLY the tier-1 entries. The previous "materialize per-node
 // vector then distribute" path satisfied this contract too, but at a peak
 // transient cost of O(N × max_degree × sizeof(AdjEntry)). The streaming path

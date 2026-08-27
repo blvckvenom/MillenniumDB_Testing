@@ -78,8 +78,9 @@ std::vector<uint8_t> read_file(const std::string& path) {
 }
 
 /// Creates sorted uint64 tuples representative of real spill content. Sorted
-/// tuples compress well with LZ4 due to prefix redundancy — the property
-/// justified in §3.B of the analysis doc.
+/// tuples compress well with LZ4 because consecutive records share leading
+/// bytes (slow-growing from_id, clustered to_id, monotonic edge_id), which
+/// is exactly the redundancy an LZ77-family codec exploits.
 std::vector<uint64_t> make_sorted_tuples(std::size_t num_records, std::size_t record_width) {
     std::mt19937_64 rng(0xDEADBEEFCAFE1234ULL);
     std::vector<uint64_t> flat(num_records * record_width);

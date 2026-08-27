@@ -2,20 +2,19 @@
 // storage: edge-index B+Tree leaves encode the full CSR layout directly,
 // enabling O(1) neighbor slicing without a separate sidecar file).
 //
-// Scope: ReadTag constructor (header + offset-table validation per design
-// §5.5), find_src_entry binary search, get_dst_at sequential + random-access
+// Scope: ReadTag constructor (page-open header + offset-table validation),
+// find_src_entry binary search, get_dst_at sequential + random-access
 // decoding with cursor cache, is_chain_head accessor, and the BPTLeafBase<N>
 // contract methods (get_record linear-scan + search_index).
 //
-// Since the v3 CSR leaf writer is not yet implemented, test pages are
-// hand-synthesized: write the 16-byte header, then the uint16 offset table,
-// then for each src entry [src_id varint, degree varint, dst0 full varint,
-// dst1..dstk-1 zigzag-delta varints]. Reuses BPT::varint_encode +
-// BPT::zigzag_encode_i64 from the delta + LEB128-varint leaf encoding layer.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md
-//   §3.1 (D1 layout), §3.3 (D3 offset table), §3.5 (D5 varint composition),
-//   §5.1 (chain-head page), §5.5 (page-open validation).
+// Test pages are hand-synthesized rather than produced through the
+// BPTLeafCSRWriter bulk-load path, so a reader bug cannot be masked by a
+// matching writer bug: write the 16-byte header, then the uint16 offset
+// table, then for each src entry [src_id varint, degree varint, dst0 full
+// varint, dst1..dstk-1 zigzag-delta varints]. Reuses BPT::varint_encode +
+// BPT::zigzag_encode_i64 from the delta + LEB128-varint leaf encoding
+// layer. The layout under test is defined byte-by-byte in
+// bpt_leaf_csr_format.h.
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_csr.h"
 
@@ -56,9 +55,10 @@ struct AlignedPageBuffer {
 };
 
 // ----------------------------------------------------------------------------
-// Synthetic CSR page builder (the v3 CSR leaf writer is not yet implemented).
+// Synthetic CSR page builder — hand-rolled on purpose, independent of the
+// production writer, so these reader tests do not inherit writer bugs.
 //
-// Emits the v3 chain-head layout per design §5.1: 16-byte header,
+// Emits the v3 chain-head layout: 16-byte header,
 // uint16 offset_table[value_count], then per-src entry
 // [src_id varint, degree varint, dst0 full varint, dst1..zigzag-delta varints].
 //
@@ -460,7 +460,7 @@ TEST(BPTLeafCSRReader, GetRecord_IteratesAllTuples) {
         // Edge_id is 0 when the kHasEdgeIds flag bit (flags bit 1) is clear,
         // which is the case for all pages built by this test helper. Pages
         // with edge ids are covered by the hub-chain and continuation tests
-        // below (design §3.4, decode_tuple_).
+        // below (see decode_tuple_ in bplus_tree_leaf_csr.cc).
     }
 }
 

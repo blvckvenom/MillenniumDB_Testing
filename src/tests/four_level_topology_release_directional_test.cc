@@ -6,7 +6,7 @@
 // The directional fwd/rev tiers are dead weight once the merged undirected slice
 // is materialized + pinned on the symmetric GPU path (the GPU kernel walks only
 // the pinned slice; the CPU UNDIRECTED dispatch uses the symmetric tier). These
-// tests drive the store through the dispatcher (Phase 2) ctor with two narrow
+// tests drive the store through the dispatcher ctor with two narrow
 // (id_width==4) L3 sidecar readers — the form materialize_symmetric_arrays()
 // requires — and assert the release contract: no-op without a slice, frees +
 // nulls the directional aliases + leaves the slice intact when a slice exists,

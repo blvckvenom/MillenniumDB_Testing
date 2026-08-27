@@ -18,8 +18,8 @@
 //      per-dst VALUE narrowing guard in add_node IS exercised for real in
 //      tests 8/9 below.
 //   5. EmptyNode_ZeroDegreeRoundTrips — node with empty neighbor list.
-//   6. TotalBytes_MatchesL2Contract — assertion against the Phase 1 contract
-//      (kL2NodeFixedOverhead + kL2PerEdgeBytes * degree).
+//   6. TotalBytes_MatchesL2Contract — assertion against the profiler's
+//      sizing contract (kL2NodeFixedOverhead + kL2PerEdgeBytes * degree).
 //   7. GetPreFreezeThrows — calling get() before freeze() throws
 //      std::logic_error, symmetric to add_node()'s post-freeze throw.
 //   8. Uint32DstOrdinalOverflow_ThrowsOnAddNode — a dst ordinal > UINT32_MAX

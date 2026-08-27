@@ -16,9 +16,6 @@
 // fixtures. The offsets used for the corruption tests are derived from
 // the v1.5 save_to_file code path (projection_catalog.cc) and documented
 // inline at each modification site.
-//
-// Design reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-// Plan reference:   docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md
 
 #include "graph_models/gql/projection/projection_catalog.h"
 

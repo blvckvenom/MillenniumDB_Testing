@@ -1,15 +1,13 @@
 // Unit tests for the BPTLeafV2 write-path encoder (delta + LEB128-varint
 // B+Tree leaf compression).
 //
-// Scope: append_record + flush byte-for-byte determinism against the
-// hand-computed examples in design doc §5.3, overflow handling, next_leaf
-// round-trip through the 16-byte header, padding invariants, and flush
-// idempotency. The read path (get_record, search_index, etc.) is stubbed
-// in the writer and is NOT exercised here — those stubs are fully
-// implemented in bpt_leaf_v2_reader_test.cc.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-//                 (§5.2 layout, §5.3 worked example, §5.4 padding).
+// Scope: append_record + flush byte-for-byte determinism against
+// hand-computed golden byte sequences, overflow handling, next_leaf
+// round-trip through the 16-byte header, padding invariants (bytes after
+// the last record are zero-filled to the 4096-byte page end, and no record
+// may span two pages), and flush idempotency. The read path (get_record,
+// search_index, etc.) is stubbed in the writer and is NOT exercised here —
+// those stubs are fully implemented in bpt_leaf_v2_reader_test.cc.
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
 
@@ -96,7 +94,8 @@ TEST(BPTLeafV2Writer, WritesRecord1AsZigzagDeltas) {
 }
 
 TEST(BPTLeafV2Writer, ThreeRecords_ExactBytesMatch) {
-    // Golden test reproducing the worked example from design §5.3.
+    // Golden test against a hand-computed encoding of three records:
+    // record 0 as full LEB128 varints, records 1-2 as zigzag deltas.
     AlignedPageBuffer page;
     BPTLeafV2<3> writer(page.data());
     ASSERT_TRUE(writer.append_record(Record<3>{1000, 2000, 3000}));

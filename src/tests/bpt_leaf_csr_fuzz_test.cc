@@ -1,7 +1,8 @@
 // Randomized encode->decode fuzz harness for the CSR-hybrid B+Tree leaf
 // format (edge-index leaves whose layout IS the CSR, encoding (src, dst,
-// edge_id) records with delta + LEB128-varint compression; design §3.9,
-// §5.1, §5.2). Mirrors the delta+varint leaf fuzz harness (for the
+// edge_id) records with delta + LEB128-varint compression; chain-head and
+// continuation page layouts are defined byte-by-byte in
+// bpt_leaf_csr_format.h). Mirrors the delta+varint leaf fuzz harness (for the
 // B+Tree leaf compression format used on non-edge indexes) structurally:
 // runs hundreds of thousands of iterations under a deterministic
 // mt19937_64 seed, cycling through N in {2, 3} and four distribution
@@ -15,7 +16,7 @@
 //
 // The iteration budget is 500k in Release, 50k under ASan (same basis
 // as the delta+varint leaf fuzz harness — ASan slows tight encode/decode
-// loops by ~18x on benito_pc). A developer can override via
+// loops by roughly an order of magnitude). A developer can override via
 // -D MAIN_ITERATIONS_OVERRIDE=... for a pre-merge full-strength check.
 //
 // Dedicated subtests:
@@ -27,9 +28,6 @@
 //     either by a thrown BPTLeafCSRDecodeException at reader construction,
 //     or by a materially different (src, degree, dsts[]) readout. Silent
 //     corruption is a FAIL.
-//
-// Design reference:
-//   docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.9 §5.1 §5.2
 //
 // Seed: MAIN_SEED is distinct from the delta+varint leaf fuzz harness seed
 // (0xDE1A4A4F12345678) to diversify corpora. See comment on MAIN_SEED below.
@@ -66,9 +64,9 @@ constexpr uint64_t MAIN_SEED  = 0xCAFEBABEDE1A4A4FULL;
 constexpr uint64_t SMOKE_SEED = MAIN_SEED + 1ULL;
 
 // Detect sanitizer-instrumented Debug builds so we can scale iterations
-// down — ASan+UBSan together slow the tight file-roundtrip loop by ~15x
-// on benito_pc; a 500k-iteration main run under Debug would blow past
-// the 5 min ASan budget.
+// down — ASan+UBSan together slow the tight file-roundtrip loop by
+// roughly an order of magnitude; a 500k-iteration main run under Debug
+// would blow far past a reasonable sanitizer-run budget.
 #if defined(__SANITIZE_ADDRESS__)
     #define MDB_FUZZ_UNDER_ASAN 1
 #elif defined(__has_feature)
@@ -836,15 +834,17 @@ TEST(BPTLeafCSRFuzzTest, TamperInjection_AllDetected) {
     //
     //   - flags bit 1 (kHasEdgeIds, byte 2 bit 1): writer emits 0 when
     //     edge-id persistence is disabled; reader tolerates 1 without using
-    //     the bit in record decoding (edge-id stream is an additive
-    //     feature, per design §3.4). Flipping this bit is semantically
-    //     harmless.
+    //     the bit in record decoding (the edge-id stream is an additive
+    //     tail after the dst stream, so the bit does not alter how the
+    //     (src, degree, dsts[]) part decodes). Flipping this bit is
+    //     semantically harmless.
     //   - next_leaf (bytes 8..11): cross-page pointer. Reader cannot
     //     cross-check without opening the neighbour page. Same exemption as
     //     the delta+varint leaf fuzz harness applies for BPTLeafV2's
     //     next_leaf field.
-    //   - min_src_id_low (bytes 12..15): fsck-only cross-check against the
-    //     directory routing key (design §3.4). Reader ctor does not
+    //   - min_src_id_low (bytes 12..15): stored redundantly as an
+    //     integrity-check mirror of the directory routing key. Reader ctor
+    //     does not
     //     validate this field because the directory side is what routes to
     //     a page, not the header side — corruption here does not affect
     //     record decoding on this page. Same pointer-style header field

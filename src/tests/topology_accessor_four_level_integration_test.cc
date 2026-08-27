@@ -24,9 +24,11 @@
 //   3. Conflict_AdjCacheFalseAndFourLevelTrue_Throws
 //      `SamplingConfig::validate()` rejects the
 //      `useFourLevelTopologyStore=true` + `useAdjacencyCache=false`
-//      combination per design D8. We assert the validate() throw
-//      surface here since `gnn_offline_sample_procedure_test.cc`
-//      does not exist in this repo today.
+//      combination — `useAdjacencyCache=false` means "no in-RAM topology
+//      caching at all", which contradicts asking for the tiered store.
+//      We assert the validate() throw surface here since
+//      `gnn_offline_sample_procedure_test.cc` does not exist in this
+//      repo today.
 
 #include <algorithm>
 #include <cstdint>
@@ -220,7 +222,7 @@ TEST(TopologyAccessorFourLevel, EnableDisable_Roundtrip) {
             << "in node " << nid;
     }
 
-    // UNDIRECTED routes through the single store->get_neighbors call (Task 14).
+    // UNDIRECTED routes through the single store->get_neighbors call.
     // No sidecar here, so the sym tier is NOT built — the store's same-rule
     // fallback must still match the BPT-oracle merge for every node.
     EXPECT_FALSE(acc_four_level.is_symmetric_topology_built());
@@ -361,8 +363,9 @@ TEST(TopologyAccessorFourLevel, Conflict_AdjCacheFalseAndFourLevelTrue_Throws) {
 //   4. Verifies per-node neighbour parity vs a BPT-only oracle accessor
 //      on `(node_id, edge_id)` pairs.
 //
-// Build-time speedup (~5×) is measured separately by Phase 6 benchmarks;
-// this unit test only proves functional equivalence.
+// Build-time speedup is measured separately by
+// scripts/bench_four_level_topology.sh; this unit test only proves
+// functional equivalence.
 // ---------------------------------------------------------------------------
 TEST(TopologyAccessorFourLevel, Build_UsesSidecarWhenAvailable) {
     (void)MdbFixture::instance();
@@ -462,8 +465,9 @@ TEST(TopologyAccessorFourLevel, Build_UsesSidecarWhenAvailable) {
     }
 
     // Cold-start path: the MinHash permutation must be empty when no
-    // node_counts.bin exists (every build today). Phase 5 will flip
-    // the warm-start branch and populate this vector.
+    // node_counts.bin exists, as in this fixture. The warm-start branch
+    // (a node_counts.bin persisted by a previous sampling run) populates
+    // it and is covered by four_level_topology_warm_start_test.cc.
     EXPECT_TRUE(store.l3_reorder_permutation().empty());
 }
 
@@ -691,8 +695,8 @@ TEST(TopologyAccessorFourLevel, Build_SymmetricTierFromDirectionalSidecars) {
         EXPECT_EQ(FixtureGraph::kNumNodes, store.l1_sym_node_count());
         EXPECT_EQ(0u, store.l2_sym_node_count());
 
-        // The single sym dispatch must return the same undirected node set as a
-        // BPT-oracle accessor for every node (Task 13 collapse).
+        // The single sym dispatch must return the same undirected node set
+        // as a BPT-oracle accessor for every node.
         mdb::gnn::TopologyAccessor oracle(*storage);
         for (uint64_t nid = 0; nid < FixtureGraph::kNumNodes; ++nid) {
             auto sym_n = store.get_neighbors(ObjectId(nid));
@@ -705,7 +709,7 @@ TEST(TopologyAccessorFourLevel, Build_SymmetricTierFromDirectionalSidecars) {
                 << "sym dispatch node " << nid;
         }
 
-        // Accessor-level Task 14: get_neighbors_into(UNDIRECTED) through a
+        // Accessor level: get_neighbors_into(UNDIRECTED) through a
         // four-level accessor with the sym tier built must match the BPT oracle.
         mdb::gnn::TopologyAccessor acc(*storage);
         acc.enable_four_level_store(cfg);

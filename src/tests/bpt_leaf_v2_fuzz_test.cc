@@ -24,9 +24,6 @@
 // BPTLeafV2DecodeException fires, or the decoded record sequence differs
 // from the original. A bit flip that leaves the decode pass and matches
 // the original is a fuzzing false negative — the test FAILs such cases.
-//
-// Design reference:
-//   docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md §7.4
 
 #include <algorithm>
 #include <array>
@@ -51,9 +48,10 @@ constexpr uint64_t MAIN_SEED  = 0xDE1A4A4F12345678ULL;
 constexpr uint64_t SMOKE_SEED = MAIN_SEED + 1ULL;
 
 // Detect sanitizer-instrumented Debug builds so we can scale iterations
-// down — ASan+UBSan together slow the tight encode/decode loop by ~18x
-// on benito_pc, so a 500k-iteration main run under Debug would take
-// ~15 min, well past the 5 min ASan budget the plan allows.
+// down — ASan+UBSan together slow the tight encode/decode loop by roughly
+// an order of magnitude (~18x measured on a desktop-class x86-64 CPU), so
+// a 500k-iteration main run under Debug would take on the order of
+// 15 minutes, far past a reasonable sanitizer-run budget.
 #if defined(__SANITIZE_ADDRESS__)
     #define MDB_FUZZ_UNDER_ASAN 1
 #elif defined(__has_feature)
@@ -66,9 +64,9 @@ constexpr uint64_t SMOKE_SEED = MAIN_SEED + 1ULL;
     #define MDB_FUZZ_UNDER_ASAN 0
 #endif
 
-// Number of iterations per seed. The design target for the full correctness
-// gate is 1M iterations. Benchmark on benito_pc (Release, -march=native,
-// glibc malloc) measured 1M at ~97 us/iter under the size-skewed k
+// Number of iterations per seed. The target for the full correctness
+// gate is 1M iterations. A Release benchmark (-march=native, glibc malloc,
+// desktop-class x86-64 CPU) measured ~97 us/iter under the size-skewed k
 // distribution used here, putting the full 1M run at ~97 s wall-clock.
 // To stay within the 60 s CI budget, the Release run uses 500k; the smoke
 // + boundary + tamper subtests remain at their original iteration counts.
@@ -520,7 +518,7 @@ TEST(BPTLeafV2FuzzTest, BoundaryCases) {
 namespace {
 
 // Byte range of the `next_leaf` field in the BPTLeafV2 header (bytes 8..11
-// inclusive, uint32 LE). By design §5.5, page-open validation does NOT
+// inclusive, uint32 LE). Page-open validation deliberately does NOT
 // verify this field — it is a pointer into another page in the leaf chain
 // and can only be sanity-checked at tree-walk time. Corruption here does
 // not compromise the current page's record stream; the tamper pass
@@ -530,8 +528,9 @@ constexpr size_t kNextLeafByteHi = 12;  // exclusive
 
 // Helper: build a valid page with ~50 records for a given N. Returns the
 // byte count actually used on the page (header + encoded payload). The
-// tamper region is [0, used_bytes) — bytes past that are zero-padding and
-// the reader tolerates corruption there (design §5.4).
+// tamper region is [0, used_bytes) — bytes past that are zero-padding,
+// which the reader never decodes (it stops after value_count records), so
+// corruption there is tolerated by construction.
 template <std::size_t N>
 size_t build_tamper_subject(PageBuf&                page,
                             std::vector<Record<N>>& inputs)
@@ -576,9 +575,9 @@ std::array<size_t, 3> tamper_pass(PageBuf&                      page,
     std::memcpy(original.data(), page.data(), Page::SIZE);
 
     for (size_t off = 0; off < bytes_to_flip; ++off) {
-        // Skip the next_leaf pointer bytes. By design §5.5 the v2 reader
-        // does not validate this field, and corruption here does not
-        // affect record correctness on the current page.
+        // Skip the next_leaf pointer bytes. The v2 reader deliberately
+        // does not validate this field at page open, and corruption here
+        // does not affect record correctness on the current page.
         if (off >= kNextLeafByteLo && off < kNextLeafByteHi) {
             continue;
         }
@@ -645,8 +644,9 @@ TEST(BPTLeafV2FuzzTest, TamperInjection_AllDetected) {
 
     // N = 1, 2, 3. Each subject fills ~50 records. The tamper region is
     // the prefix [0, 16 + encoded_payload) — the header + real payload.
-    // Bytes past that are zero-padding and the reader ignores them; a
-    // bit flip in padding is a no-op by design §5.4.
+    // Bytes past that are zero-padding and the reader ignores them (it
+    // stops after value_count records), so a bit flip in padding is a
+    // no-op by construction.
     {
         PageBuf page;
         std::vector<Record<1>> inputs;

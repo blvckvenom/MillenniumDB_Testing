@@ -267,8 +267,10 @@ bool test_public_wrapper_result_tag() {
 }
 
 // Regression guard: the floor must always equal 256 MB, matching the
-// pre-adaptive hardcoded constant. If someone accidentally raises or
-// lowers this, the "no-regression" guarantee in §8.7 of the spec breaks.
+// pre-adaptive hardcoded constant. The floor is what guarantees that no
+// workload can end up with a smaller sort buffer than it had before the
+// adaptive sizing existed; accidentally raising or lowering it silently
+// breaks that guarantee.
 bool test_default_floor_is_exactly_256_MB() {
     EXPECT_EQ(DEFAULT_SORT_BUFFER_MIN, 256ULL * 1024 * 1024);
     return false;

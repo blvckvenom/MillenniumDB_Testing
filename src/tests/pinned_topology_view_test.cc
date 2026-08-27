@@ -1,6 +1,6 @@
 // pinned_topology_view_test.cc
 //
-// Unit tests for PinnedTopologyView (Phase 2 of the dynamic GPU-UVA sampling
+// Unit tests for PinnedTopologyView (part of the dynamic GPU-UVA sampling
 // path). The view registers host-resident uint32 CSR arrays as device-visible
 // (cudaHostRegister) so a future k-hop kernel can walk them over PCIe.
 //

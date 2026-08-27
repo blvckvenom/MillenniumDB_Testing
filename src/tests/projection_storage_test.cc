@@ -181,10 +181,14 @@ int main() {
             // ================================================================
             // Sorted-vector node dedup regression suite (2026-04-20)
             // ================================================================
-            // See docs/superpowers/thesis_analysis/2026-04-20-node-bloom-scan-memory-design.md
-            // for design. These tests guard the contract that the append-only
-            // vector + finalize_node_scan + binary-search model preserves the
-            // exact semantics previously delivered by std::unordered_set.
+            // The node scan replaced its std::unordered_set dedup with an
+            // append-only vector + sort/unique in finalize_node_scan +
+            // binary-search membership. A hash set costs ~48 bytes per
+            // entry (node + buckets) vs 8 bytes in a plain vector, which
+            // on a hundred-million-node scan is the difference between
+            // exhausting RAM mid-scan and finishing. These tests guard
+            // the contract that the new model preserves the exact
+            // semantics previously delivered by std::unordered_set.
 
             // Test 10: Duplicate inserts collapse after finalize_node_scan
             std::cout << "Test 10: Duplicate add_node + finalize_node_scan...";
@@ -797,7 +801,7 @@ int main() {
         };
 
         // Test 20: sequential path (env var = "0")
-        std::cout << "Test 20: Phase 4 reader open — sequential path"
+        std::cout << "Test 20: reader open — sequential path"
                      " (MDB_PROJECTION_PARALLEL_READERS=0)...";
         ::setenv("MDB_PROJECTION_PARALLEL_READERS", "0", /*overwrite=*/1);
         uint16_t seq_mask = build_and_count_readers("test_proj_seq");
@@ -811,7 +815,7 @@ int main() {
         std::cout << " OK (mask=0x" << std::hex << seq_mask << std::dec << ")" << std::endl;
 
         // Test 21: parallel path (env var unset → default)
-        std::cout << "Test 21: Phase 4 reader open — parallel path (default)...";
+        std::cout << "Test 21: reader open — parallel path (default)...";
         uint16_t par_mask = build_and_count_readers("test_proj_par");
         if (par_mask != expected_mask) {
             std::cerr << "\nFAIL Test 21: expected reader mask 0x" << std::hex

@@ -16,10 +16,9 @@
 //
 // Covers: single-src / multi-src fit on one page, multi-page src transitions,
 // hub overflow with 2- and 3-page chains, empty writer, offset-table
-// monotonicity, header byte-level checks, and reader round-trip.
-//
-// Design reference: docs/superpowers/specs/2026-04-25-csr-hybrid-design.md §3.9,
-//                   §5.1, §5.2.
+// monotonicity, header byte-level checks, and reader round-trip. The
+// chain-head and continuation page layouts under test are defined
+// byte-by-byte in bpt_leaf_csr_format.h.
 
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 
@@ -162,7 +161,7 @@ decode_all_entries(const std::vector<char>& bytes, std::size_t num_pages)
             // Compute k_head = degree - sum(chunk_counts on continuations).
             // The on-disk format does not encode "number of dsts on the
             // chain-head" explicitly; the reader derives it from the total
-            // degree minus the continuation chunk_counts (design §3.4). We
+            // degree minus the continuation chunk_counts. We
             // must pre-walk the continuation chain to accumulate the
             // chunk_counts before decoding the chain-head's dst stream, to
             // avoid consuming zero-padding bytes beyond the head's packed

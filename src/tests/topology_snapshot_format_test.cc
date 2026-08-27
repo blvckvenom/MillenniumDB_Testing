@@ -1,10 +1,8 @@
-// Unit tests for the TopologySnapshot on-disk file format (§5.1, §5.2).
+// Unit tests for the TopologySnapshot on-disk file format.
 //
 // Scope: header round-trip, magic / version / id_width validation, flag
 // bit preservation, and `sizeof == 64` compile-time contract. File I/O,
 // mmap, and SHA-256 are covered by the topology snapshot writer and reader tests.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md
 
 #include <cstdint>
 #include <cstring>
@@ -88,8 +86,9 @@ TEST(TopologySnapshotFormat, HeaderRoundTripPreservesFields) {
 // Magic byte corruption is rejected by the parser.
 //
 // Policy: parse_topology_snapshot_header throws TopologySnapshotFormatError
-// on any failure (the reader wraps this to set has_data() = false, per
-// §3.4 fallback-first architecture).
+// on any failure; the reader wraps this to set has_data() = false, so any
+// malformed sidecar silently falls back to the B+Tree path instead of
+// failing the query.
 // ---------------------------------------------------------------------------
 TEST(TopologySnapshotFormat, BadMagicRejected) {
     const TopologySnapshotHeader src = make_sentinel_header();

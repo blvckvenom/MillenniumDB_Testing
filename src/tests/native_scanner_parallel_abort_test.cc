@@ -99,8 +99,9 @@ private:
         QueryContext::set_query_ctx(query_ctx_.get());
 
         // Bulk-build the two populated indexes through the production
-        // projection writer pipeline (RadixPartitionSort Phase 1-3 →
-        // BPTLeafWriter/BPTDirWriter), then open them by name — the same
+        // projection writer pipeline (RadixPartitionSort scan → partition →
+        // sort → concatenate, then BPTLeafWriter/BPTDirWriter), then open
+        // them by name — the same
         // write-then-open sequence graph_project uses. Records carry the
         // exact production key layouts:
         //   label_edge   {label_id, edge_id}        (projection_storage.cc)

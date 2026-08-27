@@ -38,7 +38,7 @@ TEST(FourLevelTopologySym, SymTierDefaultsOff) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 11 — the per-row merge that the symmetric populate uses. Replicates the
+// The per-row merge that the symmetric populate uses. Replicates the
 // accessor's dedup: edge_id key when has_edge_ids (distinct -> nothing removed),
 // node-id key otherwise; out(u) first, then in(u) survivors.
 // ---------------------------------------------------------------------------
@@ -46,7 +46,7 @@ using mdb::gnn::detail::symmetric_merge_row;
 using mdb::gnn::detail::resolve_symmetric_dst_tag;
 
 // Distinct edge_ids -> out ++ in with NO node-id dedup (parallel/mutual edges
-// are PRESERVED, byte-identical to the accessor + the design correction).
+// are PRESERVED, byte-identical to the accessor's runtime merge).
 TEST(FourLevelTopologySym, MergeRule_RealEdgeIds_NoDedup) {
     std::vector<uint64_t> df = {2, 3}, ef = {10, 11};
     std::vector<uint64_t> dr = {2, 4}, er = {20, 21};  // dst 2 repeats, eids distinct
@@ -83,7 +83,7 @@ TEST(FourLevelTopologySym, MergeRule_OrderOutThenIn) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 13 — get_neighbors(UNDIRECTED) with the sym tier NOT built falls back to
+// get_neighbors(UNDIRECTED) with the sym tier NOT built falls back to
 // the out+in merge keyed by the same rule. zero edge_ids -> node-id dedup.
 // ---------------------------------------------------------------------------
 TEST(FourLevelTopologySym, Undirected_FallbackMerge_NodeDedup) {
@@ -113,7 +113,7 @@ TEST(FourLevelTopologySym, Undirected_FallbackMerge_NodeDedup) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 15 — the edge_id-drop gate: dropping switches the dedup key to node-id
+// The edge_id-drop gate: dropping switches the dedup key to node-id
 // (parallel/mutual edges collapse) and zeroes every edge_id; NOT dropping keeps
 // the edge-id key (duplicates preserved).
 // ---------------------------------------------------------------------------

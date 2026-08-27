@@ -1,9 +1,10 @@
-// Unit tests para plan_sampling_backend (la decision pura GPU/CPU del muestreo).
+// Unit tests for plan_sampling_backend (the pure GPU/CPU sampling decision).
 //
-// La decision se dimensiona sobre el sidecar global de topologia (lo que la GPU
-// realmente pinea). Estos tests pasan dimensiones sinteticas (DirCsrDims) +
-// recursos de sistema sinteticos para ejercitar la tabla de decision sin GPU real
-// ni construir CSRs grandes. Corre en CI sin CUDA: la funcion es pura sizing.
+// The decision is sized against the global topology sidecar (what the GPU
+// actually pins). These tests pass synthetic dimensions (DirCsrDims) plus
+// synthetic system resources to exercise the decision table without a real
+// GPU and without building large CSRs. Runs in CI without CUDA: the function
+// is pure sizing arithmetic.
 
 #include <gtest/gtest.h>
 
@@ -18,8 +19,8 @@ using namespace mdb::gnn;
 
 namespace {
 
-// Dimensiones de una direccion: n_rows nodos, n_edges aristas.
-// csr_bytes pineados = (n_rows+1)*8 + n_edges*4.
+// Dimensions of one direction: n_rows nodes, n_edges edges.
+// Pinned csr_bytes = (n_rows+1)*8 + n_edges*4.
 DirCsrDims dims(std::uint64_t n_rows, std::uint64_t n_edges) {
     return DirCsrDims{n_rows, n_edges, /*present=*/true};
 }
@@ -30,13 +31,13 @@ mdb::gpu::SystemResources make_res(bool has_gpu, int cc,
     r.has_gpu                  = has_gpu;
     r.gpu.compute_capability   = cc;
     r.gpu.free_vram            = free_vram;
-    r.gpu.raw_free_vram        = free_vram;  // tests: raw == derated (sin derate)
+    r.gpu.raw_free_vram        = free_vram;  // tests: raw == derated (no derating)
     r.gpu.total_vram           = free_vram;
     r.ram_available            = ram;
     return r;
 }
 
-// cfg con umbral de aristas configurable.
+// Config with a configurable edge-count threshold.
 SamplingBackendConfig cfg_min_edges(std::uint64_t min_edges) {
     SamplingBackendConfig c;
     c.min_edges_for_gpu = min_edges;
@@ -67,7 +68,7 @@ TEST(SamplingBackendPlan, WorkloadTooSmallFallsToCpu) {
     auto res  = make_res(true, 80, 100'000'000, 100'000'000);
     auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, dims(100, 5000),
                                       DirCsrDims{}, SamplingBackendChoice::AUTO,
-                                      cfg_min_edges(1'000'000));  // umbral 1M > 5000
+                                      cfg_min_edges(1'000'000));  // threshold 1M > 5000
     EXPECT_EQ(plan.backend, SamplingBackend::CPU_OUT_OF_CORE);
     EXPECT_NE(plan.reason.find("workload too small"), std::string::npos);
 }
@@ -95,7 +96,8 @@ TEST(SamplingBackendPlan, FitsRamAndVramPicksVramCopy) {
 
 TEST(SamplingBackendPlan, FitsRawVramEvenIfDeratedRejects) {
     // The CSR + headroom fit the RAW free VRAM (2 GB) even though the derated
-    // free_vram (1 MB) would reject it: Gate D must key on raw free, not derated.
+    // free_vram (1 MB) would reject it: the VRAM admission check must key on
+    // raw free VRAM, not the derated figure.
     mdb::gpu::SystemResources r;
     r.has_gpu                = true;
     r.gpu.compute_capability = 80;
@@ -125,7 +127,7 @@ TEST(SamplingBackendPlan, RawVramTooTightForHeadroomPicksUva) {
 }
 
 TEST(SamplingBackendPlan, FitsRamButNotVramPicksUva) {
-    // vram chica (10 KB) < device_resident (~20.8 KB), ram amplia => UVA.
+    // small vram (10 KB) < device_resident (~20.8 KB), ample ram => UVA.
     auto res  = make_res(true, 80, /*vram=*/10'000, /*ram=*/100'000'000);
     auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, dims(100, 5000),
                                       DirCsrDims{}, SamplingBackendChoice::AUTO,
@@ -144,8 +146,8 @@ TEST(SamplingBackendPlan, UndirectedBothFit) {
 }
 
 TEST(SamplingBackendPlan, UndirectedOnlyOneDirectionFits) {
-    // fwd chico: csr = 808 + 2000*4 = 8808; rev grande: 808 + 20000*4 = 80808.
-    // headroom = 0.60*100000 = 60000 => solo fwd cabe (rev no, both no).
+    // small fwd: csr = 808 + 2000*4 = 8808; large rev: 808 + 20000*4 = 80808.
+    // headroom = 0.60*100000 = 60000 => only fwd fits (rev does not, both do not).
     auto res  = make_res(true, 80, /*vram=*/100'000'000, /*ram=*/100'000);
     auto plan = plan_sampling_backend(res, EdgeOrientation::UNDIRECTED,
                                       dims(100, 2000), dims(100, 20000),
@@ -155,8 +157,9 @@ TEST(SamplingBackendPlan, UndirectedOnlyOneDirectionFits) {
 }
 
 TEST(SamplingBackendPlan, AbsentSidecarFallsToCpu) {
-    // Sin sidecar pineable en ninguna direccion (present=false) => sin aristas =>
-    // workload too small => CPU. Es el caso de una proyeccion sin sidecar narrow.
+    // No pinnable sidecar in either direction (present=false) => zero edges =>
+    // workload too small => CPU. This is a projection built without the
+    // narrow-width sidecar.
     auto res  = make_res(true, 80, 100'000'000, 100'000'000);
     auto plan = plan_sampling_backend(res, EdgeOrientation::UNDIRECTED, DirCsrDims{},
                                       DirCsrDims{}, SamplingBackendChoice::AUTO,
@@ -165,7 +168,7 @@ TEST(SamplingBackendPlan, AbsentSidecarFallsToCpu) {
 }
 
 TEST(SamplingBackendPlan, ForceCpuSkipsGates) {
-    auto res  = make_res(true, 80, 100'000'000, 100'000'000);  // GPU capaz
+    auto res  = make_res(true, 80, 100'000'000, 100'000'000);  // capable GPU
     auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, dims(100, 5000),
                                       DirCsrDims{}, SamplingBackendChoice::FORCE_CPU,
                                       cfg_min_edges(1000));
@@ -179,21 +182,23 @@ TEST(SamplingBackendPlan, ForceGpuWithoutGpuFlagsHardError) {
                                       DirCsrDims{}, SamplingBackendChoice::FORCE_GPU,
                                       cfg_min_edges(1000));
     EXPECT_EQ(plan.backend, SamplingBackend::CPU_OUT_OF_CORE);
-    EXPECT_EQ(plan.reason.rfind("ERROR:", 0), 0u);  // empieza con "ERROR:"
+    EXPECT_EQ(plan.reason.rfind("ERROR:", 0), 0u);  // starts with "ERROR:"
 }
 
 // ---------------------------------------------------------------------------
-// Regresion 2026-07-03: el slice simetrico horneado se consume TILED desde el
-// mmap (solo ROW_PTR + ventana quedan page-locked; el COL_IDX vive en page
-// cache reclamable). El gate de RAM debe cobrar ese costo bloqueado y no el
-// CSR completo — con el CSR completo, la 2.a corrida de una misma sesion de
-// server (MemAvailable ~21 GB tras la 1.a) caia a CPU_OUT_OF_CORE aunque la
-// VRAM estaba libre. Numeros EXACTOS de la corrida papers100M que lo expuso.
+// Regression, 2026-07-03: the baked symmetric slice is consumed TILED from
+// the mmap (only ROW_PTR plus a staging window stay page-locked; COL_IDX
+// lives in reclaimable page cache). The RAM admission check must charge that
+// locked cost, not the full CSR — charged the full CSR, the second sample of
+// a single server session (MemAvailable down to ~21 GB after the first)
+// fell to CPU_OUT_OF_CORE even though the VRAM was free. The figures below
+// are the EXACT ones from the run that exposed it: a ~13.8 GB symmetric CSR
+// (111 M nodes, 3.2 B edges) against ~21 GB of MemAvailable.
 // ---------------------------------------------------------------------------
 
 TEST(SamplingBackendPlan, TiledMmapSliceNotChargedFullCsr_Papers100mRun2) {
     // headroom = 0.60 * 21'082'181'632 = 12'649'308'979 < csr 13'800'978'504,
-    // pero locked = row_ptr 888'479'656 + ventana 268'435'456 = 1'156'915'112.
+    // but locked = row_ptr 888'479'656 + window 268'435'456 = 1'156'915'112.
     auto res = make_res(/*has_gpu=*/true, /*cc=*/120,
                         /*vram=*/16'176'250'880, /*ram=*/21'082'181'632);
     DirCsrDims sym{/*n_rows=*/111'059'956, /*n_edges=*/3'228'124'712,
@@ -206,8 +211,8 @@ TEST(SamplingBackendPlan, TiledMmapSliceNotChargedFullCsr_Papers100mRun2) {
 }
 
 TEST(SamplingBackendPlan, FullPinStillChargedFullCsr) {
-    // Mismos numeros SIN tiled_mmap: el pin completo si retiene el CSR entero
-    // => el gate conservador de siempre debe seguir mandandolo a CPU.
+    // Same figures WITHOUT tiled_mmap: a full pin really does retain the whole
+    // CSR => the conservative check must keep sending it to CPU.
     auto res = make_res(true, 120, 16'176'250'880, 21'082'181'632);
     DirCsrDims full{111'059'956, 3'228'124'712, /*present=*/true,
                     /*tiled_mmap=*/false};
@@ -219,7 +224,7 @@ TEST(SamplingBackendPlan, FullPinStillChargedFullCsr) {
 }
 
 TEST(SamplingBackendPlan, TiledMmapStillCpuWhenRamTrulyTiny) {
-    // Con RAM diminuta ni siquiera el ROW_PTR + ventana caben => CPU.
+    // With tiny RAM not even ROW_PTR + window fit => CPU.
     auto res = make_res(true, 120, 16'176'250'880, /*ram=*/1'000'000'000);
     DirCsrDims sym{111'059'956, 3'228'124'712, true, /*tiled_mmap=*/true};
     auto plan = plan_sampling_backend(res, EdgeOrientation::NATURAL, sym,

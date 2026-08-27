@@ -24,7 +24,9 @@
 //   3. open_leaf_page(DELTA_VARINT) on a V1-format page whose byte 0 is not
 //      2 raises BPTLeafV2DecodeException.
 //   4. open_leaf_page(BITSET) on a V1-format page with value_count = 2
-//      (byte 0 == 2) does NOT raise — this is the design §6.1 edge case.
+//      (byte 0 == 2) does NOT raise — a legitimate V1 page can collide
+//      with the v2 sentinel byte, which is why the catalog's per-index
+//      leaf_format, not the page byte, is the dispatch key.
 //   5. Records read back through BPTLeafBase<N>* on a V2 page match the
 //      input record sequence.
 //   6. Results read back through BPTLeafBase<N>* match between an
@@ -34,13 +36,9 @@
 //   8. Repeated construct + destruct of the polymorphic leaf holder in a
 //      tight loop leaks no memory (ASan assertion; Debug-build gate).
 //
-// Direct BPlusTree<N> / BptIter<N> end-to-end tests are left for a later
-// stage, at which point the dispatch plumbing threads through the catalog
-// and a
-// real DELTA_VARINT tree can be constructed via the public API.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-// Plan reference: docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md
+// Direct BPlusTree<N> / BptIter<N> end-to-end tests are left for the point
+// at which the dispatch plumbing threads through the catalog and a real
+// DELTA_VARINT tree can be constructed via the public API.
 
 #include "storage/index/bplus_tree/bplus_tree.h"
 
@@ -257,8 +255,8 @@ TEST(BptIterDispatch, DeltaVarint_OnV1LikePage_RaisesDecodeException) {
         BPT::BPTLeafV2DecodeException);
 }
 
-// Case 4: design §6.1 edge case — a valid V1 page with value_count = 2
-// legitimately has byte 0 == 2 (value_count is a little-endian uint32 at
+// Case 4: sentinel-collision edge case — a valid V1 page with value_count
+// = 2 legitimately has byte 0 == 2 (value_count is a little-endian uint32 at
 // offset 0 in the V1 layout). Opening such a page under LeafFormat::BITSET
 // must NOT raise; the byte-0 cross-check is only applied on the
 // DELTA_VARINT branch.

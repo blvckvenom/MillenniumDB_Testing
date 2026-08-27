@@ -114,7 +114,8 @@ TEST(SymmetricLazy, MergeHelpersAreDeterministic_Idempotent) {
 }
 
 // The merged undirected list per node equals the runtime out++in merge
-// (node-id dedup) — the §6 build-time self-verify at unit scale.
+// (node-id dedup) — the build-time self-verification invariant, exercised
+// here at unit scale.
 TEST(SymmetricInvariant, MergedEqualsRuntimeUndirectedMerge) {
     // Reference "runtime merge": out(u) then in(u)-not-already-present.
     auto runtime_merge = [](const std::vector<uint32_t>& out,

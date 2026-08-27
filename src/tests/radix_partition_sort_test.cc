@@ -7,12 +7,9 @@
 //   - The `RadixPartitionSort<N>` template has no backing .cc until the
 //     implementation is added.
 //
-// That unresolved state is the expected TDD RED confirmation. The main
-// `mdb` target must still build because this header is only included
+// That unresolved state is expected while the implementation is absent. The
+// main `mdb` target must still build because this header is only included
 // here and by the implementation file once it is added.
-//
-// Design reference:
-//   docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §8.2
 
 #include <sys/resource.h>
 
@@ -147,8 +144,8 @@ TEST(RadixPartitionSort, DISABLED_Phase1PartitioningDistributesAcrossBuckets) {
     // tag. Whether such a range spreads is exactly the property under test, and
     // using anything sparser would let a broken shift pass by accident.
     for (std::uint64_t i = 1; i <= 100000; i++) {
-        // 0xD4 en el byte alto es el tag de nodo; se escribe literal porque
-        // este archivo de pruebas no incluye object_id.h.
+        // 0xD4 in the high byte is the node type tag; written as a literal
+        // because this test file does not include object_id.h.
         Record<3> r{{0xD400000000000000ULL | i, i * 17, i * 19}};
         input.push_back(r);
     }
@@ -233,18 +230,17 @@ TEST(RadixPartitionSort, Phase2EachPartitionIsSorted) {
 
 // --- Test 4: Concatenation is globally sorted (SUPERSEDED by golden comparison) ---
 //
-// This test was written during the initial TDD RED phase when the Phase 3
-// output format was not yet designed. At that time the plan assumed
-// `sort_and_write` would leave `.sorted_part_N.bin` files as its final
-// output, and the test asserted that concatenating them produced a
-// globally-sorted stream.
+// This test was written before the final output format of the concatenate
+// phase existed, under the assumption that `sort_and_write` would leave
+// `.sorted_part_N.bin` files as its final output; it asserted that
+// concatenating them produced a globally-sorted stream.
 //
-// The real Phase 3 (commit 3669282b) writes the records into
+// The real concatenate phase (commit 3669282b) writes the records into
 // BPTLeafWriter / BPTDirWriter (`.leaf` / `.dir` B+Tree pages) and REMOVES
 // the intermediate `.sorted_part_*.bin` files as post-phase cleanup — they
 // are scratch artifacts, not API output. So the original assertion cannot
 // succeed: `actual` is always empty because the files it tries to read are
-// gone by the time Phase 3 returns.
+// gone by the time sort_and_write returns.
 //
 // The invariant this test was meant to capture ("global sort order after
 // radix concatenation") is preserved — it is validated end-to-end by
@@ -435,7 +431,9 @@ TEST(RadixPartitionSort, BitsetBackend_ByteZeroNotTwo) {
     // 170 (max_records_per_leaf for N=3) in this 500-record dataset.
     // What we positively assert is: byte 0 != 0x02 under BITSET for this
     // specific dataset. (A different dataset with value_count=2 would
-    // legitimately have byte 0 = 0x02 — design §6.1 edge case.)
+    // legitimately have byte 0 = 0x02, colliding with the v2 sentinel —
+    // which is why format dispatch keys on the catalog's per-index
+    // leaf_format and treats the page byte as a cross-check only.)
     const auto hdr = read_first_16_bytes(out_base + ".leaf");
     EXPECT_NE(hdr[0], 0x02) << "BITSET backend must not emit v2 magic";
     fs::remove(out_base + ".leaf");

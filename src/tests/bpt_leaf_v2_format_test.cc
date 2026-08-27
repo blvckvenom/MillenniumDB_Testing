@@ -6,8 +6,6 @@
 // case-sensitive enum parser including the documented error message format.
 // Varint codec / writer / reader behavior is out of scope (covered by the
 // varint unit tests and the v2 leaf reader/writer tests).
-//
-// Design reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
 
 #include <cstdint>
 #include <cstring>
@@ -86,7 +84,9 @@ TEST(BPTLeafV2Format, ParseString_DeltaVarint_Returns2) {
 
 TEST(BPTLeafV2Format, ParseString_CaseSensitive) {
     // Lower-case, mixed-case and word-boundary variants must all be
-    // rejected — the parser is intentionally case-sensitive (design §4.3).
+    // rejected — the parser is intentionally case-sensitive, matching the
+    // upper-case token convention of the other graph_project config values
+    // (indexSet, orientation, graphStorage).
     EXPECT_THROW(BPT::parse_leaf_format("bitset"),       std::invalid_argument);
     EXPECT_THROW(BPT::parse_leaf_format("Delta_Varint"), std::invalid_argument);
     EXPECT_THROW(BPT::parse_leaf_format("DeltaVarint"),  std::invalid_argument);

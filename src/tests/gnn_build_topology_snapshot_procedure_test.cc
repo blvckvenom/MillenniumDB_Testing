@@ -10,8 +10,6 @@
 // procedure's core work through the `run_for_test` static hook — this keeps
 // the test hermetic (no graph import, no catalog bootstrap) while still
 // exercising the exact BPT-scan + writer body that `execute()` runs.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md §4.2
 
 #include <cstdint>
 #include <cstdio>

@@ -30,10 +30,6 @@
 // GQL integration suite and, when available, a manual `mdb` session. The
 // catalog-roundtrip tests below pin the on-disk byte contract that the
 // builder actually writes through in save_catalog().
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-delta-varint-leaf-design.md
-// Plan reference: docs/superpowers/plans/2026-04-25-delta-varint-leaf-plan.md
-//   (config-plumbing unit-test task for the delta-varint leaf encoding)
 
 #include <cstdint>
 #include <filesystem>

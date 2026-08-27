@@ -4,19 +4,19 @@
 // encoded LEB128 deltas from the previous record.  This encoding is the
 // B+Tree leaf compression format for projection indexes.
 //
-// Scope: ReadTag constructor (header validation per design §5.5),
-// get_record(pos) linear-decode semantics, search_index(target) linear scan
-// (design §3.4), corruption handling at both header and payload levels,
-// next_leaf round-trip, and cross-check that V2-encoded pages decode to the
-// same Record<N> sequence as the V1 reader on a byte-identical test corpus.
+// Scope: ReadTag constructor (the page-open header validation: format byte,
+// N cross-check, value_count bound, zero reserved fields), get_record(pos)
+// linear-decode semantics, search_index(target) linear scan (varint records
+// are variable-width, so a v2 page offers no in-page random access and every
+// lookup decodes sequentially), corruption handling at both header and
+// payload levels, next_leaf round-trip, and cross-check that V2-encoded
+// pages decode to the same Record<N> sequence as the V1 reader on a
+// byte-identical test corpus.
 //
 // The writer used to produce test pages is the BPTLeafV2<N> writer
 // constructor (non-tag overload). The reader under test is the new
 // BPTLeafV2<N>(page_bytes, ReadTag) overload plus the get_record /
 // search_index / check / print / check_range member functions.
-//
-// Design reference: delta + LEB128-varint leaf format (§3.4 linear scan /
-//                   §5.2 page layout / §5.5 page-open validation)
 
 #include "storage/index/bplus_tree/bplus_tree_leaf_v2.h"
 

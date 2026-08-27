@@ -6,7 +6,8 @@
 //
 // Scope:
 //   - Header byte values in finalized file (magic / version / flags / counts).
-//   - ROW_PTR prefix-sum contract — §5.1.
+//   - ROW_PTR prefix-sum contract (ROW_PTR[0] == 0, monotone
+//     non-decreasing, ROW_PTR[N] == total edge count).
 //   - COL_IDX ordering matches append order.
 //   - Source-.leaf SHA-256 correctness (against a hand-computed digest).
 //   - Atomic commit: `.tmp` absent after finalize, final present.
@@ -411,8 +412,9 @@ TEST_F(TopologySnapshotWriterTest, HasEdgeIdsFlagRoundTrip) {
 
 // ---------------------------------------------------------------------------
 // Test 9 — a second writer targeting the same output path while the first
-// is still holding `.tmp` is rejected. Verifies the O_EXCL discipline
-// required by the plan (dir-level lock equivalent).
+// is still holding `.tmp` is rejected. Verifies the O_EXCL discipline that
+// stands in for a directory-level lock: two concurrent builds of the same
+// sidecar must not interleave writes into one `.tmp` file.
 // ---------------------------------------------------------------------------
 TEST_F(TopologySnapshotWriterTest, ParallelWritersRejectedOnSameFile) {
     write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD, "z");

@@ -534,7 +534,8 @@ TEST_F(TopologySnapshotReaderTest, VerifySourceSha256MatchesHeader) {
 // ---------------------------------------------------------------------------
 // Test 13b — Mutating a single byte of the source `.leaf` after finalize
 // invalidates the embedded digest; the next open() falls back to B+Tree
-// (has_data()==false), matching the §3.4 fallback contract.
+// (has_data()==false). A stale sidecar must never serve neighbours for a
+// projection whose edge index has changed underneath it.
 // ---------------------------------------------------------------------------
 TEST_F(TopologySnapshotReaderTest, MutatedSourceLeafTriggersFallback) {
     write_fake_source_leaf(TopologySnapshotWriter::Direction::FORWARD,

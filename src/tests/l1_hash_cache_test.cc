@@ -16,7 +16,8 @@
 //   5. IsolatedNode_EmptyNeighbors — inserted empty list returns empty span,
 //      contains() still reports true (cache holds the entry, just zero edges).
 //   6. TotalBytes_MatchesL1Contract — total_bytes() honors
-//      kL1NodeFixedOverhead + kL1PerEdgeBytes * degree from Phase 1 contract.
+//      kL1NodeFixedOverhead + kL1PerEdgeBytes * degree, the sizing
+//      constants declared in topology_frequency_profiler.h.
 //
 // The cache is a pure data structure (no DB / System / ProjectionStorage
 // dependency), so these tests need none of the heavy fixtures used by
@@ -161,7 +162,7 @@ TEST(L1HashCache, IsolatedNode_EmptyNeighbors) {
 // ---------------------------------------------------------------------------
 // Test 6 — TotalBytes_MatchesL1Contract.
 //
-// Phase 1's `topology_frequency_profiler.h` declares:
+// `topology_frequency_profiler.h` declares:
 //   bytes(node) = kL1NodeFixedOverhead + kL1PerEdgeBytes * degree
 // Three inserts with distinct degrees + one tier-rejected insert verifies
 // the diagnostic stays in lockstep with the profiler's sizing math.
