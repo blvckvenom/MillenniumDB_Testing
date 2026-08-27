@@ -28,8 +28,16 @@ using namespace GQL;
 using namespace GQL::Procedures;
 using namespace mdb::gnn;
 
-void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
-    // Step 1: Validate argument count
+// =============================================================================
+// Extracted stages of execute(). File-local: each helper depends only on its
+// arguments, never on GnnOfflineSampleProcedure instance state.
+// =============================================================================
+
+namespace {
+
+// Rejects any argument count outside the documented 3-4 range with the full
+// usage text. Assumes nothing: runs before any argument is inspected.
+void validate_argument_count(ProcedureContext& ctx) {
     if (ctx.arguments.size() < 3 || ctx.arguments.size() > 4) {
         throw std::runtime_error(
             "gnn_offline_sample() requires 3-4 arguments, got " +
@@ -48,8 +56,12 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             "  CALL gnn_offline_sample('social', 'samples_v1', [15, 10], {batchSize: 512})"
         );
     }
+}
 
-    // Step 2: Parse projectionName
+// Parses argument 0 (projectionName): must be a non-empty STRING. Wraps the
+// type error with usage guidance. Does NOT check that the projection exists;
+// that runs later, after the cheaper argument parses.
+std::string parse_projection_name_argument(ProcedureContext& ctx) {
     std::string projection_name;
     try {
         projection_name = ctx.get_string_argument(0);
@@ -69,7 +81,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // Step 3: Parse sampleName
+    return projection_name;
+}
+
+// Parses argument 1 (sampleName): must be a non-empty STRING that is safe for
+// filesystem paths (validate_safe_name). Existence/overwrite handling stays
+// with the caller (the `force` option).
+std::string parse_sample_name_argument(ProcedureContext& ctx) {
     std::string sample_name;
     try {
         sample_name = ctx.get_string_argument(1);
@@ -89,7 +107,293 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    validate_safe_name(sample_name, "sampleName");
+    GQL::Procedures::validate_safe_name(sample_name, "sampleName");
+
+    return sample_name;
+}
+
+// Throws a "not found" error listing the available projections when
+// projection_name is not registered. No side effects on the success path.
+void ensure_projection_exists(
+    ProjectionManager& manager,
+    const std::string& projection_name)
+{
+    if (!manager.projection_exists(projection_name)) {
+        // Provide helpful error with available projections
+        auto projections = manager.list_projections();
+        std::vector<std::string> proj_names;
+        proj_names.reserve(projections.size());
+        for (const auto& p : projections) {
+            proj_names.push_back(p.name);
+        }
+        throw std::runtime_error(
+            format_not_found_error("projection", projection_name, proj_names,
+                                   "CALL graph_project('name', 'NodeLabel', 'EdgeType')")
+        );
+    }
+}
+
+// Maps the user-facing orientation string (case-insensitive NATURAL /
+// REVERSE / UNDIRECTED) onto EdgeOrientation; anything else throws listing
+// the accepted values.
+EdgeOrientation parse_edge_orientation(const std::string& orientation_str) {
+    EdgeOrientation orientation = EdgeOrientation::UNDIRECTED;
+    std::string upper_orientation = orientation_str;
+    std::transform(upper_orientation.begin(), upper_orientation.end(),
+                   upper_orientation.begin(), ::toupper);
+
+    if (upper_orientation == "NATURAL") {
+        orientation = EdgeOrientation::NATURAL;
+    } else if (upper_orientation == "REVERSE") {
+        orientation = EdgeOrientation::REVERSE;
+    } else if (upper_orientation == "UNDIRECTED") {
+        orientation = EdgeOrientation::UNDIRECTED;
+    } else {
+        throw std::runtime_error(
+            "Invalid orientation: '" + orientation_str + "'.\n"
+            "Must be 'NATURAL', 'REVERSE', or 'UNDIRECTED' (case-insensitive)."
+        );
+    }
+
+    return orientation;
+}
+
+// Environment-adaptive defaults. Both respect explicit user values; they only
+// fill in a better default when the caller was silent. Assumes db_folder and
+// projection_name are already resolved; prints a notice to stderr whenever a
+// default is filled in.
+void apply_environment_adaptive_defaults(
+    uint64_t& num_workers,
+    bool& use_predefined_splits,
+    bool use_predefined_splits_explicit,
+    const std::string& db_folder,
+    const std::string& projection_name)
+{
+    // Auto-parallelize the sampler when numWorkers was not specified. The
+    // per-batch re-seeding (each batch uses random_seed XOR batch_id) makes
+    // the sampled output deterministic regardless of how many workers pick
+    // up batches, so using multiple workers is a free speedup over sequential.
+    // Explicit numWorkers (including 0 = legacy sequential) always wins.
+    if (num_workers == std::numeric_limits<uint64_t>::max()) {
+        unsigned hc = std::thread::hardware_concurrency();
+        num_workers = (hc == 0) ? 4u : std::min<unsigned>(hc, 8u);
+        std::cerr << "[gnn_offline_sample] notice: numWorkers not set — defaulting "
+                     "to " << num_workers << " (min(cores,8)). Pass numWorkers "
+                     "explicitly to override (0 = legacy sequential).\n";
+    }
+
+    // Auto-use predefined splits when the projection has splits.bin and the
+    // caller did not set usePredefinedSplits. Otherwise a random ratio split
+    // silently ignores splits.bin -> validation collapses on labeled-subset
+    // datasets (e.g. OGB). Explicit usePredefinedSplits always wins.
+    if (!use_predefined_splits_explicit && !use_predefined_splits) {
+        auto splits_path = std::filesystem::path(db_folder) /
+                           "projections" / projection_name / "splits.bin";
+        if (std::filesystem::exists(splits_path)) {
+            use_predefined_splits = true;
+            std::cerr << "[gnn_offline_sample] notice: projection has splits.bin "
+                         "and usePredefinedSplits was not set — defaulting to "
+                         "true (using the predefined train/val/test split). Pass "
+                         "usePredefinedSplits:false to force a ratio split.\n";
+        }
+    }
+}
+
+// Maps the samplingBackend option string (case-insensitive 'cpu' / 'gpu' /
+// anything else = auto) onto the backend-choice enum.
+SamplingBackendChoice parse_sampling_backend_choice(const std::string& sampling_backend_str) {
+    std::string sb_lower = sampling_backend_str;
+    std::transform(sb_lower.begin(), sb_lower.end(), sb_lower.begin(), ::tolower);
+    if (sb_lower == "cpu") {
+        return SamplingBackendChoice::FORCE_CPU;
+    } else if (sb_lower == "gpu") {
+        return SamplingBackendChoice::FORCE_GPU;
+    }
+    return SamplingBackendChoice::AUTO;  // "auto" or unknown
+}
+
+// Maps the useSymmetricTopology option string (case-insensitive 'on' / 'off'
+// / anything else = auto) onto the symmetric-topology mode enum.
+SamplingConfig::SymmetricTopologyMode parse_symmetric_topology_mode(
+    const std::string& symmetric_topology_str)
+{
+    std::string st = symmetric_topology_str;
+    std::transform(st.begin(), st.end(), st.begin(), ::tolower);
+    if (st == "on") {
+        return SamplingConfig::SymmetricTopologyMode::ON;
+    } else if (st == "off") {
+        return SamplingConfig::SymmetricTopologyMode::OFF;
+    }
+    return SamplingConfig::SymmetricTopologyMode::AUTO;
+}
+
+// Folded feature-store build (opt-in, default OFF). With buildFeatureStore:true
+// in the options map, the four-level feature store is built right after the
+// sample is written, so the data-dependent reorder / address-tables / blocks
+// are produced in one call instead of requiring a separate
+// gnn_build_feature_store invocation. Default off => byte-identical to prior
+// behavior; the standalone gnn_build_feature_store verb remains. (This reuses
+// the existing FourLevelStore::build, which re-reads the just-written sample
+// from disk; a build fed from the in-RAM sample, eliminating that re-read,
+// would be a further increment.)
+// Returns true iff the build ran; on true, bfs_feature_name carries the
+// feature name for the extra yields. Assumes the sample was just written
+// successfully under sample_name.
+bool build_feature_store_if_requested(
+    ProcedureContext& ctx,
+    const std::string& db_folder,
+    const std::string& sample_name,
+    std::string& bfs_feature_name)
+{
+    bool build_feature_store_done = false;
+    if (ctx.arguments.size() == 4) {
+        DictOptions bfs_opts(ctx.get_argument(3));
+        const bool build_feature_store =
+            bfs_opts.get_bool("buildFeatureStore").value_or(false);
+        if (build_feature_store) {
+            bfs_feature_name =
+                bfs_opts.get_string("featureName").value_or(std::string("node_features"));
+            auto sp = SampleStorage::get_storage_path(db_folder, sample_name);
+            auto fmat_path = std::filesystem::path(db_folder) / "gnn_features" /
+                             (bfs_feature_name + ".fmat");
+            auto rmap_path = std::filesystem::path(db_folder) / "gnn_features" /
+                             (bfs_feature_name + ".rmap");
+            if (!std::filesystem::exists(fmat_path) ||
+                !std::filesystem::exists(rmap_path)) {
+                throw std::runtime_error(
+                    "buildFeatureStore: '" + bfs_feature_name +
+                    ".fmat'/'.rmap' not found under gnn_features/ — import the "
+                    "tensors first (mdb import ... --with-tensors features.npy).");
+            }
+            auto bfs_samples = SampleStorage::open(sp);
+            auto bfs_fm = FeatureMatrix::open(fmat_path);
+            auto bfs_rm = RowMapping::open(rmap_path);
+            // Honor the same build options the standalone gnn_build_feature_store
+            // accepts (budgets, force flags, reorder strategy, bakeBlocks, numHashes,
+            // ...), parsed from the SAME options map (sampling keys are ignored).
+            FourLevelStore::Config bfs_config = build_feature_store_config(&bfs_opts);
+            // autoCache: size L1 to a prior gnn_train's measured recommendation
+            // (no-op without autoCache:true / when explicit gpu_budget_mb wins).
+            apply_auto_cache_budget(bfs_config, &bfs_opts, db_folder, bfs_feature_name);
+            FourLevelStore::build(bfs_fm, bfs_rm, bfs_samples, bfs_config,
+                                  db_folder, bfs_feature_name);
+            build_feature_store_done = true;
+        }
+    }
+    return build_feature_store_done;
+}
+
+// Emits every YIELD column of gnn_offline_sample — identity, catalog
+// counters, phase-0 profiler telemetry, worker count, the sample content
+// fingerprint, sampling-backend / symmetric-topology / RSS telemetry, and the
+// optional folded feature-store pair — then closes the row. Assumes
+// result.success was already checked by the caller; only reads its inputs.
+void yield_sampling_results(
+    ProcedureContext& ctx,
+    const std::string& sample_name,
+    const std::string& projection_name,
+    const std::string& db_folder,
+    const SamplingResult& result,
+    bool build_feature_store_done,
+    const std::string& bfs_feature_name)
+{
+    auto storage_path = SampleStorage::get_storage_path(db_folder, sample_name);
+    int64_t compute_millis = static_cast<int64_t>(result.total_seconds * 1000);
+
+    ctx.yield("sampleName", ctx.create_string(sample_name));
+    ctx.yield("projectionName", ctx.create_string(projection_name));
+    ctx.yield("totalBatches", ctx.create_int(static_cast<int64_t>(result.catalog.total_batches)));
+    ctx.yield("trainBatches", ctx.create_int(static_cast<int64_t>(result.catalog.train_batches)));
+    ctx.yield("validationBatches", ctx.create_int(static_cast<int64_t>(result.catalog.validation_batches)));
+    ctx.yield("testBatches", ctx.create_int(static_cast<int64_t>(result.catalog.test_batches)));
+    ctx.yield("uniqueNodes", ctx.create_int(static_cast<int64_t>(result.catalog.unique_nodes)));
+    ctx.yield("storagePath", ctx.create_string(storage_path.string()));
+    ctx.yield("computeMillis", ctx.create_int(compute_millis));
+
+    // Cold-start topology profiler telemetry: if node_counts.bin was absent,
+    // a degree-weighted random-walk pass (Vose alias seeds) ran before sampling
+    // to produce access-frequency estimates for Four-Level Topology Store tier
+    // assignment. These yields report whether that profiler was triggered,
+    // whether it succeeded, and the number of walks and neighbor lookups done.
+    ctx.yield("phase0Triggered", ctx.create_bool(result.phase0_triggered));
+    ctx.yield("phase0Succeeded", ctx.create_bool(result.phase0_succeeded));
+    ctx.yield("phase0WalksDone",   ctx.create_int(static_cast<int64_t>(result.phase0_walks_done)));
+    ctx.yield("phase0LookupsDone", ctx.create_int(static_cast<int64_t>(result.phase0_lookups_done)));
+    ctx.yield("phase0Millis",      ctx.create_int(
+        static_cast<int64_t>(result.phase0_elapsed_seconds * 1000.0)));
+
+    // Resolved parallel sampler worker count. Reports 1 for the legacy
+    // single-thread path (numWorkers=0); matches the actual pool size otherwise.
+    ctx.yield("numWorkersUsed", ctx.create_int(
+        static_cast<int64_t>(result.num_workers_used)));
+
+    // Sample content fingerprint (the staleness/reproducibility check),
+    // surfaced as a 16-char hex STRING (avoids the
+    // signed-int64 high-bit wrap a numeric yield would suffer). Order/worker-
+    // invariant (sort-then-XOR-fold) — the O(1) semantic-equality gate for
+    // parallelism work (numWorkers, single-vs-parallel populate).
+    {
+        char fp_hex[17];
+        std::snprintf(fp_hex, sizeof(fp_hex), "%016llx",
+                      static_cast<unsigned long long>(result.catalog.sample_content_fp));
+        ctx.yield("sampleContentFp", ctx.create_string(std::string(fp_hex)));
+    }
+
+    // Sampling-backend telemetry: the backend the hardware-based planner
+    // chose, the directions the GPU path serves, and the planner's reason.
+    // The plan was applied by the engine — a GPU backend whose pinned
+    // topology view registered ran the GPU kernel; otherwise the CPU
+    // out-of-core path ran and the plan is still reported here.
+    ctx.yield("samplingBackend",    ctx.create_string(result.sampling_backend));
+    ctx.yield("samplingDirections", ctx.create_string(result.sampling_directions));
+    ctx.yield("samplingPlanReason", ctx.create_string(result.sampling_plan_reason));
+
+    // Symmetric single-slice topology telemetry. symmetricUsed reflects the
+    // resolved decision (AUTO => UNDIRECTED); symmetricBuiltOk + symmetricMs +
+    // symmetricRamBytes report the in-RAM merge of the two directional CSRs into
+    // one pre-merged undirected slice consumed by the GPU-UVA pin / sym tier.
+    ctx.yield("symmetricUsed",     ctx.create_bool(result.symmetric_used));
+    ctx.yield("symmetricBuiltOk",  ctx.create_bool(result.symmetric_built_ok));
+    ctx.yield("symmetricMs",       ctx.create_int(
+        static_cast<int64_t>(result.symmetric_ms)));
+    ctx.yield("symmetricRamBytes", ctx.create_int(
+        static_cast<int64_t>(result.symmetric_ram_bytes)));
+
+    // RAM relief telemetry. directionalRamFreedBytes is what releasing the
+    // directional fwd/rev tiers reclaimed once the merged slice was pinned (the
+    // symmetric GPU path); rssPeakBeforeFreeBytes is the process high-water mark
+    // at the tightest moment (merged slice + directional tiers both resident),
+    // rssPeakAfterFreeBytes the post-free sampling-phase high-water mark, and
+    // rssCurrentEndBytes the resident size at end. 0 when unavailable / no free.
+    ctx.yield("directionalRamFreedBytes", ctx.create_int(
+        static_cast<int64_t>(result.directional_ram_freed_bytes)));
+    ctx.yield("rssPeakBeforeFreeBytes", ctx.create_int(
+        static_cast<int64_t>(result.rss_peak_before_free_bytes)));
+    ctx.yield("rssPeakAfterFreeBytes", ctx.create_int(
+        static_cast<int64_t>(result.rss_peak_after_free_bytes)));
+    ctx.yield("rssCurrentEndBytes", ctx.create_int(
+        static_cast<int64_t>(result.rss_current_end_bytes)));
+
+    // Folded feature-store build telemetry (only present when buildFeatureStore:true).
+    if (build_feature_store_done) {
+        ctx.yield("buildFeatureStoreOk", ctx.create_bool(true));
+        ctx.yield("featureName", ctx.create_string(bfs_feature_name));
+    }
+
+    ctx.yield_row();
+}
+
+} // namespace
+
+void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
+    // Step 1: Validate argument count
+    validate_argument_count(ctx);
+
+    // Step 2: Parse projectionName
+    std::string projection_name = parse_projection_name_argument(ctx);
+
+    // Step 3: Parse sampleName
+    std::string sample_name = parse_sample_name_argument(ctx);
 
     // Step 4: Parse fanouts list
     std::vector<uint64_t> fanouts;
@@ -189,19 +493,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
 
     // Step 6: Verify projection exists
     auto& manager = ProjectionManager::get_instance();
-    if (!manager.projection_exists(projection_name)) {
-        // Provide helpful error with available projections
-        auto projections = manager.list_projections();
-        std::vector<std::string> proj_names;
-        proj_names.reserve(projections.size());
-        for (const auto& p : projections) {
-            proj_names.push_back(p.name);
-        }
-        throw std::runtime_error(
-            format_not_found_error("projection", projection_name, proj_names,
-                                   "CALL graph_project('name', 'NodeLabel', 'EdgeType')")
-        );
-    }
+    ensure_projection_exists(manager, projection_name);
 
     // Step 7: Check if sample already exists
     std::string db_folder = get_db_folder();
@@ -228,56 +520,13 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     }
 
     // Step 8: Parse orientation
-    EdgeOrientation orientation = EdgeOrientation::UNDIRECTED;
-    std::string upper_orientation = orientation_str;
-    std::transform(upper_orientation.begin(), upper_orientation.end(),
-                   upper_orientation.begin(), ::toupper);
+    EdgeOrientation orientation = parse_edge_orientation(orientation_str);
 
-    if (upper_orientation == "NATURAL") {
-        orientation = EdgeOrientation::NATURAL;
-    } else if (upper_orientation == "REVERSE") {
-        orientation = EdgeOrientation::REVERSE;
-    } else if (upper_orientation == "UNDIRECTED") {
-        orientation = EdgeOrientation::UNDIRECTED;
-    } else {
-        throw std::runtime_error(
-            "Invalid orientation: '" + orientation_str + "'.\n"
-            "Must be 'NATURAL', 'REVERSE', or 'UNDIRECTED' (case-insensitive)."
-        );
-    }
-
-    // =========================================================================
-    // Environment-adaptive defaults. Both respect explicit user values; they
-    // only fill in a better default when the caller was silent.
-    // =========================================================================
-    // Auto-parallelize the sampler when numWorkers was not specified. The
-    // per-batch re-seeding (each batch uses random_seed XOR batch_id) makes
-    // the sampled output deterministic regardless of how many workers pick
-    // up batches, so using multiple workers is a free speedup over sequential.
-    // Explicit numWorkers (including 0 = legacy sequential) always wins.
-    if (num_workers == std::numeric_limits<uint64_t>::max()) {
-        unsigned hc = std::thread::hardware_concurrency();
-        num_workers = (hc == 0) ? 4u : std::min<unsigned>(hc, 8u);
-        std::cerr << "[gnn_offline_sample] notice: numWorkers not set — defaulting "
-                     "to " << num_workers << " (min(cores,8)). Pass numWorkers "
-                     "explicitly to override (0 = legacy sequential).\n";
-    }
-
-    // Auto-use predefined splits when the projection has splits.bin and the
-    // caller did not set usePredefinedSplits. Otherwise a random ratio split
-    // silently ignores splits.bin -> validation collapses on labeled-subset
-    // datasets (e.g. OGB). Explicit usePredefinedSplits always wins.
-    if (!use_predefined_splits_explicit && !use_predefined_splits) {
-        auto splits_path = std::filesystem::path(db_folder) /
-                           "projections" / projection_name / "splits.bin";
-        if (std::filesystem::exists(splits_path)) {
-            use_predefined_splits = true;
-            std::cerr << "[gnn_offline_sample] notice: projection has splits.bin "
-                         "and usePredefinedSplits was not set — defaulting to "
-                         "true (using the predefined train/val/test split). Pass "
-                         "usePredefinedSplits:false to force a ratio split.\n";
-        }
-    }
+    // Environment-adaptive defaults (numWorkers, usePredefinedSplits): fill
+    // in better defaults only where the caller was silent.
+    apply_environment_adaptive_defaults(num_workers, use_predefined_splits,
+                                        use_predefined_splits_explicit,
+                                        db_folder, projection_name);
 
     // Step 9: Build SamplingConfig
     SamplingConfig config;
@@ -290,28 +539,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     config.test_ratio = test_ratio;
     config.random_seed = random_seed;
     config.orientation = orientation;
-    {
-        std::string sb_lower = sampling_backend_str;
-        std::transform(sb_lower.begin(), sb_lower.end(), sb_lower.begin(), ::tolower);
-        if (sb_lower == "cpu") {
-            config.sampling_backend = SamplingBackendChoice::FORCE_CPU;
-        } else if (sb_lower == "gpu") {
-            config.sampling_backend = SamplingBackendChoice::FORCE_GPU;
-        } else {
-            config.sampling_backend = SamplingBackendChoice::AUTO;  // "auto" or unknown
-        }
-    }
-    {
-        std::string st = symmetric_topology_str;
-        std::transform(st.begin(), st.end(), st.begin(), ::tolower);
-        if (st == "on") {
-            config.use_symmetric_topology = SamplingConfig::SymmetricTopologyMode::ON;
-        } else if (st == "off") {
-            config.use_symmetric_topology = SamplingConfig::SymmetricTopologyMode::OFF;
-        } else {
-            config.use_symmetric_topology = SamplingConfig::SymmetricTopologyMode::AUTO;
-        }
-    }
+    config.sampling_backend = parse_sampling_backend_choice(sampling_backend_str);
+    config.use_symmetric_topology = parse_symmetric_topology_mode(symmetric_topology_str);
     config.use_predefined_splits = use_predefined_splits;
     config.use_adjacency_cache = use_adjacency_cache;
     config.use_four_level_topology_store = use_four_level_topology_store;
@@ -368,139 +597,15 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Folded feature-store build (opt-in, default OFF). With
-    // buildFeatureStore:true the four-level feature store is built right after
-    // the sample is written, so the data-dependent reorder / address-tables /
-    // blocks are produced in one call instead of requiring a separate
-    // gnn_build_feature_store invocation. Default off => byte-identical to
-    // prior behavior; the standalone gnn_build_feature_store verb remains.
-    // (This reuses the existing FourLevelStore::build, which re-reads the
-    // just-written sample from disk; a build fed from the in-RAM sample,
-    // eliminating that re-read, would be a further increment.)
-    // -----------------------------------------------------------------------
-    bool build_feature_store_done = false;
+    // Folded feature-store build (opt-in via buildFeatureStore:true in the
+    // options map; default OFF and absent from the yields when off).
     std::string bfs_feature_name;
-    if (ctx.arguments.size() == 4) {
-        DictOptions bfs_opts(ctx.get_argument(3));
-        const bool build_feature_store =
-            bfs_opts.get_bool("buildFeatureStore").value_or(false);
-        if (build_feature_store) {
-            bfs_feature_name =
-                bfs_opts.get_string("featureName").value_or(std::string("node_features"));
-            auto sp = SampleStorage::get_storage_path(db_folder, sample_name);
-            auto fmat_path = std::filesystem::path(db_folder) / "gnn_features" /
-                             (bfs_feature_name + ".fmat");
-            auto rmap_path = std::filesystem::path(db_folder) / "gnn_features" /
-                             (bfs_feature_name + ".rmap");
-            if (!std::filesystem::exists(fmat_path) ||
-                !std::filesystem::exists(rmap_path)) {
-                throw std::runtime_error(
-                    "buildFeatureStore: '" + bfs_feature_name +
-                    ".fmat'/'.rmap' not found under gnn_features/ — import the "
-                    "tensors first (mdb import ... --with-tensors features.npy).");
-            }
-            auto bfs_samples = SampleStorage::open(sp);
-            auto bfs_fm = FeatureMatrix::open(fmat_path);
-            auto bfs_rm = RowMapping::open(rmap_path);
-            // Honor the same build options the standalone gnn_build_feature_store
-            // accepts (budgets, force flags, reorder strategy, bakeBlocks, numHashes,
-            // ...), parsed from the SAME options map (sampling keys are ignored).
-            FourLevelStore::Config bfs_config = build_feature_store_config(&bfs_opts);
-            // autoCache: size L1 to a prior gnn_train's measured recommendation
-            // (no-op without autoCache:true / when explicit gpu_budget_mb wins).
-            apply_auto_cache_budget(bfs_config, &bfs_opts, db_folder, bfs_feature_name);
-            FourLevelStore::build(bfs_fm, bfs_rm, bfs_samples, bfs_config,
-                                  db_folder, bfs_feature_name);
-            build_feature_store_done = true;
-        }
-    }
+    const bool build_feature_store_done =
+        build_feature_store_if_requested(ctx, db_folder, sample_name, bfs_feature_name);
 
     // Step 13: Yield results
-    auto storage_path = SampleStorage::get_storage_path(db_folder, sample_name);
-    int64_t compute_millis = static_cast<int64_t>(result.total_seconds * 1000);
-
-    ctx.yield("sampleName", ctx.create_string(sample_name));
-    ctx.yield("projectionName", ctx.create_string(projection_name));
-    ctx.yield("totalBatches", ctx.create_int(static_cast<int64_t>(result.catalog.total_batches)));
-    ctx.yield("trainBatches", ctx.create_int(static_cast<int64_t>(result.catalog.train_batches)));
-    ctx.yield("validationBatches", ctx.create_int(static_cast<int64_t>(result.catalog.validation_batches)));
-    ctx.yield("testBatches", ctx.create_int(static_cast<int64_t>(result.catalog.test_batches)));
-    ctx.yield("uniqueNodes", ctx.create_int(static_cast<int64_t>(result.catalog.unique_nodes)));
-    ctx.yield("storagePath", ctx.create_string(storage_path.string()));
-    ctx.yield("computeMillis", ctx.create_int(compute_millis));
-
-    // Cold-start topology profiler telemetry: if node_counts.bin was absent,
-    // a degree-weighted random-walk pass (Vose alias seeds) ran before sampling
-    // to produce access-frequency estimates for Four-Level Topology Store tier
-    // assignment. These yields report whether that profiler was triggered,
-    // whether it succeeded, and the number of walks and neighbor lookups done.
-    ctx.yield("phase0Triggered", ctx.create_bool(result.phase0_triggered));
-    ctx.yield("phase0Succeeded", ctx.create_bool(result.phase0_succeeded));
-    ctx.yield("phase0WalksDone",   ctx.create_int(static_cast<int64_t>(result.phase0_walks_done)));
-    ctx.yield("phase0LookupsDone", ctx.create_int(static_cast<int64_t>(result.phase0_lookups_done)));
-    ctx.yield("phase0Millis",      ctx.create_int(
-        static_cast<int64_t>(result.phase0_elapsed_seconds * 1000.0)));
-
-    // Resolved parallel sampler worker count. Reports 1 for the legacy
-    // single-thread path (numWorkers=0); matches the actual pool size otherwise.
-    ctx.yield("numWorkersUsed", ctx.create_int(
-        static_cast<int64_t>(result.num_workers_used)));
-
-    // Sample content fingerprint (the staleness/reproducibility check),
-    // surfaced as a 16-char hex STRING (avoids the
-    // signed-int64 high-bit wrap a numeric yield would suffer). Order/worker-
-    // invariant (sort-then-XOR-fold) — the O(1) semantic-equality gate for
-    // parallelism work (numWorkers, single-vs-parallel populate).
-    {
-        char fp_hex[17];
-        std::snprintf(fp_hex, sizeof(fp_hex), "%016llx",
-                      static_cast<unsigned long long>(result.catalog.sample_content_fp));
-        ctx.yield("sampleContentFp", ctx.create_string(std::string(fp_hex)));
-    }
-
-    // Sampling-backend telemetry: the backend the hardware-based planner
-    // chose, the directions the GPU path serves, and the planner's reason.
-    // The plan was applied by the engine — a GPU backend whose pinned
-    // topology view registered ran the GPU kernel; otherwise the CPU
-    // out-of-core path ran and the plan is still reported here.
-    ctx.yield("samplingBackend",    ctx.create_string(result.sampling_backend));
-    ctx.yield("samplingDirections", ctx.create_string(result.sampling_directions));
-    ctx.yield("samplingPlanReason", ctx.create_string(result.sampling_plan_reason));
-
-    // Symmetric single-slice topology telemetry. symmetricUsed reflects the
-    // resolved decision (AUTO => UNDIRECTED); symmetricBuiltOk + symmetricMs +
-    // symmetricRamBytes report the in-RAM merge of the two directional CSRs into
-    // one pre-merged undirected slice consumed by the GPU-UVA pin / sym tier.
-    ctx.yield("symmetricUsed",     ctx.create_bool(result.symmetric_used));
-    ctx.yield("symmetricBuiltOk",  ctx.create_bool(result.symmetric_built_ok));
-    ctx.yield("symmetricMs",       ctx.create_int(
-        static_cast<int64_t>(result.symmetric_ms)));
-    ctx.yield("symmetricRamBytes", ctx.create_int(
-        static_cast<int64_t>(result.symmetric_ram_bytes)));
-
-    // RAM relief telemetry. directionalRamFreedBytes is what releasing the
-    // directional fwd/rev tiers reclaimed once the merged slice was pinned (the
-    // symmetric GPU path); rssPeakBeforeFreeBytes is the process high-water mark
-    // at the tightest moment (merged slice + directional tiers both resident),
-    // rssPeakAfterFreeBytes the post-free sampling-phase high-water mark, and
-    // rssCurrentEndBytes the resident size at end. 0 when unavailable / no free.
-    ctx.yield("directionalRamFreedBytes", ctx.create_int(
-        static_cast<int64_t>(result.directional_ram_freed_bytes)));
-    ctx.yield("rssPeakBeforeFreeBytes", ctx.create_int(
-        static_cast<int64_t>(result.rss_peak_before_free_bytes)));
-    ctx.yield("rssPeakAfterFreeBytes", ctx.create_int(
-        static_cast<int64_t>(result.rss_peak_after_free_bytes)));
-    ctx.yield("rssCurrentEndBytes", ctx.create_int(
-        static_cast<int64_t>(result.rss_current_end_bytes)));
-
-    // Folded feature-store build telemetry (only present when buildFeatureStore:true).
-    if (build_feature_store_done) {
-        ctx.yield("buildFeatureStoreOk", ctx.create_bool(true));
-        ctx.yield("featureName", ctx.create_string(bfs_feature_name));
-    }
-
-    ctx.yield_row();
+    yield_sampling_results(ctx, sample_name, projection_name, db_folder, result,
+                           build_feature_store_done, bfs_feature_name);
 }
 
 std::vector<uint64_t> GnnOfflineSampleProcedure::parse_fanouts(

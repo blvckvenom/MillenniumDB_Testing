@@ -71,11 +71,16 @@ static void deduplicate(std::vector<std::string>& vec) {
 }
 
 // =============================================================================
-// Main execution
+// Extracted stages of execute(). File-local: each helper depends only on its
+// arguments (plus the gql_model global for catalog lookups), never on
+// ProjectProcedure instance state.
 // =============================================================================
 
-void ProjectProcedure::execute(ProcedureContext& ctx) {
-    // Step 1: Validate parameter count
+namespace {
+
+// Rejects any argument count outside the documented 3-4 range with the full
+// usage text. Assumes nothing: runs before any argument is inspected.
+void validate_argument_count(ProcedureContext& ctx) {
     if (ctx.arguments.size() < 3 || ctx.arguments.size() > 4) {
         throw std::runtime_error(
             "PROJECT procedure requires 3-4 parameters, got " +
@@ -94,29 +99,161 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             "  CALL PROJECT('gnn', 'User', {KNOWS: {orientation: 'UNDIRECTED'}})"
         );
     }
+}
 
-    // Step 2: Parse and validate graphName
-    std::string graph_name;
+// Checks that a non-empty includeFeatures value names a FeatureMatrix
+// registered in the catalog; an empty value (= option disabled) passes.
+// Assumes gql_model's catalog is loaded. Throws listing the available names.
+void validate_include_features(const std::string& include_features) {
+    if (!include_features.empty()) {
+        const auto& names = gql_model.catalog.gnn_feature_names;
+        if (std::find(names.begin(), names.end(), include_features) == names.end()) {
+            std::string msg = "feature '" + include_features + "' not found.\n\n";
+            if (names.empty()) {
+                msg += "No features exist. Create one first with:\n"
+                       "  mdb import data.gql <db> --with-tensors features.npy";
+            } else {
+                msg += "Available features: [";
+                for (size_t i = 0; i < names.size(); i++) {
+                    if (i > 0) msg += ", ";
+                    msg += "'" + names[i] + "'";
+                }
+                msg += "]";
+            }
+            throw std::runtime_error(msg);
+        }
+    }
+}
+
+// Flattens the parsed nodeProjection variant into the label list, the
+// property list, and the per-property config map the builder consumes.
+// On entry node_properties holds the global nodeProperties (map-syntax
+// properties are appended without duplicates); node_labels and
+// node_property_configs are empty and are filled here.
+void flatten_node_projection(
+    const NodeProjectionVariant& node_projection_variant,
+    std::vector<std::string>& node_labels,
+    std::vector<std::string>& node_properties,
+    std::unordered_map<std::string, PropertyConfig>& node_property_configs)
+{
+    if (std::holds_alternative<std::vector<std::string>>(node_projection_variant)) {
+        node_labels = std::get<std::vector<std::string>>(node_projection_variant);
+    } else {
+        const auto& node_map = std::get<NodeProjectionMap>(node_projection_variant);
+        for (const auto& [projected_label, config] : node_map) {
+            node_labels.push_back(config.label);
+            for (const auto& prop : config.simple_properties) {
+                if (std::find(node_properties.begin(), node_properties.end(), prop) == node_properties.end()) {
+                    node_properties.push_back(prop);
+                }
+            }
+            for (const auto& [prop_key, prop_config] : config.property_configs) {
+                const std::string& source_prop = prop_config.source_property.empty() ? prop_key : prop_config.source_property;
+                if (std::find(node_properties.begin(), node_properties.end(), source_prop) == node_properties.end()) {
+                    node_properties.push_back(source_prop);
+                }
+                node_property_configs[prop_key] = prop_config;
+            }
+        }
+    }
+}
+
+// Flattens the parsed relationshipProjection variant into the type list, the
+// edge-property list, the per-property config map, and the three per-type
+// override maps (orientation / aggregation / aggregation property). On entry
+// edge_properties holds the global relationshipProperties (map-syntax
+// properties are appended without duplicates); the remaining outputs are
+// empty and are filled here. List syntax fills only relationship_types.
+void flatten_relationship_projection(
+    const RelationshipProjectionVariant& rel_projection_variant,
+    std::vector<std::string>& relationship_types,
+    std::vector<std::string>& edge_properties,
+    std::unordered_map<std::string, PropertyConfig>& edge_property_configs,
+    std::unordered_map<std::string, Orientation>& type_orientations,
+    std::unordered_map<std::string, Aggregation>& type_aggregations,
+    std::unordered_map<std::string, std::string>& type_agg_properties)
+{
+    if (std::holds_alternative<std::vector<std::string>>(rel_projection_variant)) {
+        relationship_types = std::get<std::vector<std::string>>(rel_projection_variant);
+    } else {
+        const auto& rel_map = std::get<RelationshipProjectionMap>(rel_projection_variant);
+        for (const auto& [projected_type, config] : rel_map) {
+            relationship_types.push_back(config.type);
+
+            type_orientations[config.type] = config.orientation;
+            type_aggregations[config.type] = config.aggregation;
+            if (!config.aggregation_property.empty()) {
+                type_agg_properties[config.type] = config.aggregation_property;
+            }
+
+            for (const auto& prop : config.simple_properties) {
+                if (std::find(edge_properties.begin(), edge_properties.end(), prop) == edge_properties.end()) {
+                    edge_properties.push_back(prop);
+                }
+            }
+            for (const auto& [prop_key, prop_config] : config.property_configs) {
+                const std::string& source_prop = prop_config.source_property.empty() ? prop_key : prop_config.source_property;
+                if (std::find(edge_properties.begin(), edge_properties.end(), source_prop) == edge_properties.end()) {
+                    edge_properties.push_back(source_prop);
+                }
+                edge_property_configs[prop_key] = prop_config;
+            }
+        }
+    }
+}
+
+// Computes the `topologySnapshotBytes` yield: the combined byte size of the
+// two mmap-backed CSR sidecar files (topology_fwd.csr and topology_rev.csr)
+// produced by the builder when buildTopologySnapshot=true. Reports 0 when the
+// flag was false, when neither direction was eligible (the active IndexSet
+// lacked both edge indexes), or when stat'ing the files fails for any reason
+// (filesystem errors are swallowed here — the projection itself is the real
+// build product). Assumes the build already finalized under
+// <db_folder>/projections/<graph_name>.
+int64_t compute_topology_snapshot_bytes(
+    const std::string& db_folder,
+    const std::string& graph_name)
+{
+    int64_t snapshot_bytes = 0;
     try {
-        graph_name = parse_graph_name(ctx);
-    } catch (const std::exception& e) {
-        throw std::runtime_error(
-            "Invalid graphName parameter: " + std::string(e.what()) + "\n\n"
-            "The first parameter must be a STRING containing the projection name.\n"
-            "Example: CALL PROJECT('myProjection', ...)");
+        std::string proj_dir = db_folder + "/projections/" + graph_name;
+        std::filesystem::path fwd = std::filesystem::path(proj_dir) / "topology_fwd.csr";
+        std::filesystem::path rev = std::filesystem::path(proj_dir) / "topology_rev.csr";
+        std::error_code ec;
+        if (std::filesystem::exists(fwd, ec)) {
+            auto sz = std::filesystem::file_size(fwd, ec);
+            if (!ec) {
+                snapshot_bytes += static_cast<int64_t>(sz);
+            }
+        }
+        if (std::filesystem::exists(rev, ec)) {
+            auto sz = std::filesystem::file_size(rev, ec);
+            if (!ec) {
+                snapshot_bytes += static_cast<int64_t>(sz);
+            }
+        }
+    } catch (...) {
+        // Defensive: any filesystem exception leaves snapshot_bytes at 0.
+        snapshot_bytes = 0;
     }
-    validate_projection_name(graph_name);
+    return snapshot_bytes;
+}
 
-    // Refuse duplicate names up-front, before any build state exists.
-    // NativeProjectionBuilder's constructor performs the same check, but by
-    // then the rollback in Step 10 is armed and would tear down the
-    // PRE-EXISTING projection directory instead of just failing. Message
-    // kept identical to ProjectionManager::create_projection.
-    if (ProjectionManager::get_instance().projection_exists(graph_name)) {
-        throw std::runtime_error("Projection '" + graph_name + "' already exists");
-    }
+} // namespace
 
-    // Step 3: Parse optional config map ONCE (needed for global defaults)
+// =============================================================================
+// Config-map parsing (Step 3 of execute)
+// =============================================================================
+
+// Parses the optional 4th `configuration` map argument into a ParsedConfig:
+// global property lists / orientation / aggregation, the GNN extension
+// fields, the storage-format options (indexSet, leafFormat, graphStorage,
+// includeLabelIndexes, buildTopologySnapshot), the CSR_HYBRID-supersedes-
+// sidecar rule, and the GNN-intent auto-defaults. Assumes the argument-count
+// check already passed; when no config map was given (or the 4th argument is
+// not a map) every field keeps its documented default. May print notices to
+// stderr; throws QueryException / runtime_error on invalid values.
+ProjectProcedure::ParsedConfig ProjectProcedure::parse_config_options(ProcedureContext& ctx) {
     std::vector<std::string> global_node_properties;
     std::vector<std::string> global_edge_properties;
     Orientation global_orientation = Orientation::NATURAL;
@@ -348,25 +485,57 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         }
     }
 
-    // Validate includeFeatures against catalog (must be a registered FeatureMatrix)
-    if (!include_features.empty()) {
-        const auto& names = gql_model.catalog.gnn_feature_names;
-        if (std::find(names.begin(), names.end(), include_features) == names.end()) {
-            std::string msg = "feature '" + include_features + "' not found.\n\n";
-            if (names.empty()) {
-                msg += "No features exist. Create one first with:\n"
-                       "  mdb import data.gql <db> --with-tensors features.npy";
-            } else {
-                msg += "Available features: [";
-                for (size_t i = 0; i < names.size(); i++) {
-                    if (i > 0) msg += ", ";
-                    msg += "'" + names[i] + "'";
-                }
-                msg += "]";
-            }
-            throw std::runtime_error(msg);
-        }
+    ParsedConfig parsed;
+    parsed.global_node_properties = std::move(global_node_properties);
+    parsed.global_edge_properties = std::move(global_edge_properties);
+    parsed.global_orientation = global_orientation;
+    parsed.global_aggregation = global_aggregation;
+    parsed.global_aggregation_property = std::move(global_aggregation_property);
+    parsed.include_features = std::move(include_features);
+    parsed.label_property = std::move(label_property);
+    parsed.split_property = std::move(split_property);
+    parsed.include_label_indexes = include_label_indexes;
+    parsed.index_set = index_set;
+    parsed.leaf_format = leaf_format;
+    parsed.graph_storage = graph_storage;
+    parsed.build_topology_snapshot = build_topology_snapshot;
+    return parsed;
+}
+
+// =============================================================================
+// Main execution
+// =============================================================================
+
+void ProjectProcedure::execute(ProcedureContext& ctx) {
+    // Step 1: Validate parameter count
+    validate_argument_count(ctx);
+
+    // Step 2: Parse and validate graphName
+    std::string graph_name;
+    try {
+        graph_name = parse_graph_name(ctx);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "Invalid graphName parameter: " + std::string(e.what()) + "\n\n"
+            "The first parameter must be a STRING containing the projection name.\n"
+            "Example: CALL PROJECT('myProjection', ...)");
     }
+    validate_projection_name(graph_name);
+
+    // Refuse duplicate names up-front, before any build state exists.
+    // NativeProjectionBuilder's constructor performs the same check, but by
+    // then the rollback in Step 10 is armed and would tear down the
+    // PRE-EXISTING projection directory instead of just failing. Message
+    // kept identical to ProjectionManager::create_projection.
+    if (ProjectionManager::get_instance().projection_exists(graph_name)) {
+        throw std::runtime_error("Projection '" + graph_name + "' already exists");
+    }
+
+    // Step 3: Parse optional config map ONCE (needed for global defaults)
+    ParsedConfig cfg = parse_config_options(ctx);
+
+    // Validate includeFeatures against catalog (must be a registered FeatureMatrix)
+    validate_include_features(cfg.include_features);
 
     // Step 4: Parse nodeProjection (STRING, LIST, or MAP)
     NodeProjectionVariant node_projection_variant;
@@ -394,7 +563,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
         if (rel_type == GQL_OID::Type::DICTIONARY) {
             // Map syntax: parse with global defaults
             rel_projection_variant = parse_relationship_projection_map(
-                rel_arg, global_orientation, global_aggregation);
+                rel_arg, cfg.global_orientation, cfg.global_aggregation);
         } else {
             // String or list syntax
             rel_projection_variant = parse_relationship_projection(ctx);
@@ -415,69 +584,28 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
 
     // Step 6: Extract node labels and properties from variant
     std::vector<std::string> node_labels;
-    std::vector<std::string> node_properties = global_node_properties;
+    std::vector<std::string> node_properties = cfg.global_node_properties;
     std::unordered_map<std::string, PropertyConfig> node_property_configs;
 
-    if (std::holds_alternative<std::vector<std::string>>(node_projection_variant)) {
-        node_labels = std::get<std::vector<std::string>>(node_projection_variant);
-    } else {
-        const auto& node_map = std::get<NodeProjectionMap>(node_projection_variant);
-        for (const auto& [projected_label, config] : node_map) {
-            node_labels.push_back(config.label);
-            for (const auto& prop : config.simple_properties) {
-                if (std::find(node_properties.begin(), node_properties.end(), prop) == node_properties.end()) {
-                    node_properties.push_back(prop);
-                }
-            }
-            for (const auto& [prop_key, prop_config] : config.property_configs) {
-                const std::string& source_prop = prop_config.source_property.empty() ? prop_key : prop_config.source_property;
-                if (std::find(node_properties.begin(), node_properties.end(), source_prop) == node_properties.end()) {
-                    node_properties.push_back(source_prop);
-                }
-                node_property_configs[prop_key] = prop_config;
-            }
-        }
-    }
+    flatten_node_projection(
+        node_projection_variant, node_labels, node_properties, node_property_configs);
 
     // Step 7: Extract relationship types and per-type configuration from variant
     std::vector<std::string> relationship_types;
-    std::vector<std::string> edge_properties = global_edge_properties;
+    std::vector<std::string> edge_properties = cfg.global_edge_properties;
     std::unordered_map<std::string, PropertyConfig> edge_property_configs;
-    Orientation orientation = global_orientation;
-    Aggregation aggregation = global_aggregation;
-    std::string aggregation_property = global_aggregation_property;
+    Orientation orientation = cfg.global_orientation;
+    Aggregation aggregation = cfg.global_aggregation;
+    std::string aggregation_property = cfg.global_aggregation_property;
 
     std::unordered_map<std::string, Orientation> type_orientations;
     std::unordered_map<std::string, Aggregation> type_aggregations;
     std::unordered_map<std::string, std::string> type_agg_properties;
 
-    if (std::holds_alternative<std::vector<std::string>>(rel_projection_variant)) {
-        relationship_types = std::get<std::vector<std::string>>(rel_projection_variant);
-    } else {
-        const auto& rel_map = std::get<RelationshipProjectionMap>(rel_projection_variant);
-        for (const auto& [projected_type, config] : rel_map) {
-            relationship_types.push_back(config.type);
-
-            type_orientations[config.type] = config.orientation;
-            type_aggregations[config.type] = config.aggregation;
-            if (!config.aggregation_property.empty()) {
-                type_agg_properties[config.type] = config.aggregation_property;
-            }
-
-            for (const auto& prop : config.simple_properties) {
-                if (std::find(edge_properties.begin(), edge_properties.end(), prop) == edge_properties.end()) {
-                    edge_properties.push_back(prop);
-                }
-            }
-            for (const auto& [prop_key, prop_config] : config.property_configs) {
-                const std::string& source_prop = prop_config.source_property.empty() ? prop_key : prop_config.source_property;
-                if (std::find(edge_properties.begin(), edge_properties.end(), source_prop) == edge_properties.end()) {
-                    edge_properties.push_back(source_prop);
-                }
-                edge_property_configs[prop_key] = prop_config;
-            }
-        }
-    }
+    flatten_relationship_projection(
+        rel_projection_variant, relationship_types, edge_properties,
+        edge_property_configs, type_orientations, type_aggregations,
+        type_agg_properties);
 
     // Step 8: Deduplicate labels and types (user may pass duplicates)
     deduplicate(node_labels);
@@ -522,14 +650,14 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             type_agg_properties,
             node_property_configs,
             edge_property_configs,
-            include_features,
-            label_property,
-            split_property,
-            include_label_indexes,
-            index_set,
-            build_topology_snapshot,
-            leaf_format,
-            graph_storage
+            cfg.include_features,
+            cfg.label_property,
+            cfg.split_property,
+            cfg.include_label_indexes,
+            cfg.index_set,
+            cfg.build_topology_snapshot,
+            cfg.leaf_format,
+            cfg.graph_storage
         );
         builder.scan_nodes_by_labels(node_labels);
         builder.scan_edges_by_types(relationship_types);
@@ -560,34 +688,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("featureDim", ctx.create_int(static_cast<int64_t>(stats.feature_dim)));
     ctx.yield("numClasses", ctx.create_int(static_cast<int64_t>(stats.num_classes)));
 
-    // Compute `topologySnapshotBytes`: the combined byte size of the two mmap-backed
-    // CSR sidecar files (topology_fwd.csr and topology_rev.csr) produced by the
-    // builder when buildTopologySnapshot=true. Reports 0 when the flag was false,
-    // when neither direction was eligible (the active IndexSet lacked both edge
-    // indexes), or when stat'ing the files fails for any reason (filesystem errors
-    // are swallowed here — the projection itself is the real build product).
-    int64_t snapshot_bytes = 0;
-    try {
-        std::string proj_dir = db_folder + "/projections/" + graph_name;
-        std::filesystem::path fwd = std::filesystem::path(proj_dir) / "topology_fwd.csr";
-        std::filesystem::path rev = std::filesystem::path(proj_dir) / "topology_rev.csr";
-        std::error_code ec;
-        if (std::filesystem::exists(fwd, ec)) {
-            auto sz = std::filesystem::file_size(fwd, ec);
-            if (!ec) {
-                snapshot_bytes += static_cast<int64_t>(sz);
-            }
-        }
-        if (std::filesystem::exists(rev, ec)) {
-            auto sz = std::filesystem::file_size(rev, ec);
-            if (!ec) {
-                snapshot_bytes += static_cast<int64_t>(sz);
-            }
-        }
-    } catch (...) {
-        // Defensive: any filesystem exception leaves snapshot_bytes at 0.
-        snapshot_bytes = 0;
-    }
+    int64_t snapshot_bytes = compute_topology_snapshot_bytes(db_folder, graph_name);
     ctx.yield("topologySnapshotBytes", ctx.create_int(snapshot_bytes));
 
     ctx.yield_row();

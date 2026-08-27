@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,6 +12,21 @@
 #include "query/procedure/procedure_context.h"
 
 class DictionaryObject;
+
+// Opaque declarations for the storage-format enums held by
+// ProjectProcedure::ParsedConfig. Their definitions live in
+// storage/index/bplus_tree/bpt_leaf_format.h and
+// graph_models/gql/projection/index_set.h; the latter transitively includes
+// native_projection_builder.h, which includes this header back, so a full
+// include here would be circular.
+namespace BPT {
+enum class LeafFormat : uint8_t;
+enum class GraphStorage : uint8_t;
+} // namespace BPT
+
+namespace GQL {
+enum class IndexSet : uint8_t;
+} // namespace GQL
 
 namespace GQL {
 namespace Procedures {
@@ -250,6 +266,35 @@ public:
     void execute(ProcedureContext& ctx) override;
 
 private:
+    // ── Config-map parsing ────────────────────────────────────────────────
+
+    /// Every option parsed from the optional 4th `configuration` map argument
+    /// of graph_project(). Produced exclusively by parse_config_options(),
+    /// which assigns ALL fields (documented defaults included) — hence no
+    /// member initializers: the three enum types are only opaque-declared at
+    /// this point in the header.
+    struct ParsedConfig {
+        std::vector<std::string> global_node_properties;  ///< `nodeProperties`
+        std::vector<std::string> global_edge_properties;  ///< `relationshipProperties`
+        Orientation global_orientation;                   ///< `orientation` (default NATURAL)
+        Aggregation global_aggregation;                   ///< `aggregation` (default SINGLE)
+        std::string global_aggregation_property;          ///< resolved `aggregationProperty`
+        std::string include_features;                     ///< GNN: `includeFeatures` ("" = disabled)
+        std::string label_property;                       ///< GNN: `labelProperty` ("" = disabled)
+        std::string split_property;                       ///< GNN: `splitProperty` ("" = disabled)
+        bool include_label_indexes;                       ///< `includeLabelIndexes` (default true)
+        GQL::IndexSet index_set;                          ///< `indexSet` (default ALL)
+        BPT::LeafFormat leaf_format;                      ///< `leafFormat` (default BITSET)
+        BPT::GraphStorage graph_storage;                  ///< `graphStorage` (default BTREE)
+        bool build_topology_snapshot;                     ///< `buildTopologySnapshot` (default false)
+    };
+
+    /// Parse the optional configuration map (argument index 3) into a
+    /// ParsedConfig. A missing or non-map 4th argument yields the documented
+    /// defaults; invalid values throw. May print notices to stderr (the
+    /// CSR_HYBRID sidecar supersedence and the GNN-intent auto-defaults).
+    ParsedConfig parse_config_options(ProcedureContext& ctx);
+
     // ── Argument parsing ──────────────────────────────────────────────────
 
     /// Parse graphName from argument 0.
