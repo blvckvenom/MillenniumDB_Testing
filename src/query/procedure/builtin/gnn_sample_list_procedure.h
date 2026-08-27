@@ -18,7 +18,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.sample_list()
+ *   CALL gnn_sample_list()
  *   YIELD sampleName, projectionName, totalBatches, uniqueNodes, createdAt
  * @endcode
  *
@@ -26,20 +26,20 @@ namespace Procedures {
  *
  * @code{.gql}
  *   -- List all sample sets
- *   CALL gnn.sample_list()
+ *   CALL gnn_sample_list()
  *   YIELD sampleName, projectionName, totalBatches
  *   RETURN sampleName, projectionName, totalBatches;
  *
  *   -- Filter by projection
- *   CALL gnn.sample_list()
+ *   CALL gnn_sample_list()
  *   YIELD sampleName, projectionName, totalBatches
  *   WHERE projectionName = 'social_graph'
  *   RETURN sampleName, totalBatches;
  * @endcode
  *
- * @see gnn.offline_sample() to create new sample sets
- * @see gnn.sample_info() to get detailed information about a specific sample set
- * @see gnn.sample_drop() to delete sample sets
+ * @see gnn_offline_sample() to create new sample sets
+ * @see gnn_sample_info() to get detailed information about a specific sample set
+ * @see gnn_sample_drop() to delete sample sets
  */
 class GnnSampleListProcedure : public Procedure {
 public:

@@ -18,7 +18,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.sample_info(sampleName)
+ *   CALL gnn_sample_info(sampleName)
  *   YIELD sampleName, projectionName, totalBatches, trainBatches, ...
  * @endcode
  *
@@ -32,19 +32,19 @@ namespace Procedures {
  *
  * @code{.gql}
  *   -- Get all info about a sample set
- *   CALL gnn.sample_info('training_v1')
+ *   CALL gnn_sample_info('training_v1')
  *   YIELD sampleName, projectionName, totalBatches, fanouts, batchSize
  *   RETURN *;
  *
  *   -- Check specific configuration
- *   CALL gnn.sample_info('training_v1')
+ *   CALL gnn_sample_info('training_v1')
  *   YIELD fanouts, batchSize, randomSeed
  *   RETURN fanouts, batchSize, randomSeed;
  * @endcode
  *
- * @see gnn.sample_list() to list all sample sets
- * @see gnn.offline_sample() to create new sample sets
- * @see gnn.sample_drop() to delete sample sets
+ * @see gnn_sample_list() to list all sample sets
+ * @see gnn_offline_sample() to create new sample sets
+ * @see gnn_sample_drop() to delete sample sets
  */
 class GnnSampleInfoProcedure : public Procedure {
 public:

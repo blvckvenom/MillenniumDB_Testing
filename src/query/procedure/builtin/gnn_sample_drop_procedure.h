@@ -18,7 +18,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.sample_drop(sampleName)
+ *   CALL gnn_sample_drop(sampleName)
  *   YIELD success, message
  * @endcode
  *
@@ -32,21 +32,21 @@ namespace Procedures {
  *
  * @code{.gql}
  *   -- Delete a sample set
- *   CALL gnn.sample_drop('old_samples')
+ *   CALL gnn_sample_drop('old_samples')
  *   YIELD success, message
  *   RETURN success, message;
  *
  *   -- Check before deleting
- *   CALL gnn.sample_list() YIELD sampleName
+ *   CALL gnn_sample_list() YIELD sampleName
  *   WHERE sampleName = 'old_samples'
  *   RETURN sampleName;
  *   -- If exists:
- *   CALL gnn.sample_drop('old_samples') YIELD success;
+ *   CALL gnn_sample_drop('old_samples') YIELD success;
  * @endcode
  *
- * @see gnn.sample_list() to list all sample sets
- * @see gnn.sample_info() to get information before deleting
- * @see gnn.offline_sample() to create new sample sets
+ * @see gnn_sample_list() to list all sample sets
+ * @see gnn_sample_info() to get information before deleting
+ * @see gnn_offline_sample() to create new sample sets
  */
 class GnnSampleDropProcedure : public Procedure {
 public:

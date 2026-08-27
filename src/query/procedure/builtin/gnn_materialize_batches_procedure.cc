@@ -22,7 +22,7 @@ namespace GQL::Procedures {
 void GnnMaterializeBatchesProcedure::execute(ProcedureContext& ctx) {
     using namespace mdb::gnn;
 
-    // Deprecation notice (audit 2026-06-04): gnn_materialize_batches is redundant.
+    // Deprecation notice: gnn_materialize_batches is redundant.
     // gnn_build_feature_store is self-sufficient — it reorders + packs directly
     // from the sample. This procedure's packed/ output is not consumed by the
     // downstream stages (it is deleted by the next stage). Prefer calling

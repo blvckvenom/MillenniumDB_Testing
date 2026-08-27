@@ -19,7 +19,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.hnsw.find_similar(indexName, nodeId, k, ef)
+ *   CALL gnn_hnsw_find_similar(indexName, nodeId, k, ef)
  *   YIELD similar_node, distance
  * @endcode
  *
@@ -42,19 +42,19 @@ namespace Procedures {
  *
  * @code{.gql}
  *   -- Find 10 most similar nodes to node 42
- *   CALL gnn.hnsw.find_similar('arxiv_idx', 42, 10, 100)
+ *   CALL gnn_hnsw_find_similar('arxiv_idx', 42, 10, 100)
  *   YIELD similar_node, distance
  *   RETURN similar_node, distance;
  *
  *   -- Find similar nodes and get their properties
- *   CALL gnn.hnsw.find_similar('arxiv_idx', 42, 5, 50)
+ *   CALL gnn_hnsw_find_similar('arxiv_idx', 42, 5, 50)
  *   YIELD similar_node, distance
  *   MATCH (n) WHERE id(n) = similar_node
  *   RETURN n.title, distance;
  * @endcode
  *
- * @see gnn.hnsw.create() to create an index
- * @see gnn.hnsw.list() to list existing indexes
+ * @see gnn_hnsw_create() to create an index
+ * @see gnn_hnsw_list() to list existing indexes
  */
 class GnnHnswFindSimilarProcedure : public Procedure {
 public:

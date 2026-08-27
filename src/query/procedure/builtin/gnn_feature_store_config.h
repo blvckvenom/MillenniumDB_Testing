@@ -72,13 +72,17 @@ inline mdb::gnn::FourLevelStore::Config build_feature_store_config(const DictOpt
         // the real train host (eliminates the build-host != train-host cache
         // mismatch and keeps the .bin out of the build artifacts).
         if (auto v = opts->get_bool("noCacheBin")) config.no_cache_bin = *v;
-        // packFullFeatures is DEPRECATED AND REMOVED (infeasible: ~18x the feature
-        // matrix, no cross-batch dedup). Hard-refused from either build path.
+        // packFullFeatures is DEPRECATED AND REMOVED. It stored every batch's
+        // full receptive field with no cross-batch dedup, so its size scales
+        // with the sum of receptive fields — measured ~18x the feature matrix
+        // on a 3-hop sample — and it re-reads that same multiple per epoch.
+        // Hard-refused from either build path.
         if (opts->get_bool("packFullFeatures")) {
             throw std::runtime_error(
                 "packFullFeatures is deprecated and removed: the packed-full feature "
-                "store is infeasible (~18x the feature matrix) and is no longer "
-                "supported; use the default four-level feature store.");
+                "store duplicates every batch's receptive field (~18x the feature "
+                "matrix on deep-fanout samples) and is no longer supported; "
+                "use the default four-level feature store.");
         }
         if (auto v = opts->get_bool("writeConsolidatedSlim")) config.write_consolidated_slim = *v;
         if (auto v = opts->get_bool("cleanupIntermediate")) {

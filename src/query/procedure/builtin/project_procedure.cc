@@ -130,8 +130,12 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
 
     // Disk-cost opt-out: when false, the projection skips the four label
     // B+Tree indexes (node_label, label_node, edge_label, label_edge).
-    // Default true preserves Neo4j-GDS parity and existing behavior. See
-    // analysis doc §3.A for the rationale and safety analysis.
+    // Default true keeps Neo4j-GDS parity and backward compatibility:
+    // `MATCH (n:Label)` on existing projections keeps working. The opt-out
+    // targets large builds whose query path never touches label lookups
+    // (the GNN procedures read topology, not labels); label queries against
+    // a projection built without these indexes raise a QueryException with
+    // a clear message instead of failing silently.
     bool include_label_indexes = true;
     GQL::IndexSet index_set = GQL::IndexSet::ALL;
     // Track whether the caller explicitly set indexSet, so the GNN-intent
@@ -307,7 +311,7 @@ void ProjectProcedure::execute(ProcedureContext& ctx) {
             && build_topology_snapshot) {
             std::cerr << "[graph_project] warning: buildTopologySnapshot is "
                          "ignored when graphStorage='CSR_HYBRID' — the in-leaf "
-                         "CSR supersedes the sidecar (design §3.8 D8)."
+                         "CSR supersedes the sidecar."
                       << std::endl;
             build_topology_snapshot = false;
         }

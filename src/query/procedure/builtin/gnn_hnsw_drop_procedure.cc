@@ -12,10 +12,10 @@ void GnnHnswDropProcedure::execute(ProcedureContext& ctx) {
     // Step 1: Validate argument count
     if (ctx.arguments.size() != 1) {
         throw std::runtime_error(
-            "gnn.hnsw.drop() requires exactly 1 argument, got " +
+            "gnn_hnsw_drop() requires exactly 1 argument, got " +
             std::to_string(ctx.arguments.size()) + ".\n\n"
             "Usage:\n"
-            "  CALL gnn.hnsw.drop(indexName)\n"
+            "  CALL gnn_hnsw_drop(indexName)\n"
             "  YIELD success"
         );
     }

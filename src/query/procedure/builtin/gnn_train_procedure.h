@@ -36,7 +36,7 @@ public:
             YieldField{"didConverge",     YieldType::BOOL,   "Stopped by convergence or early stopping"},
             YieldField{"bestValAccuracy", YieldType::FLOAT,  "Best validation accuracy achieved"},
             YieldField{"testAccuracy",    YieldType::FLOAT,  "Test accuracy at the FINAL epoch (-1.0 if no test split)"},
-            YieldField{"testAccuracyAtBestVal", YieldType::FLOAT, "Test accuracy at the best-validation epoch (paper protocol); -1.0 if trackTestAtBestVal is off or no test split"},
+            YieldField{"testAccuracyAtBestVal", YieldType::FLOAT, "Test accuracy at the best-validation epoch (test-at-best-val protocol); -1.0 if trackTestAtBestVal is off or no test split"},
             YieldField{"bestValEpoch",    YieldType::INT,    "0-indexed epoch that produced bestValAccuracy (0 if trackTestAtBestVal is off)"},
             YieldField{"trainSeconds",    YieldType::FLOAT,  "Total wall-clock training time in seconds"},
             YieldField{"assembleSeconds", YieldType::FLOAT,  "Cumulative batch assemble time across all train batches in seconds"},

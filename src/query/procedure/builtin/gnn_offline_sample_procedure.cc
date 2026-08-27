@@ -32,10 +32,10 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // Step 1: Validate argument count
     if (ctx.arguments.size() < 3 || ctx.arguments.size() > 4) {
         throw std::runtime_error(
-            "gnn.offline_sample() requires 3-4 arguments, got " +
+            "gnn_offline_sample() requires 3-4 arguments, got " +
             std::to_string(ctx.arguments.size()) + ".\n\n"
             "Usage:\n"
-            "  CALL gnn.offline_sample(projectionName, sampleName, fanouts [, options])\n"
+            "  CALL gnn_offline_sample(projectionName, sampleName, fanouts [, options])\n"
             "  YIELD sampleName, totalBatches, trainBatches, ...\n\n"
             "Parameters:\n"
             "  - projectionName (STRING): Source graph projection\n"
@@ -44,8 +44,8 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             "element = hop adjacent to seeds), e.g., [10, 15]\n"
             "  - options (MAP, optional): batchSize, trainRatio, randomSeed, etc.\n\n"
             "Examples:\n"
-            "  CALL gnn.offline_sample('social', 'samples_v1', [15, 10])\n"
-            "  CALL gnn.offline_sample('social', 'samples_v1', [15, 10], {batchSize: 512})"
+            "  CALL gnn_offline_sample('social', 'samples_v1', [15, 10])\n"
+            "  CALL gnn_offline_sample('social', 'samples_v1', [15, 10], {batchSize: 512})"
         );
     }
 
@@ -57,7 +57,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid projectionName parameter: " + std::string(e.what()) + "\n\n"
             "The first parameter must be a STRING containing the projection name.\n"
-            "Example: CALL gnn.offline_sample('myProjection', ...)"
+            "Example: CALL gnn_offline_sample('myProjection', ...)"
         );
     }
 
@@ -65,7 +65,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid projection name: name cannot be empty.\n"
             "Provide a non-empty string as the first argument.\n"
-            "Example: CALL gnn.offline_sample('myProjection', ...)"
+            "Example: CALL gnn_offline_sample('myProjection', ...)"
         );
     }
 
@@ -77,7 +77,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid sampleName parameter: " + std::string(e.what()) + "\n\n"
             "The second parameter must be a STRING containing the sample set name.\n"
-            "Example: CALL gnn.offline_sample('projection', 'mySamples', ...)"
+            "Example: CALL gnn_offline_sample('projection', 'mySamples', ...)"
         );
     }
 
@@ -85,7 +85,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid sample name: name cannot be empty.\n"
             "Provide a non-empty string as the second argument.\n"
-            "Example: CALL gnn.offline_sample('projection', 'mySamples', ...)"
+            "Example: CALL gnn_offline_sample('projection', 'mySamples', ...)"
         );
     }
 
@@ -166,7 +166,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
                 "  - useSymmetricTopology (STRING): 'auto'|'on'|'off' single pre-merged undirected slice (default: 'auto')\n"
                 "  - force (BOOL): Drop + re-create an existing sample set (default: false)\n\n"
                 "Example:\n"
-                "  CALL gnn.offline_sample('proj', 'samples', [15, 10], {\n"
+                "  CALL gnn_offline_sample('proj', 'samples', [15, 10], {\n"
                 "      batchSize: 512,\n"
                 "      trainRatio: 0.8,\n"
                 "      validationRatio: 0.1,\n"
@@ -206,7 +206,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     // Step 7: Check if sample already exists
     std::string db_folder = get_db_folder();
 
-    // `force` opt (2026-05-31) — when the sample already exists, drop it
+    // `force` option — when the sample already exists, drop it
     // and re-sample (matches gnn_materialize_batches / gnn_build_feature_store
     // force semantics) instead of hard-failing. The sample dir is self-contained,
     // so remove_all is an atomic-enough drop. Default false preserves the
@@ -221,9 +221,9 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
             "  1. Pass force:true to overwrite it in place\n"
             "  2. Use a different name for the new sample set\n"
             "  3. Delete the existing one first:\n"
-            "     CALL gnn.sample_drop('" + sample_name + "')\n"
+            "     CALL gnn_sample_drop('" + sample_name + "')\n"
             "  4. List existing samples:\n"
-            "     CALL gnn.sample_list() YIELD sampleName"
+            "     CALL gnn_sample_list() YIELD sampleName"
         );
     }
 
@@ -369,14 +369,15 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     }
 
     // -----------------------------------------------------------------------
-    // F1 (opt-in, default OFF): fold the feature-store build into the sampling
-    // command. With buildFeatureStore:true the four-level feature store is built
-    // right after the sample is written, so the data-dependent reorder /
-    // address-tables / blocks are produced in one call instead of requiring a
-    // separate gnn_build_feature_store invocation. Default off => byte-identical
-    // to prior behavior; the standalone gnn_build_feature_store verb remains.
-    // (F1.a: reuses the existing FourLevelStore::build; the fed-from-RAM reorder
-    //  that eliminates the batches.dat re-read is a later increment.)
+    // Folded feature-store build (opt-in, default OFF). With
+    // buildFeatureStore:true the four-level feature store is built right after
+    // the sample is written, so the data-dependent reorder / address-tables /
+    // blocks are produced in one call instead of requiring a separate
+    // gnn_build_feature_store invocation. Default off => byte-identical to
+    // prior behavior; the standalone gnn_build_feature_store verb remains.
+    // (This reuses the existing FourLevelStore::build, which re-reads the
+    // just-written sample from disk; a build fed from the in-RAM sample,
+    // eliminating that re-read, would be a further increment.)
     // -----------------------------------------------------------------------
     bool build_feature_store_done = false;
     std::string bfs_feature_name;
@@ -458,10 +459,11 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
         ctx.yield("sampleContentFp", ctx.create_string(std::string(fp_hex)));
     }
 
-    // Dynamic sampling-backend decision (Phase 1, INERT). The backend chosen by
-    // the hardware-based planner, the directions it would serve on GPU, and the
-    // reason. GPU_* is reported but the sampling ran on the CPU path (no kernel
-    // yet), so the output is byte-identical.
+    // Sampling-backend telemetry: the backend the hardware-based planner
+    // chose, the directions the GPU path serves, and the planner's reason.
+    // The plan was applied by the engine — a GPU backend whose pinned
+    // topology view registered ran the GPU kernel; otherwise the CPU
+    // out-of-core path ran and the plan is still reported here.
     ctx.yield("samplingBackend",    ctx.create_string(result.sampling_backend));
     ctx.yield("samplingDirections", ctx.create_string(result.sampling_directions));
     ctx.yield("samplingPlanReason", ctx.create_string(result.sampling_plan_reason));
@@ -492,7 +494,7 @@ void GnnOfflineSampleProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("rssCurrentEndBytes", ctx.create_int(
         static_cast<int64_t>(result.rss_current_end_bytes)));
 
-    // F1: feature-store build telemetry (only present when buildFeatureStore:true).
+    // Folded feature-store build telemetry (only present when buildFeatureStore:true).
     if (build_feature_store_done) {
         ctx.yield("buildFeatureStoreOk", ctx.create_bool(true));
         ctx.yield("featureName", ctx.create_string(bfs_feature_name));

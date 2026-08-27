@@ -13,10 +13,10 @@ void GnnHnswInfoProcedure::execute(ProcedureContext& ctx) {
     // Step 1: Validate argument count
     if (ctx.arguments.size() != 1) {
         throw std::runtime_error(
-            "gnn.hnsw.info() requires exactly 1 argument, got " +
+            "gnn_hnsw_info() requires exactly 1 argument, got " +
             std::to_string(ctx.arguments.size()) + ".\n\n"
             "Usage:\n"
-            "  CALL gnn.hnsw.info(indexName)\n"
+            "  CALL gnn_hnsw_info(indexName)\n"
             "  YIELD indexName, dimension, nodeCount, metric, M, efConstruction, layers"
         );
     }

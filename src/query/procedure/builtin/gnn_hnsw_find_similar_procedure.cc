@@ -18,10 +18,10 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
     // Step 1: Validate argument count
     if (ctx.arguments.size() != 4) {
         throw std::runtime_error(
-            "gnn.hnsw.find_similar() requires exactly 4 arguments, got " +
+            "gnn_hnsw_find_similar() requires exactly 4 arguments, got " +
             std::to_string(ctx.arguments.size()) + ".\n\n"
             "Usage:\n"
-            "  CALL gnn.hnsw.find_similar(indexName, nodeId, k, ef)\n"
+            "  CALL gnn_hnsw_find_similar(indexName, nodeId, k, ef)\n"
             "  YIELD similar_node, distance\n\n"
             "Parameters:\n"
             "  - indexName (STRING): Name of the HNSW index\n"
@@ -29,7 +29,7 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
             "  - k (INT): Number of similar nodes to return\n"
             "  - ef (INT): Number of candidates (higher = better recall)\n\n"
             "Example:\n"
-            "  CALL gnn.hnsw.find_similar('arxiv_idx', 42, 10, 100)"
+            "  CALL gnn_hnsw_find_similar('arxiv_idx', 42, 10, 100)"
         );
     }
 
@@ -115,7 +115,7 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
         auto index_names = gql_model.catalog.hnsw_index_manager.get_index_names();
         throw std::runtime_error(
             format_not_found_error("HNSW index", index_name, index_names,
-                                   "CALL gnn.hnsw.create('index_name', 'node_features')")
+                                   "CALL gnn_hnsw_create('index_name', 'node_features')")
         );
     }
 
@@ -123,7 +123,7 @@ void GnnHnswFindSimilarProcedure::execute(ProcedureContext& ctx) {
     if (!hnsw_index->uses_raw_embeddings()) {
         throw std::runtime_error(
             "HNSW index '" + index_name + "' was not created from GNN embeddings.\n"
-            "Only indexes created with gnn.hnsw.create() can be queried with this procedure."
+            "Only indexes created with gnn_hnsw_create() can be queried with this procedure."
         );
     }
 

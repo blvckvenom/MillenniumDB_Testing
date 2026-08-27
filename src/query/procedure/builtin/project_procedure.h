@@ -25,16 +25,17 @@ namespace Procedures {
  *
  * UNDIRECTED behavior depends on source edge type:
  * - **Directed source**: Stores two edges (A→B and B→A) with same edge_id
- * - **Undirected source**: No-op (already symmetric per ISO 39075 §3.4.13)
+ * - **Undirected source**: No-op. ISO/IEC 39075:2024 §3.4.13 defines the
+ *   undirected edge and notes it "expresses a relationship that is
+ *   necessarily symmetric", so both directions are already implied.
  *
  * This differs from Neo4j GDS, which always doubles (Neo4j has no native undirected edges).
  * MillenniumDB's approach is semantically correct: undirected edges are already symmetric.
  *
- * Storage overhead:
- * - NATURAL: 1.0× baseline
- * - REVERSE: 1.0× baseline
- * - UNDIRECTED on directed: ~1.75× baseline
- * - UNDIRECTED on undirected: 1.0× baseline (no-op)
+ * Storage cost: NATURAL and REVERSE store one record per source edge.
+ * UNDIRECTED on a directed source stores each edge in both directions, so
+ * the edge indexes roughly double while node and property data are
+ * unchanged; on an undirected source it stores nothing extra.
  */
 enum class Orientation {
     NATURAL,     ///< Default: edges as specified (from → to)
@@ -45,20 +46,35 @@ enum class Orientation {
 /**
  * @brief Aggregation strategy for parallel edges (multigraph support).
  *
- * Handles multiple edges between the same pair of nodes:
- * - SINGLE: Fail if parallel edges detected (default, strict validation)
- * - MIN: Keep edge with minimum property value
- * - MAX: Keep edge with maximum property value
- * - SUM: Sum property values across parallel edges
- * - COUNT: Count parallel edges and add as property
+ * Two edges are "parallel" when they share the same (from, to, type) triple
+ * after orientation is applied. The strategy decides what the projection
+ * stores for each such group:
+ * - SINGLE (default): refuse — parallel edges raise a QueryException that
+ *   asks the caller to pick an explicit collapse strategy, instead of
+ *   dropping data silently. Detection is windowed, not exact: the detector's
+ *   seen-edge set is cleared periodically to bound memory, so parallels far
+ *   apart in scan order can escape detection and both be stored.
+ * - MIN / MAX: keep the edge whose aggregation-property value is smallest /
+ *   largest; that edge's id becomes the group's representative. Edges
+ *   missing the property do not compete.
+ * - SUM: keep the first-seen edge, with the aggregation property replaced
+ *   by the sum over the whole group.
+ * - COUNT: keep the first-seen edge and attach the group size as a
+ *   synthetic `_count` property; no aggregation property is required.
  *
- * Based on Neo4j GDS aggregation patterns for multigraph analysis.
- * See: NEO4J_AGGREGATION_PATTERNS.md for detailed semantics.
+ * The value names follow Neo4j Graph Data Science: its Graph Data Science
+ * manual page "Native projection" lists the allowed aggregation values
+ * (NONE default, SINGLE, COUNT, MIN, MAX, SUM) under "Relationship
+ * projection", but does not define what SINGLE does
+ * (https://neo4j.com/docs/graph-data-science/current/management-ops/graph-creation/graph-project/).
+ * The behaviors above — SINGLE as strict fail-on-parallel and as our
+ * default, and NONE accepted as an alias for SINGLE — are this
+ * implementation's own definitions.
  *
- * Memory overhead: ~132 KB constant (independent of graph size)
- * Performance impact: 40% CPU overhead per edge (hash table lookup)
- *
- * @see Phase 2 implementation (M1.5_Implementation_Roadmap)
+ * Cost: aggregation state is bounded by construction (the duplicate
+ * detector holds one bounded batch of group keys; the streaming aggregator
+ * holds a single group at a time), so memory use is independent of graph
+ * size. The per-edge cost is one hash-table lookup on the group key.
  */
 enum class Aggregation {
     SINGLE,  ///< Default: fail on duplicate edges (strict validation)
@@ -159,23 +175,26 @@ using RelationshipProjectionVariant = std::variant<std::vector<std::string>, Rel
 /**
  * @brief Native graph projection procedure for MillenniumDB.
  *
- * Creates disk-based graph projections by scanning label_node and label_edge
- * B+Tree indexes directly, achieving O(n+m) complexity versus Cypher's O(n²+m²).
+ * Creates disk-based graph projections by scanning the label_node and
+ * label_edge B+Tree indexes directly — one pass over the projected nodes
+ * and one over the projected edges, with no pattern-matching executor
+ * involved.
  *
  * Syntax:
  * @code{.gql}
- *   CALL PROJECT(graphName, nodeProjection, relationshipProjection [, config])
+ *   CALL graph_project(graphName, nodeProjection, relationshipProjection [, config])
  *   YIELD graphName, nodeCount, relationshipCount, projectMillis
  * @endcode
  *
  * Examples:
  * @code{.gql}
- *   CALL PROJECT('myGraph', 'User', 'KNOWS')
- *   CALL PROJECT('social', ['User', 'Post'], ['KNOWS', 'LIKES'])
+ *   CALL graph_project('myGraph', 'User', 'KNOWS')
+ *   CALL graph_project('social', ['User', 'Post'], ['KNOWS', 'LIKES'])
  * @endcode
  *
- * @see ARCHITECTURE_DESIGN.md Section 3.1 for complete specification
- * @see ISO/IEC 39075:2024 Section 15 for CALL/YIELD semantics
+ * @see ISO/IEC 39075:2024, Clause 15 "Procedure calling" (15.1 <call
+ *      procedure statement>, 15.3 <named procedure call>) for CALL/YIELD
+ *      semantics
  */
 class ProjectProcedure : public Procedure {
 public:
@@ -201,7 +220,11 @@ public:
             Parameter("relationshipProjection", ParamType::ANY, true,
                 "String type (e.g., 'KNOWS') or list of types (e.g., ['KNOWS', 'LIKES'])"),
             Parameter("configuration", ParamType::ANY, false,
-                "Optional configuration map (reserved for future use)")
+                "Optional configuration map: orientation, aggregation, "
+                "aggregationProperty, nodeProperties, relationshipProperties, "
+                "indexSet, leafFormat, graphStorage, includeLabelIndexes, "
+                "buildTopologySnapshot, includeFeatures, labelProperty, "
+                "splitProperty")
         };
     }
 

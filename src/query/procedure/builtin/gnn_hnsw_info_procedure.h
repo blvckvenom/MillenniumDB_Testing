@@ -15,7 +15,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.hnsw.info(indexName)
+ *   CALL gnn_hnsw_info(indexName)
  *   YIELD indexName, dimension, nodeCount, metric, M, efConstruction
  * @endcode
  *
@@ -28,7 +28,7 @@ namespace Procedures {
  * ## Examples
  *
  * @code{.gql}
- *   CALL gnn.hnsw.info('arxiv_idx')
+ *   CALL gnn_hnsw_info('arxiv_idx')
  *   YIELD indexName, dimension, nodeCount, M
  *   RETURN indexName, dimension, nodeCount, M;
  * @endcode

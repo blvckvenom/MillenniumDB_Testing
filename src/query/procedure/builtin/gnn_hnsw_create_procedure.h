@@ -20,7 +20,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.hnsw.create(indexName, tensorKey [, options])
+ *   CALL gnn_hnsw_create(indexName, tensorKey [, options])
  *   YIELD indexName, dimension, nodeCount, buildTimeMs
  * @endcode
  *
@@ -45,12 +45,12 @@ namespace Procedures {
  *
  * @code{.gql}
  *   -- Basic usage with default options
- *   CALL gnn.hnsw.create('arxiv_idx', 'node_features')
+ *   CALL gnn_hnsw_create('arxiv_idx', 'node_features')
  *   YIELD indexName, dimension, nodeCount, buildTimeMs
  *   RETURN indexName, nodeCount, buildTimeMs;
  *
  *   -- With custom options
- *   CALL gnn.hnsw.create('arxiv_idx', 'node_features', {
+ *   CALL gnn_hnsw_create('arxiv_idx', 'node_features', {
  *       metric: 'cosine',
  *       M: 32,
  *       efConstruction: 400
@@ -59,9 +59,9 @@ namespace Procedures {
  *   RETURN indexName, dimension, nodeCount;
  * @endcode
  *
- * @see gnn.hnsw.find_similar() to search for similar nodes
- * @see gnn.hnsw.list() to list existing indexes
- * @see gnn.hnsw.drop() to delete an index
+ * @see gnn_hnsw_find_similar() to search for similar nodes
+ * @see gnn_hnsw_list() to list existing indexes
+ * @see gnn_hnsw_drop() to delete an index
  */
 class GnnHnswCreateProcedure : public Procedure {
 public:

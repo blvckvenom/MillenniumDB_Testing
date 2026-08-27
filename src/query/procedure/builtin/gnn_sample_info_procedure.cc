@@ -17,8 +17,8 @@ void GnnSampleInfoProcedure::execute(ProcedureContext& ctx) {
     // Validate argument count
     if (ctx.arguments.size() != 1) {
         throw std::runtime_error(
-            "gnn.sample_info() requires exactly 1 argument: sampleName\n"
-            "Usage: CALL gnn.sample_info('mySamples') YIELD ..."
+            "gnn_sample_info() requires exactly 1 argument: sampleName\n"
+            "Usage: CALL gnn_sample_info('mySamples') YIELD ..."
         );
     }
 
@@ -30,7 +30,7 @@ void GnnSampleInfoProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid sampleName parameter: " + std::string(e.what()) + "\n\n"
             "The parameter must be a STRING containing the sample set name.\n"
-            "Example: CALL gnn.sample_info('training_v1')"
+            "Example: CALL gnn_sample_info('training_v1')"
         );
     }
 
@@ -38,7 +38,7 @@ void GnnSampleInfoProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid sample name: name cannot be empty.\n"
             "Provide a non-empty string as the argument.\n"
-            "Example: CALL gnn.sample_info('training_v1')"
+            "Example: CALL gnn_sample_info('training_v1')"
         );
     }
 
@@ -63,7 +63,7 @@ void GnnSampleInfoProcedure::execute(ProcedureContext& ctx) {
 
             if (sample_names.empty()) {
                 available = "No sample sets exist. Create one first with:\n"
-                            "  CALL gnn.offline_sample('projection', 'name', [15, 10])";
+                            "  CALL gnn_offline_sample('projection', 'name', [15, 10])";
             } else {
                 available = "Available sample sets: [";
                 for (size_t i = 0; i < sample_names.size(); i++) {
@@ -74,7 +74,7 @@ void GnnSampleInfoProcedure::execute(ProcedureContext& ctx) {
             }
         } else {
             available = "No sample sets exist. Create one first with:\n"
-                        "  CALL gnn.offline_sample('projection', 'name', [15, 10])";
+                        "  CALL gnn_offline_sample('projection', 'name', [15, 10])";
         }
 
         throw std::runtime_error(

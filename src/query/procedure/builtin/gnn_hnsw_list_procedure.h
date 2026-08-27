@@ -15,14 +15,14 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.hnsw.list()
+ *   CALL gnn_hnsw_list()
  *   YIELD indexName, dimension, nodeCount, metric
  * @endcode
  *
  * ## Examples
  *
  * @code{.gql}
- *   CALL gnn.hnsw.list()
+ *   CALL gnn_hnsw_list()
  *   YIELD indexName, nodeCount
  *   RETURN indexName, nodeCount;
  * @endcode

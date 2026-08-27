@@ -225,8 +225,8 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
         EmbeddingWriter::Config wconfig;
         wconfig.property_name       = write_property;
         wconfig.coverage            = write_coverage;
-        // 'seeds' leaves the fanouts empty so Phase B's on-the-fly k-hop
-        // inference is skipped outright.
+        // 'seeds' leaves the fanouts empty so the on-the-fly k-hop
+        // inference of non-seed nodes is skipped outright.
         if (write_coverage == EmbeddingWriter::Coverage::ALL) {
             wconfig.fanouts         = catalog.fanouts;
         }
@@ -257,7 +257,7 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     double l1r = tot > 0 ? double(l1h) / double(tot) : 0.0;
     double l2r = tot > 0 ? double(l2h) / double(tot) : 0.0;
 
-    // Byte-level disk-traffic accounting (2026-04-27).
+    // Byte-level disk-traffic accounting.
     uint64_t l3_bytes_disk   = stats.l3_bytes_disk.load();
     uint64_t l4_bytes_disk   = stats.l4_bytes_disk.load();
     uint64_t l3_bytes_wanted = stats.l3_bytes_wanted.load();
@@ -282,7 +282,8 @@ void GnnPredictProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",            ctx.create_float(static_cast<float>(l2r)));
     ctx.yield("l3Reads",               ctx.create_int(static_cast<int64_t>(l3r_count)));
     ctx.yield("l4Reads",               ctx.create_int(static_cast<int64_t>(l4r_count)));
-    // Byte-level disk-traffic surface — paper comparable.
+    // Byte-level disk-traffic surface, comparable to DiskGNN's (SIGMOD 2025)
+    // Table 1 row "Disk access volume (GB)".
     ctx.yield("l3BytesDisk",           ctx.create_int(static_cast<int64_t>(l3_bytes_disk)));
     ctx.yield("l4BytesDisk",           ctx.create_int(static_cast<int64_t>(l4_bytes_disk)));
     ctx.yield("totalBytesDisk",        ctx.create_int(static_cast<int64_t>(total_bytes_disk)));

@@ -15,7 +15,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.hnsw.drop(indexName)
+ *   CALL gnn_hnsw_drop(indexName)
  *   YIELD success
  * @endcode
  *
@@ -28,7 +28,7 @@ namespace Procedures {
  * ## Examples
  *
  * @code{.gql}
- *   CALL gnn.hnsw.drop('arxiv_idx')
+ *   CALL gnn_hnsw_drop('arxiv_idx')
  *   YIELD success
  *   RETURN success;
  * @endcode

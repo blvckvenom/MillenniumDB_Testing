@@ -21,7 +21,7 @@ namespace Procedures {
  * ## Syntax
  *
  * @code{.gql}
- *   CALL gnn.offline_sample(projectionName, sampleName, fanouts [, options])
+ *   CALL gnn_offline_sample(projectionName, sampleName, fanouts [, options])
  *   YIELD sampleName, totalBatches, trainBatches, validationBatches,
  *         testBatches, uniqueNodes, storagePath, computeMillis
  * @endcode
@@ -58,12 +58,12 @@ namespace Procedures {
  *
  * @code{.gql}
  *   -- Basic usage with default options
- *   CALL gnn.offline_sample('social_graph', 'training_v1', [15, 10, 5])
+ *   CALL gnn_offline_sample('social_graph', 'training_v1', [15, 10, 5])
  *   YIELD sampleName, totalBatches, computeMillis
  *   RETURN sampleName, totalBatches, computeMillis;
  *
  *   -- With custom options
- *   CALL gnn.offline_sample('social', 'samples_v1', [15, 10], {
+ *   CALL gnn_offline_sample('social', 'samples_v1', [15, 10], {
  *       batchSize: 512,
  *       trainRatio: 0.8,
  *       validationRatio: 0.1,
@@ -75,9 +75,9 @@ namespace Procedures {
  *   RETURN sampleName, totalBatches, uniqueNodes;
  * @endcode
  *
- * @see gnn.sample_list() to list existing sample sets
- * @see gnn.sample_info() to get sample set details
- * @see gnn.sample_drop() to delete sample sets
+ * @see gnn_sample_list() to list existing sample sets
+ * @see gnn_sample_info() to get sample set details
+ * @see gnn_sample_drop() to delete sample sets
  */
 class GnnOfflineSampleProcedure : public Procedure {
 public:
@@ -150,10 +150,12 @@ public:
                 "populate instead of re-running train and comparing testAccuracy."},
             YieldField{"samplingBackend", YieldType::STRING,
                 "Sampling backend chosen by the hardware-based planner: "
-                "CPU_OUT_OF_CORE, GPU_UVA, or GPU_VRAM_COPY. Phase 1 is inert — "
-                "GPU_* is reported but the sampling ran on the CPU out-of-core path."},
+                "CPU_OUT_OF_CORE, GPU_UVA, or GPU_VRAM_COPY. A GPU_* backend "
+                "runs the GPU kernel only when the pinned topology view "
+                "registers successfully; otherwise sampling falls back to the "
+                "CPU out-of-core path while this yield still reports the plan."},
             YieldField{"samplingDirections", YieldType::STRING,
-                "Graph directions the GPU path would serve under the chosen "
+                "Graph directions the GPU path serves under the chosen "
                 "backend: NONE, FORWARD_ONLY, REVERSE_ONLY, or BOTH."},
             YieldField{"samplingPlanReason", YieldType::STRING,
                 "Human-readable reason for the sampling-backend decision "

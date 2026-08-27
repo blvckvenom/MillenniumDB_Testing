@@ -159,7 +159,7 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
     auto rmap_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".rmap");
 
-    // Address-tables-only mode (added 2026-05-20) — when the caller asks for ONLY
+    // Address-tables-only mode — when the caller asks for ONLY
     // buildAddrTables=true with all force flags off AND the prior feature store
     // is fully on disk (store.meta exists), we can rebuild addr_tables/
     // sidecars without re-opening the source FeatureMatrix. This unblocks
@@ -278,7 +278,7 @@ void GnnBuildFeatureStoreProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("cpuCacheMb",   ctx.create_int(bytes_to_mb(result.cpu_cache_bytes)));
     ctx.yield("totalDiskMb",  ctx.create_int(bytes_to_mb(result.total_disk_bytes)));
     ctx.yield("overBudget",   ctx.create_bool(result.over_budget));
-    // Offline address-table build telemetry (added 2026-05-19).
+    // Offline address-table build telemetry.
     ctx.yield("addrTablesMb",
               ctx.create_int(bytes_to_mb(result.addr_tables_bytes)));
     ctx.yield("addrTablesBuiltOk",

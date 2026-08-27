@@ -151,9 +151,9 @@ static void write_training_log(
     // when every requested node was resolved (note that l3 also accumulates
     // misses where the node was outside the projection — see four_level_store.cc).
     //
-    // Byte-level fields are included for paper-comparable disk-traffic
-    // accounting (DiskGNN SIGMOD'25 Table 1 column "Disk access volume (GB)"
-    // = total_bytes_disk).
+    // Byte-level fields are included for disk-traffic accounting comparable
+    // to DiskGNN (SIGMOD 2025) Table 1, row "Disk access volume (GB)"
+    // (= total_bytes_disk).
     f << "  \"cache_stats\": {\n";
     f << "    \"l1_hits\": "              << cache_stats.l1_hits              << ",\n";
     f << "    \"l2_hits\": "              << cache_stats.l2_hits              << ",\n";
@@ -435,38 +435,45 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // (the default, and the historical behaviour) writes every node in the
     // projection, inferring the non-seeds on the fly; 'seeds' writes only the
     // nodes that were sampling seeds, which under usePredefinedSplits is
-    // exactly the labelled train/val/test set. 'all' is unaffordable at
-    // papers100M scale, and EmbeddingWriter refuses it when the host cannot
-    // hold the result.
+    // exactly the labelled train/val/test set. 'all' is unaffordable on
+    // graphs with hundreds of millions of nodes (ogbn-papers100M scale), and
+    // EmbeddingWriter refuses it when the host cannot hold the result.
     EmbeddingWriter::Coverage write_coverage = EmbeddingWriter::Coverage::ALL;
-    uint64_t    inference_batch_size = 0;    // 0 = use EmbeddingWriter default (Phase B chunk size)
+    uint64_t    inference_batch_size = 0;    // 0 = EmbeddingWriter's default non-seed inference chunk size
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
     bool        save_final       = true;
-    std::string profile_log_path = "";  // Phase 0 per-batch timing CSV (empty = disabled)
-    // Read-only isolation bench (2026-06-05): skip model forward/backward +
-    // validation; run only the producer (read_sample + load_batch_features +
-    // assemble). io_disk/epoch_t then measures the read path's throughput
-    // unthrottled by compute (settles pacing vs read-path-limit).
+    std::string profile_log_path = "";  // per-batch timing CSV (empty = disabled)
+    // Read-only isolation bench: skip model forward/backward + validation;
+    // run only the producer (read_sample + load_batch_features + assemble).
+    // The per-epoch disk-traffic and epoch-time yields then measure the read
+    // path's throughput unthrottled by compute, which tells a compute-paced
+    // read path apart from one running at its own limit.
     bool        read_only_bench  = false;
-    // Test-at-best-val protocol (2026-06-16): also eval the test split at the
-    // best-val epoch and yield testAccuracyAtBestVal (the paper §7.1 number).
+    // Test-at-best-val: also evaluate the test split at the best-validation
+    // epoch and yield testAccuracyAtBestVal. This is the protocol of DiskGNN
+    // (SIGMOD 2025) §7.1: "we report the test accuracy at the epoch when
+    // the highest validation accuracy is achieved".
     bool        track_test_at_best_val = false;
-    // LR schedule (2026-06-16): "cosine" = cosine decay (DEFAULT since 2026-06-17),
-    // "" = constant lr (DiskGNN-faithful, opt out via lrSchedule:''). Cosine made the
-    // default because it lifts papers100M test@best-val 0.6406 -> 0.6536 (>=0.652) with
-    // no downside; constant lr is the paper-faithful baseline that caps ~0.640.
-    // See docs/research/2026-06-16-accuracy-target/GAP_FINAL_SYNTHESIS.md.
+    // LR schedule: "cosine" = cosine decay (default), "" = constant lr
+    // (opt out via lrSchedule:''). Cosine is the default because on a
+    // 50-epoch GraphSAGE run over ogbn-papers100M it lifted test-at-best-val
+    // accuracy by over a point (~0.640 -> ~0.654) with no measured downside;
+    // constant lr stays available as the baseline for comparing against
+    // systems trained without a schedule.
     std::string lr_schedule = "cosine";
     // Async batch prefetcher: overlaps each batch's assemble+host-to-device
     // transfer with the previous batch's model forward+backward via a
-    // single-worker bounded-queue producer-consumer. Default true;
-    // 1.609× speedup measured on papers100M, bit-identical accuracy.
+    // single-worker bounded-queue producer-consumer. Default true: measured
+    // ~1.6× end-to-end training speedup on ogbn-papers100M with bit-identical
+    // accuracy (the producer and the model use disjoint state).
     bool        use_async_prefetcher = true;
     // Split assemble_kernel and model.forward+backward onto separate CUDA
     // streams (c10::cuda::CUDAStream + at::cuda::CUDAEvent cross-stream sync).
-    // Default false: measured neutral on celebi RTX 5070 Ti (1.4% over
-    // async prefetcher alone), so it remains opt-in.
+    // Default false: measured neutral (~1.4% over the async prefetcher alone)
+    // on a consumer 16 GB GPU — per-batch host-blocking syncs (loss.item())
+    // consume the concurrency window a second stream would exploit, and the
+    // assemble kernel is too small to contend for SMs — so it stays opt-in.
     bool        use_cuda_streams     = false;
     // Number of worker threads in AsyncBatchPrefetcher. Each worker owns a
     // private DirectIoReader and pinned host buffer so workers do not share
@@ -476,7 +483,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     uint64_t    prefetch_num_workers = 0;
     // AsyncBatchPrefetcher shared-queue size. The prefetcher caps live workers
     // at min(prefetch_num_workers, this), so N>2 workers need a larger queue.
-    // Default 2 (matching DiskGNN §6); auto-raised to the worker count below
+    // Default 2, matching DiskGNN (SIGMOD 2025) §6: "the sizes of all
+    // shared queues are set to 2"; auto-raised to the worker count below
     // if the caller bumped workers but left this default.
     uint64_t    prefetch_queue_size = 2;
 
@@ -546,7 +554,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         }
         // The AsyncBatchPrefetcher caps the live worker count at
         // min(prefetchNumWorkers, prefetchQueueSize), so N>2 workers require a
-        // larger queue. Expose the queue size; default stays 2 (DiskGNN §6).
+        // larger queue. Expose the queue size; default stays 2 (see the
+        // DiskGNN SIGMOD 2025 §6 note on the config default above).
         // Auto-raised to prefetchNumWorkers below if the caller bumped workers
         // but left the queue at the default.
         if (auto v = opts.get_int("prefetchQueueSize")) {
@@ -610,22 +619,22 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         if (auto v = opts.get_bool("saveFinal")) {
             save_final = *v;
         }
-        // Phase 0 (2026-05-17): per-batch profile CSV path. Empty disables.
+        // Per-batch profile CSV path. Empty disables.
         if (auto v = opts.get_string("profileLog")) {
             profile_log_path = *v;
         }
-        // Read-only isolation bench (2026-06-05): skip compute + validation.
+        // Read-only isolation bench: skip compute + validation.
         if (auto v = opts.get_bool("readOnlyBench")) {
             read_only_bench = *v;
         }
-        // Test-at-best-val protocol (2026-06-16): also evaluate the test split
-        // at the best-validation epoch and report it as testAccuracyAtBestVal
-        // (the DiskGNN paper §7.1 number). Default off; the final-epoch
-        // testAccuracy yield is unchanged either way.
+        // Test-at-best-val: also evaluate the test split at the
+        // best-validation epoch and report it as testAccuracyAtBestVal
+        // (the DiskGNN SIGMOD 2025 §7.1 protocol). Default off; the
+        // final-epoch testAccuracy yield is unchanged either way.
         if (auto v = opts.get_bool("trackTestAtBestVal")) {
             track_test_at_best_val = *v;
         }
-        // LR schedule (2026-06-16): "cosine" anneals lr -> ~0 over the run.
+        // LR schedule: "cosine" anneals lr -> ~0 over the run.
         if (auto v = opts.get_string("lrSchedule")) {
             lr_schedule = *v;
             if (!lr_schedule.empty() && lr_schedule != "cosine") {
@@ -705,12 +714,14 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // Resolve prefetchNumWorkers when unset (sentinel 0). The DEFAULT is 1
     // (single worker) to preserve REPRODUCIBILITY: the multi-worker prefetcher
     // delivers batches in a timing-dependent order, so N>1 training is NOT
-    // bit-reproducible across runs at a fixed seed (measured: cora testAcc
-    // wobbles 0.8796<->0.8870 at N=4; features ARE bit-identical, it is the
-    // batch ORDER that varies the SGD trajectory). Multi-worker is a SPEED
-    // opt-in (4.32x at N=8) enabled via the prefetchNumWorkers param or the env
-    // MDB_GNN_PREFETCH_WORKERS (a number, or "auto" = clamp(cores-4, 2, 8),
-    // NVMe-bound). Making it the safe default requires in-order batch delivery
+    // bit-reproducible across runs at a fixed seed (measured on the cora
+    // dataset: testAcc wobbles 0.8796<->0.8870 at N=4; features ARE
+    // bit-identical, it is the batch ORDER that varies the SGD trajectory).
+    // Multi-worker is a SPEED opt-in (measured 4.32x producer speedup at N=8
+    // with the sample on NVMe) enabled via the prefetchNumWorkers param or the env
+    // MDB_GNN_PREFETCH_WORKERS (a number, or "auto" = clamp(cores-4, 2, 8);
+    // beyond that the NVMe, not the CPU, is the limit). Making it the safe
+    // default requires in-order batch delivery
     // in AsyncBatchPrefetcher (a reorder buffer) — deferred. The OOM-safe cache
     // cap below still applies whenever N>1, so explicit multi-worker no longer
     // needs a manual sampleCacheMb to avoid the documented N>1 OOM.
@@ -745,8 +756,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // the explicit cache at the validated-safe 2 GB. N workers hold in-flight
     // pinned + combined buffers, and the kernel needs page-cache headroom for the
     // (>> RAM) reordered.fmat + packed_slim, so the naive MemAvailable/4 applied
-    // at BOTH cache sites (= MemAvailable/2) OOMs at N>1 (the documented
-    // death-during-val). The kernel page cache still uses the rest of RAM for the
+    // at BOTH cache sites (= MemAvailable/2) OOMs at N>1 (observed as the
+    // process being killed during the validation phase, when eval buffers
+    // stack on top of both caches). The kernel page cache still uses the rest of RAM for the
     // feature working set automatically, so the small explicit cap costs little.
     size_t auto_cache_budget_bytes = static_cast<size_t>(get_mem_available() / 4);
     if (prefetch_num_workers > 1) {
@@ -839,12 +851,13 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         }
     }
 
-    // Gate (A) — feature<->label integrity (2026-06-02). The labels<->splits
-    // guard above only verifies labels are PRESENT for TRAIN rows; it cannot
-    // detect a node_features.fmat whose feature ROWS are misaligned to node
-    // identity (the 2026-06-02 papers100M bug: fmat[r] held the wrong node's
-    // features, so the model trained on wrong-features + correct-label and
-    // capped accuracy ~3x, INVARIANT to all graph/model choices). This check
+    // Feature<->label integrity gate. The labels<->splits guard above only
+    // verifies labels are PRESENT for TRAIN rows; it cannot detect a
+    // node_features.fmat whose feature ROWS are misaligned to node identity
+    // (fmat[r] holding the wrong node's features). That failure mode trains
+    // on wrong-features + correct-label, which converges but silently caps
+    // accuracy at a fraction of baseline, invariant to all graph/model
+    // choices — so it is undetectable from the loss curve alone. This check
     // fits per-class feature centroids on a strided sample of TRAIN nodes and
     // aborts if nearest-centroid accuracy is no better than chance (features
     // carry no label signal). Source-independent. Opt out via env
@@ -979,8 +992,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     }
     BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
 
-    // Per-call override of the block-consumption mode for same-session
-    // A/B/C measurement (online / Option-A / self-contained). The ctor already
+    // Per-call override of the block-consumption mode so the three modes
+    // (online rebuild, baked blocks read alongside the sample, self-contained
+    // blocks) can be measured within one server session. The ctor already
     // ran its env/auto detection; we only override it when the caller explicitly
     // passed at least one of noBlocks / noSelfContained / noPackedFull, so the
     // default path (no params) is byte-identical to today. Toggles the caller
@@ -1038,9 +1052,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     }
     loop_config.prefetch_queue_size = static_cast<size_t>(prefetch_queue_size);
     loop_config.output_dir    = output_dir.string();
-    loop_config.profile_log_path = profile_log_path;  // Phase 0 instrumentation
+    loop_config.profile_log_path = profile_log_path;  // per-batch timing CSV
     loop_config.read_only_bench  = read_only_bench;   // read-only isolation bench
-    loop_config.track_test_at_best_val = track_test_at_best_val;  // paper §7.1 protocol
+    loop_config.track_test_at_best_val = track_test_at_best_val;  // test-at-best-val protocol
     loop_config.lr_schedule = lr_schedule;                        // "" | "cosine"
 
     // =========================================================================
@@ -1198,17 +1212,17 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     // Step 11.5: Write embeddings to projection (if writeProperty is set)
     //
-    // Opens ProjectionStorage for the EmbeddingWriter which needs topology
-    // access (Phase B: on-the-fly k-hop inference for non-seed nodes) and
-    // property write access (Phase C: persist embeddings as tensor properties).
+    // Opens ProjectionStorage for the EmbeddingWriter, which needs topology
+    // access (on-the-fly k-hop inference for nodes that were never seeds) and
+    // property write access (persisting embeddings as tensor properties).
     // Under 'all' coverage the fanouts are taken from the SampleCatalog so the
-    // Phase B sampling depth matches the original offline sampling; under
-    // 'seeds' they are left empty and Phase B never runs. Orientation is NOT
-    // persisted in the SampleCatalog, and gnn_train never sets
-    // Config::orientation, so Phase B falls back to the UNDIRECTED default when
-    // build_adjacency_cache_ selects its directions: for samples built with
-    // NATURAL or REVERSE orientation the non-seed inference neighborhoods
-    // differ from the training-time neighborhoods.
+    // non-seed inference sampling depth matches the original offline sampling;
+    // under 'seeds' they are left empty and non-seed inference never runs.
+    // Orientation is NOT persisted in the SampleCatalog, and gnn_train never
+    // sets Config::orientation, so non-seed inference falls back to the
+    // UNDIRECTED default when build_adjacency_cache_ selects its directions:
+    // for samples built with NATURAL or REVERSE orientation the non-seed
+    // inference neighborhoods differ from the training-time neighborhoods.
     // =========================================================================
     uint64_t nodes_written  = 0;
     uint64_t nodes_inferred = 0;
@@ -1225,9 +1239,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         EmbeddingWriter::Config wconfig;
         wconfig.property_name      = write_property;
         wconfig.coverage           = write_coverage;
-        // Phase B's on-the-fly k-hop inference is what makes 'all' coverage
-        // expensive; 'seeds' leaves the fanouts empty so the phase is skipped
-        // outright and only the pre-computed seed embeddings are written.
+        // On-the-fly k-hop inference for non-seed nodes is what makes 'all'
+        // coverage expensive; 'seeds' leaves the fanouts empty so that phase
+        // is skipped outright and only the pre-computed seed embeddings are
+        // written.
         if (write_coverage == EmbeddingWriter::Coverage::ALL) {
             wconfig.fanouts        = catalog.fanouts;
         }
@@ -1266,9 +1281,10 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     auto cache_stats = CacheStatsSnapshot::from(feature_store.get_stats());
 
-    // Print total disk traffic so the user sees the paper-comparable number
-    // directly in their server terminal (alongside the per-epoch lines from
-    // training_loop.cc).
+    // Print total disk traffic so the user sees, directly in the server
+    // terminal (alongside the per-epoch lines from training_loop.cc), the
+    // number comparable to DiskGNN's (SIGMOD 2025) Table 1 row
+    // "Disk access volume (GB)".
     {
         constexpr double GB = 1024.0 * 1024.0 * 1024.0;
         double total_gb = static_cast<double>(cache_stats.total_bytes_disk()) / GB;
@@ -1297,8 +1313,9 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("didConverge",     ctx.create_bool(result.converged));
     ctx.yield("bestValAccuracy", ctx.create_float(static_cast<float>(result.best_val_accuracy)));
     ctx.yield("testAccuracy",    ctx.create_float(static_cast<float>(test_accuracy)));
-    // Test-at-best-val protocol (2026-06-16): the paper §7.1 number. -1.0 when
-    // trackTestAtBestVal was off (the loop never captured it).
+    // Test accuracy at the best-validation epoch (the DiskGNN SIGMOD 2025
+    // §7.1 protocol). -1.0 when trackTestAtBestVal was off (the loop never
+    // captured it).
     ctx.yield("testAccuracyAtBestVal", ctx.create_float(static_cast<float>(result.test_accuracy_at_best_val)));
     ctx.yield("bestValEpoch",    ctx.create_int(static_cast<int64_t>(result.best_val_epoch)));
     ctx.yield("trainSeconds",    ctx.create_float(static_cast<float>(result.train_seconds)));
@@ -1313,7 +1330,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
     ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
     ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
-    // Byte-level disk-traffic surface for paper-comparable accounting.
+    // Byte-level disk-traffic surface, comparable to DiskGNN's (SIGMOD 2025)
+    // Table 1 row "Disk access volume (GB)".
     ctx.yield("l3BytesDisk",
               ctx.create_int(static_cast<int64_t>(cache_stats.l3_bytes_disk)));
     ctx.yield("l4BytesDisk",

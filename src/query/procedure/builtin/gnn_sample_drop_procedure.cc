@@ -14,8 +14,8 @@ void GnnSampleDropProcedure::execute(ProcedureContext& ctx) {
     // Validate argument count
     if (ctx.arguments.size() != 1) {
         throw std::runtime_error(
-            "gnn.sample_drop() requires exactly 1 argument: sampleName\n"
-            "Usage: CALL gnn.sample_drop('mySamples') YIELD success, message"
+            "gnn_sample_drop() requires exactly 1 argument: sampleName\n"
+            "Usage: CALL gnn_sample_drop('mySamples') YIELD success, message"
         );
     }
 
@@ -27,7 +27,7 @@ void GnnSampleDropProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid sampleName parameter: " + std::string(e.what()) + "\n\n"
             "The parameter must be a STRING containing the sample set name.\n"
-            "Example: CALL gnn.sample_drop('old_samples')"
+            "Example: CALL gnn_sample_drop('old_samples')"
         );
     }
 
@@ -35,7 +35,7 @@ void GnnSampleDropProcedure::execute(ProcedureContext& ctx) {
         throw std::runtime_error(
             "Invalid sample name: name cannot be empty.\n"
             "Provide a non-empty string as the argument.\n"
-            "Example: CALL gnn.sample_drop('old_samples')"
+            "Example: CALL gnn_sample_drop('old_samples')"
         );
     }
 

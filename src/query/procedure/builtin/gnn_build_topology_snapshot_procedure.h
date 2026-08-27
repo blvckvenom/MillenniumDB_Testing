@@ -39,9 +39,6 @@
 //     `native_projection_builder.cc`), so a `READONLY_TRAVERSAL` projection
 //     produces both files while a hypothetical FWD-only preset produces
 //     just `topology_fwd.csr`.
-//
-// Spec reference: docs/superpowers/specs/2026-04-25-topology-snapshot-design.md §4.2
-// Plan: docs/superpowers/plans/2026-04-25-topology-snapshot-plan.md
 
 #include <cstdint>
 #include <filesystem>
