@@ -677,6 +677,533 @@ FeatureMatrix FeatureMatrix::create_parallel(
     return fm;
 }
 
+// --- create_reordered_external_sort_() helpers ---
+namespace {
+
+// Per-bucket Pass 1 state: an open append-only temp file plus a small write
+// buffer that amortises the per-row record writes. `entries` counts the
+// (out_local, row_data) records scattered into the bucket so Pass 2 knows how
+// many to read back.
+struct Bucket {
+    int fd;
+    std::vector<char> buf;
+    size_t used;
+    uint64_t entries;
+};
+
+// Bucket geometry chosen by resolve_bucket_geometry(): how many rows each
+// Pass 1 bucket holds and how many buckets cover the N output rows.
+struct BucketGeometry {
+    uint64_t bucket_rows;
+    uint64_t num_buckets;
+};
+
+// Chooses the external-sort bucket geometry for an N-row matrix with `rb`
+// bytes per row. Re-reads MDB_GNN_REORDER_BUCKET_MB from the environment on
+// every call — see the registry note inside. Assumes rb > 0; throws when a
+// bucket's row count would not fit the u32 out_local field of a record.
+BucketGeometry resolve_bucket_geometry(uint64_t N, size_t rb) {
+    // Bucket sizing: ~1 GB per bucket → 2M rows for D=128 float32. With
+    // 56 GB output that's 56 buckets, well under the FD limit.
+    // NOT routed through the ablation registry: two FeatureMatrixTest cases in
+    // the same binary set this to different values ("1" and "3") to reach
+    // different bucket geometries, and a once-per-process answer would give the
+    // second one the first one's buckets.
+    size_t bucket_bytes = 1ULL * 1024 * 1024 * 1024;
+    if (const char* env = std::getenv("MDB_GNN_REORDER_BUCKET_MB")) {
+        try {
+            long long parsed = std::stoll(env);
+            if (parsed > 0) bucket_bytes = static_cast<size_t>(parsed) * 1024ULL * 1024ULL;
+        } catch (...) { /* ignore */ }
+    }
+    if (bucket_bytes < rb) bucket_bytes = rb;
+    const uint64_t bucket_rows = std::max<uint64_t>(1, bucket_bytes / rb);
+    const uint64_t num_buckets = (N + bucket_rows - 1) / bucket_rows;
+    if (bucket_rows > static_cast<uint64_t>(UINT32_MAX)) {
+        throw std::overflow_error(
+            "create_reordered_external_sort: bucket_rows exceeds uint32_t");
+    }
+    return BucketGeometry{ bucket_rows, num_buckets };
+}
+
+// Sweeps stale scratch directories left by crashed reorder runs of the same
+// output file (matched by filename prefix), then creates a fresh pid-suffixed
+// scratch directory for this run. Assumes output_path's parent directory
+// exists; returns the newly created scratch directory.
+fs::path prepare_reorder_scratch_dir(const fs::path& output_path) {
+    // Scratch dir name is derived from the output file plus the pid:
+    // multiple reorder builds (different feature names, or two sessions
+    // against the same server) share the same parent gnn_features dir, so
+    // a fixed ".reorder_tmp" would let one build remove_all the other's
+    // live bucket files mid-pass. Stale leftovers from crashed runs of
+    // THIS output are swept by prefix; other outputs' scratch dirs may be
+    // live and are left alone.
+    const std::string scratch_prefix = output_path.filename().string() + ".reorder_tmp.";
+    {
+        std::error_code ec;
+        fs::directory_iterator it(output_path.parent_path(), ec);
+        fs::directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.size() > scratch_prefix.size()
+                && name.compare(0, scratch_prefix.size(), scratch_prefix) == 0)
+            {
+                std::error_code rm_ec;
+                fs::remove_all(it->path(), rm_ec);
+            }
+        }
+    }
+    auto temp_dir = output_path.parent_path()
+                  / (scratch_prefix + std::to_string(::getpid()));
+    fs::remove_all(temp_dir);
+    fs::create_directories(temp_dir);
+    return temp_dir;
+}
+
+// Pass 1 (split) of the external-sort reorder: creates one temp file per
+// bucket under `temp_dir`, then streams every source row into the bucket that
+// owns its output position as an (out_local: u32, row_data) record. When
+// `permutation` is a bijection of [0, N) the source is read sequentially via
+// the inverse mapping; otherwise the original random-read output-order loop
+// runs, byte-identical for the non-injective contract.
+// `source_map_addr`/`source_map_bytes` describe the source mmap for the
+// madvise hint. Assumes `buckets` holds one zero-initialized slot per bucket;
+// on success every bucket is flushed, fsynced and closed (fd = -1) with its
+// `entries` count set. Throws on I/O failure, leaving any open bucket fds for
+// the caller to close.
+void scatter_rows_into_buckets(
+    const FeatureMatrix& source,
+    void* source_map_addr,
+    size_t source_map_bytes,
+    const std::vector<uint64_t>& permutation,
+    const fs::path& temp_dir,
+    std::vector<Bucket>& buckets,
+    uint64_t bucket_rows,
+    size_t rb,
+    std::chrono::high_resolution_clock::time_point t_start)
+{
+    const uint64_t N           = source.num_rows();
+    const uint64_t num_buckets = buckets.size();
+
+    // For each src in [0, N), write (out_local: u32, row_data) to its
+    // bucket file. Per-bucket 1 MB buffer to amortise small writes; grown
+    // to hold at least one entry when a single row exceeds 1 MB (mirrors
+    // the bucket_bytes >= rb clamp above — the flush check only empties
+    // the buffer, it cannot make a too-large entry fit).
+    const size_t entry_size = sizeof(uint32_t) + rb;
+    const size_t per_bucket_buf = std::max<size_t>(1ULL * 1024 * 1024, entry_size);
+
+    for (uint64_t b = 0; b < num_buckets; ++b) {
+        auto p = temp_dir / ("bucket_" + std::to_string(b) + ".tmp");
+        int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            throw std::runtime_error(
+                "create_reordered_external_sort: cannot create " + p.string() +
+                ": " + std::strerror(errno));
+        }
+        buckets[b].fd      = fd;
+        buckets[b].buf.assign(per_bucket_buf, 0);
+        buckets[b].used    = 0;
+        buckets[b].entries = 0;
+    }
+
+    // Make Pass 1's SOURCE reads sequential when possible. Historically Pass 1
+    // read source.row(permutation[out]) in OUTPUT order, i.e. RANDOM mmap
+    // access keyed by the permutation. On a box where the source FM exceeds RAM
+    // (papers100M: 56 GB on 30 GB) that random gather thrashes the page cache at
+    // ~37 MB/s — the exact pathology the external-sort strategy was meant to
+    // avoid but which was not fixed on the read side (it only made the WRITES
+    // sequential). Build the inverse permutation (src -> out) once in O(N); when
+    // `permutation` is a true bijection of [0,N) — the production case (all
+    // callers feed MinHashReorderer::compute_permutation, a partition of [0,N))
+    // — iterate SOURCE rows instead, so source.row(src) walks the mmap in
+    // strictly increasing offset (sequential). The bucket / out_local assignment
+    // stays a pure function of out = inv[src], so each bucket receives the
+    // identical (out_local, row) SET and Pass 2 (a pure scatter-by-out_local)
+    // yields a BYTE-IDENTICAL reordered.fmat.
+    //
+    // create_reordered() validates permutation[i] < N but NOT uniqueness, so
+    // a non-injective permutation (duplicates/gaps — e.g. the documented
+    // CreateReorderedDuplicateSourceRows contract, perm={1,1,1}) can reach
+    // here. The inverse is ill-defined for those, so we DETECT them and fall
+    // back to the exact original output-order loop, preserving byte-identical
+    // behavior for the non-injective contract.
+    const uint64_t kInvUnset = N;       // valid out values are < N, so N is a safe sentinel
+    bool is_bijection = true;
+    std::vector<uint64_t> inv;
+    inv.assign(N, kInvUnset);           // N*8 bytes (papers100M: ~888 MB); freed before Pass 2
+    for (uint64_t out = 0; out < N; ++out) {
+        uint64_t src = permutation[out];           // validated < N in create_reordered()
+        if (inv[src] != kInvUnset) { is_bijection = false; break; }  // duplicate target
+        inv[src] = out;
+    }
+    if (!is_bijection) { inv.clear(); inv.shrink_to_fit(); }
+
+    // MADV per branch: the bijection path reads sequentially (src=0..N) so we
+    // re-enable readahead via MADV_SEQUENTIAL (the whole point of the
+    // inversion). The fallback keeps the random pattern, so it must keep
+    // MADV_RANDOM — readahead on random reads only prefetches neighbours
+    // that will never be used, evicting pages that will.
+    MadviseGuard madvise_guard(source_map_addr, source_map_bytes,
+                               is_bijection ? MADV_SEQUENTIAL : MADV_RANDOM);
+
+    auto report_every = std::max<uint64_t>(1, N / 20);
+
+    if (is_bijection) {
+        // Sequential source scan: out = inv[src]; bucket keyed by out exactly
+        // as before. Byte-identical output to the fallback for a bijection.
+        for (uint64_t src = 0; src < N; ++src) {
+            uint64_t out = inv[src];
+            uint64_t b   = out / bucket_rows;
+            uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
+
+            Bucket& bk = buckets[b];
+            if (bk.used + entry_size > bk.buf.size()) {
+                write_all(bk.fd, bk.buf.data(), bk.used);
+                bk.used = 0;
+            }
+            std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
+            std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
+                        source.row(src), rb);
+            bk.used += entry_size;
+            ++bk.entries;
+
+            if ((src + 1) % report_every == 0 || src + 1 == N) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double dt = std::chrono::duration<double>(now - t_start).count();
+                std::cerr << "[create_reordered/ext] pass1 " << (src + 1)
+                          << "/" << N << " (" << std::fixed
+                          << std::setprecision(1) << dt << "s, seq)\n" << std::flush;
+            }
+        }
+        inv.clear();
+        inv.shrink_to_fit();   // release ~888 MB before Pass 2 allocates chunk_buf
+    } else {
+        // FALLBACK (exact original behavior): iterate OUTPUT rows, read
+        // source[perm[out]] (RANDOM). Preserves the documented non-injective
+        // contract (duplicate / missing perm values) byte-for-byte.
+        for (uint64_t out = 0; out < N; ++out) {
+            uint64_t src = permutation[out];
+            uint64_t b   = out / bucket_rows;
+            uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
+
+            Bucket& bk = buckets[b];
+            if (bk.used + entry_size > bk.buf.size()) {
+                write_all(bk.fd, bk.buf.data(), bk.used);
+                bk.used = 0;
+            }
+            std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
+            std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
+                        source.row(src), rb);
+            bk.used += entry_size;
+            ++bk.entries;
+
+            if ((out + 1) % report_every == 0 || out + 1 == N) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double dt = std::chrono::duration<double>(now - t_start).count();
+                std::cerr << "[create_reordered/ext] pass1 " << (out + 1)
+                          << "/" << N << " (" << std::fixed
+                          << std::setprecision(1) << dt << "s, rand)\n" << std::flush;
+            }
+        }
+    }
+    for (auto& bk : buckets) {
+        if (bk.used > 0) write_all(bk.fd, bk.buf.data(), bk.used);
+        if (::fsync(bk.fd) < 0) {
+            // Non-fatal — temp files only live until Pass 2 consumes them
+            std::cerr << "[create_reordered/ext] warning: bucket fsync failed: "
+                      << std::strerror(errno) << "\n" << std::flush;
+        }
+        // Bucket file is sequential append-only and now fully flushed; its
+        // pages are no longer needed until Pass 2 reopens it sequentially.
+        // Release them now so the kernel can reclaim the ~56 GB of bucket-file
+        // pages rather than evicting productive reordered.fmat pages under
+        // memory pressure.
+        fadvise_dontneed(bk.fd, 0, 0);  // 0,0 = "entire file"
+        ::close(bk.fd);
+        bk.fd = -1;
+    }
+}
+
+// Pass 2 (merge) of the external-sort reorder, pipelined variant: a producer
+// thread reads each bucket file and scatters its records into an in-memory
+// chunk buffer while the consumer pwrites the previously completed chunk to
+// `out_fd` and deletes its bucket file (bounded queue of capacity 2).
+// Assumes Pass 1 completed: bucket files flushed and closed, `entries` counts
+// set, and `out_fd` (owned by `out_guard`) pre-allocated with the header
+// already written. On failure joins the producer, removes `temp_dir` and the
+// partial output file, then rethrows.
+void merge_buckets_pipelined(
+    const fs::path& temp_dir,
+    const std::vector<Bucket>& buckets,
+    uint64_t bucket_rows,
+    uint64_t N,
+    size_t rb,
+    uint64_t data_off,
+    int out_fd,
+    FdGuard& out_guard,
+    const fs::path& output_path,
+    std::chrono::high_resolution_clock::time_point t_start)
+{
+    const uint64_t num_buckets = buckets.size();
+    const size_t entry_size    = sizeof(uint32_t) + rb;
+
+    struct ReadyBucket {
+        std::vector<char>      chunk_buf;
+        uint64_t               bucket_id;
+        uint64_t               chunk_start;
+        uint64_t               actual_rows;
+        std::filesystem::path  bucket_path;
+    };
+
+    ChunkPipeline<ReadyBucket> pipe(2);
+
+    std::thread producer([&]() {
+        try {
+            for (uint64_t b = 0; b < num_buckets; ++b) {
+                auto bp = temp_dir / ("bucket_" + std::to_string(b) + ".tmp");
+                int in_fd = ::open(bp.c_str(), O_RDONLY);
+                if (in_fd < 0) {
+                    throw std::runtime_error(
+                        "create_reordered_external_sort: cannot read bucket " +
+                        bp.string());
+                }
+                FdGuard in_guard(in_fd);
+
+                std::vector<char> chunk_buf(bucket_rows * rb, 0);
+
+                std::vector<char> read_buf(4 * 1024 * 1024);
+                size_t buf_pos = 0, buf_end = 0;
+                auto fill_buf = [&](size_t need) -> bool {
+                    if (buf_end - buf_pos >= need) return true;
+                    size_t remaining = buf_end - buf_pos;
+                    std::memmove(read_buf.data(),
+                                 read_buf.data() + buf_pos, remaining);
+                    buf_pos = 0; buf_end = remaining;
+                    while (buf_end < need && buf_end < read_buf.size()) {
+                        ssize_t r = ::read(in_fd, read_buf.data() + buf_end,
+                                           read_buf.size() - buf_end);
+                        if (r < 0) {
+                            if (errno == EINTR) continue;
+                            throw std::runtime_error("ext_sort: read failed");
+                        }
+                        if (r == 0) break;
+                        buf_end += r;
+                    }
+                    return buf_end - buf_pos >= need;
+                };
+
+                for (uint64_t e = 0; e < buckets[b].entries; ++e) {
+                    if (!fill_buf(entry_size)) {
+                        throw std::runtime_error("ext_sort: truncated bucket");
+                    }
+                    uint32_t out_local;
+                    std::memcpy(&out_local, read_buf.data() + buf_pos,
+                                sizeof(out_local));
+                    buf_pos += sizeof(out_local);
+                    std::memcpy(chunk_buf.data() + out_local * rb,
+                                read_buf.data() + buf_pos, rb);
+                    buf_pos += rb;
+                }
+
+                // Bucket file fully consumed — release its pages before close.
+                // close() does not itself flush the page cache, so an explicit
+                // POSIX_FADV_DONTNEED hint is required to reclaim the memory.
+                fadvise_dontneed(in_fd, 0, 0);  // 0,0 = "entire file"
+
+                uint64_t chunk_start = b * bucket_rows;
+                uint64_t actual = std::min(bucket_rows, N - chunk_start);
+                pipe.push(ReadyBucket{
+                    std::move(chunk_buf), b, chunk_start, actual, bp});
+            }
+            pipe.close();
+        } catch (...) {
+            pipe.set_error(std::current_exception());
+        }
+    });
+
+    try {
+        while (auto rb_ready_opt = pipe.pop()) {
+            auto& rb_ready = *rb_ready_opt;
+            off_t off = static_cast<off_t>(
+                data_off + rb_ready.chunk_start * rb);
+            pwrite_all(out_fd, rb_ready.chunk_buf.data(),
+                       rb_ready.actual_rows * rb, off);
+            // This chunk's output pages are now written to disk; hint the kernel
+            // that they can leave the page cache before the next bucket arrives,
+            // preventing accumulation of stale output pages under memory pressure.
+            fadvise_dontneed(out_fd, off,
+                             static_cast<off_t>(rb_ready.actual_rows * rb));
+            // Now safe to remove the consumed bucket file.
+            std::filesystem::remove(rb_ready.bucket_path);
+
+            auto now = std::chrono::high_resolution_clock::now();
+            double dt = std::chrono::duration<double>(now - t_start).count();
+            std::cerr << "[create_reordered/ext] pass2 bucket "
+                      << (rb_ready.bucket_id + 1) << "/" << num_buckets
+                      << " (pipeline, " << std::fixed << std::setprecision(1)
+                      << dt << "s)\n" << std::flush;
+        }
+        producer.join();
+    } catch (...) {
+        // Critical: drain + join even on error so the std::thread destructor
+        // doesn't trigger std::terminate(). Same drain-then-join pattern used
+        // by the other pipeline-overlap producer/consumer loops in this file.
+        pipe.set_error(std::current_exception());
+        if (producer.joinable()) producer.join();
+        fs::remove_all(temp_dir);
+        ::close(out_fd);
+        out_guard.release();
+        std::error_code ec;
+        fs::remove(output_path, ec);
+        throw;
+    }
+}
+
+// Pass 2 (merge) of the external-sort reorder, sequential variant: for each
+// bucket in order, reads its records into a zero-filled chunk buffer at their
+// out_local positions, pwrites the contiguous chunk to `out_fd` and removes
+// the bucket file. Same on-disk result as the pipelined variant. Assumes
+// Pass 1 completed: bucket files flushed and closed, `entries` counts set,
+// and `out_fd` (owned by `out_guard`) pre-allocated with the header already
+// written. On failure removes `temp_dir` and the partial output file, then
+// rethrows.
+void merge_buckets_sequential(
+    const fs::path& temp_dir,
+    const std::vector<Bucket>& buckets,
+    uint64_t bucket_rows,
+    uint64_t N,
+    size_t rb,
+    uint64_t data_off,
+    int out_fd,
+    FdGuard& out_guard,
+    const fs::path& output_path,
+    std::chrono::high_resolution_clock::time_point t_start)
+{
+    const uint64_t num_buckets = buckets.size();
+    const size_t entry_size    = sizeof(uint32_t) + rb;
+
+    std::vector<char> chunk_buf(bucket_rows * rb);
+    try {
+        for (uint64_t b = 0; b < num_buckets; ++b) {
+            // Zero-fill in case the bucket has fewer entries than bucket_rows
+            // (mostly for the final bucket; also guards against missing
+            // entries from a non-injective permutation).
+            std::memset(chunk_buf.data(), 0, chunk_buf.size());
+
+            auto p = temp_dir / ("bucket_" + std::to_string(b) + ".tmp");
+            int in_fd = ::open(p.c_str(), O_RDONLY);
+            if (in_fd < 0) {
+                throw std::runtime_error(
+                    "create_reordered_external_sort: cannot read bucket " +
+                    p.string());
+            }
+            FdGuard in_guard(in_fd);
+
+            // Buffered sequential read
+            std::vector<char> read_buf(4 * 1024 * 1024);
+            size_t buf_pos = 0;
+            size_t buf_end = 0;
+            auto fill_buf = [&](size_t need) -> bool {
+                if (buf_end - buf_pos >= need) return true;
+                size_t remaining = buf_end - buf_pos;
+                std::memmove(read_buf.data(), read_buf.data() + buf_pos, remaining);
+                buf_pos = 0;
+                buf_end = remaining;
+                while (buf_end < need && buf_end < read_buf.size()) {
+                    ssize_t r = ::read(in_fd, read_buf.data() + buf_end,
+                                       read_buf.size() - buf_end);
+                    if (r < 0) {
+                        if (errno == EINTR) continue;
+                        throw std::runtime_error("ext_sort: read failed");
+                    }
+                    if (r == 0) break;
+                    buf_end += r;
+                }
+                return buf_end - buf_pos >= need;
+            };
+
+            for (uint64_t e = 0; e < buckets[b].entries; ++e) {
+                if (!fill_buf(entry_size)) {
+                    throw std::runtime_error("ext_sort: truncated bucket");
+                }
+                uint32_t out_local;
+                std::memcpy(&out_local, read_buf.data() + buf_pos, sizeof(out_local));
+                buf_pos += sizeof(out_local);
+                std::memcpy(chunk_buf.data() + out_local * rb,
+                            read_buf.data() + buf_pos, rb);
+                buf_pos += rb;
+            }
+            ::close(in_fd);
+            in_guard.release();
+            fs::remove(p);
+
+            uint64_t chunk_start = b * bucket_rows;
+            uint64_t chunk_actual_rows = std::min(bucket_rows, N - chunk_start);
+            off_t off = static_cast<off_t>(
+                data_off + chunk_start * rb);
+            pwrite_all(out_fd, chunk_buf.data(), chunk_actual_rows * rb, off);
+            // Hint kernel that this chunk's output pages can leave the page
+            // cache. Mirrors the pipeline-branch hint to keep memory pressure
+            // symmetric between the two Pass 2 code paths.
+            fadvise_dontneed(out_fd, off,
+                             static_cast<off_t>(chunk_actual_rows * rb));
+
+            auto now = std::chrono::high_resolution_clock::now();
+            double dt = std::chrono::duration<double>(now - t_start).count();
+            std::cerr << "[create_reordered/ext] pass2 bucket " << (b + 1)
+                      << "/" << num_buckets << " (" << std::fixed
+                      << std::setprecision(1) << dt << "s)\n" << std::flush;
+        }
+    } catch (...) {
+        fs::remove_all(temp_dir);
+        ::close(out_fd);
+        out_guard.release();
+        std::error_code ec;
+        fs::remove(output_path, ec);
+        throw;
+    }
+}
+
+// Durably persists the finished reorder output: fsyncs the data file and its
+// parent directory, removes the Pass 1 scratch directory and reopens the
+// output as a FeatureMatrix. Assumes both passes completed and the full
+// header + data were written to `out_fd` (owned by `out_guard`). On fsync
+// failure removes the scratch dir and the not-known-durable output before
+// throwing, so all error exits leave the same state as the pass-level
+// cleanup paths.
+FeatureMatrix finalize_reordered_output(
+    const fs::path& output_path,
+    const fs::path& temp_dir,
+    int out_fd,
+    FdGuard& out_guard)
+{
+    if (::fsync(out_fd) < 0) {
+        // Mirror the Pass 1/2 catch blocks: remove the scratch dir and the
+        // not-known-durable output so all error exits leave the same state.
+        int fsync_errno = errno;
+        fs::remove_all(temp_dir);
+        ::close(out_fd);
+        out_guard.release();
+        std::error_code ec;
+        fs::remove(output_path, ec);
+        throw std::runtime_error(
+            "create_reordered_external_sort: fsync failed: " +
+            std::string(std::strerror(fsync_errno)));
+    }
+    {
+        int dir_fd = ::open(output_path.parent_path().c_str(), O_RDONLY);
+        if (dir_fd >= 0) { ::fsync(dir_fd); ::close(dir_fd); }
+    }
+    fs::remove_all(temp_dir);
+
+    ::close(out_fd);
+    out_guard.release();
+    return FeatureMatrix::open(output_path);
+}
+
+} // namespace
+
 // --- create_reordered() ---
 //
 // The L3 on-disk feature reorder is the hottest path in `gnn_build_feature_store`:
@@ -757,53 +1284,9 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     }
     pwrite_all(out_fd, &header, sizeof(header), 0);
 
-    // Bucket sizing: ~1 GB per bucket → 2M rows for D=128 float32. With
-    // 56 GB output that's 56 buckets, well under the FD limit.
-    // NOT routed through the ablation registry: two FeatureMatrixTest cases in
-    // the same binary set this to different values ("1" and "3") to reach
-    // different bucket geometries, and a once-per-process answer would give the
-    // second one the first one's buckets.
-    size_t bucket_bytes = 1ULL * 1024 * 1024 * 1024;
-    if (const char* env = std::getenv("MDB_GNN_REORDER_BUCKET_MB")) {
-        try {
-            long long parsed = std::stoll(env);
-            if (parsed > 0) bucket_bytes = static_cast<size_t>(parsed) * 1024ULL * 1024ULL;
-        } catch (...) { /* ignore */ }
-    }
-    if (bucket_bytes < rb) bucket_bytes = rb;
-    const uint64_t bucket_rows = std::max<uint64_t>(1, bucket_bytes / rb);
-    const uint64_t num_buckets = (N + bucket_rows - 1) / bucket_rows;
-    if (bucket_rows > static_cast<uint64_t>(UINT32_MAX)) {
-        throw std::overflow_error(
-            "create_reordered_external_sort: bucket_rows exceeds uint32_t");
-    }
+    const auto [bucket_rows, num_buckets] = resolve_bucket_geometry(N, rb);
 
-    // Scratch dir name is derived from the output file plus the pid:
-    // multiple reorder builds (different feature names, or two sessions
-    // against the same server) share the same parent gnn_features dir, so
-    // a fixed ".reorder_tmp" would let one build remove_all the other's
-    // live bucket files mid-pass. Stale leftovers from crashed runs of
-    // THIS output are swept by prefix; other outputs' scratch dirs may be
-    // live and are left alone.
-    const std::string scratch_prefix = output_path.filename().string() + ".reorder_tmp.";
-    {
-        std::error_code ec;
-        fs::directory_iterator it(output_path.parent_path(), ec);
-        fs::directory_iterator end;
-        for (; !ec && it != end; it.increment(ec)) {
-            const std::string name = it->path().filename().string();
-            if (name.size() > scratch_prefix.size()
-                && name.compare(0, scratch_prefix.size(), scratch_prefix) == 0)
-            {
-                std::error_code rm_ec;
-                fs::remove_all(it->path(), rm_ec);
-            }
-        }
-    }
-    auto temp_dir = output_path.parent_path()
-                  / (scratch_prefix + std::to_string(::getpid()));
-    fs::remove_all(temp_dir);
-    fs::create_directories(temp_dir);
+    auto temp_dir = prepare_reorder_scratch_dir(output_path);
 
     auto t_start = std::chrono::high_resolution_clock::now();
     std::cerr << "[create_reordered/ext] N=" << N << " D=" << D
@@ -812,152 +1295,11 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
               << " temp_dir=" << temp_dir.string() << "\n" << std::flush;
 
     // --- Pass 1: split ---
-    // For each src in [0, N), write (out_local: u32, row_data) to its
-    // bucket file. Per-bucket 1 MB buffer to amortise small writes; grown
-    // to hold at least one entry when a single row exceeds 1 MB (mirrors
-    // the bucket_bytes >= rb clamp above — the flush check only empties
-    // the buffer, it cannot make a too-large entry fit).
-    const size_t entry_size = sizeof(uint32_t) + rb;
-    const size_t per_bucket_buf = std::max<size_t>(1ULL * 1024 * 1024, entry_size);
-
-    struct Bucket {
-        int fd;
-        std::vector<char> buf;
-        size_t used;
-        uint64_t entries;
-    };
     std::vector<Bucket> buckets(num_buckets);
     try {
-        for (uint64_t b = 0; b < num_buckets; ++b) {
-            auto p = temp_dir / ("bucket_" + std::to_string(b) + ".tmp");
-            int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) {
-                throw std::runtime_error(
-                    "create_reordered_external_sort: cannot create " + p.string() +
-                    ": " + std::strerror(errno));
-            }
-            buckets[b].fd      = fd;
-            buckets[b].buf.assign(per_bucket_buf, 0);
-            buckets[b].used    = 0;
-            buckets[b].entries = 0;
-        }
-
-        // Make Pass 1's SOURCE reads sequential when possible. Historically Pass 1
-        // read source.row(permutation[out]) in OUTPUT order, i.e. RANDOM mmap
-        // access keyed by the permutation. On a box where the source FM exceeds RAM
-        // (papers100M: 56 GB on 30 GB) that random gather thrashes the page cache at
-        // ~37 MB/s — the exact pathology the external-sort strategy was meant to
-        // avoid but which was not fixed on the read side (it only made the WRITES
-        // sequential). Build the inverse permutation (src -> out) once in O(N); when
-        // `permutation` is a true bijection of [0,N) — the production case (all
-        // callers feed MinHashReorderer::compute_permutation, a partition of [0,N))
-        // — iterate SOURCE rows instead, so source.row(src) walks the mmap in
-        // strictly increasing offset (sequential). The bucket / out_local assignment
-        // stays a pure function of out = inv[src], so each bucket receives the
-        // identical (out_local, row) SET and Pass 2 (a pure scatter-by-out_local)
-        // yields a BYTE-IDENTICAL reordered.fmat.
-        //
-        // create_reordered() validates permutation[i] < N but NOT uniqueness, so
-        // a non-injective permutation (duplicates/gaps — e.g. the documented
-        // CreateReorderedDuplicateSourceRows contract, perm={1,1,1}) can reach
-        // here. The inverse is ill-defined for those, so we DETECT them and fall
-        // back to the exact original output-order loop, preserving byte-identical
-        // behavior for the non-injective contract.
-        const uint64_t kInvUnset = N;       // valid out values are < N, so N is a safe sentinel
-        bool is_bijection = true;
-        std::vector<uint64_t> inv;
-        inv.assign(N, kInvUnset);           // N*8 bytes (papers100M: ~888 MB); freed before Pass 2
-        for (uint64_t out = 0; out < N; ++out) {
-            uint64_t src = permutation[out];           // validated < N in create_reordered()
-            if (inv[src] != kInvUnset) { is_bijection = false; break; }  // duplicate target
-            inv[src] = out;
-        }
-        if (!is_bijection) { inv.clear(); inv.shrink_to_fit(); }
-
-        // MADV per branch: the bijection path reads sequentially (src=0..N) so we
-        // re-enable readahead via MADV_SEQUENTIAL (the whole point of the
-        // inversion). The fallback keeps the random pattern, so it must keep
-        // MADV_RANDOM — readahead on random reads only prefetches neighbours
-        // that will never be used, evicting pages that will.
-        MadviseGuard madvise_guard(source.mmap_ptr_, source.mmap_size_,
-                                   is_bijection ? MADV_SEQUENTIAL : MADV_RANDOM);
-
-        auto report_every = std::max<uint64_t>(1, N / 20);
-
-        if (is_bijection) {
-            // Sequential source scan: out = inv[src]; bucket keyed by out exactly
-            // as before. Byte-identical output to the fallback for a bijection.
-            for (uint64_t src = 0; src < N; ++src) {
-                uint64_t out = inv[src];
-                uint64_t b   = out / bucket_rows;
-                uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
-
-                Bucket& bk = buckets[b];
-                if (bk.used + entry_size > bk.buf.size()) {
-                    write_all(bk.fd, bk.buf.data(), bk.used);
-                    bk.used = 0;
-                }
-                std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
-                std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
-                            source.row(src), rb);
-                bk.used += entry_size;
-                ++bk.entries;
-
-                if ((src + 1) % report_every == 0 || src + 1 == N) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    double dt = std::chrono::duration<double>(now - t_start).count();
-                    std::cerr << "[create_reordered/ext] pass1 " << (src + 1)
-                              << "/" << N << " (" << std::fixed
-                              << std::setprecision(1) << dt << "s, seq)\n" << std::flush;
-                }
-            }
-            inv.clear();
-            inv.shrink_to_fit();   // release ~888 MB before Pass 2 allocates chunk_buf
-        } else {
-            // FALLBACK (exact original behavior): iterate OUTPUT rows, read
-            // source[perm[out]] (RANDOM). Preserves the documented non-injective
-            // contract (duplicate / missing perm values) byte-for-byte.
-            for (uint64_t out = 0; out < N; ++out) {
-                uint64_t src = permutation[out];
-                uint64_t b   = out / bucket_rows;
-                uint32_t out_local = static_cast<uint32_t>(out - b * bucket_rows);
-
-                Bucket& bk = buckets[b];
-                if (bk.used + entry_size > bk.buf.size()) {
-                    write_all(bk.fd, bk.buf.data(), bk.used);
-                    bk.used = 0;
-                }
-                std::memcpy(bk.buf.data() + bk.used, &out_local, sizeof(out_local));
-                std::memcpy(bk.buf.data() + bk.used + sizeof(out_local),
-                            source.row(src), rb);
-                bk.used += entry_size;
-                ++bk.entries;
-
-                if ((out + 1) % report_every == 0 || out + 1 == N) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    double dt = std::chrono::duration<double>(now - t_start).count();
-                    std::cerr << "[create_reordered/ext] pass1 " << (out + 1)
-                              << "/" << N << " (" << std::fixed
-                              << std::setprecision(1) << dt << "s, rand)\n" << std::flush;
-                }
-            }
-        }
-        for (auto& bk : buckets) {
-            if (bk.used > 0) write_all(bk.fd, bk.buf.data(), bk.used);
-            if (::fsync(bk.fd) < 0) {
-                // Non-fatal — temp files only live until Pass 2 consumes them
-                std::cerr << "[create_reordered/ext] warning: bucket fsync failed: "
-                          << std::strerror(errno) << "\n" << std::flush;
-            }
-            // Bucket file is sequential append-only and now fully flushed; its
-            // pages are no longer needed until Pass 2 reopens it sequentially.
-            // Release them now so the kernel can reclaim the ~56 GB of bucket-file
-            // pages rather than evicting productive reordered.fmat pages under
-            // memory pressure.
-            fadvise_dontneed(bk.fd, 0, 0);  // 0,0 = "entire file"
-            ::close(bk.fd);
-            bk.fd = -1;
-        }
+        scatter_rows_into_buckets(source, source.mmap_ptr_, source.mmap_size_,
+                                  permutation, temp_dir, buckets, bucket_rows,
+                                  rb, t_start);
     } catch (...) {
         for (auto& bk : buckets) {
             if (bk.fd >= 0) ::close(bk.fd);
@@ -998,197 +1340,11 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
     // For each bucket: open file, read all entries, scatter into
     // chunk_buf at out_local positions, sequential pwrite of chunk.
     if (use_pipeline_overlap) {
-        struct ReadyBucket {
-            std::vector<char>      chunk_buf;
-            uint64_t               bucket_id;
-            uint64_t               chunk_start;
-            uint64_t               actual_rows;
-            std::filesystem::path  bucket_path;
-        };
-
-        ChunkPipeline<ReadyBucket> pipe(2);
-
-        std::thread producer([&]() {
-            try {
-                for (uint64_t b = 0; b < num_buckets; ++b) {
-                    auto bp = temp_dir / ("bucket_" + std::to_string(b) + ".tmp");
-                    int in_fd = ::open(bp.c_str(), O_RDONLY);
-                    if (in_fd < 0) {
-                        throw std::runtime_error(
-                            "create_reordered_external_sort: cannot read bucket " +
-                            bp.string());
-                    }
-                    FdGuard in_guard(in_fd);
-
-                    std::vector<char> chunk_buf(bucket_rows * rb, 0);
-
-                    std::vector<char> read_buf(4 * 1024 * 1024);
-                    size_t buf_pos = 0, buf_end = 0;
-                    auto fill_buf = [&](size_t need) -> bool {
-                        if (buf_end - buf_pos >= need) return true;
-                        size_t remaining = buf_end - buf_pos;
-                        std::memmove(read_buf.data(),
-                                     read_buf.data() + buf_pos, remaining);
-                        buf_pos = 0; buf_end = remaining;
-                        while (buf_end < need && buf_end < read_buf.size()) {
-                            ssize_t r = ::read(in_fd, read_buf.data() + buf_end,
-                                               read_buf.size() - buf_end);
-                            if (r < 0) {
-                                if (errno == EINTR) continue;
-                                throw std::runtime_error("ext_sort: read failed");
-                            }
-                            if (r == 0) break;
-                            buf_end += r;
-                        }
-                        return buf_end - buf_pos >= need;
-                    };
-
-                    for (uint64_t e = 0; e < buckets[b].entries; ++e) {
-                        if (!fill_buf(entry_size)) {
-                            throw std::runtime_error("ext_sort: truncated bucket");
-                        }
-                        uint32_t out_local;
-                        std::memcpy(&out_local, read_buf.data() + buf_pos,
-                                    sizeof(out_local));
-                        buf_pos += sizeof(out_local);
-                        std::memcpy(chunk_buf.data() + out_local * rb,
-                                    read_buf.data() + buf_pos, rb);
-                        buf_pos += rb;
-                    }
-
-                    // Bucket file fully consumed — release its pages before close.
-                    // close() does not itself flush the page cache, so an explicit
-                    // POSIX_FADV_DONTNEED hint is required to reclaim the memory.
-                    fadvise_dontneed(in_fd, 0, 0);  // 0,0 = "entire file"
-
-                    uint64_t chunk_start = b * bucket_rows;
-                    uint64_t actual = std::min(bucket_rows, N - chunk_start);
-                    pipe.push(ReadyBucket{
-                        std::move(chunk_buf), b, chunk_start, actual, bp});
-                }
-                pipe.close();
-            } catch (...) {
-                pipe.set_error(std::current_exception());
-            }
-        });
-
-        try {
-            while (auto rb_ready_opt = pipe.pop()) {
-                auto& rb_ready = *rb_ready_opt;
-                off_t off = static_cast<off_t>(
-                    data_off + rb_ready.chunk_start * rb);
-                pwrite_all(out_fd, rb_ready.chunk_buf.data(),
-                           rb_ready.actual_rows * rb, off);
-                // This chunk's output pages are now written to disk; hint the kernel
-                // that they can leave the page cache before the next bucket arrives,
-                // preventing accumulation of stale output pages under memory pressure.
-                fadvise_dontneed(out_fd, off,
-                                 static_cast<off_t>(rb_ready.actual_rows * rb));
-                // Now safe to remove the consumed bucket file.
-                std::filesystem::remove(rb_ready.bucket_path);
-
-                auto now = std::chrono::high_resolution_clock::now();
-                double dt = std::chrono::duration<double>(now - t_start).count();
-                std::cerr << "[create_reordered/ext] pass2 bucket "
-                          << (rb_ready.bucket_id + 1) << "/" << num_buckets
-                          << " (pipeline, " << std::fixed << std::setprecision(1)
-                          << dt << "s)\n" << std::flush;
-            }
-            producer.join();
-        } catch (...) {
-            // Critical: drain + join even on error so the std::thread destructor
-            // doesn't trigger std::terminate(). Same drain-then-join pattern used
-            // by the other pipeline-overlap producer/consumer loops in this file.
-            pipe.set_error(std::current_exception());
-            if (producer.joinable()) producer.join();
-            fs::remove_all(temp_dir);
-            ::close(out_fd);
-            out_guard.release();
-            std::error_code ec;
-            fs::remove(output_path, ec);
-            throw;
-        }
+        merge_buckets_pipelined(temp_dir, buckets, bucket_rows, N, rb, data_off,
+                                out_fd, out_guard, output_path, t_start);
     } else {
-        std::vector<char> chunk_buf(bucket_rows * rb);
-        try {
-            for (uint64_t b = 0; b < num_buckets; ++b) {
-                // Zero-fill in case the bucket has fewer entries than bucket_rows
-                // (mostly for the final bucket; also guards against missing
-                // entries from a non-injective permutation).
-                std::memset(chunk_buf.data(), 0, chunk_buf.size());
-
-                auto p = temp_dir / ("bucket_" + std::to_string(b) + ".tmp");
-                int in_fd = ::open(p.c_str(), O_RDONLY);
-                if (in_fd < 0) {
-                    throw std::runtime_error(
-                        "create_reordered_external_sort: cannot read bucket " +
-                        p.string());
-                }
-                FdGuard in_guard(in_fd);
-
-                // Buffered sequential read
-                std::vector<char> read_buf(4 * 1024 * 1024);
-                size_t buf_pos = 0;
-                size_t buf_end = 0;
-                auto fill_buf = [&](size_t need) -> bool {
-                    if (buf_end - buf_pos >= need) return true;
-                    size_t remaining = buf_end - buf_pos;
-                    std::memmove(read_buf.data(), read_buf.data() + buf_pos, remaining);
-                    buf_pos = 0;
-                    buf_end = remaining;
-                    while (buf_end < need && buf_end < read_buf.size()) {
-                        ssize_t r = ::read(in_fd, read_buf.data() + buf_end,
-                                           read_buf.size() - buf_end);
-                        if (r < 0) {
-                            if (errno == EINTR) continue;
-                            throw std::runtime_error("ext_sort: read failed");
-                        }
-                        if (r == 0) break;
-                        buf_end += r;
-                    }
-                    return buf_end - buf_pos >= need;
-                };
-
-                for (uint64_t e = 0; e < buckets[b].entries; ++e) {
-                    if (!fill_buf(entry_size)) {
-                        throw std::runtime_error("ext_sort: truncated bucket");
-                    }
-                    uint32_t out_local;
-                    std::memcpy(&out_local, read_buf.data() + buf_pos, sizeof(out_local));
-                    buf_pos += sizeof(out_local);
-                    std::memcpy(chunk_buf.data() + out_local * rb,
-                                read_buf.data() + buf_pos, rb);
-                    buf_pos += rb;
-                }
-                ::close(in_fd);
-                in_guard.release();
-                fs::remove(p);
-
-                uint64_t chunk_start = b * bucket_rows;
-                uint64_t chunk_actual_rows = std::min(bucket_rows, N - chunk_start);
-                off_t off = static_cast<off_t>(
-                    data_off + chunk_start * rb);
-                pwrite_all(out_fd, chunk_buf.data(), chunk_actual_rows * rb, off);
-                // Hint kernel that this chunk's output pages can leave the page
-                // cache. Mirrors the pipeline-branch hint to keep memory pressure
-                // symmetric between the two Pass 2 code paths.
-                fadvise_dontneed(out_fd, off,
-                                 static_cast<off_t>(chunk_actual_rows * rb));
-
-                auto now = std::chrono::high_resolution_clock::now();
-                double dt = std::chrono::duration<double>(now - t_start).count();
-                std::cerr << "[create_reordered/ext] pass2 bucket " << (b + 1)
-                          << "/" << num_buckets << " (" << std::fixed
-                          << std::setprecision(1) << dt << "s)\n" << std::flush;
-            }
-        } catch (...) {
-            fs::remove_all(temp_dir);
-            ::close(out_fd);
-            out_guard.release();
-            std::error_code ec;
-            fs::remove(output_path, ec);
-            throw;
-        }
+        merge_buckets_sequential(temp_dir, buckets, bucket_rows, N, rb, data_off,
+                                 out_fd, out_guard, output_path, t_start);
     }
 
     auto t_pass2 = std::chrono::high_resolution_clock::now();
@@ -1196,29 +1352,197 @@ FeatureMatrix FeatureMatrix::create_reordered_external_sort_(
               << std::chrono::duration<double>(t_pass2 - t_pass1).count()
               << "s)\n" << std::flush;
 
-    if (::fsync(out_fd) < 0) {
-        // Mirror the Pass 1/2 catch blocks: remove the scratch dir and the
-        // not-known-durable output so all error exits leave the same state.
-        int fsync_errno = errno;
-        fs::remove_all(temp_dir);
-        ::close(out_fd);
-        out_guard.release();
-        std::error_code ec;
-        fs::remove(output_path, ec);
-        throw std::runtime_error(
-            "create_reordered_external_sort: fsync failed: " +
-            std::string(std::strerror(fsync_errno)));
-    }
-    {
-        int dir_fd = ::open(output_path.parent_path().c_str(), O_RDONLY);
-        if (dir_fd >= 0) { ::fsync(dir_fd); ::close(dir_fd); }
-    }
-    fs::remove_all(temp_dir);
-
-    ::close(out_fd);
-    out_guard.release();
-    return FeatureMatrix::open(output_path);
+    return finalize_reordered_output(output_path, temp_dir, out_fd, out_guard);
 }
+
+// --- create_reordered() chunked-path helpers ---
+namespace {
+
+// Chunked-reorder write phase, pipelined variant: one producer thread gathers
+// the next chunk's permuted source rows into a heap buffer while the calling
+// thread pwrites the previously packed chunk to `fd` (bounded queue of
+// capacity 2). Assumes the output file is pre-allocated with its header
+// already written and `permutation` is fully validated. Sets
+// `t_write_start_outer` to the write-phase start so the caller's throughput
+// summary covers exactly this phase. Rethrows the first producer/consumer
+// error after joining the producer.
+void write_reordered_chunks_pipelined(
+    const FeatureMatrix& source,
+    const std::vector<uint64_t>& permutation,
+    int fd,
+    uint64_t data_off,
+    size_t rb,
+    uint64_t N,
+    uint64_t chunk_rows,
+    size_t chunk_bytes,
+    uint64_t num_chunks,
+    std::chrono::high_resolution_clock::time_point& t_write_start_outer)
+{
+    struct ReadyChunk {
+        std::vector<char> buf;
+        uint64_t          out_start;
+        uint64_t          rows;
+    };
+
+    ChunkPipeline<ReadyChunk> pipe(2);
+    std::atomic<uint64_t> chunks_done{0};
+    auto t_write_start = std::chrono::high_resolution_clock::now();
+    t_write_start_outer = t_write_start;
+
+    std::thread producer([&]() {
+        try {
+            for (uint64_t c = 0; c < num_chunks; ++c) {
+                uint64_t out_start   = c * chunk_rows;
+                uint64_t out_end     = std::min(out_start + chunk_rows, N);
+                uint64_t actual_rows = out_end - out_start;
+                ReadyChunk rc{
+                    std::vector<char>(actual_rows * rb),
+                    out_start,
+                    actual_rows
+                };
+                for (uint64_t i = 0; i < actual_rows; ++i) {
+                    uint64_t src = permutation[out_start + i];
+                    std::memcpy(rc.buf.data() + i * rb, source.row(src), rb);
+                }
+                pipe.push(std::move(rc));
+            }
+            pipe.close();
+        } catch (...) {
+            pipe.set_error(std::current_exception());
+        }
+    });
+
+    try {
+        while (auto rc_opt = pipe.pop()) {
+            auto& rc = *rc_opt;
+            off_t off = static_cast<off_t>(
+                data_off + rc.out_start * rb);
+            pwrite_all(fd, rc.buf.data(), rc.rows * rb, off);
+            // This chunk's output pages are now written to disk; hint the
+            // kernel that they can leave the page cache so subsequent chunks
+            // don't compete with stale output pages for available RAM.
+            fadvise_dontneed(fd, off, static_cast<off_t>(rc.rows * rb));
+
+            uint64_t done = chunks_done.fetch_add(1,
+                std::memory_order_relaxed) + 1;
+            auto now = std::chrono::high_resolution_clock::now();
+            double dt = std::chrono::duration<double>(now - t_write_start).count();
+            double rate_mbs = (done * chunk_bytes / 1048576.0) / dt;
+            std::cerr << "[create_reordered] chunk " << done
+                      << "/" << num_chunks << " (pipeline, "
+                      << std::fixed << std::setprecision(1)
+                      << dt << "s elapsed, "
+                      << rate_mbs << " MB/s avg logical)\n"
+                      << std::flush;
+        }
+        producer.join();
+    } catch (...) {
+        // Signal producer to stop (in case it's blocked on push), then
+        // join to honor the std::thread destruction contract. Both calls
+        // are no-throw on the ChunkPipeline / std::thread side once
+        // notified, so we can safely re-throw the original exception.
+        pipe.set_error(std::current_exception());
+        if (producer.joinable()) producer.join();
+        throw;
+    }
+}
+
+// Chunked-reorder write phase, legacy multi-worker variant: `num_workers`
+// threads pull chunk indices from a shared atomic counter; each gathers the
+// chunk's permuted source rows into a reused heap buffer and issues one large
+// pwrite to `fd`. Assumes the output file is pre-allocated with its header
+// already written and `permutation` is fully validated. Sets
+// `t_write_start_outer` to the write-phase start so the caller's throughput
+// summary covers exactly this phase. Rethrows the first worker error after
+// all workers join.
+void write_reordered_chunks_multiworker(
+    const FeatureMatrix& source,
+    const std::vector<uint64_t>& permutation,
+    int fd,
+    uint64_t data_off,
+    size_t rb,
+    uint64_t N,
+    uint64_t chunk_rows,
+    size_t chunk_bytes,
+    uint64_t num_chunks,
+    unsigned num_workers,
+    std::chrono::high_resolution_clock::time_point& t_write_start_outer)
+{
+    // Legacy multi-worker path — preserved exactly as-is below.
+    std::vector<std::thread>      threads;
+    std::vector<std::exception_ptr> errors(num_workers, nullptr);
+    threads.reserve(num_workers);
+
+    std::atomic<uint64_t> next_chunk{0};
+    std::atomic<uint64_t> chunks_done{0};
+    auto t_write_start = std::chrono::high_resolution_clock::now();
+    t_write_start_outer = t_write_start;
+
+    for (unsigned w = 0; w < num_workers; ++w) {
+        threads.emplace_back([&, w]() {
+            try {
+                // Pre-allocate chunk buffer (max possible size). Reused
+                // across chunks to avoid per-chunk allocator churn.
+                std::vector<char> chunk_buf(chunk_rows * rb);
+                while (true) {
+                    uint64_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                    if (c >= num_chunks) break;
+
+                    uint64_t out_start = c * chunk_rows;
+                    uint64_t out_end   = std::min(out_start + chunk_rows, N);
+                    uint64_t actual_rows = out_end - out_start;
+
+                    // Gather random source rows into the contiguous
+                    // chunk buffer. Reads are scattered over `source`
+                    // mmap; this is where most of the wall-clock for
+                    // a chunk goes (page faults on cold source pages).
+                    for (uint64_t i = 0; i < actual_rows; ++i) {
+                        uint64_t src = permutation[out_start + i];
+                        std::memcpy(chunk_buf.data() + i * rb,
+                                    source.row(src), rb);
+                    }
+
+                    // One large pwrite per chunk. Replaces ~1M small
+                    // pwrites and avoids the 22× write amplification
+                    // observed on the per-row variant.
+                    off_t off = static_cast<off_t>(
+                        data_off + out_start * rb);
+                    pwrite_all(fd, chunk_buf.data(), actual_rows * rb, off);
+                    // Hint kernel that this chunk's output pages can leave
+                    // the page cache. Mirrors the pipeline-branch hint for
+                    // symmetric page-cache relief across both code paths.
+                    fadvise_dontneed(fd, off,
+                                     static_cast<off_t>(actual_rows * rb));
+
+                    uint64_t done = chunks_done.fetch_add(1,
+                        std::memory_order_relaxed) + 1;
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double dt = std::chrono::duration<double>(
+                        now - t_write_start).count();
+                    double rate_mbs = (done * chunk_bytes / 1048576.0) / dt;
+                    std::cerr << "[create_reordered] chunk " << done
+                              << "/" << num_chunks << " (w" << w
+                              << ", rows " << out_start << ".."
+                              << out_end << ", "
+                              << std::fixed << std::setprecision(1)
+                              << dt << "s elapsed, "
+                              << rate_mbs << " MB/s avg logical)\n"
+                              << std::flush;
+                }
+            } catch (...) {
+                errors[w] = std::current_exception();
+            }
+        });
+    }
+
+    for (auto& t : threads) t.join();
+    for (unsigned w = 0; w < num_workers; ++w) {
+        if (errors[w]) std::rethrow_exception(errors[w]);
+    }
+}
+
+} // namespace
+
 
 FeatureMatrix FeatureMatrix::create_reordered(
     const FeatureMatrix& source,
@@ -1385,145 +1709,14 @@ FeatureMatrix FeatureMatrix::create_reordered(
         auto t_write_start_outer = std::chrono::high_resolution_clock::now();
 
         if (use_pipeline_overlap) {
-            struct ReadyChunk {
-                std::vector<char> buf;
-                uint64_t          out_start;
-                uint64_t          rows;
-            };
-
-            ChunkPipeline<ReadyChunk> pipe(2);
-            std::atomic<uint64_t> chunks_done{0};
-            auto t_write_start = std::chrono::high_resolution_clock::now();
-            t_write_start_outer = t_write_start;
-
-            std::thread producer([&]() {
-                try {
-                    for (uint64_t c = 0; c < num_chunks; ++c) {
-                        uint64_t out_start   = c * chunk_rows;
-                        uint64_t out_end     = std::min(out_start + chunk_rows, N);
-                        uint64_t actual_rows = out_end - out_start;
-                        ReadyChunk rc{
-                            std::vector<char>(actual_rows * rb),
-                            out_start,
-                            actual_rows
-                        };
-                        for (uint64_t i = 0; i < actual_rows; ++i) {
-                            uint64_t src = permutation[out_start + i];
-                            std::memcpy(rc.buf.data() + i * rb, source.row(src), rb);
-                        }
-                        pipe.push(std::move(rc));
-                    }
-                    pipe.close();
-                } catch (...) {
-                    pipe.set_error(std::current_exception());
-                }
-            });
-
-            try {
-                while (auto rc_opt = pipe.pop()) {
-                    auto& rc = *rc_opt;
-                    off_t off = static_cast<off_t>(
-                        data_off + rc.out_start * rb);
-                    pwrite_all(fd, rc.buf.data(), rc.rows * rb, off);
-                    // This chunk's output pages are now written to disk; hint the
-                    // kernel that they can leave the page cache so subsequent chunks
-                    // don't compete with stale output pages for available RAM.
-                    fadvise_dontneed(fd, off, static_cast<off_t>(rc.rows * rb));
-
-                    uint64_t done = chunks_done.fetch_add(1,
-                        std::memory_order_relaxed) + 1;
-                    auto now = std::chrono::high_resolution_clock::now();
-                    double dt = std::chrono::duration<double>(now - t_write_start).count();
-                    double rate_mbs = (done * chunk_bytes / 1048576.0) / dt;
-                    std::cerr << "[create_reordered] chunk " << done
-                              << "/" << num_chunks << " (pipeline, "
-                              << std::fixed << std::setprecision(1)
-                              << dt << "s elapsed, "
-                              << rate_mbs << " MB/s avg logical)\n"
-                              << std::flush;
-                }
-                producer.join();
-            } catch (...) {
-                // Signal producer to stop (in case it's blocked on push), then
-                // join to honor the std::thread destruction contract. Both calls
-                // are no-throw on the ChunkPipeline / std::thread side once
-                // notified, so we can safely re-throw the original exception.
-                pipe.set_error(std::current_exception());
-                if (producer.joinable()) producer.join();
-                throw;
-            }
+            write_reordered_chunks_pipelined(source, permutation, fd, data_off,
+                                             rb, N, chunk_rows, chunk_bytes,
+                                             num_chunks, t_write_start_outer);
         } else {
-            // Legacy multi-worker path — preserved exactly as-is below.
-            std::vector<std::thread>      threads;
-            std::vector<std::exception_ptr> errors(num_workers, nullptr);
-            threads.reserve(num_workers);
-
-            std::atomic<uint64_t> next_chunk{0};
-            std::atomic<uint64_t> chunks_done{0};
-            auto t_write_start = std::chrono::high_resolution_clock::now();
-            t_write_start_outer = t_write_start;
-
-            for (unsigned w = 0; w < num_workers; ++w) {
-                threads.emplace_back([&, w]() {
-                    try {
-                        // Pre-allocate chunk buffer (max possible size). Reused
-                        // across chunks to avoid per-chunk allocator churn.
-                        std::vector<char> chunk_buf(chunk_rows * rb);
-                        while (true) {
-                            uint64_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                            if (c >= num_chunks) break;
-
-                            uint64_t out_start = c * chunk_rows;
-                            uint64_t out_end   = std::min(out_start + chunk_rows, N);
-                            uint64_t actual_rows = out_end - out_start;
-
-                            // Gather random source rows into the contiguous
-                            // chunk buffer. Reads are scattered over `source`
-                            // mmap; this is where most of the wall-clock for
-                            // a chunk goes (page faults on cold source pages).
-                            for (uint64_t i = 0; i < actual_rows; ++i) {
-                                uint64_t src = permutation[out_start + i];
-                                std::memcpy(chunk_buf.data() + i * rb,
-                                            source.row(src), rb);
-                            }
-
-                            // One large pwrite per chunk. Replaces ~1M small
-                            // pwrites and avoids the 22× write amplification
-                            // observed on the per-row variant.
-                            off_t off = static_cast<off_t>(
-                                data_off + out_start * rb);
-                            pwrite_all(fd, chunk_buf.data(), actual_rows * rb, off);
-                            // Hint kernel that this chunk's output pages can leave
-                            // the page cache. Mirrors the pipeline-branch hint for
-                            // symmetric page-cache relief across both code paths.
-                            fadvise_dontneed(fd, off,
-                                             static_cast<off_t>(actual_rows * rb));
-
-                            uint64_t done = chunks_done.fetch_add(1,
-                                std::memory_order_relaxed) + 1;
-                            auto now = std::chrono::high_resolution_clock::now();
-                            double dt = std::chrono::duration<double>(
-                                now - t_write_start).count();
-                            double rate_mbs = (done * chunk_bytes / 1048576.0) / dt;
-                            std::cerr << "[create_reordered] chunk " << done
-                                      << "/" << num_chunks << " (w" << w
-                                      << ", rows " << out_start << ".."
-                                      << out_end << ", "
-                                      << std::fixed << std::setprecision(1)
-                                      << dt << "s elapsed, "
-                                      << rate_mbs << " MB/s avg logical)\n"
-                                      << std::flush;
-                        }
-                    } catch (...) {
-                        errors[w] = std::current_exception();
-                    }
-                });
-            }
-
-            for (auto& t : threads) t.join();
-            for (unsigned w = 0; w < num_workers; ++w) {
-                if (errors[w]) std::rethrow_exception(errors[w]);
-            }
+            write_reordered_chunks_multiworker(source, permutation, fd, data_off,
+                                               rb, N, chunk_rows, chunk_bytes,
+                                               num_chunks, num_workers,
+                                               t_write_start_outer);
         }
 
         auto t_write_end = std::chrono::high_resolution_clock::now();
