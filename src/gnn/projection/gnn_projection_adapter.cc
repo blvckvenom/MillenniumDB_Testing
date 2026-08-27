@@ -348,27 +348,24 @@ std::unique_ptr<GnnProjectionHandle> GnnProjectionHandle::open(
     const std::string& projection_name,
     const GnnAdapterConfig& config
 ) {
-    // Use the singleton ProjectionManager
     auto& manager = GQL::ProjectionManager::get_instance();
 
-    // Check if projection exists
     if (!manager.projection_exists(projection_name)) {
         return nullptr;
     }
 
-    // Get projection directory and database folder
     std::string proj_dir = manager.get_projection_dir(projection_name);
     const std::string& db_folder = manager.get_db_folder();
 
-    // Create storage (opens existing projection)
+    // Opens the existing on-disk projection; the adapter holds a reference to
+    // this storage, so the handle keeps both alive together.
     auto storage = std::make_unique<GQL::ProjectionStorage>(proj_dir, db_folder);
     storage->open();
 
-    // Create adapter with reference to storage
     auto adapter = std::make_unique<GnnProjectionAdapter>(*storage, config);
 
-    // Use placement new to construct since constructor is private
-    // Actually, we need a different approach - let's use a helper
+    // The constructor is private (only this factory may build handles), so
+    // make_unique cannot be used — construct with bare new instead.
     return std::unique_ptr<GnnProjectionHandle>(
         new GnnProjectionHandle(projection_name, std::move(storage), std::move(adapter))
     );

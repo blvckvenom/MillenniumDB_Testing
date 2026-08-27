@@ -86,9 +86,10 @@ public:
      * satisfies this. A `push_back`-without-`reserve` build doubles
      * capacity heuristically; in that case `total_bytes()`
      * underestimates real RSS by up to ~2x for nodes whose vector
-     * growth left `capacity > size`. Phase 3's
-     * `FourLevelTopologyStore::build_phase` will enforce
-     * `reserve(degree)` prior to insert.
+     * growth left `capacity > size`. `FourLevelTopologyStore`'s
+     * populate step reserves its staging vector to the node's degree
+     * before moving it into `insert()`, so inserts coming from the
+     * store satisfy this.
      *
      * @param src_node_id Raw `ObjectId.id` of the source node.
      * @param neighbors   Adjacency list (taken by value so the caller
@@ -117,9 +118,11 @@ public:
     std::size_t node_count() const noexcept { return entries_.size(); }
 
     /**
-     * @brief Approximate resident-byte cost using the Phase 1 contract.
+     * @brief Approximate resident-byte cost using the profiler's
+     *        byte-budget contract (the `kL1*` constants in
+     *        `topology_frequency_profiler.h`).
      *
-     * Computed on-the-fly (not memoized) because Phase 2 builds the
+     * Computed on-the-fly (not memoized) because the store builds the
      * cache once and freezes it; the call is rare and the cost is
      * O(node_count). Sums `kL1NodeFixedOverhead + kL1PerEdgeBytes *
      * degree` per inserted node.

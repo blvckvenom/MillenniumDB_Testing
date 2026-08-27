@@ -114,7 +114,7 @@ std::size_t FourLevelTopologyStore::Neighbors::size() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
-//  Phase 2 dispatcher constructor
+//  Dispatcher constructor (pre-built tiers, unit tests)
 // ---------------------------------------------------------------------------
 
 FourLevelTopologyStore::FourLevelTopologyStore(
@@ -139,13 +139,13 @@ FourLevelTopologyStore::FourLevelTopologyStore(
       l4_rev_(std::move(l4_rev)),
       tier_lookup_ref_(&tier_lookup),
       row_lookup_(std::move(row_lookup)),
-      phase3_ctor_(false),
+      build_ctor_(false),
       built_(true),
       config_(config)
 {}
 
 // ---------------------------------------------------------------------------
-//  Phase 3 build constructor
+//  Build constructor (live B+Trees)
 // ---------------------------------------------------------------------------
 
 FourLevelTopologyStore::FourLevelTopologyStore(
@@ -158,7 +158,7 @@ FourLevelTopologyStore::FourLevelTopologyStore(
       rev_bpt_(rev_bpt),
       storage_(storage),
       projection_dir_(std::move(projection_dir)),
-      phase3_ctor_(true),
+      build_ctor_(true),
       built_(false),
       config_(config)
 {}
@@ -270,7 +270,7 @@ void FourLevelTopologyStore::enable_pinned_gpu_view(
 }
 
 // ---------------------------------------------------------------------------
-// In-RAM symmetric CSR merge (Part D — GPU-UVA single slice).
+// In-RAM symmetric CSR merge (the GPU-UVA single slice substrate).
 // ---------------------------------------------------------------------------
 
 void merge_symmetric_csr_concat(
@@ -553,7 +553,7 @@ std::size_t FourLevelTopologyStore::release_directional_tiers_() {
     // L1HashCache / L2CompactCsr free their heap on destruction; the
     // TopologySnapshotReader destructor munmaps its sidecar (the sole way to
     // drop the resident page-cache — there is no DONTNEED API). Reset only the
-    // OWNED holders; in the dispatcher (Phase 2) ctor the L3 readers are
+    // OWNED holders; in the dispatcher ctor the L3 readers are
     // borrowed (owned_l3_* are null) so reset is a no-op and the caller keeps
     // ownership. Always null the borrowed aliases so a stray directional
     // dispatch faults loudly instead of dereferencing freed memory.
@@ -1070,15 +1070,15 @@ void FourLevelTopologyStore::compute_l3_minhash_reorder_(bool warm_start_used) {
     // (matching DiskGNN Algorithm 1).
     //
     // The reorder ideally uses per-batch access sets (the `BatchProvider`
-    // callback drives MinHash through every batch's accessed-node set).
-    // This implementation uses **Option B**: frequency-band clustering
-    // from the per-node access counts already persisted in
-    // `<projection_dir>/node_counts.bin`. Nodes are bucketed into N
-    // synthetic frequency bins (log-spaced) and each bin is fed to
-    // MinHash as a "batch". The resulting permutation clusters L3-tier
-    // nodes by access-frequency similarity instead of true co-access
-    // (DiskGNN's Option A), which captures ~50% of the spatial-locality
-    // value with zero new on-disk artifact. Option A
+    // callback drives MinHash through every batch's accessed-node set —
+    // what DiskGNN's Algorithm 1 consumes). This implementation instead
+    // uses frequency-band clustering from the per-node access counts
+    // already persisted in `<projection_dir>/node_counts.bin`. Nodes are
+    // bucketed into N synthetic frequency bins (log-spaced) and each bin
+    // is fed to MinHash as a "batch". The resulting permutation clusters
+    // L3-tier nodes by access-frequency similarity instead of true
+    // co-access, which captures a sizeable share of the spatial-locality
+    // value with zero new on-disk artifact. True per-batch access sets
     // (`batch_access_sets.bin`) can be wired in later as a pure
     // `BatchProvider` swap.
     //
@@ -1295,7 +1295,7 @@ void FourLevelTopologyStore::build_lean_symmetric_() {
 }
 
 void FourLevelTopologyStore::build() {
-    if (!phase3_ctor_) {
+    if (!build_ctor_) {
         throw std::logic_error(
             "FourLevelTopologyStore::build() called on a dispatcher-mode "
             "instance — only the BPlusTree-based ctor supports build()");
@@ -1583,7 +1583,8 @@ void FourLevelTopologyStore::build() {
 
     // Wire L4 fallback closures to the live BPTs. Required so L3-tier
     // nodes whose sidecar is absent / out-of-range fall through to a
-    // working BPT direct path (per design §2.4).
+    // working BPT direct path instead of silently returning empty
+    // neighbor lists.
     if (fwd_bpt_ != nullptr) {
         BPlusTree<3>* idx = fwd_bpt_;
         l4_fwd_ = [idx](ObjectId v) -> std::vector<AdjEntry> {

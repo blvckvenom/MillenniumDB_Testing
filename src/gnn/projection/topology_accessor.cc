@@ -105,9 +105,9 @@ struct TopologyAccessor::Impl {
     // `target` keyed on record[0] (the source-side endpoint). Returns the
     // number of directed entries appended.
     //
-    // Mirrors the EmbeddingWriter Phase B scan (commit 6521cc21) but tied to
-    // the accessor lifetime so multiple downstream consumers can share one
-    // build. Reads the same `from_to_edge` / `to_from_edge` indexes the
+    // Mirrors the full-scan the EmbeddingWriter performs to seed its
+    // non-seed-inference adjacency cache, but tied to the accessor lifetime
+    // so multiple downstream consumers can share one build. Reads the same `from_to_edge` / `to_from_edge` indexes the
     // BPT path uses, so cache contents are bit-identical to the live tree
     // contents at construction time.
     uint64_t scan_into_(

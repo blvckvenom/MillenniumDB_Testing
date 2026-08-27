@@ -1,9 +1,9 @@
 #pragma once
 
-// TopologyWalkProfiler — Phase 0 cheap profiler that generates the
-// warm-start dependency for the Four-Level Topology Store
-// (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar / L4 direct
-// B+Tree).
+// TopologyWalkProfiler — cheap random-walk profiler, run before the tier
+// build, that generates the warm-start dependency for the Four-Level
+// Topology Store (L1 RAM hash / L2 compact uint32 CSR / L3 mmap sidecar /
+// L4 direct B+Tree).
 //
 // Problem this solves
 // -------------------
@@ -52,9 +52,9 @@
 // no useful information. The profiler instead samples seeds proportional
 // to degree via Vose's alias method: an O(N) pre-pass builds the table,
 // each subsequent seed draw is O(1), and walks land on hubs with the
-// same probability mass a real k-hop sampler would expand them. This
-// matches the empirical access frequency observed during a real sample
-// within ±15% per quartile (validated by unit tests).
+// same probability mass a real k-hop sampler would expand them. The
+// counts are only a proxy — the tier assignment and MinHash bucketing
+// consume the qualitative hot/warm/cold ranking, not exact counts.
 
 #include <cstddef>
 #include <cstdint>

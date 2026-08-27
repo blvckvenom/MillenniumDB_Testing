@@ -24,29 +24,30 @@ namespace mdb::gnn {
  *                 papers100M < 2^32 nodes; assertion enforced at freeze).
  *   - `node_to_l2_idx_` unordered_map keying source ObjectId.id → L2 row.
  *
- * **edge_ids decision (Phase 2)** — `edge_ids` are intentionally
- * **omitted** from the L2 layout. Three reasons:
+ * **edge_ids decision** — `edge_ids` are intentionally **omitted**
+ * from the L2 layout. Three reasons:
  *
- *   1. The Phase 1 byte-budget contract in
- *      `topology_frequency_profiler.h` allocates 8 B per edge for L2
- *      (`kL2PerEdgeBytes`). Adding a uint64 edge_id would force the
- *      contract to 12 B (4 B col_idx + 8 B edge_id) since ObjectId
- *      edge ids occupy 56 bits — the design doc §2.6 list of `uint32_t
- *      edge_ids` is wrong against `object_id.h` (8-bit type tag + 56-bit
- *      payload). Either the contract bumps to 12 (re-derives the
- *      profiler test) OR L2 holds no edge_ids. We chose the latter.
+ *   1. The byte-budget contract in `topology_frequency_profiler.h`
+ *      allocates 8 B per edge for L2 (`kL2PerEdgeBytes`). ObjectId edge
+ *      ids occupy 56 value bits (`object_id.h`: 8-bit type tag + 56-bit
+ *      payload), so they cannot be narrowed to uint32; storing them
+ *      would force the contract to 12 B per edge (4 B col_idx + 8 B
+ *      edge_id). Either the contract bumps to 12 (re-deriving the
+ *      profiler's sizing tests) OR L2 holds no edge_ids. We chose the
+ *      latter.
  *
  *   2. The sampler (`BasicKHopSampler`) only consults edge_ids for
  *      edge-property lookups, which are rare in GraphSAGE-style GNN
- *      workloads. The EmbeddingWriter Phase B path uses node-id dedup
- *      since commit `896b3897` (zero-edge-id sentinel handling).
+ *      workloads. The EmbeddingWriter's non-seed inference path dedups
+ *      neighbors by node id (treating zero edge ids as a sentinel), so
+ *      it does not need L2 edge_ids either.
  *
  *   3. Dropping edge_ids leaves the contract intact AND means L2 is
  *      effectively over-budgeted by 4 B/edge (we book 8, spend 4) —
  *      defensive safety margin at scale.
  *
  * Callers that *do* need edge_ids for an L2-tier node fall through to
- * L4 (B+Tree direct). Phase 3 may add an opt-in edge_ids array if a
+ * L4 (B+Tree direct). An opt-in edge_ids array can be added later if a
  * workload demands it.
  *
  * Lifecycle: callers `add_node()` repeatedly during the build phase,
@@ -59,9 +60,9 @@ namespace mdb::gnn {
  * **L2 fixed-cost note (papers100M scale):** at N_L2 ≈ 16M warm nodes,
  * `row_ptr_` dominates the L2 fixed memory cost: 16M × 8 bytes = 128 MB
  * pinned in RAM, vs ~32 MB for `node_to_l2_idx_` hash overhead. The
- * Phase 1 byte-budget contract `kL2NodeFixedOverhead = 8` already
- * accounts for this; the note exists to set expectations for the
- * reader who might otherwise expect the hash map to dominate.
+ * byte-budget contract `kL2NodeFixedOverhead = 8` already accounts for
+ * this; the note exists to set expectations for the reader who might
+ * otherwise expect the hash map to dominate.
  */
 class L2CompactCsr {
 public:
@@ -167,13 +168,15 @@ public:
     uint64_t    dst_type_tag() const noexcept { return dst_type_tag_; }
 
     /**
-     * @brief Approximate resident-byte cost using the Phase 1 contract.
+     * @brief Approximate resident-byte cost using the profiler's
+     *        byte-budget contract (the `kL2*` constants in
+     *        `topology_frequency_profiler.h`).
      *
      * `kL2NodeFixedOverhead + kL2PerEdgeBytes * degree` per node.
      * Note: per the edge_ids decision above, the *actual* RSS will be
      * lower than this estimate (we book 8 B/edge but spend 4 B/edge).
      * The estimate is the upper bound the profiler used at sizing
-     * time, so test parity against the Phase 1 contract checks holds.
+     * time, so parity with the profiler's contract checks holds.
      */
     std::size_t total_bytes() const;
 

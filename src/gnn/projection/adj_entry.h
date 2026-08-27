@@ -8,7 +8,7 @@ namespace mdb::gnn {
  * @brief Adjacency entry for cached topology — node id + edge id.
  *
  * Layout matches the existing private `TopologyAccessor::AdjEntry` and
- * `EmbeddingWriter::AdjEntry` structs (commits `25a663ba`, `6521cc21`)
+ * `EmbeddingWriter::AdjEntry` structs
  * but is hoisted into a public header so the Four-Level Topology Store's
  * cache-build phase — which populates `L1HashCache`, `L2CompactCsr`, and
  * exposes neighbors via `FourLevelTopologyStore::Neighbors` — can share a
@@ -22,7 +22,7 @@ namespace mdb::gnn {
  * the same way the BPT path does today.
  *
  * A follow-up cleanup will deduplicate the older private copies of this
- * struct in `topology_accessor.cc` and `embedding_writer.cc` against this
+ * struct in `topology_accessor.h` and `embedding_writer.h` against this
  * header. The current state keeps both forms alive to stay surgical.
  */
 struct AdjEntry {

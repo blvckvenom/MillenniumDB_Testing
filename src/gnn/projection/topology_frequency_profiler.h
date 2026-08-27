@@ -15,8 +15,8 @@ namespace mdb::gnn {
 //
 // These four constants describe the bytes-per-node and bytes-per-edge cost
 // of holding a node in each tier of the Four-Level Topology Store. They are
-// declared in this public header (not buried in the .cc) so that Phase 2's
-// `FourLevelTopologyStore::build_phase`, `L1HashCache`, and `L2CompactCsr`
+// declared in this public header (not buried in the .cc) so that
+// `FourLevelTopologyStore::build()`, `L1HashCache`, and `L2CompactCsr`
 // can `static_assert` / arithmetically share the same numbers used here by
 // `compute_tier_assignment`. Any change to the on-disk / in-memory layout
 // of those structures MUST be reflected here in lockstep.
@@ -42,12 +42,14 @@ constexpr std::size_t kL2PerEdgeBytes      = 8;
  *
  * The profiler exposes two source paths:
  *
- *   1. **Warm start** (`compute_from_node_counts`): reads a prior
- *      `node_counts.bin` produced by a previous `gnn_offline_sample` run.
- *      This file mirrors DiskGNN's "node access count" technique. Phase 1
- *      keeps this method as a stub that returns false (no warm-start file
- *      consumed) until `gnn_offline_sample` learns to persist the counts
- *      (tracked separately as a future phase).
+ *   1. **Warm start** (`compute_from_node_counts`): reads
+ *      `<projection_dir>/node_counts.bin` — per-node access counts
+ *      persisted by a previous `gnn_offline_sample` run (or pre-seeded
+ *      by the cheap random-walk profiler on a cold start). Keeping a
+ *      per-node access counter follows DiskGNN (SIGMOD'25), which
+ *      "simply keeps a counter for each node" during pre-processing.
+ *      Falls back to path 2 when the file is absent, stale (node-count
+ *      mismatch with the projection), or malformed.
  *
  *   2. **Cold start** (`compute_from_degrees`): falls back to the node's
  *      out / in / out+in degree (depending on `EdgeOrientation`) as a
@@ -98,17 +100,18 @@ public:
     const std::vector<uint64_t>& frequency() const { return frequency_; }
 
     /// True iff the most recent `compute()` consumed `node_counts.bin`.
-    /// Phase 1 always returns false.
     bool warm_start_used() const { return warm_start_used_; }
 
 private:
     /**
-     * @brief Phase 1 STUB — read `<projection_dir>/node_counts.bin`.
+     * @brief Warm-start reader for `<projection_dir>/node_counts.bin`.
      *
-     * Returns false unconditionally in Phase 1 because
-     * `gnn_offline_sample` does not yet persist the file. The method is
-     * preserved in the API so Phase 2 can plug in the real reader without
-     * touching call sites.
+     * Validates the file (magic, header, node count against the bound
+     * topology) and loads the per-node counts into `frequency_`.
+     * Returns true only when a complete, size-matching counts payload
+     * was loaded; returns false on any miss or validation failure so
+     * `compute()` falls back to the degree proxy. The on-disk format is
+     * documented at the implementation.
      */
     bool compute_from_node_counts_(EdgeOrientation direction);
 

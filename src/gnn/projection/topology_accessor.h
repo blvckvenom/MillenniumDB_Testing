@@ -457,10 +457,10 @@ public:
     // directions): ~3 GB — well inside a 31 GB commodity-RAM budget. Disabled
     // by default; callers must explicitly opt in.
     //
-    // Mirrors the design of the EmbeddingWriter Phase B cache (commit
-    // 6521cc21cf) but lives in TopologyAccessor so every consumer
-    // (BasicKHopSampler, EmbeddingWriter, future gnn_predict, etc.) can
-    // automatically benefit.
+    // Mirrors the design of the adjacency cache the EmbeddingWriter builds
+    // for its non-seed inference pass, but lives in TopologyAccessor so every
+    // consumer (BasicKHopSampler, EmbeddingWriter, future gnn_predict, etc.)
+    // can automatically benefit.
 
     /// Single adjacency entry: neighbor node id + edge id (raw uint64 form,
     /// without the 8-bit ObjectId type tag — added back when the cached

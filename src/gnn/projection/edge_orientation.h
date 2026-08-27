@@ -30,7 +30,16 @@ namespace mdb::gnn {
  * Mirrors GQL::Procedures::Orientation but kept separate for module isolation.
  * Controls how edges are traversed during neighbor lookup and sampling.
  *
- * @see ISO/IEC 39075:2024 §4.3.5 (Undirected Edge Handling)
+ * Terminology note: ISO/IEC 39075:2024 (GQL) defines directionality as a
+ * property of the stored edge itself — a directed edge distinguishes a source
+ * and a destination endpoint (§3.4.12 "directed edge"), an undirected edge
+ * "does not distinguish between its endpoints" (§3.4.13 "undirected edge") —
+ * and every edge carries "the indication of whether the edge is a directed
+ * edge or an undirected edge" (§4.3.5 "Graphs"). This enum is a different,
+ * implementation-side notion the standard does not define: a TRAVERSAL
+ * orientation applied to the projection's stored directed edges. UNDIRECTED
+ * here means "visit both directions of a stored directed edge", not that the
+ * edge itself is undirected.
  */
 enum class EdgeOrientation {
     NATURAL,     ///< Follow edge direction as stored (from -> to)

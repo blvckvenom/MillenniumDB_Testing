@@ -77,9 +77,10 @@ void merge_symmetric_csr_node_dedup(
  * assignment is driven by per-node access frequency: high-frequency hub
  * nodes go to fast RAM tiers, cold-tail nodes are served from disk.
  *
- * The full coordinator (constructed with the Phase 3 B+Tree constructor):
- * replaces the earlier dispatcher-only skeleton (Phase 2 constructor, kept
- * for unit tests) with a full build+dispatch cycle that:
+ * The full coordinator (constructed with the B+Tree build constructor)
+ * replaces the earlier dispatcher-only skeleton (the reference-taking
+ * dispatcher constructor, kept for unit tests) with a full build+dispatch
+ * cycle that:
  *
  *   1. Owns the four tier sources internally (forward + reverse L1
  *      hash caches and L2 compact CSRs, plus optional non-owning L3
@@ -154,8 +155,8 @@ public:
          * @brief Iterate destination ids only (edge-id-agnostic path).
          *
          * Consumers that don't care about edge ids (the GraphSAGE
-         * sampler in its hot path, EmbeddingWriter Phase B
-         * traversal) can use this helper to walk the result without
+         * sampler in its hot path, the EmbeddingWriter's non-seed
+         * inference traversal) can use this helper to walk the result without
          * branching on `tier`. The callback is invoked once per
          * destination in storage order.
          *
@@ -316,7 +317,7 @@ public:
     };
 
     // ------------------------------------------------------------------
-    //  Phase 2 dispatcher constructor (kept for unit-test compatibility).
+    //  Dispatcher constructor (kept for unit-test compatibility).
     // ------------------------------------------------------------------
     //
     // Pre-built tier sources are passed in by reference / pointer; the
@@ -325,7 +326,7 @@ public:
     // `four_level_topology_store_test.cc` to drive the dispatcher with
     // synthetic L1/L2 fixtures.
     //
-    // For real usage, prefer the Phase 3 constructor below + `build()`.
+    // For real usage, prefer the build constructor below + `build()`.
 
     using L4Lookup = std::function<std::vector<AdjEntry>(ObjectId)>;
     using RowLookup = std::function<uint64_t(ObjectId)>;
@@ -344,7 +345,7 @@ public:
         Config                                          config);
 
     // ------------------------------------------------------------------
-    //  Phase 3 build constructor.
+    //  Build constructor.
     // ------------------------------------------------------------------
     //
     // Constructs a store wired to live B+Trees + an optional storage
@@ -363,7 +364,7 @@ public:
     ///       null, `build()` produces an empty store and the dispatcher
     ///       returns empty `Neighbors` for all queries. Synthetic-test
     ///       paths that drive the dispatcher with pre-built tiers use
-    ///       the Phase 2 reference-taking constructor instead.
+    ///       the reference-taking dispatcher constructor instead.
     FourLevelTopologyStore(BPlusTree<3>*               fwd_bpt,
                            BPlusTree<3>*               rev_bpt,
                            GQL::ProjectionStorage*     storage,
@@ -376,9 +377,9 @@ public:
     ~FourLevelTopologyStore();
 
     /**
-     * @brief Orchestrate the build phase (Phase 3 constructor only).
+     * @brief Orchestrate the build (build constructor only).
      *
-     * Sequence (per design §2.3):
+     * Sequence:
      *   1. Auto-detect L1/L2 budgets from /proc/meminfo when
      *      Config::l1_budget_mb / l2_budget_mb are 0.
      *   2. Run the frequency profiler (degree proxy when no
@@ -402,7 +403,7 @@ public:
      * @brief Whether the store is ready for queries.
      *
      * Always true for the dispatcher constructor (caller-managed
-     * tiers). True for the Phase 3 constructor only after a
+     * tiers). True for the build constructor only after a
      * successful `build()`.
      */
     bool is_built() const noexcept;
@@ -549,7 +550,7 @@ public:
      * @brief Get outgoing neighbors (NATURAL).
      *
      * @throws std::logic_error when the store was constructed via the
-     *         Phase 3 ctor and `build()` has not been called.
+     *         build ctor and `build()` has not been called.
      * @throws std::out_of_range when `row_lookup(v)` is past
      *         `tier_lookup` AND no L4 callback is wired (defensive
      *         choice: silent empty would mask projection / config
@@ -574,7 +575,7 @@ public:
     const Config& config() const noexcept { return config_; }
 
     // -----------------------------
-    //  Diagnostics (Phase 3 ctor)
+    //  Diagnostics (build ctor)
     // -----------------------------
     std::size_t l1_node_count() const noexcept;
     std::size_t l2_node_count() const noexcept;
@@ -585,8 +586,9 @@ public:
     std::size_t l1_sym_node_count() const noexcept;
     std::size_t l2_sym_node_count() const noexcept;
 
-    /// Sum of L1 + L2 resident bytes (using the `kL1*` / `kL2*` Phase
-    /// 1 contracts) across both directions. L3 / L4 are mmap / disk
+    /// Sum of L1 + L2 resident bytes (using the `kL1*` / `kL2*`
+    /// byte-budget contracts from `topology_frequency_profiler.h`)
+    /// across both directions. L3 / L4 are mmap / disk
     /// resident and do not count toward in-RAM accounting.
     std::size_t total_ram_used() const noexcept;
 
@@ -618,7 +620,7 @@ private:
     std::size_t release_directional_tiers_();
 
     // -------------------------------------------------
-    //  Build helpers (only used by the Phase 3 ctor)
+    //  Build helpers (only used by the build ctor)
     // -------------------------------------------------
     void auto_detect_budgets_(std::size_t& l1_bytes,
                               std::size_t& l2_bytes) const;
@@ -698,8 +700,12 @@ private:
      *        sample-set similarity so that nearby seeds in the random-walk
      *        order share L3 mmap pages, improving disk read locality.
      *
-     * Uses `MinHashReorderer::Strategy::SEGMENTED` (the GLOBAL composite-hash
-     * ordering `(segment_id<<32) | minhash` from DiskGNN Algorithm 1). Only
+     * Uses `MinHashReorderer::Strategy::SEGMENTED`, following DiskGNN's
+     * "Disk Cache Reordering using MinHash" (Algorithm 1, SIGMOD'25). The
+     * paper reorders within each per-segment disk cache; our SEGMENTED
+     * strategy consolidates the per-segment orderings into one GLOBAL
+     * order via the composite key `(segment_id<<32) | minhash` — that
+     * consolidation is ours, not the paper's. Only
      * fires when the frequency profiler has consumed
      * `<projection_dir>/node_counts.bin` (warm start — requires a prior
      * completed sample run to have written that file). On a cold start (no
@@ -714,7 +720,7 @@ private:
      */
     void compute_l3_minhash_reorder_(bool warm_start_used);
 
-    // Tier sources — Phase 3 ctor owns them; Phase 2 dispatcher ctor
+    // Tier sources — the build ctor owns them; the dispatcher ctor
     // leaves them null and uses the caller-provided `*_ref_` members.
     std::unique_ptr<L1HashCache>                       owned_l1_fwd_;
     std::unique_ptr<L1HashCache>                       owned_l1_rev_;
@@ -761,17 +767,17 @@ private:
     const GQL::Projection::TopologySnapshotReader*     l3_sym_ = nullptr;
     L4Lookup                                           l4_sym_;
 
-    // tier_lookup_ref_ points either into owned_tier_assignment_ (Phase
-    // 3 ctor) or into a caller-provided const vector (Phase 2 ctor).
+    // tier_lookup_ref_ points either into owned_tier_assignment_ (build
+    // ctor) or into a caller-provided const vector (dispatcher ctor).
     const std::vector<uint8_t>*                        tier_lookup_ref_ = nullptr;
     RowLookup                                          row_lookup_;
 
-    // Phase 3 ctor only:
+    // Build ctor only:
     BPlusTree<3>*                                      fwd_bpt_       = nullptr;
     BPlusTree<3>*                                      rev_bpt_       = nullptr;
     GQL::ProjectionStorage*                            storage_       = nullptr;
     std::filesystem::path                              projection_dir_;
-    bool                                               phase3_ctor_   = false;
+    bool                                               build_ctor_    = false;
     bool                                               built_         = false;
     // Set true once the symmetric tier is populated (UNDIRECTED build only).
     bool                                               sym_built_     = false;
@@ -791,10 +797,10 @@ private:
     // nullptr unless enable_pinned_gpu_view() registered one.
     std::unique_ptr<PinnedTopologyView>                pinned_view_;
 
-    // In-RAM merged undirected CSR for the GPU-UVA single slice (Part D). Owns
-    // its backing vectors so the pinned pages stay valid; sym_arrays_ points into
+    // In-RAM merged undirected CSR for the GPU-UVA single slice. Owns its
+    // backing vectors so the pinned pages stay valid; sym_arrays_ points into
     // them. Built lazily by materialize_symmetric_arrays(). NOTE: distinct from
-    // the Part C sym_built_ tier-dispatch flag — this is the flat uint32 CSR for
+    // the sym_built_ tier-dispatch flag — this is the flat uint32 CSR for
     // pinning, gated by its own sym_arrays_built_.
     std::vector<uint64_t>                              sym_row_ptr_;
     std::vector<uint32_t>                              sym_col_idx_;

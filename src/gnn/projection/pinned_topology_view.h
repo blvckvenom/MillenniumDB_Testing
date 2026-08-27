@@ -2,24 +2,24 @@
 
 // pinned_topology_view.h
 //
-// Registra los arrays CSR uint32 de adyacencia (ya residentes en RAM) como
-// visibles por la GPU mediante cudaHostRegister/UVA, SIN duplicarlos: la GPU los
-// recorre por PCIe (zero-copy), igual que un muestreador out-of-core que pinea su
-// grafo en RAM del host y lo lee desde el device. Es el sustrato que consumira el
-// kernel de muestreo k-hop; aqui solo se registran/desregistran las paginas host
-// y se exponen los punteros device-visibles.
+// Registers the uint32 CSR adjacency arrays (already resident in host RAM) as
+// GPU-visible via cudaHostRegister/UVA, WITHOUT duplicating them: the GPU walks
+// them over PCIe (zero-copy), like an out-of-core sampler that pins its graph
+// in host RAM and reads it from the device. This is the substrate the k-hop
+// sampling kernel consumes; this class only registers/unregisters the host
+// pages and exposes the device-visible pointers.
 //
-// Sustratos posibles para los arrays (el llamador decide cual pasa):
-//   - Sidecar global de topologia (ROW_PTR[N+1] uint64 + COL_IDX[M] uint32):
-//     cubre TODOS los nodos indexados por fila densa, correctness-complete.
-//   - CSR compacto del tier-2 (L2CompactCsr): solo la fraccion warm.
-// En ambos casos el descriptor es el mismo (punteros host + tamaños + tag), de
-// modo que esta clase es agnostica al sustrato.
+// Possible substrates for the arrays (the caller decides which one to pass):
+//   - Global topology sidecar (ROW_PTR[N+1] uint64 + COL_IDX[M] uint32):
+//     covers ALL nodes indexed by dense row, correctness-complete.
+//   - Tier-2 compact CSR (L2CompactCsr): only the warm fraction.
+// In both cases the descriptor is the same (host pointers + sizes + tag), so
+// this class is substrate-agnostic.
 //
-// Sin GPU en runtime (o build compilado sin CUDA) es un no-op total:
-// `build_and_register` no registra nada, `is_registered()` queda false y los
-// punteros device quedan null — la via de muestreo CPU no cambia en absoluto y la
-// salida es byte-identica.
+// Without a GPU at runtime (or in a build compiled without CUDA) this is a
+// complete no-op: `build_and_register` registers nothing, `is_registered()`
+// stays false and the device pointers stay null — the CPU sampling path is
+// entirely unchanged and its output is byte-identical.
 
 #include <cstddef>
 #include <cstdint>
@@ -27,65 +27,68 @@
 namespace mdb::gnn {
 
 /**
- * @brief Vista device de una direccion del CSR (forward o reverse).
+ * @brief Device view of one CSR direction (forward or reverse).
  *
- * Los punteros son device-visibles sobre las MISMAS paginas host (no son copias;
- * el modo zero-copy hace que la GPU camine la RAM por PCIe). `dst_type_tag` es el
- * tag de tipo ObjectId pre-desplazado (`tag << 56`) que el kernel re-OR'ea al
- * materializar un ObjectId de salida, porque `d_col_idx` guarda ordinales uint32
- * tag-stripped.
+ * The pointers are device-visible over the SAME host pages (not copies; the
+ * zero-copy mapping makes the GPU walk host RAM over PCIe). `dst_type_tag` is
+ * the pre-shifted ObjectId type tag (`tag << 56`) that the kernel ORs back
+ * when materializing an output ObjectId, because `d_col_idx` stores
+ * tag-stripped uint32 ordinals.
  */
 struct PinnedDirView {
-    const uint64_t* d_row_ptr    = nullptr;  // device-ptr, longitud n_rows + 1
-    const uint32_t* d_col_idx    = nullptr;  // device-ptr, longitud n_edges
+    const uint64_t* d_row_ptr    = nullptr;  // device ptr, length n_rows + 1
+    const uint32_t* d_col_idx    = nullptr;  // device ptr, length n_edges
     uint64_t        dst_type_tag = 0;        // tag << 56
-    std::size_t     n_rows       = 0;        // N (sidecar global) o N_L2 (compacto)
+    std::size_t     n_rows       = 0;        // N (global sidecar) or N_L2 (compact)
     std::size_t     n_edges      = 0;
 
-    // --- Modo tiled (path lean simetrico) -----------------------------------
-    // En modo tiled COL_IDX NO se registra entero: ROW_PTR se pinea completo y
-    // COL_IDX se transmite en ventanas alineadas a nodos a traves de un unico
-    // buffer pinned reutilizable. `tiled==false` => los campos de arriba se
-    // comportan EXACTAMENTE como el path no-tiled (d_col_idx es el COL_IDX
-    // entero device-visible) y los de abajo quedan sin usar.
-    const uint64_t* h_row_ptr      = nullptr;  // ROW_PTR host (scan de grados por ventana)
-    const uint32_t* h_col_src      = nullptr;  // COL_IDX host fuente (mmap/heap base); NUNCA se registra
-    uint32_t*       h_col_window   = nullptr;  // buffer pinned mapped de staging (host ptr)
-    uint32_t*       d_col_window   = nullptr;  // su puntero device
-    std::size_t     window_cap_edges = 0;      // capacidad del buffer (en aristas)
+    // --- Tiled mode (lean symmetric path) -----------------------------------
+    // In tiled mode COL_IDX is NOT registered whole: ROW_PTR is pinned in full
+    // and COL_IDX is streamed in node-aligned windows through a single reusable
+    // pinned buffer. `tiled==false` => the fields above behave EXACTLY like the
+    // non-tiled path (d_col_idx is the whole device-visible COL_IDX) and the
+    // fields below stay unused.
+    const uint64_t* h_row_ptr      = nullptr;  // host ROW_PTR (per-window degree scan)
+    const uint32_t* h_col_src      = nullptr;  // host COL_IDX source (mmap/heap base); NEVER registered
+    uint32_t*       h_col_window   = nullptr;  // pinned mapped staging buffer (host ptr)
+    uint32_t*       d_col_window   = nullptr;  // its device pointer
+    std::size_t     window_cap_edges = 0;      // buffer capacity (in edges)
     bool            tiled          = false;
 
-    // --- Modo resident (CSR entero en VRAM) ---------------------------------
-    // Cuando el grafo cabe en VRAM, ROW_PTR y COL_IDX se copian a memoria DEVICE
-    // propia (cudaMalloc) y d_row_ptr/d_col_idx apuntan ahí: el kernel lee de HBM
-    // (~cientos de GB/s) en vez de páginas host por PCIe (UVA). resident y tiled
-    // son mutuamente excluyentes (resident => tiled=false, d_col_idx no-null).
+    // --- Resident mode (whole CSR in VRAM) ----------------------------------
+    // When the graph fits in VRAM, ROW_PTR and COL_IDX are copied into DEVICE
+    // memory of their own (cudaMalloc) and d_row_ptr/d_col_idx point there: the
+    // kernel reads from HBM (~hundreds of GB/s) instead of host pages over PCIe
+    // (UVA). resident and tiled are mutually exclusive (resident => tiled=false,
+    // d_col_idx non-null).
     bool            resident       = false;
 };
 
 /**
- * @brief Descriptor host de una direccion: punteros a los arrays CSR ya en RAM.
+ * @brief Host descriptor of one direction: pointers to CSR arrays already in RAM.
  *
- * `row_ptr`/`col_idx` == nullptr => esa direccion no se registra (p.ej. NATURAL
- * solo pasa forward, o un nodo sin aristas en una direccion). Los punteros deben
- * ser estables durante toda la vida del view (post-freeze / post-mmap); registrar
- * un arreglo que luego se reubica deja punteros device colgantes.
+ * `row_ptr`/`col_idx` == nullptr => that direction is not registered (e.g.
+ * NATURAL passes forward only, or a node has no edges in one direction). The
+ * pointers must be stable for the whole lifetime of the view (post-freeze /
+ * post-mmap); registering an array that later relocates leaves dangling device
+ * pointers.
  */
 struct HostCsrArrays {
-    const uint64_t* row_ptr      = nullptr;  // host, longitud n_rows + 1
-    const uint32_t* col_idx      = nullptr;  // host, longitud n_edges
+    const uint64_t* row_ptr      = nullptr;  // host, length n_rows + 1
+    const uint32_t* col_idx      = nullptr;  // host, length n_edges
     std::size_t     n_rows       = 0;
     std::size_t     n_edges      = 0;
     uint64_t        dst_type_tag = 0;        // tag << 56
 };
 
 /**
- * @brief Registra/desregistra las paginas host del CSR como device-visibles.
+ * @brief Registers/unregisters the CSR host pages as device-visible.
  *
- * No copiable ni movible: gestiona registro de paginas con el runtime CUDA, donde
- * un doble-unregister seria un error. El propietario la mantiene tras un
- * `std::unique_ptr` (el move del puntero transfiere la propiedad sin mover el
- * objeto). Construir solo sobre los arrays FINALES (post-freeze/post-mmap).
+ * Neither copyable nor movable: it manages page registrations with the CUDA
+ * runtime, where a double-unregister would be an error. The owner keeps it
+ * behind a `std::unique_ptr` (moving the pointer transfers ownership without
+ * moving the object). Construct only over the FINAL arrays
+ * (post-freeze/post-mmap).
  */
 class PinnedTopologyView {
 public:
@@ -98,119 +101,126 @@ public:
     PinnedTopologyView& operator=(PinnedTopologyView&&)      = delete;
 
     /**
-     * @brief Registra forward (si trae punteros) y reverse (opcional).
+     * @brief Registers forward (when it carries pointers) and reverse (optional).
      *
-     * No-op silencioso (`is_registered()` queda false, punteros device null)
-     * cuando el build es sin CUDA o no hay GPU capaz en runtime — la via CPU no
-     * cambia. Con GPU presente registra cada region con `cudaHostRegisterMapped`
-     * y obtiene los punteros device via `cudaHostGetDevicePointer`.
+     * Silent no-op (`is_registered()` stays false, device pointers null) when
+     * the build has no CUDA or no capable GPU is present at runtime — the CPU
+     * path is unchanged. With a GPU present, registers each region with
+     * `cudaHostRegisterMapped` and obtains the device pointers via
+     * `cudaHostGetDevicePointer`.
      *
-     * @throws std::logic_error si ya hay un registro activo (llamar `release()`
-     *         primero; re-registrar paginas ya pineadas es un bug del llamador).
-     * @throws CudaException si una llamada CUDA falla; cualquier registro parcial
-     *         se deshace antes de propagar.
+     * @throws std::logic_error if a registration is already active (call
+     *         `release()` first; re-registering already-pinned pages is a
+     *         caller bug).
+     * @throws CudaException if a CUDA call fails; any partial registration is
+     *         undone before propagating.
      */
     void build_and_register(const HostCsrArrays& fwd, const HostCsrArrays& rev);
 
     /**
-     * @brief Variante tiled: pinea ROW_PTR entero pero NO COL_IDX; transmite
-     *        COL_IDX en ventanas alineadas a nodos via un buffer pinned reusable.
+     * @brief Tiled variant: pins the whole ROW_PTR but NOT COL_IDX; streams
+     *        COL_IDX in node-aligned windows through a reusable pinned buffer.
      *
-     * Pensada para el path lean simetrico en grafos enormes (papers100M): pinear
-     * el COL_IDX entero (~12.9 GB) como copia host pineada es justo lo que dispara
-     * el OOM. Aqui ROW_PTR (~0.9 GB) se pinea entero (cudaHostRegisterMapped) y por
-     * cada direccion activa se aloca UN buffer pinned mapped de `window_cap_edges`
-     * aristas (cudaHostAllocMapped); el COL_IDX se copia ventana a ventana con
-     * `map_col_window`. Deja `fwd()->d_col_idx == nullptr`: el llamador alimenta el
-     * COL_IDX por lanzamiento via `map_col_window`. No-op silencioso sin GPU/CUDA
-     * (igual que build_and_register).
+     * Intended for the lean symmetric path on graphs whose COL_IDX is a large
+     * fraction of host RAM (e.g. ~13 GB on a ~111 M-node / ~3.3 B-edge
+     * symmetric graph): pinning the whole COL_IDX as a pinned host copy is
+     * exactly what triggers the OOM. Here ROW_PTR (an order of magnitude
+     * smaller) is pinned whole (cudaHostRegisterMapped) and, per active
+     * direction, ONE pinned mapped buffer of `window_cap_edges` edges is
+     * allocated (cudaHostAllocMapped); COL_IDX is copied window by window with
+     * `map_col_window`. Leaves `fwd()->d_col_idx == nullptr`: the caller feeds
+     * COL_IDX per launch via `map_col_window`. Silent no-op without GPU/CUDA
+     * (same as build_and_register).
      *
-     * @param window_cap_edges capacidad del buffer de ventana en aristas (debe ser
-     *        >= el grado del nodo de mayor grado, para que ninguna ventana de un
-     *        solo nodo exceda el buffer).
-     * @throws std::logic_error si ya hay un registro activo.
-     * @throws CudaException si una llamada CUDA falla (registro parcial deshecho).
+     * @param window_cap_edges window buffer capacity in edges (must be >= the
+     *        degree of the highest-degree node, so no single-node window can
+     *        exceed the buffer).
+     * @throws std::logic_error if a registration is already active.
+     * @throws CudaException if a CUDA call fails (partial registration undone).
      */
     void build_and_register_tiled(const HostCsrArrays& fwd,
                                   const HostCsrArrays& rev,
                                   std::size_t          window_cap_edges);
 
     /**
-     * @brief Stagea col_idx[edge_lo, edge_hi) de `dir` en su buffer pinned y
-     *        devuelve el device-ptr desde donde leer.
+     * @brief Stages col_idx[edge_lo, edge_hi) of `dir` into its pinned buffer
+     *        and returns the device pointer to read from.
      *
-     * Para una direccion no-tiled devuelve `dir.d_col_idx` sin tocar (edge_lo/
-     * edge_hi se ignoran): el COL_IDX entero ya es device-visible. Para una tiled
-     * copia la ventana al buffer pinned (memcpy host->host pinned, visible por el
-     * device via el mapeo) y devuelve `dir.d_col_window`. El buffer es UNICO y
-     * reusable: cada llamada lo sobreescribe, asi que el kernel de la ventana
-     * anterior debe haber sincronizado antes de re-mapear (lo hace
-     * sample_layer_on_device_ con cudaDeviceSynchronize).
+     * For a non-tiled direction returns `dir.d_col_idx` untouched (edge_lo/
+     * edge_hi are ignored): the whole COL_IDX is already device-visible. For a
+     * tiled one, copies the window into the pinned buffer (host->pinned-host
+     * memcpy, device-visible through the mapping) and returns
+     * `dir.d_col_window`. The buffer is SINGLE and reusable: each call
+     * overwrites it, so the previous window's kernel must have synchronized
+     * before re-mapping (sample_layer_on_device_ does this with
+     * cudaDeviceSynchronize).
      *
-     * @throws std::logic_error si la ventana excede la capacidad del buffer o los
-     *         punteros tiled estan sin setear.
+     * @throws std::logic_error if the window exceeds the buffer capacity or the
+     *         tiled pointers are unset.
      */
     const uint32_t* map_col_window(const PinnedDirView& dir,
                                    std::uint64_t        edge_lo,
                                    std::uint64_t        edge_hi) const;
 
     /**
-     * @brief Variante resident: copia el CSR ENTERO a memoria device (cudaMalloc
-     *        + cudaMemcpy) y deja al kernel leerlo de HBM.
+     * @brief Resident variant: copies the WHOLE CSR into device memory
+     *        (cudaMalloc + cudaMemcpy) and lets the kernel read it from HBM.
      *
-     * Para grafos que caben en VRAM: el camino más rápido (lee de HBM, no por
-     * PCIe vía UVA, ni stagea ventanas). Una sola subida amortizada al inicio.
-     * Deja `resident=true, tiled=false` y d_row_ptr/d_col_idx apuntando a los
-     * buffers device propios. No-op silencioso sin GPU/CUDA. La salida del kernel
-     * es byte-idéntica a la de build_and_register (el RNG no depende de dónde vive
-     * col_idx).
+     * For graphs that fit in VRAM: the fastest path (reads from HBM, not over
+     * PCIe via UVA, and stages no windows). A single upload amortized at start.
+     * Leaves `resident=true, tiled=false` and d_row_ptr/d_col_idx pointing at
+     * the owned device buffers. Silent no-op without GPU/CUDA. The kernel's
+     * output is byte-identical to build_and_register's (the RNG does not depend
+     * on where col_idx lives).
      *
-     * @throws std::logic_error si ya hay un registro activo.
-     * @throws CudaException si una llamada CUDA falla (buffers parciales liberados).
+     * @throws std::logic_error if a registration is already active.
+     * @throws CudaException if a CUDA call fails (partial buffers freed).
      */
     void build_and_register_resident(const HostCsrArrays& fwd,
                                      const HostCsrArrays& rev);
 
     /**
-     * @brief Desregistra todas las regiones. Idempotente y noexcept.
+     * @brief Unregisters all regions. Idempotent and noexcept.
      */
     void release() noexcept;
 
     bool is_registered() const noexcept { return registered_; }
 
-    /// nullptr si esa direccion no se registro.
+    /// nullptr if that direction was not registered.
     const PinnedDirView* fwd() const noexcept { return fwd_active_ ? &fwd_ : nullptr; }
     const PinnedDirView* rev() const noexcept { return rev_active_ ? &rev_ : nullptr; }
 
 private:
-    // Punteros HOST originales por direccion, retenidos para `cudaHostUnregister`
-    // (que toma el puntero host, no el device).
+    // Original HOST pointers per direction, retained for `cudaHostUnregister`
+    // (which takes the host pointer, not the device one).
     struct HostRegistration {
         void* row_ptr     = nullptr;
         void* col_idx     = nullptr;
-        void* col_window  = nullptr;  // buffer cudaHostAlloc (tiled); cudaFreeHost en release()
-        void* d_row_owned = nullptr;  // cudaMalloc ROW_PTR (resident); cudaFree en release()
-        void* d_col_owned = nullptr;  // cudaMalloc COL_IDX (resident); cudaFree en release()
+        void* col_window  = nullptr;  // cudaHostAlloc buffer (tiled); cudaFreeHost in release()
+        void* d_row_owned = nullptr;  // cudaMalloc ROW_PTR (resident); cudaFree in release()
+        void* d_col_owned = nullptr;  // cudaMalloc COL_IDX (resident); cudaFree in release()
     };
 
-    // Registra una direccion. Rellena `reg` incrementalmente (tras cada
-    // `cudaHostRegister` exitoso) para que `release()` deshaga registros parciales
-    // si una llamada posterior lanza.
+    // Registers one direction. Fills `reg` incrementally (after each successful
+    // `cudaHostRegister`) so `release()` can undo partial registrations if a
+    // later call throws.
     void register_dir_(const HostCsrArrays& src,
                        PinnedDirView&       out,
                        bool&                active_flag,
                        HostRegistration&    reg);
 
-    // Variante tiled de register_dir_: pinea ROW_PTR entero, aloca el buffer de
-    // ventana pinned mapped, deja d_col_idx null y setea los campos tiled de out.
+    // Tiled variant of register_dir_: pins the whole ROW_PTR, allocates the
+    // pinned mapped window buffer, leaves d_col_idx null and sets out's tiled
+    // fields.
     void register_dir_tiled_(const HostCsrArrays& src,
                              PinnedDirView&       out,
                              bool&                active_flag,
                              HostRegistration&    reg,
                              std::size_t          window_cap_edges);
 
-    // Variante resident de register_dir_: cudaMalloc ROW_PTR+COL_IDX en device y
-    // cudaMemcpy desde el mmap/heap fuente; setea resident y los d_*_owned de reg.
+    // Resident variant of register_dir_: cudaMallocs ROW_PTR+COL_IDX on the
+    // device and cudaMemcpys from the mmap/heap source; sets resident and reg's
+    // d_*_owned fields.
     void register_dir_resident_(const HostCsrArrays& src,
                                 PinnedDirView&       out,
                                 bool&                active_flag,

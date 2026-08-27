@@ -115,7 +115,7 @@ const uint32_t* PinnedTopologyView::map_col_window(const PinnedDirView& dir,
                                                    std::uint64_t edge_lo,
                                                    std::uint64_t edge_hi) const {
     if (!dir.tiled) {
-        return dir.d_col_idx;  // no-tiled: COL_IDX entero ya device-visible
+        return dir.d_col_idx;  // non-tiled: whole COL_IDX already device-visible
     }
     const std::uint64_t span = edge_hi - edge_lo;
     if (span > dir.window_cap_edges || dir.h_col_window == nullptr

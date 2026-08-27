@@ -292,11 +292,9 @@ struct FeatureAccessor::Impl {
             auto mdb_tensor = tensor_manager.get_tensor<float>(tensor_oid);
             auto size = static_cast<int64_t>(mdb_tensor.size());
 
-            // Create torch tensor from data
             auto options = torch::TensorOptions().dtype(torch::kFloat32);
             torch::Tensor result = torch::empty({size}, options);
 
-            // Copy data
             std::memcpy(result.data_ptr<float>(), mdb_tensor.data(), size * sizeof(float));
 
             // Clone to ensure we own the data (important for TMP tensors)
