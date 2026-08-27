@@ -539,10 +539,11 @@ TEST_F(FeatureMatrixTest, CreateReorderedDuplicateSourceRows) {
     }
 }
 
-// Differential gate for the 2026-06-01 ext_sort Pass-1 source-order rewrite:
+// Differential gate for the ext_sort Pass-1 source-order rewrite:
 // the inverse-permutation sequential-source path must produce byte-identical
 // output to the output-order path. Exercises the external_sort strategy across
-// >1 bucket with a PARTIAL last bucket (the skeptics' boundary concern) on a
+// >1 bucket with a PARTIAL last bucket (the boundary case most likely to
+// break) on a
 // bijection, plus the non-bijective fallback (perm={1,1,1}) which must preserve
 // the documented CreateReorderedDuplicateSourceRows contract.
 TEST_F(FeatureMatrixTest, CreateReorderedExtSortSourceOrderMatches) {

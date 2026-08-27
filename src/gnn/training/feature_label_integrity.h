@@ -28,10 +28,11 @@ struct FeatureLabelIntegrityResult {
  * Catches the failure mode where a node's stored features do NOT correspond to
  * its label (e.g. a feature matrix whose rows were permuted/misordered relative
  * to node identity) — which lets a model "learn" yet caps accuracy near the
- * aligned fraction, INVARIANT to all graph/model/sampling choices. The 2026-06-02
- * papers100M bug (node_features.fmat[r] held the wrong node's features) is exactly
- * this class; a linear/centroid probe on the raw features dropped from ~0.44 to
- * ~chance. This is the source-independent guard for it.
+ * aligned fraction, INVARIANT to all graph/model/sampling choices. A bug once
+ * observed on a papers100M-scale build (node_features.fmat[r] held the wrong
+ * node's features) is exactly this class; a linear/centroid probe on the raw
+ * features dropped from many multiples of chance down to ~chance. This is the
+ * source-independent guard for it.
  *
  * Method: fit per-class feature centroids (mean) on the sample, L2-normalize them,
  * predict each node's class as the nearest centroid (cosine), report accuracy.

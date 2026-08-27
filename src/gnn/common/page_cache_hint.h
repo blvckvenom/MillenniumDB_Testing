@@ -42,9 +42,10 @@ inline bool disabled() {
  * not break the surrounding I/O. Disabled by env var
  * MDB_GNN_NO_FADVISE=1 (for ablation studies).
  *
- * Motivation: at papers100M scale the combined working set
- * (56 GB reordered.fmat + 87 GB batches.dat + ~8 GB tier caches)
- * exceeds a 30 GB host. Without explicit hints the kernel keeps
+ * Motivation: the build phases stream artifacts (reordered feature
+ * matrix, serialized batches, tier caches) whose combined size can be
+ * several times the host's RAM — at papers100M scale, roughly 5x on a
+ * 30 GB host. Without explicit hints the kernel keeps
  * already-consumed pages in the page cache until LRU eviction forces
  * them out — by which point productive pages have been swapped.
  * Issuing DONTNEED after each region is consumed keeps the active

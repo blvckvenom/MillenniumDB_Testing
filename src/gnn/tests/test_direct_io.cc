@@ -570,7 +570,9 @@ TEST_F(DirectIoReaderTest, NonAlignedRowSizeCora) {
 }
 
 // =============================================================================
-// Spec A1 (2026-04-27): bytes_disk in ReadResult — paper-comparable accounting
+// bytes_disk in ReadResult — physical-read accounting (counts the aligned
+// O_DIRECT bytes actually issued, comparable to how disk-based GNN systems
+// report their feature-read traffic)
 // =============================================================================
 
 TEST_F(DirectIoReaderTest, BytesDiskMonotone_ReadRows) {
@@ -644,13 +646,13 @@ TEST_F(DirectIoReaderTest, BytesDiskMonotone_ReadRange) {
 }
 
 // =============================================================================
-// Spec A2 (2026-04-27): page-level dedup — merge overlapping aligned regions
+// Page-level dedup — merge overlapping aligned regions
 // =============================================================================
 
 TEST_F(DirectIoReaderTest, Dedup_SamePageMultipleRows) {
     // 4 rows of 512 B each, no header, all sharing the same 4 KB page.
-    // Pre-A2: 4 × 4096 = 16 KB physical reads.
-    // Post-A2: 1 × 4096 = 4 KB (4× reduction in disk traffic).
+    // Without dedup: 4 × 4096 = 16 KB physical reads.
+    // With dedup: 1 × 4096 = 4 KB (4× reduction in disk traffic).
     constexpr uint64_t HEADER    = 0;
     constexpr uint64_t ROW_BYTES = 512;
     constexpr uint64_t ROWS      = 8;
@@ -711,7 +713,7 @@ TEST_F(DirectIoReaderTest, Dedup_DisjointRowsNotMerged) {
 }
 
 // =============================================================================
-// Spec A3 (2026-04-27): multi-ring parallel submission stress test
+// Multi-ring parallel submission stress test
 // =============================================================================
 
 TEST_F(DirectIoReaderTest, MultiRing_StressManySpans) {

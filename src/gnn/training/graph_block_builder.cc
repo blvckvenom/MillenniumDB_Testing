@@ -23,15 +23,16 @@ build_active_indices(
     out.indices_per_layer.reserve(K + 1);
     out.sizes_per_layer.reserve(K + 1);
 
-    // --- Phase 1: accumulate the cumulative active set, layer by layer. ---
+    // --- Pass 1: accumulate the cumulative active set, layer by layer. ---
     // By the rebuild_unique_nodes() ordering invariant (nodes inserted into
     // all_unique_nodes in layer order, seeds first), adding layer k's global
     // positions in iteration order yields a monotonically increasing sequence,
     // and across all layers the full set is exactly [0,1,..,N-1]. We dedup with
     // an O(1) `seen` bitmap indexed by global position (positions are in
     // [0,N)), which is far cheaper than the prior unordered_set/unordered_map
-    // churn — that allocation traffic was the dominant per-batch CPU cost at
-    // N=8 (profile 2026-06-04: build_active_indices ~= 29% of epoch wall).
+    // churn — under multi-worker prefetch that allocation traffic was the
+    // dominant per-batch CPU cost (profiled at roughly a third of the epoch
+    // wall-clock before this change).
     std::vector<char>    seen(static_cast<size_t>(N), 0);
     std::vector<int64_t> active_positions;
     active_positions.reserve(static_cast<size_t>(N));
@@ -68,7 +69,7 @@ build_active_indices(
         prefix_sizes.push_back(static_cast<int64_t>(active_positions.size()));
     }
 
-    // --- Phase 2: identity check. The universal case is active_positions ==
+    // --- Pass 2: identity check. The universal case is active_positions ==
     // [0,1,..,M-1]; then local index == global position for every layer, so the
     // per-layer gather tensors are aranges and edges remap through oid_to_global
     // with no per-layer maps at all. ---
@@ -135,7 +136,7 @@ std::vector<torch::Tensor> build_edge_indices(
     const size_t num_layers = sample.edges_per_layer.size();
     result.reserve(num_layers);
 
-    // Fast path (2026-06-04): empty per-layer maps => active sets are identity
+    // Fast path: empty per-layer maps => active sets are identity
     // prefixes (local index == global position). Each endpoint is remapped by
     // pure array indexing into active.layer_global_pos[layer][entry_idx]
     // (precomputed in build_active_indices from the lookups it already did) —
@@ -185,7 +186,7 @@ std::vector<torch::Tensor> build_edge_indices(
         }
     }
 
-    // Nested aggregation (2026-06-02): conv k operates on dst set A_k =
+    // Nested aggregation: conv k operates on dst set A_k =
     // ∪_{j<=k} nodes_per_layer[j] (all nodes within k hops). For STANDARD
     // GraphSAGE / DGL-block message passing every such node must aggregate its
     // sampled neighbours at conv k, so edge_index[k] is the union of the

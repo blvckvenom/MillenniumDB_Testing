@@ -12,9 +12,10 @@ namespace mdb::gnn {
 /**
  * @brief Per-batch stage timing record (microseconds).
  *
- * Phase 0 profile instrumentation. All values in microseconds.
+ * Opt-in profiling instrumentation. All values in microseconds.
  * rmap_lookup_us is a SUB-counter already included in load_features_us +
- * active_us; tracked separately to quantify Phase 1 candidate savings.
+ * active_us; tracked separately so the cost of ObjectId->row lookups can be
+ * quantified on its own before investing in a cache for them.
  */
 struct BatchTiming {
     uint64_t batch_id;
@@ -25,7 +26,7 @@ struct BatchTiming {
     uint64_t l2_us;
     uint64_t l3_us;
     uint64_t l4_us;
-    uint64_t assembler_kernel_us;  // Phase A: feature_store->load_batch_features (subsumes l1..l4)
+    uint64_t assembler_kernel_us;  // feature_store->load_batch_features (subsumes l1..l4)
     uint64_t rmap_lookup_us;   // sub-counter, NOT additive
     uint64_t active_us;
     uint64_t edge_us;

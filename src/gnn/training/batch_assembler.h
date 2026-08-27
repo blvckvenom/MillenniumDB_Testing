@@ -138,7 +138,7 @@ public:
      * @brief Read-only access to the underlying FourLevelStore, if any.
      *
      * Returns nullptr in FeatureMatrix-fallback mode. Used by TrainingLoop's
-     * Phase 0 profile instrumentation (`BatchTimingLog`) to pull per-tier
+     * per-batch profile instrumentation (`BatchTimingLog`) to pull per-tier
      * timings off the store after each batch assemble. Const-correct: the
      * timings are advertised via const accessors and the store is not
      * mutated through this pointer.

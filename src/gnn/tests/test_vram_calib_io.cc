@@ -39,7 +39,8 @@ TEST(VramCalibTextTest, ParseRoundTrip) {
 }
 
 TEST(VramCalibTextTest, ParsesRealCalibFileContents) {
-    // The exact text persisted on the papers100M/16GB box.
+    // Verbatim contents of a calibration file persisted by a real
+    // papers100M training run on a 16 GB GPU.
     const std::string text =
         "recommended_l1_cache_mb=5426\n"
         "measured_peak_mb=14999\n"

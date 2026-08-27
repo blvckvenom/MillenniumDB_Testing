@@ -15,8 +15,9 @@ namespace mdb::gnn {
 /**
  * @brief Per-stage timings populated by BatchAssembler during assembly.
  *
- * Stored in nanoseconds internally to avoid sub-μs truncation of fast
- * stages (see Phase 0 μs-truncation bug fix c25ec330). TrainingLoop
+ * Stored in nanoseconds internally: fast stages complete in well under a
+ * microsecond, and an earlier integer-microsecond representation truncated
+ * them to 0, hiding their cost from the profile entirely. TrainingLoop
  * divides by 1000 at the API boundary to write μs into BatchTiming.
  *
  * All fields default to 0 — populated only when the assembler chooses
@@ -99,7 +100,7 @@ struct MiniBatch {
     SplitType split = SplitType::TRAIN;            // batch split assignment
     uint64_t batch_id = 0;                         // identifier for this batch
 
-    /// Phase A (2026-05-19): per-stage timings populated by BatchAssembler
+    /// Per-stage timings populated by BatchAssembler
     /// during assemble_from_sample(). Read by TrainingLoop into BatchTiming.
     /// Zero-initialized; "0" means "not measured by this assembler call".
     BatchTimingSubrecord timing;

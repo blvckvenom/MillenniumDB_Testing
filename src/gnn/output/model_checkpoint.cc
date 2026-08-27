@@ -138,7 +138,25 @@ std::array<uint8_t, 32> ModelCheckpoint::compute_gnn_meta_hash(
     return digest;
 }
 
-// Binary layout: docs/superpowers/plans/2026-04-16-model-checkpoint-plan.md (Task 1.3)
+// .ckptmeta binary layout (all multi-byte fields little-endian, no padding
+// beyond the 3 reserved bytes noted):
+//   magic   8 B   "GNNCKPT\0"
+//   u32           format version (currently 1)
+//   u32           save_kind (0 = WeightsOnly, 1 = Full)
+//   u64           epoch
+//   u64           patience_counter
+//   f32           best_val_accuracy
+//   i64 x4        input_dim, hidden_dim, num_classes, num_layers
+//   f64           dropout
+//   u8            normalize (0/1), then 3 reserved zero bytes
+//   f64           total_training_time_sec
+//   u64           creation_time_unix
+//   32 B          gnn_meta_hash (SHA-256 of gnn_meta.bin)
+//   var           projection_name: u32 length + bytes
+//   var           model_type:      u32 length + bytes
+//   var           epoch_losses:    u32 count + count x f64
+// The reader consumes fields in exactly this order; read_ckptmeta bounds every
+// var-length prefix by the remaining file size before allocating.
 void ModelCheckpoint::write_ckptmeta(
     const std::filesystem::path& path,
     const TrainingState&         s)
@@ -169,7 +187,8 @@ void ModelCheckpoint::write_ckptmeta_impl(
     uint32_t save_kind_val = static_cast<uint32_t>(kind);
     write_le(f, save_kind_val);
 
-    // Fixed-size fields.  Offsets match the binary layout in the spec.
+    // Fixed-size fields, in the exact order documented above (the reader
+    // consumes them in the same order).
     write_le(f, s.epoch);
     write_le(f, s.patience_counter);
     write_le(f, s.best_val_accuracy);

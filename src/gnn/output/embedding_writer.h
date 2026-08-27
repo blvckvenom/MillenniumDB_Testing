@@ -50,13 +50,13 @@ namespace mdb::gnn {
  * reference and reads GraphSamples directly to recover seed ObjectIds
  * from `nodes_per_layer[0]`.
  *
- * ## Phases (incremental implementation)
+ * ## Phases
  *
  *   - Phase A: collect_seed_embeddings() iterates ALL batches,
  *     runs model.get_embeddings(), and maps results to (row_index, tensor).
  *   - Phase B: infer_non_seed_embeddings() for nodes never seen
  *     as seeds, using on-the-fly k-hop sampling from the projection topology.
- *   - Phase C (Task 6): write_to_projection() persists embeddings as a
+ *   - Phase C: write_to_projection() persists embeddings as a
  *     new tensor property in the GQL projection.
  *
  * ## Thread safety
@@ -148,7 +148,7 @@ public:
      *
      * Phase A: Collect seed embeddings from pre-computed batches.
      * Phase B: Infer embeddings for non-seed nodes via on-the-fly k-hop sampling.
-     * Phase C (Task 6 stub): Write to projection tensor store.
+     * Phase C: Write to projection tensor store.
      *
      * @return Summary with counts and timing.
      */
@@ -348,7 +348,8 @@ private:
     /// O(avg_degree) and amortizes the full-scan O(|E|) across chunks.
     ///
     /// Memory cost: ~16 bytes per edge. arxiv (1.07 M edges): ~17 MB;
-    /// products (61.9 M edges): ~1 GB — well inside the 31 GB RAM budget.
+    /// products (61.9 M edges): ~1 GB — affordable wherever the projection
+    /// itself already fits in RAM.
     void build_adjacency_cache_();
 
     /// Look up (neighbor_node_id, edge_id) pairs for a given node id

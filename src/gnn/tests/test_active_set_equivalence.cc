@@ -6,10 +6,14 @@
 // - Finite values (no NaN/inf)
 // - Differentiable (gradients flow correctly)
 //
-// Math equivalence to the OLD model is documented in
-// ~/Desktop/2026-05-14-graphsage-active-set-shrinking-plan.md (the trace-based
-// proof that seed embeddings are bit-equivalent in the seed positions).
-// Empirical accuracy match vs paper (65.91%) is validated in Task 8 (E2E).
+// Why shrinking cannot change seed embeddings: conv k reads only rows of
+// A_{k+1} (its dst set A_k is a prefix of A_{k+1}), so the rows dropped at
+// each layer are exactly the ones no shallower layer ever consumes — the
+// full-width model computed them and then discarded them. The chain down to
+// A_0 (seeds) therefore performs identical operations on identical inputs,
+// and the seed positions are bit-equivalent to the pre-refactor model.
+// Empirical accuracy parity with the published GraphSAGE numbers is
+// validated end-to-end, not in this unit gate.
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>

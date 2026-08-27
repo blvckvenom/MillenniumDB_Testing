@@ -28,7 +28,7 @@ std::string read_all(const fs::path& p) {
 }
 
 BatchTiming sample_record(uint64_t batch_id) {
-    // Phase A (2026-05-19) schema (15 fields total):
+    // CSV schema (15 fields total):
     //   batch_id, split,
     //   sample_read_us, load_features_us,
     //   l1_us, l2_us, l3_us, l4_us, assembler_kernel_us,

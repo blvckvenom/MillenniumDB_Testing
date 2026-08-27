@@ -42,7 +42,7 @@ TrainingLoop::TrainingLoop(
     , optimizer_(optimizer)
     , config_(std::move(config))
 {
-    // Phase 0 (2026-05-17): open per-batch profile CSV iff user opted in via
+    // Open the per-batch profile CSV iff the user opted in via
     // Config::profile_log_path. BatchTimingLog truncates the target, writes
     // the CSV header, and flushes on each `flush_interval` records (default
     // 64). The unique_ptr lifetime matches TrainingLoop's, so the destructor
@@ -87,14 +87,14 @@ TrainingLoop::Result TrainingLoop::train()
     double   best_val_acc     = config_.start_best_val;
     uint64_t patience_counter = config_.start_patience;
 
-    // Test-at-best-val protocol (2026-06-16): captured each time validation
+    // Test-at-best-val protocol: captured each time validation
     // strictly improves, when config_.track_test_at_best_val is on. Stays at
     // its sentinel (-1.0 / start_epoch) when the flag is off so the procedure
     // can tell "not tracked" from a genuine 0.0 test accuracy.
     double   best_val_test_acc   = -1.0;
     uint64_t best_val_epoch_seen = config_.start_epoch;
 
-    // Per-epoch disk-traffic accounting (2026-04-27): seed prev_disk before
+    // Per-epoch disk-traffic accounting: seed prev_disk before
     // the loop so the first epoch's delta == bytes accrued during epoch 0 (not
     // since process start). When provider is unset, prev/cur/delta stay zero
     // and the conditional print below is suppressed, preserving the original
@@ -181,7 +181,7 @@ TrainingLoop::Result TrainingLoop::train()
     {
         auto epoch_start = std::chrono::steady_clock::now();
 
-        // Cosine LR schedule (2026-06-16): set the Adam lr for this epoch BEFORE
+        // Cosine LR schedule: set the Adam lr for this epoch BEFORE
         // any forward/backward. Default ("") leaves the optimizer's lr untouched
         // (constant, canonical). "cosine" anneals learning_rate -> ~0 over the
         // run: lr(t) = learning_rate * 0.5 * (1 + cos(pi * t/T)).
@@ -203,7 +203,7 @@ TrainingLoop::Result TrainingLoop::train()
         // === Training phase ===
         model_.train();
 
-        // On-device loss accumulator (GPU-sync reduction, 2026-05-15).
+        // On-device loss accumulator (GPU-sync reduction).
         // Replaces the per-batch `loss.item<double>()` (GPU→CPU sync) with a
         // single `.item()` at end-of-epoch. Stays on `device` so loss.detach()
         // accumulates without crossing the PCIe bus.
@@ -256,7 +256,7 @@ TrainingLoop::Result TrainingLoop::train()
         }
 
         for (uint64_t bid = 0; bid < train_batches; ++bid) {
-            // Phase 0 (2026-05-17) profile record. Populated incrementally
+            // Profile record. Populated incrementally
             // through the per-batch stages; appended once at end-of-iteration
             // when profile_log_ is active. Zero-initialised so fields we
             // can't cleanly time on the prefetcher path (per-tier counters,
@@ -288,8 +288,8 @@ TrainingLoop::Result TrainingLoop::train()
                 mini = assembler_.assemble(bid);
             }
 
-            // Per-batch sub-stage timing breakdown (2026-05-19): sub-stage
-            // timings populated by BatchAssembler are now propagated via
+            // Per-batch sub-stage timing breakdown: sub-stage
+            // timings populated by BatchAssembler are propagated via
             // MiniBatch::timing on BOTH paths (sequential and async
             // prefetcher). The worker stamps mini.timing before pushing into
             // the queue, so the consumer reads safely after next() returns.
@@ -314,7 +314,7 @@ TrainingLoop::Result TrainingLoop::train()
                 }
             }
 
-            // Address-table fast-path telemetry (2026-05-31): v2 addr_table
+            // Address-table fast-path telemetry: v2 addr_table
             // metrics, read from the MiniBatch (stamped by BatchAssembler immediately
             // after the load) rather than from the FourLevelStore. This makes it
             // correct on BOTH the sequential and async-prefetcher paths — under
@@ -379,20 +379,20 @@ TrainingLoop::Result TrainingLoop::train()
             auto t_assem_end = std::chrono::steady_clock::now();
             result.assemble_seconds += std::chrono::duration<double>(
                 t_assem_end - t_assem_start).count();
-            // load_features_us = umbrella for (assemble + h→d) — same as Phase 0.
-            // Phase A now attributes its 50% uninstrumented mass via
-            // sample_read/active/assembler_kernel/edge/h2d sub-stages above.
+            // load_features_us = umbrella for (assemble + h→d). The
+            // sample_read/active/assembler_kernel/edge/h2d sub-stages above
+            // attribute the mass this umbrella would otherwise hide.
             bt.load_features_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_assem_end - t_assem_start).count();
             bt.h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_assem_end - t_h2d_start).count();
 
-            // Read-only isolation bench (2026-06-05): the producer path
+            // Read-only isolation bench: the producer path
             // (read_sample + load_batch_features + GPU assemble) has already
             // run to produce `mini`. Skip the model forward/backward/optimizer
             // so the prefetch workers run UNTHROTTLED by GPU compute; the
             // per-epoch io_disk/epoch_t then measures the read+assemble path's
-            // throughput when compute does not pace it (handoff 2026-06-05 §3).
+            // throughput when compute does not pace it.
             if (config_.read_only_bench) {
                 ++num_train_batches;
                 if (profile_log_) {
@@ -423,7 +423,7 @@ TrainingLoop::Result TrainingLoop::train()
             bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 t_fwd_end - t_fwd_start).count();
 
-            // Sync-avoidance optimization (2026-05-15): guard backward on
+            // Sync-avoidance optimization: guard backward on
             // CPU-side num_labeled (computed in BatchAssembler) instead of
             // `label_mask.any().item<bool>()` — the latter incurs a per-batch
             // GPU→CPU sync.
@@ -454,7 +454,7 @@ TrainingLoop::Result TrainingLoop::train()
 
             ++num_train_batches;
 
-            // Phase 0: emit this batch's timing record. No-op when
+            // Emit this batch's timing record. No-op when
             // profile_log_path was empty (profile_log_ is nullptr).
             if (profile_log_) {
                 profile_log_->append(bt);
@@ -462,8 +462,9 @@ TrainingLoop::Result TrainingLoop::train()
 
             // Periodic fragmentation reclaim. Variable batch receptive
             // fields leak holes into the caching allocator pool; without
-            // this call the OOM at ~12 min observed on UNDIRECTED 16 GB
-            // GPUs hits well before epoch boundaries.
+            // this call, deep-fanout runs on a 16 GB GPU have hit
+            // fragmentation-driven OOM mid-epoch, well before any epoch
+            // boundary where a full reclaim would otherwise run.
 #ifdef GNN_CUDA_ENABLED
             if (config_.empty_cache_every_n_batches > 0 &&
                 num_train_batches % config_.empty_cache_every_n_batches == 0 &&
@@ -492,7 +493,7 @@ TrainingLoop::Result TrainingLoop::train()
         }
 #endif
 
-        // Sync-avoidance optimization (2026-05-15): single end-of-epoch sync to
+        // Sync-avoidance optimization: single end-of-epoch sync to
         // read accumulated loss off-device. The .item() fires exactly once per epoch instead
         // of once per labeled batch (~1300× on papers100M scale). Division
         // by num_train_batches preserves the previous behavior exactly —
@@ -521,7 +522,7 @@ TrainingLoop::Result TrainingLoop::train()
         double val_phase_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_train_end).count();
 
-        // Phase 0: flush per-batch CSV at epoch boundary so partial logs
+        // Flush the per-batch CSV at the epoch boundary so partial logs
         // survive an early termination (Ctrl-C, OOM, etc.) and post-hoc
         // analysis sees epoch-N records even if the process never reached
         // the destructor.
@@ -550,11 +551,12 @@ TrainingLoop::Result TrainingLoop::train()
             patience_counter = 0;
             best_val_epoch_seen = epoch;
             // Checkpoint persistence is delegated to the on_epoch_end callback
-            // (see AutoCheckpointer in Phase 3).
+            // (see AutoCheckpointer).
 
-            // Test-at-best-val protocol (2026-06-16): evaluate the test split
+            // Test-at-best-val protocol: evaluate the test split
             // on the current (best-val) weights so the procedure can report
-            // the paper §7.1 number (test@best-val) alongside the
+            // test-at-best-val (the reporting protocol common in GNN papers,
+            // e.g. DiskGNN SIGMOD'25 §7.1) alongside the
             // test@final-epoch number. Skipped under read_only_bench (no
             // compute) and when there are no test batches.
             if (config_.track_test_at_best_val && !config_.read_only_bench
@@ -758,7 +760,7 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         }
     }
 
-    // Phase 0 (2026-05-17): infer split from start_batch using the catalog
+    // Infer split from start_batch using the catalog
     // layout (train batches first, then validation, then test). Anything
     // landing at or after train+validation counts as TEST; otherwise VAL.
     // Matches the procedure-level convention used by gnn_train_procedure.
@@ -789,7 +791,7 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
             mini = assembler_.assemble(start_batch + i);
         }
 
-        // Phase A (2026-05-19): sub-stage timings propagated via mini.timing
+        // Sub-stage timings propagated via mini.timing
         // on both paths — see train()'s sibling comment.
         bt.sample_read_us      = mini.timing.sample_read_ns      / 1000;
         bt.active_us           = mini.timing.active_ns           / 1000;
@@ -864,7 +866,7 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         bt.forward_us = std::chrono::duration_cast<std::chrono::microseconds>(
             t_fwd_end - t_fwd_start).count();
 
-        // Sync-avoidance optimization (2026-05-15): guard on CPU-side
+        // Sync-avoidance optimization: guard on CPU-side
         // num_labeled (computed in BatchAssembler) to avoid the
         // `label_mask.any().item<bool>()` per-batch GPU→CPU sync. The remaining
         // `.sum().item<int64_t>()` collects validation accuracy — out of scope
@@ -879,7 +881,7 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
             total   += masked_labels.size(0);
         }
 
-        // Phase 0: emit this val/test batch's timing record. backward_us
+        // Emit this val/test batch's timing record. backward_us
         // stays 0 (no backward in eval). Guarded by profile_log_ so
         // tests / standalone evaluate() calls without an opt-in path are
         // unaffected.
@@ -888,7 +890,7 @@ double TrainingLoop::evaluate(uint64_t start_batch, uint64_t count)
         }
     }
 
-    // Phase 0: flush after the val/test loop so the eval records are durable
+    // Flush after the val/test loop so the eval records are durable
     // even if a later phase (e.g., callback, test cleanup) throws.
     if (profile_log_) {
         profile_log_->flush();

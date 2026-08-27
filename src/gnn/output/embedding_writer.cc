@@ -155,7 +155,7 @@ void EmbeddingWriter::check_all_coverage_fits_() const {
 }
 
 // =============================================================================
-// write_all -- full orchestrator (Phases A + B; C is a stub)
+// write_all -- full orchestrator (Phases A + B + C)
 // =============================================================================
 
 EmbeddingWriter::Result EmbeddingWriter::write_all() {

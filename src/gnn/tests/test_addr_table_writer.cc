@@ -135,7 +135,8 @@ TEST(AddrTableWriterWrite, RoundTripsViaTempFile) {
     EXPECT_EQ(hdr_back.meta_sha256_head, 0xABCDull);
 
     // Read body arrays back and compare to the in-memory buffers.
-    // Order per spec §4.1: l1_positions, l1_indices, l2_*, l3_*, l4_*, zero.
+    // On-disk body order (as AddrTableWriter serializes the arrays after
+    // the header): l1_positions, l1_indices, l2_*, l3_*, l4_*, zero.
     auto read_u32 = [&](size_t n) {
         std::vector<uint32_t> v(n);
         f.read(reinterpret_cast<char*>(v.data()),

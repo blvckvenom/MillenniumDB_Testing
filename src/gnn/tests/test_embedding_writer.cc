@@ -7,7 +7,7 @@
  * the E2E test (gnn_e2e_test.sh).
  *
  * Coverage levels in this file — NOTE the distinction:
- *   - Tests 1-12 validate the Phase A/B ALGORITHM SPEC by re-implementing
+ *   - Tests 1-12 validate the Phase A/B algorithm CONTRACT by re-implementing
  *     the collection / dedup / missing-node logic inline (the production
  *     methods are private). A regression inside EmbeddingWriter's own
  *     implementation of that logic is caught by the E2E gate, NOT by these.

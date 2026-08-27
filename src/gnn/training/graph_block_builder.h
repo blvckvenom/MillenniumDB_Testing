@@ -13,7 +13,7 @@ namespace mdb::gnn::graph_block {
 /**
  * @brief Output bundle from build_active_indices.
  *
- * Edge-remap optimization (2026-05-15): in addition to the per-layer
+ * Edge-remap optimization: in addition to the per-layer
  * global-position tensors used by the model gather, also produce a per-layer
  * `ObjectId.id -> local-position-in-A_k` hash table. These are the
  * direct map build_edge_indices needs to remap edges from layer-local
@@ -29,7 +29,8 @@ struct ActiveIndicesResult {
                                                            //  empty on the fast identity-prefix path)
     // Fast-path only: layer_global_pos[k][i] = global position (== local
     // index under the identity prefix) of nodes_per_layer[k][i], for EVERY
-    // entry incl. cross-layer duplicates. Filled for free in Phase 1 (reuses
+    // entry incl. cross-layer duplicates. Filled for free during the
+    // accumulation pass (reuses
     // the oid_to_global lookups build_active_indices already does), so
     // build_edge_indices can remap each edge endpoint by pure array indexing
     // with ZERO per-edge hash lookups. Empty on the defensive fallback.
@@ -79,12 +80,12 @@ build_active_indices(
  * This eliminates the need for an extra remap in the model — index_select
  * directly into x = features[active_indices_per_layer[k+1]] works.
  *
- * Edge-endpoint single-lookup optimization (2026-05-15): takes the per-layer
+ * Edge-endpoint single-lookup optimization: takes the per-layer
  * oid_to_local maps produced by build_active_indices so each edge endpoint
  * costs ONE hash lookup (ObjectId.id -> local idx) instead of two
  * (oid -> global -> local).
  *
- * Fast path (2026-06-04): when active.oid_to_local_per_layer is EMPTY, the
+ * Fast path: when active.oid_to_local_per_layer is EMPTY, the
  * active sets are identity prefixes (local index == global position), so each
  * endpoint is remapped by pure array indexing into active.layer_global_pos
  * (precomputed in build_active_indices) — ZERO per-edge hash lookups. When

@@ -653,12 +653,15 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
             oid_to_global[sample.all_unique_nodes[i].id] = i;
         }
 
-        // Step 2: Build per-layer active-set indices for the active-set-shrinking
-        // model refactor — see plan ~/Desktop/2026-05-14-graphsage-active-set-shrinking-plan.md.
+        // Step 2: Build per-layer active-set indices. The model processes
+        // layer k over the shrinking active set A_k (seeds = A_0 subset of
+        // A_1 subset of ... subset of A_K = all_unique_nodes), so each conv
+        // only computes rows it will actually consume instead of the full
+        // receptive field at every layer.
         // Must precede build_edge_indices so the edge tensors can be remapped from
         // global positions into local positions within each active set.
         //
-        // (2026-05-15) build_active_indices now also emits a per-layer
+        // build_active_indices also emits a per-layer
         // ObjectId.id -> local-A_k-index hash table, which build_edge_indices
         // uses directly to halve the per-edge hash count (one lookup per
         // endpoint instead of two).
@@ -676,7 +679,7 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
     }
 
     // Step 3: Load features — ALWAYS (both block and online paths need them).
-    // (2026-05-15) pass the already-deserialized sample so the FourLevelStore
+    // Pass the already-deserialized sample so the FourLevelStore
     // path skips re-reading the same ~55 MB sample file.
     auto t_load_start = std::chrono::steady_clock::now();
     bool used_v2 = false;
@@ -686,7 +689,7 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             t_load_end - t_load_start).count());
 
-    // (2026-05-31) capture the v2 addr-table dispatch result for THIS
+    // Capture the v2 addr-table dispatch result for THIS
     // batch, as reported per-call by load_features (the store's shared
     // last_used_addr_tables() flag can be overwritten by a concurrent prefetch
     // worker before we read it). Carried on the MiniBatch so TrainingLoop
@@ -736,7 +739,7 @@ MiniBatch BatchAssembler::assemble_from_sample(const GraphSample& sample) {
         mini.label_mask = torch::zeros({num_seeds}, torch::kBool);
     }
 
-    // (2026-05-15) CPU-side count of labeled seeds. label_mask is
+    // CPU-side count of labeled seeds. label_mask is
     // still on CPU at this point (device transfer happens in TrainingLoop),
     // so reading it costs only an O(num_seeds) memory scan and avoids the
     // per-batch `label_mask.any().item<bool>()` GPU→CPU sync.
@@ -783,7 +786,7 @@ torch::Tensor BatchAssembler::load_features(const GraphSample& sample,
     if (used_addr_tables) *used_addr_tables = false;
     if (feature_store_) {
         // Full mode: FourLevelStore handles all four tiers.
-        // (2026-05-15) pass the GraphSample directly so the store
+        // Pass the GraphSample directly so the store
         // does not re-read it from disk inside load_batch_features. The store
         // reports the per-call v2 dispatch outcome through the out-param.
         return feature_store_->load_batch_features(sample, used_addr_tables);

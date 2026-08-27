@@ -1849,8 +1849,8 @@ TEST_F(FourLevelStoreCoordTest, Build_BudgetExactlyFitsAll) {
 // disk_budget_bytes is set.
 // =============================================================================
 
-TEST_F(FourLevelStoreCoordTest, SpecD_TelemetryFieldsPopulated) {
-    auto samples = create_samples("fls_spec_d_a", {{0,1,2,3,4,5,6,7}});
+TEST_F(FourLevelStoreCoordTest, DiskTelemetryFieldsPopulated) {
+    auto samples = create_samples("fls_telemetry_a", {{0,1,2,3,4,5,6,7}});
     auto config = make_config(/*cpu_budget_nodes=*/2, /*reorder=*/false);
 
     auto result = FourLevelStore::build(
@@ -1875,8 +1875,8 @@ TEST_F(FourLevelStoreCoordTest, SpecD_TelemetryFieldsPopulated) {
         << "over_budget must be false when disk_budget_bytes=0";
 }
 
-TEST_F(FourLevelStoreCoordTest, SpecD_OverBudgetTriggers) {
-    auto samples = create_samples("fls_spec_d_b", {{0,1,2,3,4,5,6,7}});
+TEST_F(FourLevelStoreCoordTest, DiskOverBudgetTriggers) {
+    auto samples = create_samples("fls_telemetry_b", {{0,1,2,3,4,5,6,7}});
     auto config = make_config(/*cpu_budget_nodes=*/2, /*reorder=*/false);
     config.disk_budget_bytes = 1; // Impossibly small — must trigger warning
 
@@ -1891,8 +1891,8 @@ TEST_F(FourLevelStoreCoordTest, SpecD_OverBudgetTriggers) {
         << "over_budget must be true when total exceeds budget";
 }
 
-TEST_F(FourLevelStoreCoordTest, SpecD_ReorderedBytesNonzero) {
-    auto samples = create_samples("fls_spec_d_c", {{0,1,2,3,4,5,6,7}});
+TEST_F(FourLevelStoreCoordTest, ReorderedBytesNonzero) {
+    auto samples = create_samples("fls_telemetry_c", {{0,1,2,3,4,5,6,7}});
     auto config = make_config(/*cpu_budget_nodes=*/2, /*reorder=*/true);
 
     auto result = FourLevelStore::build(

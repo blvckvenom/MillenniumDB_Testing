@@ -441,8 +441,8 @@ TEST(FeatureAssemblerTest, CudaKernelMatchesFallback) {
 }
 
 // ===========================================================================
-// Spec C3 stage 3 module 2 (2026-05-08): assemble_cuda honours the current
-// CUDA stream set via c10::cuda::CUDAStreamGuard.
+// Dual-stream training support: assemble_cuda honours the current CUDA
+// stream set via c10::cuda::CUDAStreamGuard.
 // ===========================================================================
 
 #include <c10/cuda/CUDAStream.h>

@@ -1,9 +1,10 @@
-// Spec C3 stage 3 module 1: validate cross-stream sync primitives.
+// Cross-stream sync primitives for the dual-CUDA-stream training overlap
+// (TrainingLoop::Config::use_cuda_streams).
 //
 // These tests don't touch the training loop; they exercise the LibTorch
 // CUDA stream + event API directly to ensure our understanding is correct
-// before wiring it into the prefetcher (Module 4) and training loop
-// (Module 5). Skip cleanly when CUDA is not available.
+// before relying on it in AsyncBatchPrefetcher and TrainingLoop. Skip
+// cleanly when CUDA is not available.
 
 #include <gtest/gtest.h>
 
@@ -86,7 +87,7 @@ TEST_F(Stage3StreamsTest, CUDAEvent_RecordAndQuery) {
 
 // ---------------------------------------------------------------------------
 // Test 4: Cross-stream sync — block(stream B) makes B wait for A's event.
-// This is THE primitive Stage 3 relies on.
+// This is THE primitive the dual-stream training overlap relies on.
 // ---------------------------------------------------------------------------
 TEST_F(Stage3StreamsTest, CrossStreamSync_BlockOrdering) {
     auto stream_a = acquire_pool_stream();
@@ -183,9 +184,9 @@ TEST_F(Stage3StreamsTest, StreamSignal_Movable) {
 }
 
 // ---------------------------------------------------------------------------
-// Spec C3 stage 3 module 3 tests: model forward + backward on a custom
-// stream produce equivalent output (within FP tolerance) to the default
-// stream. This is the pattern the training loop (Module 5) will use.
+// Model forward + backward on a custom stream produce equivalent output
+// (within FP tolerance) to the default stream. This is the pattern
+// TrainingLoop uses when use_cuda_streams is on.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -262,7 +263,7 @@ TEST_F(Stage3StreamsTest, ModelForwardBackward_DefaultVsCustomStream) {
 }
 
 TEST_F(Stage3StreamsTest, ModelStream_GradientFlowsThroughEventBlock) {
-    // Simulate the Module 5 ordering: producer thread runs a kernel on
+    // Simulate the training-loop ordering: producer thread runs a kernel on
     // stream A and records an event, consumer thread blocks the train
     // stream on the event before reading the produced tensor for backward.
     // The gradient w.r.t. the produced tensor must be correct (not garbage).

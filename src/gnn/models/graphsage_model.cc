@@ -46,11 +46,25 @@ GraphSAGEModel::GraphSAGEModel(const GraphSAGEConfig& config) : config_(config) 
 
     // Opt-in (MDB_GNN_XAVIER_INIT=1): re-initialize the Linear weights with
     // Glorot/Xavier-uniform using the ReLU gain (gain = sqrt(2)) for the conv
-    // layers and gain 1 for the linear classifier head, matching DGL's
-    // SAGEConv.reset_parameters. Default (unset) preserves PyTorch's
-    // kaiming_uniform_(a=sqrt(5)) Linear default exactly, so the bit-identical
-    // gates are unaffected. Rationale: docs/research/2026-06-10-thesis-measurements/
-    // WEIGHT_INIT_THEORY.md (the live candidate for the MDB<->DiskGNN ~1pt gap).
+    // layers and gain 1 for the linear classifier head. This mirrors DGL's
+    // SAGEConv.reset_parameters, which applies
+    // nn.init.xavier_uniform_(w, gain=calculate_gain("relu")) to its linear
+    // weights (DGL, python/dgl/nn/pytorch/conv/sageconv.py); the bias zeroing
+    // below is ours -- DGL's reset_parameters does not touch biases.
+    //
+    // Why the switch exists: PyTorch's Linear default draws weights from
+    // U(-sqrt(k), sqrt(k)) with k = 1/fan_in (torch.nn.Linear documentation),
+    // i.e. Var(W) = 1/(3*fan_in). Keeping activation variance constant across
+    // ReLU layers instead wants Var(W) = 2/fan_in -- the Xavier bound
+    // gain*sqrt(6/(fan_in+fan_out)) (Glorot & Bengio, AISTATS 2010) combined
+    // with the ReLU gain sqrt(2) (He et al. 2015) -- which is 6x larger for a
+    // square layer. Each ReLU layer multiplies activation variance by roughly
+    // r = fan_in*Var(W)/2, so a per-layer deficit compounds geometrically
+    // (r^L): two pipelines that differ only in this fixed choice can show a
+    // systematic accuracy offset (not seed noise -- every run starts from the
+    // same-scaled region) that grows with depth, invisible on 2-layer runs
+    // but material at 3. Default (unset) preserves PyTorch's Linear default
+    // exactly, so the bit-identical gates are unaffected.
     {
         // "1", "true" and "yes" are the only spellings this switch has ever
         // acted on and remain the accepted set, so an existing run keeps its

@@ -56,7 +56,7 @@ TEST_F(RowMappingTest, FindFirstOccurrence) {
 }
 
 // ===========================================================================
-// Permutation fingerprint (DiskGNN-adoption Plan 1 shared infra)
+// Permutation fingerprint (guards reorder sidecars against a stale permutation)
 // ===========================================================================
 
 TEST_F(RowMappingTest, PermFingerprintStableAcrossOpen) {
@@ -440,8 +440,8 @@ TEST_F(RowMappingTest, HeaderSizeIs16Bytes) {
 }
 
 // ===========================================================================
-// Permutation-fingerprint staleness (regression for the 2026-06-01 L4
-// feature-row corruption: a .idx built from one permutation was silently
+// Permutation-fingerprint staleness (regression for an L4 feature-row
+// corruption: a .idx built from one permutation was silently
 // adopted after the .rmap was rebuilt with a DIFFERENT permutation at the
 // same count, because the old guard validated only magic+version+count).
 // ===========================================================================

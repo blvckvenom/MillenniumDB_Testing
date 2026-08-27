@@ -1,9 +1,10 @@
-// Empirical check (read-only) for the K2 claim: does a fused gather+mean kernel
-// still have to READ essentially all of A_L? For each baked batch it computes the
-// set of A_L nodes K2 must read = A_{L-1} (read as x_self, the prefix) UNION the
-// distinct SOURCES of the deepest-hop edges (read to compute the mean). Reports
-// read_fraction = |read_set| / |A_L| and unread_fraction = A_L nodes K2 could
-// skip. If unread ~ 0, K2 reads ~100% of A_L and cannot cut the tier-read cost.
+// Empirical check (read-only) for a proposed deepest-layer fused gather+mean
+// kernel: would it still have to READ essentially all of A_L? For each baked
+// batch it computes the set of A_L nodes such a kernel must read = A_{L-1}
+// (read as x_self, the prefix) UNION the distinct SOURCES of the deepest-hop
+// edges (read to compute the mean). Reports read_fraction = |read_set| / |A_L|
+// and unread_fraction = A_L nodes the kernel could skip. If unread ~ 0, the
+// kernel reads ~100% of A_L and cannot cut the tier-read cost.
 #include "gnn/sampling/sample_storage.h"
 #include "gnn/sampling/graph_sample.h"
 
@@ -50,7 +51,7 @@ int main(int argc, char** argv) {
             if (si >= 0 && static_cast<size_t>(si) < deepest_nodes.size())
                 read_set.insert(deepest_nodes[si].get_value());
 
-        // A_L and the nodes K2 could skip (in A_L but neither x_self nor a source).
+        // A_L and the nodes the kernel could skip (in A_L but neither x_self nor a source).
         const unsigned long long AL = s.all_unique_nodes.size();
         unsigned long long unread = 0;
         for (const auto& o : s.all_unique_nodes)
@@ -69,9 +70,9 @@ int main(int argc, char** argv) {
 
     std::printf("batches=%llu\n", n);
     std::printf("sum_A_L=%llu\n", sum_AL);
-    std::printf("sum_read_set=%llu  (A_L nodes K2 MUST read = A_{L-1} U deepest_sources)\n", sum_read);
+    std::printf("sum_read_set=%llu  (A_L nodes the kernel MUST read = A_{L-1} U deepest_sources)\n", sum_read);
     std::printf("READ_FRACTION_of_A_L=%.6f\n", sum_AL ? (double)sum_read / sum_AL : 0.0);
-    std::printf("sum_unread=%llu  (A_L nodes K2 could SKIP)\n", sum_unread);
+    std::printf("sum_unread=%llu  (A_L nodes the kernel could SKIP)\n", sum_unread);
     std::printf("UNREAD_FRACTION=%.6f\n", sum_AL ? (double)sum_unread / sum_AL : 0.0);
     return 0;
 }

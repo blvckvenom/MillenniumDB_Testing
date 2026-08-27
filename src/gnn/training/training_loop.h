@@ -75,7 +75,7 @@ public:
         double               start_best_val  = 0.0;
         std::vector<double>  seed_losses;
 
-        // Spec B2 (2026-04-27): optional cumulative-disk-bytes provider.
+        // Optional cumulative-disk-bytes provider.
         // If set, train() invokes it once before the first epoch and once
         // at the end of each epoch, computes the per-epoch delta, and
         // prints the L3+L4 disk-traffic delta inline on the per-epoch
@@ -93,9 +93,9 @@ public:
         // phase remains sequential. Queue size matches DiskGNN paper §6
         // default of 2.
         //
-        // Default true: empirical 1.609× wall-clock speedup measured on
-        // papers100M_caminoD_sample with bit-identical accuracy (0.5942 vs
-        // 0.5940, within noise). Set false only for debugging or to compare
+        // Default true: overlapping assembly with compute measured a ~1.6×
+        // wall-clock speedup on a papers100M-scale sample, with accuracy
+        // identical within noise. Set false only for debugging or to compare
         // against the legacy serial path.
         bool        use_async_prefetcher = true;
         size_t      prefetch_queue_size  = 2;
@@ -143,31 +143,32 @@ public:
         // epoch (<0.05%). Set to 0 to disable.
         uint64_t empty_cache_every_n_batches = 100;
 
-        // Phase 0 (2026-05-17) profile instrumentation: when non-empty,
+        // Profile instrumentation: when non-empty,
         // per-batch timings are persisted to this CSV path (train + val +
         // test). Disabled when empty (default). Captures: forward / backward
         // wall-times always; per-tier L1/L2/L3/L4/rmap sub-counters only on
         // the sequential (non-prefetcher) path where the FourLevelStore's
         // last_*_us() values can be safely attributed to the current batch.
-        // Under the AsyncBatchPrefetcher (default-on since 2026-05-07) tier
+        // Under the AsyncBatchPrefetcher (the default) tier
         // sub-counters are left at 0 — the prefetcher's worker has already
         // begun assembling batch N+1 by the time the consumer reads N, so
         // last_*_us() is racy/unattributable without MiniBatch-level
         // propagation (deferred refactor).
         std::string profile_log_path = "";
 
-        // Read-only isolation bench (2026-06-05). When true, each train batch
+        // Read-only isolation bench. When true, each train batch
         // runs the full producer path (read_sample + load_batch_features +
         // GPU assemble, via the prefetcher when enabled) but SKIPS the model
         // forward/backward/optimizer and the validation phase. The prefetch
         // workers therefore run unthrottled by GPU compute, so the per-epoch
         // io_disk / epoch_t measures the read+assemble path's throughput when
-        // compute does not pace it. This settles whether MDB's in-train read
-        // is limited by compute-pacing or by the read path itself (handoff
-        // 2026-06-05 §3 — vs DiskGNN's isolated cold-load stage ~2.18 GB/s).
+        // compute does not pace it. This settles whether the in-train read is
+        // limited by compute-pacing or by the read path itself, and yields a
+        // number comparable to systems that benchmark their feature-load
+        // stage in isolation.
         bool        read_only_bench = false;
 
-        // Test-at-best-val protocol (2026-06-16). When true, every time the
+        // Test-at-best-val protocol. When true, every time the
         // validation accuracy strictly improves (is_best), the test split is
         // ALSO evaluated and the value is captured into
         // Result::test_accuracy_at_best_val (the test accuracy of the model
@@ -175,20 +176,21 @@ public:
         // paper §7.1 reporting protocol ("test accuracy at the epoch with the
         // best validation accuracy"), as opposed to the test-at-final-epoch
         // number that gnn_train reports by default. ADDITIVE: the final-epoch
-        // testAccuracy yield is unchanged, so existing bit-identical gates
-        // (e.g. cora 0.8574939) are preserved. Default false to keep clean
+        // testAccuracy yield is unchanged, so existing bit-identical
+        // regression gates are preserved. Default false to keep clean
         // benchmark timing (each improving epoch pays one extra test-split
         // eval pass); enable per-run via the trackTestAtBestVal procedure
-        // parameter. See docs/research/2026-06-16-accuracy-target/.
+        // parameter.
         bool        track_test_at_best_val = false;
 
-        // Learning-rate schedule (2026-06-16). "" = constant lr (default,
+        // Learning-rate schedule. "" = constant lr (default,
         // canonical). "cosine" = cosine annealing from learning_rate down to ~0
         // over [start_epoch, start_epoch+epochs): at relative epoch t of T total,
         // lr(t) = learning_rate * 0.5 * (1 + cos(pi * t / T)). Set on all Adam
-        // param groups at the top of each epoch. Accuracy lever for the
-        // late-epoch generalization gap (constant lr plateaus ~ep34 then val
-        // drifts down). Opt-in via the lrSchedule procedure parameter; default
+        // param groups at the top of each epoch. Targets the late-epoch
+        // generalization gap: with constant lr the validation accuracy
+        // plateaus late in training and then drifts down, which annealing
+        // avoids. Opt-in via the lrSchedule procedure parameter; default
         // "" preserves the canonical constant-lr trajectory and bit-identical
         // gates.
         std::string lr_schedule = "";
@@ -232,7 +234,7 @@ public:
         // activation diagnostic without parsing stderr.
         unsigned             effective_prefetch_workers = 1;
 
-        // Path 4 (2026-05-19): Track whether the v2 addr_table fast path was
+        // Track whether the v2 addr_table fast path was
         // used at least once during the run, and the mean per-batch cost of
         // reading+parsing the addr_table sidecar (μs).  Only attributable on
         // the sequential (non-prefetcher) path — see the sampling site in
@@ -242,7 +244,7 @@ public:
         double               addr_table_load_us_mean  = 0.0;
         uint64_t             addr_table_load_us_count = 0;
 
-        // Test-at-best-val protocol (2026-06-16). Populated only when
+        // Test-at-best-val protocol. Populated only when
         // Config::track_test_at_best_val is true; otherwise stays at -1.0.
         // test_accuracy_at_best_val is the test-split accuracy of the model
         // weights at the epoch where validation accuracy last strictly
@@ -312,7 +314,7 @@ private:
     torch::optim::Adam&  optimizer_;
     Config               config_;
 
-    // Phase 0 (2026-05-17): per-batch CSV profile log. Constructed only when
+    // Per-batch CSV profile log. Constructed only when
     // config_.profile_log_path is non-empty; nullptr otherwise. Owned by
     // TrainingLoop; flushed on epoch boundaries and on destruction.
     std::unique_ptr<BatchTimingLog> profile_log_;

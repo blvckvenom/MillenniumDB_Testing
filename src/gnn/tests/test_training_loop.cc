@@ -375,17 +375,17 @@ TEST_F(TrainingLoopTest, PatienceStops)
 }
 
 // =============================================================================
-// Spec C3 stage 0 (2026-05-07): per-stage timing instrumentation
+// Per-stage timing instrumentation.
 //
-// Validates that the new assemble_seconds, forward_seconds, backward_seconds
+// Validates that the assemble_seconds, forward_seconds, backward_seconds
 // fields populate non-zero values during a real training run, and that their
 // sum is bounded above by train_seconds (since train_seconds also includes
 // the validation phase, the inequality is strict in general).
 // =============================================================================
 
-TEST_F(TrainingLoopTest, SpecC3_PerStageTimingPopulated)
+TEST_F(TrainingLoopTest, PerStageTimingPopulated)
 {
-    const std::string sname = "spec_c3_timing";
+    const std::string sname = "per_stage_timing";
     auto cat = create_sample_storage(sname);
 
     auto fm      = FeatureMatrix::open(fmat_path_);
@@ -446,13 +446,13 @@ TEST_F(TrainingLoopTest, SpecC3_PerStageTimingPopulated)
 }
 
 // =============================================================================
-// Spec C3 stage 3 module 5 (2026-05-08): TrainingLoop with use_cuda_streams=true
+// TrainingLoop with use_cuda_streams=true
 // runs to completion without hanging and produces a loss curve close to the
 // sequential path. Skipped on CPU-only runs.
 // =============================================================================
 
 #ifdef ENABLE_CUDA_ASSEMBLER
-TEST_F(TrainingLoopTest, SpecC3_DualStream_RunsAndConverges)
+TEST_F(TrainingLoopTest, DualStream_RunsAndConverges)
 {
     if (!torch::cuda::is_available()) {
         GTEST_SKIP() << "CUDA not available";
@@ -503,10 +503,10 @@ TEST_F(TrainingLoopTest, SpecC3_DualStream_RunsAndConverges)
     // Smoke test: with use_cuda_streams=true, training must run to
     // completion without hanging, deadlocking, or crashing. This is the
     // primary value of this test — bit-identicality vs single-stream is
-    // empirically validated by Module 6 on real data (cora_gnn / arxiv /
-    // papers100M). The fixture here is too small + CPU-fallback-prone to
-    // do a meaningful numeric comparison.
-    auto r_streams = run(true, "c3_streams_on");
+    // validated empirically on real datasets (cora_gnn / arxiv /
+    // papers100M) in the end-to-end gates. The fixture here is too small
+    // and CPU-fallback-prone to do a meaningful numeric comparison.
+    auto r_streams = run(true, "dual_streams_on");
 
     // Must have produced at least one epoch of loss and a valid val accuracy.
     ASSERT_GE(r_streams.epoch_losses.size(), 1u);

@@ -3,9 +3,10 @@
 // Async batch prefetcher — training pipeline overlap.
 //
 // Hides the per-batch assemble cost (sample read + feature gather +
-// host→device transfer, measured at 65.7% of train wall-time on
-// papers100M baseline) behind the model forward+backward compute on
-// the GPU. Mirrors the producer-consumer queue pattern from DiskGNN
+// host→device transfer, measured at roughly two-thirds of train
+// wall-time on a papers100M-scale baseline) behind the model
+// forward+backward compute on the GPU.
+// Mirrors the producer-consumer queue pattern from DiskGNN
 // SIGMOD'25 §5.3 with queue size 2 (paper §6 default).
 //
 // Thread model:

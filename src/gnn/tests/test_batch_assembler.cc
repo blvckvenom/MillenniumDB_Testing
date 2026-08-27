@@ -292,7 +292,7 @@ TEST_F(BatchAssemblerTest, EdgeIndicesAreGloballyRemapped) {
 }
 
 // =============================================================================
-// Nested-aggregation edge wiring (2026-06-02)
+// Nested-aggregation edge wiring
 //
 // 3-layer sample (2 edge layers) over the 6-node fixture:
 //   Layer 0 (seeds): node0, node1     (global pos 0,1; A_0 = {0,1})
