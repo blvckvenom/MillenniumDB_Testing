@@ -275,33 +275,123 @@ log_ok "Root batch file initialized: $ROOT_BATCH_FILE"
 # ---------------------------------------------------------------------------
 log_step "Step 1: GPU detection"
 
-detect_gpu_model() {
+# GPU generation resolution.
+#
+# The stack (CUDA version + LibTorch build) is chosen from the GPU
+# generation, and choosing wrong is expensive: CUDA 12.4 on a Blackwell card
+# compiles cleanly and only fails at RUNTIME, because the toolkit does not
+# know sm_120. So the generation is resolved from three independent sources,
+# most authoritative first, and if all three are inconclusive the script
+# ABORTS instead of guessing.
+#
+#   1. nvidia-smi     exact marketing name, but needs a working driver.
+#   2. lspci name     needs the local pci.ids database to know the device.
+#   3. PCI device id  works on any machine, but is a documented heuristic.
+#
+# Source 3 exists because pciutils ships a static device database: a card
+# newer than the installed pci.ids prints as "Device 2c05" with no model
+# name, and every name-matching rule silently misses it.
+
+detect_gpu_line() {
     if ! command -v lspci >/dev/null 2>&1; then
         $PRIV apt-get install -y pciutils >/dev/null 2>&1 || true
     fi
-    local gpu
-    gpu="$(lspci 2>/dev/null | grep -iE 'vga|3d' | grep -i nvidia || true)"
-    echo "$gpu"
+    lspci 2>/dev/null | grep -iE 'vga|3d' | grep -i nvidia || true
 }
 
-GPU_LINE="$(detect_gpu_model)"
+detect_gpu_pci_id() {
+    lspci -nn 2>/dev/null | grep -iE 'vga|3d' \
+        | grep -oiE '10de:[0-9a-f]{4}' | head -1 | cut -d: -f2 || true
+}
+
+# gpu_gen_from_name <human readable gpu name> -> 5070 | 4070 | (empty)
+gpu_gen_from_name() {
+    if echo "$1" | grep -qiE 'rtx.?5[0-9]{3}|[^0-9]5[0-9]{3}[^0-9]?(ti|super)?|blackwell'; then
+        echo 5070
+    elif echo "$1" | grep -qiE 'rtx.?4[0-9]{3}|[^0-9]4[0-9]{3}[^0-9]?(ti|super)?|ada|lovelace'; then
+        echo 4070
+    else
+        echo ""
+    fi
+}
+
+# gpu_gen_from_pci_id <4 hex digits> -> 5070 | 4070 | (empty)
+# HEURISTIC, documented on purpose. NVIDIA assigns device ids in blocks per
+# architecture: Ada (AD10x) lands in 0x2600-0x28FF, Blackwell (GB20x) in
+# 0x2B00-0x2FFF. Verified against 10de:2c05 (RTX 5070 Ti). A card outside
+# both ranges yields empty, which triggers the explicit abort below rather
+# than a silent wrong answer.
+gpu_gen_from_pci_id() {
+    case "$1" in
+        ''|*[!0-9a-fA-F]*) echo ""; return ;;
+    esac
+    local id=$((16#$1))
+    if   [ "$id" -ge $((16#2B00)) ] && [ "$id" -le $((16#2FFF)) ]; then echo 5070
+    elif [ "$id" -ge $((16#2600)) ] && [ "$id" -le $((16#28FF)) ]; then echo 4070
+    else echo ""; fi
+}
+
+GPU_LINE="$(detect_gpu_line)"
+GPU_PCI_ID="$(detect_gpu_pci_id)"
+
 if [ -n "$GPU_LINE" ]; then
     log_ok "NVIDIA GPU found: $GPU_LINE"
+    [ -n "$GPU_PCI_ID" ] && log_info "PCI device id: 10de:$GPU_PCI_ID"
 else
     log_warn "No NVIDIA GPU detected via lspci"
 fi
 
 if [ "$GPU_CHOICE" = "auto" ]; then
-    if echo "$GPU_LINE" | grep -qiE '50[789]0|5060|rtx.5'; then
-        GPU_CHOICE="5070"
-    elif echo "$GPU_LINE" | grep -qiE '40[6-9]0|4050|rtx.4'; then
-        GPU_CHOICE="4070"
-    elif [ -n "$GPU_LINE" ]; then
-        log_warn "GPU detected but unknown generation; defaulting to 4070 stack (CUDA 12.4)"
-        GPU_CHOICE="4070"
-    else
-        GPU_CHOICE="none"
+    RESOLVED=""
+    RESOLVED_SRC=""
+
+    if [ -z "$GPU_LINE" ]; then
+        RESOLVED="none"
+        RESOLVED_SRC="lspci (no NVIDIA display device on the bus)"
     fi
+
+    if [ -z "$RESOLVED" ] && command -v nvidia-smi >/dev/null 2>&1; then
+        SMI_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+        if [ -n "$SMI_NAME" ]; then
+            RESOLVED="$(gpu_gen_from_name "$SMI_NAME")"
+            [ -n "$RESOLVED" ] && RESOLVED_SRC="nvidia-smi: $SMI_NAME"
+        fi
+    fi
+
+    if [ -z "$RESOLVED" ]; then
+        RESOLVED="$(gpu_gen_from_name "$GPU_LINE")"
+        [ -n "$RESOLVED" ] && RESOLVED_SRC="lspci device name"
+    fi
+
+    if [ -z "$RESOLVED" ] && [ -n "$GPU_PCI_ID" ]; then
+        RESOLVED="$(gpu_gen_from_pci_id "$GPU_PCI_ID")"
+        if [ -n "$RESOLVED" ]; then
+            RESOLVED_SRC="PCI device id heuristic (10de:$GPU_PCI_ID)"
+            log_warn "Generation inferred from the PCI device id, not from a model name."
+            log_warn "  Your pci.ids database does not know this card. Refresh it with:"
+            log_warn "    sudo update-pciids"
+            log_warn "  Override with --gpu=5070 or --gpu=4070 if this is wrong."
+        fi
+    fi
+
+    if [ -z "$RESOLVED" ]; then
+        log_err "Could not determine the GPU generation."
+        log_err "  lspci line : ${GPU_LINE:-<none>}"
+        log_err "  PCI id     : ${GPU_PCI_ID:-<none>}"
+        log_err ""
+        log_err "  Refusing to guess: picking the wrong CUDA version compiles fine"
+        log_err "  and then fails at runtime, which is far harder to diagnose."
+        log_err ""
+        log_err "  Fix it with either:"
+        log_err "    sudo update-pciids            # refresh the PCI device database"
+        log_err "    scripts/onboard.sh --gpu=5070 # Blackwell: RTX 50xx, CUDA 12.8"
+        log_err "    scripts/onboard.sh --gpu=4070 # Ada:       RTX 40xx, CUDA 12.4"
+        log_err "    scripts/onboard.sh --no-gpu   # build CPU-only on purpose"
+        die "GPU generation unresolved"
+    fi
+
+    GPU_CHOICE="$RESOLVED"
+    log_ok "GPU generation resolved from $RESOLVED_SRC -> stack $GPU_CHOICE"
 fi
 
 case "$GPU_CHOICE" in
