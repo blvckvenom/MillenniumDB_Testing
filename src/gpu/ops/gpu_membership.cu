@@ -120,8 +120,8 @@ bool edge_keep_membership_gpu(
     constexpr int block_size = 256;
     int grid_size = static_cast<int>(
         // 65535 grid limit (well below CC 7.x+ limits but matches gpu_filter.cu's
-        // conservative cap so a single 5070 Ti config doesn't dispatch absurd
-        // grids; the for-loop in the kernel handles any leftover work).
+        // conservative cap so a single consumer-GPU config doesn't dispatch
+        // absurd grids; the for-loop in the kernel handles any leftover work).
         std::min(static_cast<uint64_t>((num_edges + block_size - 1) / block_size),
                  static_cast<uint64_t>(65535)));
 

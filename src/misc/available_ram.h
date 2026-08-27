@@ -2,7 +2,27 @@
 
 // Adaptive sort buffer helper for ExternalRecordSort and ExternalEdgeSort.
 // Convention: no namespace (matches src/misc/total_ram.h sibling).
-// See docs/superpowers/specs/2026-04-14-adaptive-ram-buffer-design.md
+//
+// Sizing policy: buffer = max(256 MB floor, MemAvailable * 3/4), overridable
+// with the MDB_SORT_BUFFER_MB environment variable (integer megabytes).
+//
+// Why MemAvailable and not total RAM: the sort runs mid-session, after buffer
+// pools and other subsystems already hold memory, so total RAM overstates
+// what can safely be taken. The Linux kernel documentation ("The /proc
+// Filesystem", section "meminfo", https://docs.kernel.org/filesystems/proc.html)
+// defines MemAvailable as "an estimate of how much memory is available for
+// starting new applications, without swapping" — the budget an in-RAM sort
+// can claim. The kernel does not prescribe how much of that budget a process
+// should take: the 3/4 ratio is our choice, matching the factor this project
+// already applies to import-time buffer-pool sizing (see
+// src/import/*/default_config.h), and the 256 MB floor preserves the
+// historical fixed buffer size so no workload regresses and a mis-set
+// override (e.g. MDB_SORT_BUFFER_MB=1) cannot shrink the buffer below what
+// the in-memory sort path needs.
+//
+// The value is recomputed at each sorter construction (one /proc/meminfo
+// read, well under a millisecond) so later sorts observe RAM freed or
+// claimed by other processes in between; there is deliberately no caching.
 
 #include <cctype>
 #include <cerrno>

@@ -93,13 +93,15 @@ TEST(ResourcePlannerTest, Record2Uses24BytesPerRecord) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 4.1 — GPU dataset safety ceiling gate
+// GPU dataset safety ceiling gate
 // ---------------------------------------------------------------------------
 // enforce_gpu_dataset_ceiling downgrades GPU_FULL / GPU_CHUNKED to a CPU
 // strategy when the in-memory record vector would exceed the 2 GB ceiling.
-// This protects the legacy CLASSIC monolithic path (which can hand the GPU a
-// 38.7 GB host vector and OOM); the RADIX per-partition path is always far
-// under the ceiling, so a downgrade there never fires in practice.
+// This protects the legacy CLASSIC monolithic path (which sorts the whole
+// dataset in one host vector, tens of gigabytes on billion-edge
+// projections, and would OOM the GPU); the RADIX per-partition path is
+// always far under the ceiling, so a downgrade there never fires in
+// practice.
 
 TEST(GpuDatasetCeiling, LargeGpuFullDowngradesToCpuParallel) {
     SortPlan plan;

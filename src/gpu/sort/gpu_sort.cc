@@ -32,8 +32,8 @@ namespace {
 // detection. This reader is a LIGHTWEIGHT DUPLICATE of the read half of
 // src/graph_models/gql/projection/spill_codec.{h,cc}; kept independent so
 // the mdb_gpu library stays isolated from graph_models (per the "zero
-// MillenniumDB dependencies" rule documented in src/gpu/CMakeLists.txt and
-// CLAUDE.md).
+// MillenniumDB dependencies" rule declared at the top of
+// src/gpu/CMakeLists.txt).
 //
 // If the SpillCodec format ever evolves, update BOTH this copy and the
 // canonical implementation. The unit tests in spill_codec_test.cc guard

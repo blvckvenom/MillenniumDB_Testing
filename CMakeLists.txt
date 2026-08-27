@@ -112,8 +112,6 @@ endif()
 # paths, or persisted projection data.
 #
 # Install on Ubuntu/Debian: sudo apt install liblz4-dev
-#
-# See docs/superpowers/thesis_analysis/2026-04-20-projection-disk-reduction-analysis.md §3.B
 # ============================================================================
 set(LZ4_LIBS "")
 find_library(LZ4_LIBRARY NAMES lz4)
@@ -201,7 +199,25 @@ include_directories(${CMAKE_SOURCE_DIR}/third_party/boost_1_82/include)
 include_directories(${CMAKE_SOURCE_DIR}/third_party/libnpy)
 include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/third_party/ska_sort)
 
+# ============================================================================
 # Optional: GNN Module with LibTorch
+# ============================================================================
+# ENABLE_GNN builds the in-database GNN training module (mdb_gnn_core) and
+# compiles the gnn_* GQL procedures (graph_project feature ingestion,
+# gnn_offline_sample, gnn_build_feature_store, gnn_train, gnn_predict, ...).
+#
+# It is OFF by default because it requires LibTorch (expected under
+# third_party/libtorch) and lengthens the build considerably. With
+# ENABLE_GNN=OFF the gnn_* procedures do not exist in the server, so calling
+# one fails at procedure lookup — this is the most common cause of "missing
+# feature" reports on fresh builds. If a gnn_* call fails, check this flag
+# first:
+#
+#   cmake -B build/Release -D CMAKE_BUILD_TYPE=Release -D ENABLE_GNN=ON
+#
+# CUDA is independent of this flag: it is detected separately below, and the
+# GNN module falls back to CPU execution when no GPU toolkit is present.
+# ============================================================================
 option(ENABLE_GNN "Enable GNN training module with LibTorch" OFF)
 
 # enable_testing() must be called before add_subdirectory(src/gnn) so that
@@ -294,7 +310,7 @@ foreach(target ${BUILD_TARGETS})
     if(ENABLE_GNN)
         # millenniumdb is listed again after mdb_gnn_core so that any symbol
         # defined in libmillenniumdb.a that is first referenced from
-        # libmdb_gnn_core.a (e.g. Spec #4-B T4.7's TopologySnapshotReader,
+        # libmdb_gnn_core.a (e.g. TopologySnapshotReader,
         # whose only consumer under LTO is mdb_gnn/projection/topology_accessor)
         # is still resolved by the single-pass ld.bfd static-archive linker.
         target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES} millenniumdb)
@@ -325,7 +341,8 @@ foreach(target ${TEST_TARGETS})
     # Link GNN module and LibTorch when enabled
     if(ENABLE_GNN)
         # See comment above BUILD_TARGETS loop for why millenniumdb is
-        # re-linked after mdb_gnn_core under ENABLE_GNN (T4.7 link-order).
+        # re-linked after mdb_gnn_core under ENABLE_GNN (single-pass
+        # static-archive link order).
         target_link_libraries(${target} mdb_gnn_core ${TORCH_LIBRARIES} millenniumdb)
     endif()
     add_test(
@@ -336,20 +353,17 @@ foreach(target ${TEST_TARGETS})
 endforeach(target)
 
 # ============================================================================
-# Radix-Partition Sort unit tests (TDD phase-gated)
+# Radix-Partition Sort unit tests
 # ============================================================================
 # Registered here (not in a per-directory src/tests/CMakeLists.txt) to match
 # the existing project layout where test targets live in the top-level file.
 #
-# The test source references partition_file.h which is added in Task 5.
-# Until that file exists, the test target is NOT registered so the RED state
-# does not pollute `ctest` or CI green contracts. Once Task 5 lands and the
-# header exists, the test is registered automatically on the next CMake
-# configure; tests may still fail to compile/link or fail assertions until
-# Tasks 6-11 implement the RadixPartitionSort<N> methods — this is the
-# expected TDD GREEN drive-in path. The main `mdb` target is unaffected
-# regardless, because radix_partition_sort.h is only included from this
-# test file.
+# The test source references partition_file.h. While that header is absent
+# from the tree the test target is NOT registered, so a missing-source state
+# does not pollute `ctest` or CI; once the header exists the test registers
+# automatically on the next CMake configure. The main `mdb` target is
+# unaffected either way, because radix_partition_sort.h is only included
+# from this test file.
 #
 # Precedent for EXISTS-gated test registration: src/gnn/CMakeLists.txt.
 # ============================================================================
@@ -392,7 +406,7 @@ if(GTest_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/p
 elseif(NOT GTest_FOUND)
     message(STATUS "GTest not found - radix_partition_sort_test disabled")
 else()
-    message(STATUS "partition_file.h not present yet (Task 5 pending) - radix_partition_sort_test registration deferred")
+    message(STATUS "partition_file.h not present - radix_partition_sort_test registration deferred")
 endif()
 
 # ============================================================================
@@ -506,7 +520,7 @@ if(GTest_FOUND)
 endif()
 
 # ============================================================================
-# Serial scan pipeline unit tests (Spec #2, TDD-gated)
+# Serial scan pipeline unit tests
 # ============================================================================
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/edge_keep_bitmap.h" AND
@@ -549,7 +563,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# IndexSet unit tests (Spec #3 T3.3)
+# IndexSet unit tests
 # ============================================================================
 # Registers the index_set_test target when GTest is available and the
 # corresponding header exists. Mirrors the EXISTS-gated registration
@@ -595,11 +609,11 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# Missing-index query-layer diagnostic unit tests (Spec #3 T3.9)
+# Missing-index query-layer diagnostic unit tests
 # ============================================================================
 # Registers projection_missing_index_test when GTest is available and the
 # corresponding source exists. Validates the `projection_index_name` /
-# `minimum_preset_for` helpers added to index_set.{h,cc} in T3.9, plus the
+# `minimum_preset_for` helpers in index_set.{h,cc}, plus the
 # format of the QueryException message produced by GQLModel getters when a
 # query hits an index elided by the active IndexSet preset.
 if(GTest_FOUND AND
@@ -634,7 +648,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# TopologySnapshot CSR file format unit tests (Spec #4-B T4.3)
+# TopologySnapshot CSR file format unit tests
 # ============================================================================
 # Registers topology_snapshot_format_test when GTest is available and the
 # corresponding header exists. Mirrors the EXISTS-gated registration
@@ -721,7 +735,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v2 leaf header format unit tests (Spec #5 T5.3)
+# B+Tree v2 leaf header format unit tests
 # ============================================================================
 # Registers bpt_leaf_v2_format_test when GTest is available and the source
 # file exists. Follows the precedent of topology_snapshot_format_test.
@@ -764,10 +778,10 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v3 (CSR_HYBRID) leaf header format unit tests (Spec #8 T8.3)
+# B+Tree v3 (CSR_HYBRID) leaf header format unit tests
 # ============================================================================
 # Registers bpt_leaf_csr_format_test when GTest is available and the source
-# file exists. Follows the precedent of bpt_leaf_v2_format_test (Spec #5 T5.3).
+# file exists. Follows the precedent of bpt_leaf_v2_format_test.
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_format_test.cc"
    AND TARGET GTest::gtest_main)
@@ -807,7 +821,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v3 CSR_HYBRID leaf reader unit tests (Spec #8 T8.4)
+# B+Tree v3 CSR_HYBRID leaf reader unit tests
 # ============================================================================
 # Registers bpt_leaf_csr_reader_test when GTest is available and the source file
 # exists. Follows the precedent of bpt_leaf_csr_format_test.
@@ -850,7 +864,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v3 CSR_HYBRID leaf writer unit tests (Spec #8 T8.5)
+# B+Tree v3 CSR_HYBRID leaf writer unit tests
 # ============================================================================
 # Registers bpt_leaf_csr_writer_test when GTest is available and the source
 # file exists. Follows the precedent of bpt_leaf_csr_reader_test.
@@ -893,10 +907,12 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v3 CSR_HYBRID multipage integration test (Spec #8-B T8-B.1)
+# B+Tree v3 CSR_HYBRID multipage integration test
 # ============================================================================
 # Registers bpt_leaf_csr_multipage_test — end-to-end writer + reader +
-# ContinuationTag dispatch across hub chains. Guards the T8-B.1 fix.
+# ContinuationTag dispatch across hub chains. Guards the hub-chain fixes
+# (reader tuple counting across continuation pages, ContinuationTag
+# construction, and writer leaf-chain linkage).
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_multipage_test.cc"
    AND TARGET GTest::gtest_main)
@@ -932,10 +948,10 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v3 CSR_HYBRID leaf fuzz tests (Spec #8 T8.11)
+# B+Tree v3 CSR_HYBRID leaf fuzz tests
 # ============================================================================
 # Registers bpt_leaf_csr_fuzz_test when GTest is available and the source file
-# exists. Follows the precedent of bpt_leaf_v2_fuzz_test (Spec #5 T5.14).
+# exists. Follows the precedent of bpt_leaf_v2_fuzz_test.
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/bpt_leaf_csr_fuzz_test.cc"
    AND TARGET GTest::gtest_main)
@@ -972,14 +988,14 @@ if(GTest_FOUND AND
         COMMAND $<TARGET_FILE:bpt_leaf_csr_fuzz_test>
         WORKING_DIRECTORY tests
     )
-    # Release wall-clock target ~45 s on benito_pc for 500k iterations;
-    # Debug/ASan is typically 3-5x slower. 180 s accommodates Release with
-    # margin; Debug/ASan may need more but plan permits. Follows T5.14.
+    # The 500k Release iterations take on the order of a minute on a
+    # desktop-class CPU; Debug/ASan is typically 3-5x slower. 180 s
+    # accommodates Release with margin; Debug/ASan runs may need more.
     set_tests_properties(bpt_leaf_csr_fuzz_test PROPERTIES TIMEOUT 180)
 endif()
 
 # ============================================================================
-# B+Tree LEB128 varint codec unit tests (Spec #5 T5.4)
+# B+Tree LEB128 varint codec unit tests
 # ============================================================================
 # Registers varint_test when GTest is available and the source file exists.
 # Follows the precedent of bpt_leaf_v2_format_test.
@@ -1022,7 +1038,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v2 leaf writer unit tests (Spec #5 T5.7)
+# B+Tree v2 leaf writer unit tests
 # ============================================================================
 # Registers bpt_leaf_v2_writer_test when GTest is available and the source
 # file exists. Follows the precedent of varint_test.
@@ -1065,7 +1081,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree v2 leaf reader unit tests (Spec #5 T5.8)
+# B+Tree v2 leaf reader unit tests
 # ============================================================================
 # Registers bpt_leaf_v2_reader_test when GTest is available and the source file
 # exists. Follows the precedent of bpt_leaf_v2_writer_test.
@@ -1108,7 +1124,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# B+Tree polymorphic leaf dispatch unit tests (Spec #5 T5.9)
+# B+Tree polymorphic leaf dispatch unit tests
 # ============================================================================
 # Registers bpt_iter_dispatch_test when GTest is available and the source file
 # exists. Follows the precedent of bpt_leaf_v2_reader_test.
@@ -1231,8 +1247,8 @@ if(GTest_FOUND AND
 endif()
 
 # Registers projection_graph_storage_config_test when GTest is available and
-# the source file exists. Follows the precedent of projection_leaffmt_config_test
-# (Spec #5 T5.11).
+# the source file exists. Follows the precedent of
+# projection_leaffmt_config_test.
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/projection_graph_storage_config_test.cc"
    AND TARGET GTest::gtest_main)
@@ -1273,9 +1289,11 @@ if(GTest_FOUND AND
 endif()
 
 # Registers graph_storage_integration_test when GTest is available and the
-# source file exists. Spec #8 T8.9 integration-level regressions for the
-# CSR_HYBRID write dispatch (edge indexes), leaf-format invariants, and the
-# sidecar supersession (design §3.8 D8).
+# source file exists. Integration-level regressions for the CSR_HYBRID write
+# dispatch (edge indexes), leaf-format invariants, and sidecar supersession:
+# a CSR_HYBRID projection must not also emit topology_*.csr sidecars, since
+# its v3 leaves already provide the O(1) neighbour access the sidecar exists
+# to give.
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/graph_storage_integration_test.cc"
    AND TARGET GTest::gtest_main)
@@ -1389,17 +1407,17 @@ if(GTest_FOUND AND
         COMMAND $<TARGET_FILE:bpt_leaf_v2_fuzz_test>
         WORKING_DIRECTORY tests
     )
-    # Release wall-clock is ~51 s on benito_pc; Debug/ASan is typically 3-5x
-    # slower (see plan doc §T5.14 "Verification" step 4). 360 s accommodates
-    # both.
+    # Release wall-clock is on the order of a minute on a desktop-class
+    # CPU; Debug/ASan is typically 3-5x slower. 360 s accommodates both.
     set_tests_properties(bpt_leaf_v2_fuzz_test PROPERTIES TIMEOUT 360)
 endif()
 
 # ============================================================================
-# TopologySnapshot CSR writer unit tests (Spec #4-B T4.4)
+# TopologySnapshot CSR writer unit tests
 # ============================================================================
 # Same EXISTS-gated registration pattern as topology_snapshot_format_test.
-# The writer depends on the T4.3 header plus the new .cc — gate on both.
+# The writer depends on the topology_snapshot.h format header plus its own
+# .cc, so the gate keys on the .cc landing.
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot_writer.cc")
     add_executable(topology_snapshot_writer_test
@@ -1437,10 +1455,11 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# TopologySnapshot CSR reader unit tests (Spec #4-B T4.5)
+# TopologySnapshot CSR reader unit tests
 # ============================================================================
 # Same EXISTS-gated registration pattern as topology_snapshot_writer_test.
-# The reader depends on the T4.3 header plus the new .cc — gate on both.
+# The reader depends on the topology_snapshot.h format header plus its own
+# .cc, so the gate keys on the .cc landing.
 if(GTest_FOUND AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/graph_models/gql/projection/topology_snapshot_reader.cc")
     add_executable(topology_snapshot_reader_test
@@ -1478,10 +1497,10 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# TopologyWalkProfiler unit tests (Plan E Phase 0, 2026-05-11)
+# TopologyWalkProfiler unit tests
 # ============================================================================
-# EXISTS-gated on both the new test file AND the profiler source so the
-# target only configures once the Plan E implementation lands.
+# EXISTS-gated on both the test file AND the profiler source so the
+# target only configures once the profiler implementation is present.
 if(GTest_FOUND AND ENABLE_GNN AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_walk_profiler_test.cc" AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/gnn/projection/topology_walk_profiler.cc")
@@ -1514,7 +1533,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# NativeProjectionBuilder × TopologySnapshot integration test (Spec #4-B T4.6)
+# NativeProjectionBuilder × TopologySnapshot integration test
 # ============================================================================
 # EXISTS-gated so the target is only configured once the integration source
 # lands. Shares the GTest linking recipe with the other projection tests.
@@ -1550,7 +1569,7 @@ if(GTest_FOUND AND
 endif()
 
 # ============================================================================
-# TopologyAccessor × CSR fast-path integration test (Spec #4-B T4.7)
+# TopologyAccessor × CSR fast-path integration test
 # ============================================================================
 # Verifies the mmap fast-path integration in
 # src/gnn/projection/topology_accessor.cc and the per-direction fallback
@@ -1568,7 +1587,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
     )
     # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
     # over serdi's main(), and mdb_gnn_core must come before the trailing
-    # millenniumdb so the T4.7 link-order fix applies here too.
+    # millenniumdb so the static-archive link-order fix applies here too.
     target_link_libraries(topology_accessor_csr_path_test
         GTest::gtest_main
         GTest::gtest
@@ -1592,9 +1611,9 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# TopologyAccessor adjacency cache unit tests (Spec #11)
+# TopologyAccessor adjacency cache unit tests
 # ============================================================================
-# Validates the in-memory adjacency cache mode added by Spec #11. Cache vs
+# Validates TopologyAccessor's in-memory adjacency cache mode. Cache vs
 # B+Tree paths must produce bit-identical neighbour sets and bit-identical
 # k-hop sampling output under a fixed RNG seed. Mirrors the linker recipe
 # of topology_accessor_csr_path_test (gtest_main first, mdb_gnn_core before
@@ -1632,12 +1651,12 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# Topology frequency profiler tests (Spec #13 Phase 1)
+# Topology frequency profiler tests
 # ============================================================================
-# Validates the frequency profiler that the Four-Level Topology Store will
-# use to seed L1 / L2 / L3 tier assignment. Covers the cold-start (degree
-# proxy) and stubbed-warm-start paths, mixed orientations, and the greedy
-# tier sizing helper. Linker recipe mirrors topology_accessor_adjacency_cache_test.
+# Validates the frequency profiler that the Four-Level Topology Store uses
+# to seed L1 / L2 / L3 tier assignment. Covers the cold-start (degree
+# proxy) path, warm-start rejection of malformed node_counts.bin files,
+# mixed orientations, and the greedy tier sizing helper. Linker recipe mirrors topology_accessor_adjacency_cache_test.
 if(GTest_FOUND AND ENABLE_GNN AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_frequency_profiler_test.cc")
     add_executable(topology_frequency_profiler_test
@@ -1677,9 +1696,10 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# L1HashCache tests (Spec #13 Phase 2 / T13.4)
+# L1HashCache tests
 # ============================================================================
-# Pure data-structure tests for the lifted Spec #11 RAM hash cache: insert
+# Pure data-structure tests for the hot-tier RAM hash cache (lifted from
+# the monolithic adjacency cache): insert
 # respects tier_assignment, round-trip parity, large-degree safety, and the
 # total_bytes() contract anchored against kL1NodeFixedOverhead /
 # kL1PerEdgeBytes from topology_frequency_profiler.h.
@@ -1721,7 +1741,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# L2CompactCsr tests (Spec #13 Phase 2 / T13.5)
+# L2CompactCsr tests
 # ============================================================================
 # Pure data-structure tests for the warm-tier compact CSR cache: build/lookup
 # round-trip, out-of-order insert identity, freeze immutability, isolated
@@ -1958,13 +1978,13 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# FourLevelTopologyStore dispatcher tests (Spec #13 Phase 2 / T13.6)
+# FourLevelTopologyStore dispatcher tests
 # ============================================================================
 # Validates the tier-dispatch skeleton: L1/L2 hits, L3 sidecar absence
 # falls through to L4, L4 BPT fallback, defensive throws on missing
 # fallback configuration, isolated nodes across tiers, multi-tier graph
-# consistency, out-of-range row_lookup behavior. Phase 3 (T13.7) wires the
-# build orchestration; Phase 2 ships only this dispatch contract.
+# consistency, out-of-range row_lookup behavior. The build orchestration
+# is exercised separately; this suite pins only the dispatch contract.
 if(GTest_FOUND AND ENABLE_GNN AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/four_level_topology_store_test.cc")
     add_executable(four_level_topology_store_test
@@ -2003,12 +2023,13 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# TopologyAccessor four-level integration tests (Spec #13 Phase 3 / T13.8)
+# TopologyAccessor four-level integration tests
 # ============================================================================
 # End-to-end check that enable_four_level_store() over a live ProjectionStorage
 # returns byte-identical neighbour sets vs the BPT-direct path, that the
-# default-disabled path preserves Spec #4-B / Spec #11 behaviour, and that
-# SamplingConfig::validate() rejects the D8-violating combination.
+# default-disabled path preserves the sidecar / adjacency-cache behaviour,
+# and that SamplingConfig::validate() rejects the incompatible combination
+# (four-level store enabled while the adjacency cache is disabled).
 if(GTest_FOUND AND ENABLE_GNN AND
    EXISTS "${CMAKE_SOURCE_DIR}/src/tests/topology_accessor_four_level_integration_test.cc")
     add_executable(topology_accessor_four_level_integration_test
@@ -2047,7 +2068,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# Four-Level Topology Store tagged-ObjectId dispatch regression (Spec #13)
+# Four-Level Topology Store tagged-ObjectId dispatch regression
 # ============================================================================
 # Guards the row_lookup_ tag-mask fix: production projections store nodes
 # with ObjectId.id = (MASK_NODE | row_idx), and pre-fix the dispatcher
@@ -2135,7 +2156,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# FourLevelTopologyStore warm-start activation tests (Spec #13 Phase 5)
+# FourLevelTopologyStore warm-start activation tests
 # ============================================================================
 # Exercises the round-trip between gnn_offline_sample's `node_counts.bin`
 # writer and the TopologyFrequencyProfiler reader, plus the activation
@@ -2179,9 +2200,9 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# Multi-layer k-hop sampling determinism tests (Spec #4-B T4.11)
+# Multi-layer k-hop sampling determinism tests
 # ============================================================================
-# Complements T4.7 (single-layer sample_neighbors determinism). Exercises
+# Complements the single-layer sample_neighbors determinism tests. Exercises
 # TopologyAccessor::sample_khop_neighbors under the 3×N matrix of
 # orientations × fanout shapes, asserting bit-identical output between the
 # CSR fast-path and the B+Tree fallback for fixed RNG seeds. Also covers
@@ -2222,7 +2243,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# gnn_build_topology_snapshot procedure unit tests (Spec #4-B T4.9)
+# gnn_build_topology_snapshot procedure unit tests
 # ============================================================================
 # EXISTS-gated so the target is only configured once the procedure source
 # lands. Shares the GTest linking recipe with the other projection tests.
@@ -2239,7 +2260,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
     )
     # GTest::gtest_main must come BEFORE millenniumdb so its main() wins
     # over serdi's main(). mdb_gnn_core carries the procedure impl, and
-    # millenniumdb provides ProjectionStorage + BPlusTree — the T4.7
+    # millenniumdb provides ProjectionStorage + BPlusTree — the usual
     # link-order rule (mdb_gnn_core before trailing millenniumdb) applies.
     target_link_libraries(gnn_build_topology_snapshot_procedure_test
         GTest::gtest_main
@@ -2451,7 +2472,7 @@ if(GTest_FOUND AND ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# Isolated TopologyAccessor micro-benchmark (Spec #4-B T4.17)
+# Isolated TopologyAccessor micro-benchmark
 # ============================================================================
 # Standalone binary that measures `TopologyAccessor::sample_khop_neighbors`
 # wall-clock on a preexisting projection under two modes (CSR sidecars
@@ -2486,7 +2507,7 @@ if(ENABLE_GNN AND
 endif()
 
 # ============================================================================
-# BatchedEdgeAggregator unit tests (Spec #26)
+# BatchedEdgeAggregator unit tests
 # ============================================================================
 # Registers batched_edge_aggregator_test when GTest is available and the
 # corresponding header exists. Mirrors the EXISTS-gated registration
