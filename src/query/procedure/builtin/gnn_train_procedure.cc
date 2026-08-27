@@ -366,57 +366,17 @@ static void export_embeddings(
     model.train();
 }
 
+
 // =============================================================================
-// Procedure execution
+// Helpers extracted from GnnTrainProcedure::execute()
 // =============================================================================
 
-void GnnTrainProcedure::execute(ProcedureContext& ctx) {
-    using namespace mdb::gnn;
+namespace {
 
-    // =========================================================================
-    // Step 1: Parse arguments
-    // =========================================================================
-    if (ctx.arguments.size() < 2 || ctx.arguments.size() > 3) {
-        throw std::runtime_error(
-            "gnn_train requires 2-3 arguments.\n\n"
-            "Usage: CALL gnn_train(sampleName, featureName [, options])\n"
-            "Example: CALL gnn_train('my_sample', 'node_features', "
-            "{model: 'graphsage', epochs: 50, lr: 0.01})");
-    }
-
-    // Parse sampleName
-    std::string sample_name;
-    try {
-        sample_name = ctx.get_string_argument(0);
-    } catch (const std::exception& e) {
-        throw std::runtime_error(
-            "Invalid sampleName parameter: " + std::string(e.what()) + "\n\n"
-            "The first parameter must be a STRING.\n"
-            "Example: CALL gnn_train('my_sample', 'node_features')");
-    }
-    if (sample_name.empty()) {
-        throw std::runtime_error("sampleName cannot be empty.");
-    }
-    validate_safe_name(sample_name, "sampleName");
-
-    // Parse featureName
-    std::string feature_name;
-    try {
-        feature_name = ctx.get_string_argument(1);
-    } catch (const std::exception& e) {
-        throw std::runtime_error(
-            "Invalid featureName parameter: " + std::string(e.what()) + "\n\n"
-            "The second parameter must be a STRING.\n"
-            "Example: CALL gnn_train('my_sample', 'node_features')");
-    }
-    if (feature_name.empty()) {
-        throw std::runtime_error("featureName cannot be empty.");
-    }
-    validate_safe_name(feature_name, "featureName");
-
-    // =========================================================================
-    // Step 2: Parse options
-    // =========================================================================
+// All caller-tunable knobs of gnn_train with their documented defaults.
+// Field names, option keys, and defaults are the procedure's public surface;
+// parse_options_argument() fills them from the optional third CALL argument.
+struct TrainOptions {
     std::string model_type       = "graphsage";
     int64_t     hidden_dim       = 256;
     double      dropout          = 0.5;
@@ -438,7 +398,7 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // exactly the labelled train/val/test set. 'all' is unaffordable on
     // graphs with hundreds of millions of nodes (ogbn-papers100M scale), and
     // EmbeddingWriter refuses it when the host cannot hold the result.
-    EmbeddingWriter::Coverage write_coverage = EmbeddingWriter::Coverage::ALL;
+    mdb::gnn::EmbeddingWriter::Coverage write_coverage = mdb::gnn::EmbeddingWriter::Coverage::ALL;
     uint64_t    inference_batch_size = 0;    // 0 = EmbeddingWriter's default non-seed inference chunk size
     std::string resume_from;       // empty = fresh training
     bool        save_on_best_val = true;
@@ -487,6 +447,22 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // shared queues are set to 2"; auto-raised to the worker count below
     // if the caller bumped workers but left this default.
     uint64_t    prefetch_queue_size = 2;
+
+    // Parses the optional third CALL argument (an options map) into the
+    // fields above, validating each value. Assumes the positional arguments
+    // were already validated (ctx holds 2 or 3 arguments); fields keep their
+    // defaults for keys the caller did not pass.
+    void parse_options_argument(ProcedureContext& ctx);
+
+    // Builds the TrainingLoop configuration from the parsed options plus the
+    // resolved output directory. Assumes prefetch_num_workers was already
+    // resolved (non-zero); auto-raises prefetch_queue_size to the worker
+    // count in place, so call it before reading that field again.
+    mdb::gnn::TrainingLoop::Config make_loop_config(const fs::path& output_dir);
+};
+
+void TrainOptions::parse_options_argument(ProcedureContext& ctx) {
+    using namespace mdb::gnn;
 
     if (ctx.arguments.size() == 3) {
         DictOptions opts(ctx.get_argument(2));
@@ -643,11 +619,101 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             }
         }
     }
+}
 
-    // =========================================================================
-    // Step 3: Validate inputs exist
-    // =========================================================================
-    std::string db_folder = get_db_folder();
+mdb::gnn::TrainingLoop::Config TrainOptions::make_loop_config(const fs::path& output_dir) {
+    using namespace mdb::gnn;
+
+    TrainingLoop::Config loop_config;
+    loop_config.epochs        = epochs;
+    loop_config.learning_rate = lr;
+    loop_config.weight_decay  = weight_decay;
+    loop_config.tolerance     = tolerance;
+    loop_config.patience      = patience;
+    loop_config.random_seed   = random_seed;
+    loop_config.use_async_prefetcher = use_async_prefetcher;
+    loop_config.use_cuda_streams     = use_cuda_streams;
+    loop_config.prefetch_num_workers = static_cast<unsigned>(prefetch_num_workers);
+    // The prefetcher caps live workers at min(workers, queue). If the caller
+    // raised workers but left the queue at the default 2, auto-raise the queue
+    // so the requested workers are actually honored.
+    if (prefetch_queue_size < prefetch_num_workers) {
+        prefetch_queue_size = prefetch_num_workers;
+    }
+    loop_config.prefetch_queue_size = static_cast<size_t>(prefetch_queue_size);
+    loop_config.output_dir    = output_dir.string();
+    loop_config.profile_log_path = profile_log_path;  // per-batch timing CSV
+    loop_config.read_only_bench  = read_only_bench;   // read-only isolation bench
+    loop_config.track_test_at_best_val = track_test_at_best_val;  // test-at-best-val protocol
+    loop_config.lr_schedule = lr_schedule;                        // "" | "cosine"
+
+    return loop_config;
+}
+
+// Validates the CALL argument count and extracts the two mandatory
+// positional STRING arguments into sample_name / feature_name.
+// Assumes nothing was parsed yet; throws with usage guidance on any
+// violation. On return both out-params are non-empty, filesystem-safe names.
+void parse_positional_arguments(
+    ProcedureContext& ctx,
+    std::string&      sample_name,
+    std::string&      feature_name)
+{
+    if (ctx.arguments.size() < 2 || ctx.arguments.size() > 3) {
+        throw std::runtime_error(
+            "gnn_train requires 2-3 arguments.\n\n"
+            "Usage: CALL gnn_train(sampleName, featureName [, options])\n"
+            "Example: CALL gnn_train('my_sample', 'node_features', "
+            "{model: 'graphsage', epochs: 50, lr: 0.01})");
+    }
+
+    // Parse sampleName
+    try {
+        sample_name = ctx.get_string_argument(0);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "Invalid sampleName parameter: " + std::string(e.what()) + "\n\n"
+            "The first parameter must be a STRING.\n"
+            "Example: CALL gnn_train('my_sample', 'node_features')");
+    }
+    if (sample_name.empty()) {
+        throw std::runtime_error("sampleName cannot be empty.");
+    }
+    validate_safe_name(sample_name, "sampleName");
+
+    // Parse featureName
+    try {
+        feature_name = ctx.get_string_argument(1);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "Invalid featureName parameter: " + std::string(e.what()) + "\n\n"
+            "The second parameter must be a STRING.\n"
+            "Example: CALL gnn_train('my_sample', 'node_features')");
+    }
+    if (feature_name.empty()) {
+        throw std::runtime_error("featureName cannot be empty.");
+    }
+    validate_safe_name(feature_name, "featureName");
+}
+
+// On-disk inputs gnn_train reads directly, resolved and validated by
+// validate_train_inputs() before anything is opened.
+struct TrainInputPaths {
+    fs::path fmat_path;     // <feature>.fmat  — original feature matrix
+    fs::path rmap_path;     // <feature>.rmap  — node <-> row mapping
+    fs::path storage_path;  // <db>/samples/<sample> directory
+};
+
+// Verifies the feature is registered in the catalog and that the feature
+// matrix, row mapping, pre-built FourLevelStore metadata, and sample
+// directory all exist on disk. Assumes db_folder points at an open database;
+// throws with a remediation hint naming the missing piece. Read-only.
+TrainInputPaths validate_train_inputs(
+    const std::string& db_folder,
+    const std::string& sample_name,
+    const std::string& feature_name)
+{
+    using namespace mdb::gnn;
 
     // Validate feature name is registered in catalog
     const auto& names = gql_model.catalog.gnn_feature_names;
@@ -699,32 +765,27 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                 "CALL gnn_offline_sample('projection', 'name', [fanouts])"));
     }
 
-    // =========================================================================
-    // Step 4: Open data sources
-    //
-    // The original FeatureMatrix is intentionally NOT opened here: features
-    // are served exclusively through FourLevelStore below, which reads from
-    // its own reordered .fmat / _cpu_cache.bin / packed_slim files. The
-    // RowMapping is still required because BatchAssembler uses it for label
-    // lookups (labels.bin is indexed by the ORIGINAL row indices).
-    // =========================================================================
-    auto rm = RowMapping::open(rmap_path);
-    auto samples = SampleStorage::open(storage_path);
+    return TrainInputPaths{std::move(fmat_path), std::move(rmap_path),
+                           std::move(storage_path)};
+}
 
-    // Resolve prefetchNumWorkers when unset (sentinel 0). The DEFAULT is 1
-    // (single worker) to preserve REPRODUCIBILITY: the multi-worker prefetcher
-    // delivers batches in a timing-dependent order, so N>1 training is NOT
-    // bit-reproducible across runs at a fixed seed (measured on the cora
-    // dataset: testAcc wobbles 0.8796<->0.8870 at N=4; features ARE
-    // bit-identical, it is the batch ORDER that varies the SGD trajectory).
-    // Multi-worker is a SPEED opt-in (measured 4.32x producer speedup at N=8
-    // with the sample on NVMe) enabled via the prefetchNumWorkers param or the env
-    // MDB_GNN_PREFETCH_WORKERS (a number, or "auto" = clamp(cores-4, 2, 8);
-    // beyond that the NVMe, not the CPU, is the limit). Making it the safe
-    // default requires in-order batch delivery
-    // in AsyncBatchPrefetcher (a reorder buffer) — deferred. The OOM-safe cache
-    // cap below still applies whenever N>1, so explicit multi-worker no longer
-    // needs a manual sampleCacheMb to avoid the documented N>1 OOM.
+// Resolve prefetchNumWorkers when unset (sentinel 0). The DEFAULT is 1
+// (single worker) to preserve REPRODUCIBILITY: the multi-worker prefetcher
+// delivers batches in a timing-dependent order, so N>1 training is NOT
+// bit-reproducible across runs at a fixed seed (measured on the cora
+// dataset: testAcc wobbles 0.8796<->0.8870 at N=4; features ARE
+// bit-identical, it is the batch ORDER that varies the SGD trajectory).
+// Multi-worker is a SPEED opt-in (measured 4.32x producer speedup at N=8
+// with the sample on NVMe) enabled via the prefetchNumWorkers param or the env
+// MDB_GNN_PREFETCH_WORKERS (a number, or "auto" = clamp(cores-4, 2, 8);
+// beyond that the NVMe, not the CPU, is the limit). Making it the safe
+// default requires in-order batch delivery
+// in AsyncBatchPrefetcher (a reorder buffer) — deferred. The OOM-safe cache
+// cap below still applies whenever N>1, so explicit multi-worker no longer
+// needs a manual sampleCacheMb to avoid the documented N>1 OOM.
+// Assumes it runs once per call, before any cache budget is derived from the
+// worker count; returns the input unchanged when it is already non-zero.
+uint64_t resolve_prefetch_worker_count(uint64_t prefetch_num_workers) {
     if (prefetch_num_workers == 0) {
         unsigned auto_n = 1;
         // text() and not number(): the knob takes either a count or the word
@@ -751,15 +812,28 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         }
     }
 
-    // Auto RAM-cache budget (shared by the sample cache + struct cache below):
-    // -1 = auto, 0 = disabled, >0 = explicit MB. When auto AND multi-worker, cap
-    // the explicit cache at the validated-safe 2 GB. N workers hold in-flight
-    // pinned + combined buffers, and the kernel needs page-cache headroom for the
-    // (>> RAM) reordered.fmat + packed_slim, so the naive MemAvailable/4 applied
-    // at BOTH cache sites (= MemAvailable/2) OOMs at N>1 (observed as the
-    // process being killed during the validation phase, when eval buffers
-    // stack on top of both caches). The kernel page cache still uses the rest of RAM for the
-    // feature working set automatically, so the small explicit cap costs little.
+    return prefetch_num_workers;
+}
+
+// Applies the deserialized-sample cache budget and the skip-edge-ids read
+// optimization to the opened SampleStorage, and returns the auto cache
+// budget in bytes so the caller can reuse it for the struct cache.
+// Assumes prefetch_num_workers is already resolved (non-zero). Logs the
+// chosen budget to stderr.
+// Auto RAM-cache budget (shared by the sample cache + struct cache below):
+// -1 = auto, 0 = disabled, >0 = explicit MB. When auto AND multi-worker, cap
+// the explicit cache at the validated-safe 2 GB. N workers hold in-flight
+// pinned + combined buffers, and the kernel needs page-cache headroom for the
+// (>> RAM) reordered.fmat + packed_slim, so the naive MemAvailable/4 applied
+// at BOTH cache sites (= MemAvailable/2) OOMs at N>1 (observed as the
+// process being killed during the validation phase, when eval buffers
+// stack on top of both caches). The kernel page cache still uses the rest of RAM for the
+// feature working set automatically, so the small explicit cap costs little.
+size_t configure_sample_cache(
+    mdb::gnn::SampleStorage& samples,
+    int64_t                  sample_cache_mb,
+    uint64_t                 prefetch_num_workers)
+{
     size_t auto_cache_budget_bytes = static_cast<size_t>(get_mem_available() / 4);
     if (prefetch_num_workers > 1) {
         auto_cache_budget_bytes =
@@ -785,8 +859,29 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // I/O on deep-fanout samples where edge_ids are ~50% of the bytes.
     samples.set_skip_edge_ids_on_read(true);
 
-    const auto& catalog = samples.get_catalog();
-    std::string projection_name = catalog.projection_name;
+    return auto_cache_budget_bytes;
+}
+
+// Everything gnn_train needs from the projection that backs the sample:
+// its directory, GNN metadata, and the optional label / split stores
+// (null when the projection was built without labelProperty / splitProperty).
+struct ProjectionTrainingData {
+    std::string                           proj_dir;
+    fs::path                              meta_path;  // <proj_dir>/gnn_meta.bin
+    mdb::gnn::GnnMeta                     meta;
+    std::unique_ptr<mdb::gnn::LabelStore> labels;
+    std::unique_ptr<mdb::gnn::SplitStore> splits;
+};
+
+// Resolves the projection directory and loads gnn_meta.bin plus the optional
+// labels.bin / splits.bin stores. Assumes projection_name came from the
+// sample catalog; throws when the projection no longer exists or was created
+// without GNN config. Read-only.
+ProjectionTrainingData open_projection_training_data(
+    const std::string& projection_name,
+    const std::string& sample_name)
+{
+    using namespace mdb::gnn;
 
     // Projection directory (for GnnMeta, labels, splits)
     auto& proj_manager = GQL::ProjectionManager::get_instance();
@@ -821,11 +916,24 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         splits = std::make_unique<SplitStore>(SplitStore::open(splits_path));
     }
 
-    // Consistency guard: labels.bin and splits.bin must agree on row indexing
-    // (both indexed by rmap row). If labels.bin was built against an older
-    // rmap and the rmap was later rewritten, TRAIN rows in splits.bin will
-    // map to -1 labels — model trains on noise. Scan first N rmap rows and
-    // verify the invariant; abort with remediation hint if violated.
+    return ProjectionTrainingData{std::move(proj_dir), std::move(meta_path),
+                                  std::move(meta), std::move(labels),
+                                  std::move(splits)};
+}
+
+// Consistency guard: labels.bin and splits.bin must agree on row indexing
+// (both indexed by rmap row). If labels.bin was built against an older
+// rmap and the rmap was later rewritten, TRAIN rows in splits.bin will
+// map to -1 labels — model trains on noise. Scan first N rmap rows and
+// verify the invariant; abort with remediation hint if violated.
+// Assumes both pointers may be null (the check only runs when both stores
+// exist); reads the stores, mutates nothing.
+void check_label_split_row_alignment(
+    mdb::gnn::LabelStore* labels,
+    mdb::gnn::SplitStore* splits)
+{
+    using namespace mdb::gnn;
+
     if (labels && splits) {
         constexpr uint64_t SCAN_LIMIT = 100000;
         const uint64_t scan_n = std::min<uint64_t>(SCAN_LIMIT, splits->num_nodes());
@@ -850,81 +958,102 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             );
         }
     }
+}
 
-    // Feature<->label integrity gate. The labels<->splits guard above only
-    // verifies labels are PRESENT for TRAIN rows; it cannot detect a
-    // node_features.fmat whose feature ROWS are misaligned to node identity
-    // (fmat[r] holding the wrong node's features). That failure mode trains
-    // on wrong-features + correct-label, which converges but silently caps
-    // accuracy at a fraction of baseline, invariant to all graph/model
-    // choices — so it is undetectable from the loss curve alone. This check
-    // fits per-class feature centroids on a strided sample of TRAIN nodes and
-    // aborts if nearest-centroid accuracy is no better than chance (features
-    // carry no label signal). Source-independent. Opt out via env
-    // MDB_GNN_SKIP_INTEGRITY=1.
-    {
-        // The accepted list is exactly the three spellings the old condition
-        // compared against, so "TRUE" or "2" still leave the guard armed. The
-        // difference is that they are now reported as unrecognised rather than
-        // silently reading as "do not skip", which for a data-integrity gate is
-        // the difference between a deliberate opt-out and a mistyped one.
-        const std::string skip_raw
-            = Ablation::choice("MDB_GNN_SKIP_INTEGRITY", "0", {"0", "1", "true", "yes"});
-        const bool skip_integrity = (skip_raw != "0");
-        auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
-        if (!skip_integrity && labels && splits && meta.feature_dim > 0 &&
-            meta.num_classes >= 2 && fs::exists(fmat_path)) {
-            try {
-                auto fm = FeatureMatrix::open(fmat_path);
-                if (fm.dtype() == GnnDtype::FLOAT32 &&
-                    fm.num_cols() == static_cast<size_t>(meta.feature_dim)) {
-                    const size_t   D    = static_cast<size_t>(meta.feature_dim);
-                    const uint64_t N    = std::min(splits->num_nodes(), labels->num_nodes());
-                    const uint64_t WANT = 20000;
-                    const uint64_t stride = std::max<uint64_t>(1, N / (WANT * 3));
-                    std::vector<uint64_t> rows;
-                    rows.reserve(WANT);
-                    for (uint64_t r = 0; r < N && rows.size() < WANT; r += stride) {
-                        if (splits->get(r) == SplitStore::TRAIN && labels->get(r) >= 0)
-                            rows.push_back(r);
-                    }
-                    if (rows.size() >= 200) {
-                        std::vector<float>   feat(rows.size() * D);
-                        fm.extract_rows(rows, feat.data());
-                        std::vector<int64_t> lab(rows.size());
-                        for (size_t i = 0; i < rows.size(); ++i)
-                            lab[i] = labels->get(rows[i]);
-                        auto res = FeatureLabelIntegrity::check(
-                            feat.data(), rows.size(), D, lab.data(), meta.num_classes);
-                        if (res.ran && !res.passed) {
-                            char buf[512];
-                            std::snprintf(buf, sizeof(buf),
-                                "gnn_train: feature<->label INTEGRITY CHECK FAILED "
-                                "(nearest-centroid acc %.4f <= threshold %.4f, chance %.4f, "
-                                "on %zu TRAIN nodes). The feature store carries no label "
-                                "signal: node_features.fmat rows are misaligned to node "
-                                "identity (a node's features do not predict its label). "
-                                "Rebuild features so fmat[r] == the source features for node r "
-                                "(via graph_project / re-import). Bypass with "
-                                "MDB_GNN_SKIP_INTEGRITY=1.",
-                                res.accuracy, res.threshold, res.chance, res.num_scored);
-                            throw FeatureLabelIntegrityError(buf);
-                        }
+// Feature<->label integrity gate. The labels<->splits guard above only
+// verifies labels are PRESENT for TRAIN rows; it cannot detect a
+// node_features.fmat whose feature ROWS are misaligned to node identity
+// (fmat[r] holding the wrong node's features). That failure mode trains
+// on wrong-features + correct-label, which converges but silently caps
+// accuracy at a fraction of baseline, invariant to all graph/model
+// choices — so it is undetectable from the loss curve alone. This check
+// fits per-class feature centroids on a strided sample of TRAIN nodes and
+// aborts if nearest-centroid accuracy is no better than chance (features
+// carry no label signal). Source-independent. Opt out via env
+// MDB_GNN_SKIP_INTEGRITY=1.
+// Assumes it runs once per call (the MDB_GNN_SKIP_INTEGRITY ablation switch
+// must be consulted exactly once per gnn_train invocation); reads the source
+// fmat, mutates nothing. Throws only on a FAILED verdict — any error that
+// merely prevents RUNNING the check is a logged skip.
+void run_feature_label_integrity_gate(
+    const std::string&       db_folder,
+    const std::string&       feature_name,
+    mdb::gnn::LabelStore*    labels,
+    mdb::gnn::SplitStore*    splits,
+    const mdb::gnn::GnnMeta& meta)
+{
+    using namespace mdb::gnn;
+
+    // The accepted list is exactly the three spellings the old condition
+    // compared against, so "TRUE" or "2" still leave the guard armed. The
+    // difference is that they are now reported as unrecognised rather than
+    // silently reading as "do not skip", which for a data-integrity gate is
+    // the difference between a deliberate opt-out and a mistyped one.
+    const std::string skip_raw
+        = Ablation::choice("MDB_GNN_SKIP_INTEGRITY", "0", {"0", "1", "true", "yes"});
+    const bool skip_integrity = (skip_raw != "0");
+    auto fmat_path = fs::path(db_folder) / "gnn_features" / (feature_name + ".fmat");
+    if (!skip_integrity && labels && splits && meta.feature_dim > 0 &&
+        meta.num_classes >= 2 && fs::exists(fmat_path)) {
+        try {
+            auto fm = FeatureMatrix::open(fmat_path);
+            if (fm.dtype() == GnnDtype::FLOAT32 &&
+                fm.num_cols() == static_cast<size_t>(meta.feature_dim)) {
+                const size_t   D    = static_cast<size_t>(meta.feature_dim);
+                const uint64_t N    = std::min(splits->num_nodes(), labels->num_nodes());
+                const uint64_t WANT = 20000;
+                const uint64_t stride = std::max<uint64_t>(1, N / (WANT * 3));
+                std::vector<uint64_t> rows;
+                rows.reserve(WANT);
+                for (uint64_t r = 0; r < N && rows.size() < WANT; r += stride) {
+                    if (splits->get(r) == SplitStore::TRAIN && labels->get(r) >= 0)
+                        rows.push_back(r);
+                }
+                if (rows.size() >= 200) {
+                    std::vector<float>   feat(rows.size() * D);
+                    fm.extract_rows(rows, feat.data());
+                    std::vector<int64_t> lab(rows.size());
+                    for (size_t i = 0; i < rows.size(); ++i)
+                        lab[i] = labels->get(rows[i]);
+                    auto res = FeatureLabelIntegrity::check(
+                        feat.data(), rows.size(), D, lab.data(), meta.num_classes);
+                    if (res.ran && !res.passed) {
+                        char buf[512];
+                        std::snprintf(buf, sizeof(buf),
+                            "gnn_train: feature<->label INTEGRITY CHECK FAILED "
+                            "(nearest-centroid acc %.4f <= threshold %.4f, chance %.4f, "
+                            "on %zu TRAIN nodes). The feature store carries no label "
+                            "signal: node_features.fmat rows are misaligned to node "
+                            "identity (a node's features do not predict its label). "
+                            "Rebuild features so fmat[r] == the source features for node r "
+                            "(via graph_project / re-import). Bypass with "
+                            "MDB_GNN_SKIP_INTEGRITY=1.",
+                            res.accuracy, res.threshold, res.chance, res.num_scored);
+                        throw FeatureLabelIntegrityError(buf);
                     }
                 }
-            } catch (const FeatureLabelIntegrityError&) {
-                throw;  // integrity failure — propagate
-            } catch (const std::exception& e) {
-                // Non-fatal: could not run the check (e.g. fmat open issue). Warn, do not block.
-                std::cerr << "[gnn_train] feature-label integrity check skipped: "
-                          << e.what() << "\n";
             }
+        } catch (const FeatureLabelIntegrityError&) {
+            throw;  // integrity failure — propagate
+        } catch (const std::exception& e) {
+            // Non-fatal: could not run the check (e.g. fmat open issue). Warn, do not block.
+            std::cerr << "[gnn_train] feature-label integrity check skipped: "
+                      << e.what() << "\n";
         }
     }
+}
 
-    // =========================================================================
-    // Step 5: Configure model and training
-    // =========================================================================
+// Builds the GraphSAGE configuration from the sample catalog (layer count)
+// and the projection's GNN metadata (dims), validating both. Assumes meta
+// was already read; throws on an empty fanout list or non-positive dims.
+mdb::gnn::GraphSAGEConfig build_gnn_config(
+    const mdb::gnn::SampleCatalog& catalog,
+    const mdb::gnn::GnnMeta&       meta,
+    int64_t                        hidden_dim,
+    double                         dropout,
+    bool                           normalize)
+{
+    using namespace mdb::gnn;
 
     // Infer num_layers from sample catalog fanouts
     int64_t num_layers = static_cast<int64_t>(catalog.num_layers());
@@ -952,35 +1081,22 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             + " in GNN metadata. Must be positive.");
     }
 
-    // Reproducibility seed
-    if (random_seed >= 0) {
-        torch::manual_seed(static_cast<uint64_t>(random_seed));
-    }
+    return gnn_config;
+}
 
-    GraphSAGEModel model(gnn_config);
-
-    // =========================================================================
-    // Step 6: Create output directory
-    // =========================================================================
-    auto output_dir = fs::path(proj_dir) / "gnn_output" / output_dir_name;
-    fs::create_directories(output_dir);
-
-    // =========================================================================
-    // Step 7: Open FourLevelStore and create BatchAssembler in full mode
-    //
-    // FourLevelStore reads the hierarchical feature store built by
-    // gnn_build_feature_store: L1 (GPU) + L2 (CPU pinned) + L3 (disk reordered)
-    // + L4 (packed slim per-batch). Its stats counters let us verify that all
-    // four tiers are exercised during training — this is the DiskGNN contract.
-    // =========================================================================
-    mdb::gnn::FourLevelStore feature_store(db_folder, feature_name, samples);
-
-    // feature_dim contract guard: the projection's gnn_meta.bin and the feature
-    // store's store.meta are two independent sources of feature_dim. If they
-    // disagree (projection re-imported / rebuilt with a different feature width
-    // but the feature store not rebuilt), the model is sized to meta.feature_dim
-    // while assemble() emits store.feature_dim()-wide rows -> an opaque torch
-    // shape error mid-forward. Fail early with a clear remediation message.
+// feature_dim contract guard: the projection's gnn_meta.bin and the feature
+// store's store.meta are two independent sources of feature_dim. If they
+// disagree (projection re-imported / rebuilt with a different feature width
+// but the feature store not rebuilt), the model is sized to meta.feature_dim
+// while assemble() emits store.feature_dim()-wide rows -> an opaque torch
+// shape error mid-forward. Fail early with a clear remediation message.
+// Assumes the FourLevelStore was just opened; reads only, throws on mismatch.
+void check_feature_dim_contract(
+    const mdb::gnn::FourLevelStore& feature_store,
+    const mdb::gnn::GnnMeta&        meta,
+    const std::string&              sample_name,
+    const std::string&              feature_name)
+{
     if (feature_store.feature_dim() != static_cast<uint64_t>(meta.feature_dim)) {
         throw std::runtime_error(
             "gnn_train: feature_dim mismatch — projection gnn_meta.bin reports "
@@ -990,19 +1106,26 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
               "CALL gnn_build_feature_store('" + sample_name + "', '"
             + feature_name + "', {force:true}).");
     }
-    BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
+}
 
-    // Per-call override of the block-consumption mode so the three modes
-    // (online rebuild, baked blocks read alongside the sample, self-contained
-    // blocks) can be measured within one server session. The ctor already
-    // ran its env/auto detection; we only override it when the caller explicitly
-    // passed at least one of noBlocks / noSelfContained / noPackedFull, so the
-    // default path (no params) is byte-identical to today. Toggles the caller
-    // did NOT pass keep their MDB_GNN_NO_* env default (same "1" semantics as
-    // BatchAssembler::init_blocks_) instead of resetting to false, so a partial
-    // per-call override cannot silently cancel an env pin set on the server.
-    // The override re-runs the SAME eligibility logic, so it can never force
-    // an unsafe (unservable) mode.
+// Per-call override of the block-consumption mode so the three modes
+// (online rebuild, baked blocks read alongside the sample, self-contained
+// blocks) can be measured within one server session. The ctor already
+// ran its env/auto detection; we only override it when the caller explicitly
+// passed at least one of noBlocks / noSelfContained / noPackedFull, so the
+// default path (no params) is byte-identical to today. Toggles the caller
+// did NOT pass keep their MDB_GNN_NO_* env default (same "1" semantics as
+// BatchAssembler::init_blocks_) instead of resetting to false, so a partial
+// per-call override cannot silently cancel an env pin set on the server.
+// The override re-runs the SAME eligibility logic, so it can never force
+// an unsafe (unservable) mode.
+// Assumes the assembler's constructor already ran its env/auto block-mode
+// detection; mutates only the assembler's block-consumption mode, and only
+// when the caller passed at least one of the three toggles.
+void apply_block_mode_override(
+    ProcedureContext&         ctx,
+    mdb::gnn::BatchAssembler& assembler)
+{
     if (ctx.arguments.size() == 3) {
         DictOptions block_opts(ctx.get_argument(2));
         auto nb  = block_opts.get_bool("noBlocks");
@@ -1019,47 +1142,17 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
                 npf.value_or(env_on("MDB_GNN_NO_PACKED_FULL")));
         }
     }
+}
 
-    // Structural per-batch cache: reuse the index/label build across epochs
-    // (the cost model showed build_active_indices + build_edge_indices dominate
-    // the assemble worker cost; the feature gather is cheap when L1-resident).
-    // Same budget knob/policy as the sample cache.
-    {
-        size_t budget = (sample_cache_mb < 0)
-            ? auto_cache_budget_bytes
-            : static_cast<size_t>(sample_cache_mb) * 1024ULL * 1024ULL;
-        assembler.set_struct_cache_budget_bytes(budget);
-    }
-
-    // =========================================================================
-    // Step 8: Run training
-    // =========================================================================
-    TrainingLoop::Config loop_config;
-    loop_config.epochs        = epochs;
-    loop_config.learning_rate = lr;
-    loop_config.weight_decay  = weight_decay;
-    loop_config.tolerance     = tolerance;
-    loop_config.patience      = patience;
-    loop_config.random_seed   = random_seed;
-    loop_config.use_async_prefetcher = use_async_prefetcher;
-    loop_config.use_cuda_streams     = use_cuda_streams;
-    loop_config.prefetch_num_workers = static_cast<unsigned>(prefetch_num_workers);
-    // The prefetcher caps live workers at min(workers, queue). If the caller
-    // raised workers but left the queue at the default 2, auto-raise the queue
-    // so the requested workers are actually honored.
-    if (prefetch_queue_size < prefetch_num_workers) {
-        prefetch_queue_size = prefetch_num_workers;
-    }
-    loop_config.prefetch_queue_size = static_cast<size_t>(prefetch_queue_size);
-    loop_config.output_dir    = output_dir.string();
-    loop_config.profile_log_path = profile_log_path;  // per-batch timing CSV
-    loop_config.read_only_bench  = read_only_bench;   // read-only isolation bench
-    loop_config.track_test_at_best_val = track_test_at_best_val;  // test-at-best-val protocol
-    loop_config.lr_schedule = lr_schedule;                        // "" | "cosine"
-
-    // =========================================================================
-    // Step 8a: Build base TrainingState (identifying fields) for checkpoints
-    // =========================================================================
+// Builds the identifying TrainingState fields shared by every checkpoint of
+// this run (model dims, projection identity, gnn_meta hash, creation time).
+// Assumes meta_path exists (validated earlier); reads it to hash it.
+mdb::gnn::TrainingState build_base_training_state(
+    const mdb::gnn::GraphSAGEConfig& gnn_config,
+    const std::string&               model_type,
+    const std::string&               projection_name,
+    const fs::path&                  meta_path)
+{
     mdb::gnn::TrainingState base_state;
     base_state.input_dim          = gnn_config.input_dim;
     base_state.hidden_dim         = gnn_config.hidden_dim;
@@ -1075,14 +1168,25 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
 
-    torch::optim::Adam optimizer(
-        model.parameters(),
-        torch::optim::AdamOptions(lr).weight_decay(weight_decay)
-    );
+    return base_state;
+}
 
-    // =========================================================================
-    // Step 8b: Resume from checkpoint if requested
-    // =========================================================================
+// Loads the checkpoint named by resume_from (relative names resolve against
+// <output_dir>/checkpoints), validates it against this projection, and seeds
+// loop_config + base_state with the loaded epoch/patience/best-val/losses and
+// original creation/total-time. Returns the epoch training resumes from
+// (0 when resume_from is empty = fresh training). Assumes model and optimizer
+// are freshly constructed; both are overwritten with the loaded parameters.
+uint64_t resume_training_from_checkpoint(
+    const std::string&              resume_from,
+    const fs::path&                 output_dir,
+    mdb::gnn::GraphSAGEModel&       model,
+    torch::optim::Adam&             optimizer,
+    const fs::path&                 meta_path,
+    const std::string&              projection_name,
+    mdb::gnn::TrainingLoop::Config& loop_config,
+    mdb::gnn::TrainingState&        base_state)
+{
     uint64_t resumed_from_epoch = 0;
     if (!resume_from.empty()) {
         fs::path resume_basename;
@@ -1109,12 +1213,413 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
         base_state.total_training_time_sec = loaded.total_training_time_sec;
     }
 
+    return resumed_from_epoch;
+}
+
+// Outcome of the optional embedding write-back; all-zero / empty when
+// writeProperty was not set (then no write happened and no coverage applies).
+struct EmbeddingWriteBack {
+    uint64_t    nodes_written  = 0;
+    uint64_t    nodes_inferred = 0;
+    double      inference_ms   = 0.0;
+    double      write_ms       = 0.0;
+    std::string write_coverage_str;
+};
+
+// Opens ProjectionStorage for the EmbeddingWriter, which needs topology
+// access (on-the-fly k-hop inference for nodes that were never seeds) and
+// property write access (persisting embeddings as tensor properties).
+// Under 'all' coverage the fanouts are taken from the SampleCatalog so the
+// non-seed inference sampling depth matches the original offline sampling;
+// under 'seeds' they are left empty and non-seed inference never runs.
+// Orientation is NOT persisted in the SampleCatalog, and gnn_train never
+// sets Config::orientation, so non-seed inference falls back to the
+// UNDIRECTED default when build_adjacency_cache_ selects its directions:
+// for samples built with NATURAL or REVERSE orientation the non-seed
+// inference neighborhoods differ from the training-time neighborhoods.
+// Assumes training finished (model holds the final weights) and the
+// projection still exists; writes tensor properties into the projection.
+EmbeddingWriteBack write_embeddings_to_projection(
+    const TrainOptions&            opt,
+    mdb::gnn::GraphSAGEModel&      model,
+    mdb::gnn::BatchAssembler&      assembler,
+    mdb::gnn::SampleStorage&       samples,
+    const mdb::gnn::RowMapping&    rm,
+    const mdb::gnn::SampleCatalog& catalog,
+    const fs::path&                fmat_path,
+    const std::string&             proj_dir,
+    const std::string&             db_folder)
+{
+    using namespace mdb::gnn;
+
+    uint64_t nodes_written  = 0;
+    uint64_t nodes_inferred = 0;
+    double   inference_ms   = 0.0;
+    double   write_ms       = 0.0;
+    // Coverage the write-back actually ran under; empty when writeProperty was
+    // not set, since then no write happened and no coverage applies.
+    std::string write_coverage_str;
+
+    if (!opt.write_property.empty()) {
+        write_coverage_str =
+            opt.write_coverage == EmbeddingWriter::Coverage::SEEDS ? "seeds" : "all";
+
+        EmbeddingWriter::Config wconfig;
+        wconfig.property_name      = opt.write_property;
+        wconfig.coverage           = opt.write_coverage;
+        // On-the-fly k-hop inference for non-seed nodes is what makes 'all'
+        // coverage expensive; 'seeds' leaves the fanouts empty so that phase
+        // is skipped outright and only the pre-computed seed embeddings are
+        // written.
+        if (opt.write_coverage == EmbeddingWriter::Coverage::ALL) {
+            wconfig.fanouts        = catalog.fanouts;
+        }
+        wconfig.feature_matrix_path = fmat_path;
+        if (opt.inference_batch_size > 0) {
+            wconfig.batch_size = opt.inference_batch_size;
+        }
+
+        GQL::ProjectionStorage proj_storage(proj_dir, db_folder);
+        proj_storage.open();
+
+        EmbeddingWriter writer(
+            model,
+            assembler,
+            samples,
+            rm,
+            catalog,
+            proj_storage,
+            wconfig
+        );
+        auto wresult = writer.write_all();
+
+        nodes_written  = wresult.nodes_written;
+        nodes_inferred = wresult.nodes_inferred;
+        inference_ms   = wresult.inference_ms;
+        write_ms       = wresult.write_ms;
+    }
+
+    return EmbeddingWriteBack{nodes_written, nodes_inferred, inference_ms,
+                              write_ms, write_coverage_str};
+}
+
+// Absolute checkpoint paths (no extension) the run produced; a path is empty
+// when its checkpoint kind was disabled or (best) never improved.
+struct CheckpointPaths {
+    std::string best_checkpoint_str;
+    std::string final_checkpoint_str;
+};
+
+// Saves the final_model checkpoint from the finished run's state and resolves
+// the yieldable best/final checkpoint paths. Assumes loop.train() completed
+// (result is final) and autockpt already handled per-epoch best_model saves.
+CheckpointPaths finalize_checkpoints(
+    mdb::gnn::AutoCheckpointer&               autockpt,
+    const mdb::gnn::AutoCheckpointer::Policy& ac_policy,
+    const fs::path&                           ckpt_dir,
+    const mdb::gnn::TrainingState&            base_state,
+    const mdb::gnn::TrainingLoop::Config&     loop_config,
+    const mdb::gnn::TrainingLoop::Result&     result,
+    const TrainOptions&                       opt)
+{
+    mdb::gnn::TrainingState final_state  = base_state;
+    final_state.epoch                    = loop_config.start_epoch + result.ran_epochs;
+    final_state.patience_counter         = 0;  // exhausted / reset at end
+    final_state.best_val_accuracy        = static_cast<float>(result.best_val_accuracy);
+    final_state.epoch_losses             = result.epoch_losses;
+    final_state.total_training_time_sec  = base_state.total_training_time_sec + result.train_seconds;
+
+    autockpt.save_final(final_state);
+
+    std::string best_checkpoint_str;
+    if (opt.save_on_best_val && autockpt.best_val_seen() > 0.0) {
+        best_checkpoint_str =
+            std::filesystem::absolute(ckpt_dir / ac_policy.best_basename).string();
+    }
+    std::string final_checkpoint_str;
+    if (opt.save_final) {
+        final_checkpoint_str =
+            std::filesystem::absolute(ckpt_dir / ac_policy.final_basename).string();
+    }
+
+    return CheckpointPaths{std::move(best_checkpoint_str),
+                           std::move(final_checkpoint_str)};
+}
+
+// Print total disk traffic so the user sees, directly in the server
+// terminal (alongside the per-epoch lines from training_loop.cc), the
+// number comparable to DiskGNN's (SIGMOD 2025) Table 1 row
+// "Disk access volume (GB)".
+// Assumes the snapshot was taken after training/eval/export completed.
+void print_feature_store_disk_traffic(const CacheStatsSnapshot& cache_stats) {
+    constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+    double total_gb = static_cast<double>(cache_stats.total_bytes_disk()) / GB;
+    double l3_gb    = static_cast<double>(cache_stats.l3_bytes_disk)      / GB;
+    double l4_gb    = static_cast<double>(cache_stats.l4_bytes_disk)      / GB;
+    std::cout << "[gnn_train] disk traffic total="
+              << std::fixed << std::setprecision(2) << total_gb << " GB"
+              << " (l3=" << l3_gb << ", l4=" << l4_gb << ")"
+              << "  l3_amplification=" << std::setprecision(3)
+              << cache_stats.l3_read_amplification() << "x\n";
+}
+
+// Emits the training / cache / write-back / checkpoint YIELD columns in the
+// order the procedure has always produced them. Column names are the
+// procedure's public surface. Assumes all results are final; does NOT call
+// yield_row() — the caller finishes the row after the calibration yields.
+void yield_training_columns(
+    ProcedureContext&                     ctx,
+    const std::string&                    model_type,
+    const mdb::gnn::TrainingLoop::Result& result,
+    double                                test_accuracy,
+    const CacheStatsSnapshot&             cache_stats,
+    const EmbeddingWriteBack&             write_back,
+    const std::string&                    best_checkpoint_str,
+    const std::string&                    final_checkpoint_str,
+    uint64_t                              resumed_from_epoch)
+{
+    ctx.yield("modelName",       ctx.create_string(model_type));
+    ctx.yield("ranEpochs",       ctx.create_int(static_cast<int64_t>(result.ran_epochs)));
+    ctx.yield("didConverge",     ctx.create_bool(result.converged));
+    ctx.yield("bestValAccuracy", ctx.create_float(static_cast<float>(result.best_val_accuracy)));
+    ctx.yield("testAccuracy",    ctx.create_float(static_cast<float>(test_accuracy)));
+    // Test accuracy at the best-validation epoch (the DiskGNN SIGMOD 2025
+    // §7.1 protocol). -1.0 when trackTestAtBestVal was off (the loop never
+    // captured it).
+    ctx.yield("testAccuracyAtBestVal", ctx.create_float(static_cast<float>(result.test_accuracy_at_best_val)));
+    ctx.yield("bestValEpoch",    ctx.create_int(static_cast<int64_t>(result.best_val_epoch)));
+    ctx.yield("trainSeconds",    ctx.create_float(static_cast<float>(result.train_seconds)));
+    // Per-stage cumulative timings for diagnosing the async-prefetcher and
+    // pipeline-overlap behavior. assemble + forward + backward should sum to
+    // approximately the train phase wall time (excluding eval). assembleSeconds
+    // is the upper bound on what the async prefetcher can hide behind compute.
+    ctx.yield("assembleSeconds", ctx.create_float(static_cast<float>(result.assemble_seconds)));
+    ctx.yield("forwardSeconds",  ctx.create_float(static_cast<float>(result.forward_seconds)));
+    ctx.yield("backwardSeconds", ctx.create_float(static_cast<float>(result.backward_seconds)));
+    ctx.yield("l1HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l1_hit_ratio())));
+    ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
+    ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
+    ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
+    // Byte-level disk-traffic surface, comparable to DiskGNN's (SIGMOD 2025)
+    // Table 1 row "Disk access volume (GB)".
+    ctx.yield("l3BytesDisk",
+              ctx.create_int(static_cast<int64_t>(cache_stats.l3_bytes_disk)));
+    ctx.yield("l4BytesDisk",
+              ctx.create_int(static_cast<int64_t>(cache_stats.l4_bytes_disk)));
+    ctx.yield("totalBytesDisk",
+              ctx.create_int(static_cast<int64_t>(cache_stats.total_bytes_disk())));
+    ctx.yield("l3ReadAmplification",
+              ctx.create_float(static_cast<float>(cache_stats.l3_read_amplification())));
+    ctx.yield("nodesWritten",    ctx.create_int(static_cast<int64_t>(write_back.nodes_written)));
+    ctx.yield("nodesInferred",   ctx.create_int(static_cast<int64_t>(write_back.nodes_inferred)));
+    ctx.yield("inferenceMillis", ctx.create_float(static_cast<float>(write_back.inference_ms)));
+    ctx.yield("writeMillis",     ctx.create_float(static_cast<float>(write_back.write_ms)));
+    ctx.yield("writeCoverage",   ctx.create_string(write_back.write_coverage_str));
+    ctx.yield("bestCheckpointPath",  ctx.create_string(best_checkpoint_str));
+    ctx.yield("finalCheckpointPath", ctx.create_string(final_checkpoint_str));
+    ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
+    ctx.yield("effectivePrefetchWorkers",
+              ctx.create_int(static_cast<int64_t>(result.effective_prefetch_workers)));
+}
+
+// Dynamic-cache calibration: from the measured peak VRAM, recommend the
+// max-safe L1 cache for this machine+workload. l1_resident = the GPU-resident
+// bytes of the current cache (data portion of the .bin); reserve = peak - L1;
+// recommended L1 = total_vram - reserve - margin. Yielded + logged + persisted
+// to <feature>_vram_calib.txt so a later build can auto-size to it.
+// Assumes calib_peak_vram was measured around loop.train() (0 on CPU-only
+// builds, which makes this yield zeros and skip the persist). Writes
+// <feature>_vram_calib.txt and yields peakVramMb / recommendedL1CacheMb.
+void yield_vram_calibration(
+    ProcedureContext&               ctx,
+    const mdb::gnn::GraphSAGEModel& model,
+    const std::string&              db_folder,
+    const std::string&              feature_name,
+    uint64_t                        calib_peak_vram)
+{
+    const int64_t  in_dim    = model.config().input_dim;
+    const uint64_t row_bytes = static_cast<uint64_t>(in_dim) * 4ull;  // float32
+    uint64_t l1_resident = 0;
+    std::error_code calib_ec;
+    auto gpu_cache_path = std::filesystem::path(db_folder) / "gnn_features"
+                        / (feature_name + "_gpu_cache.bin");
+    auto fsz = std::filesystem::file_size(gpu_cache_path, calib_ec);
+    if (!calib_ec && fsz > 32 && row_bytes > 0) {
+        const uint64_t n = (fsz - 32) / (8 + row_bytes);  // hdr + n*(8 oid + row)
+        l1_resident = n * row_bytes;
+    }
+    const uint64_t peak_mb = calib_peak_vram >> 20;
+    uint64_t recommended_l1_mb = 0, reserve_mb = 0, total_vram_mb = 0;
+    if (calib_peak_vram > 0) {
+        const auto res = mdb::gpu::detect_resources();
+        const uint64_t total_vram = res.gpu.total_vram;
+        total_vram_mb = total_vram >> 20;
+        const uint64_t reserve =
+            calib_peak_vram > l1_resident ? calib_peak_vram - l1_resident : calib_peak_vram;
+        reserve_mb = reserve >> 20;
+        // 1280 MB headroom. 512 MB left the auto-sized L1 at the VRAM
+        // ceiling: at the ~5.4 GB recommendation on a 16 GB device the
+        // cold-start epoch still hit transient CUDA OOMs (which fall back to
+        // a per-batch path that zero-fills the affected batches). 1280 MB
+        // covers the cold-start allocation spike plus run-to-run measurement
+        // noise, keeping the auto-applied L1 OOM-free.
+        const uint64_t margin = 1280ull * 1024 * 1024;
+        const long long rec =
+            static_cast<long long>(total_vram) - static_cast<long long>(reserve)
+            - static_cast<long long>(margin);
+        recommended_l1_mb = rec > 0 ? (static_cast<uint64_t>(rec) >> 20) : 0;
+        std::cerr << "[gnn_train] VRAM calib (measured): peak=" << peak_mb
+                  << "MB L1=" << (l1_resident >> 20) << "MB reserve=" << reserve_mb
+                  << "MB total_vram=" << total_vram_mb
+                  << "MB => recommended l1CacheMb=" << recommended_l1_mb << "\n";
+        // Persist via the shared calib format (single source of truth with
+        // the autoCache reader in gnn_build_feature_store) — byte-identical
+        // to the prior inline layout.
+        mdb::gnn::write_vram_calib(
+            std::filesystem::path(db_folder) / "gnn_features"
+                / (feature_name + "_vram_calib.txt"),
+            mdb::gnn::VramCalib{recommended_l1_mb, peak_mb, reserve_mb,
+                                total_vram_mb});
+    }
+    ctx.yield("peakVramMb", ctx.create_int(static_cast<int64_t>(peak_mb)));
+    ctx.yield("recommendedL1CacheMb",
+              ctx.create_int(static_cast<int64_t>(recommended_l1_mb)));
+}
+
+} // namespace
+
+// =============================================================================
+// Procedure execution
+// =============================================================================
+
+void GnnTrainProcedure::execute(ProcedureContext& ctx) {
+    using namespace mdb::gnn;
+
+    // =========================================================================
+    // Step 1: Parse arguments
+    // =========================================================================
+    std::string sample_name;
+    std::string feature_name;
+    parse_positional_arguments(ctx, sample_name, feature_name);
+
+    // =========================================================================
+    // Step 2: Parse options
+    // =========================================================================
+    TrainOptions opt;
+    opt.parse_options_argument(ctx);
+
+    // =========================================================================
+    // Step 3: Validate inputs exist
+    // =========================================================================
+    std::string db_folder = get_db_folder();
+    auto paths = validate_train_inputs(db_folder, sample_name, feature_name);
+
+    // =========================================================================
+    // Step 4: Open data sources
+    //
+    // The original FeatureMatrix is intentionally NOT opened here: features
+    // are served exclusively through FourLevelStore below, which reads from
+    // its own reordered .fmat / _cpu_cache.bin / packed_slim files. The
+    // RowMapping is still required because BatchAssembler uses it for label
+    // lookups (labels.bin is indexed by the ORIGINAL row indices).
+    // =========================================================================
+    auto rm = RowMapping::open(paths.rmap_path);
+    auto samples = SampleStorage::open(paths.storage_path);
+
+    opt.prefetch_num_workers =
+        resolve_prefetch_worker_count(opt.prefetch_num_workers);
+
+    // Shared by the sample cache here and the assembler struct cache below.
+    size_t auto_cache_budget_bytes = configure_sample_cache(
+        samples, opt.sample_cache_mb, opt.prefetch_num_workers);
+
+    const auto& catalog = samples.get_catalog();
+    std::string projection_name = catalog.projection_name;
+
+    auto proj_data = open_projection_training_data(projection_name, sample_name);
+    const std::string& proj_dir  = proj_data.proj_dir;
+    const fs::path&    meta_path = proj_data.meta_path;
+    const GnnMeta&     meta      = proj_data.meta;
+    auto&              labels    = proj_data.labels;
+    auto&              splits    = proj_data.splits;
+
+    check_label_split_row_alignment(labels.get(), splits.get());
+    run_feature_label_integrity_gate(
+        db_folder, feature_name, labels.get(), splits.get(), meta);
+
+    // =========================================================================
+    // Step 5: Configure model and training
+    // =========================================================================
+    GraphSAGEConfig gnn_config =
+        build_gnn_config(catalog, meta, opt.hidden_dim, opt.dropout, opt.normalize);
+
+    // Reproducibility seed
+    if (opt.random_seed >= 0) {
+        torch::manual_seed(static_cast<uint64_t>(opt.random_seed));
+    }
+
+    GraphSAGEModel model(gnn_config);
+
+    // =========================================================================
+    // Step 6: Create output directory
+    // =========================================================================
+    auto output_dir = fs::path(proj_dir) / "gnn_output" / opt.output_dir_name;
+    fs::create_directories(output_dir);
+
+    // =========================================================================
+    // Step 7: Open FourLevelStore and create BatchAssembler in full mode
+    //
+    // FourLevelStore reads the hierarchical feature store built by
+    // gnn_build_feature_store: L1 (GPU) + L2 (CPU pinned) + L3 (disk reordered)
+    // + L4 (packed slim per-batch). Its stats counters let us verify that all
+    // four tiers are exercised during training — this is the DiskGNN contract.
+    // =========================================================================
+    mdb::gnn::FourLevelStore feature_store(db_folder, feature_name, samples);
+    check_feature_dim_contract(feature_store, meta, sample_name, feature_name);
+
+    BatchAssembler assembler(feature_store, samples, labels.get(), splits.get(), rm);
+    apply_block_mode_override(ctx, assembler);
+
+    // Structural per-batch cache: reuse the index/label build across epochs
+    // (the cost model showed build_active_indices + build_edge_indices dominate
+    // the assemble worker cost; the feature gather is cheap when L1-resident).
+    // Same budget knob/policy as the sample cache.
+    {
+        size_t budget = (opt.sample_cache_mb < 0)
+            ? auto_cache_budget_bytes
+            : static_cast<size_t>(opt.sample_cache_mb) * 1024ULL * 1024ULL;
+        assembler.set_struct_cache_budget_bytes(budget);
+    }
+
+    // =========================================================================
+    // Step 8: Run training
+    // =========================================================================
+    TrainingLoop::Config loop_config = opt.make_loop_config(output_dir);
+
+    // =========================================================================
+    // Step 8a: Build base TrainingState (identifying fields) for checkpoints
+    // =========================================================================
+    mdb::gnn::TrainingState base_state = build_base_training_state(
+        gnn_config, opt.model_type, projection_name, meta_path);
+
+    torch::optim::Adam optimizer(
+        model.parameters(),
+        torch::optim::AdamOptions(opt.lr).weight_decay(opt.weight_decay)
+    );
+
+    // =========================================================================
+    // Step 8b: Resume from checkpoint if requested
+    // =========================================================================
+    uint64_t resumed_from_epoch = resume_training_from_checkpoint(
+        opt.resume_from, output_dir, model, optimizer, meta_path,
+        projection_name, loop_config, base_state);
+
     // =========================================================================
     // Step 8c: Construct AutoCheckpointer and wire its callback
     // =========================================================================
     mdb::gnn::AutoCheckpointer::Policy ac_policy;
-    ac_policy.save_on_best_val = save_on_best_val;
-    ac_policy.save_final       = save_final;
+    ac_policy.save_on_best_val = opt.save_on_best_val;
+    ac_policy.save_final       = opt.save_final;
 
     auto ckpt_dir = output_dir / "checkpoints";
     mdb::gnn::AutoCheckpointer autockpt(
@@ -1161,25 +1666,8 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // =========================================================================
     // Step 8d: Finalize checkpoint
     // =========================================================================
-    mdb::gnn::TrainingState final_state  = base_state;
-    final_state.epoch                    = loop_config.start_epoch + result.ran_epochs;
-    final_state.patience_counter         = 0;  // exhausted / reset at end
-    final_state.best_val_accuracy        = static_cast<float>(result.best_val_accuracy);
-    final_state.epoch_losses             = result.epoch_losses;
-    final_state.total_training_time_sec  = base_state.total_training_time_sec + result.train_seconds;
-
-    autockpt.save_final(final_state);
-
-    std::string best_checkpoint_str;
-    if (save_on_best_val && autockpt.best_val_seen() > 0.0) {
-        best_checkpoint_str =
-            std::filesystem::absolute(ckpt_dir / ac_policy.best_basename).string();
-    }
-    std::string final_checkpoint_str;
-    if (save_final) {
-        final_checkpoint_str =
-            std::filesystem::absolute(ckpt_dir / ac_policy.final_basename).string();
-    }
+    CheckpointPaths ckpt_paths = finalize_checkpoints(
+        autockpt, ac_policy, ckpt_dir, base_state, loop_config, result, opt);
 
     // =========================================================================
     // Step 9: Evaluate on test set
@@ -1204,72 +1692,17 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // Step 11: Export embeddings
     // =========================================================================
     bool did_export_emb = false;
-    if (export_emb) {
+    if (opt.export_emb) {
         export_embeddings(model, assembler, catalog, gnn_config, feature_name, output_dir);
         did_export_emb = true;
     }
 
     // =========================================================================
     // Step 11.5: Write embeddings to projection (if writeProperty is set)
-    //
-    // Opens ProjectionStorage for the EmbeddingWriter, which needs topology
-    // access (on-the-fly k-hop inference for nodes that were never seeds) and
-    // property write access (persisting embeddings as tensor properties).
-    // Under 'all' coverage the fanouts are taken from the SampleCatalog so the
-    // non-seed inference sampling depth matches the original offline sampling;
-    // under 'seeds' they are left empty and non-seed inference never runs.
-    // Orientation is NOT persisted in the SampleCatalog, and gnn_train never
-    // sets Config::orientation, so non-seed inference falls back to the
-    // UNDIRECTED default when build_adjacency_cache_ selects its directions:
-    // for samples built with NATURAL or REVERSE orientation the non-seed
-    // inference neighborhoods differ from the training-time neighborhoods.
     // =========================================================================
-    uint64_t nodes_written  = 0;
-    uint64_t nodes_inferred = 0;
-    double   inference_ms   = 0.0;
-    double   write_ms       = 0.0;
-    // Coverage the write-back actually ran under; empty when writeProperty was
-    // not set, since then no write happened and no coverage applies.
-    std::string write_coverage_str;
-
-    if (!write_property.empty()) {
-        write_coverage_str =
-            write_coverage == EmbeddingWriter::Coverage::SEEDS ? "seeds" : "all";
-
-        EmbeddingWriter::Config wconfig;
-        wconfig.property_name      = write_property;
-        wconfig.coverage           = write_coverage;
-        // On-the-fly k-hop inference for non-seed nodes is what makes 'all'
-        // coverage expensive; 'seeds' leaves the fanouts empty so that phase
-        // is skipped outright and only the pre-computed seed embeddings are
-        // written.
-        if (write_coverage == EmbeddingWriter::Coverage::ALL) {
-            wconfig.fanouts        = catalog.fanouts;
-        }
-        wconfig.feature_matrix_path = fmat_path;
-        if (inference_batch_size > 0) {
-            wconfig.batch_size = inference_batch_size;
-        }
-
-        GQL::ProjectionStorage proj_storage(proj_dir, db_folder);
-        proj_storage.open();
-
-        EmbeddingWriter writer(
-            model,
-            assembler,
-            samples,
-            rm,
-            catalog,
-            proj_storage,
-            wconfig
-        );
-        auto wresult = writer.write_all();
-
-        nodes_written  = wresult.nodes_written;
-        nodes_inferred = wresult.nodes_inferred;
-        inference_ms   = wresult.inference_ms;
-        write_ms       = wresult.write_ms;
-    }
+    EmbeddingWriteBack write_back = write_embeddings_to_projection(
+        opt, model, assembler, samples, rm, catalog,
+        paths.fmat_path, proj_dir, db_folder);
 
     // =========================================================================
     // Step 11.6: Snapshot FourLevelStore cache statistics
@@ -1280,131 +1713,24 @@ void GnnTrainProcedure::execute(ProcedureContext& ctx) {
     // hierarchy is invisible to the user.
     // =========================================================================
     auto cache_stats = CacheStatsSnapshot::from(feature_store.get_stats());
-
-    // Print total disk traffic so the user sees, directly in the server
-    // terminal (alongside the per-epoch lines from training_loop.cc), the
-    // number comparable to DiskGNN's (SIGMOD 2025) Table 1 row
-    // "Disk access volume (GB)".
-    {
-        constexpr double GB = 1024.0 * 1024.0 * 1024.0;
-        double total_gb = static_cast<double>(cache_stats.total_bytes_disk()) / GB;
-        double l3_gb    = static_cast<double>(cache_stats.l3_bytes_disk)      / GB;
-        double l4_gb    = static_cast<double>(cache_stats.l4_bytes_disk)      / GB;
-        std::cout << "[gnn_train] disk traffic total="
-                  << std::fixed << std::setprecision(2) << total_gb << " GB"
-                  << " (l3=" << l3_gb << ", l4=" << l4_gb << ")"
-                  << "  l3_amplification=" << std::setprecision(3)
-                  << cache_stats.l3_read_amplification() << "x\n";
-    }
+    print_feature_store_disk_traffic(cache_stats);
 
     // =========================================================================
     // Step 12: Write training log
     // =========================================================================
     write_training_log(
-        output_dir, model_type, sample_name, feature_name,
+        output_dir, opt.model_type, sample_name, feature_name,
         projection_name, loop_config, gnn_config, result,
         test_accuracy, did_export_emb, cache_stats);
 
     // =========================================================================
     // Step 13: Yield results
     // =========================================================================
-    ctx.yield("modelName",       ctx.create_string(model_type));
-    ctx.yield("ranEpochs",       ctx.create_int(static_cast<int64_t>(result.ran_epochs)));
-    ctx.yield("didConverge",     ctx.create_bool(result.converged));
-    ctx.yield("bestValAccuracy", ctx.create_float(static_cast<float>(result.best_val_accuracy)));
-    ctx.yield("testAccuracy",    ctx.create_float(static_cast<float>(test_accuracy)));
-    // Test accuracy at the best-validation epoch (the DiskGNN SIGMOD 2025
-    // §7.1 protocol). -1.0 when trackTestAtBestVal was off (the loop never
-    // captured it).
-    ctx.yield("testAccuracyAtBestVal", ctx.create_float(static_cast<float>(result.test_accuracy_at_best_val)));
-    ctx.yield("bestValEpoch",    ctx.create_int(static_cast<int64_t>(result.best_val_epoch)));
-    ctx.yield("trainSeconds",    ctx.create_float(static_cast<float>(result.train_seconds)));
-    // Per-stage cumulative timings for diagnosing the async-prefetcher and
-    // pipeline-overlap behavior. assemble + forward + backward should sum to
-    // approximately the train phase wall time (excluding eval). assembleSeconds
-    // is the upper bound on what the async prefetcher can hide behind compute.
-    ctx.yield("assembleSeconds", ctx.create_float(static_cast<float>(result.assemble_seconds)));
-    ctx.yield("forwardSeconds",  ctx.create_float(static_cast<float>(result.forward_seconds)));
-    ctx.yield("backwardSeconds", ctx.create_float(static_cast<float>(result.backward_seconds)));
-    ctx.yield("l1HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l1_hit_ratio())));
-    ctx.yield("l2HitRatio",      ctx.create_float(static_cast<float>(cache_stats.l2_hit_ratio())));
-    ctx.yield("l3Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l3_reads)));
-    ctx.yield("l4Reads",         ctx.create_int(static_cast<int64_t>(cache_stats.l4_reads)));
-    // Byte-level disk-traffic surface, comparable to DiskGNN's (SIGMOD 2025)
-    // Table 1 row "Disk access volume (GB)".
-    ctx.yield("l3BytesDisk",
-              ctx.create_int(static_cast<int64_t>(cache_stats.l3_bytes_disk)));
-    ctx.yield("l4BytesDisk",
-              ctx.create_int(static_cast<int64_t>(cache_stats.l4_bytes_disk)));
-    ctx.yield("totalBytesDisk",
-              ctx.create_int(static_cast<int64_t>(cache_stats.total_bytes_disk())));
-    ctx.yield("l3ReadAmplification",
-              ctx.create_float(static_cast<float>(cache_stats.l3_read_amplification())));
-    ctx.yield("nodesWritten",    ctx.create_int(static_cast<int64_t>(nodes_written)));
-    ctx.yield("nodesInferred",   ctx.create_int(static_cast<int64_t>(nodes_inferred)));
-    ctx.yield("inferenceMillis", ctx.create_float(static_cast<float>(inference_ms)));
-    ctx.yield("writeMillis",     ctx.create_float(static_cast<float>(write_ms)));
-    ctx.yield("writeCoverage",   ctx.create_string(write_coverage_str));
-    ctx.yield("bestCheckpointPath",  ctx.create_string(best_checkpoint_str));
-    ctx.yield("finalCheckpointPath", ctx.create_string(final_checkpoint_str));
-    ctx.yield("resumedFromEpoch",    ctx.create_int(static_cast<int64_t>(resumed_from_epoch)));
-    ctx.yield("effectivePrefetchWorkers",
-              ctx.create_int(static_cast<int64_t>(result.effective_prefetch_workers)));
-
-    // Dynamic-cache calibration: from the measured peak VRAM, recommend the
-    // max-safe L1 cache for this machine+workload. l1_resident = the GPU-resident
-    // bytes of the current cache (data portion of the .bin); reserve = peak - L1;
-    // recommended L1 = total_vram - reserve - margin. Yielded + logged + persisted
-    // to <feature>_vram_calib.txt so a later build can auto-size to it.
-    {
-        const int64_t  in_dim    = model.config().input_dim;
-        const uint64_t row_bytes = static_cast<uint64_t>(in_dim) * 4ull;  // float32
-        uint64_t l1_resident = 0;
-        std::error_code calib_ec;
-        auto gpu_cache_path = std::filesystem::path(db_folder) / "gnn_features"
-                            / (feature_name + "_gpu_cache.bin");
-        auto fsz = std::filesystem::file_size(gpu_cache_path, calib_ec);
-        if (!calib_ec && fsz > 32 && row_bytes > 0) {
-            const uint64_t n = (fsz - 32) / (8 + row_bytes);  // hdr + n*(8 oid + row)
-            l1_resident = n * row_bytes;
-        }
-        const uint64_t peak_mb = calib_peak_vram >> 20;
-        uint64_t recommended_l1_mb = 0, reserve_mb = 0, total_vram_mb = 0;
-        if (calib_peak_vram > 0) {
-            const auto res = mdb::gpu::detect_resources();
-            const uint64_t total_vram = res.gpu.total_vram;
-            total_vram_mb = total_vram >> 20;
-            const uint64_t reserve =
-                calib_peak_vram > l1_resident ? calib_peak_vram - l1_resident : calib_peak_vram;
-            reserve_mb = reserve >> 20;
-            // 1280 MB headroom. 512 MB left the auto-sized L1 at the VRAM
-            // ceiling: at the ~5.4 GB recommendation on a 16 GB device the
-            // cold-start epoch still hit transient CUDA OOMs (which fall back to
-            // a per-batch path that zero-fills the affected batches). 1280 MB
-            // covers the cold-start allocation spike plus run-to-run measurement
-            // noise, keeping the auto-applied L1 OOM-free.
-            const uint64_t margin = 1280ull * 1024 * 1024;
-            const long long rec =
-                static_cast<long long>(total_vram) - static_cast<long long>(reserve)
-                - static_cast<long long>(margin);
-            recommended_l1_mb = rec > 0 ? (static_cast<uint64_t>(rec) >> 20) : 0;
-            std::cerr << "[gnn_train] VRAM calib (measured): peak=" << peak_mb
-                      << "MB L1=" << (l1_resident >> 20) << "MB reserve=" << reserve_mb
-                      << "MB total_vram=" << total_vram_mb
-                      << "MB => recommended l1CacheMb=" << recommended_l1_mb << "\n";
-            // Persist via the shared calib format (single source of truth with
-            // the autoCache reader in gnn_build_feature_store) — byte-identical
-            // to the prior inline layout.
-            mdb::gnn::write_vram_calib(
-                std::filesystem::path(db_folder) / "gnn_features"
-                    / (feature_name + "_vram_calib.txt"),
-                mdb::gnn::VramCalib{recommended_l1_mb, peak_mb, reserve_mb,
-                                    total_vram_mb});
-        }
-        ctx.yield("peakVramMb", ctx.create_int(static_cast<int64_t>(peak_mb)));
-        ctx.yield("recommendedL1CacheMb",
-                  ctx.create_int(static_cast<int64_t>(recommended_l1_mb)));
-    }
+    yield_training_columns(
+        ctx, opt.model_type, result, test_accuracy, cache_stats, write_back,
+        ckpt_paths.best_checkpoint_str, ckpt_paths.final_checkpoint_str,
+        resumed_from_epoch);
+    yield_vram_calibration(ctx, model, db_folder, feature_name, calib_peak_vram);
     // Address-table fast-path telemetry: whether the v2 addr_table path
     // was active during training and its mean load latency in microseconds.
     ctx.yield("useAddrTablesEffective",
