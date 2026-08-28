@@ -1,0 +1,23 @@
+graph {
+  {
+    node [shape=plain fontcolor=black fontsize=10]
+    authorl [ pos="0,0.4!" label="Author" ]
+    bookl   [ pos="1.2,0.4!" label="Author"]
+    arrowl  [ pos="0.6,0.15!" fontsize=8 label="Knows"]
+  }
+
+  {
+    node [shape=plain fontsize=8]
+    author_props [pos="0,-0.4!" label="name:John\nborn:1954"]
+    books_props [pos="1.2,-0.4!" label="name:Jane\nborn:1959"]
+  }
+
+  {
+    node [fixedsize=shape fontcolor=black fontsize=10 width=0.5 shape=circle style=filled]
+    author  [ pos="0,0!" fillcolor=lightgreen label=""]
+    book    [ pos="1.2,0!" fillcolor=lightgreen label=""]
+
+  }
+
+  author -- book
+}
