@@ -1,5 +1,7 @@
 #include "gnn/storage/row_mapping.h"
 
+#include "gnn/common/posix_io.h"
+
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -27,39 +29,6 @@ static_assert(std::is_nothrow_move_constructible_v<std::unique_ptr<std::once_fla
               "build_index_flag_ must be nothrow-movable for RowMapping noexcept move operations");
 
 namespace fs = std::filesystem;
-
-namespace {
-
-class FdGuard {
-public:
-    explicit FdGuard(int fd) : fd_(fd) {}
-    ~FdGuard() { if (fd_ >= 0) ::close(fd_); }
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-private:
-    int fd_;
-};
-
-void write_all(int fd, const void* buf, size_t count) {
-    const char* p = static_cast<const char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t written = ::write(fd, p, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "RowMapping: write failed: " + std::string(std::strerror(errno)));
-        }
-        if (written == 0) {
-            throw std::runtime_error(
-                "RowMapping: write returned 0 for non-zero count — disk full or I/O error");
-        }
-        p += written;
-        remaining -= static_cast<size_t>(written);
-    }
-}
-
-} // anonymous namespace
 
 // --- Move semantics ---
 

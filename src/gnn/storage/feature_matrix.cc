@@ -1,5 +1,7 @@
 #include "gnn/storage/feature_matrix.h"
 
+#include "gnn/common/posix_io.h"
+
 #include "gnn/common/page_cache_hint.h"   // fadvise_dontneed / madvise_dontneed: page-cache relief after sequential writes
 #include "gnn/common/pipeline_overlap.h"  // ChunkPipeline: opt-in producer-consumer overlap for reorder passes
 #include "misc/ablation_registry.h"       // Ablation::*: resolve an env switch and declare it in the same act
@@ -31,18 +33,6 @@ namespace fs = std::filesystem;
 // --- RAII helpers ---
 namespace {
 
-class FdGuard {
-public:
-    explicit FdGuard(int fd) : fd_(fd) {}
-    ~FdGuard() { if (fd_ >= 0) ::close(fd_); }
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-    int get() const { return fd_; }
-    void release() { fd_ = -1; }
-private:
-    int fd_;
-};
-
 // RAII guard that restores madvise hint on scope exit (even if exception thrown)
 class MadviseGuard {
 public:
@@ -61,25 +51,6 @@ private:
     void*  addr_;
     size_t len_;
 };
-
-void write_all(int fd, const void* buf, size_t count) {
-    const char* p = static_cast<const char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t written = ::write(fd, p, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "FeatureMatrix: write failed: " + std::string(std::strerror(errno)));
-        }
-        if (written == 0) {
-            throw std::runtime_error(
-                "FeatureMatrix: write returned 0 for non-zero count — disk full or I/O error");
-        }
-        p += written;
-        remaining -= static_cast<size_t>(written);
-    }
-}
 
 // Physical pre-allocation: fallocate(2) reserves disk blocks up-front so
 // subsequent pwrites don't have to allocate extents on the fly. Falls back

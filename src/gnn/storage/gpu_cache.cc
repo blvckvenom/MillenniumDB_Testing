@@ -1,5 +1,7 @@
 #include "gnn/storage/gpu_cache.h"
 
+#include "gnn/common/posix_io.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <thread>
@@ -20,59 +22,7 @@ namespace mdb::gnn {
 
 namespace fs = std::filesystem;
 
-// ---------------------------------------------------------------------------
-// RAII helpers (same pattern as FeatureMatrix / RowMapping)
-// ---------------------------------------------------------------------------
 namespace {
-
-class FdGuard {
-public:
-    explicit FdGuard(int fd) : fd_(fd) {}
-    ~FdGuard() { if (fd_ >= 0) ::close(fd_); }
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-    int get() const { return fd_; }
-private:
-    int fd_;
-};
-
-void write_all(int fd, const void* buf, size_t count) {
-    const char* p = static_cast<const char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t written = ::write(fd, p, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "GpuCache::build: write failed: " + std::string(std::strerror(errno)));
-        }
-        if (written == 0) {
-            throw std::runtime_error(
-                "GpuCache::build: write returned 0 — disk full or I/O error");
-        }
-        p += written;
-        remaining -= static_cast<size_t>(written);
-    }
-}
-
-void read_all(int fd, void* buf, size_t count) {
-    char* p = static_cast<char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t n = ::read(fd, p, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "GpuCache: read failed: " + std::string(std::strerror(errno)));
-        }
-        if (n == 0) {
-            throw std::runtime_error(
-                "GpuCache: unexpected EOF during read");
-        }
-        p += n;
-        remaining -= static_cast<size_t>(n);
-    }
-}
 
 /// Map GnnDtype to torch::ScalarType.
 torch::ScalarType to_torch_dtype(GnnDtype dt) {

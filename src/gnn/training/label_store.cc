@@ -1,5 +1,7 @@
 #include "gnn/training/label_store.h"
 
+#include "gnn/common/posix_io.h"
+
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -12,43 +14,6 @@
 namespace mdb::gnn {
 
 namespace fs = std::filesystem;
-
-// ============================================================================
-// Anonymous helpers
-// ============================================================================
-
-namespace {
-
-class FdGuard {
-public:
-    explicit FdGuard(int fd) : fd_(fd) {}
-    ~FdGuard() { if (fd_ >= 0) ::close(fd_); }
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-private:
-    int fd_;
-};
-
-void write_all(int fd, const void* buf, size_t count) {
-    const char* p = static_cast<const char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t written = ::write(fd, p, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                "LabelStore: write failed: " + std::string(std::strerror(errno)));
-        }
-        if (written == 0) {
-            throw std::runtime_error(
-                "LabelStore: write returned 0 — disk full or I/O error");
-        }
-        p         += written;
-        remaining -= static_cast<size_t>(written);
-    }
-}
-
-} // anonymous namespace
 
 // ============================================================================
 // Move semantics + destructor
