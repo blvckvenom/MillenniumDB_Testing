@@ -15,7 +15,7 @@ else
     source $VENV/bin/activate
 fi
 
-COMMANDS=(all sparql mql gql unit)
+COMMANDS=(all sparql mql gql unit gnn)
 
 CMD=all
 if [[ ${1-} ]]; then
@@ -28,8 +28,13 @@ if [[ ${1-} ]]; then
 fi
 
 # Configure build and compile
-cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug
-cmake --build build/Debug
+# Detect if GNN module should be enabled (check if LibTorch exists)
+GNN_FLAGS=""
+if [ -d "third_party/libtorch" ]; then
+    GNN_FLAGS="-D ENABLE_GNN=ON"
+fi
+cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug -D BUILD_TESTING=ON $GNN_FLAGS
+cmake --build build/Debug -j $(nproc)
 
 # Remove SPARQL tmp dir
 [[ -d  $TESTS/sparql/tmp/ ]] && echo -e ${BLUE}Removing  $TESTS/sparql/tmp/${NC} && rm -r  $TESTS/sparql/tmp/
@@ -59,6 +64,22 @@ if [[ $CMD = "all" || $CMD = "unit" ]]; then
     cd build/Debug/
     printf "${BLUE}RUNNING UNIT TESTS${NC}\n"
     ctest --output-on-failure || ERROR=true
+    cd ../..
+fi
+
+if [[ $CMD = "all" || $CMD = "gnn" ]]; then
+    if [ -d "third_party/libtorch" ]; then
+        printf "${BLUE}RUNNING GNN E2E TESTS${NC}\n"
+        $TESTS/gnn_e2e_test.sh build/Debug || ERROR=true
+
+        printf "${BLUE}RUNNING GNN PROJECTION INTEGRATION TESTS${NC}\n"
+        $TESTS/gql/test_suites/projection_gnn/run_test.sh build/Debug || ERROR=true
+
+        printf "${BLUE}RUNNING GNN TRAINING E2E TEST (GraphSAGE on Cora)${NC}\n"
+        $TESTS/gql/test_suites/gnn_training/run_test.sh build/Debug || ERROR=true
+    else
+        printf "${BLUE}SKIPPING GNN E2E TESTS (LibTorch not found)${NC}\n"
+    fi
 fi
 
 if [[ $ERROR ]]; then

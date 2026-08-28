@@ -1,0 +1,31 @@
+// Usuarios con saldo
+0 :Usuario nombre:"Ana" saldo:5000
+1 :Usuario nombre:"Carlos" saldo:3000
+2 :Usuario nombre:"Maria" saldo:7000
+3 :Usuario nombre:"Pedro" saldo:2000
+4 :Usuario nombre:"Laura" saldo:4500
+
+// TRANSFIERE - Aristas paralelas (múltiples entre mismos usuarios)
+0->1 :TRANSFIERE monto:100 fecha:"2024-01-15"
+0->1 :TRANSFIERE monto:250 fecha:"2024-01-20"
+0->1 :TRANSFIERE monto:150 fecha:"2024-02-01"
+1->2 :TRANSFIERE monto:500 fecha:"2024-01-10"
+1->2 :TRANSFIERE monto:300 fecha:"2024-01-25"
+2->3 :TRANSFIERE monto:200 fecha:"2024-02-05"
+2->0 :TRANSFIERE monto:400 fecha:"2024-02-10"
+3->4 :TRANSFIERE monto:150 fecha:"2024-02-15"
+3->4 :TRANSFIERE monto:350 fecha:"2024-02-20"
+3->4 :TRANSFIERE monto:100 fecha:"2024-02-25"
+4->0 :TRANSFIERE monto:600 fecha:"2024-03-01"
+
+// CONOCE - Sin paralelas (aristas no dirigidas para comparar)
+0~1 :CONOCE desde:"2020-01-01"
+1~2 :CONOCE desde:"2019-05-15"
+2~3 :CONOCE desde:"2021-08-20"
+3~4 :CONOCE desde:"2022-03-10"
+
+// SIGUE - Sin paralelas (aristas dirigidas para comparar)
+0->2 :SIGUE
+1->3 :SIGUE
+2->4 :SIGUE
+3->0 :SIGUE
