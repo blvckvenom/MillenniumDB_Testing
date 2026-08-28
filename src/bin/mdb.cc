@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "bin/mdb-csv-import.h"
 #include "bin/mdb-dump.h"
 #include "bin/mdb-import.h"
@@ -5,98 +7,121 @@
 #include "bin/mdb-server.h"
 #include "cli/cli.h"
 
-using std::cout;
 using namespace MdbBin;
 
 void print_mdb_version()
 {
-    cout << "MillenniumDB v1.0.0\n";
+    std::cout << "MillenniumDB v1.0.0\n";
 }
 
 void print_server_help()
 {
-    cout << "\nServer Usage:"
-            "\n  mdb server <db_folder> [OPTIONS]"
-            "\n"
-            "\n  Options:"
-            "\n    -j,--threads,--workers <N>         number of worker threads"
-            "\n    -p,--port <port>                   server port (default: 1234)"
-            "\n    -t,--timeout <seconds>             set query timeout (default: 60)"
-            "\n    --browser <true|false>             enable or disable web browser"
-            "\n    --browser-port <port>              browser port (default: 4321)"
-            "\n    --admin-user <username>            admin username"
-            "\n    --admin-password <password>        admin password"
-            "\n    --strings-dynamic <bytes>          size for the strings-dynamic-buffer"
-            "\n    --strings-static <bytes>           size for static strings-static-buffer"
-            "\n    --tensors-dynamic <bytes>          size for the tensors-dynamic-buffer"
-            "\n    --tensors-static <bytes>           size for static tensors-static-buffer"
-            "\n    --private-buffer <bytes>           size for the private-buffer"
-            "\n    --versioned-buffer <bytes>         size for the versioned-buffer"
-            "\n";
+    std::cout << R"(
+Server usage: mdb server <db_folder> [options]
+
+  Server Options:
+    -j,--threads,--workers <N>         Number of worker threads (default: auto)
+    -p,--port <port>                   Server port (default: 1234)
+    -t,--timeout <seconds>             Query timeout (default: 60)
+
+  Browser Interface:
+    --browser <bool>                   Enable or disable web browser
+    --browser-port <port>              Browser port (default: 4321)
+
+  Security:
+    --admin-user <username>            Admin username
+    --admin-password <password>        Admin password
+    --ssl-cert <path>                  Path to SSL certificate file
+    --ssl-key <path>                   Path to SSL key file
+
+  Memory Configuration:
+    (Values support suffixes: KB, MB, GB, TB)
+    --strings-dynamic <N>              Size of dynamic string buffer
+    --strings-static <N>               Size of static static string buffer
+    --tensors-dynamic <N>              Size of dynamic tensor buffer
+    --tensors-static <N>               Size of static static tensor buffer
+    --private-buffer <N>               Size of private buffer
+    --versioned-buffer <N>             Size of versioned buffer
+
+  Logging:
+    --log-path <path>                  Redirect logs to file instead of stdout
+    --log-timestamp <bool>             Include timestamps in log output
+    --log-category <bool>              Include category names in log output
+    --log-debug <bool>                 Include debug category in log
+    --log-error <bool>                 Include error category in log
+    --log-info <bool>                  Include info category in log
+)";
 }
 
 void print_import_help()
 {
-    cout << "\nImport Usage:"
-            "\n  mdb import <files...> <db_folder> [OPTIONS]\n"
-            "\n"
-            "\n  alternative use with stdinput (useful for importing compressed files)"
-            "\n  example:"
-            "\n    bzcat file.ttl.bz2 | mdb import <db_folder> --format ttl"
-            "\n"
-            "\n  Options:"
-            "\n    --buffer-strings                   size of buffer for strings used during import (default: 2GB)"
-            "\n    --buffer-tensors                   size of buffer for tensors used during import (default: 2GB)"
-            "\n    --format                           specify the file format"
-            "\n                                         * RDF: [ttl nt n3 rdf]"
-            "\n                                         * GQL: [gql]"
-            "\n                                         * Quad Model: [qm]"
-            "\n  Options for RDF:"
-            "\n    --prefixes                         prefixes file path (for IRI compression)"
-            "\n    --btree-permutations               3, 4 or 6 (default: 4)"
-            "\n";
+    std::cout << R"(
+Import Usage: mdb import <files...> <db_folder> [options]
+
+  Alternative usage with stdin (useful for importing compressed files):
+    Example:
+    bzcat file.ttl.bz2 | mdb import <db_folder> --format ttl
+
+  Options:
+    --buffer-strings <N>               Size of strings buffer (default: 2GB)
+    --buffer-tensors <N>               Size of tensors buffer (default: 2GB)
+    --format <ext>                     Specify the file format:
+                                       * RDF: [ttl, nt, n3, rdf]
+                                       * GQL: [gql]
+                                       * Quad Model: [qm]
+
+  Options for RDF:
+    --prefixes <path>                  Prefixes file path (for IRI compression)
+    --btree-permutations <N>           3, 4, or 6 (default: 4)
+
+  Options for GQL:
+    --with-tensors <file.npy>          Import node embeddings from NumPy file
+)";
 }
 
 void print_csv_import_help()
 {
-    cout << "\nCSV Import Usage:"
-            "\n  mdb csv-import <gql|quad> <db_folder> --nodes <node_files...> --edges <edge_files> [OPTIONS]"
-            "\n"
-            "\n  Options:"
-            "\n    --buffer-strings                   size of buffer for strings used during import (default: 2GB)"
-            "\n    --buffer-tensors                   size of buffer for tensors used during import (default: 2GB)"
-            "\n    --list-separator                   character used to separate lists (default: ';')"
-            "\n";
+    std::cout << R"(
+CSV Import Usage:
+  mdb csv-import <gql|quad> <db_folder> --nodes <node_files...> --edges <edge_files> [options]
+
+  Options:
+    --buffer-strings                   Size of strings buffer (default: 2GB)
+    --buffer-tensors                   Size of tensors buffer (default: 2GB)
+    --list-separator                   Character to separate lists (default: ';')
+)";
 }
 
 void print_dump_help()
 {
-    cout << "\nDump Usage:"
-            "\n  mdb dump <db_folder> <output_file_prefix> <format>"
-            "\n"
-            "\n  Valid formats:"
-            "\n   * RDF: [nt ttl]"
-            "\n   * GQL: NOT SUPPORTED YET"
-            "\n   * Quad Model: [qm json]"
-            "\n";
+    std::cout << R"(
+Dump Usage:
+  mdb dump <db_folder> <output_file_prefix> <format>
+
+  Valid formats:
+    * RDF: [nt ttl]
+    * GQL: NOT SUPPORTED YET
+    * Quad Model: [qm json]
+)";
 }
 
 void print_cli_help()
 {
-    cout << "\nCLI Usage:"
-            "\n  mdb cli <db_folder> [OPTIONS]"
-            "\n"
-            "\n  Options:"
-            "\n    --strings-dynamic <bytes>          size for the strings-dynamic-buffer"
-            "\n    --strings-static <bytes>           size for static strings-static-buffer"
-            "\n    --private-buffer <bytes>           size for the private-buffer"
-            "\n    --versioned-buffer <bytes>         size for the versioned-buffer"
-            "\n";
+    std::cout << R"(
+CLI Usage:
+  mdb cli <db_folder> [options]
+
+  Options:
+    --strings-dynamic <bytes>          Size of dynamic string buffer
+    --strings-static <bytes>           Size of static string buffer
+    --private-buffer <bytes>           Size of private buffer
+    --versioned-buffer <bytes>         Size of versioned buffer
+)";
 }
 
 void print_projection_help()
 {
-    cout << "\nProjection Management Usage:"
+    std::cout << "\nProjection Management Usage:"
             "\n  mdb list-projections <db_folder>"
             "\n      List all projections in a GQL database"
             "\n"
@@ -113,21 +138,23 @@ void print_projection_help()
 void print_help()
 {
     print_mdb_version();
-    cout << "\nUsage: mdb <COMMAND> <ARGS> [OPTIONS]"
-            "\nCommands:"
-            "\n * server                              start the server"
-            "\n * import                              create a new database from a supported file format"
-            "\n                                        * RDF: [.ttl .nt .rdf]"
-            "\n                                        * GQL: [.gql]"
-            "\n                                        * Quad Model: [.qm]"
-            "\n * csv-import                          create a new database from csv files"
-            "\n * dump                                export a database into a file"
-            "\n * cli                                 start the CLI for querying a database"
-            "\n * list-projections                    list all projections in a GQL database"
-            "\n * drop-projection                     delete a projection from a GQL database"
-            "\n * inspect-projection                  show projection details"
-            "\n * help,--help                         print this help message"
-            "\n";
+    std::cout << R"(
+Usage: mdb <command> [<args>] [options]
+Commands:
+  server                               Start the database server
+  import                               Create a new database from a supported file format
+                                         * RDF: [.ttl .nt .rdf]
+                                         * GQL: [.gql]
+                                         * Quad Model: [.qm]
+  csv-import                           create a new database from csv files
+  dump                                 Export a database to a file
+  cli                                  Launch the CLI for querying a database
+  list-projections                     List all projections in a GQL database
+  drop-projection                      Delete a projection from a GQL database
+  inspect-projection                   Show projection details
+  help,--help                          Print this message or help for a specific command
+
+)";
 
     print_server_help();
     print_import_help();
@@ -139,6 +166,13 @@ void print_help()
 
 int main(int argc, char* argv[])
 {
+    // Default the CUDA caching allocator to expandable segments BEFORE any CUDA
+    // use (LibTorch reads this once at allocator init). This reclaims fragmented
+    // reserved-but-unallocated VRAM, which is what lets the GNN feature store run
+    // a large GPU feature cache (e.g. l1CacheMb:6144 on a 16 GB GPU) at N=8
+    // without the fragmentation OOM. overwrite=0 so an explicit user value wins.
+    ::setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True", 0);
+
     std::ios_base::sync_with_stdio(false);
 
     if (argc < 2) {

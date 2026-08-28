@@ -384,6 +384,11 @@ public:
         visit_expr_with_expr<ExprTanh>(expr);
     }
 
+    void visit(GQL::ExprIn& expr) override
+    {
+        visit_expr_with_lhs_and_rhs<ExprIn>(expr);
+    }
+
     void visit(GQL::ExprAggCount& expr) override
     {
         visit_expr_with_expr<ExprAggCount>(expr);
@@ -443,6 +448,11 @@ public:
             }
         }
         expr.projection_name_expr->accept_visitor(*this);
+    }
+
+    void visit(GQL::ExprCosineDistance& expr) override
+    {
+        visit_expr_with_lhs_and_rhs<ExprCosineDistance>(expr);
     }
 
     void visit(GQL::ExprAggCountAll&) override { }

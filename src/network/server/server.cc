@@ -7,6 +7,8 @@
 
 #include <boost/beast.hpp>
 
+#include "misc/ablation_registry.h"
+#include "misc/fatal_error.h"
 #include "misc/logger.h"
 #include "network/server/listener.h"
 #include "network/server/protocol.h"
@@ -16,6 +18,14 @@ using namespace MDBServer;
 using namespace boost;
 using tcp = asio::ip::tcp;
 namespace http = boost::beast::http;
+
+namespace {
+// Written from the SIGTERM/SIGINT handler and polled by execute_timeouts().
+// Mutating a plain bool from a signal handler is undefined behavior;
+// volatile std::sig_atomic_t is the only integer type std::signal
+// guarantees safe to write from a handler.
+volatile std::sig_atomic_t shutdown_signal_received = 0;
+} // namespace
 
 // Append an HTTP rel-path to a local filesystem path.
 // The returned path is normalized for the platform.
@@ -101,7 +111,7 @@ void write(beast::tcp_stream& stream, http::message<isRequest, Body, Fields>&& m
 {
     (void) beast::http::write(stream, msg, ec);
     if (ec) {
-        logger(Category::Error) << "Browser write error: " << ec.message();
+        logger.error() << "Browser write error: " << ec.message();
     }
 }
 
@@ -181,11 +191,15 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
             return;
         }
 
-        // if ENV MDB_BROWSER is set use that
-        char* env_browser = std::getenv("MDB_BROWSER");
+        // Resolved once instead of per request: the document root cannot change
+        // under a running server, and going through the registry puts the root the
+        // process actually served from into the same log as every other switch.
+        // Unlike its neighbours there, this one selects an interface and not a
+        // code path under measurement.
+        static const std::string browser_root
+            = Ablation::text("MDB_BROWSER", MDBServer::Protocol::DEFAULT_BROWSER_PATH);
 
-        std::string path = env_browser == nullptr ? MDBServer::Protocol::DEFAULT_BROWSER_PATH : env_browser;
-        path = path_cat(path, req.target());
+        std::string path = path_cat(browser_root, req.target());
         if (req.target().back() == '/')
             path.append("index.html");
 
@@ -238,8 +252,43 @@ void MDBServer::Server::browser_session(tcp::socket&& socket)
 
 void Server::browser_listener(asio::io_context* browser_io_context, int port)
 {
-    // Start the acceptor and listen for connections, dispatching them to the session
-    asio::ip::tcp::acceptor acceptor(*browser_io_context, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
+    // This runs in a detached thread. Never call FATAL_ERROR / std::exit() here —
+    // that would tear down static objects while worker threads are still running,
+    // causing "pure virtual method called" crashes. Log and return instead; the
+    // query server keeps running without the browser UI.
+
+    asio::ip::tcp::acceptor acceptor(*browser_io_context);
+    asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), port);
+
+    boost::system::error_code ec;
+
+    acceptor.open(endpoint.protocol(), ec);
+    if (ec) {
+        logger.error() << "Browser listener failed to open socket: " << ec.message();
+        return;
+    }
+
+    acceptor.set_option(asio::socket_base::reuse_address(true), ec);
+    if (ec) {
+        logger.error() << "Browser listener failed to set socket options: " << ec.message();
+        return;
+    }
+
+    acceptor.bind(endpoint, ec);
+    if (ec) {
+        if (ec == boost::asio::error::address_in_use) {
+            logger.error() << "Browser port " << endpoint.port()
+                           << " already in use, browser interface disabled";
+        } else {
+            logger.error() << "Browser listener failed to bind: " << ec.message();
+        }
+        return;
+    }
+    acceptor.listen(asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+        logger.error() << "Browser listener failed to listen: " << ec.message();
+        return;
+    }
 
     while (true) {
         asio::ip::tcp::socket socket(*browser_io_context);
@@ -259,7 +308,7 @@ void Server::run(
 {
     asio::io_context io_context(num_workers);
 
-    Listener listener(*this, io_context, tcp::endpoint(tcp::v4(), port), query_timeout);
+    Listener listener(*this, io_context, ssl_ctx, tcp::endpoint(tcp::v4(), port), query_timeout);
 
     std::signal(SIGTERM, &signal_shutdown_server);
     std::signal(SIGINT, &signal_shutdown_server);
@@ -283,15 +332,18 @@ void Server::run(
     listener.run();
     work_guard.reset();
 
-    std::cout << "MillenniumDB HTTP/WebSocket server listening on http://localhost:" << port << "\n";
+    logger.info() << "Server started";
+    std::cout << "\nMillenniumDB HTTP/WebSocket server listening on http://localhost:" << port << "\n";
+    if (ssl_ctx.has_value()) {
+        std::cout << "MillenniumDB HTTPS/WSS server listening on https://localhost:" << port << "\n";
+    }
 
     std::unique_ptr<asio::io_context> browser_io_context;
     if (launch_browser) {
         browser_io_context = std::make_unique<asio::io_context>(1);
         std::thread browser_listener_thread(browser_listener, browser_io_context.get(), browser_port);
         browser_listener_thread.detach();
-        std::cout << "MillenniumDB browser interface is available at http://localhost:" << browser_port
-                  << "\n";
+        std::cout << "MillenniumDB browser interface available at http://localhost:" << browser_port << "\n";
     }
 
     std::cout << "\nTo terminate the server, press Ctrl+C" << std::endl;
@@ -311,16 +363,18 @@ void Server::run(
     // Wait for all threads in the thread pool to exit
     for (auto& thread : threads)
         thread.join();
+
+    logger.info() << "Server shutdown";
 }
 
 void Server::signal_shutdown_server(int)
 {
-    shutdown_server = true;
+    shutdown_signal_received = 1;
 }
 
 void Server::execute_timeouts()
 {
-    while (!shutdown_server) {
+    while (!shutdown_signal_received) {
         auto start = std::chrono::system_clock::now();
 
         while (std::chrono::system_clock::now() - start < std::chrono::milliseconds(1'000)) {
@@ -389,4 +443,11 @@ std::pair<std::string, std::chrono::system_clock::time_point>
 void Server::set_admin_user(const std::string& user, const std::string& password)
 {
     users.emplace_back(user, password);
+}
+
+void Server::enable_ssl(const std::string& cert_file, const std::string& key_file)
+{
+    ssl_ctx.emplace(asio::ssl::context(asio::ssl::context::tls_server));
+    ssl_ctx->use_certificate_chain_file(cert_file);
+    ssl_ctx->use_private_key_file(key_file, boost::asio::ssl::context::pem);
 }

@@ -97,22 +97,41 @@ void FileManager::update_appends(const std::map<FileId, unsigned>& appended_page
 
 FileId FileManager::get_file_id(const string& filename)
 {
-    auto search = filename2file_id.find(filename);
-    if (search != filename2file_id.end()) {
-        return search->second;
-    } else {
-        const auto file_path = get_file_path(filename);
+    // Thread-safe lookup. The mutex protects the two maps;
+    // the open()/lseek() syscalls run outside the critical section so
+    // concurrent callers (e.g. ProjectionStorage::open_all_bplustree_readers_
+    // with MDB_PROJECTION_PARALLEL_READERS=1) can overlap their kernel
+    // metadata work. This is a strict improvement: callers were
+    // single-threaded before this lock was added, so its cost is negligible.
+    {
+        std::lock_guard<std::mutex> guard(maps_mutex);
+        auto search = filename2file_id.find(filename);
+        if (search != filename2file_id.end()) {
+            return search->second;
+        }
+    }
 
-        auto fd = open(file_path.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
-        if (fd == -1) {
-            throw std::runtime_error("Could not open file " + file_path);
+    const auto file_path = get_file_path(filename);
+
+    auto fd = open(file_path.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    if (fd == -1) {
+        throw std::runtime_error("Could not open file " + file_path);
+    }
+    uint32_t page_count = lseek(fd, 0, SEEK_END) / Page::SIZE;
+
+    {
+        std::lock_guard<std::mutex> guard(maps_mutex);
+        // Re-check: another thread may have raced ahead and inserted the
+        // same filename while our open() was in flight. If so, close our
+        // duplicate descriptor and return the existing id.
+        auto search = filename2file_id.find(filename);
+        if (search != filename2file_id.end()) {
+            ::close(fd);
+            return search->second;
         }
         const auto res = FileId(fd);
         filename2file_id.insert({ filename, res });
-
-        uint32_t page_count = lseek(fd, 0, SEEK_END) / Page::SIZE;
         fid2pages.insert({ res, page_count });
-
         return res;
     }
 }

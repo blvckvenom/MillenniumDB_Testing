@@ -646,9 +646,9 @@ void CLI::AppendHistoryEntryToFile(const std::vector<std::wstring>& history_entr
 
 
 int CLI::Init() {
-    for (auto& cat : logger.categories) {
-        cat.second.enabled = false;
-    }
+    logger.debug_config.enabled = false;
+    logger.error_config.enabled = false;
+    logger.info_config.enabled = false;
 
     setlocale(LC_ALL, "en_US.UTF-8");
     std::locale::global(std::locale("en_US.UTF-8"));
@@ -1713,7 +1713,7 @@ void CLI::ProcessSPARQLQuery(std::ostream& os, const std::string& query) {
         query_return_status = ReturnStatus::Error;
         query_is_done = true;
         return;
-    } catch (InterruptedException& e) {
+    } catch (const InterruptedException& e) {
         query_result_count = -1;
         query_return_status = ReturnStatus::Interrupted;
         query_is_done = true;
@@ -1784,7 +1784,7 @@ void CLI::ProcessMQLQuery(std::ostream& os, const std::string& query) {
         query_return_status = ReturnStatus::Error;
         query_is_done = true;
         return;
-    } catch (InterruptedException& e) {
+    } catch (const InterruptedException& e) {
         query_result_count = -1;
         query_return_status = ReturnStatus::Interrupted;
         query_is_done = true;
@@ -1858,7 +1858,7 @@ void CLI::ProcessGQLQuery(std::ostream& os, const std::string& query) {
         query_return_status = ReturnStatus::Error;
         query_is_done = true;
         return;
-    } catch (InterruptedException& e) {
+    } catch (const InterruptedException& e) {
         query_result_count = -1;
         query_return_status = ReturnStatus::Interrupted;
         query_is_done = true;

@@ -1,5 +1,6 @@
 #include "hnsw_index_manager.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <mutex>
 
@@ -29,6 +30,8 @@ HNSWIndexManager::~HNSWIndexManager()
 
 void HNSWIndexManager::load_hnsw_index(const std::string& name, const HNSWIndexMetadata& metadata)
 {
+    std::unique_lock<std::shared_mutex> lck(name2hnsw_index_mutex);
+
     try {
         const auto metric_func = metric_type2metric_func(metadata.metric_type);
         auto hnsw_index = HNSWIndex::load(name, metric_func);
@@ -37,9 +40,9 @@ void HNSWIndexManager::load_hnsw_index(const std::string& name, const HNSWIndexM
         name2metadata[name] = metadata;
         predicate2names[metadata.predicate].emplace_back(name);
     } catch (const std::exception& e) {
-        logger(Category::Error) << "Failed to load HnswIndex \"" + name + "\": " + e.what();
+        logger.error() << "Failed to load HnswIndex \"" + name + "\": " + e.what();
     } catch (...) {
-        logger(Category::Error) << "Failed to load HnswIndex \"" + name + "\": Unknown error";
+        logger.error() << "Failed to load HnswIndex \"" + name + "\": Unknown error";
     }
 }
 
@@ -107,6 +110,48 @@ void HNSWIndexManager::write_to_disk(const std::string& name, HNSWIndex* index)
     if (!ofs.good()) {
         throw std::runtime_error("Could not write index file");
     }
+
+    // write raw embeddings flag and data (for GNN indexes)
+    const bool uses_raw = index->uses_raw_embeddings();
+    ofs.write(reinterpret_cast<const char*>(&uses_raw), sizeof(bool));
+    if (!ofs.good()) {
+        throw std::runtime_error("Could not write index file");
+    }
+
+    if (uses_raw) {
+        const uint64_t raw_size = index->raw_embeddings_.size();
+        ofs.write(reinterpret_cast<const char*>(&raw_size), sizeof(uint64_t));
+        if (!ofs.good()) {
+            throw std::runtime_error("Could not write index file");
+        }
+
+        if (raw_size > 0) {
+            ofs.write(
+                reinterpret_cast<const char*>(index->raw_embeddings_.data()),
+                sizeof(float) * raw_size
+            );
+            if (!ofs.good()) {
+                throw std::runtime_error("Could not write index file");
+            }
+        }
+
+        // Write pre-computed norms for optimized search
+        const uint64_t norms_size = index->raw_embedding_norms_.size();
+        ofs.write(reinterpret_cast<const char*>(&norms_size), sizeof(uint64_t));
+        if (!ofs.good()) {
+            throw std::runtime_error("Could not write index file");
+        }
+
+        if (norms_size > 0) {
+            ofs.write(
+                reinterpret_cast<const char*>(index->raw_embedding_norms_.data()),
+                sizeof(float) * norms_size
+            );
+            if (!ofs.good()) {
+                throw std::runtime_error("Could not write index file");
+            }
+        }
+    }
 }
 
 HNSWIndex* HNSWIndexManager::get_hnsw_index(const std::string& name)
@@ -118,6 +163,54 @@ HNSWIndex* HNSWIndexManager::get_hnsw_index(const std::string& name)
     }
 
     return it->second.get();
+}
+
+bool HNSWIndexManager::drop_hnsw_index(const std::string& name)
+{
+    std::unique_lock lck(name2hnsw_index_mutex);
+
+    // Check if index exists
+    auto it = name2hnsw_index.find(name);
+    if (it == name2hnsw_index.end()) {
+        return false;
+    }
+
+    // Get predicate from metadata for cleanup
+    std::string predicate;
+    auto meta_it = name2metadata.find(name);
+    if (meta_it != name2metadata.end()) {
+        predicate = meta_it->second.predicate;
+        name2metadata.erase(meta_it);
+    }
+
+    // Remove from predicate2names
+    if (!predicate.empty()) {
+        auto pred_it = predicate2names.find(predicate);
+        if (pred_it != predicate2names.end()) {
+            auto& names = pred_it->second;
+            names.erase(std::remove(names.begin(), names.end(), name), names.end());
+            if (names.empty()) {
+                predicate2names.erase(pred_it);
+            }
+        }
+    }
+
+    // Remove from memory
+    name2hnsw_index.erase(it);
+
+    // Remove from disk
+    const auto relative_index_path = fs::path(HNSW_INDEX_DIR) / name;
+    const auto absolute_index_path = file_manager.get_file_path(relative_index_path);
+    try {
+        if (fs::exists(absolute_index_path)) {
+            fs::remove_all(absolute_index_path);
+        }
+    } catch (const std::exception& e) {
+        logger.error() << "Failed to remove HNSW index directory: " << e.what();
+    }
+
+    has_changes_.store(true, std::memory_order_release);
+    return true;
 }
 
 template <Catalog::ModelID model_id>
@@ -152,9 +245,14 @@ uint_fast32_t HNSWIndexManager::create_hnsw_index(
 
         std::unique_lock lck(name2hnsw_index_mutex);
         name2hnsw_index[name] = std::move(hnsw_index);
-        name2metadata[name] = { metric_type, predicate };
+        name2metadata[name] = {
+            metric_type,
+            predicate,
+            model_id == Catalog::ModelID::QUAD ? HNSWSource::PROPERTY : HNSWSource::PREDICATE,
+            "" // these two builders always read the base graph
+        };
         predicate2names[predicate].emplace_back(name);
-        has_changes_ = true;
+        has_changes_.store(true, std::memory_order_release);
         return result;
     } catch (const std::exception& e) {
         throw std::runtime_error("Failed to create HNSW index \"" + name + "\": " + e.what());
@@ -167,5 +265,6 @@ template uint_fast32_t HNSWIndexManager::create_hnsw_index<
     Catalog::ModelID::QUAD>(const std::string&, const std::string&, uint64_t, uint64_t, uint64_t, MetricType);
 template uint_fast32_t HNSWIndexManager::create_hnsw_index<
     Catalog::ModelID::RDF>(const std::string&, const std::string&, uint64_t, uint64_t, uint64_t, MetricType);
-template uint_fast32_t HNSWIndexManager::create_hnsw_index<
-    Catalog::ModelID::GQL>(const std::string&, const std::string&, uint64_t, uint64_t, uint64_t, MetricType);
+// Note: GQL uses a different HNSW creation path (direct HNSWIndex::create +
+// index_from_raw_embeddings + write_to_disk + load_hnsw_index) via
+// gnn_hnsw_create_procedure.cc, so no GQL template instantiation is needed.

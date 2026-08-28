@@ -30,10 +30,8 @@ void QueryContext::clear_active_projection() {
 }
 
 void QueryContext::load_projection(const std::string& proj_name) {
-    std::cerr << "[QueryContext] load_projection() called for '" << proj_name << "'" << std::endl;
     active_projection = proj_name;
     projection_ctx = std::make_unique<GQL::ProjectionQueryContext>(proj_name);
-    std::cerr << "[QueryContext] Projection context created, valid=" << projection_ctx->is_valid() << std::endl;
 }
 
 void QueryContext::unload_projection() {

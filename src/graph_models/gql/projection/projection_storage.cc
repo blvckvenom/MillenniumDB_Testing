@@ -1,13 +1,36 @@
 #include "projection_storage.h"
 
+#include <algorithm>
+#include <bitset>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <functional>
+#include <iostream>
 #include <stdexcept>
+#include <vector>
 
+// Parallel execution for std::sort (requires TBB on GCC/Clang)
+#ifdef HAS_TBB
+#include <execution>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+#endif
+
+#include "external_record_sort.h"
+#include "graph_models/gql/projection/index_set.h"
+#include "graph_models/gql/projection/leaf_compression.h"
+#include "graph_models/gql/projection/native_projection_builder.h"
+#include "graph_models/gql/projection/sorter_dispatch.h"
+#include "graph_models/gql/projection/topology_snapshot_from_leaf.h"
+#include "graph_models/gql/projection/topology_snapshot_writer.h"
+#include "misc/ablation_registry.h"
 #include "projection_catalog.h"
 #include "storage/index/bplus_tree/bplus_tree.h"
 #include "storage/index/bplus_tree/bpt_mem_import.h"
 #include "storage/index/record.h"
+#include "storage/page/page.h"
 
 namespace GQL {
 
@@ -47,13 +70,21 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
     }
 
     // Pre-allocate for better performance
-    inserted_nodes.reserve(INITIAL_CAPACITY);
-    inserted_edges.reserve(INITIAL_CAPACITY);
+    collected_nodes_.reserve(INITIAL_CAPACITY);
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
+
+    // Initialize Bloom filter for memory-efficient edge deduplication
+    // Using default expected edges with 1% false positive rate
+    edge_bloom_filter_ = std::make_unique<BloomFilter>(DEFAULT_EXPECTED_EDGES, BLOOM_FILTER_FPR);
+
+    // Initialize streaming record buffers (memory-bounded, spill to disk)
+    initialize_streaming_buffers();
 }
 
-ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const std::string& db_folder, const std::string& projection_name_)
+ProjectionStorage::ProjectionStorage(const std::string& projection_dir_,
+                                     const std::string& db_folder,
+                                     const std::string& projection_name_)
     : projection_dir(projection_dir_), projection_name(projection_name_)
 {
     // Calculate relative path from db_folder
@@ -67,14 +98,24 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
     }
 
     // Pre-allocate for better performance
-    inserted_nodes.reserve(INITIAL_CAPACITY);
-    inserted_edges.reserve(INITIAL_CAPACITY);
+    collected_nodes_.reserve(INITIAL_CAPACITY);
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
+
+    // Initialize Bloom filter for memory-efficient edge deduplication
+    edge_bloom_filter_ = std::make_unique<BloomFilter>(DEFAULT_EXPECTED_EDGES, BLOOM_FILTER_FPR);
+
+    // Initialize streaming record buffers (memory-bounded, spill to disk)
+    initialize_streaming_buffers();
 }
 
-ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const std::string& db_folder, const std::string& projection_name_, const Features& features_)
-    : projection_dir(projection_dir_), projection_name(projection_name_), features(features_)
+ProjectionStorage::ProjectionStorage(const std::string& projection_dir_,
+                                     const std::string& db_folder,
+                                     const std::string& projection_name_,
+                                     const Features& features_)
+    : projection_dir(projection_dir_),
+      projection_name(projection_name_),
+      features(features_)
 {
     // Calculate relative path from db_folder
     if (projection_dir.find(db_folder) == 0) {
@@ -87,60 +128,37 @@ ProjectionStorage::ProjectionStorage(const std::string& projection_dir_, const s
     }
 
     // Pre-allocate for better performance
-    inserted_nodes.reserve(INITIAL_CAPACITY);
-    inserted_edges.reserve(INITIAL_CAPACITY);
+    collected_nodes_.reserve(INITIAL_CAPACITY);
     node_batch.reserve(BATCH_SIZE);
     edge_batch.reserve(BATCH_SIZE);
+
+    // Initialize Bloom filter for memory-efficient edge deduplication
+    edge_bloom_filter_ = std::make_unique<BloomFilter>(DEFAULT_EXPECTED_EDGES, BLOOM_FILTER_FPR);
+
+    // Initialize streaming record buffers (memory-bounded, spill to disk)
+    initialize_streaming_buffers();
 }
 
 ProjectionStorage::~ProjectionStorage() {
-    flush();
+    // Destructors are implicitly noexcept — a throw from flush() during
+    // unwinding (e.g. builder aborted after an error and the projection
+    // directory was rolled back) would call std::terminate. Swallow any
+    // flush failure here; the caller's rollback handles cleanup.
+    try {
+        flush();
+    } catch (...) {
+        // Best-effort cleanup.
+    }
 }
 
 void ProjectionStorage::init() {
-    // Initialize B+tree indexes using relative paths
-    // rel_dir is relative to file_manager's db_folder (e.g., "projections/test_projection")
-
-    // Initialize required indexes (always created)
-    init_empty_bptree<1>(projection_dir + "/nodes");
-    init_empty_bptree<3>(projection_dir + "/from_to_edge");
-    init_empty_bptree<3>(projection_dir + "/to_from_edge");
-    init_empty_bptree<2>(projection_dir + "/edge_direction");
-
-    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
-    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
-    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
-    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
-
-    // Initialize optional label indexes if requested
-    if (features.include_node_labels) {
-        init_empty_bptree<2>(projection_dir + "/node_label");
-        init_empty_bptree<2>(projection_dir + "/label_node");  // Auxiliary index for label->node lookup
-        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
-        label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
-    }
-
-    if (features.include_edge_labels) {
-        init_empty_bptree<2>(projection_dir + "/edge_label");
-        init_empty_bptree<2>(projection_dir + "/label_edge");  // Auxiliary index for label->edge lookup
-        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
-        label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
-    }
-
-    // Initialize optional property indexes if requested
-    if (features.include_node_properties) {
-        init_empty_bptree<3>(projection_dir + "/node_key_value");
-        init_empty_bptree<3>(projection_dir + "/key_value_node");  // Auxiliary index for key/value->node lookup
-        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
-        key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");
-    }
-
-    if (features.include_edge_properties) {
-        init_empty_bptree<3>(projection_dir + "/edge_key_value");
-        init_empty_bptree<3>(projection_dir + "/key_value_edge");  // Auxiliary index for key/value->edge lookup
-        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
-        key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
-    }
+    // BULK IMPORT MODE: Don't create B+tree files here.
+    // B+tree indexes will be created during flush() via build_all_indexes_bulk().
+    // This completely bypasses the buffer pool for large projections.
+    //
+    // The directory should already exist (created by NativeProjectionBuilder).
+    // We just need to ensure it exists for safety.
+    std::filesystem::create_directories(projection_dir);
 }
 
 void ProjectionStorage::open() {
@@ -158,64 +176,203 @@ void ProjectionStorage::open() {
         edge_count = catalog.edge_count;
         directed_edge_count = catalog.directed_edge_count;
         undirected_edge_count = catalog.undirected_edge_count;
+
+        // Restore IndexSet preset so the query layer can name the preset
+        // this projection was built under when a missing index is accessed.
+        // Older catalogs (pre-v1.4) default to ALL via
+        // ProjectionCatalog::load(), so this is safe for all versions.
+        requested_index_set = catalog.index_set;
+
+        // Restore the leaf-format preset from the v1.5 catalog byte array
+        // (delta + LEB128-varint leaf encoding configuration). Pre-v1.5
+        // catalogs default every slot to BITSET (handled by
+        // ProjectionCatalog::load); we pick the first entry as the
+        // projection-wide format since the current surface only supports a
+        // single format per projection. Empty vector (no materialized
+        // indexes recorded) falls through to the BITSET default.
+        if (!catalog.leaf_formats.empty()) {
+            const uint8_t fmt = catalog.leaf_formats[0];
+            if (fmt == static_cast<uint8_t>(BPT::LeafFormat::DELTA_VARINT)) {
+                requested_leaf_format = BPT::LeafFormat::DELTA_VARINT;
+            } else {
+                requested_leaf_format = BPT::LeafFormat::BITSET;
+            }
+        }
+
+        // Restore the per-projection graph-storage mode (BTREE or CSR_HYBRID)
+        // from the v1.6 catalog byte. CSR_HYBRID means the edge-index B+Tree
+        // leaves embed the CSR layout directly instead of using the standard
+        // BITSET/DELTA_VARINT formats. ProjectionCatalog::load() defaults
+        // this to BTREE (1) for pre-v1.6 catalogs and validates the byte is
+        // in {1, 2} on read, so we can trust the value here. The
+        // requested_graph_storage field is consumed by the edge-index sorter
+        // dispatch to select BPTLeafCSRWriter when CSR_HYBRID; under BTREE
+        // the dispatch emits standard leaves regardless.
+        if (catalog.graph_storage
+            == static_cast<uint8_t>(BPT::GraphStorage::CSR_HYBRID)) {
+            requested_graph_storage = BPT::GraphStorage::CSR_HYBRID;
+        } else {
+            requested_graph_storage = BPT::GraphStorage::BTREE;
+        }
     }
 
-    // Open required indexes (always present)
-    nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes");
-    from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge");
-    to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge");
-    edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction");
+    // Thread the restored leaf encoding (BITSET or DELTA_VARINT) into every
+    // BPlusTree reader so BptIter dispatches on the right leaf layout at
+    // read time.
+    const BPT::LeafFormat lf = requested_leaf_format;
+
+    // Under CSR_HYBRID graph storage, the edge indexes (from_to_edge /
+    // to_from_edge) carry v3 CSR leaves — the B+Tree leaves embed the CSR
+    // layout directly — with a distinct header byte (0x03). BptIter's
+    // 3-way dispatch keys on the LeafFormat passed to the BPlusTree<N>
+    // ctor, so we must pass CSR_HYBRID for edge indexes in this mode while
+    // keeping the user-requested format for everything else. Non-edge
+    // indexes remain on lf (BITSET / DELTA_VARINT).
+    const BPT::LeafFormat edge_lf =
+        (requested_graph_storage == BPT::GraphStorage::CSR_HYBRID)
+            ? BPT::LeafFormat::CSR_HYBRID
+            : lf;
+
+    // Open readers only for indexes whose bit is in the active IndexSet
+    // preset (mirrors open_all_bplustree_readers_). FileManager::get_file_id()
+    // opens with O_CREAT, so unconditional construction of a BPlusTree for
+    // an index elided by GNN_MINIMAL / READONLY_TRAVERSAL would produce
+    // 0-byte .leaf/.dir files on disk — defeating the file-count /
+    // disk-footprint contract of the preset. Pre-v1.4 catalogs default to
+    // IndexSet::ALL (see above), so every legacy projection keeps the
+    // previous unconditional behavior.
+    const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
+
+    if (has_flag(active_mask, ProjectionIndex::NODES)) {
+        nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
+        from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
+        to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
+        edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
+    }
+
+    // Open edge-first indexes if they exist (added in Phase 13). Dual gate:
+    // the IndexSet bit AND on-disk presence, so pre-Phase-13 projections
+    // (built before these files existed) still open cleanly under ALL.
+    std::filesystem::path proj_path_check(projection_dir);
+    if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)
+        && std::filesystem::exists(proj_path_check / "edge_from_to.leaf"))
+    {
+        edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)
+        && std::filesystem::exists(proj_path_check / "edge_n1_n2.leaf"))
+    {
+        edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
+    }
 
     // Open optional label indexes if they exist
     if (std::filesystem::exists(proj_path / "node_label.leaf")) {
-        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label");
+        node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label", lf);
         features.include_node_labels = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "label_node.leaf")) {
-            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node");
+            label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node", lf);
         }
     }
 
     if (std::filesystem::exists(proj_path / "edge_label.leaf")) {
-        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label");
+        edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label", lf);
         features.include_edge_labels = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "label_edge.leaf")) {
-            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge");
+            label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge", lf);
         }
     }
+
+    // Property indexes must be opened as BITSET regardless of the projection's
+    // requested leafFormat. Rationale: EmbeddingWriter (Phase 6) calls
+    // BPlusTree::insert() to add embedding properties post-training, and only
+    // v1 BITSET leaves are mutable (v2/v3 throw logic_error on insert). The
+    // writer path already emits v1 for these indexes; forcing the reader to
+    // also dispatch v1 prevents byte0 format mismatch → terminate.
+    const BPT::LeafFormat prop_lf = BPT::LeafFormat::BITSET;
 
     // Open optional property indexes if they exist
     if (std::filesystem::exists(proj_path / "node_key_value.leaf")) {
-        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value");
+        node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", prop_lf);
         features.include_node_properties = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "key_value_node.leaf")) {
-            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node");
+            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", prop_lf);
         }
     }
 
+    // Edge property indexes
     if (std::filesystem::exists(proj_path / "edge_key_value.leaf")) {
-        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value");
+        edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", prop_lf);
         features.include_edge_properties = true;
         // Also open auxiliary index if it exists
         if (std::filesystem::exists(proj_path / "key_value_edge.leaf")) {
-            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge");
+            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", prop_lf);
         }
     }
 }
 
-void ProjectionStorage::add_node(const ProjectedNode& node) {
-    uint64_t node_id_val = node.node_id.id;
+void ProjectionStorage::ensure_node_property_indexes() {
+    std::filesystem::path proj_path(projection_dir);
 
-    // Check if already inserted
-    if (inserted_nodes.find(node_id_val) != inserted_nodes.end()) {
-        return;
+    // Property indexes must be BITSET (mutable v1). EmbeddingWriter (Phase 6)
+    // calls BPlusTree::insert() on these indexes to persist embedding tensors,
+    // and only v1 supports insert(); v2 / v3 throw logic_error on mutation.
+    // BPTLeafWriter<3>::make_empty() also emits v1 leaves, so BITSET keeps
+    // both writer and reader dispatch aligned.
+    const BPT::LeafFormat prop_lf = BPT::LeafFormat::BITSET;
+
+    if (!node_key_value_index) {
+        std::string base = rel_dir + "/node_key_value";
+        { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
+        { BPTDirWriter<3>  dw(base + ".dir"); }
+        node_key_value_index = std::make_unique<BPlusTree<3>>(base, prop_lf);
+        features.include_node_properties = true;
+    }
+    if (!key_value_node_index) {
+        std::string base = rel_dir + "/key_value_node";
+        { BPTLeafWriter<3> lw(base + ".leaf"); lw.make_empty(); }
+        { BPTDirWriter<3>  dw(base + ".dir"); }
+        key_value_node_index = std::make_unique<BPlusTree<3>>(base, prop_lf);
+    }
+}
+
+void ProjectionStorage::add_node(const ProjectedNode& node) {
+    // Append unconditionally. finalize_node_scan() collapses duplicates with
+    // std::sort + std::unique once the node scan completes, trading a 48 B/entry
+    // hash set (previous impl) for an 8 B/entry sorted vector. Callers that
+    // truly require per-insert dedup semantics must use has_node() before
+    // add_node(); existing flows (single- and multi-label scan) tolerate
+    // duplicates because node scan callbacks are the only producer.
+    collected_nodes_.push_back(node.node_id.id);
+    collected_nodes_sorted_ = false;  // appended unsorted → invalidates invariant
+
+    // The same append invalidates the bitmap, but with a far worse failure
+    // mode: an unsorted vector only makes has_node() SLOW (the linear fallback,
+    // which is what happens today anyway), while a stale bitmap makes it WRONG.
+    // It would answer "absent" for the node just added, the edge scan would
+    // silently drop every edge touching it, and the projection would come out
+    // smaller with no error anywhere — the same shape as the Bloom discard that
+    // cost 2.69 M edges on papers100M.
+    //
+    // Not hypothetical: finalize() calls flush_nodes() unconditionally, after
+    // finalize_node_scan() already ran. node_batch is provably drained by then,
+    // so it is a no-op today; this line is what keeps it harmless if it ever
+    // stops being one. The null-pointer test costs nothing on the 111 M
+    // add_node() calls of a normal build.
+    if (node_bitmap_) {
+        node_bitmap_.reset();
+        node_bitmap_status_ = "invalidated-by-late-add";
     }
 
-    // Add to batch
     node_batch.push_back(node);
-    inserted_nodes.insert(node_id_val);
 
     // Flush batch if it reaches threshold
     if (node_batch.size() >= BATCH_SIZE) {
@@ -223,118 +380,161 @@ void ProjectionStorage::add_node(const ProjectedNode& node) {
     }
 }
 
-void ProjectionStorage::add_edge(const ProjectedEdge& edge) {
-    uint64_t edge_id = edge.edge_id.id;
+void ProjectionStorage::add_edge(const ProjectedEdge& edge, bool skip_bloom_check) {
+    // MEMORY-EFFICIENT DEDUPLICATION: Use Bloom filter instead of hash set.
+    // This reduces memory from O(n) to O(1) with configurable false positive rate.
+    //
+    // False positives are acceptable because:
+    // 1. They only cause a small percentage of legitimate edges to be skipped
+    // 2. Final correctness is guaranteed by std::unique() during bulk index build
+    //
+    // Memory savings: ~4 GB for 123M edges (hash set) → ~128 MB (Bloom filter)
+    //
+    // NOTE: skip_bloom_check=true bypasses the Bloom filter for paths that already
+    // guarantee uniqueness (e.g., streaming aggregation which deduplicates via sorting).
+    // This eliminates false positives for those paths, achieving 100% accuracy.
 
-    // Check if already inserted
-    if (inserted_edges.find(edge_id) != inserted_edges.end()) {
-        std::cerr << "[ProjectionStorage] Skipping duplicate edge 0x" << std::hex << edge_id << std::dec << std::endl;
-        return;
+    if (!skip_bloom_check) {
+        // Check Bloom filter for probable duplicates
+        if (edge_bloom_filter_->probably_contains_edge(edge.from_node.id, edge.to_node.id, edge.edge_id.id)) {
+            return;  // Probably already seen (may be false positive, but std::unique handles it)
+        }
+
+        // Add to Bloom filter for future duplicate detection
+        edge_bloom_filter_->add_edge(edge.from_node.id, edge.to_node.id, edge.edge_id.id);
     }
 
-    std::cerr << "[ProjectionStorage] Adding edge 0x" << std::hex << edge_id << std::dec
-              << " to batch (size before: " << edge_batch.size() << ")" << std::endl;
-
-    // Add to batch
     edge_batch.push_back(edge);
-    inserted_edges.insert(edge_id);
 
-    // Flush batch if it reaches threshold
+    // Flush batch to collection vectors if threshold reached
     if (edge_batch.size() >= BATCH_SIZE) {
-        std::cerr << "[ProjectionStorage] Batch full, flushing " << edge_batch.size() << " edges" << std::endl;
         flush_edge_batch();
+        // NOTE: Don't clear Bloom filter - we need to track ALL edges for duplicate detection
     }
 }
 
 void ProjectionStorage::add_node_label(ObjectId node_id, ObjectId label_id) {
-    // Only insert if label index is enabled
-    if (!node_label_index) {
+    // Only collect if label indexing is enabled
+    if (!features.include_node_labels) {
         return;
     }
 
-    // Write to primary index: {node_id, label_id}
+    // STREAMING BUFFER: Collect records with automatic disk spill
+    // Primary index: {node_id, label_id}
     Record<2> node_label_record;
     node_label_record[0] = node_id.id;
     node_label_record[1] = label_id.id;
-    node_label_index->insert(node_label_record);
+    node_label_records_buffer_->push_back(node_label_record);
 
-    // Write to auxiliary index: {label_id, node_id} (for efficient label->nodes queries)
-    if (label_node_index) {
-        Record<2> label_node_record;
-        label_node_record[0] = label_id.id;
-        label_node_record[1] = node_id.id;
-        label_node_index->insert(label_node_record);
-    }
+    // Auxiliary index: {label_id, node_id} (for efficient label->nodes queries)
+    Record<2> label_node_record;
+    label_node_record[0] = label_id.id;
+    label_node_record[1] = node_id.id;
+    label_node_records_buffer_->push_back(label_node_record);
 }
 
 void ProjectionStorage::add_edge_label(ObjectId edge_id, ObjectId label_id) {
-    // Only insert if label index is enabled
-    if (!edge_label_index) {
+    // Only collect if label indexing is enabled
+    if (!features.include_edge_labels) {
         return;
     }
 
-    // Write to primary index: {edge_id, label_id}
+    // STREAMING BUFFER: Collect records with automatic disk spill
+    // Primary index: {edge_id, label_id}
     Record<2> edge_label_record;
     edge_label_record[0] = edge_id.id;
     edge_label_record[1] = label_id.id;
-    edge_label_index->insert(edge_label_record);
+    edge_label_records_buffer_->push_back(edge_label_record);
 
-    // Write to auxiliary index: {label_id, edge_id} (for efficient label->edges queries)
-    if (label_edge_index) {
-        Record<2> label_edge_record;
-        label_edge_record[0] = label_id.id;
-        label_edge_record[1] = edge_id.id;
-        label_edge_index->insert(label_edge_record);
-    }
+    // Auxiliary index: {label_id, edge_id} (for efficient label->edges queries)
+    Record<2> label_edge_record;
+    label_edge_record[0] = label_id.id;
+    label_edge_record[1] = edge_id.id;
+    label_edge_records_buffer_->push_back(label_edge_record);
 }
 
 void ProjectionStorage::add_node_property(ObjectId node_id, ObjectId key_id, ObjectId value_id) {
-    // Only insert if property index is enabled
-    if (!node_key_value_index) {
+    // Only collect if property indexing is enabled
+    if (!features.include_node_properties) {
         return;
     }
 
-    // Write to primary index: {node_id, key_id, value_id}
+    // STREAMING BUFFER: Collect records with automatic disk spill
+    // Primary index: {node_id, key_id, value_id}
     Record<3> node_prop_record;
     node_prop_record[0] = node_id.id;
     node_prop_record[1] = key_id.id;
     node_prop_record[2] = value_id.id;
-    node_key_value_index->insert(node_prop_record);
+    node_key_value_records_buffer_->push_back(node_prop_record);
 
-    // Write to auxiliary index: {key_id, value_id, node_id} (for efficient property->nodes queries)
-    if (key_value_node_index) {
-        Record<3> key_value_node_record;
-        key_value_node_record[0] = key_id.id;
-        key_value_node_record[1] = value_id.id;
-        key_value_node_record[2] = node_id.id;
-        key_value_node_index->insert(key_value_node_record);
-    }
+    // Auxiliary index: {key_id, value_id, node_id} (for efficient property->nodes queries)
+    Record<3> key_value_node_record;
+    key_value_node_record[0] = key_id.id;
+    key_value_node_record[1] = value_id.id;
+    key_value_node_record[2] = node_id.id;
+    key_value_node_records_buffer_->push_back(key_value_node_record);
 }
 
 void ProjectionStorage::add_edge_property(ObjectId edge_id, ObjectId key_id, ObjectId value_id) {
-    // Only insert if property index is enabled
-    if (!edge_key_value_index) {
+    // Only collect if property indexing is enabled
+    if (!features.include_edge_properties) {
         return;
     }
 
-    // Write to primary index: {edge_id, key_id, value_id}
+    // STREAMING BUFFER: Collect records with automatic disk spill
+    // Primary index: {edge_id, key_id, value_id}
     Record<3> edge_prop_record;
     edge_prop_record[0] = edge_id.id;
     edge_prop_record[1] = key_id.id;
     edge_prop_record[2] = value_id.id;
-    edge_key_value_index->insert(edge_prop_record);
+    edge_key_value_records_buffer_->push_back(edge_prop_record);
 
-    // Write to auxiliary index: {key_id, value_id, edge_id} (for efficient property->edges queries)
-    if (key_value_edge_index) {
-        Record<3> key_value_edge_record;
-        key_value_edge_record[0] = key_id.id;
-        key_value_edge_record[1] = value_id.id;
-        key_value_edge_record[2] = edge_id.id;
-        key_value_edge_index->insert(key_value_edge_record);
-    }
+    // Auxiliary index: {key_id, value_id, edge_id} (for efficient property->edges queries)
+    Record<3> key_value_edge_record;
+    key_value_edge_record[0] = key_id.id;
+    key_value_edge_record[1] = value_id.id;
+    key_value_edge_record[2] = edge_id.id;
+    key_value_edge_records_buffer_->push_back(key_value_edge_record);
 }
 
 bool ProjectionStorage::has_node(ObjectId node_id) const {
+    // In-memory scan-phase check against the sorted-vector dedup tracker.
+    // Expected path: finalize_node_scan() was called at scan→scan transition,
+    // so we can use O(log N) binary search. The pre-finalize fallback is
+    // defensive (e.g. unit tests that query mid-scan) and correctness-
+    // preserving.
+    // Three representations of the SAME set, in decreasing order of speed:
+    //   1. node_bitmap_   one bit per id in [min,max]; ~1.6 ns, one cache
+    //                     line. Built by finalize_node_scan() when the span
+    //                     fits NODE_BITMAP_MAX_BYTES.
+    //   2. binary search  built unconditionally by finalize_node_scan();
+    //                     292.0 ns measured at papers100M scale.
+    //   3. linear scan    pre-finalize fallback. Defensive: unit tests query
+    //                     mid-scan. The builder always finalizes first.
+    //
+    // 1 and 2 are answer-for-answer equivalent by construction, so a bitmap
+    // MISS must NOT re-ask the vector; the else-if chain enforces that. The
+    // invariant that makes it safe is add_node() dropping the bitmap.
+    //
+    // is_kept() does the whole range check in one unsigned comparison:
+    // `id - min` wraps upward for id < min and lands past the span, and a
+    // foreign type tag shifts it by a multiple of 2^56, far past any span this
+    // budget admits. No masking, no second branch.
+    if (node_bitmap_) {
+        if (node_bitmap_->is_kept(node_id.id - node_bitmap_min_)) {
+            return true;
+        }
+    } else if (collected_nodes_sorted_) {
+        if (std::binary_search(collected_nodes_.begin(), collected_nodes_.end(),
+                               node_id.id)) {
+            return true;
+        }
+    } else if (std::find(collected_nodes_.begin(), collected_nodes_.end(),
+                         node_id.id) != collected_nodes_.end()) {
+        return true;
+    }
+
+    // Fall back to B+tree check if index exists (for query phase after flush)
     if (!nodes_index) {
         return false;
     }
@@ -368,16 +568,29 @@ bool ProjectionStorage::has_edge(ObjectId from, ObjectId to) const {
     return iter.next() != nullptr;
 }
 
+void ProjectionStorage::drain_pending_batches() {
+    flush_node_batch();
+    flush_edge_batch();
+}
+
 void ProjectionStorage::flush() {
-    // Flush any pending batched writes
+    // Flush any pending batched writes to streaming buffers
     flush_node_batch();
     flush_edge_batch();
 
+    // STREAMING BULK IMPORT: Build all B+tree indexes at once using direct file writes.
+    // This completely bypasses the buffer pool, enabling projections of arbitrary size.
+    // Only build if we have records to write (avoid overwriting existing indexes on re-flush).
+    bool has_records = (node_records_buffer_ && node_records_buffer_->size() > 0) ||
+                       (from_to_records_buffer_ && from_to_records_buffer_->size() > 0) ||
+                       (to_from_records_buffer_ && to_from_records_buffer_->size() > 0);
+
+    if (has_records) {
+        build_all_indexes_bulk();
+    }
+
     // Save catalog with projection metadata
     save_catalog();
-
-    // B+trees are automatically flushed when they go out of scope
-    // This method is here for explicit control if needed
 }
 
 void ProjectionStorage::flush_node_batch() {
@@ -385,36 +598,22 @@ void ProjectionStorage::flush_node_batch() {
         return;
     }
 
+    // STREAMING BUFFER: Collect records with automatic disk spill.
+    // NO B+tree insertions here - all indexes are built in bulk during finalize().
+    // Memory bounded: spills to disk when threshold exceeded.
+
     for (const auto& node : node_batch) {
         uint64_t node_id_val = node.node_id.id;
 
-        // Insert into nodes index
+        // Collect node record for bulk building
         Record<1> node_record;
         node_record[0] = node_id_val;
+        node_records_buffer_->push_back(node_record);
+        node_count++;
 
-        if (nodes_index->insert(node_record)) {
-            node_count++;
-        }
-
-        // Handle node properties if present
-        if (!node.properties.empty()) {
-            if (!node_properties_index) {
-                init_empty_bptree<3>(projection_dir + "/node_properties");
-                node_properties_index = std::make_unique<BPlusTree<3>>(
-                    rel_dir + "/node_properties"
-                );
-            }
-
-            for (const auto& [prop_name, prop_value] : node.properties) {
-                // Store property (simplified - in production would need property name encoding)
-                Record<3> prop_record;
-                prop_record[0] = node_id_val;
-                prop_record[1] = std::hash<std::string>{}(prop_name); // Simplified
-                prop_record[2] = prop_value.id;
-
-                node_properties_index->insert(prop_record);
-            }
-        }
+        // Note: Node properties embedded in ProjectedNode are handled via
+        // add_node_property() calls from NativeProjectionBuilder, not here.
+        // This avoids double-counting and ensures proper key_id encoding.
     }
 
     node_batch.clear();
@@ -425,75 +624,226 @@ void ProjectionStorage::flush_edge_batch() {
         return;
     }
 
-    std::cerr << "[ProjectionStorage] flush_edge_batch: Flushing " << edge_batch.size() << " edges to B+tree" << std::endl;
+    // STREAMING BUFFER: Collect records with automatic disk spill.
+    // NO B+tree insertions here - all indexes are built in bulk during finalize().
+    // Memory bounded: spills to disk when threshold exceeded.
+    //
+    // When serial_write_mask_ is non-zero (SERIAL scan mode, set by
+    // begin_serial_edge_pass_), only write to the buffer(s) whose
+    // ProjectionIndex bit is set.  This bounds peak scratch disk to
+    // O(max single-pass spill) instead of O(5 × full-edge-set) on
+    // large datasets (papers100M disk fix — see begin_serial_edge_pass_).
+    const bool serial_mode = (serial_write_mask_ != 0);
+    const uint32_t mask    = serial_write_mask_;
 
     for (const auto& edge : edge_batch) {
         uint64_t from_id = edge.from_node.id;
         uint64_t to_id = edge.to_node.id;
         uint64_t edge_id = edge.edge_id.id;
 
-        // For undirected edges, normalize the ordering to avoid duplicates
-        // Always store with lower node ID first to ensure consistent (from, to) pairs
-        if (!edge.is_directed && from_id > to_id) {
-            std::swap(from_id, to_id);
+        // Collect from->to record
+        if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::FROM_TO_EDGE))) {
+            Record<3> from_to_record;
+            from_to_record[0] = from_id;
+            from_to_record[1] = to_id;
+            from_to_record[2] = edge_id;
+            from_to_records_buffer_->push_back(from_to_record);
         }
 
-        // Insert into from->to index
-        Record<3> from_to_record;
-        from_to_record[0] = from_id;
-        from_to_record[1] = to_id;
-        from_to_record[2] = edge_id;
+        // Collect to->from record
+        if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::TO_FROM_EDGE))) {
+            Record<3> to_from_record;
+            to_from_record[0] = to_id;
+            to_from_record[1] = from_id;
+            to_from_record[2] = edge_id;
+            to_from_records_buffer_->push_back(to_from_record);
+        }
 
-        bool inserted = from_to_edge_index->insert(from_to_record);
-        if (inserted) {
+        // Collect direction record
+        if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::EDGE_DIRECTION))) {
+            Record<2> direction_record;
+            direction_record[0] = edge_id;
+            direction_record[1] = edge.is_directed ? 1 : 0;
+            direction_records_buffer_->push_back(direction_record);
+        }
+
+        // Collect edge-first records (for edge-bound query patterns)
+        if (!serial_mode || (mask & (static_cast<uint32_t>(ProjectionIndex::EDGE_FROM_TO)
+                                    | static_cast<uint32_t>(ProjectionIndex::EDGE_N1_N2)))) {
+            Record<3> edge_first_record;
+            edge_first_record[0] = edge_id;
+            edge_first_record[1] = from_id;
+            edge_first_record[2] = to_id;
+            if (edge.is_directed) {
+                if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::EDGE_FROM_TO))) {
+                    edge_from_to_records_buffer_->push_back(edge_first_record);
+                }
+            } else {
+                if (!serial_mode || (mask & static_cast<uint32_t>(ProjectionIndex::EDGE_N1_N2))) {
+                    edge_n1_n2_records_buffer_->push_back(edge_first_record);
+                }
+            }
+        }
+
+        // Update counts once per unique edge processed.
+        // In SERIAL mode each core edge pass re-scans the same edges;
+        // only count on the canonical FROM_TO_EDGE pass (the first pass
+        // in the edge phase) to avoid multiplying edge_count by 5.
+        // In CLASSIC mode (serial_mode=false) always count.
+        const bool count_this_pass =
+            !serial_mode ||
+            (mask & static_cast<uint32_t>(ProjectionIndex::FROM_TO_EDGE));
+        if (count_this_pass) {
             edge_count++;
-            std::cerr << "[ProjectionStorage] Inserted edge 0x" << std::hex << edge_id << std::dec
-                      << " into from_to_edge_index (" << from_id << " -> " << to_id << "), edge_count=" << edge_count << std::endl;
-
             if (edge.is_directed) {
                 directed_edge_count++;
             } else {
                 undirected_edge_count++;
             }
         }
-
-        // Insert into to->from index
-        Record<3> to_from_record;
-        to_from_record[0] = to_id;
-        to_from_record[1] = from_id;
-        to_from_record[2] = edge_id;
-
-        to_from_edge_index->insert(to_from_record);
-
-        // Store edge direction
-        Record<2> direction_record;
-        direction_record[0] = edge_id;
-        direction_record[1] = edge.is_directed ? 1 : 0;
-
-        edge_direction_index->insert(direction_record);
-
-        // Handle edge properties if present
-        if (!edge.properties.empty()) {
-            if (!edge_properties_index) {
-                init_empty_bptree<4>(projection_dir + "/edge_properties");
-                edge_properties_index = std::make_unique<BPlusTree<4>>(
-                    rel_dir + "/edge_properties"
-                );
-            }
-
-            for (const auto& [prop_name, prop_value] : edge.properties) {
-                Record<4> prop_record;
-                prop_record[0] = edge_id;
-                prop_record[1] = std::hash<std::string>{}(prop_name); // Simplified
-                prop_record[2] = prop_value.id;
-                prop_record[3] = 0; // Reserved
-
-                edge_properties_index->insert(prop_record);
-            }
-        }
     }
 
     edge_batch.clear();
+}
+
+void ProjectionStorage::resize_bloom_filter(size_t expected_edges, double fpr) {
+    // Only resize if new size is larger than current default
+    // This prevents unnecessary memory allocation for small projections
+    if (expected_edges <= DEFAULT_EXPECTED_EDGES) {
+        return;  // Default 10M is sufficient
+    }
+
+    // Create new larger Bloom filter to handle the expected edge count
+    // Memory scales linearly: ~10 bits per edge for 1% FPR
+    // Example: 61M edges → ~76 MB, 100M edges → ~125 MB
+    edge_bloom_filter_ = std::make_unique<BloomFilter>(expected_edges, fpr);
+}
+
+// Read ONCE per process, like the MDB_PROJECTION_SORTER=classic|radix
+// precedent. "binary" restores the pre-bitmap structure so the A/B protocol can
+// measure both arms without recompiling; anything else, including unset, keeps
+// the bitmap.
+//
+// Deliberately NOT named with "BITMAP" in it: MDB_PROJECTION_BITMAP_GPU already
+// exists two files away and means a different thing (a parallel binary search
+// over EDGES on the GPU).
+//
+// There is no second variable for the budget. "budget refused" and "disabled by
+// env" produce the IDENTICAL state (node_bitmap_ == nullptr), so this one
+// switch already exercises the fallback branch end to end; a max-megabytes knob
+// would only add a tunable whose sole misuse is raising it until the host
+// swaps.
+static bool node_bitmap_enabled() {
+    static const bool cached = []() {
+        // Truth rule unchanged: only "binary" restores the pre-bitmap search.
+        // The gain is that "binray" no longer selects the bitmap by merely
+        // failing to spell the other arm — it falls back AND is reported, which
+        // is the whole reason a mistyped arm used to look like a correct run.
+        // The static keeps the per-name lock off the callers of has_node().
+        return Ablation::choice("MDB_PROJECTION_NODE_MEMBERSHIP", "bitmap",
+                                {"binary", "bitmap"}) != "binary";
+    }();
+    return cached;
+}
+
+void ProjectionStorage::finalize_node_scan() {
+    if (collected_nodes_sorted_) {
+        return;  // Idempotent: second call is a no-op.
+    }
+    std::sort(collected_nodes_.begin(), collected_nodes_.end());
+    collected_nodes_.erase(std::unique(collected_nodes_.begin(),
+                                       collected_nodes_.end()),
+                           collected_nodes_.end());
+    // Release any excess capacity from multi-label over-collection.
+    collected_nodes_.shrink_to_fit();
+    collected_nodes_sorted_ = true;
+
+    // AFTER the sort (min/max are front()/back() at O(1), and the fill is one
+    // sequential pass) and AFTER shrink_to_fit(), which transiently holds two
+    // copies of the vector: there is no reason to add 13 MiB to the worst
+    // instant of the phase.
+    build_node_bitmap_();
+}
+
+void ProjectionStorage::build_node_bitmap_() {
+    // Always start from nothing: this also runs on a RE-finalize, i.e. after an
+    // add_node() that dropped a previous bitmap, and a stale one would be the
+    // single worst defect this change can have (see add_node).
+    node_bitmap_.reset();
+    node_bitmap_min_ = 0;
+
+    if (collected_nodes_.empty()) {
+        // front()/back() on an empty vector is undefined behaviour. This guard
+        // is why, not elegance: finalize_node_scan() on a reopened storage, or
+        // a node filter that selects nothing, both land here. Logged with zero
+        // extents because there are none to report.
+        node_bitmap_status_ = "empty-node-set";
+        log_node_bitmap_decision_(0, 0, 0, 0);
+        return;
+    }
+    if (!node_bitmap_enabled()) {
+        // Logged like every other outcome, and NOT skipped: this is the line
+        // the A/B protocol reads to confirm that the reference arm really ran
+        // without the bitmap. A silent arm is an unverifiable arm.
+        node_bitmap_status_ = "disabled-by-env";
+        log_node_bitmap_decision_(collected_nodes_.size(),
+                                  collected_nodes_.front(),
+                                  collected_nodes_.back(),
+                                  collected_nodes_.back() - collected_nodes_.front());
+        return;
+    }
+
+    const uint64_t min_id = collected_nodes_.front();
+    const uint64_t max_id = collected_nodes_.back();
+    const uint64_t span   = max_id - min_id;   // inclusive: span + 1 ids
+
+    // Compare in BITS against the budget. Written as `span >= BYTES * 8` and
+    // never as `(span + 1 + 63) / 64`, because span + 1 overflows to 0 when the
+    // set spans the whole 64-bit space (min = 0, max = UINT64_MAX) — which is
+    // precisely the pathological mixed-tag case this check must reject.
+    // BYTES * 8 = 2^29 cannot overflow.
+    if (span >= static_cast<uint64_t>(NODE_BITMAP_MAX_BYTES) * 8ULL) {
+        node_bitmap_status_ = "span-exceeds-budget";
+        log_node_bitmap_decision_(collected_nodes_.size(), min_id, max_id, span);
+        return;
+    }
+
+    auto bm = std::make_unique<EdgeKeepBitmap>();
+    bm->reserve(static_cast<std::size_t>(span) + 1);   // zero-initialised
+    for (const uint64_t id : collected_nodes_) {
+        bm->set_kept(id - min_id);                     // duplicates collapse free
+    }
+    bm->finalize();   // immutable from here: no writer can race the edge scan
+
+    node_bitmap_min_    = min_id;
+    node_bitmap_        = std::move(bm);
+    node_bitmap_status_ = "adopted";
+    log_node_bitmap_decision_(collected_nodes_.size(), min_id, max_id, span);
+
+    // The vector is NOT freed. Its external reader uploads it verbatim for the
+    // GPU membership path and would read an emptied vector as "the projection
+    // has no nodes" = keep no edges, in silence. The bitmap ACCOMPANIES the
+    // vector; replacing it is a separate change with its own test surgery.
+}
+
+// Printed on EVERY finalize, adopt or refuse. Rationale: with a 64 MiB ceiling
+// the refusal branch is unreachable for every graph in this project, so if it
+// ever fires the only symptom will be the whole projection quietly running 1.4x
+// slower. This line is the one thing that gives that regression a name. One
+// line per projection build; it is not on any hot path.
+void ProjectionStorage::log_node_bitmap_decision_(std::size_t num_ids,
+                                                  uint64_t min_id,
+                                                  uint64_t max_id,
+                                                  uint64_t span) const {
+    std::cout << "[NODE_BITMAP]"
+              << " status=" << node_bitmap_status_
+              << " nodes=" << num_ids
+              << " min=" << min_id
+              << " max=" << max_id
+              << " span=" << span
+              << " bytes=" << node_bitmap_bytes()
+              << " budget_bytes=" << NODE_BITMAP_MAX_BYTES
+              << std::endl;
 }
 
 std::vector<ObjectId> ProjectionStorage::get_all_node_ids() const {
@@ -572,6 +922,105 @@ std::vector<std::tuple<ObjectId, ObjectId, ObjectId, bool>> ProjectionStorage::g
     return edges;
 }
 
+std::optional<ObjectId> ProjectionStorage::get_node_property(ObjectId node_id, ObjectId key_id) const {
+    // Check if node properties index exists
+    if (!node_key_value_index) {
+        return std::nullopt;
+    }
+
+    // Search for (node_id, key_id, MIN) to (node_id, key_id, MAX)
+    Record<3> min_record;
+    min_record[0] = node_id.id;
+    min_record[1] = key_id.id;
+    min_record[2] = 0;
+
+    Record<3> max_record;
+    max_record[0] = node_id.id;
+    max_record[1] = key_id.id;
+    max_record[2] = UINT64_MAX;
+
+    bool interruption_requested = false;
+    auto iter = node_key_value_index->get_range(&interruption_requested, min_record, max_record);
+
+    const Record<3>* record = iter.next();
+    if (record == nullptr) {
+        return std::nullopt;
+    }
+
+    // BptIter bounds the scan from ABOVE only (it filters against `max` and
+    // never against `min`), and when the cursor runs past the end of a leaf it
+    // follows next_leaf. A directory separator that is too large therefore
+    // hands us the first record of the NEXT leaf -- another node's property --
+    // instead of nothing. Serving that would be a silent wrong answer, which
+    // is strictly worse than a missing one: verify the record is actually ours.
+    if ((*record)[0] != node_id.id || (*record)[1] != key_id.id) {
+        return std::nullopt;
+    }
+
+    // Return the value (third element)
+    return ObjectId((*record)[2]);
+}
+
+std::optional<ObjectId> ProjectionStorage::get_edge_property(ObjectId edge_id, ObjectId key_id) const {
+    // Check if edge properties index exists
+    if (!edge_key_value_index) {
+        return std::nullopt;
+    }
+
+    // Search for (edge_id, key_id, MIN) to (edge_id, key_id, MAX)
+    Record<3> min_record;
+    min_record[0] = edge_id.id;
+    min_record[1] = key_id.id;
+    min_record[2] = 0;
+
+    Record<3> max_record;
+    max_record[0] = edge_id.id;
+    max_record[1] = key_id.id;
+    max_record[2] = UINT64_MAX;
+
+    bool interruption_requested = false;
+    auto iter = edge_key_value_index->get_range(&interruption_requested, min_record, max_record);
+
+    const Record<3>* record = iter.next();
+    if (record == nullptr) {
+        return std::nullopt;
+    }
+
+    // Same lower-bound guard as get_node_property: the iterator only filters
+    // against `max`, so a bad directory separator can surface the next edge's
+    // property record here. Never answer with a record that is not ours.
+    if ((*record)[0] != edge_id.id || (*record)[1] != key_id.id) {
+        return std::nullopt;
+    }
+
+    // Return the value (third element)
+    return ObjectId((*record)[2]);
+}
+
+void ProjectionStorage::register_node_key(const std::string& key_name, uint64_t key_id) {
+    if (node_keys2id_.find(key_name) != node_keys2id_.end()) {
+        return;  // Already registered
+    }
+    node_keys2id_[key_name] = key_id;
+    // Ensure node_keys_str_ has space for the ID
+    if (key_id >= node_keys_str_.size()) {
+        node_keys_str_.resize(key_id + 1);
+    }
+    node_keys_str_[key_id] = key_name;
+}
+
+void ProjectionStorage::register_edge_key(const std::string& key_name, uint64_t key_id) {
+    if (edge_keys2id_.find(key_name) != edge_keys2id_.end()) {
+        return;  // Already registered
+    }
+    edge_keys2id_[key_name] = key_id;
+    // Ensure edge_keys_str_ has space for the ID
+    if (key_id >= edge_keys_str_.size()) {
+        edge_keys_str_.resize(key_id + 1);
+    }
+    edge_keys_str_[key_id] = key_name;
+}
+
 void ProjectionStorage::save_catalog() {
     // Don't create catalog if projection name is empty (e.g., when opening existing projection)
     if (projection_name.empty()) {
@@ -582,7 +1031,8 @@ void ProjectionStorage::save_catalog() {
 
     // Set projection metadata
     catalog.projection_name = projection_name;
-    catalog.creation_timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    catalog.creation_timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
 
     // Set statistics
     catalog.node_count = node_count;
@@ -601,8 +1051,1141 @@ void ProjectionStorage::save_catalog() {
     catalog.includes_node_properties = features.include_node_properties;
     catalog.includes_edge_properties = features.include_edge_properties;
 
+    // Persist the property name lists the caller asked for, so inspect-projection
+    // can show them after the fact. Empty = "all available" (builder convention).
+    catalog.included_node_properties = requested_node_properties;
+    catalog.included_edge_properties = requested_edge_properties;
+
+    // Set v1.2 key mappings (for projection-specific properties like _count)
+    for (const auto& [name, id] : node_keys2id_) {
+        catalog.add_node_key(name, id);
+    }
+    for (const auto& [name, id] : edge_keys2id_) {
+        catalog.add_edge_key(name, id);
+    }
+
+    // Persist the v1.4 IndexSet preset. The default ordinal (0 = ALL) is set
+    // both here and on the catalog field, so a builder that never sets the
+    // preset still produces a well-formed v1.4 catalog equivalent to the
+    // legacy "everything materialized" behavior.
+    catalog.index_set = requested_index_set;
+
+    // Persist the per-index leaf-format byte array in catalog v1.5. This
+    // records whether each B+Tree index uses the standard BITSET leaf
+    // encoding (v1, legacy) or the delta + LEB128-varint encoding (v2,
+    // opt-in). Size == number of materialized indexes under the active
+    // IndexSet preset (one byte per slot, in canonical ProjectionIndex enum
+    // order; see projection_catalog.{h,cc}). The current graph_project
+    // surface exposes a single projection-wide format, so every slot gets
+    // the same byte. ProjectionCatalog::save() defaults an empty vector to
+    // all-BITSET, but we populate it explicitly here so DELTA_VARINT is
+    // actually recorded when the user opts in.
+    //
+    // CSR_HYBRID (edge-index B+Tree leaves that embed the CSR layout) is
+    // NOT recorded per-slot in leaf_formats — the v1.5 array validator
+    // only accepts BITSET/DELTA_VARINT, and the sealed catalog file cannot
+    // be extended. Instead, the per-projection `graph_storage` byte (v1.6)
+    // carries the CSR_HYBRID signal; the open-time reader in
+    // ProjectionStorage::open() derives the right LeafFormat for
+    // FROM_TO_EDGE / TO_FROM_EDGE from that byte and bypasses leaf_formats
+    // for those two slots. Non-edge indexes honor leaf_formats as before.
+    {
+        const auto mask =
+            static_cast<uint32_t>(project_index_mask_for(requested_index_set));
+        const size_t num_materialized =
+            static_cast<size_t>(__builtin_popcount(mask));
+        catalog.leaf_formats.assign(
+            num_materialized,
+            static_cast<uint8_t>(requested_leaf_format));
+    }
+
+    // Persist the per-projection graph-storage mode (BTREE or CSR_HYBRID)
+    // as the v1.6 catalog byte. Default BTREE (1) is byte-for-byte
+    // identical to pre-v1.6 catalogs (the v1.6 byte is absent there, and
+    // load() defaults to BTREE for those). CSR_HYBRID means the edge-index
+    // B+Tree leaves embed the CSR layout directly; this byte is the sole
+    // catalog signal for that mode, since leaf_formats (v1.5) does not
+    // encode it.
+    catalog.graph_storage = static_cast<uint8_t>(requested_graph_storage);
+
     // Save to disk
     catalog.save();
+}
+
+bool ProjectionStorage::edge_exists_in_btree(ObjectId from, ObjectId to, ObjectId edge_id) const {
+    if (!from_to_edge_index) {
+        return false;
+    }
+
+    // Exact match lookup: (from, to, edge_id)
+    Record<3> search_record;
+    search_record[0] = from.id;
+    search_record[1] = to.id;
+    search_record[2] = edge_id.id;
+
+    bool interruption_requested = false;
+    auto iter = from_to_edge_index->get_range(&interruption_requested, search_record, search_record);
+    return iter.next() != nullptr;
+}
+
+// ============================================================================
+// BULK IMPORT IMPLEMENTATION
+// ============================================================================
+//
+// These methods build B+tree indexes using direct file writes, completely
+// bypassing the buffer pool. This enables building indexes for arbitrarily
+// large datasets without memory pressure issues.
+//
+// Pattern: Sort records → Write leaf pages → Build directory
+// ============================================================================
+
+template<std::size_t N>
+size_t ProjectionStorage::build_index_bulk(std::vector<Record<N>>& records, const std::string& base_path) {
+    BPTLeafWriter<N> leaf_writer(base_path + ".leaf");
+    BPTDirWriter<N> dir_writer(base_path + ".dir");
+
+    // Handle empty index case
+    if (records.empty()) {
+        leaf_writer.make_empty();
+        return 0;
+    }
+
+    // Sort records for B+tree ordering
+#ifdef HAS_TBB
+    std::sort(std::execution::par_unseq, records.begin(), records.end());
+#else
+    std::sort(records.begin(), records.end());
+#endif
+
+    // Remove duplicates (stable, maintains sorted order)
+    auto last = std::unique(records.begin(), records.end());
+    records.erase(last, records.end());
+
+    // Capture count after deduplication (for accurate statistics)
+    size_t unique_count = records.size();
+
+    // Calculate leaf page capacity
+    // IMPORTANT: BPTLeafWriter::max_records formula doesn't account for the N-byte bitset!
+    // Formula (Page::SIZE - 8) / (8*N) = 511 for N=1, but only 510 records actually fit.
+    // Correct formula: (Page::SIZE - header - bitset) / record_size
+    constexpr size_t max_records_per_leaf = (Page::SIZE - 2*sizeof(uint32_t) - N) / (sizeof(uint64_t) * N);
+
+    // Allocate buffer for formatted leaf data.
+    // Compression packs MORE than max_records_per_leaf records into a page
+    // (each record costs fewer than N*8 bytes once redundant bytes are shared),
+    // but the on-disk payload is always bounded by Page::SIZE. Size the buffer
+    // to Page::SIZE so a fully-packed compressed page fits.
+    const size_t max_buffer_size = Page::SIZE;
+    auto leaf_buffer = std::make_unique<char[]>(max_buffer_size);
+
+    // Write records to leaf pages
+    size_t total_records = records.size();
+    size_t leaf_page_number = 0;
+    size_t records_written = 0;
+
+    const bool compress_leaves = !leaf_compression_disabled();
+    // Upper bound on records per compressed page (a fully-redundant page holds
+    // at most Page::SIZE entries; the planner clamps to the real budget).
+    const size_t records_per_page_cap = compress_leaves ? Page::SIZE : max_records_per_leaf;
+    std::bitset<N * 8> no_compression;  // All zeros = no compression
+
+    while (records_written < total_records) {
+        // Get pointer to first record of this leaf
+        Record<N>* page_start = &records[records_written];
+        const size_t remaining = total_records - records_written;
+
+        // Decide how many records fit on this (possibly compressed) page and
+        // the redundant-byte bitset for exactly those records. When
+        // compression is disabled, this is the fixed max_records_per_leaf with
+        // an all-zero bitset.
+        size_t records_in_page;
+        std::bitset<N * 8> page_bitset;
+        if (compress_leaves) {
+            auto plan = plan_compressed_page<N>(page_start, remaining,
+                                                records_per_page_cap);
+            records_in_page = plan.records_in_page;
+            page_bitset     = plan.bitset;
+        } else {
+            records_in_page = std::min(max_records_per_leaf, remaining);
+            page_bitset     = no_compression;
+        }
+
+        // Determine next leaf page number (0 for last page)
+        uint32_t next_page = (records_written + records_in_page < total_records)
+                                 ? static_cast<uint32_t>(leaf_page_number + 1)
+                                 : 0;
+
+        // Build directory entry (skip first leaf - B+tree convention)
+        if (leaf_page_number > 0) {
+            dir_writer.bulk_insert(page_start, 0, static_cast<int32_t>(leaf_page_number));
+        }
+
+        // Format data for process_block(): the leaf buffer holds the exact
+        // [N bitset bytes] + [redundant_count shared bytes] + [non-redundant
+        // per-record bytes] layout BPTLeafV1 decodes.
+        pack_compressed_page<N>(page_start,
+                                static_cast<uint32_t>(records_in_page),
+                                page_bitset,
+                                leaf_buffer.get());
+
+        // Write leaf page
+        leaf_writer.process_block(
+            leaf_buffer.get(),
+            static_cast<uint32_t>(records_in_page),
+            page_bitset,
+            next_page
+        );
+
+        records_written += records_in_page;
+        leaf_page_number++;
+    }
+
+    // Writers automatically flush to disk when destroyed
+    return unique_count;
+}
+
+// ============================================================================
+// STREAMING BULK IMPORT IMPLEMENTATION
+// ============================================================================
+//
+// Memory-bounded index building using external merge sort.
+// Streams sorted records without loading all data into RAM.
+//
+// Memory model: O(buffer_size) regardless of dataset size
+// ============================================================================
+
+template<std::size_t N>
+size_t ProjectionStorage::build_index_streaming(ExternalRecordSort<N>& sorter, const std::string& base_path) {
+    // Dispatch on the projection-wide leaf-format preset. BITSET preserves
+    // legacy byte-identical behavior; DELTA_VARINT produces v2 leaves with
+    // a 16-byte header + zigzag-delta LEB128-varint payload, which
+    // compresses sorted B+Tree records by encoding successive deltas rather
+    // than full values. The format is populated from the `leafFormat` config
+    // parameter on graph_project (project_procedure.cc) and threaded
+    // through NativeProjectionBuilder into requested_leaf_format during
+    // construction.
+    if (requested_leaf_format == BPT::LeafFormat::DELTA_VARINT) {
+        BPTLeafV2Writer<N> leaf_writer(base_path + ".leaf");
+        BPTDirWriter<N>    dir_writer(base_path + ".dir");
+
+        if (sorter.total_records() == 0) {
+            leaf_writer.make_empty();
+            return 0;
+        }
+
+        Record<N> prev_record{};
+        bool   has_prev_v2  = false;
+        size_t unique_count = 0;
+
+        sorter.stream_sorted([&](const Record<N>& record) {
+            // Inline dedup
+            if (has_prev_v2 && record == prev_record) return;
+            prev_record = record;
+            has_prev_v2 = true;
+            ++unique_count;
+
+            const bool started_new_page = leaf_writer.append_record(record);
+            if (started_new_page) {
+                // `record` is the first record of the newly-opened page.
+                // B+Tree dir convention: every non-first leaf gets a dir
+                // entry pointing at its own index.
+                dir_writer.bulk_insert(
+                    &record, 0,
+                    static_cast<int32_t>(leaf_writer.current_page_index()));
+            }
+        });
+
+        // Flush tail page with next_leaf = 0 so read-side chain terminates.
+        leaf_writer.finalize();
+
+        return unique_count;
+    }
+
+    // BITSET path — legacy leaf encoding, byte-identical to original output.
+    BPTLeafWriter<N> leaf_writer(base_path + ".leaf");
+    BPTDirWriter<N> dir_writer(base_path + ".dir");
+
+    // Handle empty index case
+    if (sorter.total_records() == 0) {
+        leaf_writer.make_empty();
+        return 0;
+    }
+
+    // Calculate leaf page capacity (same formula as build_index_bulk)
+    constexpr size_t max_records_per_leaf = (Page::SIZE - 2*sizeof(uint32_t) - N) / (sizeof(uint64_t) * N);
+
+    // Allocate buffer for formatted leaf data. Compression packs more records
+    // per page, so size to Page::SIZE (the compressed payload upper bound).
+    const size_t max_buffer_size = Page::SIZE;
+    auto leaf_buffer = std::make_unique<char[]>(max_buffer_size);
+
+    // Streaming state
+    std::vector<Record<N>> page_records;
+    page_records.reserve(max_records_per_leaf);
+
+    Record<N> prev_record;
+    bool has_prev = false;
+    size_t unique_count = 0;
+    size_t leaf_page_number = 0;
+
+    const bool compress_leaves = !leaf_compression_disabled();
+    std::bitset<N * 8> no_compression;  // All zeros = no compression
+
+    // Running redundant-byte bitset over the records currently buffered on the
+    // page; kept in sync with page_records so the compressed flush trigger can
+    // measure the on-disk page cost without rescanning every record. Reset to
+    // all-set whenever a page is flushed (a single record is all-redundant).
+    std::bitset<N * 8> running_bitset;
+    running_bitset.set();
+    auto page_overflows_with = [&](const Record<N>& candidate) -> bool {
+        // Fold the candidate into a copy of the running bitset and test the
+        // resulting page cost against Page::SIZE — identical budget arithmetic
+        // to BPTLeafV1::get_page_size and plan_compressed_page.
+        std::bitset<N * 8> bs = running_bitset;
+        const unsigned char* first =
+            reinterpret_cast<const unsigned char*>(&page_records[0]);
+        const unsigned char* cand =
+            reinterpret_cast<const unsigned char*>(&candidate);
+        for (size_t b = 0; b < N * 8; ++b) {
+            if (bs[b] && cand[b] != first[b]) bs.set(b, false);
+        }
+        const size_t rc = bs.count();
+        const size_t n  = page_records.size() + 1;
+        return 2 * sizeof(uint32_t) + N + rc + n * (sizeof(uint64_t) * N - rc) > Page::SIZE;
+    };
+
+    // Lambda to write a leaf page
+    auto write_leaf_page = [&](bool is_last_page) {
+        if (page_records.empty()) return;
+
+        // Determine next leaf page number (0 for last page)
+        uint32_t next_page = is_last_page ? 0 : static_cast<uint32_t>(leaf_page_number + 1);
+
+        // Build directory entry (skip first leaf - B+tree convention)
+        if (leaf_page_number > 0) {
+            dir_writer.bulk_insert(&page_records[0], 0, static_cast<int32_t>(leaf_page_number));
+        }
+
+        // Format data for process_block(): see build_index_bulk for the exact
+        // [N bitset bytes] + [redundant bytes] + [non-redundant per-record
+        // bytes] layout. Default compresses; escape hatch restores raw bytes.
+        std::bitset<N * 8> page_bitset =
+            compress_leaves
+                ? compute_redundant_bitset<N>(page_records.data(),
+                                              static_cast<uint32_t>(page_records.size()))
+                : no_compression;
+
+        pack_compressed_page<N>(page_records.data(),
+                                static_cast<uint32_t>(page_records.size()),
+                                page_bitset,
+                                leaf_buffer.get());
+
+        // Write leaf page
+        leaf_writer.process_block(
+            leaf_buffer.get(),
+            static_cast<uint32_t>(page_records.size()),
+            page_bitset,
+            next_page
+        );
+
+        leaf_page_number++;
+        page_records.clear();
+        running_bitset.set();  // fresh page: a single record is all-redundant
+    };
+
+    // Stream sorted records with inline deduplication
+    sorter.stream_sorted([&](const Record<N>& record) {
+        // Deduplication: skip if same as previous
+        if (has_prev && record == prev_record) {
+            return;
+        }
+        prev_record = record;
+        has_prev = true;
+        unique_count++;
+
+        if (compress_leaves) {
+            // Compressed: flush the current page when appending `record` would
+            // exceed the Page::SIZE budget, then start a new page with it. A
+            // single record always fits (8 + 9*N <= 4096 for N <= 3).
+            if (!page_records.empty() && page_overflows_with(record)) {
+                write_leaf_page(false);  // running_bitset reset inside
+            }
+            // Fold `record` into the running bitset for the (possibly new) page.
+            if (page_records.empty()) {
+                running_bitset.set();
+            } else {
+                const unsigned char* first =
+                    reinterpret_cast<const unsigned char*>(&page_records[0]);
+                const unsigned char* rec =
+                    reinterpret_cast<const unsigned char*>(&record);
+                for (size_t b = 0; b < N * 8; ++b) {
+                    if (running_bitset[b] && rec[b] != first[b]) {
+                        running_bitset.set(b, false);
+                    }
+                }
+            }
+            page_records.push_back(record);
+        } else {
+            page_records.push_back(record);
+            // Write page when full (fixed record count, no compression).
+            if (page_records.size() >= max_records_per_leaf) {
+                write_leaf_page(false);  // Not last page
+            }
+        }
+    });
+
+    // Write final partial page
+    write_leaf_page(true);  // Is last page
+
+    return unique_count;
+}
+
+// Explicit template instantiations for streaming build
+template size_t ProjectionStorage::build_index_streaming<1>(ExternalRecordSort<1>&, const std::string&);
+template size_t ProjectionStorage::build_index_streaming<2>(ExternalRecordSort<2>&, const std::string&);
+template size_t ProjectionStorage::build_index_streaming<3>(ExternalRecordSort<3>&, const std::string&);
+
+// =========================================================================
+// Per-index build methods (extracted from build_all_indexes_bulk).
+//
+// Each method wraps exactly one GQL::sort_and_build_index<N>() call,
+// using the matching StreamingRecordBuffer and a per-projection
+// sort_tmp/ scratch directory. Optional indexes early-return when
+// their feature flag is false or the backing buffer is null.
+//
+// Callers: build_all_indexes_bulk() in CLASSIC mode, and
+// build_one_index(ProjectionIndex) in SERIALIZED mode.
+// =========================================================================
+
+void ProjectionStorage::build_nodes_index_() {
+    // 1. Nodes index (Record<1>: node_id)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    node_count = GQL::sort_and_build_index<1>(
+        *node_records_buffer_,
+        projection_dir + "/nodes",
+        /*estimated_count=*/node_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<1>& sorter, const std::string& path) {
+            return build_index_streaming<1>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_from_to_edge_index_() {
+    // 2. From→To edge index (Record<3>: from, to, edge_id)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *from_to_records_buffer_,
+        projection_dir + "/from_to_edge",
+        /*estimated_count=*/from_to_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format,
+        // Edge indexes pick up the per-projection graph-storage mode.
+        // Under CSR_HYBRID the dispatch bypasses the build_from_sorter
+        // callback and invokes BPTLeafCSRWriter directly, producing v3
+        // leaf pages where the B+Tree leaf IS the CSR adjacency list.
+        // BTREE (default) preserves legacy byte-identical output.
+        requested_graph_storage
+    );
+
+    // Integrated topology CSR sidecar emission (topology_fwd.csr).
+    // The CSR sidecar is an mmap-backed file that provides O(1) neighbor
+    // slices, accelerating GNN k-hop sampling versus O(log N) B+Tree
+    // traversal. Runs only when NativeProjectionBuilder pre-set the opt-in
+    // flag AND the projection is in BTREE mode. Under CSR_HYBRID the
+    // B+Tree leaves already embed the CSR adjacency list and supersede the
+    // sidecar, so we skip emission here.
+    if (build_topology_snapshot_
+        && requested_graph_storage != BPT::GraphStorage::CSR_HYBRID) {
+        try {
+            GQL::Projection::build_topology_snapshot_from_leaf(
+                std::filesystem::path(projection_dir),
+                GQL::Projection::TopologySnapshotWriter::Direction::FORWARD,
+                node_count,
+                /*include_edge_ids=*/true);
+            fwd_topology_snapshot_built_ = true;
+        } catch (const std::exception& e) {
+            // Non-fatal: leave the flag false so the legacy post-hoc
+            // path can retry from the BPT iterator in finalize().
+            std::cerr << "[Projection] integrated topology_fwd.csr build "
+                         "failed: " << e.what()
+                      << " — falling back to post-hoc builder" << std::endl;
+        }
+    }
+}
+
+void ProjectionStorage::build_to_from_edge_index_() {
+    // 3. To→From edge index (Record<3>: to, from, edge_id)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *to_from_records_buffer_,
+        projection_dir + "/to_from_edge",
+        /*estimated_count=*/to_from_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format,
+        // Pass the per-projection graph-storage mode; see build_from_to_edge_index_() above.
+        requested_graph_storage
+    );
+
+    // Integrated topology CSR sidecar emission (topology_rev.csr).
+    // Same gate and fallback logic as the FORWARD builder above: the
+    // mmap-backed reverse sidecar enables O(1) reverse-neighbor slices
+    // for k-hop sampling. Skipped under CSR_HYBRID because the reverse
+    // edge B+Tree leaves already embed the CSR adjacency list.
+    if (build_topology_snapshot_
+        && requested_graph_storage != BPT::GraphStorage::CSR_HYBRID) {
+        try {
+            GQL::Projection::build_topology_snapshot_from_leaf(
+                std::filesystem::path(projection_dir),
+                GQL::Projection::TopologySnapshotWriter::Direction::REVERSE,
+                node_count,
+                /*include_edge_ids=*/true);
+            rev_topology_snapshot_built_ = true;
+        } catch (const std::exception& e) {
+            std::cerr << "[Projection] integrated topology_rev.csr build "
+                         "failed: " << e.what()
+                      << " — falling back to post-hoc builder" << std::endl;
+        }
+    }
+}
+
+void ProjectionStorage::build_edge_direction_index_() {
+    // 4. Edge direction index (Record<2>: edge_id, is_directed)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<2>(
+        *direction_records_buffer_,
+        projection_dir + "/edge_direction",
+        /*estimated_count=*/direction_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<2>& sorter, const std::string& path) {
+            return build_index_streaming<2>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_edge_from_to_index_() {
+    // 5. Edge→From→To index for directed edges (Record<3>: edge_id, from, to)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *edge_from_to_records_buffer_,
+        projection_dir + "/edge_from_to",
+        /*estimated_count=*/edge_from_to_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_edge_n1_n2_index_() {
+    // 6. Edge→N1→N2 index for undirected edges (Record<3>: edge_id, n1, n2)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *edge_n1_n2_records_buffer_,
+        projection_dir + "/edge_n1_n2",
+        /*estimated_count=*/edge_n1_n2_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_node_label_index_() {
+    // Node→Label index (Record<2>: node_id, label_id)
+    if (!features.include_node_labels || !node_label_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<2>(
+        *node_label_records_buffer_,
+        projection_dir + "/node_label",
+        /*estimated_count=*/node_label_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<2>& sorter, const std::string& path) {
+            return build_index_streaming<2>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_label_node_index_() {
+    // Label→Node index (Record<2>: label_id, node_id)
+    if (!features.include_node_labels || !label_node_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<2>(
+        *label_node_records_buffer_,
+        projection_dir + "/label_node",
+        /*estimated_count=*/label_node_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<2>& sorter, const std::string& path) {
+            return build_index_streaming<2>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_edge_label_index_() {
+    // Edge→Label index (Record<2>: edge_id, label_id)
+    if (!features.include_edge_labels || !edge_label_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<2>(
+        *edge_label_records_buffer_,
+        projection_dir + "/edge_label",
+        /*estimated_count=*/edge_label_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<2>& sorter, const std::string& path) {
+            return build_index_streaming<2>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_label_edge_index_() {
+    // Label→Edge index (Record<2>: label_id, edge_id)
+    if (!features.include_edge_labels || !label_edge_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<2>(
+        *label_edge_records_buffer_,
+        projection_dir + "/label_edge",
+        /*estimated_count=*/label_edge_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<2>& sorter, const std::string& path) {
+            return build_index_streaming<2>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_node_key_value_index_() {
+    // Node→Key→Value index (Record<3>: node_id, key_id, value_id)
+    if (!features.include_node_properties || !node_key_value_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *node_key_value_records_buffer_,
+        projection_dir + "/node_key_value",
+        /*estimated_count=*/node_key_value_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_key_value_node_index_() {
+    // Key→Value→Node index (Record<3>: key_id, value_id, node_id)
+    if (!features.include_node_properties || !key_value_node_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *key_value_node_records_buffer_,
+        projection_dir + "/key_value_node",
+        /*estimated_count=*/key_value_node_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_edge_key_value_index_() {
+    // Edge→Key→Value index (Record<3>: edge_id, key_id, value_id)
+    if (!features.include_edge_properties || !edge_key_value_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *edge_key_value_records_buffer_,
+        projection_dir + "/edge_key_value",
+        /*estimated_count=*/edge_key_value_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::build_key_value_edge_index_() {
+    // Key→Value→Edge index (Record<3>: key_id, value_id, edge_id)
+    if (!features.include_edge_properties || !key_value_edge_records_buffer_) return;
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+    GQL::sort_and_build_index<3>(
+        *key_value_edge_records_buffer_,
+        projection_dir + "/key_value_edge",
+        /*estimated_count=*/key_value_edge_records_buffer_->size(),  // actual record count, used by the radix partition sort to size partitions correctly
+        [this](ExternalRecordSort<3>& sorter, const std::string& path) {
+            return build_index_streaming<3>(sorter, path);
+        },
+        sort_temp_dir,
+        requested_leaf_format
+    );
+}
+
+void ProjectionStorage::reset_sort_scratch_() {
+    std::error_code ec;
+    std::filesystem::remove_all(projection_dir + "/sort_tmp", ec);
+    // Best-effort cleanup; recreate empty dir for the next pass.
+    std::filesystem::create_directories(projection_dir + "/sort_tmp");
+    // NOTE: .radix_scratch (used by RadixPartitionSort) is managed by that
+    // class's destructor; we don't need to touch it here.
+}
+
+void ProjectionStorage::begin_serial_edge_pass_(ProjectionIndex which) {
+    // -----------------------------------------------------------------------
+    // Disk-bound fix: SERIAL+RADIX exhausted disk (ENOSPC) on
+    // billion-edge graphs before this per-pass masking existed.
+    //
+    // Root cause: flush_edge_batch() distributes every edge to ALL 5 edge
+    // streaming buffers simultaneously. In the old design, pass 1
+    // (FROM_TO_EDGE) filled all 5 buffers in one scan, with passes 2-5
+    // each consuming their pre-filled buffer. On papers100M (1.6B edges ×
+    // 24 bytes × 4 non-target buffers ≈ 153 GB of spill files) the disk
+    // filled before RadixPartitionSort could write partition files for the
+    // first edge-index pass, producing the "short write to part_7.bin"
+    // ENOSPC error.
+    //
+    // Fix (per-pass mask):
+    //   serial_write_mask_ restricts flush_edge_batch() to only write to
+    //   the buffer(s) corresponding to the current target index. Every pass
+    //   independently re-scans the source edges for its own buffer only.
+    //   The edge bloom filter is also cleared so the fresh per-pass scan
+    //   emits all edges regardless of what prior passes added (the
+    //   EdgeFilter from Phase B handles structural dedup; the bloom is
+    //   redundant in SERIAL mode).
+    //
+    //   Non-target buffers that may have accumulated spill data from the
+    //   immediately preceding pass are explicitly cleared here to reclaim
+    //   disk.  (The target buffer itself is cleared by sort_and_build_index
+    //   via input_stream.clear() after the B+Tree is written.)
+    //
+    // Bounded disk: O(max single-pass spill) at all times.
+    // Correctness:  each pass has a fresh bloom + fresh target buffer.
+    // -----------------------------------------------------------------------
+
+    // Clear any residual spill files from non-target buffers.
+    auto clear_if = [](auto& buf) { if (buf) buf->clear(); };
+    clear_if(from_to_records_buffer_);
+    clear_if(to_from_records_buffer_);
+    clear_if(direction_records_buffer_);
+    clear_if(edge_from_to_records_buffer_);
+    clear_if(edge_n1_n2_records_buffer_);
+    clear_if(edge_label_records_buffer_);
+    clear_if(label_edge_records_buffer_);
+    clear_if(edge_key_value_records_buffer_);
+    clear_if(key_value_edge_records_buffer_);
+
+    // Reset bloom so each pass sees all edges fresh.
+    if (edge_bloom_filter_) edge_bloom_filter_->clear();
+
+    // Arm the write mask: flush_edge_batch() will skip all other buffers.
+    serial_write_mask_ = static_cast<uint32_t>(which);
+}
+
+void ProjectionStorage::end_serial_edge_pass_() {
+    // Disarm the write mask so that any post-serialized code (e.g., classic
+    // path, label/property passes) uses the full all-buffer write path.
+    serial_write_mask_ = 0;
+}
+
+void ProjectionStorage::build_all_indexes_bulk() {
+    // =========================================================================
+    // STREAMING BULK IMPORT: Build indexes with bounded memory
+    // =========================================================================
+    //
+    // Uses ExternalRecordSort for memory-bounded external merge sort.
+    // Each index is built by streaming sorted records directly to B+tree
+    // leaf pages, with inline deduplication.
+    //
+    // Memory model: O(adaptive buffer) = O(MemAvailable * 0.75),
+    //               with a 256 MB floor. See src/misc/available_ram.h.
+    //               ~adaptive MB for sort + one page for B+tree writing
+    // =========================================================================
+
+    // Create temp directory for sorted runs (shared by all 14 builds)
+    std::string sort_temp_dir = projection_dir + "/sort_tmp";
+    std::filesystem::create_directories(sort_temp_dir);
+
+    // Gate topology/label index materialization on the active IndexSet
+    // preset mask. The 10 gated bits are: NODES, NODE_LABEL, LABEL_NODE,
+    // FROM_TO_EDGE, TO_FROM_EDGE, EDGE_DIRECTION, EDGE_FROM_TO, EDGE_N1_N2,
+    // EDGE_LABEL, LABEL_EDGE. Property indexes (NODE_KEY_VALUE,
+    // KEY_VALUE_NODE, EDGE_KEY_VALUE, KEY_VALUE_EDGE) are NOT gated here —
+    // they remain conditional on features.include_*_properties inside their
+    // respective build_*_index_() helpers. The mask is computed once per
+    // build since requested_index_set is immutable after the builder hands
+    // off to flush().
+    const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
+
+    // PHASE 1: Required topology indexes — now gated by IndexSet.
+    // GNN_MINIMAL keeps NODES + FROM_TO_EDGE + TO_FROM_EDGE; the 3
+    // edge-lookup indexes (EDGE_DIRECTION / EDGE_FROM_TO / EDGE_N1_N2)
+    // are elided for k-hop-sampling-only workloads.
+    if (has_flag(active_mask, ProjectionIndex::NODES)) {
+        build_nodes_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
+        build_from_to_edge_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
+        build_to_from_edge_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
+        build_edge_direction_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)) {
+        build_edge_from_to_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)) {
+        build_edge_n1_n2_index_();
+    }
+
+    // PHASE 2: Optional label indexes — gated by both IndexSet and the
+    // features.include_*_labels flag. The features flag is still consulted
+    // inside each build_*_label_index_() helper, so when include_label_indexes
+    // is false the helpers short-circuit even if IndexSet would have kept
+    // them; conversely, GNN_MINIMAL omits all four label bits regardless of
+    // the features flag.
+    if (has_flag(active_mask, ProjectionIndex::NODE_LABEL)) {
+        build_node_label_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::LABEL_NODE)) {
+        build_label_node_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_LABEL)) {
+        build_edge_label_index_();
+    }
+    if (has_flag(active_mask, ProjectionIndex::LABEL_EDGE)) {
+        build_label_edge_index_();
+    }
+
+    // PHASE 3: Optional property indexes — NOT gated by IndexSet.
+    // Property-config gates via features.include_*_properties remain
+    // the sole controller inside each helper.
+    build_node_key_value_index_();
+    build_key_value_node_index_();
+    build_edge_key_value_index_();
+    build_key_value_edge_index_();
+
+    // PHASE 4: Cleanup + open indexes for reading.
+    // Delegated to open_all_bplustree_readers_() so the SERIALIZED path
+    // (finalize_serialized_) can call the same Phase 4 after its piecemeal
+    // build passes without duplicating the reader-open logic.
+    open_all_bplustree_readers_();
+}
+
+// Phase 4 extracted from build_all_indexes_bulk(): opens all B+Tree index
+// readers after the .leaf/.dir files have been built, and removes the
+// sort_tmp scratch directory as a final cleanup step.
+//
+// Called by:
+//   - build_all_indexes_bulk() (CLASSIC path) after all 14 sort+build calls.
+//   - NativeProjectionBuilder::finalize_serialized_() (SERIALIZED path) after
+//     the last build_one_index() call, before save_catalog() runs.
+void ProjectionStorage::open_all_bplustree_readers_() {
+    // Remove sort_tmp scratch directory (created by build_*_index_ helpers
+    // and also by reset_sort_scratch_ between serialized passes).
+    // best-effort: if already removed, remove_all is a no-op.
+    std::filesystem::remove_all(projection_dir + "/sort_tmp");
+
+    // Open readers only for indexes whose bit is in the active IndexSet
+    // preset. FileManager::get_file_id() opens with O_CREAT, so
+    // unconditional construction of a BPlusTree for a skipped index would
+    // produce a 0-byte .leaf/.dir on disk — defeating the file-count /
+    // disk-footprint contract of GNN_MINIMAL. The query layer will diagnose
+    // attempts to use an elided index at runtime.
+    const ProjectionIndex active_mask = project_index_mask_for(requested_index_set);
+
+    // Thread the projection-wide leaf encoding (BITSET or DELTA_VARINT)
+    // into every BPlusTree reader so BptIter dispatches on the right leaf
+    // layout. A future extension may introduce per-index mixed formats;
+    // this call site consumes a single projection-wide value because that
+    // is what the current graph_project surface exposes.
+    const BPT::LeafFormat lf = requested_leaf_format;
+
+    // Mirrored from the open() path: under CSR_HYBRID graph storage, the
+    // FROM_TO_EDGE / TO_FROM_EDGE B+Trees carry v3 CSR leaves (the B+Tree
+    // leaf IS the CSR adjacency list); all other indexes keep the
+    // projection-wide leaf format.
+    const BPT::LeafFormat edge_lf =
+        (requested_graph_storage == BPT::GraphStorage::CSR_HYBRID)
+            ? BPT::LeafFormat::CSR_HYBRID
+            : lf;
+
+    // Phase 4 reader opening is parallelized via TBB. Previously the 14
+    // file-open syscalls ran back-to-back sequentially. Each B+Tree ctor
+    // only calls FileManager::get_file_id() twice (.dir + .leaf), so we
+    // collect the independent open tasks into a task vector and dispatch
+    // them in parallel. Each task writes to a DIFFERENT std::unique_ptr
+    // member, so there is no shared-mutable-state contention between tasks.
+    // FileManager's internal mutex makes map mutations safe; the
+    // open()/lseek() syscalls run outside the critical section and overlap
+    // across threads.
+    //
+    // Disable via env var: MDB_PROJECTION_PARALLEL_READERS=0
+    // (intended for A/B benchmarking and bisecting any future regression).
+    using OpenTask = std::function<void()>;
+    std::vector<OpenTask> tasks;
+    tasks.reserve(14);
+
+    // Open topology indexes (previously unconditionally opened).
+    if (has_flag(active_mask, ProjectionIndex::NODES)) {
+        tasks.emplace_back([this, lf]() {
+            nodes_index = std::make_unique<BPlusTree<1>>(rel_dir + "/nodes", lf);
+        });
+    }
+    if (has_flag(active_mask, ProjectionIndex::FROM_TO_EDGE)) {
+        tasks.emplace_back([this, edge_lf]() {
+            from_to_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/from_to_edge", edge_lf);
+        });
+    }
+    if (has_flag(active_mask, ProjectionIndex::TO_FROM_EDGE)) {
+        tasks.emplace_back([this, edge_lf]() {
+            to_from_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/to_from_edge", edge_lf);
+        });
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_DIRECTION)) {
+        tasks.emplace_back([this, lf]() {
+            edge_direction_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_direction", lf);
+        });
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_FROM_TO)) {
+        tasks.emplace_back([this, lf]() {
+            edge_from_to_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_from_to", lf);
+        });
+    }
+    if (has_flag(active_mask, ProjectionIndex::EDGE_N1_N2)) {
+        tasks.emplace_back([this, lf]() {
+            edge_n1_n2_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_n1_n2", lf);
+        });
+    }
+
+    // Open optional label indexes — dual gate: features.include_*_labels
+    // AND the IndexSet bit. features flag still participates so legacy
+    // include_label_indexes=false users retain their disk-saving behavior.
+    if (features.include_node_labels) {
+        if (has_flag(active_mask, ProjectionIndex::NODE_LABEL)) {
+            tasks.emplace_back([this, lf]() {
+                node_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/node_label", lf);
+            });
+        }
+        if (has_flag(active_mask, ProjectionIndex::LABEL_NODE)) {
+            tasks.emplace_back([this, lf]() {
+                label_node_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_node", lf);
+            });
+        }
+    }
+    if (features.include_edge_labels) {
+        if (has_flag(active_mask, ProjectionIndex::EDGE_LABEL)) {
+            tasks.emplace_back([this, lf]() {
+                edge_label_index = std::make_unique<BPlusTree<2>>(rel_dir + "/edge_label", lf);
+            });
+        }
+        if (has_flag(active_mask, ProjectionIndex::LABEL_EDGE)) {
+            tasks.emplace_back([this, lf]() {
+                label_edge_index = std::make_unique<BPlusTree<2>>(rel_dir + "/label_edge", lf);
+            });
+        }
+    }
+
+    // Open optional property indexes — NOT gated by IndexSet.
+    if (features.include_node_properties) {
+        tasks.emplace_back([this, lf]() {
+            node_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/node_key_value", lf);
+        });
+        tasks.emplace_back([this, lf]() {
+            key_value_node_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_node", lf);
+        });
+    }
+    if (features.include_edge_properties) {
+        tasks.emplace_back([this, lf]() {
+            edge_key_value_index = std::make_unique<BPlusTree<3>>(rel_dir + "/edge_key_value", lf);
+        });
+        tasks.emplace_back([this, lf]() {
+            key_value_edge_index = std::make_unique<BPlusTree<3>>(rel_dir + "/key_value_edge", lf);
+        });
+    }
+
+    // Decide parallel vs sequential dispatch. Default is parallel (TBB
+    // available); env override forces the legacy sequential path for A/B
+    // benchmarks and bisecting regressions. "0", "false", "off" all disable.
+    bool use_parallel = true;
+    if (const char* env = std::getenv("MDB_PROJECTION_PARALLEL_READERS")) {
+        const std::string v(env);
+        if (v == "0" || v == "false" || v == "off" || v == "FALSE" || v == "OFF") {
+            use_parallel = false;
+        }
+    }
+
+#ifdef HAS_TBB
+    if (use_parallel && tasks.size() > 1) {
+        tbb::parallel_for(
+            tbb::blocked_range<std::size_t>(0, tasks.size(), 1),
+            [&tasks](const tbb::blocked_range<std::size_t>& r) {
+                for (std::size_t i = r.begin(); i < r.end(); ++i) {
+                    tasks[i]();
+                }
+            });
+    } else {
+        for (auto& task : tasks) {
+            task();
+        }
+    }
+#else
+    (void)use_parallel;
+    for (auto& task : tasks) {
+        task();
+    }
+#endif
+}
+
+// Dispatcher for the serialized scan pipeline: routes a single-bit
+// ProjectionIndex value to the corresponding private build_<name>_index_()
+// helper. The default: clause catches NONE, ALL_NODE, ALL_EDGE, ALL, and
+// any unknown bit pattern, enforcing single-bit-only semantics. Callers
+// (finalize_serialized_) iterate over single-bit enumerators via
+// enabled_indexes_().
+void ProjectionStorage::build_one_index(ProjectionIndex which) {
+    switch (which) {
+        case ProjectionIndex::NODES:           build_nodes_index_();          break;
+        case ProjectionIndex::NODE_LABEL:      build_node_label_index_();     break;
+        case ProjectionIndex::LABEL_NODE:      build_label_node_index_();     break;
+        case ProjectionIndex::NODE_KEY_VALUE:  build_node_key_value_index_(); break;
+        case ProjectionIndex::KEY_VALUE_NODE:  build_key_value_node_index_(); break;
+        case ProjectionIndex::FROM_TO_EDGE:    build_from_to_edge_index_();   break;
+        case ProjectionIndex::TO_FROM_EDGE:    build_to_from_edge_index_();   break;
+        case ProjectionIndex::EDGE_DIRECTION:  build_edge_direction_index_(); break;
+        case ProjectionIndex::EDGE_FROM_TO:    build_edge_from_to_index_();   break;
+        case ProjectionIndex::EDGE_N1_N2:      build_edge_n1_n2_index_();     break;
+        case ProjectionIndex::EDGE_LABEL:      build_edge_label_index_();     break;
+        case ProjectionIndex::LABEL_EDGE:      build_label_edge_index_();     break;
+        case ProjectionIndex::EDGE_KEY_VALUE:  build_edge_key_value_index_(); break;
+        case ProjectionIndex::KEY_VALUE_EDGE:  build_key_value_edge_index_(); break;
+        default:
+            throw std::invalid_argument(
+                "build_one_index: must be a single-bit ProjectionIndex value (got 0x" +
+                std::to_string(static_cast<uint32_t>(which)) + ")");
+    }
+}
+
+// Explicit template instantiations for the record sizes used
+template size_t ProjectionStorage::build_index_bulk<1>(std::vector<Record<1>>&, const std::string&);
+template size_t ProjectionStorage::build_index_bulk<2>(std::vector<Record<2>>&, const std::string&);
+template size_t ProjectionStorage::build_index_bulk<3>(std::vector<Record<3>>&, const std::string&);
+
+void ProjectionStorage::initialize_streaming_buffers() {
+    // =========================================================================
+    // Initialize streaming record buffers for memory-bounded bulk import
+    // =========================================================================
+    //
+    // Each buffer has a configurable memory threshold (default 64 MB).
+    // When the threshold is exceeded, records are spilled to temporary files.
+    // This enables building projections of arbitrary size with bounded memory.
+    //
+    // Total memory budget: ~512 MB for all buffers (vs 12-14 GB for vectors)
+    //
+    // Spill path override:
+    //   If the env var MDB_PROJECTION_SPILL_DIR is set, spill files are
+    //   written under <env>/<projection_name>/tmp_* instead of inside the
+    //   projection directory. This lets operators redirect spill I/O to a
+    //   different volume (HDD archive, tmpfs, separate SSD) when the DB
+    //   volume is disk-constrained, without affecting where the final B+Tree
+    //   indexes and catalog live. Spills are ephemeral so no persistent data
+    //   leaves the projection dir.
+    // =========================================================================
+
+    std::string spill_base = projection_dir;
+    // text(), not choice(): a spill path has no closed set of valid values. It
+    // is still declared, because "which volume absorbed the spill I/O" changes
+    // what a timing arm measures and was nowhere in the run's record.
+    const std::string env_dir =
+        Ablation::text("MDB_PROJECTION_SPILL_DIR", "");
+    if (!env_dir.empty()) {
+        // Derive a subdir named after the projection so concurrent
+        // projection builds don't collide. Extracting the trailing path
+        // component of projection_dir (e.g. "papers100M_proj" from
+        // "data/dbs/gql/papers100M/projections/papers100M_proj").
+        std::filesystem::path pd(projection_dir);
+        std::string subname = pd.filename().string();
+        if (subname.empty()) {
+            subname = "projection";
+        }
+        spill_base = env_dir + "/" + subname;
+        std::error_code ec;
+        std::filesystem::create_directories(spill_base, ec);
+        if (ec) {
+            throw std::runtime_error(
+                "MDB_PROJECTION_SPILL_DIR='" + env_dir +
+                "': cannot create spill directory '" + spill_base +
+                "': " + ec.message());
+        }
+    }
+
+    // Required index buffers (always created)
+    node_records_buffer_ = std::make_unique<StreamingRecordBuffer<1>>(
+        spill_base + "/tmp_nodes", STREAMING_BUFFER_THRESHOLD);
+
+    from_to_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_from_to", STREAMING_BUFFER_THRESHOLD);
+
+    to_from_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_to_from", STREAMING_BUFFER_THRESHOLD);
+
+    direction_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
+        spill_base + "/tmp_direction", STREAMING_BUFFER_THRESHOLD);
+
+    edge_from_to_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_edge_from_to", STREAMING_BUFFER_THRESHOLD);
+
+    edge_n1_n2_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_edge_n1_n2", STREAMING_BUFFER_THRESHOLD);
+
+    // Optional label index buffers (always created for simplicity, but may remain empty)
+    node_label_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
+        spill_base + "/tmp_node_label", STREAMING_BUFFER_THRESHOLD);
+
+    label_node_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
+        spill_base + "/tmp_label_node", STREAMING_BUFFER_THRESHOLD);
+
+    edge_label_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
+        spill_base + "/tmp_edge_label", STREAMING_BUFFER_THRESHOLD);
+
+    label_edge_records_buffer_ = std::make_unique<StreamingRecordBuffer<2>>(
+        spill_base + "/tmp_label_edge", STREAMING_BUFFER_THRESHOLD);
+
+    // Optional property index buffers (always created for simplicity, but may remain empty)
+    node_key_value_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_node_kv", STREAMING_BUFFER_THRESHOLD);
+
+    key_value_node_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_kv_node", STREAMING_BUFFER_THRESHOLD);
+
+    edge_key_value_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_edge_kv", STREAMING_BUFFER_THRESHOLD);
+
+    key_value_edge_records_buffer_ = std::make_unique<StreamingRecordBuffer<3>>(
+        spill_base + "/tmp_kv_edge", STREAMING_BUFFER_THRESHOLD);
 }
 
 } // namespace GQL

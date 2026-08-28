@@ -114,6 +114,10 @@ public:
         cancellation_token = get_uuid();
 
         tmp_manager.reset(thread_info.worker_index);
+
+        // Clear projection context from previous query (USE GRAPH state must not leak).
+        // Uses clear_active_projection() defined in .cc where ProjectionQueryContext is complete.
+        clear_active_projection();
     }
 
     // Projection management methods (for GQL USE GRAPH support)

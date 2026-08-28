@@ -12,7 +12,7 @@ As you may notice this dataset contains tensors by the predicate `ex:embedding` 
 tensorFloat("[1.0, 1.5, 3.2]")
 ```
 
-You can read further about our tensor implementation at its [documentation](/doc/datatypes/tensor.md).
+You can read further about our tensor implementation in this document.
 
 Using the same database from the previous step, we can operate this tensors with all the arithmetic operations as you would expect from a vectorial engine.
 
@@ -126,12 +126,12 @@ For removing a HNSW index, make sure that the database is not running and remove
 
 ```bash
 # RDF
-rm -r data/tutorial/rdf/tutorial-db/hnsw_index/my_index
+rm -r data/dbs/rdf/YOUR_DB_NAME/hnsw_index/my_index
 ```
 
 ```bash
 # Quad Model
-rm -r data/tutorial/quad_model/tutorial-db/hnsw_index/my_index
+rm -r data/dbs/qm/YOUR_DB_NAME/hnsw_index/my_index
 ```
 
-You can read further about the HNSW index at its [documentation](/doc/indexes/hnsw.md). It is recommended to tweak the HNSW construction and querying index arguments given the specific database instance.
+It is recommended to tweak the HNSW construction and querying index arguments given the specific database instance.

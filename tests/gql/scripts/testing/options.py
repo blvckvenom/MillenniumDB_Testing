@@ -55,7 +55,43 @@ TEST_SUITES: list[str] = [
     "datetime",
     "path_binding",
     "group_by",
+    "call_procedure",
+    "projection_native",
+    "projection_properties",
+    "projection_comprehensive",
+    "projection_advanced",
+    "projection_adaptive_buffer",
+    "projection_no_labels",
+    "list_exprs",
 ]
+
+# GNN test suites require ENABLE_GNN=ON build with LibTorch. Add suites here when GNN integration tests are created.
+GNN_TEST_SUITES: list[str] = [
+]
+
+
+def get_test_suites(executable: Path | None = None) -> list[str]:
+    """Return test suites, filtering GNN suites if binary doesn't support them."""
+    import subprocess
+
+    if executable is None:
+        executable = EXECUTABLE
+
+    has_gnn = False
+    try:
+        result = subprocess.run(
+            [str(executable), "help"],
+            capture_output=True, text=True, timeout=5
+        )
+        has_gnn = "gnn" in result.stdout.lower()
+    except Exception:
+        pass
+
+    suites = list(TEST_SUITES)
+    if has_gnn:
+        suites.extend(GNN_TEST_SUITES)
+    return suites
+
 
 # Tests with the following query files fill be ignored
 IGNORED_TESTS: set[str] = set()

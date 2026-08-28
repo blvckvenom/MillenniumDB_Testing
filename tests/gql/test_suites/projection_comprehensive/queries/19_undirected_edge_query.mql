@@ -1,0 +1,3 @@
+USE comp_16
+MATCH (n:Item)-[e:SIMILAR]-(m:Item)
+RETURN count(*) AS similar_count

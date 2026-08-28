@@ -1,11 +1,8 @@
 #pragma once
 
-#include <mutex>
-
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 
-#include "network/sparql/response_type.h"
 #include "query/executor/query_executor/gql/return_executor.h"
 #include "query/executor/query_executor/query_executor.h"
 #include "query/parser/op/gql/op.h"
@@ -14,9 +11,8 @@ namespace MDBServer {
 
 class Server;
 
+template<typename stream_t>
 class HttpGQLSession {
-    using stream_type = boost::beast::tcp_stream;
-
 public:
     using DurationMS = std::chrono::duration<float, std::milli>;
 
@@ -26,7 +22,7 @@ public:
 
     explicit HttpGQLSession(
         Server& server,
-        stream_type&& stream,
+        stream_t&& stream,
         boost::beast::http::request<boost::beast::http::string_body>&& request,
         std::chrono::seconds query_timeout
     );
@@ -40,7 +36,9 @@ private:
 
     Server& server;
 
-    stream_type stream;
+    uint_fast32_t worker;
+
+    stream_t stream;
 
     boost::beast::http::request<boost::beast::http::string_body> request;
 

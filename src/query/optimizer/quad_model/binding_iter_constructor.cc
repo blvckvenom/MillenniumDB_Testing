@@ -74,20 +74,20 @@ void BindingIterConstructor::visit(OpBasicGraphPattern& op_basic_graph_pattern)
     std::vector<std::unique_ptr<Plan>> base_plans;
 
     // Process Labels
-    for (auto& op_label : op_basic_graph_pattern.labels) {
-        base_plans.push_back(std::make_unique<LabelPlan>(op_label.node, op_label.label));
+    for (auto& label : op_basic_graph_pattern.labels) {
+        base_plans.push_back(std::make_unique<LabelPlan>(label.node, label.label));
     }
 
     // Process properties (value is fixed)
-    for (auto& op_property : op_basic_graph_pattern.properties) {
+    for (auto& property : op_basic_graph_pattern.properties) {
         base_plans.push_back(
-            std::make_unique<PropertyPlan>(op_property.obj, op_property.key, op_property.value)
+            std::make_unique<PropertyPlan>(property.obj, property.key, property.value)
         );
     }
 
     // Process connections
-    for (auto& op_edge : op_basic_graph_pattern.edges) {
-        base_plans.push_back(std::make_unique<EdgePlan>(op_edge.from, op_edge.to, op_edge.type, op_edge.edge)
+    for (auto& edge : op_basic_graph_pattern.edges) {
+        base_plans.push_back(std::make_unique<EdgePlan>(edge.from, edge.to, edge.type, edge.edge)
         );
     }
 
@@ -180,6 +180,10 @@ void BindingIterConstructor::visit(OpCall& op_call)
         argument_binding_exprs.emplace_back(std::move(expr_to_binding_expr.tmp));
     }
 
+    for (const auto& yield_var : op_call.yield_vars) {
+        safe_assigned_vars.insert(yield_var);
+    }
+
     switch (op_call.procedure_type) {
     case OpCall::ProcedureType::HNSW_TOP_K:
         tmp = std::make_unique<Procedure::HNSWTopK>(
@@ -213,10 +217,6 @@ void BindingIterConstructor::visit(OpCall& op_call)
             + std::to_string(static_cast<uint8_t>(op_call.procedure_type))
         );
     }
-
-    for (const auto& yield_var : op_call.yield_vars) {
-        safe_assigned_vars.insert(yield_var);
-    }
 }
 
 void BindingIterConstructor::visit(OpLet& op_let)
@@ -226,8 +226,8 @@ void BindingIterConstructor::visit(OpLet& op_let)
     for (auto& [var, expr] : op_let.var_expr) {
         ExprToBindingExpr expr_to_binding_expr(this, {}, false);
         expr->accept_visitor(expr_to_binding_expr);
-        var_binding_expr.emplace_back(var, std::move(expr_to_binding_expr.tmp)),
-            safe_assigned_vars.emplace(var);
+        var_binding_expr.emplace_back(var, std::move(expr_to_binding_expr.tmp));
+        safe_assigned_vars.emplace(var);
     }
 
     tmp = std::make_unique<Let>(std::move(var_binding_expr));

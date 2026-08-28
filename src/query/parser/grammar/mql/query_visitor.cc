@@ -122,7 +122,7 @@ Any QueryVisitor::visitSimpleQuery(MQL_Parser::SimpleQueryContext* ctx)
 
     for (auto& primitiveStatement : primitiveStatements) {
         visit(primitiveStatement);
-        if (auto where_stmt = primitiveStatement->whereStatement()) {
+        if (primitiveStatement->whereStatement()) {
             assert(current_expr != nullptr);
             if (current_expr->has_aggregation()) {
                 throw QueryException("Cannot have aggregations inside WHERE, use HAVING INSTEAD");
@@ -1471,11 +1471,11 @@ Any QueryVisitor::visitComparisonExprIs(MQL_Parser::ComparisonExprIsContext* ctx
         );
     }
 
-    bool not = ctx->K_NOT() != nullptr;
-    if (not ) {
+    bool is_negated = ctx->K_NOT() != nullptr;
+    if (is_negated) {
         propertyTypeBitmap = ~propertyTypeBitmap;
     }
-    current_expr = std::make_unique<ExprIs>(not, std::move(current_expr), type, propertyTypeBitmap);
+    current_expr = std::make_unique<ExprIs>(is_negated, std::move(current_expr), type, propertyTypeBitmap);
 
     return 0;
 }

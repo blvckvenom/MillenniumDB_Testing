@@ -1,0 +1,3 @@
+CALL graph_project('test_timing', 'User', 'KNOWS')
+YIELD graphName
+RETURN graphName

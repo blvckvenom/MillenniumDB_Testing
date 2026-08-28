@@ -62,8 +62,13 @@ public:
         os << std::string(indent, ' ');
         os << "OpQueryStatements()\n";
 
-        for (auto& op : ops) {
-            op->print_to_ostream(os, indent + 2);
+        for (size_t i = 0; i < ops.size(); i++) {
+            if (ops[i] == nullptr) {
+                os << std::string(indent + 2, ' ');
+                os << "<NULL OP at index " << i << ">\n";
+            } else {
+                ops[i]->print_to_ostream(os, indent + 2);
+            }
         }
         os << "\n";
         return os;

@@ -1,0 +1,2 @@
+CALL graph_exists('nonexistent_projection') YIELD exists AS projection_found
+RETURN projection_found

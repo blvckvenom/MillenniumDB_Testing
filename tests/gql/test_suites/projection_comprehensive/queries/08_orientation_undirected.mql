@@ -1,0 +1,3 @@
+CALL graph_project('comp_08', 'Person', 'KNOWS', {orientation: 'UNDIRECTED'})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

@@ -30,5 +30,6 @@ public:
     void visit(OpGroupBy&) override { }
     void visit(OpUnitTable&) override { }
     void visit(OpEmpty&) override { }
+    void visit(OpCallProcedure&) override { }
 };
 } // namespace GQL

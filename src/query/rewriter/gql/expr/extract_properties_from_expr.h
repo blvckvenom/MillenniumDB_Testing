@@ -356,6 +356,11 @@ public:
         tmp = expr.clone();
     }
 
+    void visit(ExprIn& expr)
+    {
+        tmp = expr.clone();
+    }
+
     void visit(ExprAggCountAll& expr)
     {
         tmp = expr.clone();
@@ -412,6 +417,11 @@ public:
     }
 
     void visit(ExprAggProject& expr)
+    {
+        tmp = expr.clone();
+    }
+
+    void visit(ExprCosineDistance& expr)
     {
         tmp = expr.clone();
     }

@@ -234,7 +234,7 @@ void UpdateExecutor::visit(OpInsertData& op_insert_data)
                                                         .get_predicate2names();
     Name2InsertsMap text_index_name2inserts;
 
-    const auto& hnsw_index_predicate2names = rdf_model.catalog.hnsw_index_manager.get_predicate2names();
+    const auto hnsw_index_predicate2names = rdf_model.catalog.hnsw_index_manager.get_predicate2names();
     Name2InsertsMap hnsw_index_name2inserts;
 
     // to receive the data
@@ -387,7 +387,7 @@ void UpdateExecutor::visit(OpDeleteData& op_delete_data)
                                                         .get_predicate2names();
     Name2DeletesMap text_index_name2deletes;
 
-    const auto& hnsw_index_predicate2names = rdf_model.catalog.hnsw_index_manager.get_predicate2names();
+    const auto hnsw_index_predicate2names = rdf_model.catalog.hnsw_index_manager.get_predicate2names();
     Name2DeletesMap hnsw_index_name2deletes;
 
     for (auto& triple : op_delete_data.triples) {

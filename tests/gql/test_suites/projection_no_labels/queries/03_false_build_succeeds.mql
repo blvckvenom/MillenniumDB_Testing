@@ -1,0 +1,12 @@
+// Explicit includeLabelIndexes: false.
+// The builder must accept the flag and complete the projection without the
+// 4 label indexes. nodeCount and relationshipCount are reported as usual
+// because those come from the non-label buffers (nodes, from_to_edge,
+// to_from_edge, edge_direction, edge_from_to) which are NOT affected by
+// the flag.
+CALL graph_project('proj_no_labels', 'User', 'KNOWS', {
+    orientation: 'NATURAL',
+    includeLabelIndexes: false
+})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

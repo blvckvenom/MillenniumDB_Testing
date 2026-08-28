@@ -1,0 +1,3 @@
+CALL graph_project('test_expr', 'User', 'KNOWS')
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount, nodeCount + relationshipCount AS total

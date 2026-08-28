@@ -1,8 +1,24 @@
 #include "import.h"
 
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <thread>
+
+#ifdef ENABLE_GNN
+#include "gnn/storage/feature_matrix.h"
+#include "gnn/storage/gnn_dtype.h"
+#include "gnn/storage/row_mapping.h"
+#endif
 #include "graph_models/common/conversions.h"
 #include "graph_models/inliner.h"
 #include "import/import_helper.h"
+#include "import/npy_loader.h"
+#include "misc/ablation_registry.h"
+#include "misc/fatal_error.h"
 #include "misc/unicode_escape.h"
 #include "storage/index/lists/list_encoder.h"
 
@@ -11,12 +27,14 @@ using namespace Import::GQL;
 OnDiskImport::OnDiskImport(
     const std::string& db_folder,
     uint64_t strings_buffer_size,
-    uint64_t tensors_buffer_size
+    uint64_t tensors_buffer_size,
+    const std::string& tensor_file
 ) :
     catalog("catalog.dat"),
     strings_buffer_size(strings_buffer_size),
     tensors_buffer_size(tensors_buffer_size),
     db_folder(db_folder),
+    tensor_file_(tensor_file),
     node_labels(db_folder + "/node_labels"),
     edge_labels(db_folder + "/edge_labels"),
     node_properties(db_folder + "/node_properties"),
@@ -294,34 +312,29 @@ uint64_t OnDiskImport::get_datatype_value_id()
         value_id = DateTime::from_dateTime(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << " invalid dateTime: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid dateTime `", lexer.str, '`');
         }
     } else if (strcmp(datatype_beg, "date") == 0) {
         value_id = DateTime::from_date(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << "invalid date: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid date `", lexer.str, '`');
         }
     } else if (strcmp(datatype_beg, "time") == 0) {
         value_id = DateTime::from_time(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << "invalid time: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid time `", lexer.str, '`');
         }
     } else if (strcmp(datatype_beg, "dateTimeStamp") == 0) {
         value_id = DateTime::from_dateTimeStamp(lexer.str);
         if (value_id == ObjectId::NULL_ID) {
             parsing_errors++;
-            std::cout << "ERROR on line " << current_line << ", ";
-            std::cout << "invalid dateTimeStamp: " << lexer.str << "\n";
+            WARN("line ", current_line, ": Invalid dateTimeStamp `", lexer.str, '`');
         }
     } else {
         parsing_errors++;
-        std::cout << "ERROR on line " << current_line << ", ";
-        std::cout << "unknown datatype: " << datatype_beg << "\n";
+        WARN("line ", current_line, ": unknown datatype `", lexer.str, '`');
     }
     return value_id;
 }
@@ -571,7 +584,7 @@ void OnDiskImport::finish_line()
 void OnDiskImport::print_error()
 {
     parsing_errors++;
-    std::cout << "ERROR on line " << current_line << "\n";
+    WARN("ERROR on line ", current_line);
 }
 
 void OnDiskImport::try_save_node_label(uint64_t node_id, uint64_t label_id)
@@ -641,9 +654,11 @@ void OnDiskImport::start_import(MDBIstream& in)
 
     std::cout << "-------------------------------------\n";
     if (parsing_errors != 0) {
-        std::cout << "\n!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!\n";
-        std::cout << "  " << parsing_errors << " errors found.\n";
-        std::cout << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+        WARN(
+            "\n!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!\n  ",
+            parsing_errors,
+            " errors found.\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        );
     }
     print_duration("Parsing", start);
 
@@ -1006,6 +1021,30 @@ void OnDiskImport::start_import(MDBIstream& in)
 
     print_duration("Write B+tree indexes", start);
 
+    // Free the external_helper buffer (~4GB default) before loading NPY tensors.
+    // The buffer was only needed for string/tensor hashing and B+tree creation;
+    // keeping it alive during NPY load caused std::bad_alloc on large datasets.
+    external_helper.reset();
+
+#ifdef ENABLE_GNN
+    // Import node embeddings from NPY file if provided
+    if (!tensor_file_.empty()) {
+        import_node_tensors();
+        print_duration("Import node tensors", start);
+    }
+#else
+    if (!tensor_file_.empty()) {
+        WARN("--with-tensors was specified but this build has ENABLE_GNN=OFF.\n"
+             "  Tensor file '", tensor_file_, "' was NOT imported.\n"
+             "  Rebuild with -D ENABLE_GNN=ON to enable tensor import.");
+        // The worker knob below is read only by the tensor-import path, which is
+        // not in this build. Saying so is the difference between an arm that took
+        // the other path and an arm that ran the same code twice.
+        Ablation::inert("MDB_TENSOR_IMPORT_WORKERS",
+                        "ENABLE_GNN=OFF, tensor import not compiled in");
+    }
+#endif
+
     catalog.print(std::cout);
 
     print_duration("Total Import", import_start);
@@ -1025,8 +1064,7 @@ void OnDiskImport::advance_automaton(int token)
         func();
     } catch (std::exception& e) {
         parsing_errors++;
-        std::cout << "ERROR on line " << current_line << "\n";
-        std::cout << e.what() << "\n";
+        WARN("ERROR on line ", current_line, "\n", e.what());
         current_state = State::WRONG_LINE;
     }
 }
@@ -1089,3 +1127,112 @@ inline void OnDiskImport::process_pending(
     // process pending finished, clean up the last pending file
     pending_vector->skip_indexing();
 }
+
+#ifdef ENABLE_GNN
+void OnDiskImport::import_node_tensors() {
+    std::cout << "Loading node embeddings from: " << tensor_file_ << "\n";
+
+    // Memmap the .npy so we never materialize the full array in RAM — papers100M
+    // features alone are 53 GiB, which OOMs std::vector on commodity hardware.
+    std::string err;
+    auto mm = NpyLoader::load_memmapped(tensor_file_, err);
+    if (!mm.valid()) {
+        FATAL_ERROR("Failed to memmap tensor file '", tensor_file_, "': ", err);
+    }
+
+    const auto& meta = mm.metadata();
+    if (meta.shape.size() != 2) {
+        FATAL_ERROR("Expected 2D tensor (num_nodes, feature_dim), got ",
+                    meta.shape.size(), "D");
+    }
+
+    const uint64_t num_nodes   = meta.shape[0];
+    const uint64_t feature_dim = meta.shape[1];
+    const bool     is_float64  = meta.is_float64;
+    const size_t   item_bytes  = is_float64 ? sizeof(double) : sizeof(float);
+    const size_t   row_bytes   = feature_dim * item_bytes;
+
+    if (feature_dim > 0 && num_nodes > UINT64_MAX / feature_dim) {
+        FATAL_ERROR("Tensor dimensions overflow: ", num_nodes, " x ", feature_dim);
+    }
+    if (num_nodes != catalog.nodes_count) {
+        FATAL_ERROR("Tensor has ", num_nodes, " rows but graph has ",
+                    catalog.nodes_count, " nodes. They must match.");
+    }
+
+    std::cout << "  Shape: " << num_nodes << " x " << feature_dim << "\n";
+    std::cout << "  Dtype: " << (is_float64 ? "float64" : "float32") << "\n";
+    std::cout << "  Order: C (row-major)\n";
+
+    namespace fs = std::filesystem;
+    auto gnn_features_dir = fs::path(db_folder) / "gnn_features";
+    fs::create_directories(gnn_features_dir);
+
+    auto fmat_path = gnn_features_dir / "node_features.fmat";
+    auto rmap_path = gnn_features_dir / "node_features.rmap";
+    auto gnn_dtype = is_float64 ? mdb::gnn::GnnDtype::FLOAT64 : mdb::gnn::GnnDtype::FLOAT32;
+
+    const char* src_bytes = static_cast<const char*>(mm.data());
+
+    // Worker count for the parallel feature copy. Sequential (papers100M
+    // 56 GiB) was ~30 min wall clock dominated by fwrite/fsync overhead, not
+    // the memcpy. Striping rows across N pwrite()-based workers turns the
+    // copy I/O-bound on the destination disk instead of single-thread bound.
+    //
+    // MDB_TENSOR_IMPORT_WORKERS:
+    //   unset / 0 — auto-detect: min(8, hardware_concurrency() - 1)
+    //   1         — force the legacy sequential path (for A/B benchmarking)
+    //   N > 1     — explicit worker count
+    //
+    // Resolved through the registry so the count lands in the log: a
+    // sequential-vs-parallel A/B on this knob is otherwise indistinguishable
+    // after the fact, because nothing else records which arm ran. The INT_MAX
+    // bound reproduces the old std::stoi range check — a value past int used to
+    // throw and fall through to auto-detect, and still does.
+    unsigned tensor_workers = 0;
+    const long requested_workers = Ablation::number("MDB_TENSOR_IMPORT_WORKERS", 0);
+    if (requested_workers >= 0 && requested_workers <= INT_MAX) {
+        tensor_workers = static_cast<unsigned>(requested_workers);
+    }
+    if (tensor_workers == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 2; // hardware_concurrency may return 0 on exotic systems
+        tensor_workers = std::min<unsigned>(8u, hw > 1 ? hw - 1 : 1);
+    }
+
+    std::cout << "  Workers: " << tensor_workers
+              << " (override via MDB_TENSOR_IMPORT_WORKERS)\n";
+
+    try {
+        // Stream rows from the mmapped source into the .fmat output. Each
+        // worker uses its own row buffer (~row_bytes peak) and pwrite()s to
+        // disjoint offsets in the pre-allocated output file; the source mmap
+        // is read-only and shared safely across threads.
+        mdb::gnn::FeatureMatrix::create_parallel(
+            fmat_path, num_nodes, feature_dim, gnn_dtype,
+            [src_bytes, row_bytes](uint64_t row_id, void* dest, uint64_t dest_bytes) {
+                std::memcpy(dest, src_bytes + row_id * row_bytes, dest_bytes);
+            },
+            tensor_workers
+        );
+
+        // Write RowMapping (.rmap): sequential-ObjectId identity map.
+        std::vector<ObjectId> node_oids;
+        node_oids.reserve(num_nodes);
+        for (uint64_t i = 0; i < num_nodes; ++i) {
+            node_oids.push_back(ObjectId(i | ObjectId::MASK_NODE));
+        }
+        mdb::gnn::RowMapping::create(rmap_path, node_oids);
+    } catch (...) {
+        std::error_code ec;
+        fs::remove(fmat_path, ec);
+        fs::remove(rmap_path, ec);
+        throw;
+    }
+
+    catalog.register_gnn_feature("node_features");
+
+    std::cout << "  Stored node_features: " << num_nodes << " x " << feature_dim
+              << " (" << fmat_path.string() << ")\n";
+}
+#endif // ENABLE_GNN

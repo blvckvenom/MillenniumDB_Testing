@@ -48,3 +48,9 @@ void CheckStatements::visit(OpRepetition&) { }
 void CheckStatements::visit(OpLinearPattern&) { }
 void CheckStatements::visit(OpUnitTable&) { }
 void CheckStatements::visit(OpEmpty&) { }
+void CheckStatements::visit(OpCallProcedure&)
+{
+    // CALL is a valid statement that can introduce variables (via YIELD)
+    // and precede RETURN, just like MATCH and LET
+    has_match_or_let = true;
+}

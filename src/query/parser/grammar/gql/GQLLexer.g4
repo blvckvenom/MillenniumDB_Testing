@@ -288,6 +288,10 @@ COPY
    : 'COPY'
    ;
 
+COSINEDISTANCE
+   : 'COSINEDISTANCE'
+   ;
+
 COS
    : 'COS'
    ;

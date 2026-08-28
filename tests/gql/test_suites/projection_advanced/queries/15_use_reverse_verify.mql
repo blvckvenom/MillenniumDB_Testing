@@ -1,0 +1,3 @@
+USE adv_11
+MATCH (n)-[e]->(m)
+RETURN count(*) AS edge_count

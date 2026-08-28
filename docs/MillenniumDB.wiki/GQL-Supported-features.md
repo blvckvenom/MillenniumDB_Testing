@@ -54,6 +54,9 @@ These statements are supported.
   * The return statement can contain a list of expressions or the `*` symbol.
   * Supports `DISTINCT` and `ALL`.
   * Supports the group by clause
+* Call statement
+  * `CALL` with procedure name and arguments is supported.
+  * `YIELD` clause for selecting procedure output fields is supported.
 
 ## Expression
 

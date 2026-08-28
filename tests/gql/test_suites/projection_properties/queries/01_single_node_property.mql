@@ -1,0 +1,3 @@
+CALL graph_project('prop_single_node', 'User', 'Friend', {nodeProperties: 'age'})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

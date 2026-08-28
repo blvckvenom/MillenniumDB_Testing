@@ -24,8 +24,7 @@ void my_terminate_handler()
 {
     try {
         std::cerr << boost::stacktrace::stacktrace();
-    } catch (...) {
-    }
+    } catch (...) { }
     std::abort();
 }
 
@@ -96,14 +95,17 @@ int main(int argc, char* argv[])
                 quad_model.MAX_LIMIT = config.limit;
             }
 
-            quad_model.catalog.print(std::cout);
+            logger.info([](std::ostream& os) {
+                quad_model.catalog.print(os);
+            });
 
             try {
                 for (int i = 0; i < warmups; i++) {
                     auto version_scope = buffer_manager.init_version_readonly();
                     get_query_ctx().prepare(*version_scope, config.query_timeout);
 
-                    auto logical_plan = MQL::QueryParser::get_query_plan(query);
+                    MQL::QueryParser parser(query);
+                    auto logical_plan = parser.get_query_plan({});
                     MQL::ExecutorConstructor query_optimizer(MQL::ReturnType::CSV);
                     logical_plan->accept_visitor(query_optimizer);
 
@@ -116,7 +118,8 @@ int main(int argc, char* argv[])
                 get_query_ctx().prepare(*version_scope, config.query_timeout);
 
                 auto start_parser = system_clock::now();
-                auto logical_plan = MQL::QueryParser::get_query_plan(query);
+                MQL::QueryParser parser(query);
+                auto logical_plan = parser.get_query_plan({});
                 DurationMS parser_duration = system_clock::now() - start_parser;
 
                 auto start_optimizer = system_clock::now();
@@ -129,7 +132,7 @@ int main(int argc, char* argv[])
                 auto physical_plan = std::move(query_optimizer.executor);
                 auto execution_start = system_clock::now();
 
-                logger.log(Category::ExecutionStats, [&physical_plan](std::ostream& os) {
+                logger.info([&physical_plan](std::ostream& os) {
                     physical_plan->analyze(os, true);
                     os << '\n';
                 });
@@ -137,21 +140,21 @@ int main(int argc, char* argv[])
                 auto result_count = physical_plan->execute(std::cout);
                 DurationMS execution_duration = system_clock::now() - execution_start;
 
-                logger(Category::Info) << "Results: " << result_count << "\n"
-                                       << "Parser duration:    " << parser_duration.count() << " ms\n"
-                                       << "Optimizer duration: " << optimizer_duration.count() << " ms\n"
-                                       << "Execution duration: " << execution_duration.count() << " ms";
+                logger.info() << "Results            : " << result_count << "\n"
+                              << "Parser duration    : " << parser_duration.count() << " ms\n"
+                              << "Optimizer duration : " << optimizer_duration.count() << " ms\n"
+                              << "Execution duration : " << execution_duration.count() << " ms";
             } catch (const QueryParsingException& e) {
-                logger(Category::Error) << "Query Parsing Exception. Line " << e.line << ", col: " << e.column
-                                        << ": " << e.what();
+                logger.error() << "Query Parsing Exception. Line " << e.line << ", col: " << e.column << ": "
+                               << e.what();
 
                 std::cout << std::string(e.what());
             } catch (const QueryException& e) {
-                logger(Category::Error) << "Query Exception: " << e.what();
+                logger.error() << "Query Exception: " << e.what();
 
                 std::cout << std::string(e.what());
             } catch (const LogicException& e) {
-                logger(Category::Error) << "Logic Exception: " << e.what();
+                logger.error() << "Logic Exception: " << e.what();
 
                 std::cout << std::string(e.what());
             }
@@ -167,14 +170,17 @@ int main(int argc, char* argv[])
                 rdf_model.MAX_LIMIT = config.limit;
             }
 
-            rdf_model.catalog.print(std::cout);
+            logger.info([](std::ostream& os) {
+                rdf_model.catalog.print(os);
+            });
 
             try {
                 for (int i = 0; i < warmups; i++) {
                     auto version_scope = buffer_manager.init_version_readonly();
                     get_query_ctx().prepare(*version_scope, config.query_timeout);
 
-                    auto logical_plan = SPARQL::QueryParser::get_query_plan(query);
+                    SPARQL::QueryParser parser(query);
+                    auto logical_plan = parser.get_query_plan({});
                     SPARQL::ExecutorConstructor executor_constructor(SPARQL::ResponseType::TSV);
                     logical_plan->accept_visitor(executor_constructor);
 
@@ -187,7 +193,8 @@ int main(int argc, char* argv[])
                 get_query_ctx().prepare(*version_scope, config.query_timeout);
 
                 auto start_parser = system_clock::now();
-                auto logical_plan = SPARQL::QueryParser::get_query_plan(query);
+                SPARQL::QueryParser parser(query);
+                auto logical_plan = parser.get_query_plan({});
                 DurationMS parser_duration = system_clock::now() - start_parser;
 
                 auto start_optimizer = system_clock::now();
@@ -200,7 +207,7 @@ int main(int argc, char* argv[])
                 auto physical_plan = std::move(executor_constructor.executor);
                 auto execution_start = system_clock::now();
 
-                logger.log(Category::ExecutionStats, [&physical_plan](std::ostream& os) {
+                logger.info([&physical_plan](std::ostream& os) {
                     physical_plan->analyze(os, false);
                     os << '\n';
                 });
@@ -208,27 +215,27 @@ int main(int argc, char* argv[])
                 auto result_count = physical_plan->execute(std::cout);
                 DurationMS execution_duration = system_clock::now() - execution_start;
 
-                logger.log(Category::ExecutionStats, [&physical_plan](std::ostream& os) {
+                logger.info([&physical_plan](std::ostream& os) {
                     physical_plan->analyze(os, true);
                     os << '\n';
                 });
 
-                logger(Category::Info) << "Results: " << result_count << "\n"
-                                       << "Parser duration:    " << parser_duration.count() << " ms\n"
-                                       << "Optimizer duration: " << optimizer_duration.count() << " ms\n"
-                                       << "Execution duration: " << execution_duration.count() << " ms";
+                logger.info() << "Results            : " << result_count << "\n"
+                              << "Parser duration    : " << parser_duration.count() << " ms\n"
+                              << "Optimizer duration : " << optimizer_duration.count() << " ms\n"
+                              << "Execution duration : " << execution_duration.count() << " ms";
 
             } catch (const QueryParsingException& e) {
-                logger(Category::Error) << "Query Parsing Exception. Line " << e.line << ", col: " << e.column
-                                        << ": " << e.what();
+                logger.error() << "Query Parsing Exception. Line " << e.line << ", col: " << e.column << ": "
+                               << e.what();
 
                 std::cout << std::string(e.what());
             } catch (const QueryException& e) {
-                logger(Category::Error) << "Query Exception: " << e.what();
+                logger.error() << "Query Exception: " << e.what();
 
                 std::cout << std::string(e.what());
             } catch (const LogicException& e) {
-                logger(Category::Error) << "Logic Exception: " << e.what();
+                logger.error() << "Logic Exception: " << e.what();
 
                 std::cout << std::string(e.what());
             }

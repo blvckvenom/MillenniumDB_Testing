@@ -1,0 +1,36 @@
+// ============================================================
+// Advanced projection test dataset
+// Tests: MAP syntax, aggregation, renaming, defaults, aliasing
+// 6 nodes, 11 edges (including 5 parallel TRANSFER edges)
+// ============================================================
+
+// Persons: some have 'rating', some don't (tests defaultValue)
+0 :Person name:"Alice" age:30 rating:9.5
+1 :Person name:"Bob" age:25 rating:7.0
+2 :Person name:"Carol" age:35
+3 :Person name:"Dave"
+
+// Items
+I0 :Item title:"Widget"
+I1 :Item title:"Gadget"
+
+// KNOWS: no parallel edges (safe for SINGLE aggregation)
+0->1 :KNOWS weight:1.0
+1->2 :KNOWS weight:2.0
+2->0 :KNOWS weight:3.0
+
+// TRANSFER: parallel edges for aggregation tests
+// 0->1 has 3 edges: amounts 100, 200, 50
+// 1->2 has 2 edges: amounts 75, 25
+0->1 :TRANSFER amount:100
+0->1 :TRANSFER amount:200
+0->1 :TRANSFER amount:50
+1->2 :TRANSFER amount:75
+1->2 :TRANSFER amount:25
+
+// FOLLOWS: for per-type orientation
+0->2 :FOLLOWS
+1->0 :FOLLOWS
+
+// SIMILAR: undirected edge
+I0~I1 :SIMILAR score:0.8

@@ -1,5 +1,7 @@
 # Unsupported features
 
+**Last updated:** 2026-03-24
+
 These features are not supported. The list follows the same order as in the GQL Standard.
 
 * Session management
@@ -11,16 +13,13 @@ These features are not supported. The list follows the same order as in the GQL 
 * Query statements
   * Composite query expressions
     * We do not support query conjunction or set operators `UNION`, `EXCEPT`, `INTERSECT`.
-  * Call query statement
   * Group by clause
   * Select statement
-* Procedure calling and control flow
 * Common elements
   * At schema
-  * Use graph clause
+  * Use graph clause (partially supported: `USE projection_name` works for querying native projections, but full graph expression syntax from ISO 39075 is not implemented)
   * Graph pattern binding table
   * Insert graph pattern
-  * Yield clause
 * Object references
 * Type elements
 * Predicates

@@ -65,17 +65,10 @@ bool BFSEnum<MULTIPLE_FINAL>::_next()
 
         // Starting state is solution
         if (automaton.is_final_state[automaton.start_state]) {
-            auto reached_state = SearchState(
-                automaton.start_state,
-                current_state->node_id,
-                nullptr,
-                true,
-                ObjectId::get_null()
-            );
             if (MULTIPLE_FINAL) {
                 reached_final.insert(current_state->node_id.id);
             }
-            auto path_id = path_manager.set_path(visited.insert(reached_state).first.operator->(), path_var);
+            auto path_id = path_manager.set_path(current_state, path_var);
             parent_binding->add(path_var, path_id);
             parent_binding->add(end, current_state->node_id);
             return true;
@@ -162,11 +155,9 @@ template<bool MULTIPLE_FINAL>
 void BFSEnum<MULTIPLE_FINAL>::print(std::ostream& os, int indent, bool stats) const
 {
     if (stats) {
-        if (stats) {
-            os << std::string(indent, ' ') << "[begin: " << stat_begin << " next: " << stat_next
-               << " reset: " << stat_reset << " results: " << results << " idx_searches: " << idx_searches
-               << "]\n";
-        }
+        os << std::string(indent, ' ') << "[begin: " << stat_begin << " next: " << stat_next
+            << " reset: " << stat_reset << " results: " << results << " idx_searches: " << idx_searches
+            << "]\n";
     }
     os << std::string(indent, ' ') << "Paths::Any::BFSEnum(path_var: " << path_var
        << ", start: " << start << ", end: " << end << ")";

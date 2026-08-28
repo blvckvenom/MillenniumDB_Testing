@@ -3,6 +3,18 @@
 MillenniumDB should be able to be built on any x86-64 Linux distribution.
 On windows, Windows Subsystem for Linux (WSL) can be used. MacOS is supported if using a Mac chip. For Mac with Intel chips or Windows without WSL, Docker can be used: see [[Docker]].
 
+## System Requirements
+
+- x86-64 Linux distribution (Windows via WSL, MacOS on Apple Silicon supported)
+- GCC >= 8.1
+- CMake >= 3.12
+- Git
+- libssl
+- ncursesw and less (for CLI)
+- Python >= 3.8 with venv (for tests)
+- ICU library (libicu-dev)
+- Boost 1.82 (must be manually installed - see below)
+
 ## Install Dependencies
 
 MillenniumDB needs the following dependencies:
@@ -54,6 +66,28 @@ mv boost_1_82_0/boost $MDB_HOME/third_party/boost_1_82/include
 rm -r boost_1_82_0.tar.gz boost_1_82_0
 ```
 
+## Install Documentation Tools (Optional)
+
+For API documentation generation with class diagrams:
+
+```bash
+# Ubuntu/Debian
+sudo apt install doxygen graphviz
+
+# MacOS
+brew install doxygen graphviz
+
+# Generate documentation
+doxygen Doxyfile
+
+# View in browser
+xdg-open docs/api/html/index.html  # Linux native
+open docs/api/html/index.html       # MacOS
+
+# WSL (Windows Subsystem for Linux)
+"/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" "$(wslpath -w docs/api/html/index.html)"
+```
+
 ## Build the Project
 
 Go back into the repository root directory and configure and build MillenniumDB:
@@ -72,4 +106,31 @@ If the compilation is successful, then you should be able to run this command to
 
 ```bash
 build/Release/bin/mdb help
+```
+
+## Build Types
+
+### Release Build (Recommended for Normal Use)
+
+```bash
+cmake -B build/Release -D CMAKE_BUILD_TYPE=Release
+cmake --build build/Release -j <n>
+```
+
+### Debug Build (With Sanitizers)
+
+Includes AddressSanitizer and UndefinedBehaviorSanitizer for development:
+
+```bash
+cmake -B build/Debug -D CMAKE_BUILD_TYPE=Debug
+cmake --build build/Debug -j <n>
+```
+
+### Profile Build (Requires gperftools/tcmalloc)
+
+For performance profiling:
+
+```bash
+cmake -B build/Profile -D CMAKE_BUILD_TYPE=Release -D PROFILE=ON
+cmake --build build/Profile -j <n>
 ```

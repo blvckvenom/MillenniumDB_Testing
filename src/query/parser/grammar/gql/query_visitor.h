@@ -74,6 +74,10 @@ private:
     OpEdge create_edge(VarId left_node, VarId right_node, VarId edge_id, VarId direction_var, EdgeType type);
     uint64_t get_unsigned_integer(std::string& str);
 
+    // Helper methods for parsing DataConfig parameter
+    DataConfig parse_data_config(GQLParser::RecordLiteralContext* ctx);
+    std::vector<std::string> parse_string_list(GQLParser::ListLiteralContext* ctx);
+
     std::vector<std::unique_ptr<Expr>> filter_items;
     std::vector<OpReturn::Item> return_items;
 
@@ -161,7 +165,6 @@ public:
     std::any visitSubpathVariableDeclaration(GQLParser::SubpathVariableDeclarationContext* ctx) override;
 
     // Labels
-    std::any visitIsLabelExpression(GQLParser::IsLabelExpressionContext* ctx) override;
     std::any visitLabelExpression(GQLParser::LabelExpressionContext* ctx) override;
     std::any visitLabelTerm(GQLParser::LabelTermContext* ctx) override;
     std::any visitLabelFactor(GQLParser::LabelFactorContext* ctx) override;
@@ -177,6 +180,7 @@ public:
     // Predicate expression
     std::any visitGqlBooleanTestExpression(GQLParser::GqlBooleanTestExpressionContext* ctx) override;
     std::any visitGqlComparisonExpression(GQLParser::GqlComparisonExpressionContext* ctx) override;
+    std::any visitGqlInExpression(GQLParser::GqlInExpressionContext* ctx) override;
 
     // Expression atom
     std::any visitGqlParenthesizedExpression(GQLParser::GqlParenthesizedExpressionContext* ctx) override;
@@ -201,6 +205,11 @@ public:
     std::any visitIntegerLiteral(GQLParser::IntegerLiteralContext* ctx) override;
     std::any visitFloatLiteral(GQLParser::FloatLiteralContext* ctx) override;
     std::any visitBooleanLiteral(GQLParser::BooleanLiteralContext* ctx) override;
+    std::any visitListLiteral(GQLParser::ListLiteralContext* ctx) override;
+    std::any visitListValueConstructor(GQLParser::ListValueConstructorContext* ctx) override;
+    std::any visitRecordLiteral(GQLParser::RecordLiteralContext* ctx) override;
+    std::any visitGqlCollectionExpression(GQLParser::GqlCollectionExpressionContext* ctx) override;
+    std::any visitRecordValueConstructor(GQLParser::RecordValueConstructorContext* ctx) override;
     std::any visitGqlUnaryExpression(GQLParser::GqlUnaryExpressionContext* ctx) override;
 
     std::any visitOrderByAndPageStatement(GQLParser::OrderByAndPageStatementContext* ctx) override;
@@ -211,6 +220,9 @@ public:
     // numericFunction
     std::any visitGqlOneArgScalarFunction(GQLParser::GqlOneArgScalarFunctionContext* ctx) override;
     std::any visitGqlTwoArgScalarFunction(GQLParser::GqlTwoArgScalarFunctionContext* ctx) override;
+
+    // tensorFunction
+    std::any visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext* ctx) override;
 
     // stringFunction
     std::any visitGqlSubstringFunction(GQLParser::GqlSubstringFunctionContext* ctx) override;

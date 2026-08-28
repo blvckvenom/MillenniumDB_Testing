@@ -1,0 +1,431 @@
+#include "gnn/sampling/seed_selector.h"
+
+#include <algorithm>
+#include <climits>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <numeric>
+#include <stdexcept>
+
+#include "gnn/projection/topology_accessor.h"
+#include "gnn/storage/row_mapping.h"
+#include "graph_models/gql/projection/projection_manager.h"
+#include "graph_models/gql/projection/projection_storage.h"
+
+namespace fs = std::filesystem;
+
+namespace mdb::gnn {
+
+// =============================================================================
+// Implementation Details
+// =============================================================================
+
+struct SeedSelector::Impl {
+    GQL::ProjectionStorage& storage;
+    SamplingConfig config;
+
+    // Cached data — one of two paths is used:
+    //  (a) ObjectId path: all_seeds stores full ObjectIds (8 bytes each)
+    //  (b) Index path:    seed_indices stores uint32_t row indices (4 bytes each)
+    //      ObjectIds are recovered on demand via row_mapping_->get()
+    const RowMapping* row_mapping_ = nullptr;
+    bool use_index_path_ = false;             // true when RowMapping available and size <= UINT32_MAX
+    std::vector<ObjectId>  all_seeds;         // (a) ObjectId path
+    std::vector<uint32_t>  seed_indices;      // (b) Index path
+    SeedSplit split;
+    bool seeds_collected = false;
+    bool split_computed = false;
+
+    Impl(GQL::ProjectionStorage& storage_, const SamplingConfig& config_,
+         const RowMapping* row_mapping)
+        : storage(storage_)
+        , config(config_)
+        , row_mapping_(row_mapping)
+    {
+        // Validate configuration
+        config.validate();
+
+        // Determine if we can use the index path (uint32_t row indices).
+        // Falls back to ObjectId path when RowMapping is null or too large.
+        if (row_mapping_ && row_mapping_->size() <= static_cast<uint64_t>(UINT32_MAX)) {
+            use_index_path_ = true;
+        }
+    }
+
+    /**
+     * @brief Collect seeds using NodeIterator or RowMapping.
+     *
+     * Two paths:
+     *  (a) Index path (use_index_path_): generate [0, 1, ..., N-1] as uint32_t
+     *      indices into RowMapping. Half the memory of ObjectId storage.
+     *  (b) ObjectId path (fallback): load all ObjectIds via NodeIterator.
+     */
+    void collect_all_seeds() {
+        if (seeds_collected) {
+            return;
+        }
+
+        if (use_index_path_) {
+            // Index-based: generate [0, 1, 2, ..., N-1] as uint32_t
+            uint64_t N = row_mapping_->size();
+            seed_indices.resize(N);
+            std::iota(seed_indices.begin(), seed_indices.end(), uint32_t(0));
+            // ObjectIds recovered on demand via row_mapping_->get(seed_indices[i])
+        } else {
+            // Original path: load all ObjectIds via NodeIterator
+            all_seeds.clear();
+            NodeIterator iter(storage);
+            uint64_t total = iter.total_count();
+            all_seeds.reserve(total);
+
+            constexpr size_t BATCH_SIZE = 10000;
+            while (auto batch = iter.next_batch(BATCH_SIZE)) {
+                for (const auto& node_id : *batch) {
+                    all_seeds.push_back(node_id);
+                }
+            }
+        }
+
+        seeds_collected = true;
+    }
+
+    /**
+     * @brief Convert a range of seed_indices to ObjectIds via RowMapping.
+     *
+     * Helper for compute_split() on the index path.
+     */
+    std::vector<ObjectId> indices_to_object_ids(
+        const std::vector<uint32_t>& indices,
+        size_t begin,
+        size_t end
+    ) const {
+        std::vector<ObjectId> result;
+        result.reserve(end - begin);
+        for (size_t i = begin; i < end; ++i) {
+            result.push_back(row_mapping_->get(indices[i]));
+        }
+        return result;
+    }
+
+    /**
+     * @brief Read splits.bin from the projection directory and assign seeds.
+     *
+     * File format (matches SplitStore):
+     *   Offset  Size  Field
+     *    0       8    magic: "GNNS\0\0\0\0"
+     *    8       4    version: uint32 (1)
+     *   12       4    reserved: uint32 (0)
+     *   16       8    num_nodes: uint64
+     *   24      N*1   splits: uint8[N]  (0=TRAIN, 1=VAL, 2=TEST, 255=UNLABELED)
+     *
+     * We read the file directly (no torch dependency) to avoid header conflicts.
+     */
+    void compute_predefined_split() {
+        // Get projection directory
+        auto& manager = GQL::ProjectionManager::get_instance();
+        std::string proj_dir = manager.get_projection_dir(config.projection_name);
+
+        auto splits_path = fs::path(proj_dir) / "splits.bin";
+        if (!fs::exists(splits_path)) {
+            throw std::runtime_error(
+                "usePredefinedSplits is true but splits.bin not found at: " +
+                splits_path.string() + "\n"
+                "Ensure the projection was created with split data "
+                "(e.g., graph_project with splits configuration)."
+            );
+        }
+
+        // Require RowMapping for predefined splits (need row index lookup)
+        if (!row_mapping_) {
+            throw std::runtime_error(
+                "usePredefinedSplits requires a RowMapping but none was provided. "
+                "The projection may not have a row_mapping.rmap file."
+            );
+        }
+
+        std::ifstream sf(splits_path, std::ios::binary);
+        if (!sf.is_open()) {
+            throw std::runtime_error(
+                "Failed to open splits.bin at: " + splits_path.string()
+            );
+        }
+
+        // Read and validate header
+        static constexpr uint8_t EXPECTED_MAGIC[8] = {'G','N','N','S','\0','\0','\0','\0'};
+
+        uint8_t magic[8];
+        sf.read(reinterpret_cast<char*>(magic), 8);
+        if (!sf || std::memcmp(magic, EXPECTED_MAGIC, 8) != 0) {
+            throw std::runtime_error(
+                "Invalid splits.bin: bad magic header at " + splits_path.string()
+            );
+        }
+
+        uint32_t version = 0;
+        sf.read(reinterpret_cast<char*>(&version), 4);
+        if (!sf || version != 1) {
+            throw std::runtime_error(
+                "Unsupported splits.bin version: " + std::to_string(version) +
+                " (expected 1) at " + splits_path.string()
+            );
+        }
+
+        uint32_t reserved = 0;
+        sf.read(reinterpret_cast<char*>(&reserved), 4);
+
+        uint64_t num_nodes = 0;
+        sf.read(reinterpret_cast<char*>(&num_nodes), 8);
+        if (!sf) {
+            throw std::runtime_error(
+                "Failed to read splits.bin header at " + splits_path.string()
+            );
+        }
+
+        // Read split data
+        std::vector<uint8_t> split_data(num_nodes);
+        sf.read(reinterpret_cast<char*>(split_data.data()), num_nodes);
+        if (!sf) {
+            throw std::runtime_error(
+                "Failed to read split data from splits.bin (expected " +
+                std::to_string(num_nodes) + " bytes) at " + splits_path.string()
+            );
+        }
+
+        // Assign seeds to splits based on predefined values
+        auto assign_seeds = [&](const std::vector<ObjectId>& seeds) {
+            for (const auto& seed : seeds) {
+                auto row_opt = row_mapping_->find(seed);
+                if (!row_opt) {
+                    continue;  // Seed not in RowMapping, skip
+                }
+                if (*row_opt >= num_nodes) {
+                    continue;  // Row index out of bounds for split data, skip
+                }
+                uint8_t split_val = split_data[*row_opt];
+                switch (split_val) {
+                    case 0: split.train_seeds.push_back(seed);      break;  // TRAIN
+                    case 1: split.validation_seeds.push_back(seed);  break;  // VAL
+                    case 2: split.test_seeds.push_back(seed);        break;  // TEST
+                    default: break;  // UNLABELED (255) or unknown, skip
+                }
+            }
+        };
+
+        if (use_index_path_) {
+            // Convert all indices to ObjectIds, then assign
+            auto all_oids = indices_to_object_ids(seed_indices, 0, seed_indices.size());
+            assign_seeds(all_oids);
+        } else {
+            assign_seeds(all_seeds);
+        }
+    }
+
+    /**
+     * @brief Split seeds into train/validation/test sets.
+     *
+     * Uses deterministic shuffle with config.random_seed for reproducibility.
+     * Operates on either seed_indices (index path) or all_seeds (ObjectId path).
+     *
+     * When config.use_predefined_splits is true, reads splits.bin from the
+     * projection directory instead of random ratio-based splitting.
+     */
+    void compute_split() {
+        if (split_computed) {
+            return;
+        }
+
+        // Ensure seeds are collected
+        collect_all_seeds();
+
+        // Branch: predefined splits vs. ratio-based
+        if (config.use_predefined_splits) {
+            compute_predefined_split();
+            split_computed = true;
+            return;
+        }
+
+        if (use_index_path_) {
+            // Index path: shuffle uint32_t indices, then convert ranges to ObjectIds
+            if (seed_indices.empty()) {
+                split_computed = true;
+                return;
+            }
+
+            std::vector<uint32_t> shuffled = seed_indices;
+            deterministic_shuffle(shuffled, config.random_seed);
+
+            size_t total = shuffled.size();
+            size_t train_end = static_cast<size_t>(total * config.train_ratio);
+            size_t val_end = train_end + static_cast<size_t>(total * config.val_ratio);
+
+            if (config.train_ratio > 0 && train_end == 0 && total > 0) {
+                train_end = 1;
+            }
+            if (config.val_ratio > 0 && val_end == train_end && total > train_end) {
+                val_end = train_end + 1;
+            }
+
+            split.train_seeds      = indices_to_object_ids(shuffled, 0, train_end);
+            split.validation_seeds = indices_to_object_ids(shuffled, train_end, val_end);
+            split.test_seeds       = indices_to_object_ids(shuffled, val_end, total);
+        } else {
+            // ObjectId path (original)
+            if (all_seeds.empty()) {
+                split_computed = true;
+                return;
+            }
+
+            std::vector<ObjectId> shuffled = all_seeds;
+            deterministic_shuffle(shuffled, config.random_seed);
+
+            size_t total = shuffled.size();
+            size_t train_end = static_cast<size_t>(total * config.train_ratio);
+            size_t val_end = train_end + static_cast<size_t>(total * config.val_ratio);
+
+            if (config.train_ratio > 0 && train_end == 0 && total > 0) {
+                train_end = 1;
+            }
+            if (config.val_ratio > 0 && val_end == train_end && total > train_end) {
+                val_end = train_end + 1;
+            }
+
+            split.train_seeds.assign(shuffled.begin(), shuffled.begin() + train_end);
+            split.validation_seeds.assign(shuffled.begin() + train_end, shuffled.begin() + val_end);
+            split.test_seeds.assign(shuffled.begin() + val_end, shuffled.end());
+        }
+
+        split_computed = true;
+    }
+
+    /**
+     * @brief Generate shuffled batches for a specific split and epoch.
+     */
+    std::vector<std::vector<ObjectId>> generate_split_batches(
+        const std::vector<ObjectId>& seeds,
+        uint64_t epoch,
+        uint64_t split_offset
+    ) {
+        if (seeds.empty()) {
+            return {};
+        }
+
+        // Create a copy and shuffle for this epoch
+        std::vector<ObjectId> shuffled = seeds;
+
+        // Deterministic seed: base_seed + epoch * 3 + split_offset
+        // This ensures different shuffles per epoch AND per split
+        uint64_t rng_seed = config.random_seed + epoch * 3 + split_offset;
+        deterministic_shuffle(shuffled, rng_seed);
+
+        // Create batches
+        return create_batches(shuffled, config.batch_size);
+    }
+};
+
+// =============================================================================
+// SeedSelector Public Interface
+// =============================================================================
+
+SeedSelector::SeedSelector(GQL::ProjectionStorage& storage,
+                           const SamplingConfig& config,
+                           const RowMapping* row_mapping)
+    : impl_(std::make_unique<Impl>(storage, config, row_mapping))
+{
+}
+
+SeedSelector::~SeedSelector() = default;
+
+SeedSelector::SeedSelector(SeedSelector&&) noexcept = default;
+SeedSelector& SeedSelector::operator=(SeedSelector&&) noexcept = default;
+
+std::vector<ObjectId> SeedSelector::collect_seeds() {
+    impl_->collect_all_seeds();
+
+    if (impl_->use_index_path_) {
+        // Materialize ObjectIds from indices for callers that need the full vector
+        return impl_->indices_to_object_ids(
+            impl_->seed_indices, 0, impl_->seed_indices.size());
+    }
+    return impl_->all_seeds;
+}
+
+SeedSplit SeedSelector::get_seed_split() {
+    impl_->compute_split();
+    return impl_->split;
+}
+
+SplitBatches SeedSelector::generate_batches() {
+    // Generate batches with initial shuffle (using config.random_seed)
+    return generate_epoch_batches(0);
+}
+
+SplitBatches SeedSelector::generate_epoch_batches(uint64_t shuffle_seed) {
+    impl_->compute_split();
+
+    SplitBatches batches;
+    batches.train_batches = impl_->generate_split_batches(
+        impl_->split.train_seeds, shuffle_seed, 0
+    );
+    batches.validation_batches = impl_->generate_split_batches(
+        impl_->split.validation_seeds, shuffle_seed, 1
+    );
+    batches.test_batches = impl_->generate_split_batches(
+        impl_->split.test_seeds, shuffle_seed, 2
+    );
+
+    return batches;
+}
+
+std::vector<std::vector<ObjectId>> SeedSelector::generate_split_batches(
+    SplitType split_type,
+    uint64_t shuffle_seed
+) {
+    impl_->compute_split();
+
+    switch (split_type) {
+        case SplitType::TRAIN:
+            return impl_->generate_split_batches(impl_->split.train_seeds, shuffle_seed, 0);
+        case SplitType::VALIDATION:
+            return impl_->generate_split_batches(impl_->split.validation_seeds, shuffle_seed, 1);
+        case SplitType::TEST:
+            return impl_->generate_split_batches(impl_->split.test_seeds, shuffle_seed, 2);
+    }
+
+    // Unreachable, but satisfy compiler
+    return {};
+}
+
+size_t SeedSelector::total_seed_count() {
+    impl_->collect_all_seeds();
+    return impl_->use_index_path_ ? impl_->seed_indices.size() : impl_->all_seeds.size();
+}
+
+size_t SeedSelector::seed_count(SplitType split_type) {
+    impl_->compute_split();
+
+    switch (split_type) {
+        case SplitType::TRAIN:
+            return impl_->split.train_seeds.size();
+        case SplitType::VALIDATION:
+            return impl_->split.validation_seeds.size();
+        case SplitType::TEST:
+            return impl_->split.test_seeds.size();
+    }
+
+    return 0;
+}
+
+size_t SeedSelector::batches_per_epoch(SplitType split_type) {
+    size_t seeds = seed_count(split_type);
+    if (seeds == 0) return 0;
+    return (seeds + impl_->config.batch_size - 1) / impl_->config.batch_size;
+}
+
+size_t SeedSelector::total_batches_per_epoch() {
+    return batches_per_epoch(SplitType::TRAIN) +
+           batches_per_epoch(SplitType::VALIDATION) +
+           batches_per_epoch(SplitType::TEST);
+}
+
+} // namespace mdb::gnn

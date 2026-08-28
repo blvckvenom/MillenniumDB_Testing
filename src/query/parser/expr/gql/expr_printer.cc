@@ -455,14 +455,30 @@ void ExprPrinter::visit(ExprLabels& expr)
     os << "LABELS(" << expr.var << ")";
 }
 
-void ExprPrinter::visit(ExprAggCountAll&)
-{
-    os << "COUNT(*)";
-}
-
 void ExprPrinter::visit(ExprProperties& expr)
 {
     os << "PROPERTIES(" << expr.var << ")";
+}
+
+void ExprPrinter::visit(ExprIn& expr)
+{
+    expr.lhs->accept_visitor(*this);
+    os << " IN ";
+    expr.rhs->accept_visitor(*this);
+}
+
+void ExprPrinter::visit(ExprCosineDistance& expr)
+{
+    os << "COSINEDISTANCE(";
+    expr.lhs->accept_visitor(*this);
+    os << ", ";
+    expr.rhs->accept_visitor(*this);
+    os << ")";
+}
+
+void ExprPrinter::visit(ExprAggCountAll&)
+{
+    os << "COUNT(*)";
 }
 
 void ExprPrinter::visit(ExprAggCount& expr)

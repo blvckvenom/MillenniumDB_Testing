@@ -1,0 +1,3 @@
+CALL graph_project('test_three', ['User', 'Post', 'Comment'], ['LIKES', 'WROTE', 'COMMENTED_ON'])
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount

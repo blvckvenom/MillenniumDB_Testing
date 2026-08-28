@@ -1,0 +1,13 @@
+// Test data for CALL procedure integration tests
+// This is a simple graph to ensure the database is valid
+// The actual CALL tests use built-in procedures that don't depend on this data
+
+// Create some basic nodes
+N0 :Person name:"Alice" age:30
+N1 :Person name:"Bob" age:25
+N2 :Company name:"TechCorp"
+
+// Create some edges
+N0->N1 :KNOWS since:2020
+N0->N2 :WORKS_AT role:"Engineer"
+N1->N2 :WORKS_AT role:"Manager"

@@ -1927,6 +1927,10 @@ public:
     return visitChildren(ctx);
   }
 
+  virtual std::any visitGqlInExpression(GQLParser::GqlInExpressionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
   virtual std::any visitGqlExistsExpression(GQLParser::GqlExistsExpressionContext *ctx) override {
     return visitChildren(ctx);
   }
@@ -2016,6 +2020,10 @@ public:
   }
 
   virtual std::any visitFunctionCall(GQLParser::FunctionCallContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitGqlCosineDistanceFunction(GQLParser::GqlCosineDistanceFunctionContext *ctx) override {
     return visitChildren(ctx);
   }
 

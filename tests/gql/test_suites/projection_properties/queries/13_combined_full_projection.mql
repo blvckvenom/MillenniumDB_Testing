@@ -1,0 +1,3 @@
+CALL graph_project('prop_combined_full', ['User', 'Post'], ['Friend', 'Posted'], {nodeProperties: ['age', 'name', 'title', 'views'], relationshipProperties: ['since', 'via']})
+YIELD graphName, nodeCount, relationshipCount
+RETURN graphName, nodeCount, relationshipCount
