@@ -35,7 +35,7 @@ struct MemoryStats {
     size_t total;            // Total GPU memory
     size_t free;             // Currently free
     size_t used;             // Total - Free
-    size_t allocated_by_us;  // Memory allocated by our MemoryPool
+    size_t allocated_by_us;  // Bytes this process allocated, as tracked here
     size_t cached_by_torch;  // Memory in LibTorch's caching allocator
 };
 

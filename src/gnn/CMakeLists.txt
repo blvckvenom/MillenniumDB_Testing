@@ -61,14 +61,10 @@ endif()
 add_library(mdb_gnn_core STATIC
     # Phase 0: Core LibTorch Foundation
     core/cuda_context.cc
-    core/memory_pool.cc
     core/sparse_ops.cc
     core/feature_assembler.cc
 
     # GNN Tensor Storage (independent from MDB tensors)
-    storage/inmemory_gnn_tensor_store.cc
-    storage/file_gnn_tensor_store.cc
-    storage/gnn_tensor_converter.cc
 
     # Phase 0: Storage - FeatureMatrix (redesign)
     storage/feature_matrix.cc
@@ -296,9 +292,9 @@ if(BUILD_TESTING)
     find_package(GTest QUIET)
 
     if(GTest_FOUND)
-        # NOTE: cuda_context / memory_pool / sparse_ops have no dedicated unit
-        # tests yet — sparse_ops (scatter_sum) is covered indirectly via
-        # test_graphsage_model and the E2E gates.
+        # NOTE: cuda_context and sparse_ops have no dedicated unit tests yet.
+        # sparse_ops (scatter_sum) is covered indirectly via test_graphsage_model
+        # and the end-to-end gates.
 
         # GNN Storage tests (FeatureMatrix + RowMapping)
         # Multiple .cc files → one executable, filtered via --gtest_filter
