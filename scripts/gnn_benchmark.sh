@@ -252,11 +252,16 @@ done
 case "$DATASET" in
   arxiv|products)
     if [ -n "$PY" ] && ! "$PY" -c "import ogb" 2>/dev/null; then
-        fail "$DATASET is converted through the ogb package, which is not installed.
+        fail "$DATASET is converted through the ogb package, which is not installed
+  in $PY.
 
-      $PY -m pip install ogb torch
+  Install it in the project virtual environment, not system-wide -- a
+  distribution python refuses pip installs as externally managed:
 
-  cora and papers100M do not need it."
+      python3 -m venv $REPO/scripts/gnn_datasets/.venv
+      $REPO/scripts/gnn_datasets/.venv/bin/pip install numpy requests tqdm ogb torch
+
+  It is about 2.5 GB. cora and papers100M do not need it."
     fi ;;
 esac
 
