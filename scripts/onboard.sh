@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# MillenniumDB feature-GNN — Automated Onboarding
+# MillenniumDB — Automated Onboarding
 # ============================================================================
 # Installs every dependency needed to build and test this repository on a
 # fresh Ubuntu / Pop!_OS 22.04+ machine, including NVIDIA driver, CUDA Toolkit,
@@ -41,7 +41,7 @@
 #         sudo apt update && sudo apt install -y git
 #      On Ubuntu Desktop "normal installation" git usually comes preinstalled.
 #   3. This repo cloned — requires git + network:
-#         git clone --branch feature-GNN <fork-url>
+#         git clone <repository-url>
 #         cd MillenniumDB_Testing
 #   4. (Recommended) Secure Boot disabled in UEFI firmware to avoid the MOK
 #      enrollment dance post-reboot. The script warns if SB is enabled.
@@ -858,8 +858,12 @@ fi
 # OGB's (zip with data.npz). Skipped with --skip-cora.
 #
 # Idempotent: downloads to $MDB_HOME/cora_data/raw/cora.tgz and skips if
-# already present. Conversion to GQL format happens separately via
-# scripts/gnn_datasets/download_gnn_datasets.py --dataset cora.
+# already present, then converts it to the .gql + .npy form the pipeline reads.
+#
+# The conversion is not optional. data/example/gql/cora/ is gitignored, so a
+# fresh clone has no fixture, and every command this script recommends at the
+# end -- cora_fastloop.sh, run-tests gnn, gnn_benchmark.sh cora -- aborts
+# without it.
 # ---------------------------------------------------------------------------
 if [ "$SKIP_CORA" -eq 0 ]; then
     log_step "Pre-staging Cora raw (LINQS, 5 MB)"
@@ -873,6 +877,20 @@ if [ "$SKIP_CORA" -eq 0 ]; then
             log_ok "Cora raw downloaded to $CORA_DIR/cora.tgz"
         else
             log_warn "Cora download failed — re-run: wget -O $CORA_DIR/cora.tgz $CORA_URL"
+        fi
+    fi
+
+    # Convert to the .gql + feature/label .npy triple the GNN procedures read.
+    if [ -f "$MDB_HOME/data/example/gql/cora/cora.gql" ]; then
+        log_ok "Cora already converted at data/example/gql/cora/"
+    else
+        CORA_PY="$MDB_HOME/scripts/gnn_datasets/.venv/bin/python"
+        [ -x "$CORA_PY" ] || CORA_PY="$(command -v python3)"
+        if "$CORA_PY" "$MDB_HOME/scripts/download_gnn_datasets.py" \
+               --dataset cora --output "$MDB_HOME/data/example/gql"; then
+            log_ok "Cora converted to data/example/gql/cora/"
+        else
+            log_warn "Cora conversion failed — re-run: python3 scripts/download_gnn_datasets.py --dataset cora"
         fi
     fi
 fi
@@ -994,7 +1012,7 @@ echo "    ./scripts/cora_fastloop.sh     # 5 s end-to-end GNN gate (start here)"
 echo "    ./scripts/run-tests gql        # full GQL test suite"
 echo "    ./scripts/run-tests            # every suite (unit+sparql+mql+gql)"
 if [ "$ENABLE_GPU" -eq 1 ]; then
-    echo "    ./scripts/verify_gnn_integration.sh   # GNN pipeline smoke test"
+    echo "    ./scripts/gnn_benchmark.sh cora        # download, train, verify the GPU is used"
 fi
 echo ""
 # Dataset pre-staging hook is now executed earlier, before the NEEDS_REBOOT
