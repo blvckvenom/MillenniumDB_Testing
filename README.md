@@ -14,3 +14,25 @@ The main objective of this project is to create a fully functional and easy-to-e
 This project is still in active development and is not production ready yet, some functionality is missing and there may be bugs.
 
 To learn more about MillenniumDB and how to use it, see our [Wiki](https://github.com/MillenniumDB/MillenniumDB/wiki).
+
+## Graph neural networks
+
+MillenniumDB can train a graph neural network over a projection of a stored graph,
+without exporting it. The pipeline is four GQL procedures — project, sample, build a
+feature store, train — and the trained embeddings can be written back as queryable
+tensor properties.
+
+It is compiled out by default. Build it with `-D ENABLE_GNN=ON`, or let
+`scripts/onboard.sh` set up the whole environment, and then run a benchmark
+end to end with a single command:
+
+```bash
+scripts/onboard.sh                # driver, CUDA, LibTorch, Boost, build, tests
+scripts/gnn_benchmark.sh cora     # download, import, project, sample, train
+```
+
+Four benchmark graphs are supported out of the box: `cora`, `ogbn-arxiv`,
+`ogbn-products` and `ogbn-papers100M`. See
+[docs/MillenniumDB.wiki/Setup-GNN.md](docs/MillenniumDB.wiki/Setup-GNN.md) for the
+build and [docs/MillenniumDB.wiki/Creating-and-running-a-GNN-database.md](docs/MillenniumDB.wiki/Creating-and-running-a-GNN-database.md)
+for the pipeline.
