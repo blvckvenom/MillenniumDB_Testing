@@ -84,7 +84,7 @@ These are compatible with MillenniumDB's `NpyLoader` (`src/import/npy_loader.h`)
 
 ### Split Assignments
 
-- **Cora**: Standard Planetoid splits (Yang et al., 2016) — 140 train, 500 val, 1000 test
+- **Cora**: Positional 140/500/1000 slice over cora.content order (NOT the Planetoid split) — 140 train, 500 val, 1000 test
 - **OGB**: Official OGB splits provided by `dataset.get_idx_split()`
 
 ## Legacy Scripts

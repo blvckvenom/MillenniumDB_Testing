@@ -432,7 +432,10 @@ def main():
     print("=" * 60)
     print()
     print("Next step:")
-    print(f"  ./build/Release/bin/mdb import {out_gql} ./data/dbs/gql/{args.dataset_name}")
+    # --with-tensors registers the feature matrix. An import without it succeeds
+    # and graph_project then fails, with a full reimport as the only recovery.
+    print(f"  ./build/Release/bin/mdb import {out_gql} ./data/dbs/gql/{args.dataset_name} \\")
+    print(f"      --with-tensors {out_feat}")
 
 
 if __name__ == "__main__":
