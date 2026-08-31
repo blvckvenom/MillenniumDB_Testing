@@ -169,7 +169,13 @@ cleanup() {
     [ -n "$SRVPID" ] && wait "$SRVPID" 2>/dev/null
     rm -f "$RESP" 2>/dev/null
     if [ "$KEEP" = "1" ]; then echo "[keep] database left at $DB"
-    elif [ "$CREATED_DB" = 1 ]; then rm -rf "$DB" "$DB.import.log" 2>/dev/null; fi
+    elif [ "$CREATED_DB" = 1 ]; then
+        # The import log survives a failure. The failure message tells the reader
+        # to look at it, and deleting it on the way out made that advice useless.
+        rm -rf "$DB" 2>/dev/null
+        if [ "$RC" = 0 ]; then rm -f "$DB.import.log" 2>/dev/null
+        elif [ -s "$DB.import.log" ]; then echo "[bench] import log kept at $DB.import.log"; fi
+    fi
     exit $RC
 }
 trap cleanup EXIT INT TERM

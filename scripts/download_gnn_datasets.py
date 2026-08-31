@@ -337,7 +337,7 @@ class CoraConverter(DatasetConverter):
             [node[4] for node in nodes], dtype=np.float32
         )
         feat_path = output_dir / "cora_features.npy"
-        np.save(feat_path, features_matrix)
+        np.save(feat_path, np.ascontiguousarray(features_matrix))
         print(f"  Features: {features_matrix.shape} → {feat_path}")
 
         # Labels: (N,) int
@@ -553,7 +553,12 @@ class OGBConverter(DatasetConverter):
 
         if node_feat is not None:
             feat_path = output_dir / f"{self.file_prefix}_features.npy"
-            feat_array = np.asarray(node_feat, dtype=np.float32)
+            # ascontiguousarray, not asarray: asarray preserves the source's
+            # memory order, and ogb hands back Fortran-order arrays. The
+            # importer refuses an F-order .npy rather than transposing it,
+            # because transposing means materialising the whole matrix and the
+            # memmap path exists precisely to avoid that.
+            feat_array = np.ascontiguousarray(node_feat, dtype=np.float32)
             np.save(feat_path, feat_array)
             print(f"  Features: {feat_array.shape} → {feat_path}")
 
