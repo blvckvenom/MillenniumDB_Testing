@@ -22,6 +22,7 @@
 #   --db <path>       where to build the database (default: a fresh temp dir)
 #   --port <n>        server port (default 7879)
 #   --epochs <n>      override the training epochs
+#   --gpu-cache-mb <n>  size of the GPU feature cache (default: per dataset)
 #
 # Why a GPU is required by default: MillenniumDB falls back to CPU silently when
 # CUDA is unavailable. Nothing errors, the run simply takes several times longer.
@@ -40,6 +41,7 @@ REFRESH=0
 KEEP=0
 DB=""
 EPOCHS=""
+GPU_CACHE=""
 DATASET=""
 
 while [ $# -gt 0 ]; do
@@ -59,6 +61,9 @@ while [ $# -gt 0 ]; do
         --epochs)         [ $# -ge 2 ] || { echo "--epochs needs a number" >&2; exit 1; }
                           case "$2" in ''|*[!0-9]*) echo "--epochs takes an integer, got '$2'" >&2; exit 1 ;; esac
                           EPOCHS="$2"; shift ;;
+        --gpu-cache-mb)   [ $# -ge 2 ] || { echo "--gpu-cache-mb needs a number" >&2; exit 1; }
+                          case "$2" in ''|*[!0-9]*) echo "--gpu-cache-mb takes an integer, got '$2'" >&2; exit 1 ;; esac
+                          GPU_CACHE="$2"; shift ;;
         -h|--help)        sed -n '2,29p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1  (try --help)" >&2; exit 1 ;;
     esac
@@ -118,6 +123,16 @@ papers100M)
     exit 1 ;;
 esac
 [ -n "$EPOCHS" ] || EPOCHS=$DEF_EPOCHS
+
+# The cache budgets are fixed per dataset rather than sized to the card, so that
+# two machines produce comparable numbers: a 24 GB card given a 24 GB budget
+# would post hit ratios an 8 GB card cannot, and the gap would read as speed
+# when it is only budget. --gpu-cache-mb is the escape for a card that cannot
+# hold the default.
+if [ -n "$GPU_CACHE" ]; then
+    BUILD_OPTS=$(echo "$BUILD_OPTS" | sed -E "s/gpu_budget_mb:[0-9]+/gpu_budget_mb:$GPU_CACHE/")
+    case "$BUILD_OPTS" in *gpu_budget_mb:*) ;; *) BUILD_OPTS="gpu_budget_mb:$GPU_CACHE,$BUILD_OPTS" ;; esac
+fi
 
 GQL_DIR="$REPO/data/example/gql/$DS_DIR"
 GQL="$GQL_DIR/$PREFIX.gql"

@@ -33,7 +33,10 @@
 
 set -euo pipefail
 
-MDB=${MDB:-./build/Release/bin/mdb}
+# Resolved from this script rather than from the caller's directory, so the
+# benchmark runs from anywhere. MDB_HOME still overrides.
+MDB_HOME="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MDB=${MDB:-$MDB_HOME/build/Release/bin/mdb}
 BENCH=${BENCH:-./build/Release/bin/bench_topology_micro}
 PORT_BASE=${PORT_BASE:-19971}
 NUM_SEEDS=${NUM_SEEDS:-10000}
