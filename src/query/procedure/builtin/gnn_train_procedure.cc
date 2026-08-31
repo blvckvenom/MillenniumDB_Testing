@@ -953,7 +953,7 @@ void check_label_split_row_alignment(
                 std::to_string(train_with_label) + " have a valid (non -1) label. "
                 "Likely cause: rmap was rewritten after labels.bin was built. "
                 "Fix: regenerate labels.bin + splits.bin against the current rmap "
-                "(scripts/regenerate_labels_splits.py) or rebuild the projection "
+                "or rebuild the projection "
                 "with graph_project."
             );
         }
