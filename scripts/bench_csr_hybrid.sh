@@ -21,14 +21,16 @@
 #     flags this per row so downstream consumers do not silently compare
 #     scan_edge_count across storage modes.
 #   - gnn_offline_sample throughput: uniqueNodes / wall_clock seconds on
-#     a fixed small seed set with fanout [15, 10] and a stable random seed.
+#     a fixed small seed set with fanout [10, 15] (DGL order; hop order 15 then 10) and a stable random seed.
 #     This is the primary Gate D GNN metric and exercises
 #     TopologyAccessor -> BptIter -> BPTLeafCSR.
 #
 # IndexSet: GNN_MINIMAL (topology-only subset matches Gate C/D scope).
 # Sorter  : radix (default for this bench, matches bench_leaffmt.sh).
 #
-# Strict: papers100M is NEVER projected (benito_pc not authorized; celebi-only).
+# Strict: papers100M is NEVER projected here: this bench is scoped to graphs that
+# finish in minutes, and projecting papers100M takes tens of minutes and more
+# RAM than a development machine has.
 # Missing datasets are SKIPPED (logged) rather than abort, so dev machines
 # without the big OGB copies can still run the cora_gnn smoke.
 #
@@ -70,7 +72,12 @@ SKIP_SCAN=${SKIP_SCAN:-0}
 SKIP_SAMPLE=${SKIP_SAMPLE:-0}
 BENCH_PROJ=${BENCH_PROJ:-bench_csrhyb_tmp}
 BENCH_SAMPLE=${BENCH_SAMPLE:-bench_csrhyb_sample}
-FANOUTS=${FANOUTS:-"[15, 10]"}
+# Fanout notation: since 2026-07-06 gnn_offline_sample reads the list in DGL
+# order -- the LAST element is the hop adjacent to the seeds -- and reverses it
+# internally. The default below was flipped to preserve the hop order this bench
+# was written to measure; results produced before that flip sampled the mirror
+# order and are not comparable with results produced after.
+FANOUTS=${FANOUTS:-"[10, 15]"}
 NUM_SEEDS=${NUM_SEEDS:-512}
 
 # Dataset configuration: name  db_path  node_label  edge_type
@@ -85,7 +92,7 @@ if [[ -n "${DATASETS:-}" ]]; then
     NEW_DATASETS=()
     for ds in $DATASETS; do
         if [[ "$ds" == "papers100M" || "$ds" == *papers100M* ]]; then
-            echo "ERROR: papers100M is out of scope for bench_csr_hybrid.sh (benito_pc not authorized; celebi-only dataset). Aborting." >&2
+            echo "ERROR: papers100M is out of scope for bench_csr_hybrid.sh: projecting it takes tens of minutes. Aborting." >&2
             exit 3
         fi
         matched=0
@@ -113,7 +120,7 @@ STORAGE_LIST=(${STORAGE_MODES:-BTREE CSR_HYBRID})
 for entry in "${DATASETS_LIST[@]}"; do
     name="${entry%%|*}"
     if [[ "$name" == "papers100M" || "$name" == *papers100M* ]]; then
-        echo "ERROR: papers100M is out of scope for bench_csr_hybrid.sh (benito_pc not authorized; celebi-only dataset). Aborting." >&2
+        echo "ERROR: papers100M is out of scope for bench_csr_hybrid.sh: projecting it takes tens of minutes. Aborting." >&2
         exit 3
     fi
 done

@@ -1,3 +1,14 @@
+# clangd configuration.
+#
+# Paths here are relative to the repository root, which is where editors launch
+# clangd from. They used to be absolute and pointed at one contributor's home
+# directory, so the language server resolved nothing for anybody else.
+#
+# third_party/libtorch and third_party/boost_1_82 are created by
+# scripts/onboard.sh: the first is a symlink to wherever LibTorch was unpacked,
+# the second is a real directory. Without those the fallback flags below simply
+# find nothing, which is the same state as having no configuration at all.
+
 InlayHints:
   Enabled: No
   Designators: Yes
@@ -5,10 +16,12 @@ InlayHints:
   DeducedTypes: Yes
 
 CompileFlags:
-  # Use GNN-Debug build which includes LibTorch paths
-  CompilationDatabase: build/GNN-Debug/
+  # The build the project documents. Point this at build/Debug or a GNN-specific
+  # build directory if that is what you configured.
+  CompilationDatabase: build/Release/
 
-  # Fallback flags for files not in compile_commands.json (e.g., new headers)
+  # Fallback flags for files absent from compile_commands.json, such as a header
+  # that no translation unit includes yet.
   Add:
     - "-xc++"
     - "-std=c++17"
@@ -21,16 +34,16 @@ CompileFlags:
     - "-isystem/usr/include/x86_64-linux-gnu"
     - "-isystem/usr/include"
     # Project includes
-    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/src"
-    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/src/gnn"
-    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/libtorch/include"
-    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/libtorch/include/torch/csrc/api/include"
-    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/boost_1_82/include"
-    - "-I/home/benito_pc/Escritorio/MillenniumDB-Trabajo-Personal-todo-/third_party/antlr4-runtime-4.13.1/src"
+    - "-Isrc"
+    - "-Isrc/gnn"
+    - "-Ithird_party/libtorch/include"
+    - "-Ithird_party/libtorch/include/torch/csrc/api/include"
+    - "-Ithird_party/boost_1_82/include"
+    - "-Ithird_party/antlr4-runtime-4.13.1/src"
     - "-DGNN_CUDA_ENABLED"
     - "-D_GLIBCXX_USE_CXX11_ABI=1"
 
-  # Remove problematic flags that clangd doesn't understand
+  # Flags the compiler accepts but clangd does not.
   Remove:
     - "-fno-operator-names"
     - "-march=native"

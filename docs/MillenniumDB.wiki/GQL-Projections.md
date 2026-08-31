@@ -786,7 +786,7 @@ al MAP de configuración.
 
 ### Flujo completo con `includeFeatures`
 
-Ver `Working-with-tensors.md` y `Partial_Idea/` para el flujo canónico:
+Ver `Working-with-tensors.md` y `docs/adr/` para el flujo canónico:
 
 > **Ejemplo aspiracional — no ejecutado en este documento.** Requiere
 > importar Papers con `--with-tensors <features.npy>` y registrar una
@@ -1076,7 +1076,7 @@ mid-process requiere reiniciar el servidor.
 
 ### Referencias
 
-- Diseño formal: ADR-004 (`Partial_Idea/decisions/004_radix_partition_sort.md`)
+- Diseño formal: ADR-004 (`docs/adr/004_radix_partition_sort.md`)
 - Implementación: `src/graph_models/gql/projection/{sorter_dispatch,partition_file,parallel_scan_partitioner,radix_partition_sort}.{h,cc}`
 - Script golden compare: `scripts/test_projection_radix.sh`
 
@@ -1384,7 +1384,7 @@ version **no cambia** — no hay migración.
 
 ### Referencias
 
-- Spec:- Plan:- ADR: `Partial_Idea/decisions/006_topology_snapshot.md`
+- Spec:- Plan:- ADR: `docs/adr/006_topology_snapshot.md`
 - Master plan §8-9:---
 
 ## Leaf encoding — `leafFormat` config parameter (added 2026-04-24, ADR 007)
@@ -1567,7 +1567,7 @@ v1.5 reader las trata como `BITSET` de forma transparente.
 
 ### Referencias
 
-- Spec:- Plan:- ADR: `Partial_Idea/decisions/007_delta_varint_leaf.md`
+- Spec:- Plan:- ADR: `docs/adr/007_delta_varint_leaf.md`
 - Master plan:---
 
 ## Graph storage — `graphStorage` config parameter (added 2026-04-24, ADR 008)
@@ -1758,5 +1758,5 @@ material en storage.
 
 - Spec: `docs/design/specs/2026-04-25-csr-hybrid-design.md`
 - Plan: `docs/design/plans/2026-04-25-csr-hybrid-plan.md`
-- ADR: `Partial_Idea/decisions/008_csr_hybrid.md`
+- ADR: `docs/adr/008_csr_hybrid.md`
 - Master plan:

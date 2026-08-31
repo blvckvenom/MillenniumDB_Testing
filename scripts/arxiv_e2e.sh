@@ -13,7 +13,7 @@
 # OGB time-split train/valid/test). Generate it once with:
 #   <conda diskgnn_cu124>/bin/python scripts/gnn_datasets/download_ogb.py \
 #       --dataset ogbn-arxiv --output data/example/gql/ogbn-arxiv/ \
-#       --ogb-root /home/bfuentes/diskgnn_data/ogb_raw
+#       --ogb-root "$HOME/ogb_data"
 #
 # Exit 0 = PASS.
 set -u -o pipefail

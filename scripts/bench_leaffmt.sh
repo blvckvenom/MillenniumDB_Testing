@@ -15,7 +15,9 @@
 # Stack: SERIAL_SCAN + RADIX (MDB_PROJECTION_SERIAL_SCAN=1 MDB_PROJECTION_SORTER=radix)
 # IndexSet: GNN_MINIMAL (topology-only subset matches Gate C scope).
 #
-# Strict: papers100M is NEVER projected (benito_pc not authorized; celebi-only).
+# Strict: papers100M is NEVER projected here: this bench is scoped to graphs that
+# finish in minutes, and projecting papers100M takes tens of minutes and more
+# RAM than a development machine has.
 # Missing datasets are SKIPPED (logged) rather than abort, so dev machines
 # without the big OGB copies can still run the cora_gnn smoke.
 #
@@ -58,7 +60,7 @@ if [[ -n "${DATASETS:-}" ]]; then
     NEW_DATASETS=()
     for ds in $DATASETS; do
         if [[ "$ds" == "papers100M" || "$ds" == *papers100M* ]]; then
-            echo "ERROR: papers100M is out of scope for bench_leaffmt.sh (benito_pc not authorized; celebi-only dataset). Aborting." >&2
+            echo "ERROR: papers100M is out of scope for bench_leaffmt.sh: projecting it takes tens of minutes. Aborting." >&2
             exit 3
         fi
         matched=0
@@ -85,7 +87,7 @@ FORMATS_LIST=(${FORMATS:-BITSET DELTA_VARINT})
 for entry in "${DATASETS_LIST[@]}"; do
     name="${entry%%|*}"
     if [[ "$name" == "papers100M" || "$name" == *papers100M* ]]; then
-        echo "ERROR: papers100M is out of scope for bench_leaffmt.sh (benito_pc not authorized; celebi-only dataset). Aborting." >&2
+        echo "ERROR: papers100M is out of scope for bench_leaffmt.sh: projecting it takes tens of minutes. Aborting." >&2
         exit 3
     fi
 done
