@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# Resolved from this script so the archive stays runnable off the machine it
+# was written on. MDB_HOME and MDB both override.
+MDB_HOME="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+MDB="${MDB:-$MDB_HOME/build/Release/bin/mdb}"
 set -e
 
 echo "=== PROJECT Aggregate Function Integration Test ==="
@@ -21,7 +26,7 @@ EOF
 
 # Import the data
 echo "3. Importing data..."
-/home/benito/B_MillenniumDB/MillenniumDB/build/Release/bin/mdb import /tmp/test_data.gql /tmp/mdb_project_test
+"$MDB" import /tmp/test_data.gql /tmp/mdb_project_test
 
 echo ""
 echo "4. Testing PROJECT syntax parsing..."

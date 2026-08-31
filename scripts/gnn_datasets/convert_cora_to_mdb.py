@@ -16,10 +16,10 @@ Usage:
 
 Examples:
     # Quick test (16 features)
-    python convert_cora_to_mdb.py ~/Descargas/cora/cora ./data/example/gql/cora/cora.gql
+    python convert_cora_to_mdb.py path/to/cora ./data/example/gql/cora/cora.gql
 
     # Full features (1433 dimensions)
-    python convert_cora_to_mdb.py ~/Descargas/cora/cora ./data/example/gql/cora/cora_full.gql 1433
+    python convert_cora_to_mdb.py path/to/cora ./data/example/gql/cora/cora_full.gql 1433
 """
 
 import os

@@ -23,7 +23,10 @@
 
 set -euo pipefail
 
-MDB=${MDB:-./build/Release/bin/mdb}
+# Resolved from this script rather than from the caller's directory, so the
+# benchmark runs from anywhere. MDB_HOME still overrides.
+MDB_HOME="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MDB=${MDB:-$MDB_HOME/build/Release/bin/mdb}
 DB=${DB:-data/dbs/gql/cora_gnn}
 PORT=${PORT:-19884}
 NODE_LABEL=${NODE_LABEL:-Paper}

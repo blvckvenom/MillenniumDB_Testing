@@ -25,14 +25,9 @@ CompileFlags:
   Add:
     - "-xc++"
     - "-std=c++17"
-    # System includes (GCC 13)
-    - "-isystem/usr/include/c++/13"
-    - "-isystem/usr/include/x86_64-linux-gnu/c++/13"
-    - "-isystem/usr/include/c++/13/backward"
-    - "-isystem/usr/lib/gcc/x86_64-linux-gnu/13/include"
-    - "-isystem/usr/local/include"
-    - "-isystem/usr/include/x86_64-linux-gnu"
-    - "-isystem/usr/include"
+    # No -isystem entries for the standard library. They used to name GCC 13
+    # explicitly, which resolves to nothing on a host with any other version, and
+    # clangd already asks the compiler for its own system include paths.
     # Project includes
     - "-Isrc"
     - "-Isrc/gnn"
