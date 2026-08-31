@@ -64,7 +64,11 @@ while [ $# -gt 0 ]; do
         --gpu-cache-mb)   [ $# -ge 2 ] || { echo "--gpu-cache-mb needs a number" >&2; exit 1; }
                           case "$2" in ''|*[!0-9]*) echo "--gpu-cache-mb takes an integer, got '$2'" >&2; exit 1 ;; esac
                           GPU_CACHE="$2"; shift ;;
-        -h|--help)        sed -n '2,29p' "$0"; exit 0 ;;
+        # Located by the header's own banner lines rather than by a fixed
+        # range, which silently desyncs the moment the header grows -- that is
+        # how the explanation below lost its last two lines. The pattern avoids
+        # interval quantifiers, which mawk rejects without --re-interval.
+        -h|--help)        awk 'NR==1{next} /^# =+$/{n++} n>=3{exit} {print}' "$0"; exit 0 ;;
         *) echo "unknown argument: $1  (try --help)" >&2; exit 1 ;;
     esac
     shift
