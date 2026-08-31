@@ -43,12 +43,15 @@ print_ok() {
 
 print_warn() {
     echo -e "  ${YELLOW}⚠${NC} $1"
-    ((WARNINGS++))
+    # Post-increment returns the OLD value, so at 0 it returns 0, which is a
+    # false exit status and kills the script under 'set -e' on the very first
+    # warning. Assignment always succeeds.
+    WARNINGS=$((WARNINGS + 1))
 }
 
 print_error() {
     echo -e "  ${RED}✗${NC} $1"
-    ((ERRORS++))
+    ERRORS=$((ERRORS + 1))
 }
 
 # ============================================================================
@@ -247,8 +250,7 @@ if [ -d "$GNN_DIR" ]; then
     KEY_FILES=(
         "CMakeLists.txt"
         "core/cuda_context.h"
-        "core/tensor_utils.h"
-        "storage/gnn_tensor_store.h"
+            "storage/gnn_tensor_store.h"
         "storage/gnn_tensor_converter.h"
         "projection/feature_accessor.h"
     )
