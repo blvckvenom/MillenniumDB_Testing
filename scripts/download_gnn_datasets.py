@@ -29,6 +29,7 @@ GNN Integration Team - MillenniumDB
 import argparse
 import hashlib
 import os
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -80,9 +81,12 @@ CORA_CLASS_MAP = {
     "Theory": 6,
 }
 
-# Standard Planetoid splits (Yang et al., 2016)
-# Indices into the sorted node list that define train/val/test
-CORA_SPLIT_TRAIN = 140   # first 140 nodes (20 per class)
+# A positional 140/500/1000 slice over the order cora.content happens to be
+# written in. This is NOT the Planetoid split of Yang et al. (2016): that one is
+# 20 nodes per class by construction, whereas this one produces
+# {0:14, 1:11, 2:41, 3:28, 4:21, 5:8, 6:17}. Accuracy measured against it is a
+# smoke gate and is not comparable with published Cora numbers.
+CORA_SPLIT_TRAIN = 140   # first 140 nodes in file order
 CORA_SPLIT_VAL   = 500   # next 500 nodes
 CORA_SPLIT_TEST  = 1000  # next 1000 nodes
 
@@ -148,8 +152,12 @@ class DatasetConverter(ABC):
         print(f"  GQL file:  {gql}  ({gql.stat().st_size / 1024:.1f} KB)")
         print(f"  Features:  {feat}  ({feat.stat().st_size / 1024 / 1024:.1f} MB)")
         print(f"  Labels:    {labels}  ({labels.stat().st_size / 1024:.1f} KB)")
+        # --with-tensors is what registers the feature matrix and writes the row
+        # mapping. An import without it succeeds, and graph_project then fails
+        # with no way forward but a full reimport.
         print(f"\n  Import into MillenniumDB:")
-        print(f"    ./build/Release/bin/mdb import {gql} ./data/dbs/gql/{self.name}")
+        print(f"    ./build/Release/bin/mdb import {gql} ./data/dbs/gql/{self.name} \\")
+        print(f"        --with-tensors {feat}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,9 +276,9 @@ class CoraConverter(DatasetConverter):
             print(f"  Warning: {skipped} edges skipped (referenced non-existent papers)")
         print(f"  Parsed {len(edges)} edges")
 
-        # ── Assign Planetoid splits ──────────────────────────────────────
-        # Standard splits: train=0..139, val=140..639, test=640..1639
-        # remaining nodes are unlabeled (indices 1640..2707)
+        # ── Assign the positional split ──────────────────────────────────
+        # train=0..139, val=140..639, test=640..1639 in cora.content order;
+        # everything past 1639 is unlabeled. See the note on CORA_SPLIT_TRAIN.
         train_end = CORA_SPLIT_TRAIN
         val_end = train_end + CORA_SPLIT_VAL
         test_end = val_end + CORA_SPLIT_TEST
@@ -556,17 +564,165 @@ class OGBConverter(DatasetConverter):
             print(f"  Labels:   {labels_array.shape} → {label_path}")
 
 
+class StreamingOGBConverter(DatasetConverter):
+    """
+    Converts the very large OGB datasets that cannot go through OGBConverter.
+
+    OGBConverter loads a dataset with ogb.nodeproppred.NodePropPredDataset,
+    which allocates every array eagerly. For ogbn-papers100M the feature matrix
+    alone is 53 GiB, so that path exhausts memory on any commodity machine.
+
+    This converter instead delegates to two existing pieces:
+
+      1. scripts/download-dataset.sh   fetches the raw zip from the SNAP mirror
+                                       and unpacks it, nothing more.
+      2. stream_convert_ogb.py         reads the .npy members of the raw
+                                       data.npz one chunk at a time, so peak
+                                       memory stays near 500 MB no matter how
+                                       large the graph is.
+
+    Only the "-bin" OGB distributions carry the raw/data.npz that the streaming
+    converter reads; the .csv.gz distributions must use OGBConverter.
+    """
+
+    DATASETS = {
+        "ogbn-papers100M": {
+            "nodes": 111_059_956,
+            "edges": 1_615_685_872,
+            "feat_dim": 128,
+            "directed": True,
+            "split_kind": "time",
+            "raw_dir_name": "ogbn_papers100M",
+            "download_arg": "papers100M",
+            "description": "Citation network, the largest OGB node-property benchmark",
+            "download_size": "~60GB",
+            "disk_after_convert": "~105GB",
+            # Raw archive, edge staging file, features, .gql and labels all
+            # coexist during the conversion.
+            "peak_transient_gb": 190,
+        },
+    }
+
+    def __init__(self, dataset_name: str):
+        if dataset_name not in self.DATASETS:
+            raise ValueError(
+                f"Unknown streaming dataset: {dataset_name}. "
+                f"Supported: {list(self.DATASETS.keys())}"
+            )
+        self._dataset_name = dataset_name
+        self._info = self.DATASETS[dataset_name]
+
+    @property
+    def name(self) -> str:
+        return self._dataset_name
+
+    @property
+    def file_prefix(self) -> str:
+        # stream_convert_ogb.py names its outputs after --dataset-name, which we
+        # pass as the short form, so the prefix must match that and not the
+        # "ogbn-" qualified name.
+        return self._info["download_arg"]
+
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    def download(self, cache_dir: Path) -> Path:
+        """Fetch the raw zip via download-dataset.sh and return its unpacked dir."""
+        info = self._info
+        repo = self._repo_root()
+        # `or` rather than a default: MDB_HOME="" is a value to os.environ.get but
+        # not to the shell's ${MDB_HOME:-...}, so the two would resolve to
+        # different directories and the failure would surface as a confusing
+        # complaint about the archive layout.
+        raw_root = Path(os.environ.get("MDB_HOME") or cache_dir.parent) / "ogb_data"
+        target = raw_root / info["raw_dir_name"]
+
+        print(f"[{self.name}] Raw download ({info['download_size']})...")
+        print(f"  Description: {info['description']}")
+        print(f"  Expected: {info['nodes']:,} nodes, {info['edges']:,} edges")
+        print(f"  Disk after conversion: {info['disk_after_convert']}")
+        print(f"  Peak during conversion: ~{info['peak_transient_gb']} GB")
+
+        # Fail here rather than hours into a download that cannot finish.
+        import shutil
+        need = info["peak_transient_gb"] * 1024 ** 3
+        for label, where in (("raw", raw_root), ("output", cache_dir.parent)):
+            probe = where
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            free = shutil.disk_usage(probe).free
+            if free < need:
+                raise RuntimeError(
+                    f"{self.name} needs about {info['peak_transient_gb']} GB free at "
+                    f"peak, and the {label} path {where} has {free / 1024 ** 3:.0f} GB. "
+                    f"Point MDB_HOME and --output at a larger filesystem."
+                )
+
+        if (target / "raw" / "data.npz").exists():
+            print(f"  Already present at {target}, skipping download.")
+            return target
+
+        script = repo / "scripts" / "download-dataset.sh"
+        if not script.exists():
+            raise RuntimeError(f"missing {script}")
+
+        child_env = dict(os.environ, MDB_HOME=str(raw_root.parent))
+        subprocess.run(["bash", str(script), info["download_arg"]],
+                       check=True, env=child_env)
+
+        if not (target / "raw" / "data.npz").exists():
+            raise RuntimeError(
+                f"{script.name} finished but {target}/raw/data.npz is absent; "
+                f"the archive layout is not the '-bin' distribution this "
+                f"converter needs"
+            )
+        return target
+
+    def convert(self, raw_path: Path, output_dir: Path) -> None:
+        """Run the bounded-memory converter over the unpacked raw directory."""
+        info = self._info
+        repo = self._repo_root()
+        converter = repo / "scripts" / "gnn_datasets" / "stream_convert_ogb.py"
+        if not converter.exists():
+            raise RuntimeError(f"missing {converter}")
+
+        cmd = [
+            sys.executable, str(converter),
+            "--raw-dir", str(raw_path / "raw"),
+            "--split-dir", str(raw_path / "split" / info["split_kind"]),
+            "--output", str(output_dir),
+            "--dataset-name", info["download_arg"],
+        ]
+        if info["directed"]:
+            cmd.append("--directed")
+
+        print(f"[{self.name}] Streaming conversion (peak RAM stays near 500 MB)...")
+        subprocess.run(cmd, check=True)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-AVAILABLE_DATASETS = ["cora", "ogbn-arxiv", "ogbn-products"]
+# Every dataset any benchmark, test, or reproduction script in this repository
+# actually uses. ogbn-mag and ogbn-proteins can be downloaded by
+# scripts/download-dataset.sh but nothing consumes them, and neither converter
+# below handles them: mag is heterogeneous (four node types, so it has no single
+# edge_index) and proteins carries edge features rather than node features.
+AVAILABLE_DATASETS = ["cora", "ogbn-arxiv", "ogbn-products", "ogbn-papers100M"]
+
+# What "--dataset all" resolves to. papers100M is excluded on purpose: it is a
+# 50 GB download that expands past 120 GB, which is not something a convenience
+# alias should start without being named.
+DEFAULT_ALL = ["cora", "ogbn-arxiv", "ogbn-products"]
 
 
 def build_converter(name: str) -> DatasetConverter:
     """Factory: return the appropriate converter for a dataset name."""
     if name == "cora":
         return CoraConverter()
+    elif name in StreamingOGBConverter.DATASETS:
+        return StreamingOGBConverter(name)
     else:
         return OGBConverter(name)
 
@@ -581,10 +737,20 @@ def list_datasets() -> None:
     for ds_name, info in OGBConverter.DATASETS.items():
         print(f"{ds_name:<18} {info['nodes']:>12,} {info['edges']:>14,} "
               f"{info['feat_dim']:>10} {'OGB':<10}")
+    for ds_name, info in StreamingOGBConverter.DATASETS.items():
+        print(f"{ds_name:<18} {info['nodes']:>12,} {info['edges']:>14,} "
+              f"{info['feat_dim']:>10} {'OGB':<10}")
     print("-" * 72)
+    print("\n  --dataset all  covers: " + ", ".join(DEFAULT_ALL))
+    print("  ogbn-papers100M is excluded from 'all': 50 GB to download, past")
+    print("  120 GB once converted. Name it explicitly to fetch it.")
+    print("\n  ogbn-mag and ogbn-proteins are downloadable through")
+    print("  scripts/download-dataset.sh but cannot be converted here and no")
+    print("  benchmark in this repository uses them.")
     print("\nUsage:")
     print("  python scripts/download_gnn_datasets.py --dataset cora")
     print("  python scripts/download_gnn_datasets.py --dataset all")
+    print("  python scripts/download_gnn_datasets.py --dataset ogbn-papers100M")
 
 
 def main():
@@ -640,18 +806,24 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine which datasets to process
-    datasets = AVAILABLE_DATASETS if args.dataset == "all" else [args.dataset]
+    datasets = DEFAULT_ALL if args.dataset == "all" else [args.dataset]
 
+    failed = []
     for ds_name in datasets:
         try:
             converter = build_converter(ds_name)
             converter.run(output_base, cache_dir, force=args.force)
         except Exception as e:
             print(f"\n✗ Error processing {ds_name}: {e}")
+            failed.append(ds_name)
             if ds_name != datasets[-1]:
                 print("  Continuing with next dataset...\n")
 
     print("\n" + "=" * 60)
+    if failed:
+        print("  FAILED: " + ", ".join(failed))
+        print("=" * 60)
+        sys.exit(1)
     print("  All done!")
     print("=" * 60)
 

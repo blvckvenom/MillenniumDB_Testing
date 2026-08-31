@@ -156,8 +156,25 @@ ALT_NAMES=(
 for pair in "${ALT_NAMES[@]}"; do
     src="${pair%:*}"
     dst="${pair#*:}"
-    if [ -d "$src" ] && [ ! -d "$dst" ]; then
-        mv "$src" "$dst"
+    # No "&& [ ! -d $dst ]" guard here. An empty destination left by an aborted
+    # run does not trip the file-based idempotency check above, so with the guard
+    # the rename was skipped and the run paid the whole download and extraction
+    # before failing with a complaint about the archive layout.
+    if [ -d "$src" ]; then
+        if [ -d "$dst" ]; then
+            # A plain mv into an existing directory nests it as $dst/$src.
+            # An empty leftover is safe to discard; a populated one is not
+            # something this script should silently overwrite.
+            if rmdir "$dst" 2>/dev/null; then
+                mv "$src" "$dst"
+            else
+                echo "ERROR: $dst already exists and is not empty." >&2
+                echo "       Remove or move it, then re-run." >&2
+                exit 1
+            fi
+        else
+            mv "$src" "$dst"
+        fi
         break
     fi
 done
