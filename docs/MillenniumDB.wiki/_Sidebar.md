@@ -11,6 +11,12 @@
 * [[Creating and running a database]]
 * [[Docker]]
 
+## Graph neural networks
+
+* [[Setup|Setup GNN]]
+* [[Creating and running a GNN database]]
+* [[Model checkpoints|GNN Model Checkpoints]]
+
 ## Tensors
 
 * [[Working with tensors]]
