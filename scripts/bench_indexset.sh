@@ -11,7 +11,8 @@
 #
 # Stack: SERIAL_SCAN + RADIX (MDB_PROJECTION_SERIAL_SCAN=1 MDB_PROJECTION_SORTER=radix)
 #
-# Strict: papers100M is NEVER projected (celebi-only dataset).
+# Strict: papers100M is NEVER projected here: this bench is scoped to graphs that
+# finish in minutes, not to a 111M-node graph.
 #
 # Output:
 #   CSV at /tmp/bench_indexset_<ts>.csv with columns
@@ -64,7 +65,7 @@ MODES_LIST=(${MODES:-ALL GNN_MINIMAL READONLY_TRAVERSAL})
 for entry in "${DATASETS_LIST[@]}"; do
     name="${entry%%|*}"
     if [[ "$name" == "papers100M" || "$name" == *papers100M* ]]; then
-        echo "ERROR: papers100M is out of scope for bench_indexset.sh (celebi-only dataset). Aborting." >&2
+        echo "ERROR: papers100M is out of scope for bench_indexset.sh: projecting it takes tens of minutes. Aborting." >&2
         exit 3
     fi
 done
