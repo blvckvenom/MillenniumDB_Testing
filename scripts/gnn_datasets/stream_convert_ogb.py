@@ -108,6 +108,9 @@ def extract_features(
     print(f"[1/6] Features -> {output_path}")
     print(f"       shape={shape}, dtype={dtype}, size={total_bytes/1e9:.2f} GB")
 
+    # fortran_order stays at its default of False: the importer refuses an
+    # F-order .npy rather than transposing it, since transposing means holding
+    # the whole matrix in memory and this path exists to avoid that.
     out = np.lib.format.open_memmap(
         str(output_path), mode="w+", dtype=dtype, shape=shape
     )
