@@ -59,7 +59,7 @@ while [ $# -gt 0 ]; do
                           case "$2" in ''|*[!0-9]*) echo "--port takes an integer, got '$2'" >&2; exit 1 ;; esac
                           PORT="$2"; shift ;;
         --epochs)         [ $# -ge 2 ] || { echo "--epochs needs a number" >&2; exit 1; }
-                          case "$2" in ''|*[!0-9]*) echo "--epochs takes an integer, got '$2'" >&2; exit 1 ;; esac
+                          case "$2" in ''|*[!0-9]*|0) echo "--epochs takes a positive integer, got '$2'" >&2; exit 1 ;; esac
                           EPOCHS="$2"; shift ;;
         --gpu-cache-mb)   [ $# -ge 2 ] || { echo "--gpu-cache-mb needs a number" >&2; exit 1; }
                           case "$2" in ''|*[!0-9]*) echo "--gpu-cache-mb takes an integer, got '$2'" >&2; exit 1 ;; esac
@@ -174,7 +174,10 @@ say()  { printf '\033[1;36m[bench]\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[0;32m+\033[0m %s\n' "$*"; }
 warn() { printf '  \033[1;33m!\033[0m %s\n' "$*"; }
 fail() { printf '\033[0;31m[bench] FAILED:\033[0m %s\n' "$*" >&2; RC=1; exit 1; }
-now()  { date +%s; }
+# Whole seconds turned most cora stages into a row of zeros and made the
+# total wobble between 2 and 4 for identical work.
+now()  { date +%s.%N; }
+elapsed() { python3 -c "print(f'{$(now) - $1:.1f}')"; }
 
 # gql <label> <query> — POST a query, leave the body in $RESP, return non-zero
 # when the server reported a problem. Two traps are handled here:
@@ -184,9 +187,18 @@ now()  { date +%s; }
 #   when it is not being captured. Writing to a file instead of stdout keeps
 #   this out of a command substitution, so the caller's `|| fail` really aborts.
 gql() {
-    local label=$1 query=$2
-    curl -s --max-time 86400 -X POST "http://localhost:$PORT/gql" \
-         -H "Content-Type: text/plain" --data-binary "$query" > "$RESP" 2>&1
+    local label=$1 query=$2 code
+    code=$(curl -s --max-time 86400 -o "$RESP" -w '%{http_code}' \
+                -X POST "http://localhost:$PORT/gql" \
+                -H "Content-Type: text/plain" --data-binary "$query" 2>/dev/null)
+    # The status is the fact; the keyword scan is only a second opinion. The
+    # server answers 4xx/5xx with a bare message and no status line in the body,
+    # and most of those messages contain none of the words below -- "epochs must
+    # be positive" is one -- so a body-only check reports a failed call as green.
+    case "$code" in
+        2*) ;;
+        *)  printf '\n  HTTP %s\n' "$code" >&2; cat "$RESP" >&2; printf '\n'; return 1 ;;
+    esac
     if grep -qiE "(error|exception|failed|not found|bad query|unexpected)" "$RESP"; then
         printf '\n'; cat "$RESP" >&2; printf '\n'
         return 1
@@ -205,7 +217,7 @@ print(d[h.index('$1')] if '$1' in h else 'NA')
 "
 }
 
-stage() { TIMINGS+=("$1|$2"); }
+stage() { TIMINGS+=("$1|$(printf '%.1f' "$2")"); }
 
 # The server answers with whatever printf %g produced, so a plain accuracy can
 # arrive as 7.52E-1. Render it back to something a person reads at a glance.
@@ -231,6 +243,19 @@ for candidate in "$REPO/scripts/gnn_datasets/.venv/bin/python" "$(command -v pyt
     [ -x "$candidate" ] || continue
     if "$candidate" -c "import numpy, requests" 2>/dev/null; then PY="$candidate"; break; fi
 done
+# arxiv and products load their source through the ogb package, which pulls in
+# torch. Prove it here rather than after the download stage has already started.
+case "$DATASET" in
+  arxiv|products)
+    if [ -n "$PY" ] && ! "$PY" -c "import ogb" 2>/dev/null; then
+        fail "$DATASET is converted through the ogb package, which is not installed.
+
+      $PY -m pip install ogb torch
+
+  cora and papers100M do not need it."
+    fi ;;
+esac
+
 [ -n "$PY" ] || fail "no python with numpy and requests.
 
   Create the project venv once:
@@ -302,7 +327,7 @@ if ! grep -qm1 'split:' "$GQL"; then
   data directory somewhere else instead of overwriting it."
 fi
 ok "graph: $(du -h "$GQL" | cut -f1)   features: $(du -h "$NPY" | cut -f1)   splits present"
-stage dataset $(( $(now) - t0 ))
+stage dataset "$(elapsed "$t0")"
 
 # The database is what actually fills the disk: base plus features plus one
 # projection. Refuse now rather than hours in, and refuse /tmp when /tmp is a
@@ -330,7 +355,7 @@ t0=$(now)
 "$MDB" import "$GQL" "$DB" --with-tensors "$NPY" >"$DB.import.log" 2>&1 \
     || fail "import failed — see $DB.import.log"
 ok "database: $DB"
-stage import $(( $(now) - t0 ))
+stage import "$(elapsed "$t0")"
 
 # ---------------------------------------------------------------------------
 say "4/6  server"
@@ -373,7 +398,7 @@ gql graph_project "CALL graph_project('$PROJ','$NODE_LABEL','$EDGE_LABEL',{
     }) YIELD graphName,nodeCount,relationshipCount,featureDim,numClasses RETURN *" \
     || fail "graph_project did not create the projection"
 ok "project: $(col nodeCount) nodes, $(col relationshipCount) edges, dim $(col featureDim), $(col numClasses) classes"
-stage graph_project $(( $(now) - t0 ))
+stage graph_project "$(elapsed "$t0")"
 
 t0=$(now)
 gql gnn_offline_sample "CALL gnn_offline_sample('$PROJ','$SAMPLE',$FANOUT,{
@@ -383,7 +408,7 @@ gql gnn_offline_sample "CALL gnn_offline_sample('$PROJ','$SAMPLE',$FANOUT,{
     }) YIELD totalBatches,trainBatches,validationBatches,testBatches,uniqueNodes RETURN *" \
     || fail "gnn_offline_sample did not produce a sample"
 ok "sample: $(col totalBatches) batches (train $(col trainBatches)), $(col uniqueNodes) unique nodes"
-stage gnn_offline_sample $(( $(now) - t0 ))
+stage gnn_offline_sample "$(elapsed "$t0")"
 
 t0=$(now)
 gql gnn_build_feature_store "CALL gnn_build_feature_store('$SAMPLE','node_features',{
@@ -392,7 +417,7 @@ gql gnn_build_feature_store "CALL gnn_build_feature_store('$SAMPLE','node_featur
     || fail "gnn_build_feature_store did not build the store"
 GPU_SEEN=$(col gpuAvailable)
 ok "store: L1=$(col l1Nodes) L2=$(col l2Nodes) L3=$(col l3Nodes) L4=$(col l4Nodes)"
-stage gnn_build_feature_store $(( $(now) - t0 ))
+stage gnn_build_feature_store "$(elapsed "$t0")"
 
 # The runtime check that matters. nvidia-smi answering only proves a device
 # exists; this is MillenniumDB reporting whether its own build could use it.
@@ -427,7 +452,7 @@ ACC=$(col testAccuracy)
 VAL=$(col bestValAccuracy)
 L1H=$(col l1HitRatio)
 ok "train: test $(num "$ACC"), best val $(num "$VAL"), $(col ranEpochs) epochs in $(num "$(col trainSeconds)") s, L1 hit $(num "$L1H")"
-stage gnn_train $(( $(now) - t0 ))
+stage gnn_train "$(elapsed "$t0")"
 
 # ---------------------------------------------------------------------------
 say "6/6  verdict"
@@ -437,7 +462,7 @@ printf '  %-26s %10s\n' "--------------------------" "-------"
 TOTAL=0
 for row in "${TIMINGS[@]}"; do
     printf '  %-26s %10s\n' "${row%%|*}" "${row##*|}"
-    TOTAL=$(( TOTAL + ${row##*|} ))
+    TOTAL=$(python3 -c "print(f'{$TOTAL + ${row##*|}:.1f}')")
 done
 printf '  %-26s %10s\n\n' "total" "$TOTAL"
 

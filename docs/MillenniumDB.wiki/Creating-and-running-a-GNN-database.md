@@ -29,7 +29,8 @@ carries its features on edges rather than nodes.
 scripts/gnn_benchmark.sh cora          # a few seconds
 scripts/gnn_benchmark.sh arxiv         # a few minutes
 scripts/gnn_benchmark.sh products      # tens of minutes
-scripts/gnn_benchmark.sh papers100M     # hours, and 120 GB of disk
+scripts/gnn_benchmark.sh papers100M     # hours; 60 GB download, 105 GB of
+                                       # dataset files, 200 GB for the database
 ```
 
 One command per dataset, from nothing to a trained model: it downloads and
@@ -62,9 +63,9 @@ pipeline produced a model; it is not comparable with published Cora figures.
 ### 1. Download and convert
 
 ```bash
-python scripts/download_gnn_datasets.py --list
-python scripts/download_gnn_datasets.py --dataset cora
-python scripts/download_gnn_datasets.py --dataset all      # the three small ones
+python3 scripts/download_gnn_datasets.py --list
+python3 scripts/download_gnn_datasets.py --dataset cora
+python3 scripts/download_gnn_datasets.py --dataset all      # the three small ones
 ```
 
 Each dataset produces three files under `data/example/gql/<dataset>/`:
@@ -137,7 +138,9 @@ published division instead of generating one.
 
 Only properties named in `nodeProperties` cross into the projection. Without it
 the projection carries topology, features, labels and splits but no attributes,
-and a later query that filters on one of them returns nothing.
+and *reading* one of them later fails outright rather than returning an empty
+result: the projection materialized no property index, so the query raises
+`index 'key_value_node' is not materialized`.
 
 Two options matter at scale. `indexSet: 'GNN_MINIMAL'` builds 5 of the 10
 topology indexes, which is everything sampling and training need, at roughly 61%

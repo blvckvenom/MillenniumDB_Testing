@@ -16,7 +16,7 @@ normally, and `CALL gnn_train(...)` reports an unknown procedure.
 | LibTorch (C++ distribution of PyTorch) | the model, the optimiser, and the tensor operations |
 | NVIDIA driver with a kernel module for the **running** kernel | otherwise CUDA is invisible |
 | CUDA Toolkit matching the LibTorch build | mixing a `cu124` LibTorch with a `cu128` toolkit fails at link time |
-| ~25 GB free | the cu128 LibTorch unpacks to 6 GB, its zip is another 3.6 GB, and the automated path builds both Release (~2 GB) and a Debug tree of about 13 GB |
+| ~40 GB free | the cu128 LibTorch unpacks to 6 GB with its zip another 3.6 GB, the CUDA Toolkit takes 8.8 GB plus a 5.4 GB installer left in `/tmp`, and the automated path builds both Release (~2 GB) and a Debug tree of about 13 GB |
 
 The LibTorch build has to match the GPU generation. Ada cards (RTX 40 series)
 take the `cu124` distribution; Blackwell cards (RTX 50 series) need `cu128`.
@@ -127,9 +127,15 @@ error. The signs, in the order they appear:
 | Symptom | Where |
 |---|---|
 | `gpuAvailable` reads `false` | `gnn_build_feature_store` output |
-| `l1Nodes` is 0 and `l1HitRatio` is 0.0 | `gnn_build_feature_store`, `gnn_train` |
+| `l1Nodes` is 0 and `l1HitRatio` is 0.0, **on a store built with a non-zero `gpu_budget_mb`** | `gnn_build_feature_store`, `gnn_train` |
 | `useAddrTablesEffective` reads `false` | `gnn_train` output |
 | epochs take several times longer than expected | anywhere |
+
+The qualification on the second row matters. `scripts/gnn_benchmark.sh cora`
+builds its store with `gpu_budget_mb:0`, so a perfectly healthy GPU also reports
+`l1Nodes=0` and `l1HitRatio=0.0` there. Pass `--gpu-cache-mb 512` to see the
+cache exercised, or read the `gpuAvailable` line instead, which answers the
+question directly.
 
 The most common cause on a rolling-release distribution is a kernel upgrade: the
 driver package is still installed, but no kernel module was built for the kernel
