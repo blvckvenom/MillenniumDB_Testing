@@ -37,9 +37,9 @@
 #
 # Stack: MDB_PROJECTION_SORTER=radix.
 #
-# Strict: papers100M is NEVER projected here (celebi-only dataset, see
+# Strict: papers100M is NEVER projected here (too large for this bench, see
 # docs/research/2026-04-25-spec13-papers100m-procedure.md for the manual
-# celebi procedure that complements this bench at papers scale).
+# separate procedure that covers papers scale).
 # ogbn-products is OPT-IN via DATASETS=ogbn-products because spec11 risks
 # OOM and the bench is meant to be routine.
 #
@@ -63,7 +63,7 @@
 #   MODES           Override mode list (space-separated subset of:
 #                   spec13 spec11 caminoD bpt)
 #   NUM_SEEDS       batchSize passed to gnn_offline_sample (default: 512)
-#   FANOUTS         Fanout list passed to gnn_offline_sample (default: "[15, 10]")
+#   FANOUTS         Fanout list passed to gnn_offline_sample (default: "[10, 15]", DGL order)
 
 set -euo pipefail
 export LC_ALL=C
@@ -73,7 +73,12 @@ PORT_BASE=${PORT_BASE:-19990}
 BENCH_PROJ=${BENCH_PROJ:-bench_four_level_tmp}
 BENCH_SAMPLE=${BENCH_SAMPLE:-bench_four_level_sample}
 NUM_SEEDS=${NUM_SEEDS:-512}
-FANOUTS=${FANOUTS:-"[15, 10]"}
+# Fanout notation: since 2026-07-06 gnn_offline_sample reads the list in DGL
+# order -- the LAST element is the hop adjacent to the seeds -- and reverses it
+# internally. The default below was flipped to preserve the hop order this bench
+# was written to measure; results produced before that flip sampled the mirror
+# order and are not comparable with results produced after.
+FANOUTS=${FANOUTS:-"[10, 15]"}
 
 # Dataset configuration: name | db_path | node_label | edge_type
 # ogbn-products is intentionally absent from the default — opt in via DATASETS.
@@ -93,7 +98,7 @@ if [[ -n "${DATASETS:-}" ]]; then
     for ds in $DATASETS; do
         if [[ "$ds" == "papers100M" || "$ds" == *papers100M* ]]; then
             echo "ERROR: papers100M is out of scope for bench_four_level_topology.sh" >&2
-            echo "       (celebi-only dataset; see docs/research/2026-04-25-spec13-papers100m-procedure.md)" >&2
+            echo "       (see docs/research/2026-04-25-spec13-papers100m-procedure.md)" >&2
             exit 3
         fi
         for entry in "${DATASETS_KNOWN[@]}"; do
@@ -113,7 +118,7 @@ for entry in "${DATASETS_LIST[@]}"; do
     name="${entry%%|*}"
     if [[ "$name" == "papers100M" || "$name" == *papers100M* ]]; then
         echo "ERROR: papers100M is out of scope for bench_four_level_topology.sh" >&2
-        echo "       (celebi-only dataset; see docs/research/2026-04-25-spec13-papers100m-procedure.md)" >&2
+        echo "       (see docs/research/2026-04-25-spec13-papers100m-procedure.md)" >&2
         exit 3
     fi
 done

@@ -17,9 +17,14 @@
 # extrapolation, and gpu/cpu budget recommendations.
 #
 # Usage: bench_costmodel.sh [cora] [arxiv]   (default: both)
+# Fanout notation: since 2026-07-06 gnn_offline_sample reads the list in DGL
+# order -- the LAST element is the hop adjacent to the seeds -- and reverses it
+# internally. The literals below were flipped to preserve the hop order this
+# bench was written to measure; a CSV produced before that flip sampled the
+# mirror order and is not comparable with one produced after.
 set -u -o pipefail
 
-REPO=/home/bfuentes/MillenniumDB_Testing
+REPO="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MDB="$REPO/build/Release/bin/mdb"
 PORT=7885
 OUTDIR="$REPO/docs/research/2026-05-31-costmodel"
@@ -114,8 +119,8 @@ run_dataset() {
 # --- driver ---
 echo "dataset,stage,wall_s,dread_MB,dwrite_MB,lread_MB,lwrite_MB,peakrss_MB" > "$CSV"
 WANT="${*:-cora arxiv}"
-echo "$WANT" | grep -qw cora  && run_dataset cora  "$REPO/data/example/gql/cora/cora.gql" "$REPO/data/example/gql/cora/cora_features.npy" Paper CITES "[10,5]" 64 30 256 512 256
-echo "$WANT" | grep -qw arxiv && run_dataset arxiv "$REPO/data/example/gql/ogbn-arxiv/ogbn-arxiv/ogbn_arxiv.gql" "$REPO/data/example/gql/ogbn-arxiv/ogbn-arxiv/ogbn_arxiv_features.npy" Node CONNECTS "[15,10]" 1024 30 256 2048 512
+echo "$WANT" | grep -qw cora  && run_dataset cora  "$REPO/data/example/gql/cora/cora.gql" "$REPO/data/example/gql/cora/cora_features.npy" Paper CITES "[5,10]" 64 30 256 512 256
+echo "$WANT" | grep -qw arxiv && run_dataset arxiv "$REPO/data/example/gql/ogbn-arxiv/ogbn-arxiv/ogbn_arxiv.gql" "$REPO/data/example/gql/ogbn-arxiv/ogbn-arxiv/ogbn_arxiv_features.npy" Node CONNECTS "[10,15]" 1024 30 256 2048 512
 
 say "CSV written: $CSV"
 column -t -s, "$CSV"

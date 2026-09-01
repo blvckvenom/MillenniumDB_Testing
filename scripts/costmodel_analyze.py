@@ -24,7 +24,7 @@ SHAPES = {
 def feat_mb(s):  # feature matrix footprint in MB (float32)
     return s["N"] * s["D"] * 4 / 1e6
 
-NVME_SEQ_MBPS = 3000.0  # celebi Gen4 NVMe sequential reference (order-of-magnitude)
+NVME_SEQ_MBPS = 3000.0  # PCIe Gen4 NVMe sequential reference (order-of-magnitude)
 
 def detect_hw():
     vram = ram = 0.0
@@ -171,7 +171,7 @@ def main():
             ps = max(ps, 0.0)
             p(f"{st:<12}{drv:>13}{fmt(a0,9,2)}{b:>12.2e}{fmt(ps,10)}{fmt(ps/60,10)}")
         p(f"{'train':<12}{'cache-bound':>13}{'-':>9}{'-':>12}{'N/A':>10}{'N/A':>10}")
-        p("\n  REALITY CHECK vs known papers100M measurements (memory: diskgnn-baseline-celebi, "
+        p("\n  REALITY CHECK vs known papers100M measurements ("
           "Plan F): the real sample is ~78-153s and pack/build ~327s — far below the affine "
           "projection above. The linear-in-edges driver OVER-predicts the topology stages because "
           "(i) sampling parallelizes across workers (Plan F numWorkers) and (ii) cost is really "

@@ -9,7 +9,7 @@
 # against the canonical bit-identical constant 0.8574939. EXPECT=skip disables,
 # EXPECT=<float> overrides.
 set -u -o pipefail
-REPO=/home/bfuentes/MillenniumDB_Testing
+REPO="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MDB="$REPO/build/Release/bin/mdb"
 CORA_GQL="$REPO/data/example/gql/cora/cora.gql"; CORA_NPY="$REPO/data/example/gql/cora/cora_features.npy"
 PORT="${PORT:-7886}"; WORKERS="${WORKERS:-1}"; ODIRECT="${ODIRECT:-0}"; DROPOUT="${DROPOUT:-0.5}"; BAKE="${BAKE:-0}"; PACKFULL="${PACKFULL:-0}"; EXPECT="${EXPECT:-auto}"

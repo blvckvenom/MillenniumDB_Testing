@@ -42,7 +42,10 @@ FANOUTS=${FANOUTS:-"15,10"}
 ORIENTATION=${ORIENTATION:-UNDIRECTED}
 
 # Fanouts string for GQL call (spaces, brackets).
-FANOUTS_GQL=$(echo "[$FANOUTS]" | sed 's/,/, /g')
+# No GQL form is derived from FANOUTS on purpose. This bench drives
+# TopologyAccessor::sample_khop_neighbors directly, so the list is consumed in
+# hop order; gnn_offline_sample would reverse it first. Reusing one value for
+# both paths would sample mirrored hop orders under the same name.
 
 # Dataset configuration: name|db_path|node_label|edge_type|proj_name
 declare -a DATASETS_DEFAULT=(
@@ -55,7 +58,7 @@ if [[ -n "${DATASETS:-}" ]]; then
     NEW_DATASETS=()
     for ds in $DATASETS; do
         if [[ "$ds" == "papers100M" || "$ds" == *papers100M* ]]; then
-            echo "ERROR: papers100M is out of scope (celebi-only dataset)." >&2
+            echo "ERROR: papers100M is out of scope: projecting it takes tens of minutes." >&2
             exit 3
         fi
         for entry in "${DATASETS_DEFAULT[@]}"; do
