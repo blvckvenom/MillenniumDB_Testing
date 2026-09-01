@@ -23,7 +23,10 @@
 # Spec reference: docs/superpowers/specs/2026-04-21-radix-partition-sort-design.md §6 (I4), §8 (T1)
 set -euo pipefail
 
-MDB=${MDB:-./build/Release/bin/mdb}
+# Resolved from this script rather than from the caller's directory, so the
+# benchmark runs from anywhere. MDB_HOME still overrides.
+MDB_HOME="${MDB_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MDB=${MDB:-$MDB_HOME/build/Release/bin/mdb}
 DB=${DB:-data/dbs/gql/cora_gnn}
 PORT=${PORT:-19880}
 
