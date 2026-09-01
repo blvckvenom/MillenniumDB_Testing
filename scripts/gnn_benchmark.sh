@@ -89,7 +89,8 @@ cora)
     PROJ_ORIENT=UNDIRECTED;  FANOUT="[5,10]";      BATCH=64
     BUILD_OPTS="gpu_budget_mb:0,cpu_budget_mb:100,force:1"
     PROJ_OPTS=""
-    NEED_GB=1
+    TRAIN_OPTS=""
+    NEED_GB=1;               NEED_RAM_GB=2
     DEF_EPOCHS=30;           ACC_FLOOR=0.65;  DETERMINISM=1
     ;;
 arxiv)
@@ -98,7 +99,8 @@ arxiv)
     PROJ_ORIENT=UNDIRECTED;  FANOUT="[10,15]";     BATCH=1024
     BUILD_OPTS="gpu_budget_mb:2048,cpu_budget_mb:512"
     PROJ_OPTS=""
-    NEED_GB=8
+    TRAIN_OPTS="sampleCacheMb:1024,"
+    NEED_GB=8;               NEED_RAM_GB=6
     DEF_EPOCHS=30;           ACC_FLOOR=0.60;  DETERMINISM=0
     ;;
 products)
@@ -107,7 +109,11 @@ products)
     PROJ_ORIENT=UNDIRECTED;  FANOUT="[10,15]";     BATCH=1024
     BUILD_OPTS="gpu_budget_mb:2048,cpu_budget_mb:512"
     PROJ_OPTS=""
-    NEED_GB=60
+    # The training phase, not the store, is what exhausts host memory here: an
+    # unbounded sample cache plus prefetch queues took 29.3 GB and the kernel
+    # killed the server. These bound it.
+    TRAIN_OPTS="sampleCacheMb:2048,prefetchNumWorkers:2,prefetchQueueSize:2,"
+    NEED_GB=60;              NEED_RAM_GB=24
     DEF_EPOCHS=30;           ACC_FLOOR=0.70;  DETERMINISM=0
     ;;
 papers100M)
@@ -119,7 +125,8 @@ papers100M)
     # default turns the sidecars on and writes two ~27 GB files nobody asked for;
     # GNN_MINIMAL drops the five topology indexes sampling never reads.
     PROJ_OPTS="indexSet:'GNN_MINIMAL',buildTopologySnapshot:false,"
-    NEED_GB=200
+    TRAIN_OPTS="sampleCacheMb:2048,prefetchNumWorkers:8,prefetchQueueSize:6,"
+    NEED_GB=200;             NEED_RAM_GB=28
     DEF_EPOCHS=50;           ACC_FLOOR=0.60;  DETERMINISM=0
     ;;
 "")
@@ -172,8 +179,14 @@ cleanup() {
     elif [ "$CREATED_DB" = 1 ]; then
         # The import log survives a failure. The failure message tells the reader
         # to look at it, and deleting it on the way out made that advice useless.
+        # The server log lives inside $DB. Rescue it before the directory goes,
+        # or a training failure leaves nothing to read but the kernel log.
+        if [ "$RC" != 0 ] && [ -s "$DB/server.log" ]; then
+            cp "$DB/server.log" "$DB.server.log" 2>/dev/null
+            echo "[bench] server log kept at $DB.server.log"
+        fi
         rm -rf "$DB" 2>/dev/null
-        if [ "$RC" = 0 ]; then rm -f "$DB.import.log" 2>/dev/null
+        if [ "$RC" = 0 ]; then rm -f "$DB.import.log" "$DB.server.log" 2>/dev/null
         elif [ -s "$DB.import.log" ]; then echo "[bench] import log kept at $DB.import.log"; fi
     fi
     exit $RC
@@ -360,6 +373,17 @@ if [ -n "${AVAIL_GB:-}" ] && [ "$AVAIL_GB" -lt "$NEED_GB" ]; then
 fi
 ok "disk: ${AVAIL_GB:-?} GB free at $DB_PARENT, need about ${NEED_GB} GB"
 
+# Disk was checked; memory was not, and memory is what the training phase runs
+# out of. The kernel kills the server outright, so the failure arrives with no
+# message from MillenniumDB at all.
+RAM_GB=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null)
+if [ -n "${RAM_GB:-}" ] && [ "$RAM_GB" -lt "$NEED_RAM_GB" ]; then
+    fail "$DATASET training needs about ${NEED_RAM_GB} GB of host memory and this
+  machine has ${RAM_GB} GB. The kernel will kill the server mid-run rather than
+  report an error. Lower the epochs, or run a smaller dataset."
+fi
+ok "memory: ${RAM_GB:-?} GB total, need about ${NEED_RAM_GB} GB"
+
 # ---------------------------------------------------------------------------
 say "3/6  import"
 # ---------------------------------------------------------------------------
@@ -455,7 +479,7 @@ fi
 # stops the run short of the epochs that were asked for.
 t0=$(now)
 gql gnn_train "CALL gnn_train('$SAMPLE','node_features',{
-        model:'graphsage',
+        ${TRAIN_OPTS}model:'graphsage',
         hiddenDim:256,
         epochs:$EPOCHS,
         randomSeed:42,
@@ -501,7 +525,7 @@ fi
 if [ "$DETERMINISM" = 1 ]; then
     say "     determinism: same seed, second run"
     gql gnn_train_repeat "CALL gnn_train('$SAMPLE','node_features',{
-            model:'graphsage',
+            ${TRAIN_OPTS}model:'graphsage',
             hiddenDim:256,
             epochs:$EPOCHS,
             randomSeed:42,
