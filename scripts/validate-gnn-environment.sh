@@ -250,8 +250,6 @@ if [ -d "$GNN_DIR" ]; then
     KEY_FILES=(
         "CMakeLists.txt"
         "core/cuda_context.h"
-            "storage/gnn_tensor_store.h"
-        "storage/gnn_tensor_converter.h"
         "projection/feature_accessor.h"
     )
 
