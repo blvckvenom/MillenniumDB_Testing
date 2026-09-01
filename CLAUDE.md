@@ -35,15 +35,29 @@ peak 96 % of the 16 GB GPU and 26.7 GiB of host RAM; feature cache 9.2 GB.
 `/mnt/data_disk` with 357 GB free, 545 GB total. It also has 103 GiB of active swap that no
 measurement has ever controlled for.
 
-## Branches, and where each thing lives (since 2026-08-28)
+## Branches, and where each thing lives (since 2026-09-01)
 
-Three branches with different content on purpose. Everything is pushed.
+Two roles, not three.
 
 | Branch | Role | Carries |
 |---|---|---|
-| `main` | published, clean | upstream layout, full `src/gnn`, `docs/{adr,design,MillenniumDB.wiki}`, 33 scripts |
-| `refactor/readability` | the readability work | everything below plus 17 refactor commits |
-| `feature-GNN` | development history | `CLAUDE.md`, `Partial_Idea/`, `docs/superpowers/`, research notes, 83 scripts |
+| `main` | published, clean | upstream layout, full `src/gnn`, `docs/{adr,design,MillenniumDB.wiki}`, 35 scripts |
+| `feature-GNN` | development, and the only real history | `CLAUDE.md`, `Partial_Idea/`, `docs/superpowers/`, research notes, the campaign scripts, and the readability refactor |
+| `refactor/readability` | redundant | the same commit as `feature-GNN`; kept only until the move is confirmed |
+
+The 2026-08-28 version of this table claimed three distinct roles. It was wrong:
+`refactor/readability` was never a sibling of `feature-GNN`, it was a strict
+descendant, so one contained the other entirely. On 2026-09-01 `feature-GNN` was
+fast-forwarded onto it — 18 commits gained, none lost, no merge commit, because a
+fast-forward only moves the label. `feature-GNN` is the branch to develop on; its
+name is what every research note, ADR and `REPRODUCE.md` cites.
+
+**Fixes born on `main` do not reach `feature-GNN` by themselves.** The onboarding
+repairs of 2026-08-31 were made directly on `main`, so `feature-GNN` still carries
+their defects until they are cherry-picked across. Merging `main` into a
+development branch is NOT the way to do it: `main` was built by squash-merging and
+then deleting, and those deletions would take `CLAUDE.md`, `Partial_Idea/` and
+`docs/superpowers/` with them.
 
 **A second worktree holds `main` at `~/mdb_main_clean`.** Do NOT `git checkout main` inside this
 repository: 758 files that `main` does not track would be deleted from disk, including this file.
