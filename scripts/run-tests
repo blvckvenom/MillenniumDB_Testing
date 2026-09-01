@@ -6,6 +6,18 @@ ERROR=
 VENV=tests/.venv
 TESTS=tests
 
+# A shell script that documentation tells the reader to run with a leading ./
+# must be committed executable. Twice now a script has landed at 100644 while
+# looking fine on disk, because a worktree with core.fileMode=false reports the
+# filesystem bit and not the one git recorded. Only the index settles it.
+NOT_EXEC=$(git ls-files -s -- '*.sh' 2>/dev/null | awk '$1=="100644"{print $4}')
+if [ -n "$NOT_EXEC" ]; then
+    echo -e "${RED}Shell scripts committed without the executable bit:${NC}"
+    echo "$NOT_EXEC" | sed 's/^/  /'
+    echo "  Fix: git update-index --chmod=+x <file> && git commit"
+    exit 1
+fi
+
 if ! diff -q $VENV/requirements.txt $TESTS/requirements.txt; then
     python3 -m venv $VENV
     source $VENV/bin/activate
