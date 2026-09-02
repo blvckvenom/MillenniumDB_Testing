@@ -157,6 +157,12 @@ docs/research/*
 # Large GNN datasets (download via scripts/download_gnn_datasets.py)
 data/example/gql/ogbn-*/
 data/example/gql/cora/
+# The three lines above end in "/" and match directories only. Since 2026-09-02 these
+# paths are symlinks into /data (docs/superpowers/specs/2026-09-02-data-root-design.md),
+# and git treats a symlink as a file, so they need patterns without the trailing slash.
+data/example/gql/papers100M
+data/example/gql/ogbn-arxiv
+data/example/gql/cora
 scripts/gnn_datasets/ogb_data/
 *.npy
 
