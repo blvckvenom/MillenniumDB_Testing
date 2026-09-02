@@ -1002,6 +1002,16 @@ else
     echo -e "${YELLOW}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 fi
 echo ""
+# -- /data link health (see docs/superpowers/specs/2026-09-02-data-root-design.md) --
+# The repo reaches its databases through symlinks into /data; a broken link
+# fails loudly at first use, so surface it here rather than mid-experiment.
+if [ -d /data ] && [ -x "$MDB_HOME/scripts/data-root/check.sh" ]; then
+    echo "=== /data link health (scripts/data-root/check.sh) ==="
+    if ! "$MDB_HOME/scripts/data-root/check.sh"; then
+        echo -e "${YELLOW}  /data reported problems (above). Repo links: scripts/data-root/link-repo.sh${NC}"
+    fi
+    echo ""
+fi
 echo "  Binary:   $MDB_HOME/build/Release/bin/mdb help"
 echo "  Stack:    LibTorch=$LIBTORCH_EXPECTED, GPU=$GPU_CHOICE"
 echo "  Logs:     $LOG_DIR/"
