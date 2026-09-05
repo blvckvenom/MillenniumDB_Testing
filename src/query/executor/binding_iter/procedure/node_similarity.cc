@@ -50,6 +50,8 @@ struct NodeSimilarityProfile {
     double per_node_ranking_ms = 0.0;
     double global_ranking_ms = 0.0;
     double total_reset_ms = 0.0;
+    double total_next_ms = 0.0;
+    double total_operator_ms = 0.0;
 
     uint64_t undirected_records = 0;
     uint64_t directed_records = 0;
@@ -67,6 +69,9 @@ struct NodeSimilarityProfile {
     uint64_t results_capacity = 0;
     uint64_t result_tuple_size = sizeof(std::tuple<ObjectId, ObjectId, ObjectId>);
     uint64_t k_candidate_tuple_size = sizeof(std::tuple<ObjectId, ObjectId, ObjectId>);
+    uint64_t next_calls = 0;
+    uint64_t next_true_calls = 0;
+    uint64_t next_false_calls = 0;
 };
 
 void write_profile_csv(const NodeSimilarityProfile& profile)
@@ -98,6 +103,8 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
                << "per_node_ranking_ms,"
                << "global_ranking_ms,"
                << "total_reset_ms,"
+               << "total_next_ms,"
+               << "total_operator_ms,"
                << "undirected_records,"
                << "directed_records,"
                << "adjacency_nodes,"
@@ -113,7 +120,10 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
                << "results_size,"
                << "results_capacity,"
                << "result_tuple_size,"
-               << "k_candidate_tuple_size\n";
+               << "k_candidate_tuple_size,"
+               << "next_calls,"
+               << "next_true_calls,"
+               << "next_false_calls\n";
     }
 
     output << profile.similarity_metric << ','
@@ -144,6 +154,8 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
            << profile.per_node_ranking_ms << ','
            << profile.global_ranking_ms << ','
            << profile.total_reset_ms << ','
+           << profile.total_next_ms << ','
+           << profile.total_operator_ms << ','
            << profile.undirected_records << ','
            << profile.directed_records << ','
            << profile.adjacency_nodes << ','
@@ -159,7 +171,10 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
            << profile.results_size << ','
            << profile.results_capacity << ','
            << profile.result_tuple_size << ','
-           << profile.k_candidate_tuple_size << '\n';
+           << profile.k_candidate_tuple_size << ','
+           << profile.next_calls << ','
+           << profile.next_true_calls << ','
+           << profile.next_false_calls << '\n';
 }
 
 } // namespace
@@ -285,6 +300,7 @@ void NodeSimilarity::_reset()
         profile.results_size = static_cast<uint64_t>(results.size());
         profile.results_capacity = static_cast<uint64_t>(results.capacity());
         profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
+        profile.total_operator_ms = profile.total_reset_ms;
         write_profile_csv(profile);
         return;
     }
@@ -438,6 +454,7 @@ void NodeSimilarity::_reset()
     profile.results_size = static_cast<uint64_t>(results.size());
     profile.results_capacity = static_cast<uint64_t>(results.capacity());
     profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
+    profile.total_operator_ms = profile.total_reset_ms;
 
     write_profile_csv(profile);
 }
