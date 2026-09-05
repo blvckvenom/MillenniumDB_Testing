@@ -61,6 +61,8 @@ struct NodeSimilarityProfile {
     uint64_t results_before_global_limit = 0;
     uint64_t k_candidates_total = 0;
     uint64_t max_k_candidates_for_node = 0;
+    uint64_t k_candidates_capacity_total = 0;
+    uint64_t max_k_candidates_capacity_for_node = 0;
     uint64_t results_size = 0;
     uint64_t results_capacity = 0;
     uint64_t result_tuple_size = sizeof(std::tuple<ObjectId, ObjectId, ObjectId>);
@@ -105,6 +107,8 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
                << "results_before_global_limit,"
                << "k_candidates_total,"
                << "max_k_candidates_for_node,"
+               << "k_candidates_capacity_total,"
+               << "max_k_candidates_capacity_for_node,"
                << "results_size,"
                << "results_capacity,"
                << "result_tuple_size\n";
@@ -148,6 +152,8 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
            << profile.results_before_global_limit << ','
            << profile.k_candidates_total << ','
            << profile.max_k_candidates_for_node << ','
+           << profile.k_candidates_capacity_total << ','
+           << profile.max_k_candidates_capacity_for_node << ','
            << profile.results_size << ','
            << profile.results_capacity << ','
            << profile.result_tuple_size << '\n';
@@ -350,6 +356,11 @@ void NodeSimilarity::_reset()
             profile.max_k_candidates_for_node = std::max<uint64_t>(
                 profile.max_k_candidates_for_node,
                 static_cast<uint64_t>(candidates.size())
+            );
+            profile.k_candidates_capacity_total += static_cast<uint64_t>(candidates.capacity());
+            profile.max_k_candidates_capacity_for_node = std::max<uint64_t>(
+                profile.max_k_candidates_capacity_for_node,
+                static_cast<uint64_t>(candidates.capacity())
             );
 
             std::sort(candidates.begin(), candidates.end(), [&](const auto& lhs, const auto& rhs) {
