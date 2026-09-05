@@ -62,6 +62,8 @@ struct NodeSimilarityProfile {
     uint64_t k_candidates_total = 0;
     uint64_t max_k_candidates_for_node = 0;
     uint64_t results_size = 0;
+    uint64_t results_capacity = 0;
+    uint64_t result_tuple_size = sizeof(std::tuple<ObjectId, ObjectId, ObjectId>);
 };
 
 void write_profile_csv(const NodeSimilarityProfile& profile)
@@ -103,7 +105,9 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
                << "results_before_global_limit,"
                << "k_candidates_total,"
                << "max_k_candidates_for_node,"
-               << "results_size\n";
+               << "results_size,"
+               << "results_capacity,"
+               << "result_tuple_size\n";
     }
 
     output << profile.similarity_metric << ','
@@ -144,7 +148,9 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
            << profile.results_before_global_limit << ','
            << profile.k_candidates_total << ','
            << profile.max_k_candidates_for_node << ','
-           << profile.results_size << '\n';
+           << profile.results_size << ','
+           << profile.results_capacity << ','
+           << profile.result_tuple_size << '\n';
 }
 
 } // namespace
@@ -268,6 +274,7 @@ void NodeSimilarity::_reset()
     if (nodes.size() < 2) {
         profile.results_before_global_limit = static_cast<uint64_t>(results.size());
         profile.results_size = static_cast<uint64_t>(results.size());
+        profile.results_capacity = static_cast<uint64_t>(results.capacity());
         profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
         write_profile_csv(profile);
         return;
@@ -415,6 +422,7 @@ void NodeSimilarity::_reset()
     }
     profile.global_ranking_ms = profile_ms(global_ranking_start, ProfileClock::now());
     profile.results_size = static_cast<uint64_t>(results.size());
+    profile.results_capacity = static_cast<uint64_t>(results.capacity());
     profile.total_reset_ms = profile_ms(total_reset_start, ProfileClock::now());
 
     write_profile_csv(profile);
