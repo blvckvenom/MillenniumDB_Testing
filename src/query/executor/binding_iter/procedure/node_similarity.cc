@@ -66,6 +66,7 @@ struct NodeSimilarityProfile {
     uint64_t results_size = 0;
     uint64_t results_capacity = 0;
     uint64_t result_tuple_size = sizeof(std::tuple<ObjectId, ObjectId, ObjectId>);
+    uint64_t k_candidate_tuple_size = sizeof(std::tuple<ObjectId, ObjectId, ObjectId>);
 };
 
 void write_profile_csv(const NodeSimilarityProfile& profile)
@@ -111,7 +112,8 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
                << "max_k_candidates_capacity_for_node,"
                << "results_size,"
                << "results_capacity,"
-               << "result_tuple_size\n";
+               << "result_tuple_size,"
+               << "k_candidate_tuple_size\n";
     }
 
     output << profile.similarity_metric << ','
@@ -156,7 +158,8 @@ void write_profile_csv(const NodeSimilarityProfile& profile)
            << profile.max_k_candidates_capacity_for_node << ','
            << profile.results_size << ','
            << profile.results_capacity << ','
-           << profile.result_tuple_size << '\n';
+           << profile.result_tuple_size << ','
+           << profile.k_candidate_tuple_size << '\n';
 }
 
 } // namespace
