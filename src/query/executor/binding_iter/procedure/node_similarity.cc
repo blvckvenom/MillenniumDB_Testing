@@ -7,7 +7,6 @@
 #include <cmath>
 #include <fstream>
 #include <map>
-#include <set>
 #include <utility>
 
 #include "graph_models/gql/conversions.h"
@@ -256,7 +255,6 @@ void NodeSimilarity::_reset()
     std::array<uint64_t, 3> max_ids = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
 
     std::vector<std::pair<uint64_t, uint64_t>> adjacency_contributions;
-    std::map<uint64_t, std::set<uint64_t>> adjacency;
 
     const auto scan_undirected_start = ProfileClock::now();
     auto undirected_edge_iter = gql_model.get_n1_n2_edge().get_range(
@@ -272,8 +270,6 @@ void NodeSimilarity::_reset()
         adjacency_contributions.emplace_back(node2, node1);
 
         // Undirected edge contributes both ways: node1~node2 => neighbors(node1)+=node2 and neighbors(node2)+=node1
-        adjacency[node1].insert(node2);
-        adjacency[node2].insert(node1);
         ++profile.undirected_records;
     }
     profile.scan_undirected_ms = profile_ms(scan_undirected_start, ProfileClock::now());
@@ -291,7 +287,6 @@ void NodeSimilarity::_reset()
         adjacency_contributions.emplace_back(from, to);
 
         // Directed edge contributes only in outgoing direction: from->to => neighbors(from)+=to
-        adjacency[from].insert(to);
         ++profile.directed_records;
     }
     profile.scan_directed_ms = profile_ms(scan_directed_start, ProfileClock::now());
@@ -322,43 +317,28 @@ void NodeSimilarity::_reset()
     assert(csr_adjacency.offsets.size() == csr_adjacency.node_ids.size() + 1);
     assert(csr_adjacency.offsets.front() == 0);
     assert(csr_adjacency.offsets.back() == csr_adjacency.neighbors.size());
-    assert(csr_adjacency.node_ids.size() == adjacency.size());
-
-    auto adjacency_it = adjacency.cbegin();
-    for (std::size_t row = 0; row < csr_adjacency.node_ids.size(); ++row, ++adjacency_it) {
-        assert(adjacency_it != adjacency.cend());
-        assert(csr_adjacency.node_ids[row] == adjacency_it->first);
+    for (std::size_t row = 0; row < csr_adjacency.node_ids.size(); ++row) {
         assert(csr_adjacency.offsets[row] <= csr_adjacency.offsets[row + 1]);
         assert(csr_adjacency.offsets[row + 1] <= csr_adjacency.neighbors.size());
-        assert(csr_adjacency.degree(row) == adjacency_it->second.size());
-        assert(std::equal(
-            csr_adjacency.neighbors.cbegin() + csr_adjacency.offsets[row],
-            csr_adjacency.neighbors.cbegin() + csr_adjacency.offsets[row + 1],
-            adjacency_it->second.cbegin(),
-            adjacency_it->second.cend()
-        ));
     }
-    assert(adjacency_it == adjacency.cend());
 #endif
 
-    profile.adjacency_nodes = static_cast<uint64_t>(adjacency.size());
-    for (const auto& [node, neighbors] : adjacency) {
-        profile.neighbor_entries += static_cast<uint64_t>(neighbors.size());
-    }
+    profile.adjacency_nodes = static_cast<uint64_t>(csr_adjacency.node_ids.size());
+    profile.neighbor_entries = static_cast<uint64_t>(csr_adjacency.neighbors.size());
 
     const auto degree_filter_start = ProfileClock::now();
-    std::vector<uint64_t> nodes;
-    nodes.reserve(adjacency.size());
-    for (const auto& [node, neighbors] : adjacency) {
-        const auto degree = static_cast<uint64_t>(neighbors.size());
+    std::vector<std::size_t> eligible_rows;
+    eligible_rows.reserve(csr_adjacency.node_ids.size());
+    for (std::size_t row = 0; row < csr_adjacency.node_ids.size(); ++row) {
+        const auto degree = static_cast<uint64_t>(csr_adjacency.degree(row));
         if (degree >= degree_cutoff && degree <= upper_degree_cutoff) {
-            nodes.push_back(node);
+            eligible_rows.push_back(row);
         }
     }
-    profile.nodes_after_degree_filter = static_cast<uint64_t>(nodes.size());
+    profile.nodes_after_degree_filter = static_cast<uint64_t>(eligible_rows.size());
     profile.degree_filter_ms = profile_ms(degree_filter_start, ProfileClock::now());
 
-    if (nodes.size() < 2) {
+    if (eligible_rows.size() < 2) {
         profile.results_before_global_limit = static_cast<uint64_t>(results.size());
         profile.results_size = static_cast<uint64_t>(results.size());
         profile.results_capacity = static_cast<uint64_t>(results.capacity());
@@ -371,33 +351,46 @@ void NodeSimilarity::_reset()
     std::map<uint64_t, std::vector<std::tuple<ObjectId, ObjectId, ObjectId>>> k_candidates;
 
     const auto pair_scoring_start = ProfileClock::now();
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-        const auto& neighbors_i = adjacency.at(nodes[i]);
-        for (std::size_t j = i + 1; j < nodes.size(); ++j) {
-            const auto& neighbors_j = adjacency.at(nodes[j]);
+    for (std::size_t i = 0; i < eligible_rows.size(); ++i) {
+        const auto row_i = eligible_rows[i];
+        const auto node_id_i = csr_adjacency.node_ids[row_i];
+        const auto begin_i = csr_adjacency.offsets[row_i];
+        const auto end_i = csr_adjacency.offsets[row_i + 1];
+        const auto degree_i = csr_adjacency.degree(row_i);
+        for (std::size_t j = i + 1; j < eligible_rows.size(); ++j) {
+            const auto row_j = eligible_rows[j];
+            const auto node_id_j = csr_adjacency.node_ids[row_j];
+            const auto begin_j = csr_adjacency.offsets[row_j];
+            const auto end_j = csr_adjacency.offsets[row_j + 1];
+            const auto degree_j = csr_adjacency.degree(row_j);
             ++profile.pairs_checked;
 
-            const auto& smaller = (neighbors_i.size() <= neighbors_j.size()) ? neighbors_i : neighbors_j;
-            const auto& larger = (neighbors_i.size() <= neighbors_j.size()) ? neighbors_j : neighbors_i;
-
             std::size_t intersection_size = 0;
-            for (const auto& neighbor : smaller) {
-                if (larger.count(neighbor) == 1) {
+            auto left = begin_i;
+            auto right = begin_j;
+            while (left < end_i && right < end_j) {
+                if (csr_adjacency.neighbors[left] == csr_adjacency.neighbors[right]) {
                     ++intersection_size;
+                    ++left;
+                    ++right;
+                } else if (csr_adjacency.neighbors[left] < csr_adjacency.neighbors[right]) {
+                    ++left;
+                } else {
+                    ++right;
                 }
             }
 
             double similarity = 0.0;
             switch (similarity_metric) {
             case SimilarityMetric::JACCARD: {
-                const auto union_size = neighbors_i.size() + neighbors_j.size() - intersection_size;
+                const auto union_size = degree_i + degree_j - intersection_size;
                 similarity = (union_size == 0)
                                  ? 0.0
                                  : static_cast<double>(intersection_size) / static_cast<double>(union_size);
                 break;
             }
             case SimilarityMetric::OVERLAP: {
-                const auto min_degree = std::min(neighbors_i.size(), neighbors_j.size());
+                const auto min_degree = std::min(degree_i, degree_j);
                 similarity = (min_degree == 0)
                                  ? 0.0
                                  : static_cast<double>(intersection_size) / static_cast<double>(min_degree);
@@ -405,7 +398,7 @@ void NodeSimilarity::_reset()
             }
             case SimilarityMetric::COSINE: {
                 const auto denominator = std::sqrt(
-                    static_cast<double>(neighbors_i.size()) * static_cast<double>(neighbors_j.size())
+                    static_cast<double>(degree_i) * static_cast<double>(degree_j)
                 );
                 similarity = (denominator == 0.0)
                                  ? 0.0
@@ -416,13 +409,13 @@ void NodeSimilarity::_reset()
 
             if (similarity >= similarity_cutoff) {
                 ++profile.pairs_after_similarity_cutoff;
-                const auto node_i = ObjectId(nodes[i]);
-                const auto node_j = ObjectId(nodes[j]);
+                const auto node_i = ObjectId(node_id_i);
+                const auto node_j = ObjectId(node_id_j);
                 const auto similarity_oid = GQL::Conversions::pack_double(similarity);
 
                 if (top_k.has_value() || bottom_k.has_value()) {
-                    k_candidates[nodes[i]].emplace_back(node_i, node_j, similarity_oid);
-                    k_candidates[nodes[j]].emplace_back(node_j, node_i, similarity_oid);
+                    k_candidates[node_id_i].emplace_back(node_i, node_j, similarity_oid);
+                    k_candidates[node_id_j].emplace_back(node_j, node_i, similarity_oid);
                 } else {
                     results.emplace_back(node_i, node_j, similarity_oid);
                 }
