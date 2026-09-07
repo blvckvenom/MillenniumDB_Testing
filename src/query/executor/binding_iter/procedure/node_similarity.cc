@@ -406,10 +406,95 @@ void NodeSimilarity::_reset()
                 }
             }
 
+            std::size_t required_intersection = 0;
+            if (similarity_cutoff > 0.0) {
+                const auto max_intersection = std::min(degree_i, degree_j);
+                const auto impossible_intersection = max_intersection + 1;
+
+                double required_intersection_estimate = 0.0;
+                switch (similarity_metric) {
+                case SimilarityMetric::JACCARD:
+                    required_intersection_estimate = similarity_cutoff
+                                                   * static_cast<double>(degree_i + degree_j)
+                                                   / (1.0 + similarity_cutoff);
+                    break;
+                case SimilarityMetric::OVERLAP:
+                    required_intersection_estimate = similarity_cutoff
+                                                   * static_cast<double>(max_intersection);
+                    break;
+                case SimilarityMetric::COSINE:
+                    required_intersection_estimate = similarity_cutoff
+                                                   / (eligible_i.inv_sqrt_degree
+                                                      * eligible_j.inv_sqrt_degree);
+                    break;
+                }
+
+                const auto estimated_required_intersection = std::ceil(required_intersection_estimate);
+                if (estimated_required_intersection >= static_cast<double>(impossible_intersection)) {
+                    required_intersection = impossible_intersection;
+                } else {
+                    required_intersection = std::max<std::size_t>(
+                        1,
+                        static_cast<std::size_t>(estimated_required_intersection)
+                    );
+                }
+
+                const auto similarity_for_intersection = [&](std::size_t hypothetical_intersection) {
+                    switch (similarity_metric) {
+                    case SimilarityMetric::JACCARD: {
+                        const auto union_size = degree_i + degree_j - hypothetical_intersection;
+                        return (union_size == 0)
+                                   ? 0.0
+                                   : static_cast<double>(hypothetical_intersection)
+                                         / static_cast<double>(union_size);
+                    }
+                    case SimilarityMetric::OVERLAP: {
+                        const auto min_degree = std::min(degree_i, degree_j);
+                        return (min_degree == 0)
+                                   ? 0.0
+                                   : static_cast<double>(hypothetical_intersection)
+                                         / static_cast<double>(min_degree);
+                    }
+                    case SimilarityMetric::COSINE:
+                        return static_cast<double>(hypothetical_intersection)
+                             * eligible_i.inv_sqrt_degree
+                             * eligible_j.inv_sqrt_degree;
+                    }
+                    return 0.0;
+                };
+
+                while (
+                    required_intersection > 1
+                    && similarity_for_intersection(required_intersection - 1) >= similarity_cutoff
+                ) {
+                    --required_intersection;
+                }
+                while (
+                    required_intersection <= max_intersection
+                    && similarity_for_intersection(required_intersection) < similarity_cutoff
+                ) {
+                    ++required_intersection;
+                }
+
+                if (required_intersection > max_intersection) {
+                    continue;
+                }
+            }
+
+            bool intersection_pruned = false;
             std::size_t intersection_size = 0;
             auto left = begin_i;
             auto right = begin_j;
             while (left < end_i && right < end_j) {
+                if (similarity_cutoff > 0.0) {
+                    const auto max_possible_intersection = intersection_size
+                                                         + std::min(end_i - left, end_j - right);
+                    if (max_possible_intersection < required_intersection) {
+                        intersection_pruned = true;
+                        break;
+                    }
+                }
+
                 if (csr_adjacency.neighbors[left] == csr_adjacency.neighbors[right]) {
                     ++intersection_size;
                     ++left;
@@ -419,6 +504,10 @@ void NodeSimilarity::_reset()
                 } else {
                     ++right;
                 }
+            }
+
+            if (intersection_pruned) {
+                continue;
             }
 
             double similarity = 0.0;
