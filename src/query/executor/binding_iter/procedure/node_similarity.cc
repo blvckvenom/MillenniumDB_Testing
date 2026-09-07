@@ -33,6 +33,13 @@ struct CsrAdjacency {
     }
 };
 
+struct EligibleNode {
+    uint64_t node_id;
+    std::size_t begin;
+    std::size_t end;
+    std::size_t degree;
+};
+
 static constexpr const char* NODE_SIMILARITY_PROFILE_PATH =
     "/Users/andres/Documents/beauchef/memoria/node_similarity_benchmarks/results/node_similarity_profile.csv";
 
@@ -327,18 +334,26 @@ void NodeSimilarity::_reset()
     profile.neighbor_entries = static_cast<uint64_t>(csr_adjacency.neighbors.size());
 
     const auto degree_filter_start = ProfileClock::now();
-    std::vector<std::size_t> eligible_rows;
-    eligible_rows.reserve(csr_adjacency.node_ids.size());
+    std::vector<EligibleNode> eligible_nodes;
+    eligible_nodes.reserve(csr_adjacency.node_ids.size());
     for (std::size_t row = 0; row < csr_adjacency.node_ids.size(); ++row) {
-        const auto degree = static_cast<uint64_t>(csr_adjacency.degree(row));
-        if (degree >= degree_cutoff && degree <= upper_degree_cutoff) {
-            eligible_rows.push_back(row);
+        const auto begin = csr_adjacency.offsets[row];
+        const auto end = csr_adjacency.offsets[row + 1];
+        const auto degree = end - begin;
+        const auto degree_for_filter = static_cast<uint64_t>(degree);
+        if (degree_for_filter >= degree_cutoff && degree_for_filter <= upper_degree_cutoff) {
+            eligible_nodes.push_back(EligibleNode {
+                csr_adjacency.node_ids[row],
+                begin,
+                end,
+                degree
+            });
         }
     }
-    profile.nodes_after_degree_filter = static_cast<uint64_t>(eligible_rows.size());
+    profile.nodes_after_degree_filter = static_cast<uint64_t>(eligible_nodes.size());
     profile.degree_filter_ms = profile_ms(degree_filter_start, ProfileClock::now());
 
-    if (eligible_rows.size() < 2) {
+    if (eligible_nodes.size() < 2) {
         profile.results_before_global_limit = static_cast<uint64_t>(results.size());
         profile.results_size = static_cast<uint64_t>(results.size());
         profile.results_capacity = static_cast<uint64_t>(results.capacity());
@@ -351,18 +366,18 @@ void NodeSimilarity::_reset()
     std::map<uint64_t, std::vector<std::tuple<ObjectId, ObjectId, ObjectId>>> k_candidates;
 
     const auto pair_scoring_start = ProfileClock::now();
-    for (std::size_t i = 0; i < eligible_rows.size(); ++i) {
-        const auto row_i = eligible_rows[i];
-        const auto node_id_i = csr_adjacency.node_ids[row_i];
-        const auto begin_i = csr_adjacency.offsets[row_i];
-        const auto end_i = csr_adjacency.offsets[row_i + 1];
-        const auto degree_i = csr_adjacency.degree(row_i);
-        for (std::size_t j = i + 1; j < eligible_rows.size(); ++j) {
-            const auto row_j = eligible_rows[j];
-            const auto node_id_j = csr_adjacency.node_ids[row_j];
-            const auto begin_j = csr_adjacency.offsets[row_j];
-            const auto end_j = csr_adjacency.offsets[row_j + 1];
-            const auto degree_j = csr_adjacency.degree(row_j);
+    for (std::size_t i = 0; i < eligible_nodes.size(); ++i) {
+        const auto& eligible_i = eligible_nodes[i];
+        const auto node_id_i = eligible_i.node_id;
+        const auto begin_i = eligible_i.begin;
+        const auto end_i = eligible_i.end;
+        const auto degree_i = eligible_i.degree;
+        for (std::size_t j = i + 1; j < eligible_nodes.size(); ++j) {
+            const auto& eligible_j = eligible_nodes[j];
+            const auto node_id_j = eligible_j.node_id;
+            const auto begin_j = eligible_j.begin;
+            const auto end_j = eligible_j.end;
+            const auto degree_j = eligible_j.degree;
             ++profile.pairs_checked;
 
             std::size_t intersection_size = 0;
