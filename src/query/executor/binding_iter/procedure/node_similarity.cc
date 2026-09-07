@@ -385,6 +385,27 @@ void NodeSimilarity::_reset()
             const auto degree_j = eligible_j.degree;
             ++profile.pairs_checked;
 
+            if (
+                similarity_cutoff > 0.0
+                && similarity_metric != SimilarityMetric::OVERLAP
+            ) {
+                const auto max_intersection = std::min(degree_i, degree_j);
+                double max_similarity;
+                if (similarity_metric == SimilarityMetric::JACCARD) {
+                    const auto max_union_size = degree_i + degree_j - max_intersection;
+                    max_similarity = static_cast<double>(max_intersection)
+                                   / static_cast<double>(max_union_size);
+                } else {
+                    max_similarity = static_cast<double>(max_intersection)
+                                   * eligible_i.inv_sqrt_degree
+                                   * eligible_j.inv_sqrt_degree;
+                }
+
+                if (max_similarity < similarity_cutoff) {
+                    continue;
+                }
+            }
+
             std::size_t intersection_size = 0;
             auto left = begin_i;
             auto right = begin_j;
