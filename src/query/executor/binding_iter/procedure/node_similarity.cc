@@ -8,6 +8,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <utility>
 
 #include "graph_models/gql/conversions.h"
 #include "graph_models/gql/gql_model.h"
@@ -19,6 +20,19 @@ namespace {
 
 using ProfileClock = std::chrono::steady_clock;
 using ProfileDurationMS = std::chrono::duration<double, std::milli>;
+
+struct CsrAdjacency {
+    std::vector<uint64_t> node_ids;
+    std::vector<std::size_t> offsets { 0 };
+    std::vector<uint64_t> neighbors;
+
+    std::size_t degree(std::size_t row) const noexcept
+    {
+        assert(offsets.size() == node_ids.size() + 1);
+        assert(row < node_ids.size());
+        return offsets[row + 1] - offsets[row];
+    }
+};
 
 static constexpr const char* NODE_SIMILARITY_PROFILE_PATH =
     "/Users/andres/Documents/beauchef/memoria/node_similarity_benchmarks/results/node_similarity_profile.csv";
@@ -241,6 +255,7 @@ void NodeSimilarity::_reset()
     std::array<uint64_t, 3> min_ids = { 0, 0, 0 };
     std::array<uint64_t, 3> max_ids = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
 
+    std::vector<std::pair<uint64_t, uint64_t>> adjacency_contributions;
     std::map<uint64_t, std::set<uint64_t>> adjacency;
 
     const auto scan_undirected_start = ProfileClock::now();
@@ -252,6 +267,9 @@ void NodeSimilarity::_reset()
     while (const auto* current_record = undirected_edge_iter.next()) {
         const auto node1 = (*current_record)[0];
         const auto node2 = (*current_record)[1];
+
+        adjacency_contributions.emplace_back(node1, node2);
+        adjacency_contributions.emplace_back(node2, node1);
 
         // Undirected edge contributes both ways: node1~node2 => neighbors(node1)+=node2 and neighbors(node2)+=node1
         adjacency[node1].insert(node2);
@@ -270,6 +288,8 @@ void NodeSimilarity::_reset()
         const auto from = (*current_record)[0];
         const auto to   = (*current_record)[1];
 
+        adjacency_contributions.emplace_back(from, to);
+
         // Directed edge contributes only in outgoing direction: from->to => neighbors(from)+=to
         adjacency[from].insert(to);
         ++profile.directed_records;
@@ -277,6 +297,49 @@ void NodeSimilarity::_reset()
     profile.scan_directed_ms = profile_ms(scan_directed_start, ProfileClock::now());
     // Self-loops are included through the main edge indexes above. The equal_u_edge/equal_d_edge
     // indexes are only specialized access paths for explicit self-loop patterns.
+
+    std::sort(adjacency_contributions.begin(), adjacency_contributions.end());
+    adjacency_contributions.erase(
+        std::unique(adjacency_contributions.begin(), adjacency_contributions.end()),
+        adjacency_contributions.end()
+    );
+
+    CsrAdjacency csr_adjacency;
+    for (const auto& [source, neighbor] : adjacency_contributions) {
+        if (csr_adjacency.node_ids.empty() || csr_adjacency.node_ids.back() != source) {
+            if (!csr_adjacency.node_ids.empty()) {
+                csr_adjacency.offsets.push_back(csr_adjacency.neighbors.size());
+            }
+            csr_adjacency.node_ids.push_back(source);
+        }
+        csr_adjacency.neighbors.push_back(neighbor);
+    }
+    if (!csr_adjacency.node_ids.empty()) {
+        csr_adjacency.offsets.push_back(csr_adjacency.neighbors.size());
+    }
+
+#ifndef NDEBUG
+    assert(csr_adjacency.offsets.size() == csr_adjacency.node_ids.size() + 1);
+    assert(csr_adjacency.offsets.front() == 0);
+    assert(csr_adjacency.offsets.back() == csr_adjacency.neighbors.size());
+    assert(csr_adjacency.node_ids.size() == adjacency.size());
+
+    auto adjacency_it = adjacency.cbegin();
+    for (std::size_t row = 0; row < csr_adjacency.node_ids.size(); ++row, ++adjacency_it) {
+        assert(adjacency_it != adjacency.cend());
+        assert(csr_adjacency.node_ids[row] == adjacency_it->first);
+        assert(csr_adjacency.offsets[row] <= csr_adjacency.offsets[row + 1]);
+        assert(csr_adjacency.offsets[row + 1] <= csr_adjacency.neighbors.size());
+        assert(csr_adjacency.degree(row) == adjacency_it->second.size());
+        assert(std::equal(
+            csr_adjacency.neighbors.cbegin() + csr_adjacency.offsets[row],
+            csr_adjacency.neighbors.cbegin() + csr_adjacency.offsets[row + 1],
+            adjacency_it->second.cbegin(),
+            adjacency_it->second.cend()
+        ));
+    }
+    assert(adjacency_it == adjacency.cend());
+#endif
 
     profile.adjacency_nodes = static_cast<uint64_t>(adjacency.size());
     for (const auto& [node, neighbors] : adjacency) {
