@@ -38,6 +38,7 @@ struct EligibleNode {
     std::size_t begin;
     std::size_t end;
     std::size_t degree;
+    double inv_sqrt_degree;
 };
 
 static constexpr const char* NODE_SIMILARITY_PROFILE_PATH =
@@ -342,11 +343,15 @@ void NodeSimilarity::_reset()
         const auto degree = end - begin;
         const auto degree_for_filter = static_cast<uint64_t>(degree);
         if (degree_for_filter >= degree_cutoff && degree_for_filter <= upper_degree_cutoff) {
+            const auto inv_sqrt_degree = similarity_metric == SimilarityMetric::COSINE
+                                             ? 1.0 / std::sqrt(static_cast<double>(degree))
+                                             : 0.0;
             eligible_nodes.push_back(EligibleNode {
                 csr_adjacency.node_ids[row],
                 begin,
                 end,
-                degree
+                degree,
+                inv_sqrt_degree
             });
         }
     }
@@ -412,12 +417,9 @@ void NodeSimilarity::_reset()
                 break;
             }
             case SimilarityMetric::COSINE: {
-                const auto denominator = std::sqrt(
-                    static_cast<double>(degree_i) * static_cast<double>(degree_j)
-                );
-                similarity = (denominator == 0.0)
-                                 ? 0.0
-                                 : static_cast<double>(intersection_size) / denominator;
+                similarity = static_cast<double>(intersection_size)
+                           * eligible_i.inv_sqrt_degree
+                           * eligible_j.inv_sqrt_degree;
                 break;
             }
             }
