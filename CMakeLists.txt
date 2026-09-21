@@ -189,12 +189,14 @@ file(GLOB_RECURSE GNN_SRCS src/gnn/*.cc)
 file(GLOB GNN_PROCEDURE_SRCS src/query/procedure/builtin/gnn_*_procedure.cc)
 # .cu files are not matched by the src/*.cc glob, so only .cc exclusion is needed
 file(GLOB_RECURSE GPU_SRCS src/gpu/*.cc)
+file(GLOB_RECURSE BENCH_SRCS src/bench/*.cc)
 # Remove unwanted files from common sources
 list(REMOVE_ITEM SRCS ${BIN_SRCS})
 list(REMOVE_ITEM SRCS ${TEST_SRCS})
 list(REMOVE_ITEM SRCS ${GNN_SRCS})
 list(REMOVE_ITEM SRCS ${GNN_PROCEDURE_SRCS})
 list(REMOVE_ITEM SRCS ${GPU_SRCS})
+list(REMOVE_ITEM SRCS ${BENCH_SRCS})
 
 message(STATUS "Build MillenniumDB's binaries")
 # Third party dependencies
