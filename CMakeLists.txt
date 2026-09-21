@@ -128,8 +128,13 @@ else()
     message(STATUS "  Install liblz4-dev for 3-5× smaller spill files")
 endif()
 
+set(TARGET_ARCH "native" CACHE STRING "Target CPU architecture for -march (e.g. native, x86-64-v2, x86-64-v3). Leave empty to omit.")
+
 # Define the compiler flags
-set(CMAKE_CXX_FLAGS "-Wall -Wextra -pedantic -Wno-deprecated -pthread -march=native -funroll-loops")
+set(CMAKE_CXX_FLAGS "-Wall -Wextra -pedantic -Wno-deprecated -pthread -funroll-loops")
+if(TARGET_ARCH)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=${TARGET_ARCH}")
+endif()
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g3 -fsanitize=undefined,address -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -g0")
 
