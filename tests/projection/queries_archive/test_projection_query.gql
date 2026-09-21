@@ -1,2 +1,0 @@
-MATCH (u:User)-[f:FRIEND]-(friend:User)
-RETURN PROJECT('user_friends')
