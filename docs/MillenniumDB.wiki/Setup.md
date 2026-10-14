@@ -89,7 +89,7 @@ open docs/api/html/index.html       # MacOS
 
 ## Build the Project
 
-Go back into the repository root directory and configure and build MillenniumDB:
+From the repository root directory, configure and build MillenniumDB:
 
 ```bash
 cmake -B build/Release -D CMAKE_BUILD_TYPE=Release && cmake --build build/Release/
