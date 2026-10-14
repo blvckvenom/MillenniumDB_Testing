@@ -41,28 +41,27 @@ brew install cmake ncurses openssl@3 icu4c
 
 ## Clone the repository
 
-Clone this repository, enter the repository root directory and set `MDB_HOME`:
+Clone this repository and enter the repository root directory, where the commands below run. No script needs `MDB_HOME`: every script finds the checkout from its own location when it is not set.
 
 ```bash
 git clone git@github.com:MillenniumDB/MillenniumDB.git
 cd MillenniumDB
-export MDB_HOME=$(pwd)
 ```
 
 ## Install Boost
 
-Download [`boost_1_82_0.tar.gz`](https://archives.boost.io/release/1.82.0/source/boost_1_82_0.tar.gz) using a browser or wget:
+Download [`boost_1_82_0.tar.gz`](https://archives.boost.io/release/1.82.0/source/boost_1_82_0.tar.gz) into the repository root, using a browser or wget:
 
 ```bash
 wget -q --show-progress https://archives.boost.io/release/1.82.0/source/boost_1_82_0.tar.gz
 ```
 
-and run the following in the directory where boost was downloaded:
+and run the following from the repository root:
 
 ```bash
 tar -xf boost_1_82_0.tar.gz
-mkdir -p $MDB_HOME/third_party/boost_1_82/include
-mv boost_1_82_0/boost $MDB_HOME/third_party/boost_1_82/include
+mkdir -p third_party/boost_1_82/include
+mv boost_1_82_0/boost third_party/boost_1_82/include
 rm -r boost_1_82_0.tar.gz boost_1_82_0
 ```
 
